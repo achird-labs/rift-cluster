@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rift-ee",
+    "crates/rift-cluster",
+]
+# The vendored open-source Rift is its own workspace; keep it out of ours and
+# consume its crates purely as path dependencies (see [workspace.dependencies]).
+exclude = ["vendor/rift"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Rift-Enterprise-Commercial"
+authors = ["Rift Enterprise"]
+repository = "https://github.com/EtaCassiopeia/rift-enterprise"
+rust-version = "1.92"
+
+[workspace.dependencies]
+# Open-source Rift core, pinned via the vendor/rift submodule. Paths are
+# resolved against this workspace root; workspace inheritance inside the
+# vendored crates resolves against vendor/rift/Cargo.toml.
+rift-types = { path = "vendor/rift/crates/rift-types" }
+rift-core = { path = "vendor/rift/crates/rift-core" }
+
+# Shared third-party deps for enterprise crates.
+tokio = { version = "1.41", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }

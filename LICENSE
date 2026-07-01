@@ -1,0 +1,14 @@
+Rift Enterprise — Commercial License
+Copyright (c) 2026 Rift Enterprise. All rights reserved.
+
+This repository and its contents (excluding code under `vendor/`, which is
+governed by its own upstream license — the open-source Rift project is licensed
+under Apache-2.0) are proprietary and confidential.
+
+No part of this software may be reproduced, distributed, sublicensed, or used to
+create derivative works without a valid commercial license agreement with the
+copyright holder. Unauthorized copying, distribution, or use is strictly
+prohibited.
+
+The vendored open-source Rift core under `vendor/rift` remains licensed under
+the Apache License, Version 2.0; see `vendor/rift/LICENSE` for its terms.

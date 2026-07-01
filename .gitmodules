@@ -1,0 +1,4 @@
+[submodule "vendor/rift"]
+	path = vendor/rift
+	url = https://github.com/EtaCassiopeia/rift.git
+	branch = master

@@ -1,0 +1,16 @@
+[package]
+name = "rift-ee"
+description = "Rift Enterprise Edition — proprietary extensions layered on the open-source Rift core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rift-core.workspace = true
+rift-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true

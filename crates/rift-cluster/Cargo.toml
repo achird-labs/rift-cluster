@@ -1,0 +1,19 @@
+[package]
+name = "rift-cluster"
+description = "Distributed clustering for Rift Enterprise: control-plane sync, membership, and sharded imposters."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rift-ee = { path = "../rift-ee" }
+rift-core.workspace = true
+rift-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+serde.workspace = true
