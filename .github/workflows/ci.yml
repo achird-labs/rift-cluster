@@ -16,6 +16,13 @@ jobs:
         with:
           submodules: recursive
 
+      # rift-core's default `lua` feature pulls in mlua/luajit, whose build
+      # script links against a system LuaJIT located via pkg-config.
+      - name: Install system dependencies (LuaJIT)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libluajit-5.1-dev
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

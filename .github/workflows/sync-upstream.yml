@@ -28,6 +28,13 @@ jobs:
           echo "rev=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "subject=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
 
+      # rift-core's default `lua` feature pulls in mlua/luajit, whose build
+      # script links against a system LuaJIT located via pkg-config.
+      - name: Install system dependencies (LuaJIT)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libluajit-5.1-dev
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Verify enterprise workspace builds against new upstream
