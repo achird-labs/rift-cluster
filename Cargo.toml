@@ -10,18 +10,29 @@ exclude = ["vendor/rift"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "LicenseRef-Rift-Enterprise-Commercial"
 authors = ["Rift Enterprise"]
-repository = "https://github.com/EtaCassiopeia/rift-enterprise"
+repository = "https://github.com/achird-labs/rift-enterprise"
 rust-version = "1.92"
 
 [workspace.dependencies]
-# Open-source Rift core, pinned via the vendor/rift submodule. Paths are
-# resolved against this workspace root; workspace inheritance inside the
-# vendored crates resolves against vendor/rift/Cargo.toml.
+# Open-source Rift, pinned via the vendor/rift submodule. Paths are resolved
+# against this workspace root; workspace inheritance inside the vendored crates
+# resolves against vendor/rift/Cargo.toml.
 rift-types = { path = "vendor/rift/crates/rift-types" }
-rift-core = { path = "vendor/rift/crates/rift-core" }
+rift-mock-core = { path = "vendor/rift/crates/rift-mock-core" }
+# The server layer (ServerBuilder, metrics server, gateway dispatch) that the
+# enterprise binary composes instead of forking `main.rs`. Taken without the
+# binary-only `mimalloc` default; the feature list mirrors rift-mock-core's
+# defaults so both views of the core agree (upstream's feature-propagation
+# invariant — a feature default-on in the core reaches nothing through a
+# `default-features = false` consumer unless it is forwarded).
+rift-http-proxy = { path = "vendor/rift/crates/rift-http-proxy", default-features = false, features = [
+    "redis-backend",
+    "javascript",
+    "quamina-matching",
+] }
 
 # Shared third-party deps for enterprise crates.
 tokio = { version = "1.41", features = ["full"] }

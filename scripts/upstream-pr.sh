@@ -11,7 +11,7 @@ set -euo pipefail
 
 branch="${1:?usage: upstream-pr.sh <branch> \"<PR title>\"}"
 title="${2:?usage: upstream-pr.sh <branch> \"<PR title>\"}"
-upstream_repo="EtaCassiopeia/rift"
+upstream_repo="achird-labs/rift"
 
 cd "$(dirname "$0")/../vendor/rift"
 

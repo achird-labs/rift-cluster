@@ -1,7 +1,7 @@
 # Development workflow
 
 `rift-enterprise` is the private, proprietary superset of the open-source
-[Rift](https://github.com/EtaCassiopeia/rift). It follows an **open-core** model:
+[Rift](https://github.com/achird-labs/rift). It follows an **open-core** model:
 
 - The open-source core is vendored, read-only, as a git submodule at
   `vendor/rift`, pinned to a specific upstream commit.
@@ -17,7 +17,7 @@ is the point: it keeps proprietary and open-source code cleanly separated.
 ## First checkout
 
 ```sh
-git clone --recurse-submodules git@github.com:EtaCassiopeia/rift-enterprise.git
+git clone --recurse-submodules git@github.com:achird-labs/rift-enterprise.git
 # or, if already cloned:
 git submodule update --init --recursive
 cargo check --workspace
@@ -38,9 +38,17 @@ scripts/sync-upstream.sh
 ## Adding an enterprise feature
 
 1. Build it in a new or existing enterprise crate under `crates/`.
-2. Depend on core via the workspace deps (`rift-core.workspace = true`).
-3. Extend the core through its public seams (FFI, behaviors, scripting) rather
-   than forking logic.
+2. Depend on the core through the **`rift-ee` facade** (`rift-ee = { path =
+   "../rift-ee" }`), never on `rift-mock-core` / `rift-http-proxy` directly.
+   `rift-ee` re-exports the OSS crates plus the upstream extension seams under
+   `rift_ee::seams`; keeping it the sole path means Cargo enforces the
+   open-core boundary instead of a convention nobody checks. Only `rift-ee`
+   itself carries the vendored path deps (declared in `[workspace.dependencies]`
+   at the root).
+3. Extend the core through those seams (flow store, sequencer, journal, proxy
+   store, config reconcile + events, response decoration, server builder)
+   rather than forking logic. If a seam you need does not exist, that is an
+   upstream PR — see the cross-repo flow below — not a local fork.
 
 ## When an enterprise feature needs a core change first (cross-repo PR)
 
