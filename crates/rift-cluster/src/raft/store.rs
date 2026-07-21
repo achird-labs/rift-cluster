@@ -431,6 +431,12 @@ enum EngineAction {
         port: u16,
         edit: StubEditScript,
     },
+    /// Pause/resume in place via the upstream write-through (#817): never a
+    /// wholesale replace, so the imposter's runtime state survives.
+    SetEnabled {
+        port: u16,
+        enabled: bool,
+    },
     /// A sync that must NOT run: a stored record failed to parse, and a partial
     /// desired set would delete the live imposters it omits. Recorded as an
     /// apply failure for the named port; the engine keeps its current state.
@@ -774,8 +780,8 @@ impl RedbStateMachine {
     }
 
     /// The desired engine state as of now, read from an open (possibly
-    /// mid-transaction) view of `sm_configs`: every enabled default-tenant
-    /// config, parsed.
+    /// mid-transaction) view of `sm_configs`: every default-tenant config,
+    /// parsed — disabled ones included (a paused imposter stays bound, #817).
     ///
     /// `Ok(Err((port, reason)))` means a stored record failed to parse. That
     /// must abort the sync, not shrink it: `apply_config` deletes every live
@@ -799,9 +805,9 @@ impl RedbStateMachine {
                     return Ok(Err((port, format!("stored record will not parse: {e}"))));
                 }
             };
-            if !stored.enabled {
-                continue;
-            }
+            // Disabled configs stay in the desired set: upstream keeps a
+            // paused imposter bound (serving 503) — dropping it here would
+            // read as "delete it" to apply_config (#817).
             match serde_json::from_str::<ImposterConfig>(&stored.config_json) {
                 Ok(config) => desired.push(config),
                 Err(e) => {
@@ -854,7 +860,7 @@ impl RedbStateMachine {
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 let stored = StoredImposter {
                     config_json,
-                    enabled: true,
+                    enabled: config.enabled,
                     revision: index,
                 };
                 let value = serde_json::to_string(&stored)
@@ -874,14 +880,20 @@ impl RedbStateMachine {
                         Some(guard) => match serde_json::from_str(guard.value()) {
                             Ok(record) => record,
                             Err(e) => {
-                                return Ok(Err(format!("stored record for port {port}: {e}")));
+                                tracing::error!(port = *port, error = %e, "corrupt stored record");
+                                return Ok(Err(format!(
+                                    "corrupt stored record for port {port}: {e}"
+                                )));
                             }
                         },
                     }
                 };
                 let mut config: ImposterConfig = match serde_json::from_str(&record.config_json) {
                     Ok(config) => config,
-                    Err(e) => return Ok(Err(format!("stored config for port {port}: {e}"))),
+                    Err(e) => {
+                        tracing::error!(port = *port, error = %e, "corrupt stored config");
+                        return Ok(Err(format!("corrupt stored config for port {port}: {e}")));
+                    }
                 };
                 if let Err(reason) = control::apply_edit(&mut config.stubs, edit) {
                     return Ok(Err(reason));
@@ -927,11 +939,51 @@ impl RedbStateMachine {
                 }
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
-            // `validate` refused these before mutation is reached; keep a
-            // deterministic refusal rather than a panic path in case a future
-            // caller skips validation.
-            ControlOp::SetEnabled { .. } => {
-                Ok(Err("SetEnabled is not available yet (#15)".to_owned()))
+            ControlOp::SetEnabled {
+                tenant,
+                port,
+                enabled,
+            } => {
+                let mut record: StoredImposter = {
+                    match configs.get((tenant.as_str(), *port)).map_err(io)? {
+                        None => return Ok(Err(format!("no imposter on port {port}"))),
+                        Some(guard) => match serde_json::from_str(guard.value()) {
+                            Ok(record) => record,
+                            Err(e) => {
+                                tracing::error!(port = *port, error = %e, "corrupt stored record");
+                                return Ok(Err(format!(
+                                    "corrupt stored record for port {port}: {e}"
+                                )));
+                            }
+                        },
+                    }
+                };
+                // Both copies of the flag move together: the embedded config
+                // is what the engine, snapshots and the desired-set builder
+                // consume; the record field is a redundant projection kept in
+                // sync so later slices can read it without a config parse.
+                let mut config: ImposterConfig = match serde_json::from_str(&record.config_json) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        tracing::error!(port = *port, error = %e, "corrupt stored config");
+                        return Ok(Err(format!("corrupt stored config for port {port}: {e}")));
+                    }
+                };
+                record.enabled = *enabled;
+                config.enabled = *enabled;
+                record.config_json = serde_json::to_string(&config)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                record.revision = index;
+                let value = serde_json::to_string(&record)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                configs
+                    .insert((tenant.as_str(), *port), value.as_str())
+                    .map_err(io)?;
+                crate::metrics::config_applied(*port, index);
+                Ok(Ok(vec![EngineAction::SetEnabled {
+                    port: *port,
+                    enabled: *enabled,
+                }]))
             }
             ControlOp::TenantPut { .. }
             | ControlOp::TenantDelete { .. }
@@ -969,6 +1021,17 @@ impl RedbStateMachine {
                          (a partial sync would delete live imposters)"
                     );
                     self.apply_failures.lock().insert(port, error);
+                }
+                EngineAction::SetEnabled { port, enabled } => {
+                    match engine.set_imposter_enabled(port, enabled).await {
+                        Ok(()) => {
+                            self.apply_failures.lock().remove(&port);
+                        }
+                        Err(e) => {
+                            tracing::error!(port, error = %e, "engine refused a committed toggle");
+                            self.apply_failures.lock().insert(port, e.to_string());
+                        }
+                    }
                 }
                 EngineAction::Patch { port, edit } => {
                     match Self::drive_patch(engine, port, &edit).await {
@@ -1026,6 +1089,7 @@ impl RedbStateMachine {
             .iter()
             .chain(&report.replaced)
             .chain(&report.stub_patched)
+            .chain(&report.toggled)
             .chain(&report.deleted)
         {
             failures.remove(port);
@@ -1966,6 +2030,94 @@ mod tests {
         assert!(sm.parked_intents().expect("list").is_empty());
         sm.unpark_intent(&op_id)
             .expect("unparking twice is a no-op");
+    }
+
+    /// Issue #9 slice 4 / #15: SetEnabled toggles in place — the imposter is
+    /// never recreated, so its runtime state survives a pause/resume cycle.
+    #[tokio::test]
+    async fn set_enabled_toggles_in_place() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        sm.apply(vec![entry(1, put(1, 18090, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply put");
+        let before = engine.get_imposter(18090).expect("bound");
+        assert!(before.is_enabled());
+
+        let disable = request(
+            2,
+            ControlOp::SetEnabled {
+                tenant: TenantId::default(),
+                port: 18090,
+                enabled: false,
+            },
+        );
+        let responses = sm.apply(vec![entry(2, disable)]).await.expect("apply");
+        assert_eq!(responses, vec![ControlResponse::applied(2)]);
+
+        let body = sm.read_config(18090).expect("read").expect("present");
+        assert!(
+            body.contains("\"enabled\":false"),
+            "the stored config carries the flag: {body}"
+        );
+        let after = engine.get_imposter(18090).expect("still bound");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the toggle must not recreate the imposter"
+        );
+        assert!(!after.is_enabled());
+
+        // A toggle on an absent port is a deterministic refusal.
+        let ghost = request(
+            3,
+            ControlOp::SetEnabled {
+                tenant: TenantId::default(),
+                port: 19999,
+                enabled: false,
+            },
+        );
+        let responses = sm.apply(vec![entry(3, ghost)]).await.expect("apply");
+        assert!(
+            matches!(&responses[0].outcome, ControlOutcome::Failed { reason } if reason.contains("19999")),
+            "{responses:?}"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// A paused config must STAY in the engine's desired set: dropping it
+    /// would read as "delete the imposter" to apply_config — a pause is not a
+    /// teardown (#817).
+    #[tokio::test]
+    async fn a_disabled_config_stays_bound_through_sibling_syncs() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        sm.apply(vec![entry(1, put(1, 18091, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply put");
+        sm.apply(vec![entry(
+            2,
+            request(
+                2,
+                ControlOp::SetEnabled {
+                    tenant: TenantId::default(),
+                    port: 18091,
+                    enabled: false,
+                },
+            ),
+        )])
+        .await
+        .expect("apply disable");
+
+        // A sibling create triggers a full-set sync; the paused imposter must
+        // survive it, still bound and still paused.
+        sm.apply(vec![entry(3, put(3, 18092, json!([])))])
+            .await
+            .expect("apply sibling");
+        assert_eq!(engine.count(), 2, "the paused imposter was not torn down");
+        assert!(!engine.get_imposter(18091).expect("bound").is_enabled());
+
+        engine.shutdown().await;
     }
 
     /// A bind-failed port that is then deleted must not leave a phantom entry

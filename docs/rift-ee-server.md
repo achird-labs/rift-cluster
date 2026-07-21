@@ -206,10 +206,12 @@ separate header lines rather than collapsed.
 
 Under `--cluster`, the public admin address is served by a thin front: the
 config-mutating routes (`POST/PUT/DELETE /imposters`, `DELETE
-/imposters/:port`, stub CRUD) become replicated control ops committed through
-the Raft leader — submitted on any node, forwarded automatically — and
-everything else (reads, scenario state, recorded requests, enable/disable) is
-reverse-proxied to the local engine unchanged. A 2xx from a mutating route
+/imposters/:port`, stub CRUD, and `POST /imposters/:port/{enable,disable}`)
+become replicated control ops committed through the Raft leader — submitted on
+any node, forwarded automatically — and everything else (reads, scenario
+state, recorded requests) is reverse-proxied to the local engine unchanged. A
+pause replicates and survives restarts (upstream #817): it applies in place on
+every node, so the paused imposter's scenario state is intact on resume. A 2xx from a mutating route
 means the write is durable on a majority and, with the default
 `--cluster-write-barrier=ready-nodes`, applied on every Ready node; if the
 barrier times out the response still succeeds and names the lagging nodes in
@@ -251,10 +253,10 @@ failures reported on `GET /_cluster/imposters`).
 
 The data-plane pull-on-miss safety net (retry a failing match once after
 waiting ≤ 500 ms for a lagging apply) needs an upstream no-match seam that
-v0.15.0 does not expose; until that seam lands its window is kept small by the
-default `ready-nodes` barrier (a 2xx already implies fleet-wide apply) and the
-`cluster-reconciled` readiness gate (a catching-up node takes no traffic).
-`SetEnabled` replication waits on the upstream imposter-enabled seam (#15).
+the current pin does not expose; until that seam lands its window is kept
+small by the default `ready-nodes` barrier (a 2xx already implies fleet-wide
+apply) and the `cluster-reconciled` readiness gate (a catching-up node takes
+no traffic).
 
 Two flags from the Phase-1 plan are deliberately **not** accepted yet, because
 nothing behind them exists and this codebase refuses flags that quietly do

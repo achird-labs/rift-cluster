@@ -1169,3 +1169,230 @@ async fn a_restarted_node_replays_its_own_parked_intents() {
     follower.shutdown().await;
     leader.shutdown().await;
 }
+
+/// Issue #15 / #9 slice 4: a pause is replicated config — it answers through
+/// the control plane, survives a restart, and resuming finds the imposter's
+/// stubs intact (the toggle applies in place, never a replace).
+#[tokio::test]
+async fn disable_replicates_survives_restart_and_preserves_state() {
+    let bind = {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve");
+        held.local_addr().expect("addr").to_string()
+    };
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli_at(&state, &bind, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+    assert!(wait_served(port, "from-a").await);
+
+    let response = client
+        .post(format!("http://{admin}/imposters/{port}/disable"))
+        .send()
+        .await
+        .expect("disable");
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(
+        response.headers().get("rift-cluster-revision").is_some(),
+        "the toggle is a replicated write and says so"
+    );
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["message"], "Imposter disabled", "upstream's own shape");
+
+    // The data plane answers 503 while paused (still bound, not gone).
+    let paused = reqwest::get(format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect("paused imposter still answers TCP");
+    assert_eq!(paused.status().as_u16(), 503);
+
+    let read: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get imposter")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(read["enabled"], false, "{read}");
+
+    // Restart on the same state: the pause must survive (the whole point).
+    server.shutdown().await;
+    let server = compose::start(cluster_cli_at(&state, &bind, &["--cluster-allow-solo"]))
+        .await
+        .expect("restart");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let paused = reqwest::get(format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect("still bound after restart");
+    assert_eq!(
+        paused.status().as_u16(),
+        503,
+        "a restart must not silently re-enable a paused imposter"
+    );
+
+    // Resume: the stub set survived the pause/restart cycle intact.
+    let response = client
+        .post(format!("http://{admin}/imposters/{port}/enable"))
+        .send()
+        .await
+        .expect("enable");
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(
+        wait_served(port, "from-a").await,
+        "resume serves the original stub — nothing was reset"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #15: the pause converges — disabling through one node's admin stops
+/// the OTHER node's engine serving within the write barrier.
+#[tokio::test]
+async fn disable_on_one_node_pauses_the_fleet() {
+    let leader_state = TempDir::new().expect("tempdir");
+    let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
+        .await
+        .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+    let follower_state = TempDir::new().expect("tempdir");
+    let follower = compose::start(cluster_cli(&follower_state, &["--cluster-seeds", &seed]))
+        .await
+        .expect("follower joins");
+    wait_ready(&follower).await;
+
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("http://{}/imposters", leader.admin_addr()))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+    assert!(wait_served(port, "from-a").await);
+
+    // Disable through the FOLLOWER's admin (forward path), barrier default on:
+    // the 2xx implies every node has applied the pause.
+    let response = client
+        .post(format!(
+            "http://{}/imposters/{port}/disable",
+            follower.admin_addr()
+        ))
+        .send()
+        .await
+        .expect("disable via follower");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let paused = reqwest::get(format!("http://127.0.0.1:{port}/"))
+        .await
+        .expect("paused imposter answers");
+    assert_eq!(
+        paused.status().as_u16(),
+        503,
+        "the fleet's engine is paused"
+    );
+
+    // Both nodes' config planes agree — the barrier's 2xx promised exactly this.
+    for admin in [leader.admin_addr(), follower.admin_addr()] {
+        let view: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+            .await
+            .expect("get imposter")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(view["enabled"], false, "node {admin} disagrees: {view}");
+    }
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// Issue #15: toggling a port that never existed answers 404 through the
+/// front — the typed shape, not a committed no-op dressed as success.
+#[tokio::test]
+async fn disabling_a_ghost_port_is_a_404() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/imposters/59999/disable",
+            server.admin_addr()
+        ))
+        .send()
+        .await
+        .expect("disable ghost");
+    assert_eq!(response.status().as_u16(), 404);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert!(
+        body["errors"][0]["type"].is_string(),
+        "typed envelope: {body}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #15: a replayed toggle (same Idempotency-Key) collapses to the
+/// original application — same revision both times.
+#[tokio::test]
+async fn a_keyed_toggle_retries_exactly_once() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+
+    let disable = || {
+        client
+            .post(format!("http://{admin}/imposters/{port}/disable"))
+            .header("idempotency-key", "pause-once")
+            .send()
+    };
+    let first = disable().await.expect("first disable");
+    assert_eq!(first.status().as_u16(), 200);
+    let first_revision = first
+        .headers()
+        .get("rift-cluster-revision")
+        .and_then(|v| v.to_str().ok())
+        .expect("revision header")
+        .to_owned();
+
+    let retry = disable().await.expect("retried disable");
+    assert_eq!(retry.status().as_u16(), 200);
+    assert_eq!(
+        retry
+            .headers()
+            .get("rift-cluster-revision")
+            .and_then(|v| v.to_str().ok())
+            .expect("revision header"),
+        first_revision,
+        "the retry must collapse to the original toggle"
+    );
+
+    server.shutdown().await;
+}
