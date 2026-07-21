@@ -563,6 +563,32 @@ impl RedbStateMachine {
         self.apply_failures.lock().clone()
     }
 
+    /// Drive the attached engine to the currently applied state — the
+    /// cold-start / post-join reconcile (issue #9 slice 2). Apply only projects
+    /// *new* entries onto the engine, so a restarted node must run this once to
+    /// materialize what its tables already hold. A no-op without an engine;
+    /// engine-side failures land in [`Self::apply_failures`] as usual.
+    #[allow(clippy::result_large_err)]
+    pub async fn reconcile_engine(&self) -> StorageResult<()> {
+        let action = {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let table = read_txn
+                .open_table(SM_CONFIGS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            match Self::desired_configs(&table)
+                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+            {
+                Ok(desired) => EngineAction::Sync(desired),
+                Err((port, error)) => EngineAction::RefuseSync { port, error },
+            }
+        };
+        self.drive_engine(vec![action]).await;
+        Ok(())
+    }
+
     /// Test-only: overwrite a raw `sm_configs` row, bypassing validation — the
     /// broken-record refusal path is unreachable through the public API.
     #[cfg(test)]

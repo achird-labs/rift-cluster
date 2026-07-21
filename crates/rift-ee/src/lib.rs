@@ -55,6 +55,16 @@ pub mod seams {
     /// error the engine reports when an apply side-effect fails.
     pub use rift_mock_core::imposter::{ImposterConfig, ImposterError, Stub};
 
+    /// The typed admin error envelope (upstream #797): a stable `type` slug
+    /// plus the frozen legacy `code`. Client-visible cluster failures emit
+    /// this, never a hand-rolled shape.
+    pub use rift_mock_core::response::{ErrorKind, error_response_typed};
+
+    /// The `--allowInjection` classifier: whether a config carries a scripting
+    /// surface. The clustered admin front gates terminated writes on this, the
+    /// same check the OSS admin applies before storing.
+    pub use rift_http_proxy::injection_gate::config_uses_script_surface;
+
     /// Backend-outage reporting and response decoration: how a backend surfaces
     /// as a structured 503, and how per-request annotations become response
     /// headers without the OSS handlers knowing what they mean.
@@ -150,6 +160,8 @@ mod tests {
         _named::<ImposterConfig>();
         _named::<ImposterError>();
         _named::<Stub>();
+        let _ = ErrorKind::Unavailable;
+        let _ = (error_response_typed, config_uses_script_surface);
         _named::<BackendUnavailable>();
         _named::<TlsDefaults>();
         _named::<ServerBuilder>();

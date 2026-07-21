@@ -17,10 +17,11 @@ use rift_cluster::rpc::Router;
 use rift_cluster::{ClusterDecorator, NodeConfig, NodeIdentity, RaftNode, metrics};
 use rift_ee::seams::{ImposterManager, RunningServer, ServerBuilder, TlsDefaults};
 
+use crate::admin_front::{self, AdminFront, FrontConfig};
 use crate::cli::EeCli;
 use crate::cluster_api::{self, NodeSlot};
 use crate::probes::{self, ProbeListener};
-use crate::readiness::{GATE_JOINED, Readiness};
+use crate::readiness::{GATE_JOINED, GATE_RECONCILED, Readiness};
 
 /// How long a starting node keeps trying its seeds before giving up.
 ///
@@ -41,19 +42,28 @@ pub struct ComposedServer {
     server: RunningServer,
     probes: Option<ProbeListener>,
     node: Option<Arc<RaftNode>>,
+    /// The clustered admin front, when clustering is on: it owns the public
+    /// admin address, and the OSS admin inside `server` is on loopback.
+    front: Option<AdminFront>,
     /// Samples the fleet gauges. Aborted on shutdown so it cannot outlive the
     /// node it reads.
     metrics_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// Reconciles the engine and satisfies [`GATE_RECONCILED`]; aborted on
+    /// shutdown for the same reason as the sampler.
+    reconciler: Option<tokio::task::JoinHandle<()>>,
     cluster_addr: Option<SocketAddr>,
     readiness: Arc<Readiness>,
     leave_timeout: Duration,
 }
 
 impl ComposedServer {
-    /// The bound admin API address.
+    /// The bound admin API address — the front's when clustering is on, the
+    /// OSS admin's otherwise. Either way: where clients point.
     #[must_use]
     pub fn admin_addr(&self) -> SocketAddr {
-        self.server.admin_addr()
+        self.front
+            .as_ref()
+            .map_or_else(|| self.server.admin_addr(), AdminFront::local_addr)
     }
 
     /// The bound probe address — `None` when clustering is off, because an
@@ -85,8 +95,16 @@ impl ComposedServer {
         if let Some(sampler) = self.metrics_sampler {
             sampler.abort();
         }
+        if let Some(reconciler) = self.reconciler {
+            reconciler.abort();
+        }
         if let Some(probes) = self.probes {
             probes.shutdown().await;
+        }
+        // The front goes before the OSS admin behind it, so a straggling
+        // request meets a closed port rather than a half-alive pipeline.
+        if let Some(front) = self.front {
+            front.shutdown().await;
         }
         self.server.shutdown().await;
         if let Some(node) = self.node
@@ -155,7 +173,9 @@ pub async fn start_with_runtimes(
             server,
             probes: None,
             node: None,
+            front: None,
             metrics_sampler: None,
+            reconciler: None,
             cluster_addr: None,
             readiness: Arc::new(Readiness::awaiting([])),
             leave_timeout: Duration::ZERO,
@@ -179,7 +199,7 @@ pub async fn start_with_runtimes(
     // visible on /metrics even if the node then fails to start.
     metrics::set_insecure(cluster.is_insecure());
 
-    let readiness = Arc::new(Readiness::awaiting([GATE_JOINED]));
+    let readiness = Arc::new(Readiness::awaiting([GATE_JOINED, GATE_RECONCILED]));
 
     // Probes come up first, before the node exists. `/healthz` has to answer
     // *during* the join — a liveness probe that gets connection-refused while
@@ -192,6 +212,17 @@ pub async fn start_with_runtimes(
         .await
         .with_context(|| format!("binding the probe listener on {probe_bind}"))?;
 
+    // The manager exists before the node so committed ops can drive it from
+    // the very first apply; the data-plane server later composes around this
+    // same instance rather than building its own.
+    let manager = match cluster_manager(&cli, accept_runtimes) {
+        Ok(manager) => Arc::new(manager),
+        Err(e) => {
+            probes.shutdown().await;
+            return Err(e.context("building the clustered imposter manager"));
+        }
+    };
+
     let slot = NodeSlot::default();
     let node = match RaftNode::start(NodeConfig {
         node_id: identity.node_id(),
@@ -200,10 +231,7 @@ pub async fn start_with_runtimes(
         data_dir: state_dir,
         secret: cluster.secret,
         routes: cluster_api::routes(Router::new(), slot.clone(), Arc::clone(&readiness)),
-        // Tables-only for now: the admin write path (#9 slice 2) threads the
-        // server's ImposterManager through here together with GATE_RECONCILED,
-        // so applied configs materialize as bound imposters.
-        engine: None,
+        engine: Some(Arc::clone(&manager)),
     })
     .await
     {
@@ -213,7 +241,13 @@ pub async fn start_with_runtimes(
             return Err(anyhow::Error::new(e).context("starting the cluster control-plane node"));
         }
     };
-    slot.set(&node)?;
+    if let Err(e) = slot.set(&node) {
+        probes.shutdown().await;
+        if let Err(e) = node.shutdown().await {
+            tracing::error!(error = %e, "cluster node shutdown reported an error");
+        }
+        return Err(anyhow::Error::new(e).context("binding the operator surface to the node"));
+    }
 
     let cluster_addr = node.advertise_addr();
     let leave_timeout = Duration::from_secs(cli.cluster.cluster_leave_timeout);
@@ -222,11 +256,13 @@ pub async fn start_with_runtimes(
     // `start` is an embedding seam that callers retry, so a failure must not
     // leave the cluster port bound or the redb state dir locked — it would fail
     // the retry too, with an error that hides the real cause.
-    match attach_data_plane(cli, &node, &readiness, accept_runtimes).await {
-        Ok(server) => Ok(ComposedServer {
+    match attach_data_plane(cli, &node, &readiness, manager).await {
+        Ok((server, front, reconciler)) => Ok(ComposedServer {
             server,
             probes: Some(probes),
+            front: Some(front),
             metrics_sampler: Some(spawn_metrics_sampler(Arc::clone(&node))),
+            reconciler: Some(reconciler),
             node: Some(node),
             cluster_addr: Some(cluster_addr),
             readiness,
@@ -246,18 +282,27 @@ pub async fn start_with_runtimes(
 /// the running node. Split out so a failure anywhere in it lands on one cleanup
 /// path in [`start_with_runtimes`].
 async fn attach_data_plane(
-    cli: EeCli,
+    mut cli: EeCli,
     node: &Arc<RaftNode>,
     readiness: &Arc<Readiness>,
-    accept_runtimes: Vec<tokio::runtime::Handle>,
-) -> anyhow::Result<RunningServer> {
+    manager: Arc<ImposterManager>,
+) -> anyhow::Result<(RunningServer, AdminFront, tokio::task::JoinHandle<()>)> {
     join_or_bootstrap(node, &cli).await?;
     readiness.satisfy(GATE_JOINED);
 
-    let manager = Arc::new(
-        cluster_manager(&cli, accept_runtimes)
-            .context("building the clustered imposter manager")?,
-    );
+    // The public admin address belongs to the front (issue #9): the OSS admin
+    // retreats to an ephemeral loopback port the front proxies to. `--cluster`
+    // off never reaches this function, so that path keeps upstream's binding
+    // untouched.
+    let public_admin = format!("{}:{}", cli.oss.host, cli.oss.port);
+    let api_key = cli.oss.api_key.clone();
+    let allow_injection = cli.oss.allow_injection;
+    cli.oss.host = "127.0.0.1".to_owned();
+    cli.oss.port = 0;
+
+    let barrier = cli.cluster.cluster_write_barrier;
+    let barrier_timeout = Duration::from_secs(cli.cluster.cluster_write_barrier_timeout);
+
     let server = ServerBuilder::from_cli(cli.oss)
         .manager(manager)
         .start()
@@ -274,7 +319,71 @@ async fn attach_data_plane(
         ));
     }
 
-    Ok(server)
+    let front = match admin_front::bind(
+        FrontConfig {
+            public_addr: public_admin.clone(),
+            upstream_admin: server.admin_addr(),
+            api_key,
+            allow_injection,
+            barrier,
+            barrier_timeout,
+        },
+        node,
+    )
+    .await
+    {
+        Ok(front) => front,
+        Err(e) => {
+            server.shutdown().await;
+            return Err(anyhow::Error::new(e).context(format!(
+                "binding the clustered admin front on {public_admin}"
+            )));
+        }
+    };
+
+    Ok((server, front, spawn_reconciler(node, readiness)))
+}
+
+/// Catch up to the leader's applied index as observed at join, project the
+/// applied configs onto the engine, then open [`GATE_RECONCILED`] (ADR-001
+/// §5.2). Every step retries: readiness simply stays pending — visibly, with
+/// the gate named by `/readyz` — until the node is genuinely reconciled.
+fn spawn_reconciler(
+    node: &Arc<RaftNode>,
+    readiness: &Arc<Readiness>,
+) -> tokio::task::JoinHandle<()> {
+    let node = Arc::downgrade(node);
+    let readiness = Arc::clone(readiness);
+    tokio::spawn(async move {
+        let mut quiet_ticks: u32 = 0;
+        loop {
+            let Some(node) = node.upgrade() else { return };
+            // A wedged reconcile must be diagnosable from the logs, not only
+            // from the gate `/readyz` keeps naming: one warning every ~5s.
+            quiet_ticks += 1;
+            if quiet_ticks.is_multiple_of(50) {
+                tracing::warn!(
+                    last_applied = node.status().last_applied,
+                    "still reconciling: no leader reachable or applied state behind"
+                );
+            }
+            if let Some(target) = node.leader_applied().await
+                && node.status().last_applied.unwrap_or(0) >= target
+            {
+                match node.reconcile_engine().await {
+                    Ok(()) => {
+                        readiness.satisfy(GATE_RECONCILED);
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "engine reconcile failed; retrying");
+                    }
+                }
+            }
+            drop(node);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
 }
 
 /// Re-sample the fleet gauges on a timer.
@@ -329,6 +438,18 @@ fn cluster_manager(
 /// Attach to an existing cluster through the seeds, or found one when the
 /// operator has said that is what they want.
 async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
+    // A restart resumes: the durable log already carries the membership, and
+    // both re-initializing (refused by openraft) and re-joining (already a
+    // member) would fail a node that is perfectly able to come back on its own.
+    if node
+        .is_initialized()
+        .await
+        .context("reading cluster initialization state")?
+    {
+        tracing::info!("cluster state present; resuming membership from the durable log");
+        return Ok(());
+    }
+
     if cli.cluster.cluster_seeds.is_empty() {
         anyhow::ensure!(
             cli.cluster.cluster_allow_solo,

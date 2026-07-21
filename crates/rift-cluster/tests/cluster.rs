@@ -448,3 +448,48 @@ async fn test_leader_failover() {
     );
     cluster.shutdown_all().await;
 }
+
+/// Issue #9: the write barrier degrades to a *warning* on an unreachable node —
+/// the write itself stays committed. A healthy fleet reports nobody unapplied;
+/// with a member killed, exactly that member is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn barrier_names_exactly_the_unapplied_node() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    let revision = cluster.write_on_leader(8080, "barrier-healthy").await;
+    let unapplied = cluster
+        .leader()
+        .expect("leader")
+        .await_applied(revision, Duration::from_secs(5))
+        .await;
+    assert!(
+        unapplied.is_empty(),
+        "a healthy fleet leaves nobody unapplied: {unapplied:?}"
+    );
+
+    // Kill a follower (never the leader) and write again: the commit still
+    // succeeds on the majority, and the barrier names the dead node — only it.
+    let victim = [1, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader_id)
+        .expect("a follower exists");
+    cluster.kill(victim).await;
+
+    let revision = cluster.write_on_leader(8081, "barrier-degraded").await;
+    let unapplied = cluster
+        .leader()
+        .expect("leader")
+        .await_applied(revision, Duration::from_millis(500))
+        .await;
+    assert_eq!(
+        unapplied,
+        vec![victim],
+        "the barrier must name the dead node and nothing else"
+    );
+    cluster.shutdown_all().await;
+}
