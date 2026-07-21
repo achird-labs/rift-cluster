@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rift_cluster::{NodeConfig, NodeError, NodeId, RaftNode, Router};
+use rift_cluster::{NodeConfig, NodeError, NodeId, RaftNode};
 use tempfile::TempDir;
 
 const SECRET: &str = "harness-cluster-secret";
@@ -59,7 +59,6 @@ async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> RaftNode {
         advertise: Some(addr),
         data_dir: dir.to_path_buf(),
         secret: Some(SECRET.to_owned()),
-        routes: Router::new(),
     };
     // A restart can momentarily race the previous instance's async teardown
     // releasing the redb file lock: a real process restart frees it on exit, but

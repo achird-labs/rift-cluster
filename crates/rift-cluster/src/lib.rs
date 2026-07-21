@@ -17,19 +17,15 @@
 //!   plane's worker threads.
 //! * [`config`] — the startup guards that refuse a cluster which would be
 //!   quietly wrong (unauthenticated, unbound, or on an incompatible runtime).
-//! * [`decorate`] — the response decorator that turns cluster op notes into
-//!   `Rift-Cluster-*` headers, so the open-source handlers stay cluster-unaware.
 
 pub mod bridge;
 pub mod config;
-pub mod decorate;
 pub mod metrics;
 pub mod raft;
 pub mod rpc;
 
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
-pub use decorate::ClusterDecorator;
 pub use raft::{
     ControlOp, ControlResponse, KeyClass, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus,
     OwnedKey, RaftNode, Ring, StatusReport, TypeConfig,
