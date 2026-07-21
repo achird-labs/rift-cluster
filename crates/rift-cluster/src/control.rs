@@ -96,9 +96,8 @@ pub enum ControlOp {
     DeleteAll {
         tenant: TenantId,
     },
-    /// Slice 4: rejected by [`validate`] until the upstream `enabled` seam
-    /// exists (#15). In the log format now for the same stability reason as the
-    /// reserved variants.
+    /// Pause/resume serving on a port, applied in place — never a wholesale
+    /// replace (upstream #817 semantics; enterprise #15).
     SetEnabled {
         tenant: TenantId,
         port: u16,
@@ -228,10 +227,7 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             require_default_tenant(tenant)
         }
         ControlOp::DeleteAll { tenant } => require_default_tenant(tenant),
-        ControlOp::SetEnabled { .. } => Err(
-            "SetEnabled is not available yet: it needs the upstream imposter-enabled seam (#15)"
-                .to_owned(),
-        ),
+        ControlOp::SetEnabled { tenant, .. } => require_default_tenant(tenant),
         ControlOp::TenantPut { .. }
         | ControlOp::TenantDelete { .. }
         | ControlOp::PrincipalPut { .. }
@@ -533,14 +529,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_set_enabled_until_the_upstream_seam_exists() {
+    fn validate_accepts_set_enabled_on_the_default_tenant_only() {
         let op = ControlOp::SetEnabled {
             tenant: TenantId::default(),
             port: 1,
             enabled: false,
         };
-        let err = validate(&op).expect_err("slice 4, gated on #15");
-        assert!(err.contains("#15"), "{err}");
+        assert_eq!(validate(&op), Ok(()));
+
+        let op = ControlOp::SetEnabled {
+            tenant: TenantId::new("acme"),
+            port: 1,
+            enabled: false,
+        };
+        validate(&op).expect_err("non-default tenant is still refused");
     }
 
     #[test]

@@ -11,10 +11,11 @@
 //! bar (#37) rides on that path having zero new code.
 //!
 //! What terminates here is exactly the *replicated-config* surface: imposter
-//! create/replace/delete and stub CRUD. Runtime-state mutations (scenarios,
-//! spaces, recorded-request deletes, enable/disable) stay proxied to the local
-//! engine — they are node-local today by design and tracked by #15/#16, and
-//! silently replicating them here would change semantics those issues own.
+//! create/replace/delete, stub CRUD, and enable/disable (config since
+//! upstream #817 — a pause must survive restarts and converge fleet-wide,
+//! #15). Runtime-state mutations (scenarios, spaces, recorded-request
+//! deletes) stay proxied to the local engine — node-local today by design,
+//! tracked by #16.
 //!
 //! Mutation responses are rendered by re-reading the just-applied state through
 //! the loopback admin (`GET /imposters/:port` after the barrier), so the body
@@ -211,6 +212,7 @@ enum Terminated {
     DeleteStubAt(u16, usize),
     ReplaceStubById(u16, String),
     DeleteStubById(u16, String),
+    SetEnabled(u16, bool),
 }
 
 fn classify(method: &Method, path: &str) -> Option<Terminated> {
@@ -227,6 +229,8 @@ fn classify(method: &Method, path: &str) -> Option<Terminated> {
     let port: u16 = segments.first()?.parse().ok()?;
     match segments.as_slice() {
         [_] if *method == Method::DELETE => Some(Terminated::DeleteImposter(port)),
+        [_, "enable"] if *method == Method::POST => Some(Terminated::SetEnabled(port, true)),
+        [_, "disable"] if *method == Method::POST => Some(Terminated::SetEnabled(port, false)),
         [_, "stubs"] => match *method {
             Method::POST => Some(Terminated::AddStub(port)),
             Method::PUT => Some(Terminated::ReplaceStubs(port)),
@@ -583,17 +587,25 @@ async fn build_and_run(
     };
     set_header(&mut response, HEADER_REVISION, &revision);
     set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
+    let mut warnings = Vec::new();
     if !unapplied.is_empty() {
         let nodes = unapplied
             .iter()
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        set_header(
-            &mut response,
-            HEADER_WARNINGS,
-            &format!("unapplied={nodes}"),
-        );
+        warnings.push(format!("unapplied={nodes}"));
+    }
+    // The commit is fleet truth, but THIS node's engine may still have failed
+    // to realize it (a bind, a refused toggle): §7.4.6 — success with a named
+    // warning, never a silent divergence the client cannot see.
+    if let Some(port) = mutation.port
+        && let Some(failure) = node.apply_failures().get(&port)
+    {
+        warnings.push(format!("local-engine={failure}"));
+    }
+    if !warnings.is_empty() {
+        set_header(&mut response, HEADER_WARNINGS, &warnings.join(","));
     }
     Ok(response)
 }
@@ -773,6 +785,26 @@ async fn build_mutation(
                 port: Some(port),
                 render: Render::FetchAfter {
                     path: format!("/imposters/{port}"),
+                    status: StatusCode::OK,
+                },
+            })
+        }
+        Terminated::SetEnabled(port, enabled) => {
+            let state = if enabled { "enabled" } else { "disabled" };
+            Ok(Mutation {
+                ops: vec![ControlOp::SetEnabled {
+                    tenant: TenantId::default(),
+                    port,
+                    enabled,
+                }],
+                port: Some(port),
+                // Upstream's own response shape, byte-identical — no re-read
+                // needed for a message body.
+                render: Render::Captured {
+                    body: Bytes::from(
+                        serde_json::json!({ "message": format!("Imposter {state}") }).to_string(),
+                    ),
+                    content_type: json_content_type(),
                     status: StatusCode::OK,
                 },
             })
@@ -1085,6 +1117,8 @@ mod tests {
             (Method::DELETE, "/imposters/4545/stubs/2"),
             (Method::PUT, "/imposters/4545/stubs/by-id/a"),
             (Method::DELETE, "/imposters/4545/stubs/by-id/a"),
+            (Method::POST, "/imposters/4545/enable"),
+            (Method::POST, "/imposters/4545/disable"),
         ];
         for (method, path) in terminated {
             assert!(
@@ -1098,8 +1132,6 @@ mod tests {
         let proxied = [
             (Method::GET, "/imposters"),
             (Method::GET, "/imposters/4545"),
-            (Method::POST, "/imposters/4545/enable"),
-            (Method::POST, "/imposters/4545/disable"),
             (Method::DELETE, "/imposters/4545/savedRequests"),
             (Method::DELETE, "/imposters/4545/requests"),
             (Method::POST, "/imposters/4545/verify"),

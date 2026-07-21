@@ -55,6 +55,11 @@ pub struct ComposedServer {
     /// rules as the reconciler.
     intent_replayer: Option<tokio::task::JoinHandle<()>>,
     cluster_addr: Option<SocketAddr>,
+    /// The clustered engine, held so shutdown can stop its imposters: their
+    /// listeners are independent of the admin plane, and a composed shutdown
+    /// that leaves them serving would strand every bound port (visible
+    /// in-process; in a container the process exit hides it).
+    manager: Option<Arc<ImposterManager>>,
     readiness: Arc<Readiness>,
     leave_timeout: Duration,
 }
@@ -121,6 +126,9 @@ impl ComposedServer {
             front.shutdown().await;
         }
         self.server.shutdown().await;
+        if let Some(manager) = self.manager {
+            manager.shutdown().await;
+        }
         if let Some(node) = self.node
             && let Err(e) = node.shutdown().await
         {
@@ -192,6 +200,7 @@ pub async fn start_with_runtimes(
             reconciler: None,
             intent_replayer: None,
             cluster_addr: None,
+            manager: None,
             readiness: Arc::new(Readiness::awaiting([])),
             leave_timeout: Duration::ZERO,
         });
@@ -271,7 +280,7 @@ pub async fn start_with_runtimes(
     // `start` is an embedding seam that callers retry, so a failure must not
     // leave the cluster port bound or the redb state dir locked — it would fail
     // the retry too, with an error that hides the real cause.
-    match attach_data_plane(cli, &node, &readiness, manager).await {
+    match attach_data_plane(cli, &node, &readiness, Arc::clone(&manager)).await {
         Ok((server, front, reconciler)) => Ok(ComposedServer {
             server,
             probes: Some(probes),
@@ -281,6 +290,7 @@ pub async fn start_with_runtimes(
             intent_replayer: Some(spawn_intent_replayer(Arc::clone(&node))),
             node: Some(node),
             cluster_addr: Some(cluster_addr),
+            manager: Some(manager),
             readiness,
             leave_timeout,
         }),
