@@ -70,10 +70,33 @@ pub mod seams {
 /// Build edition marker, surfaced in banners and `--version` output.
 pub const EDITION: &str = "enterprise";
 
+/// The open-source Rift this build embeds, as the vendored submodule's
+/// `git describe` (e.g. `v0.15.0`), or `unknown` when the pin could not be
+/// determined at build time.
+///
+/// This is deliberately not any vendored crate's `CARGO_PKG_VERSION`: every
+/// crate under `vendor/rift` inherits `0.1.0` from that workspace, so those
+/// numbers identify nothing. See this crate's `build.rs`.
+pub const UPSTREAM_VERSION: &str = env!("RIFT_UPSTREAM_VERSION");
+
 /// Returns the semantic version of this enterprise build.
 #[must_use]
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// The one-line identity an enterprise binary reports from `--version` and at
+/// startup: its own version, its edition, and which open-source Rift is inside
+/// it. All three matter on a bug report — the edition says which code paths
+/// exist at all, and the pin says which engine produced the behaviour.
+#[must_use]
+pub fn version_banner() -> String {
+    format!(
+        "{} ({EDITION}, rift {UPSTREAM_VERSION})",
+        version(),
+        EDITION = EDITION,
+        UPSTREAM_VERSION = UPSTREAM_VERSION,
+    )
 }
 
 #[cfg(test)]
@@ -136,5 +159,20 @@ mod tests {
     fn version_is_the_crate_version() {
         assert_eq!(super::version(), env!("CARGO_PKG_VERSION"));
         assert_eq!(super::EDITION, "enterprise");
+    }
+
+    #[test]
+    fn the_banner_names_the_edition_and_the_embedded_upstream() {
+        let banner = super::version_banner();
+        assert!(banner.starts_with(super::version()), "{banner}");
+        assert!(banner.contains("enterprise"), "{banner}");
+        assert!(banner.contains(super::UPSTREAM_VERSION), "{banner}");
+    }
+
+    #[test]
+    fn the_upstream_pin_is_never_an_empty_string() {
+        // An empty pin would render as `rift ` and read as a formatting bug
+        // rather than as missing information; build.rs substitutes a marker.
+        assert!(!super::UPSTREAM_VERSION.is_empty());
     }
 }

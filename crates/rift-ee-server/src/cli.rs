@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use rift_cluster::{ClusterConfig, ConfigError, RuntimeTopology};
 use rift_ee::seams::Cli as OssCli;
@@ -96,9 +97,16 @@ pub struct ClusterArgs {
     pub cluster_probe_bind: SocketAddr,
 }
 
+/// What `--version` prints: this build's version, its edition, and the
+/// open-source Rift embedded in it.
+///
+/// Built once at first use rather than `concat!`-ed, because `EDITION` and the
+/// upstream pin are consts rather than literals.
+static VERSION_BANNER: LazyLock<String> = LazyLock::new(rift_ee::version_banner);
+
 /// `rift-ee-server`: the Rift server with enterprise clustering.
 #[derive(clap::Parser, Debug)]
-#[command(name = "rift-ee-server", version, about)]
+#[command(name = "rift-ee-server", version = VERSION_BANNER.as_str(), about)]
 pub struct EeCli {
     #[command(flatten)]
     pub oss: OssCli,

@@ -18,6 +18,23 @@ rift-ee-server --port 2525 --datadir ./data \
   --cluster-seeds rift-headless.default.svc.cluster.local:4790
 ```
 
+## Identifying a build
+
+```
+$ rift-ee-server --version
+rift-ee-server 0.1.0 (enterprise, rift v0.15.0)
+```
+
+Three things, all of which matter on a bug report: this build's version, the
+edition (which says which code paths exist at all), and **which open-source Rift
+is embedded**. That last one is the vendored submodule's pin, not a crate
+version — every crate under `vendor/rift` inherits `0.1.0` from that workspace,
+so their versions identify nothing. A build where the pin could not be
+determined (a source tarball, an image without `git`) reports `rift unknown`
+rather than a plausible-looking wrong version.
+
+The same string is logged at startup.
+
 ## Relationship to the `rift` binary
 
 Every open-source flag and subcommand parses here; a test in `tests/cli.rs`
