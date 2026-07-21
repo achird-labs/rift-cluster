@@ -13,8 +13,7 @@ rift-enterprise/
 ├── vendor/rift/            # git submodule → achird-labs/rift (read-only core)
 ├── crates/
 │   ├── rift-ee/            # enterprise facade: OSS crates + extension seams
-│   ├── rift-cluster/       # distributed clustering (control plane, membership)
-│   └── rift-ee-server/     # the enterprise binary: OSS server + cluster backends
+│   └── rift-cluster/       # distributed clustering (control plane, membership)
 ├── scripts/
 │   ├── sync-upstream.sh    # bump vendor/rift to upstream master
 │   └── upstream-pr.sh      # open a cross-repo PR against public Rift
@@ -31,16 +30,7 @@ cd rift-enterprise
 cargo check --workspace
 ```
 
-Run the enterprise server — identical to the open-source `rift` without
-`--cluster`, a cluster node with it:
-
-```sh
-cargo run -p rift-ee-server -- --port 2525 --datadir ./data
-```
-
-See [`docs/rift-ee-server.md`](docs/rift-ee-server.md) for its flags, startup
-guards, probes and the `/_cluster/*` operator surface, and
-[`docs/dev-workflow.md`](docs/dev-workflow.md) for syncing the core, adding
+See [`docs/dev-workflow.md`](docs/dev-workflow.md) for syncing the core, adding
 features, and the cross-repo PR flow.
 
 ## Crate layout

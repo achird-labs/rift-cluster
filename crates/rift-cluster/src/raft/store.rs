@@ -402,31 +402,6 @@ impl RedbStateMachine {
             .map_err(|e| StorageIOError::read_state_machine(&e))?
             .map(|g| g.value().to_string()))
     }
-
-    /// Every port that currently has an applied config, ascending.
-    ///
-    /// Ports rather than bodies: the operator endpoints report *what* the node
-    /// has converged on, and a fleet's full config set is far larger than the
-    /// answer to that question.
-    #[allow(clippy::result_large_err)]
-    pub fn configured_ports(&self) -> StorageResult<Vec<u16>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let table = read_txn
-            .open_table(SM_CONFIGS_TABLE)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let mut ports = Vec::new();
-        for item in table
-            .iter()
-            .map_err(|e| StorageIOError::read_state_machine(&e))?
-        {
-            let (port, _) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            ports.push(port.value());
-        }
-        Ok(ports)
-    }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
