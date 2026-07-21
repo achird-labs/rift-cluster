@@ -11,14 +11,19 @@
 //! completes — before it accepts any peer traffic.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use openraft::error::{NetworkError, RPCError, RaftError, Unreachable};
+use openraft::error::{
+    ChangeMembershipError, ClientWriteError, InProgress, NetworkError, RPCError, RaftError,
+    Unreachable,
+};
 use openraft::network::RPCOption;
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, ClientWriteResponse, InstallSnapshotRequest,
+    InstallSnapshotResponse, VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, ChangeMembers, Raft, RaftNetwork, RaftNetworkFactory};
 use serde::de::DeserializeOwned;
@@ -49,6 +54,24 @@ pub(crate) const CLUSTER_APPLIED_PATH: &str = "/internal/v1/applied";
 /// Beyond this a larger quorum costs more than it buys, so extra members stay
 /// learners until an operator changes membership explicitly.
 pub(crate) const MAX_AUTO_VOTERS: usize = 9;
+
+/// How long a membership change waits for an entry to commit. Kept under
+/// [`DEFAULT_REQUEST_TIMEOUT`] so the wait expires *inside* the joiner's own RPC
+/// budget: a longer bound would be unobservable — the joiner would give up
+/// first, drop this handler mid-admission, and retry, piling a second concurrent
+/// admission onto the leader it was already contending with.
+const ADMIT_COMMIT_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+/// How many times a membership change re-submits after losing the slot to a
+/// concurrent admission. Each attempt waits for the competing entry rather than
+/// spinning, and every attempt but the last lets exactly one competitor through,
+/// so the ceiling only needs to exceed the number of nodes that can be admitted
+/// at once — [`MAX_AUTO_VOTERS`] — with room to spare. Uncontended joins never
+/// reach attempt 2.
+const ADMIT_MAX_ATTEMPTS: usize = 12;
+
+/// openraft's error type for the two membership entry points used here.
+type MembershipError = RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>;
 
 /// A node's request to be admitted to the cluster, sent to a seed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,9 +354,12 @@ pub(crate) async fn local_write(
 /// returns a `ForwardToLeader` error, surfaced here so the caller can retry the
 /// leader.
 async fn admit(raft: &Raft<TypeConfig>, id: NodeId, advertise: String) -> Result<(), RpcError> {
-    raft.add_learner(id, BasicNode::new(advertise), true)
-        .await
-        .map_err(|e| RpcError::Handler(e.to_string()))?;
+    // Concurrent joins are the normal case (a StatefulSet rollout seeds every
+    // pod off the same node), so failures name the candidate they belong to.
+    membership_change(raft, &format!("admit {id}: add learner"), || {
+        raft.add_learner(id, BasicNode::new(advertise.clone()), true)
+    })
+    .await?;
 
     // Promote incrementally with `AddVoterIds`, never by replacing the whole
     // voter set: the voter count read from the metrics *watch* lags the committed
@@ -349,11 +375,91 @@ async fn admit(raft: &Raft<TypeConfig>, id: NodeId, advertise: String) -> Result
         .voter_ids()
         .collect();
     if voters.len() < MAX_AUTO_VOTERS && !voters.contains(&id) {
-        raft.change_membership(ChangeMembers::AddVoterIds(BTreeSet::from([id])), false)
-            .await
-            .map_err(|e| RpcError::Handler(e.to_string()))?;
+        membership_change(raft, &format!("admit {id}: promote to voter"), || {
+            raft.change_membership(ChangeMembers::AddVoterIds(BTreeSet::from([id])), false)
+        })
+        .await?;
     }
     Ok(())
+}
+
+/// Submit one membership change, waiting out whatever change currently holds the
+/// slot.
+///
+/// openraft accepts a membership change only while the previous one is committed
+/// (`effective == committed`), and a joining node routinely arrives before that
+/// holds: the founding node's own bootstrap entry, or a *concurrent* admission of
+/// another joiner, can still be in flight. The change is then rejected outright
+/// with [`InProgress`] and the join fails — the intermittent seed-join failure in
+/// #38, which reproduces reliably when two nodes seed off one leader.
+///
+/// So a rejection here is not terminal: wait for the entry the error names, then
+/// re-submit. The retry keys off openraft's *typed* error rather than its
+/// rendered message, and it waits on that exact entry instead of sleeping a
+/// guessed interval. On success the applied-index wait is what lets the caller
+/// read a membership view that already includes this change.
+async fn membership_change<F, Fut>(
+    raft: &Raft<TypeConfig>,
+    what: &str,
+    submit: F,
+) -> Result<(), RpcError>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<ClientWriteResponse<TypeConfig>, MembershipError>>,
+{
+    let mut waited_on = None;
+    for _ in 0..ADMIT_MAX_ATTEMPTS {
+        match submit().await {
+            Ok(resp) => return wait_applied(raft, resp.log_id.index, what).await,
+            Err(e) => {
+                let Some(pending) = in_progress(&e) else {
+                    return Err(RpcError::Handler(format!("{what}: {e}")));
+                };
+                // openraft only reports this rejection because some membership
+                // entry is uncommitted, so it always names one; a rejection
+                // without an entry to wait for would leave nothing to retry
+                // against and must not become a hot re-submit loop.
+                let index = pending
+                    .membership_log_id
+                    .as_ref()
+                    .map(|l| l.index)
+                    .ok_or_else(|| {
+                        RpcError::Handler(format!(
+                            "{what}: membership change in progress but no entry to wait for: {e}"
+                        ))
+                    })?;
+                waited_on = Some(index);
+                wait_applied(raft, index, what).await?;
+            }
+        }
+    }
+    Err(RpcError::Handler(format!(
+        "{what}: contended by concurrent membership changes through all \
+         {ADMIT_MAX_ATTEMPTS} attempts (last waited on entry {waited_on:?})"
+    )))
+}
+
+/// Wait for `index` to be applied locally, which implies it is committed — the
+/// precondition openraft enforces before the next membership change.
+async fn wait_applied(raft: &Raft<TypeConfig>, index: u64, what: &str) -> Result<(), RpcError> {
+    raft.wait(Some(ADMIT_COMMIT_TIMEOUT))
+        .applied_index_at_least(Some(index), "membership entry applied")
+        .await
+        .map(|_| ())
+        .map_err(|e| RpcError::Handler(format!("{what}: awaiting membership entry {index}: {e}")))
+}
+
+/// The typed "a membership change is already under way" rejection, or `None` for
+/// every other failure. Structural match on openraft's error — a string match on
+/// the message would be exactly the fragile shape the typed errors exist to
+/// avoid.
+fn in_progress(e: &MembershipError) -> Option<&InProgress<NodeId>> {
+    match e {
+        RaftError::APIError(ClientWriteError::ChangeMembershipError(
+            ChangeMembershipError::InProgress(pending),
+        )) => Some(pending),
+        _ => None,
+    }
 }
 
 fn raft_of(slot: &RaftSlot) -> Result<&Raft<TypeConfig>, RpcError> {
@@ -367,4 +473,61 @@ fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, RpcError> {
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RpcError> {
     serde_json::to_vec(value).map_err(|e| RpcError::Handler(format!("encode: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::error::{Fatal, ForwardToLeader, LearnerNotFound};
+    use openraft::{CommittedLeaderId, LogId};
+
+    fn log_id(index: u64) -> LogId<NodeId> {
+        LogId::new(CommittedLeaderId::new(1, 0), index)
+    }
+
+    /// The retry decision must read openraft's typed error, not its rendered
+    /// message: a message match would silently stop retrying the day openraft
+    /// rewords the error, turning every contended join back into the #38 failure.
+    /// Asserting on the *classifier* is what keeps that regression out — the
+    /// end-to-end join tests pass either way.
+    #[test]
+    fn in_progress_matches_only_the_typed_rejection() {
+        let pending = InProgress {
+            committed: Some(log_id(3)),
+            membership_log_id: Some(log_id(4)),
+        };
+        let contended: MembershipError = RaftError::APIError(
+            ClientWriteError::ChangeMembershipError(ChangeMembershipError::InProgress(pending)),
+        );
+
+        let matched = in_progress(&contended).expect("the in-progress rejection must be retryable");
+        assert_eq!(
+            matched.membership_log_id.as_ref().map(|l| l.index),
+            Some(4),
+            "the entry to wait for comes from the typed error, not from parsing its text"
+        );
+    }
+
+    /// Everything that is not that rejection must fail the join immediately.
+    /// Retrying a fatal error would turn a hard failure into a slow one.
+    #[test]
+    fn in_progress_rejects_every_other_failure() {
+        let others: Vec<MembershipError> = vec![
+            RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                leader_id: Some(1),
+                leader_node: Some(BasicNode::new("127.0.0.1:1".to_owned())),
+            })),
+            RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::LearnerNotFound(LearnerNotFound { node_id: 7 }),
+            )),
+            RaftError::Fatal(Fatal::Stopped),
+        ];
+
+        for e in &others {
+            assert!(
+                in_progress(e).is_none(),
+                "must not be treated as retryable: {e}"
+            );
+        }
+    }
 }

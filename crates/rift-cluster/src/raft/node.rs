@@ -1057,4 +1057,73 @@ mod tests {
         n2.shutdown().await.ok();
         n3.shutdown().await.ok();
     }
+
+    /// Two nodes seeding off the same leader at the same time. Each admission is
+    /// its own membership change, so without a commit barrier between
+    /// `add_learner` and the voter promotion the second admission observes the
+    /// first one's entry still uncommitted and openraft rejects it outright
+    /// (`InProgress`). This is the deterministic form of the intermittent
+    /// single-join race in #38.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_seed_joins_all_become_voters() {
+        let (d1, d2, d3) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+
+        let seed = n1.advertise_addr();
+        let (r2, r3) = tokio::join!(n2.join_via(seed), n3.join_via(seed));
+        r2.expect("n2 join must not lose the admission race");
+        r3.expect("n3 join must not lose the admission race");
+
+        let voters = n1.status().voters;
+        assert!(
+            voters.contains(&2) && voters.contains(&3),
+            "both joiners must be promoted to voter, got {voters:?}"
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+        n3.shutdown().await.ok();
+    }
+
+    /// The same contention, repeated. One concurrent pass can get lucky on the
+    /// interleaving; the failure this guards was intermittent in CI, so the gate
+    /// repeats it. (A *sequential* join loop was measured not to reproduce #38 at
+    /// all — `add_learner` returns after its own entry applies — so repeating one
+    /// would only buy runtime.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_seed_joins_survive_repetition() {
+        for round in 0..4 {
+            let (d1, d2, d3) = (
+                TempDir::new().unwrap(),
+                TempDir::new().unwrap(),
+                TempDir::new().unwrap(),
+            );
+            let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+            n1.cluster_init().await.expect("init n1");
+            let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+            let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+
+            let seed = n1.advertise_addr();
+            let (r2, r3) = tokio::join!(n2.join_via(seed), n3.join_via(seed));
+            r2.unwrap_or_else(|e| panic!("round {round}: n2 join lost the admission race: {e}"));
+            r3.unwrap_or_else(|e| panic!("round {round}: n3 join lost the admission race: {e}"));
+
+            let voters = n1.status().voters;
+            assert!(
+                voters.contains(&2) && voters.contains(&3),
+                "round {round}: both joiners must be voters, got {voters:?}"
+            );
+
+            n1.shutdown().await.ok();
+            n2.shutdown().await.ok();
+            n3.shutdown().await.ok();
+        }
+    }
 }
