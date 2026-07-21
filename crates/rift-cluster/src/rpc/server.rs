@@ -52,9 +52,21 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
-    /// Bind the cluster port.
+    /// Bind the cluster port with `SO_REUSEADDR`.
+    ///
+    /// `SO_REUSEADDR` lets a restarting node rebind its address immediately even
+    /// while connections accepted by the previous instance (which share the
+    /// listener's local port) are still draining — without it, a fast restart
+    /// races those sockets and fails with `EADDRINUSE`. It never permits a second
+    /// *listener* on a live port, so it does not weaken binding.
     pub async fn bind(addr: SocketAddr, config: RpcServerConfig) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(addr).await?;
+        let socket = match addr {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        };
+        socket.set_reuseaddr(true)?;
+        socket.bind(addr)?;
+        let listener = socket.listen(1024)?;
         Ok(Self {
             listener,
             config: Arc::new(config),
@@ -67,14 +79,36 @@ impl RpcServer {
     }
 
     /// Serve until the task is dropped or cancelled.
+    ///
+    /// Connection tasks are owned by a [`JoinSet`], not detached: when this future
+    /// is dropped (the accept task is aborted at shutdown), the set is dropped and
+    /// every in-flight connection is aborted with it — so stopping a node actually
+    /// releases its sockets, rather than leaving peers talking to a zombie whose
+    /// Raft has already stopped.
     pub async fn serve(self) {
         // A systemic accept failure (fd exhaustion) returns instantly and
         // forever, so a bare `continue` would spin a core and flood the log
         // exactly when the node is already in trouble. Back off instead, and
         // reset as soon as an accept succeeds.
         let mut backoff = Duration::from_millis(1);
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            let (stream, peer) = match self.listener.accept().await {
+            let accepted = tokio::select! {
+                // Reap finished connections so the set stays bounded to the live
+                // ones; disabled while empty so the arm never resolves spuriously.
+                // A cancelled task is an expected shutdown; a panicked one is a
+                // real bug and must not vanish silently.
+                Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(e) = joined
+                        && e.is_panic()
+                    {
+                        tracing::error!(error = %e, "cluster rpc connection task panicked");
+                    }
+                    continue;
+                }
+                accepted = self.listener.accept() => accepted,
+            };
+            let (stream, peer) = match accepted {
                 Ok(accepted) => {
                     backoff = Duration::from_millis(1);
                     accepted
@@ -87,7 +121,7 @@ impl RpcServer {
                 }
             };
             let config = Arc::clone(&self.config);
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let service = service_fn(move |req| {
                     let config = Arc::clone(&config);
                     async move { Ok::<_, std::convert::Infallible>(handle(config, req).await) }
