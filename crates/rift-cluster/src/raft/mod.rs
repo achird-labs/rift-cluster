@@ -14,6 +14,7 @@
 //! this spike, not a hand-rolled smoke test.
 
 pub mod identity;
+pub mod network;
 pub mod node;
 pub mod store;
 
