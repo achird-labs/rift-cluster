@@ -1,0 +1,233 @@
+# Rift Enterprise as a Kubernetes StatefulSet.
+#
+#     kubectl apply -f deploy/k8s/statefulset.yaml
+#
+# A StatefulSet rather than a Deployment, for two reasons that both matter:
+# each node needs stable durable storage for its Raft log and node identity,
+# and each needs a stable DNS name for peers to dial. A Deployment gives
+# neither, and a rescheduled pod would come back as a *different* node with an
+# empty state directory.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: rift-cluster
+  labels:
+    app: rift-ee-server
+spec:
+  # Headless: peers resolve this name to the pod IPs directly. It is what
+  # --cluster-seeds points at, and it is why `publishNotReadyAddresses` below
+  # is not optional.
+  clusterIP: None
+  # A joining node must be able to resolve and dial peers that are themselves
+  # not Ready yet — during a cold start no node is Ready until it has joined,
+  # so a Service that hid not-ready pods would deadlock the whole cluster.
+  publishNotReadyAddresses: true
+  selector:
+    app: rift-ee-server
+  ports:
+    - name: cluster
+      port: 4790
+      targetPort: cluster
+---
+# The Service traffic actually goes to. Separate from the headless one because
+# this one MUST respect readiness: it is the load-balancer gate, and routing to
+# a node that has not finished converging is the thing /readyz exists to stop.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rift
+  labels:
+    app: rift-ee-server
+spec:
+  selector:
+    app: rift-ee-server
+  ports:
+    - name: admin
+      port: 2525
+      targetPort: admin
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rift-cluster-secret
+type: Opaque
+stringData:
+  # Replace before deploying anywhere real; this is a placeholder so the
+  # manifest applies cleanly. The cluster port authenticates every peer RPC
+  # with it, and a node started without it refuses to start unless explicitly
+  # told to run insecure.
+  cluster-secret: "CHANGE-ME-before-deploying"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rift
+  labels:
+    app: rift-ee-server
+spec:
+  serviceName: rift-cluster
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: rift-ee-server
+  template:
+    metadata:
+      labels:
+        app: rift-ee-server
+    spec:
+      # ---------------------------------------------------------------------
+      # THE RULE THIS MANIFEST EXISTS TO ENCODE.
+      #
+      # On SIGTERM the node fails readiness first, keeps serving in-flight work
+      # for --cluster-leave-timeout, and only then closes its listeners. This
+      # value must be at least TWICE that timeout: the kubelet starts counting
+      # at SIGTERM, and the drain has to finish with room to spare or the pod
+      # is SIGKILLed mid-leave and the graceful leave becomes a hard one.
+      #
+      #   RIFT_CLUSTER_LEAVE_TIMEOUT = 15  ->  terminationGracePeriodSeconds >= 30
+      #
+      # Raise both together, never one alone.
+      # ---------------------------------------------------------------------
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: rift-ee-server
+          image: rift-ee-server:latest
+          imagePullPolicy: IfNotPresent
+          # A StatefulSet template is uniform, but the founding node is not:
+          # ordinal 0 must BOOTSTRAP the cluster, and every other ordinal must
+          # JOIN it. Handing rift-0 a seed list containing only itself would
+          # deadlock — it would spend the whole seed-retry window dialling a
+          # cluster that does not exist yet, then fail to start.
+          #
+          # `exec` matters as much as the branch: without it `sh` stays PID 1,
+          # SIGTERM never reaches the server, and the graceful leave this whole
+          # manifest is tuned around silently never happens.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ "${POD_NAME##*-}" = "0" ]; then
+                export RIFT_CLUSTER_ALLOW_SOLO=true
+                unset RIFT_CLUSTER_SEEDS
+              fi
+              exec rift-ee-server
+          ports:
+            - name: admin
+              containerPort: 2525
+            - name: probes
+              containerPort: 2526
+            - name: cluster
+              containerPort: 4790
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # --cluster-advertise takes a socket address, not a DNS name, so the
+            # pod's own IP is what it must announce. (--cluster-seeds below IS a
+            # name — that one is resolved on every join attempt.) A rescheduled
+            # pod comes back with a new IP and re-announces it on join.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RIFT_CLUSTER
+              value: "true"
+            - name: RIFT_CLUSTER_ADVERTISE
+              value: "$(POD_IP):4790"
+            - name: RIFT_CLUSTER_BIND
+              value: "0.0.0.0:4790"
+            # Binding the wildcard is a deliberate acknowledgment: inside a pod
+            # network namespace it is the only way to accept peer traffic, and
+            # the cluster port stays protected by the shared secret and by
+            # NetworkPolicy rather than by the bind address.
+            - name: RIFT_CLUSTER_BIND_PUBLIC_OK
+              value: "true"
+            # Every pod seeds from the first. rift-0 finds only itself here,
+            # which is why it also carries --cluster-allow-solo below.
+            - name: RIFT_CLUSTER_SEEDS
+              value: "rift-0.rift-cluster:4790"
+            - name: RIFT_CLUSTER_NODE_NAME
+              value: "$(POD_NAME)"
+            - name: RIFT_CLUSTER_PROBE_BIND
+              value: "0.0.0.0:2526"
+            - name: RIFT_CLUSTER_LEAVE_TIMEOUT
+              value: "15"
+            - name: RIFT_CLUSTER_STATE_DIR
+              value: "/var/lib/rift/_cluster"
+            - name: MB_DATADIR
+              value: "/var/lib/rift/data"
+            - name: RIFT_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: rift-cluster-secret
+                  key: cluster-secret
+          # Liveness: is the process alive? Answered throughout the join and
+          # throughout the drain, because restarting a node in either state
+          # makes things strictly worse. `failureThreshold` is generous for the
+          # same reason.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          # Readiness: should traffic come here? Closed until every startup
+          # gate reports in, and closed again the moment a graceful leave
+          # begins — which is what sheds this pod from the `rift` Service
+          # before any socket closes.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          # Startup: gives a cold cluster time to elect and converge without
+          # the liveness probe killing pods mid-join. 30 x 5s = 150s.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/rift
+            # readOnlyRootFilesystem is on, so anything that wants a scratch
+            # path needs one provided explicitly.
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

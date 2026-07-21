@@ -13,7 +13,22 @@ use std::process::Command;
 /// than an obviously absent one, because it gets pasted into bug reports.
 const UNKNOWN: &str = "unknown";
 
+/// Both the override a packager sets and the variable the crate reads. One name
+/// so the two can never drift apart.
+const UPSTREAM_ENV: &str = "RIFT_UPSTREAM_VERSION";
+
 fn main() {
+    // A packager who knows the pin can state it: a container build, a distro
+    // build and a release job all commonly build from a context with no git
+    // history at all, and `unknown` is the honest-but-useless answer there.
+    println!("cargo:rerun-if-env-changed={UPSTREAM_ENV}");
+    if let Ok(explicit) = std::env::var(UPSTREAM_ENV)
+        && !explicit.trim().is_empty()
+    {
+        println!("cargo:rustc-env={UPSTREAM_ENV}={}", explicit.trim());
+        return;
+    }
+
     let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -26,7 +41,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", vendored.display());
 
     let pin = describe(&vendored).unwrap_or_else(|| UNKNOWN.to_owned());
-    println!("cargo:rustc-env=RIFT_UPSTREAM_VERSION={pin}");
+    println!("cargo:rustc-env={UPSTREAM_ENV}={pin}");
 }
 
 /// `git describe` the vendored checkout: an exact tag when the pin is a release
