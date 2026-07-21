@@ -220,3 +220,22 @@ fn an_explicitly_insecure_cluster_is_allowed_but_marked() {
     let config = cli.resolve_cluster().expect("validates");
     assert!(config.is_insecure());
 }
+
+/// `--version` has to identify the *embedded* open-source Rift, not just this
+/// crate: every crate under `vendor/rift` inherits `0.1.0` from that workspace,
+/// so a bare crate version tells an operator nothing about which engine is in
+/// the binary they are reporting a bug against.
+#[test]
+fn version_reports_the_edition_and_the_embedded_upstream_rift() {
+    let rendered = EeCli::command().render_version();
+    assert!(rendered.contains(rift_ee::version()), "{rendered}");
+    assert!(rendered.contains("enterprise"), "{rendered}");
+    assert!(
+        rendered.contains(rift_ee::UPSTREAM_VERSION),
+        "the upstream pin must be reported: {rendered}"
+    );
+    assert!(
+        !rendered.contains("rift )"),
+        "an empty pin renders as a formatting bug rather than missing info: {rendered}"
+    );
+}

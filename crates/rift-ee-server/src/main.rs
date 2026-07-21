@@ -36,8 +36,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     info!(
-        edition = rift_ee::EDITION,
-        version = rift_ee::version(),
+        version = %rift_ee::version_banner(),
         cluster = cli.cluster.cluster,
         "starting Rift Enterprise"
     );
