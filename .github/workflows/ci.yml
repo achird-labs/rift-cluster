@@ -30,3 +30,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # Guards one invariant the compiler cannot: exactly one copy of
+      # `prometheus` in the tree. Two copies means two global registries, and
+      # cluster metrics that silently never reach /metrics.
+      - name: Single prometheus copy
+        run: scripts/check-single-prometheus.sh
