@@ -180,10 +180,18 @@ That works only while the whole build links **one** copy of that crate; a second
 one would carry its own registry and these gauges would silently reach no
 endpoint. `scripts/check-single-prometheus.sh` enforces it in CI.
 
-The config-sync families the Phase-1 plan also lists —
-`rift_cluster_config_revision{port}`, `rift_cluster_config_converged`,
-`rift_cluster_config_conflicts_total` and `rift_cluster_bind_failures{port}` —
-measure a write path that does not exist yet and arrive with config-sync.
+The config-sync families (issue #9): `rift_cluster_config_revision{port}`
+(applied revision per imposter — two nodes disagreeing have not converged),
+`rift_cluster_bind_failures{port}` (1 while a committed config cannot be
+realized locally; resampled after every engine drive, so healing clears it),
+`rift_cluster_write_forwards_total`, `rift_cluster_barrier_waits_total` /
+`rift_cluster_barrier_timeouts_total`, `rift_cluster_dedup_hits_total`, and
+the R4 ledger's `rift_cluster_intents_parked_total` / `_replayed_total` /
+`rift_cluster_intents_pending` (resampled by every replay sweep). The
+Phase-1 plan's `rift_cluster_config_converged` and
+`rift_cluster_config_conflicts_total` are still pending — convergence is a
+fleet-level derivation (compare `config_revision` across nodes) and conflicts
+cannot exist until a non-Raft write mode does.
 
 ## Response headers
 
@@ -240,6 +248,13 @@ state has caught up to the leader's and its imposters are bound (or their
 failures reported on `GET /_cluster/imposters`).
 
 ## What lands later
+
+The data-plane pull-on-miss safety net (retry a failing match once after
+waiting ≤ 500 ms for a lagging apply) needs an upstream no-match seam that
+v0.15.0 does not expose; until that seam lands its window is kept small by the
+default `ready-nodes` barrier (a 2xx already implies fleet-wide apply) and the
+`cluster-reconciled` readiness gate (a catching-up node takes no traffic).
+`SetEnabled` replication waits on the upstream imposter-enabled seam (#15).
 
 Two flags from the Phase-1 plan are deliberately **not** accepted yet, because
 nothing behind them exists and this codebase refuses flags that quietly do

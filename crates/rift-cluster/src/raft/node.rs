@@ -407,6 +407,7 @@ impl RaftNode {
             };
             let body = serde_json::to_vec(&request)
                 .map_err(|e| NodeError::Write(format!("encode forwarded write: {e}")))?;
+            crate::metrics::write_forwarded();
             match self
                 .client
                 .call(peer, "POST", CLUSTER_WRITE_PATH, body)
@@ -492,6 +493,7 @@ impl RaftNode {
                 pending.remove(&id);
             }
             if pending.is_empty() || tokio::time::Instant::now() >= deadline {
+                crate::metrics::barrier_observed(pending.len());
                 return pending.into_keys().collect();
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

@@ -486,6 +486,7 @@ async fn drain_parked_intents(node: &RaftNode) {
             return;
         }
     };
+    metrics::intents_pending_sampled(intents.len());
     for request in intents {
         let op_id = request.op_id;
         match node.submit(request).await {
@@ -496,7 +497,10 @@ async fn drain_parked_intents(node: &RaftNode) {
             // no-op inside its 24 h window (a metric for over-aged intents is
             // the metrics slice's job).
             Ok(_) => match node.unpark_intent(&op_id) {
-                Ok(()) => tracing::info!(%op_id, "replayed parked intent"),
+                Ok(()) => {
+                    metrics::intent_replayed();
+                    tracing::info!(%op_id, "replayed parked intent");
+                }
                 Err(e) => tracing::error!(%op_id, error = %e, "replayed but could not unpark"),
             },
             // No quorum fails every intent identically — stop the sweep. Any
