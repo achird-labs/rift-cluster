@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rift-ee",
     "crates/rift-cluster",
+    "crates/rift-ee-server",
 ]
 # The vendored open-source Rift is its own workspace; keep it out of ours and
 # consume its crates purely as path dependencies (see [workspace.dependencies]).

@@ -61,6 +61,21 @@ pub enum ConfigError {
          would stall every connection pinned to that worker"
     )]
     PerCoreUnsupported,
+
+    #[error(
+        "--cluster is not supported with the TLS-MITM intercept listener \
+         (--intercept-port or an `intercept` config block): intercept state is per-node and is \
+         not replicated, so a clustered fleet would answer the same client differently depending \
+         on which node it reached"
+    )]
+    InterceptUnsupported,
+
+    /// The secret file could not be read or was empty. Kept distinct from
+    /// [`Self::SecretRequired`] so an operator who *did* pass the flag is told
+    /// about the file rather than about the flag — and so an unreadable secret
+    /// can never degrade into an unauthenticated cluster port.
+    #[error("--cluster-secret-file {path} could not be read: {detail}")]
+    SecretFileUnreadable { path: String, detail: String },
 }
 
 /// Everything the cluster needs decided before it starts.
@@ -75,6 +90,8 @@ pub struct ClusterConfig {
     pub secret: Option<String>,
     pub insecure: bool,
     pub runtime: RuntimeTopology,
+    /// Whether the data plane was asked to run the TLS-MITM intercept listener.
+    pub intercept: bool,
 }
 
 impl ClusterConfig {
@@ -90,6 +107,10 @@ impl ClusterConfig {
 
         if self.runtime == RuntimeTopology::PerCore {
             return Err(ConfigError::PerCoreUnsupported);
+        }
+
+        if self.intercept {
+            return Err(ConfigError::InterceptUnsupported);
         }
 
         let bind = self.bind.ok_or(ConfigError::BindRequired)?;
@@ -169,6 +190,18 @@ mod tests {
     }
 
     #[test]
+    fn guard_rejects_intercept_mode() {
+        let config = ClusterConfig {
+            intercept: true,
+            ..valid()
+        };
+        assert_eq!(config.validate(), Err(ConfigError::InterceptUnsupported));
+        let msg = ConfigError::InterceptUnsupported.to_string();
+        assert!(msg.contains("--cluster"), "{msg}");
+        assert!(msg.contains("intercept"), "{msg}");
+    }
+
+    #[test]
     fn guard_requires_an_explicit_bind() {
         let config = ClusterConfig {
             bind: None,
@@ -233,6 +266,7 @@ mod tests {
         let config = ClusterConfig {
             enabled: false,
             runtime: RuntimeTopology::PerCore,
+            intercept: true,
             ..Default::default()
         };
         assert_eq!(config.validate(), Ok(()));

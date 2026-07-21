@@ -2494,6 +2494,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-ee-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "rift-cluster",
+ "rift-ee",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "rift-http-proxy"
 version = "0.1.0"
 dependencies = [

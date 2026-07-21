@@ -62,7 +62,9 @@ pub mod seams {
     /// single-port gateway dispatch an enterprise binary composes rather than
     /// forking.
     pub use rift_http_proxy::gateway::dispatch_to_port;
-    pub use rift_http_proxy::server::{ServerBuilder, run_metrics_server};
+    pub use rift_http_proxy::server::{
+        Cli, Commands, RunningServer, ServerBuilder, run_metrics_server,
+    };
 }
 
 /// Build edition marker, surfaced in banners and `--version` output.
@@ -120,6 +122,9 @@ mod tests {
         _named::<BackendUnavailable>();
         _named::<TlsDefaults>();
         _named::<ServerBuilder>();
+        _named::<RunningServer>();
+        _named::<Cli>();
+        _named::<Commands>();
         let _ = (annotate, backend_error_response, dispatch_to_port);
         let _ = (
             run_metrics_server,
