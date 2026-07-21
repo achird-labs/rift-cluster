@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rift_cluster::rpc::Router;
-use rift_cluster::{ClusterDecorator, NodeConfig, NodeIdentity, RaftNode};
+use rift_cluster::{ClusterDecorator, NodeConfig, NodeIdentity, RaftNode, metrics};
 use rift_ee::seams::{ImposterManager, RunningServer, ServerBuilder, TlsDefaults};
 
 use crate::cli::EeCli;
@@ -30,12 +30,20 @@ use crate::readiness::{GATE_JOINED, Readiness};
 /// misconfigured seed list fails the deployment instead of hanging it.
 const SEED_JOIN_DEADLINE: Duration = Duration::from_secs(30);
 
+/// How often the fleet gauges are re-sampled from Raft metrics. Fast enough that
+/// a leadership change is visible within a scrape interval, slow enough to stay
+/// invisible next to the data plane.
+const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// A running enterprise server: the open-source planes, plus the cluster ones
 /// when clustering is on.
 pub struct ComposedServer {
     server: RunningServer,
     probes: Option<ProbeListener>,
     node: Option<Arc<RaftNode>>,
+    /// Samples the fleet gauges. Aborted on shutdown so it cannot outlive the
+    /// node it reads.
+    metrics_sampler: Option<tokio::task::JoinHandle<()>>,
     cluster_addr: Option<SocketAddr>,
     readiness: Arc<Readiness>,
     leave_timeout: Duration,
@@ -74,6 +82,9 @@ impl ComposedServer {
 
     /// Stop every listener immediately, without a drain.
     pub async fn shutdown(self) {
+        if let Some(sampler) = self.metrics_sampler {
+            sampler.abort();
+        }
         if let Some(probes) = self.probes {
             probes.shutdown().await;
         }
@@ -144,6 +155,7 @@ pub async fn start_with_runtimes(
             server,
             probes: None,
             node: None,
+            metrics_sampler: None,
             cluster_addr: None,
             readiness: Arc::new(Readiness::awaiting([])),
             leave_timeout: Duration::ZERO,
@@ -162,6 +174,10 @@ pub async fn start_with_runtimes(
     })?;
     let identity = NodeIdentity::load_or_mint(&state_dir, cli.proposed_node_id())
         .with_context(|| format!("reading node identity from {}", state_dir.display()))?;
+
+    // Auditable before anything binds: an unauthenticated cluster port must be
+    // visible on /metrics even if the node then fails to start.
+    metrics::set_insecure(cluster.is_insecure());
 
     let readiness = Arc::new(Readiness::awaiting([GATE_JOINED]));
 
@@ -206,6 +222,7 @@ pub async fn start_with_runtimes(
         Ok(server) => Ok(ComposedServer {
             server,
             probes: Some(probes),
+            metrics_sampler: Some(spawn_metrics_sampler(Arc::clone(&node))),
             node: Some(node),
             cluster_addr: Some(cluster_addr),
             readiness,
@@ -254,6 +271,23 @@ async fn attach_data_plane(
     }
 
     Ok(server)
+}
+
+/// Re-sample the fleet gauges on a timer.
+///
+/// A `Weak` handle for the same reason the operator surface holds one: this task
+/// must never be what keeps the node alive, or shutdown would deadlock on a task
+/// that is itself waiting to read the node.
+fn spawn_metrics_sampler(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
+    let node = Arc::downgrade(&node);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(METRICS_SAMPLE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let Some(node) = node.upgrade() else { return };
+            metrics::observe_node(&node.status(), &node.ring());
+        }
+    })
 }
 
 /// The open-source manager the builder would have constructed, plus the cluster

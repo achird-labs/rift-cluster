@@ -131,6 +131,29 @@ the fleet has converged.
 
 `/_cluster/ring` and `/_cluster/kv` arrive with later phases.
 
+## Metrics
+
+Under `--cluster` the node publishes fleet gauges on the existing metrics port
+(`--metrics-port`, default 9090), alongside the open-source metrics — they are
+registered into the same Prometheus registry `GET /metrics` already serves, so
+there is nothing extra to scrape:
+
+| Metric | Meaning |
+|---|---|
+| `rift_cluster_members{state="voter"}` | size of the effective voter set as this node sees it |
+| `rift_cluster_members{state="leader"}` | `1` on the leader, `0` elsewhere — summing it across the fleet answers "is there exactly one leader?" |
+| `rift_cluster_ring_epoch` | membership log index the ownership ring is derived from; two nodes reporting different epochs have not converged |
+| `rift_cluster_insecure` | `1` when this node's cluster port runs unauthenticated, so a fleet can be audited for it |
+
+These are sampled from Raft metrics every 5s rather than pushed, because
+leadership and membership change without the cluster crate being called; an
+event-driven gauge would silently go stale.
+
+The config-sync families the Phase-1 plan also lists —
+`rift_cluster_config_revision{port}`, `rift_cluster_config_converged`,
+`rift_cluster_config_conflicts_total` and `rift_cluster_bind_failures{port}` —
+measure a write path that does not exist yet and arrive with config-sync.
+
 ## Response headers
 
 Under `--cluster`, cluster-aware code annotates a request and the enterprise
