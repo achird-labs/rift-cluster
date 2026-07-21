@@ -33,6 +33,12 @@ subtle.workspace = true
 rand.workspace = true
 parking_lot.workspace = true
 
+openraft.workspace = true
+redb.workspace = true
+
 [dev-dependencies]
 # Streaming request bodies, to prove the body cap holds without a declared length.
 futures-lite = "2"
+# Each openraft storage-suite store and each membership test gets its own temp
+# `redb` database file, cleaned up when the guard drops.
+tempfile = "3"

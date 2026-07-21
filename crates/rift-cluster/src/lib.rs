@@ -21,17 +21,15 @@
 pub mod bridge;
 pub mod config;
 pub mod metrics;
+pub mod raft;
 pub mod rpc;
 
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
+pub use raft::{ControlOp, ControlResponse, NodeId, TypeConfig};
 pub use rpc::{Router, RpcClient, RpcError, RpcServer};
 
 use serde::{Deserialize, Serialize};
-
-/// Identity of a single Rift node within a cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(pub String);
 
 /// A point-in-time view of cluster membership.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
