@@ -200,6 +200,10 @@ pub async fn start_with_runtimes(
         data_dir: state_dir,
         secret: cluster.secret,
         routes: cluster_api::routes(Router::new(), slot.clone(), Arc::clone(&readiness)),
+        // Tables-only for now: the admin write path (#9 slice 2) threads the
+        // server's ImposterManager through here together with GATE_RECONCILED,
+        // so applied configs materialize as bound imposters.
+        engine: None,
     })
     .await
     {

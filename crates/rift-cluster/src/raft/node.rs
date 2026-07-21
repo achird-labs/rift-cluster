@@ -16,13 +16,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::{BasicNode, Config, Raft, ServerState};
+use rift_ee::seams::{ImposterConfig, ImposterManager};
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use super::network::{self, CLUSTER_JOIN_PATH, JoinRequest, RaftSlot, RpcNetwork};
 use super::ring::Ring;
 use super::store::{self, RedbStateMachine};
-use super::{ControlOp, NodeId, TypeConfig};
+use super::{NodeId, TypeConfig};
+use crate::control::{ControlOp, ControlRequest, ControlResponse, TenantId};
 use crate::rpc::client::AlwaysHealthy;
 use crate::rpc::{
     Router, RpcClient, RpcClientConfig, RpcServer, RpcServerConfig, Signer, Verifier,
@@ -66,6 +69,11 @@ pub struct NodeConfig {
     /// phases' state endpoints) is registered here rather than on a second port
     /// with its own credential.
     pub routes: Router,
+    /// The local engine committed control ops are applied to. `None` runs the
+    /// control plane tables-only (tests, or an embedder that has not wired the
+    /// engine yet) — applied configs are then served from the state machine but
+    /// no imposters are actually bound.
+    pub engine: Option<Arc<ImposterManager>>,
 }
 
 // Hand-written so the shared secret never lands in a log line — matching the
@@ -79,6 +87,7 @@ impl std::fmt::Debug for NodeConfig {
             .field("data_dir", &self.data_dir)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .field("routes", &self.routes.len())
+            .field("engine", &self.engine.is_some())
             .finish()
     }
 }
@@ -159,6 +168,10 @@ impl RaftNode {
         let (log_store, state_machine) = store::new(config.data_dir.join(RAFT_DB_FILE))
             .await
             .map_err(|e| NodeError::Storage(e.to_string()))?;
+        let state_machine = match &config.engine {
+            Some(engine) => state_machine.with_engine(engine.clone()),
+            None => state_machine,
+        };
         let sm_reader = state_machine.clone();
 
         let raft_config = Arc::new(
@@ -308,24 +321,57 @@ impl RaftNode {
         Ok(())
     }
 
-    /// Submit an imposter-config write through Raft and return its committed
-    /// revision (the applied log index). Fails if this node is not the leader or
-    /// the entry does not commit.
-    pub async fn put_imposter(&self, port: u16, body: String) -> Result<u64, NodeError> {
+    /// Submit a control op through Raft and return the state machine's
+    /// committed response. Fails if this node is not the leader or the entry
+    /// does not commit; a *committed* refusal (validation, absent port) is the
+    /// response's `Failed` outcome, not an error — the write itself succeeded.
+    pub async fn write(&self, request: ControlRequest) -> Result<ControlResponse, NodeError> {
         let response = self
             .raft
-            .client_write(ControlOp::PutImposter { port, body })
+            .client_write(request)
             .await
             .map_err(|e| NodeError::Write(e.to_string()))?;
-        Ok(response.data.revision)
+        Ok(response.data)
     }
 
-    /// Read the committed imposter-config body for `port` from the applied state
-    /// machine. Answers from local durable state — it does not require leadership.
+    /// Convenience: submit a default-tenant `PutImposter` with a freshly minted
+    /// `op_id`. The full write path (client-supplied `Idempotency-Key`,
+    /// forward-to-leader, barrier) builds [`Self::write`] requests itself.
+    pub async fn put_imposter(&self, config: ImposterConfig) -> Result<ControlResponse, NodeError> {
+        // A clock before the Unix epoch mints 0, which only weakens this op's
+        // dedup TTL (it reads as already-old to the cluster's logical clock) —
+        // never the stored response — so it is not worth a panic path.
+        let issued_at_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.write(ControlRequest {
+            op_id: Uuid::new_v4(),
+            principal: None,
+            issued_at_secs,
+            op: ControlOp::PutImposter {
+                tenant: TenantId::default(),
+                config: Box::new(config),
+            },
+        })
+        .await
+    }
+
+    /// Read the committed imposter-config JSON for the default tenant's `port`
+    /// from the applied state machine. Answers from local durable state — it
+    /// does not require leadership.
     pub fn get_imposter(&self, port: u16) -> Result<Option<String>, NodeError> {
         self.sm_reader
             .read_config(port)
             .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Last engine side-effect failure per port (0 = set-level): the ports whose
+    /// committed config the local engine could not realize (e.g. a bind
+    /// failure). Empty on a healthy node.
+    #[must_use]
+    pub fn apply_failures(&self) -> BTreeMap<u16, String> {
+        self.sm_reader.apply_failures()
     }
 
     /// Every port this node has a committed config for, ascending. Like
@@ -435,7 +481,29 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             secret: Some(SECRET.to_owned()),
             routes: Router::new(),
+            engine: None,
         }
+    }
+
+    /// A minimal real config for `port`, tagged with `name` so tests can tell
+    /// bodies apart the way the spike's opaque strings used to.
+    fn imposter(port: u16, name: &str) -> ImposterConfig {
+        serde_json::from_value(serde_json::json!({
+            "port": port,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "name": name,
+        }))
+        .expect("test config parses")
+    }
+
+    /// The `name` tag of a stored config body.
+    fn name_of(body: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()?
+            .get("name")?
+            .as_str()
+            .map(str::to_owned)
     }
 
     /// Raft publishes `last_applied` into its metrics watch asynchronously, so it
@@ -453,10 +521,15 @@ mod tests {
         node.status().last_applied
     }
 
-    /// Poll, bounded, until `node` has the committed config for `port`.
+    /// Poll, bounded, until `node`'s committed config for `port` carries `want`
+    /// as its name tag.
     async fn wait_config(node: &RaftNode, port: u16, want: &str) -> bool {
         for _ in 0..50 {
-            if node.get_imposter(port).unwrap().as_deref() == Some(want) {
+            let named = node
+                .get_imposter(port)
+                .unwrap()
+                .and_then(|body| name_of(&body));
+            if named.as_deref() == Some(want) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -554,10 +627,16 @@ mod tests {
         assert_eq!(before.last_applied, None);
 
         node.cluster_init().await.expect("cluster init");
-        let rev = node
-            .put_imposter(8080, "stub-body".to_owned())
+        let response = node
+            .put_imposter(imposter(8080, "stub-body"))
             .await
             .expect("write");
+        assert_eq!(
+            response.outcome,
+            crate::control::ControlOutcome::Applied,
+            "a valid put commits as applied"
+        );
+        let rev = response.revision;
 
         let after = node.status();
         assert_eq!(after.node_id, 42);
@@ -578,12 +657,13 @@ mod tests {
             let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
             node.cluster_init().await.expect("cluster init");
             let rev = node
-                .put_imposter(8080, "durable-body".to_owned())
+                .put_imposter(imposter(8080, "durable-body"))
                 .await
-                .expect("write");
+                .expect("write")
+                .revision;
             assert_eq!(
-                node.get_imposter(8080).unwrap().as_deref(),
-                Some("durable-body")
+                node.get_imposter(8080).unwrap().and_then(|b| name_of(&b)),
+                Some("durable-body".to_owned())
             );
             node.shutdown().await.expect("shutdown");
             rev
@@ -591,8 +671,8 @@ mod tests {
 
         let node = RaftNode::start(config_in(&dir, 1)).await.expect("restart");
         assert_eq!(
-            node.get_imposter(8080).unwrap().as_deref(),
-            Some("durable-body"),
+            node.get_imposter(8080).unwrap().and_then(|b| name_of(&b)),
+            Some("durable-body".to_owned()),
             "config must survive a full restart (R3)"
         );
         assert_eq!(
@@ -644,7 +724,7 @@ mod tests {
         }
 
         // A write on the leader replicates to every node's applied state.
-        n1.put_imposter(8080, "shared".to_owned())
+        n1.put_imposter(imposter(8080, "shared"))
             .await
             .expect("write");
         for node in [&n1, &n2, &n3] {
@@ -707,7 +787,7 @@ mod tests {
 
         // A write submitted to the follower must not silently succeed: openraft
         // refuses it (forward-to-leader), surfaced as a typed error.
-        let err = n2.put_imposter(8080, "on-follower".to_owned()).await;
+        let err = n2.put_imposter(imposter(8080, "on-follower")).await;
         assert!(
             matches!(err, Err(NodeError::Write(_))),
             "follower write must be rejected, got {err:?}"
@@ -752,7 +832,7 @@ mod tests {
 
         // The new leader can commit a write (proves it has a live quorum).
         leader
-            .put_imposter(9090, "after-failover".to_owned())
+            .put_imposter(imposter(9090, "after-failover"))
             .await
             .expect("write on new leader");
 

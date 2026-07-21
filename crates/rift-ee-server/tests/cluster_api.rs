@@ -30,6 +30,7 @@ async fn start() -> Fixture {
         data_dir: dir.path().to_path_buf(),
         secret: Some(SECRET.to_owned()),
         routes: cluster_api::routes(rift_cluster::Router::new(), slot.clone(), readiness.clone()),
+        engine: None,
     };
     let node = Arc::new(RaftNode::start(config).await.expect("node starts"));
     slot.set(&node).expect("the slot is bound exactly once");
@@ -81,7 +82,10 @@ async fn config_and_imposters_report_committed_state() {
 
     fixture
         .node
-        .put_imposter(4545, r#"{"port":4545,"protocol":"http"}"#.to_owned())
+        .put_imposter(
+            serde_json::from_value(serde_json::json!({ "port": 4545, "protocol": "http" }))
+                .expect("test config parses"),
+        )
         .await
         .expect("committed write");
 

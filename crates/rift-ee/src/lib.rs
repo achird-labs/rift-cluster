@@ -50,6 +50,11 @@ pub mod seams {
         ApplyReport, ImposterEvent, ImposterEventListener, ImposterManager, TlsDefaults, stub_key,
     };
 
+    /// The config types a replicated control op carries (ADR-001 §4.1): the
+    /// imposter config itself, the stub type its edit scripts address, and the
+    /// error the engine reports when an apply side-effect fails.
+    pub use rift_mock_core::imposter::{ImposterConfig, ImposterError, Stub};
+
     /// Backend-outage reporting and response decoration: how a backend surfaces
     /// as a structured 503, and how per-request annotations become response
     /// headers without the OSS handlers knowing what they mean.
@@ -142,6 +147,9 @@ mod tests {
         _named::<LocalProxyStore>();
         _named::<ApplyReport>();
         _named::<ImposterEvent>();
+        _named::<ImposterConfig>();
+        _named::<ImposterError>();
+        _named::<Stub>();
         _named::<BackendUnavailable>();
         _named::<TlsDefaults>();
         _named::<ServerBuilder>();

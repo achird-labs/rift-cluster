@@ -9,7 +9,11 @@
 //!   before a log id, `get_log_state` has nowhere else to recover it from.
 //! * `raft_vote`     — `() -> Vote<u64>` (JSON).
 //! * `raft_snapshot` — `() -> StoredSnapshot` (JSON): the last installed/built snapshot.
-//! * `sm_configs`    — `u16 -> String`: the state machine's `PutImposter` records.
+//! * `sm_configs`    — `(tenant, port) -> StoredImposter` (JSON): the applied
+//!   config, its enabled flag, and the revision (log index) that last wrote it.
+//! * `sm_op_dedup`   — `op_id -> DedupEntry` (JSON): the response recorded for an
+//!   applied op, kept for [`DEDUP_TTL_SECS`] so a replayed intent (crash-replay,
+//!   client retry with the same `Idempotency-Key`) is exactly-once-in-effect.
 //! * `sm_applied`    — `() -> AppliedState` (JSON): last-applied log id + membership.
 //!
 //! Log and vote writes commit with `Durability::Immediate` per the ADR (log and vote
@@ -17,6 +21,27 @@
 //! (`None`) durability — the snapshot table is a redundant persisted copy for
 //! [`RaftStateMachine::get_current_snapshot`], not the durability boundary; the log
 //! is.
+//!
+//! # Apply semantics (issue #9)
+//!
+//! Apply is **deterministic and infallible** with respect to the local engine:
+//!
+//! 1. Inside one write transaction: GC expired dedup entries, then per entry —
+//!    dedup-check, [`crate::control::validate`], mutate `sm_configs`, record the
+//!    response in `sm_op_dedup`. Everything here depends only on the committed
+//!    op and the tables, so every replica computes the same tables and the same
+//!    [`ControlResponse`]. A deterministic refusal (validation, patching an
+//!    absent port) is a *committed* `Failed` outcome, not an apply error.
+//! 2. After the transaction commits: drive the local `ImposterManager` (when
+//!    one is attached) toward the applied state. A side-effect failure here — a
+//!    port that will not bind, an edit the live engine refuses — never fails
+//!    apply; it is recorded per port in [`RedbStateMachine::apply_failures`]
+//!    for the operator surface (`GET /_cluster/imposters`) and the
+//!    `Rift-Cluster-Warnings` header (§7.4.6 semantics preserved).
+//!
+//! Only real storage I/O errors fail apply — for openraft a storage failure is
+//! fatal to the node, and that is the correct severity for a log that can no
+//! longer be applied.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -30,10 +55,13 @@ use openraft::{
     BasicNode, Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
     SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use parking_lot::Mutex;
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDefinition};
+use rift_ee::seams::{ApplyReport, ImposterConfig, ImposterError, ImposterManager};
 use serde::{Deserialize, Serialize};
 
-use super::{ControlOp, ControlResponse, TypeConfig};
+use super::TypeConfig;
+use crate::control::{self, ControlOp, ControlResponse, DEFAULT_TENANT, StubEdit, StubEditScript};
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
 
@@ -41,8 +69,15 @@ const LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const LOG_META_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_log_meta");
 const VOTE_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_vote");
 const SNAPSHOT_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_snapshot");
-const SM_CONFIGS_TABLE: TableDefinition<u16, &str> = TableDefinition::new("sm_configs");
+const SM_CONFIGS_TABLE: TableDefinition<(&str, u16), &str> = TableDefinition::new("sm_configs");
+const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
+
+/// How long an applied op's response is retained for dedup: 24 h (issue #9).
+/// After expiry a replay of the same `op_id` re-applies — the durable-intent
+/// replay loop (slice 3) retries on the scale of seconds-to-minutes, so a day
+/// bounds the table without weakening the guarantee it exists for.
+const DEDUP_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// Persisted marker for the last log id purged from `raft_log`.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -50,19 +85,51 @@ struct LogMeta {
     last_purged_log_id: Option<LogId<u64>>,
 }
 
-/// Persisted state-machine cursor: last-applied log id + membership.
+/// Persisted state-machine cursor: last-applied log id + membership, plus the
+/// replicated logical clock — the maximum `issued_at_secs` any applied entry
+/// has carried. Dedup TTL/GC run against this, never against a replica's local
+/// clock, so every replica expires exactly the same entries at exactly the same
+/// log point.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AppliedState {
     last_applied_log: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
+    #[serde(default)]
+    logical_clock_secs: u64,
 }
 
-/// The state machine's data, as captured in a snapshot.
+/// What `sm_configs` stores per `(tenant, port)`: the canonical config JSON,
+/// whether the imposter is enabled (always `true` until the `SetEnabled` slice
+/// lands with #15), and the log index that last wrote this record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredImposter {
+    config_json: String,
+    enabled: bool,
+    revision: u64,
+}
+
+/// What `sm_op_dedup` stores per `op_id`. The applying log index lives inside
+/// `response.revision`; a separate copy would be dead data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DedupEntry {
+    response: ControlResponse,
+    expires_at_secs: u64,
+}
+
+/// The state machine's data, as captured in a snapshot. Dedup entries are part
+/// of the replicated state on purpose: a follower catching up via snapshot must
+/// still collapse a replayed `op_id` to the original response, or a partition
+/// heal would double-apply the intents replayed across it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SnapshotPayload {
-    configs: BTreeMap<u16, String>,
+    /// `(tenant, port, stored-imposter JSON)` rows of `sm_configs`.
+    configs: Vec<(String, u16, String)>,
+    /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
+    dedup: Vec<(String, String)>,
     last_applied_log: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
+    #[serde(default)]
+    logical_clock_secs: u64,
 }
 
 /// A snapshot plus the metadata openraft needs to identify it, as persisted in
@@ -99,6 +166,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(VOTE_TABLE).map_err(io)?;
         write_txn.open_table(SNAPSHOT_TABLE).map_err(io)?;
         write_txn.open_table(SM_CONFIGS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
         write_txn
             .commit()
@@ -342,10 +410,50 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
 // State machine
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+/// What the post-commit engine drive must do for one applied op, in log order.
+///
+/// `Sync` carries the desired config set *as of that op* (snapshotted inside
+/// the apply transaction), so a batch like `Put(A); PatchStubs(A)` replays
+/// against the engine with the same intermediate states the tables went
+/// through — computing the set after commit would make the later patch
+/// double-apply.
+#[derive(Debug)]
+enum EngineAction {
+    Sync(Vec<ImposterConfig>),
+    Patch {
+        port: u16,
+        edit: StubEditScript,
+    },
+    /// A sync that must NOT run: a stored record failed to parse, and a partial
+    /// desired set would delete the live imposters it omits. Recorded as an
+    /// apply failure for the named port; the engine keeps its current state.
+    RefuseSync {
+        port: u16,
+        error: String,
+    },
+}
+
+#[derive(Clone)]
 pub struct RedbStateMachine {
     db: Arc<Database>,
     snapshot_idx: Arc<AtomicU64>,
+    /// The local engine committed ops are projected onto. `None` in storage
+    /// tests and while the embedder has not wired one — the state machine is
+    /// then tables-only, which is exactly what the conformance suite exercises.
+    engine: Option<Arc<ImposterManager>>,
+    /// Last engine side-effect failure per port, cleared when a later drive
+    /// succeeds for that port. Key 0 is the set-level slot (an `apply_config`
+    /// refusal that names no single port). This is node status, not replicated
+    /// state — every replica has its own bind outcomes.
+    apply_failures: Arc<Mutex<BTreeMap<u16, String>>>,
+}
+
+impl std::fmt::Debug for RedbStateMachine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedbStateMachine")
+            .field("engine", &self.engine.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RedbStateMachine {
@@ -353,7 +461,18 @@ impl RedbStateMachine {
         Self {
             db,
             snapshot_idx: Arc::new(AtomicU64::new(0)),
+            engine: None,
+            apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Attach the local engine committed ops are applied to. Call before the
+    /// state machine is handed to `Raft::new` (and before cloning a reader), so
+    /// every handle shares the same engine and failure map.
+    #[must_use]
+    pub fn with_engine(mut self, engine: Arc<ImposterManager>) -> Self {
+        self.engine = Some(engine);
+        self
     }
 
     // `StorageResult` wraps openraft's `StorageError<u64>`, which is inherently
@@ -380,8 +499,8 @@ impl RedbStateMachine {
 }
 
 impl RedbStateMachine {
-    /// Read the applied imposter-config body for `port`, or `None` if no config
-    /// has been applied for it.
+    /// Read the applied config JSON for the default tenant's `port`, or `None`
+    /// if no config has been applied for it.
     ///
     /// This is the node's read path: reads answer from the applied state machine
     /// directly and never go through Raft, so a follower or a restarted node can
@@ -397,13 +516,18 @@ impl RedbStateMachine {
         let table = read_txn
             .open_table(SM_CONFIGS_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        Ok(table
-            .get(port)
+        table
+            .get((DEFAULT_TENANT, port))
             .map_err(|e| StorageIOError::read_state_machine(&e))?
-            .map(|g| g.value().to_string()))
+            .map(|g| {
+                serde_json::from_str::<StoredImposter>(g.value())
+                    .map(|stored| stored.config_json)
+                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))
+            })
+            .transpose()
     }
 
-    /// Every port that currently has an applied config, ascending.
+    /// Every default-tenant port that currently has an applied config, ascending.
     ///
     /// Ports rather than bodies: the operator endpoints report *what* the node
     /// has converged on, and a fleet's full config set is far larger than the
@@ -422,10 +546,293 @@ impl RedbStateMachine {
             .iter()
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         {
-            let (port, _) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            ports.push(port.value());
+            let (key, _) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (tenant, port) = key.value();
+            if tenant == DEFAULT_TENANT {
+                ports.push(port);
+            }
         }
         Ok(ports)
+    }
+
+    /// Last engine side-effect failure per port (0 = set-level), as recorded by
+    /// the most recent drives. Empty when the local engine matches the applied
+    /// state.
+    #[must_use]
+    pub fn apply_failures(&self) -> BTreeMap<u16, String> {
+        self.apply_failures.lock().clone()
+    }
+
+    /// Test-only: overwrite a raw `sm_configs` row, bypassing validation — the
+    /// broken-record refusal path is unreachable through the public API.
+    #[cfg(test)]
+    fn inject_raw_config(&self, tenant: &str, port: u16, value: &str) {
+        let txn = self.db.begin_write().expect("test txn");
+        {
+            let mut table = txn.open_table(SM_CONFIGS_TABLE).expect("test table");
+            table.insert((tenant, port), value).expect("test insert");
+        }
+        txn.commit().expect("test commit");
+    }
+
+    /// Remove dedup entries whose TTL has passed relative to `now_secs` — the
+    /// replicated logical clock in production, an injected value in tests.
+    fn gc_dedup(
+        table: &mut Table<'_, &'static str, &'static str>,
+        now_secs: u64,
+    ) -> Result<(), redb::StorageError> {
+        table.retain(
+            |op_id, value| match serde_json::from_str::<DedupEntry>(value) {
+                Ok(entry) => entry.expires_at_secs > now_secs,
+                Err(e) => {
+                    // A dedup row that will not parse can only weaken replay
+                    // collapse for its own op — dropping it is safe, but it is
+                    // committed-state corruption and must not vanish silently.
+                    tracing::error!(op_id, error = %e, "dropping unparseable sm_op_dedup entry");
+                    false
+                }
+            },
+        )
+    }
+
+    /// The desired engine state as of now, read from an open (possibly
+    /// mid-transaction) view of `sm_configs`: every enabled default-tenant
+    /// config, parsed.
+    ///
+    /// `Ok(Err((port, reason)))` means a stored record failed to parse. That
+    /// must abort the sync, not shrink it: `apply_config` deletes every live
+    /// imposter missing from the desired set, so silently skipping a broken
+    /// record would tear down a healthy imposter and report it as an
+    /// operator-issued delete. The caller refuses the sync and records the
+    /// failure instead — the engine keeps serving its last-known state.
+    fn desired_configs(
+        table: &impl ReadableTable<(&'static str, u16), &'static str>,
+    ) -> Result<Result<Vec<ImposterConfig>, (u16, String)>, redb::StorageError> {
+        let mut desired = Vec::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            let (tenant, port) = key.value();
+            if tenant != DEFAULT_TENANT {
+                continue;
+            }
+            let stored = match serde_json::from_str::<StoredImposter>(value.value()) {
+                Ok(stored) => stored,
+                Err(e) => {
+                    return Ok(Err((port, format!("stored record will not parse: {e}"))));
+                }
+            };
+            if !stored.enabled {
+                continue;
+            }
+            match serde_json::from_str::<ImposterConfig>(&stored.config_json) {
+                Ok(config) => desired.push(config),
+                Err(e) => {
+                    return Ok(Err((port, format!("stored config will not parse: {e}"))));
+                }
+            }
+        }
+        Ok(Ok(desired))
+    }
+
+    /// Build the engine action for a config op: a full sync when every stored
+    /// record parses, a recorded refusal when one does not.
+    #[allow(clippy::result_large_err)]
+    fn sync_action(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+    ) -> StorageResult<EngineAction> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        Ok(match Self::desired_configs(configs).map_err(io)? {
+            Ok(desired) => EngineAction::Sync(desired),
+            Err((port, error)) => EngineAction::RefuseSync { port, error },
+        })
+    }
+
+    /// Mutate `sm_configs` for one validated op and return the engine actions it
+    /// implies. `Ok(Err(reason))` is a deterministic domain refusal (recorded as
+    /// a `Failed` outcome); `Err(_)` is real storage I/O and fails apply.
+    #[allow(clippy::result_large_err)]
+    fn mutate_tables(
+        configs: &mut Table<'_, (&'static str, u16), &'static str>,
+        op: &ControlOp,
+        index: u64,
+    ) -> StorageResult<Result<Vec<EngineAction>, String>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        match op {
+            ControlOp::PutImposter { tenant, config } => {
+                // `validate` guaranteed the port; a missing one here means a
+                // caller skipped validation, and a deterministic refusal is the
+                // safe answer.
+                let Some(port) = config.port else {
+                    return Ok(Err("config must carry an explicit port".to_owned()));
+                };
+                let config_json = serde_json::to_string(config)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                let stored = StoredImposter {
+                    config_json,
+                    enabled: true,
+                    revision: index,
+                };
+                let value = serde_json::to_string(&stored)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                configs
+                    .insert((tenant.as_str(), port), value.as_str())
+                    .map_err(io)?;
+                Ok(Ok(vec![Self::sync_action(configs)?]))
+            }
+            ControlOp::PatchStubs { tenant, port, edit } => {
+                // Block-scoped so the read guard's borrow of `configs` ends
+                // before the insert below.
+                let mut record: StoredImposter = {
+                    match configs.get((tenant.as_str(), *port)).map_err(io)? {
+                        None => return Ok(Err(format!("no imposter on port {port}"))),
+                        Some(guard) => match serde_json::from_str(guard.value()) {
+                            Ok(record) => record,
+                            Err(e) => {
+                                return Ok(Err(format!("stored record for port {port}: {e}")));
+                            }
+                        },
+                    }
+                };
+                let mut config: ImposterConfig = match serde_json::from_str(&record.config_json) {
+                    Ok(config) => config,
+                    Err(e) => return Ok(Err(format!("stored config for port {port}: {e}"))),
+                };
+                if let Err(reason) = control::apply_edit(&mut config.stubs, edit) {
+                    return Ok(Err(reason));
+                }
+                record.config_json = serde_json::to_string(&config)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                record.revision = index;
+                let value = serde_json::to_string(&record)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                configs
+                    .insert((tenant.as_str(), *port), value.as_str())
+                    .map_err(io)?;
+                Ok(Ok(vec![EngineAction::Patch {
+                    port: *port,
+                    edit: edit.clone(),
+                }]))
+            }
+            ControlOp::DeleteImposter { tenant, port } => {
+                // Removing an absent port is a no-op, not a failure: deletes are
+                // idempotent at the state-machine level (the admin-surface 404
+                // for a missing imposter is the write path's concern).
+                configs.remove((tenant.as_str(), *port)).map_err(io)?;
+                Ok(Ok(vec![Self::sync_action(configs)?]))
+            }
+            ControlOp::DeleteAll { tenant } => {
+                let tenant = tenant.as_str();
+                configs.retain(|(t, _), _| t != tenant).map_err(io)?;
+                Ok(Ok(vec![Self::sync_action(configs)?]))
+            }
+            // `validate` refused these before mutation is reached; keep a
+            // deterministic refusal rather than a panic path in case a future
+            // caller skips validation.
+            ControlOp::SetEnabled { .. } => {
+                Ok(Err("SetEnabled is not available yet (#15)".to_owned()))
+            }
+            ControlOp::TenantPut { .. }
+            | ControlOp::TenantDelete { .. }
+            | ControlOp::PrincipalPut { .. }
+            | ControlOp::PrincipalDelete { .. }
+            | ControlOp::BindingPut { .. }
+            | ControlOp::BindingDelete { .. } => Ok(Err("reserved op: RFC-002 (#17)".to_owned())),
+        }
+    }
+
+    /// Project the applied state onto the local engine, in log order. Failures
+    /// are recorded per port and never propagate — see the module doc.
+    async fn drive_engine(&self, actions: Vec<EngineAction>) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        for action in actions {
+            match action {
+                EngineAction::Sync(desired) => {
+                    let desired_ports: std::collections::BTreeSet<u16> =
+                        desired.iter().filter_map(|c| c.port).collect();
+                    match engine.apply_config(desired).await {
+                        Ok(report) => self.record_report(&report, &desired_ports),
+                        Err(e) => {
+                            tracing::error!(error = %e, "engine refused the applied config set");
+                            self.apply_failures.lock().insert(0, e.to_string());
+                        }
+                    }
+                }
+                EngineAction::RefuseSync { port, error } => {
+                    tracing::error!(
+                        port,
+                        error = %error,
+                        "refusing engine sync: a stored record will not parse \
+                         (a partial sync would delete live imposters)"
+                    );
+                    self.apply_failures.lock().insert(port, error);
+                }
+                EngineAction::Patch { port, edit } => {
+                    match Self::drive_patch(engine, port, &edit).await {
+                        Ok(()) => {
+                            self.apply_failures.lock().remove(&port);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                port,
+                                error = %e,
+                                "engine refused a committed stub edit"
+                            );
+                            self.apply_failures.lock().insert(port, e.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn drive_patch(
+        engine: &ImposterManager,
+        port: u16,
+        edit: &StubEditScript,
+    ) -> Result<(), ImposterError> {
+        for step in &edit.0 {
+            match step {
+                StubEdit::Add { stub, index } => {
+                    engine.add_stub(port, stub.clone(), *index).await?;
+                }
+                StubEdit::ReplaceById { id, stub } => {
+                    engine.replace_stub_by_id(port, id, stub.clone()).await?;
+                }
+                StubEdit::DeleteById { id } => {
+                    engine.delete_stub_by_id(port, id).await?;
+                }
+                StubEdit::Move { from, to } => {
+                    engine.move_stub(port, *from, *to).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold a successful sync's report into the failure map, under one lock:
+    /// clear the ports it touched (and the set-level slot), drop entries for
+    /// ports with no desired config — without that, a bind-failed port that is
+    /// later deleted keeps its stale entry forever (the engine never had it, so
+    /// no report bucket names it) — then record the ports that failed.
+    fn record_report(&self, report: &ApplyReport, desired_ports: &std::collections::BTreeSet<u16>) {
+        let mut failures = self.apply_failures.lock();
+        for port in report
+            .created
+            .iter()
+            .chain(&report.replaced)
+            .chain(&report.stub_patched)
+            .chain(&report.deleted)
+        {
+            failures.remove(port);
+        }
+        failures.retain(|port, _| desired_ports.contains(port));
+        for (port, error) in &report.failed {
+            failures.insert(*port, error.to_string());
+        }
     }
 }
 
@@ -433,29 +840,43 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
     async fn build_snapshot(&mut self) -> StorageResult<Snapshot<TypeConfig>> {
         let applied = self.read_applied()?;
 
-        let configs = {
+        let (configs, dedup) = {
             let read_txn = self
                 .db
                 .begin_read()
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let table = read_txn
+            let configs_table = read_txn
                 .open_table(SM_CONFIGS_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let mut configs = BTreeMap::new();
-            for item in table
+            let mut configs = Vec::new();
+            for item in configs_table
                 .iter()
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
             {
-                let (k, v) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                configs.insert(k.value(), v.value().to_string());
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (tenant, port) = key.value();
+                configs.push((tenant.to_owned(), port, value.value().to_owned()));
             }
-            configs
+            let dedup_table = read_txn
+                .open_table(SM_DEDUP_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut dedup = Vec::new();
+            for item in dedup_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                dedup.push((key.value().to_owned(), value.value().to_owned()));
+            }
+            (configs, dedup)
         };
 
         let payload = SnapshotPayload {
             configs,
+            dedup,
             last_applied_log: applied.last_applied_log,
             last_membership: applied.last_membership.clone(),
+            logical_clock_secs: applied.logical_clock_secs,
         };
         let data =
             serde_json::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -521,6 +942,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
         let entries_iter = entries.into_iter();
         let mut responses = Vec::with_capacity(entries_iter.size_hint().0);
+        let mut engine_actions = Vec::new();
 
         let write_txn = self
             .db
@@ -530,28 +952,74 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut configs = write_txn
                 .open_table(SM_CONFIGS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut dedup = write_txn
+                .open_table(SM_DEDUP_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            // GC against the *replicated* logical clock (see `AppliedState`),
+            // so every replica drops exactly the same entries at the same log
+            // point — a local clock here would let a TTL-boundary replay
+            // re-apply on one replica and collapse on another.
+            Self::gc_dedup(&mut dedup, applied.logical_clock_secs)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
 
             for entry in entries_iter {
                 let log_id = entry.log_id;
                 applied.last_applied_log = Some(log_id);
 
                 match entry.payload {
-                    EntryPayload::Blank => responses.push(ControlResponse {
-                        revision: log_id.index,
-                    }),
-                    EntryPayload::Normal(ControlOp::PutImposter { port, body }) => {
-                        configs
-                            .insert(port, body.as_str())
+                    EntryPayload::Blank => {
+                        responses.push(ControlResponse::applied(log_id.index));
+                    }
+                    EntryPayload::Normal(request) => {
+                        applied.logical_clock_secs =
+                            applied.logical_clock_secs.max(request.issued_at_secs);
+                        let op_key = request.op_id.to_string();
+                        let previous = dedup
+                            .get(op_key.as_str())
+                            .map_err(|e| StorageIOError::write_state_machine(&e))?
+                            .map(|g| serde_json::from_str::<DedupEntry>(g.value()))
+                            .transpose()
+                            .map_err(|e| StorageIOError::write_state_machine(&e))?
+                            // An entry that expired mid-batch (the sweep above
+                            // ran on the pre-batch clock) is not a replay hit.
+                            .filter(|prev| prev.expires_at_secs > applied.logical_clock_secs);
+                        if let Some(previous) = previous {
+                            // Replayed intent: return the original response —
+                            // same revision both times — and change nothing.
+                            responses.push(previous.response);
+                            continue;
+                        }
+
+                        let outcome = match control::validate(&request.op) {
+                            Err(reason) => Err(reason),
+                            Ok(()) => Self::mutate_tables(&mut configs, &request.op, log_id.index)?,
+                        };
+                        let response = match outcome {
+                            Ok(actions) => {
+                                engine_actions.extend(actions);
+                                ControlResponse::applied(log_id.index)
+                            }
+                            Err(reason) => ControlResponse::failed(log_id.index, reason),
+                        };
+
+                        let dedup_entry = DedupEntry {
+                            // Stored copy: the same response must come back for
+                            // any replay of this op_id.
+                            response: response.clone(),
+                            expires_at_secs: applied
+                                .logical_clock_secs
+                                .saturating_add(DEDUP_TTL_SECS),
+                        };
+                        let value = serde_json::to_string(&dedup_entry)
                             .map_err(|e| StorageIOError::write_state_machine(&e))?;
-                        responses.push(ControlResponse {
-                            revision: log_id.index,
-                        });
+                        dedup
+                            .insert(op_key.as_str(), value.as_str())
+                            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                        responses.push(response);
                     }
                     EntryPayload::Membership(membership) => {
                         applied.last_membership = StoredMembership::new(Some(log_id), membership);
-                        responses.push(ControlResponse {
-                            revision: log_id.index,
-                        });
+                        responses.push(ControlResponse::applied(log_id.index));
                     }
                 }
             }
@@ -569,6 +1037,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         write_txn
             .commit()
             .map_err(|e| StorageIOError::write_state_machine(&e))?;
+
+        self.drive_engine(engine_actions).await;
 
         Ok(responses)
     }
@@ -604,7 +1074,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         write_txn
             .set_durability(Durability::Immediate)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        {
+        let action = {
             let mut snap_table = write_txn
                 .open_table(SNAPSHOT_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
@@ -618,15 +1088,34 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             configs_table
                 .retain(|_, _| false)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (port, body) in &payload.configs {
+            for (tenant, port, value) in &payload.configs {
                 configs_table
-                    .insert(*port, body.as_str())
+                    .insert((tenant.as_str(), *port), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+            let action = match Self::desired_configs(&configs_table)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?
+            {
+                Ok(desired) => EngineAction::Sync(desired),
+                Err((port, error)) => EngineAction::RefuseSync { port, error },
+            };
+
+            let mut dedup_table = write_txn
+                .open_table(SM_DEDUP_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            dedup_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (op_id, value) in &payload.dedup {
+                dedup_table
+                    .insert(op_id.as_str(), value.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
             let applied = AppliedState {
                 last_applied_log: payload.last_applied_log,
                 last_membership: payload.last_membership,
+                logical_clock_secs: payload.logical_clock_secs,
             };
             let applied_bytes = serde_json::to_vec(&applied)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
@@ -636,10 +1125,15 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             applied_table
                 .insert((), applied_bytes.as_slice())
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        }
+            action
+        };
         write_txn
             .commit()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+
+        // A snapshot replaces the whole applied state, so the engine converges
+        // on it the same way apply does — after the durable write, best-effort.
+        self.drive_engine(vec![action]).await;
 
         Ok(())
     }
@@ -670,11 +1164,24 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
 #[cfg(test)]
 mod tests {
-    use openraft::StorageError;
-    use openraft::testing::{StoreBuilder, Suite};
-    use tempfile::TempDir;
+    use std::sync::Arc;
 
-    use super::{RedbLogStore, RedbStateMachine, new};
+    use openraft::storage::{RaftStateMachine, Snapshot};
+    use openraft::testing::{StoreBuilder, Suite};
+    use openraft::{
+        CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder, StorageError,
+    };
+    use redb::ReadableTable;
+    use rift_ee::seams::{ImposterConfig, ImposterManager};
+    use serde_json::json;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use super::{DEDUP_TTL_SECS, DedupEntry, RedbLogStore, RedbStateMachine, SM_DEDUP_TABLE, new};
+    use crate::control::{
+        ControlOp, ControlOutcome, ControlRequest, ControlResponse, StubEdit, StubEditScript,
+        TenantId,
+    };
     use crate::raft::TypeConfig;
 
     struct RedbBuilder;
@@ -702,5 +1209,565 @@ mod tests {
     fn redb_storage_passes_openraft_suite() -> Result<(), StorageError<u64>> {
         Suite::test_all(RedbBuilder)?;
         Ok(())
+    }
+
+    // -- issue #9 state-machine gate ------------------------------------------
+
+    async fn fresh_sm(engine: Option<Arc<ImposterManager>>) -> (TempDir, RedbStateMachine) {
+        let td = TempDir::new().expect("tempdir");
+        let (_, sm) = new(td.path().join("raft.redb")).await.expect("open store");
+        let sm = match engine {
+            Some(engine) => sm.with_engine(engine),
+            None => sm,
+        };
+        (td, sm)
+    }
+
+    fn entry(index: u64, request: ControlRequest) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(request),
+        }
+    }
+
+    fn request(op_id: u128, op: ControlOp) -> ControlRequest {
+        request_at(op_id, 0, op)
+    }
+
+    fn request_at(op_id: u128, issued_at_secs: u64, op: ControlOp) -> ControlRequest {
+        ControlRequest {
+            op_id: Uuid::from_u128(op_id),
+            principal: None,
+            issued_at_secs,
+            op,
+        }
+    }
+
+    fn config(port: u16, stubs: serde_json::Value) -> ImposterConfig {
+        serde_json::from_value(json!({
+            "port": port,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "stubs": stubs,
+        }))
+        .expect("test config parses")
+    }
+
+    fn put(op_id: u128, port: u16, stubs: serde_json::Value) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::PutImposter {
+                tenant: TenantId::default(),
+                config: Box::new(config(port, stubs)),
+            },
+        )
+    }
+
+    fn stored_stub_ids(sm: &RedbStateMachine, port: u16) -> Vec<String> {
+        let body = sm
+            .read_config(port)
+            .expect("read config")
+            .expect("config present");
+        let config: serde_json::Value = serde_json::from_str(&body).expect("parses");
+        config["stubs"]
+            .as_array()
+            .expect("stubs array")
+            .iter()
+            .map(|s| s["id"].as_str().expect("test stubs carry ids").to_owned())
+            .collect()
+    }
+
+    fn engine_stub_ids(engine: &ImposterManager, port: u16) -> Vec<String> {
+        engine
+            .get_imposter(port)
+            .expect("imposter exists")
+            .get_stubs()
+            .iter()
+            .map(|s| s.id.clone().expect("test stubs carry ids"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn apply_put_records_config_and_revision() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let responses = sm
+            .apply(vec![entry(5, put(1, 8080, json!([])))])
+            .await
+            .expect("apply");
+        assert_eq!(responses, vec![ControlResponse::applied(5)]);
+        let body = sm.read_config(8080).expect("read").expect("present");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parses");
+        assert_eq!(parsed["port"], 8080);
+        assert_eq!(sm.configured_ports().expect("ports"), vec![8080]);
+    }
+
+    /// A validation refusal is a committed, deterministic outcome: the response
+    /// says `failed`, the tables are untouched, and a second node applying the
+    /// same entry computes the identical response.
+    #[tokio::test]
+    async fn validation_failure_is_a_deterministic_no_op() {
+        let bad = |op_id: u128| {
+            request(
+                op_id,
+                ControlOp::PutImposter {
+                    tenant: TenantId::default(),
+                    config: serde_json::from_value(json!({ "port": 1, "protocol": "smtp" }))
+                        .expect("parses"),
+                },
+            )
+        };
+        let (_td, mut sm) = fresh_sm(None).await;
+        let (_td2, mut sm2) = fresh_sm(None).await;
+        let responses = sm.apply(vec![entry(3, bad(1))]).await.expect("apply");
+        let responses2 = sm2.apply(vec![entry(3, bad(1))]).await.expect("apply");
+        assert_eq!(responses, responses2, "replicas must agree");
+        match &responses[0].outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(reason.contains("protocol"), "{reason}");
+            }
+            other => panic!("expected failed outcome, got {other:?}"),
+        }
+        assert_eq!(sm.read_config(1).expect("read"), None, "nothing mutated");
+    }
+
+    /// Same `op_id` twice — the crash-replay / same-`Idempotency-Key` case —
+    /// applies once and returns the original revision both times.
+    #[tokio::test]
+    async fn dedup_collapses_a_replayed_op_to_the_original_response() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, put(1, 8080, json!([])))])
+            .await
+            .expect("apply put");
+
+        let add = |op_id: u128| {
+            request(
+                op_id,
+                ControlOp::PatchStubs {
+                    tenant: TenantId::default(),
+                    port: 8080,
+                    edit: StubEditScript(vec![StubEdit::Add {
+                        stub: serde_json::from_value(json!({ "id": "a" })).expect("parses"),
+                        index: None,
+                    }]),
+                },
+            )
+        };
+        let first = sm.apply(vec![entry(2, add(7))]).await.expect("apply");
+        assert_eq!(first, vec![ControlResponse::applied(2)]);
+
+        let replay = sm.apply(vec![entry(3, add(7))]).await.expect("replay");
+        assert_eq!(
+            replay,
+            vec![ControlResponse::applied(2)],
+            "the replay must return the ORIGINAL revision, not its own index"
+        );
+        assert_eq!(
+            stored_stub_ids(&sm, 8080),
+            vec!["a"],
+            "the edit must have applied exactly once"
+        );
+
+        // A different op_id is a new op, not a replay: this one really runs —
+        // and deterministically fails, because id "a" already exists.
+        let fresh = sm.apply(vec![entry(4, add(8))]).await.expect("apply");
+        assert_eq!(fresh[0].revision, 4);
+        assert!(
+            matches!(&fresh[0].outcome, ControlOutcome::Failed { .. }),
+            "adding a duplicate id must fail deterministically: {fresh:?}"
+        );
+        assert_eq!(stored_stub_ids(&sm, 8080), vec!["a"]);
+    }
+
+    #[test]
+    fn dedup_gc_drops_only_expired_entries() {
+        let td = TempDir::new().expect("tempdir");
+        let db = redb::Database::create(td.path().join("gc.redb")).expect("create");
+        let txn = db.begin_write().expect("txn");
+        {
+            let mut table = txn.open_table(SM_DEDUP_TABLE).expect("table");
+            for (op, expires) in [("old", 100_u64), ("live", 100 + DEDUP_TTL_SECS)] {
+                let entry = DedupEntry {
+                    response: ControlResponse::applied(1),
+                    expires_at_secs: expires,
+                };
+                let value = serde_json::to_string(&entry).expect("serialize");
+                table.insert(op, value.as_str()).expect("insert");
+            }
+            RedbStateMachine::gc_dedup(&mut table, 101).expect("gc");
+            assert!(table.get("old").expect("get").is_none(), "expired: dropped");
+            assert!(table.get("live").expect("get").is_some(), "live: retained");
+        }
+        txn.commit().expect("commit");
+    }
+
+    #[tokio::test]
+    async fn put_drives_the_engine_and_preserves_siblings() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+
+        sm.apply(vec![
+            entry(1, put(1, 18081, json!([{ "id": "a" }]))),
+            entry(2, put(2, 18082, json!([]))),
+        ])
+        .await
+        .expect("apply");
+        assert_eq!(engine.count(), 2, "both imposters live in the engine");
+
+        // A sibling-port change must leave 18081 untouched (the #316 contract:
+        // identical config → not recreated).
+        sm.apply(vec![entry(3, put(3, 18082, json!([{ "id": "b" }])))])
+            .await
+            .expect("apply");
+        assert_eq!(engine.count(), 2);
+        assert_eq!(engine_stub_ids(&engine, 18081), vec!["a"]);
+        assert_eq!(engine_stub_ids(&engine, 18082), vec!["b"]);
+        assert!(
+            sm.apply_failures().is_empty(),
+            "healthy applies record no failures: {:?}",
+            sm.apply_failures()
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// The core infallibility clause: a port that cannot bind fails the *engine
+    /// drive*, never the apply. The config is committed, the response is
+    /// `applied`, and the failure is node status.
+    #[tokio::test]
+    async fn bind_failure_does_not_fail_apply() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocker");
+        let port = blocker.local_addr().expect("addr").port();
+
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        let responses = sm
+            .apply(vec![entry(1, put(1, port, json!([])))])
+            .await
+            .expect("apply must not fail on a bind failure");
+        assert_eq!(responses, vec![ControlResponse::applied(1)]);
+        assert!(
+            sm.read_config(port).expect("read").is_some(),
+            "the committed config is in the tables regardless"
+        );
+        let failures = sm.apply_failures();
+        assert!(
+            failures.contains_key(&port),
+            "the bind failure must be recorded as node status, got {failures:?}"
+        );
+
+        // The engine heals once the port frees up: a later committed write
+        // clears the recorded failure.
+        drop(blocker);
+        sm.apply(vec![entry(2, put(2, port, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply");
+        assert!(
+            !sm.apply_failures().contains_key(&port),
+            "a successful drive clears the failure: {:?}",
+            sm.apply_failures()
+        );
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn patch_reorders_stubs_in_engine_and_stored_config() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        sm.apply(vec![entry(
+            1,
+            put(
+                1,
+                18083,
+                json!([{ "id": "a" }, { "id": "b" }, { "id": "c" }]),
+            ),
+        )])
+        .await
+        .expect("apply put");
+
+        let patch = request(
+            2,
+            ControlOp::PatchStubs {
+                tenant: TenantId::default(),
+                port: 18083,
+                edit: StubEditScript(vec![StubEdit::Move { from: 2, to: 0 }]),
+            },
+        );
+        let responses = sm.apply(vec![entry(2, patch)]).await.expect("apply patch");
+        assert_eq!(responses, vec![ControlResponse::applied(2)]);
+        assert_eq!(stored_stub_ids(&sm, 18083), vec!["c", "a", "b"]);
+        assert_eq!(engine_stub_ids(&engine, 18083), vec!["c", "a", "b"]);
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deletes_reconcile_the_engine() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        sm.apply(vec![
+            entry(1, put(1, 18084, json!([]))),
+            entry(2, put(2, 18085, json!([]))),
+        ])
+        .await
+        .expect("apply puts");
+        assert_eq!(engine.count(), 2);
+
+        sm.apply(vec![entry(
+            3,
+            request(
+                3,
+                ControlOp::DeleteImposter {
+                    tenant: TenantId::default(),
+                    port: 18084,
+                },
+            ),
+        )])
+        .await
+        .expect("apply delete");
+        assert_eq!(engine.count(), 1);
+        assert_eq!(sm.configured_ports().expect("ports"), vec![18085]);
+
+        sm.apply(vec![entry(
+            4,
+            request(
+                4,
+                ControlOp::DeleteAll {
+                    tenant: TenantId::default(),
+                },
+            ),
+        )])
+        .await
+        .expect("apply delete-all");
+        assert_eq!(engine.count(), 0);
+        assert!(sm.configured_ports().expect("ports").is_empty());
+
+        engine.shutdown().await;
+    }
+
+    /// Snapshot round-trip carries BOTH tables: a follower installed from
+    /// snapshot serves the configs and still collapses a replayed op_id.
+    #[tokio::test]
+    async fn snapshot_carries_configs_and_dedup_state() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, put(9, 8080, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+        assert!(
+            follower.read_config(8080).expect("read").is_some(),
+            "installed snapshot serves the config"
+        );
+
+        let replay = follower
+            .apply(vec![entry(10, put(9, 8080, json!([{ "id": "a" }])))])
+            .await
+            .expect("replay after install");
+        assert_eq!(
+            replay,
+            vec![ControlResponse::applied(1)],
+            "dedup state survived the snapshot: the replay returns the original revision"
+        );
+    }
+
+    /// A `Failed` outcome is committed state like any other: a replay of the
+    /// same op_id must return the identical failure, not re-run validation.
+    /// (Also covers PatchStubs on an absent port ⇒ deterministic `Failed`.)
+    #[tokio::test]
+    async fn a_failed_outcome_is_deduped_like_any_other() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let patch = |op_id: u128| {
+            request(
+                op_id,
+                ControlOp::PatchStubs {
+                    tenant: TenantId::default(),
+                    port: 4444,
+                    edit: StubEditScript(vec![StubEdit::Add {
+                        stub: serde_json::from_value(json!({ "id": "a" })).expect("parses"),
+                        index: None,
+                    }]),
+                },
+            )
+        };
+        let first = sm.apply(vec![entry(1, patch(7))]).await.expect("apply");
+        match &first[0].outcome {
+            ControlOutcome::Failed { reason } => assert!(reason.contains("4444"), "{reason}"),
+            other => panic!("patching an absent port must fail, got {other:?}"),
+        }
+        let replay = sm.apply(vec![entry(2, patch(7))]).await.expect("replay");
+        assert_eq!(
+            replay, first,
+            "a Failed outcome must dedup to the identical response and revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_absent_port_is_applied_not_failed() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let responses = sm
+            .apply(vec![entry(
+                1,
+                request(
+                    1,
+                    ControlOp::DeleteImposter {
+                        tenant: TenantId::default(),
+                        port: 5555,
+                    },
+                ),
+            )])
+            .await
+            .expect("apply");
+        assert_eq!(
+            responses,
+            vec![ControlResponse::applied(1)],
+            "deletes are idempotent at the state-machine level"
+        );
+    }
+
+    /// A follower that catches up via snapshot must materialize the configs in
+    /// its local engine, not just its tables.
+    #[tokio::test]
+    async fn install_snapshot_drives_an_attached_engine() {
+        let (_td, mut leader_sm) = fresh_sm(None).await;
+        leader_sm
+            .apply(vec![entry(1, put(1, 18086, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply");
+        let mut builder = leader_sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let engine = Arc::new(ImposterManager::new());
+        let (_td2, mut follower) = fresh_sm(Some(engine.clone())).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+        assert_eq!(engine.count(), 1, "the snapshot's configs must be bound");
+        assert_eq!(engine_stub_ids(&engine, 18086), vec!["a"]);
+
+        engine.shutdown().await;
+    }
+
+    /// GC runs on the replicated logical clock carried by `issued_at_secs`:
+    /// once later entries advance it past an entry's TTL, a replay of that
+    /// op_id re-applies — identically on every replica.
+    #[tokio::test]
+    async fn gc_through_apply_expires_via_the_logical_clock() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let put_at = |op_id: u128, issued: u64| {
+            request_at(
+                op_id,
+                issued,
+                ControlOp::PutImposter {
+                    tenant: TenantId::default(),
+                    config: Box::new(config(8080, json!([]))),
+                },
+            )
+        };
+        sm.apply(vec![entry(1, put_at(1, 1_000))])
+            .await
+            .expect("apply");
+
+        // Advance the logical clock past op 1's TTL with an unrelated op.
+        sm.apply(vec![entry(
+            2,
+            request_at(
+                2,
+                1_000 + DEDUP_TTL_SECS + 1,
+                ControlOp::DeleteImposter {
+                    tenant: TenantId::default(),
+                    port: 9999,
+                },
+            ),
+        )])
+        .await
+        .expect("apply");
+
+        // The next batch's sweep GCs op 1's entry, so its replay re-applies.
+        let replay = sm
+            .apply(vec![entry(3, put_at(1, 1_000 + DEDUP_TTL_SECS + 1))])
+            .await
+            .expect("replay");
+        assert_eq!(
+            replay,
+            vec![ControlResponse::applied(3)],
+            "an expired dedup entry no longer collapses the replay"
+        );
+    }
+
+    /// One unparseable stored record must refuse the whole engine sync — a
+    /// partial desired set would read as "delete the missing imposters".
+    #[tokio::test]
+    async fn a_broken_stored_record_refuses_sync_instead_of_deleting() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        sm.apply(vec![entry(1, put(1, 18087, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply");
+        assert_eq!(engine.count(), 1);
+
+        sm.inject_raw_config(crate::control::DEFAULT_TENANT, 18088, "not json");
+
+        let responses = sm
+            .apply(vec![entry(2, put(2, 18089, json!([])))])
+            .await
+            .expect("apply still succeeds — the refusal is engine status");
+        assert_eq!(responses, vec![ControlResponse::applied(2)]);
+        assert_eq!(
+            engine.count(),
+            1,
+            "the live imposter must NOT be torn down, and the new one must not \
+             be created by a partial sync"
+        );
+        assert_eq!(engine_stub_ids(&engine, 18087), vec!["a"]);
+        assert!(
+            sm.apply_failures().contains_key(&18088),
+            "the broken record is surfaced as node status: {:?}",
+            sm.apply_failures()
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// A bind-failed port that is then deleted must not leave a phantom entry
+    /// in `apply_failures` — the port has no config to fail against anymore.
+    #[tokio::test]
+    async fn deleting_a_bind_failed_port_clears_its_failure() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocker");
+        let port = blocker.local_addr().expect("addr").port();
+
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        sm.apply(vec![entry(1, put(1, port, json!([])))])
+            .await
+            .expect("apply");
+        assert!(sm.apply_failures().contains_key(&port));
+
+        sm.apply(vec![entry(
+            2,
+            request(
+                2,
+                ControlOp::DeleteImposter {
+                    tenant: TenantId::default(),
+                    port,
+                },
+            ),
+        )])
+        .await
+        .expect("apply delete");
+        assert!(
+            !sm.apply_failures().contains_key(&port),
+            "a deleted port cannot keep a live failure: {:?}",
+            sm.apply_failures()
+        );
+
+        engine.shutdown().await;
     }
 }

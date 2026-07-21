@@ -22,6 +22,7 @@
 
 pub mod bridge;
 pub mod config;
+pub mod control;
 pub mod decorate;
 pub mod metrics;
 pub mod raft;
@@ -29,10 +30,14 @@ pub mod rpc;
 
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
+pub use control::{
+    ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT, StubEdit,
+    StubEditScript, TenantId,
+};
 pub use decorate::ClusterDecorator;
 pub use raft::{
-    ControlOp, ControlResponse, KeyClass, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus,
-    OwnedKey, RaftNode, Ring, StatusReport, TypeConfig,
+    KeyClass, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey, RaftNode, Ring,
+    StatusReport, TypeConfig,
 };
 pub use rpc::{Router, RpcClient, RpcError, RpcServer};
 
