@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rift_cluster::{NodeConfig, NodeError, NodeId, RaftNode, Router};
+use rift_cluster::{NodeConfig, NodeId, RaftNode, Router};
 use tempfile::TempDir;
 
 const SECRET: &str = "harness-cluster-secret";
@@ -62,27 +62,12 @@ async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> RaftNode {
         routes: Router::new(),
         engine: None,
     };
-    // A restart can momentarily race the previous instance's async teardown
-    // releasing the redb file lock: a real process restart frees it on exit, but
-    // in-process the old node's Raft core drops its storage a beat after
-    // `shutdown()` returns. Retry briefly on exactly that transient rather than
-    // treating a test artifact as a failure.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match RaftNode::start(config.clone()).await {
-            Ok(node) => return node,
-            Err(e) if is_lock_contention(&e) && Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(e) => panic!("start node {id}: {e}"),
-        }
-    }
-}
-
-/// Whether a start failure is the transient redb file lock still held by a
-/// just-stopped previous instance (see [`spawn`]).
-fn is_lock_contention(e: &NodeError) -> bool {
-    matches!(e, NodeError::Storage(m) if m.contains("already open") || m.contains("acquire lock"))
+    // No retry-on-lock-contention: `RaftNode::shutdown` now waits for the Raft
+    // core to release its storage handles before returning (#41), so a restart on
+    // a directory whose previous node was shut down cannot race the redb lock.
+    RaftNode::start(config)
+        .await
+        .unwrap_or_else(|e| panic!("start node {id}: {e}"))
 }
 
 /// A running in-process cluster.
