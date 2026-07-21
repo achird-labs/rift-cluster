@@ -40,3 +40,17 @@ anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cluster transport. hyper/hyper-util/http-body-util track the versions the
+# vendored engine already builds against, so the workspace resolves one copy.
+hyper = { version = "1.5", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1"] }
+http-body-util = "0.1"
+
+# Cluster RPC authentication (RFC-001 §11.2): keyed MAC over each request.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+rand = "0.8"
+parking_lot = "0.12"

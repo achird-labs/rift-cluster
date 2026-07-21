@@ -19,4 +19,20 @@ rift-ee = { path = "../rift-ee" }
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+rand.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+# Streaming request bodies, to prove the body cap holds without a declared length.
+futures-lite = "2"

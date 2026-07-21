@@ -1,8 +1,31 @@
 //! Distributed clustering for Rift Enterprise.
 //!
-//! Scaffold for the distributed edition: node membership, control-plane
-//! synchronization of imposters/stubs across a cluster, and request sharding.
-//! Real implementations land here; this module currently defines the shape.
+//! This crate holds the cluster runtime that turns independent Rift nodes into
+//! one fleet. It reaches the open-source engine only through the `rift_ee`
+//! facade — never through the vendored crates directly — so the open-core
+//! boundary is enforced by the dependency graph rather than by convention.
+//!
+//! What is here today is the transport substrate every later phase builds on:
+//!
+//! * [`rpc`] — the authenticated cluster port. Peers sign every request with
+//!   the shared secret; the server negotiates protocol version, verifies the
+//!   credential, and dispatches into a [`rpc::Router`] that ships empty. The
+//!   control plane and the state backends register their own endpoints, so the
+//!   transport stays agnostic about what it carries.
+//! * [`bridge`] — the private cluster-io runtime and the sync→async boundary,
+//!   with the permit bounds that keep an owner outage from consuming the data
+//!   plane's worker threads.
+//! * [`config`] — the startup guards that refuse a cluster which would be
+//!   quietly wrong (unauthenticated, unbound, or on an incompatible runtime).
+
+pub mod bridge;
+pub mod config;
+pub mod metrics;
+pub mod rpc;
+
+pub use bridge::{Bridge, BridgeConfig, CallerClass};
+pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
+pub use rpc::{Router, RpcClient, RpcError, RpcServer};
 
 use serde::{Deserialize, Serialize};
 
