@@ -11,7 +11,7 @@ pub mod routes;
 pub mod server;
 
 pub use auth::{AuthError, SignedRequest, Signer, Verifier};
-pub use client::{PeerHealth, RpcClient, RpcClientConfig};
+pub use client::{AlwaysHealthy, PeerHealth, RpcClient, RpcClientConfig};
 pub use routes::{Handler, HandlerFuture, PROTO_VERSION, ProtocolVersion, Router};
 pub use server::{DEFAULT_MAX_BODY_BYTES, RpcServer, RpcServerConfig};
 
