@@ -1,0 +1,14 @@
+# Keep the build context to sources: `target/` alone is many GB and would be
+# copied into the builder only to be ignored by cargo.
+target/
+# Not used by any build step — the Dockerfile is passed with -f. Excluding it
+# means editing a compose file or the verify script does not invalidate COPY
+# and trigger a full recompile.
+deploy/
+.claude/
+.rift-ship/
+.git/
+vendor/rift/target/
+vendor/rift/.git/
+**/*.md
+!README.md

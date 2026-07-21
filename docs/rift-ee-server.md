@@ -131,6 +131,10 @@ what the leave exists to avoid.
 > A shorter period kills the process mid-drain and turns a graceful leave into a
 > hard one.
 
+Manifests that encode this rule — a Dockerfile, a 3-node compose cluster, and a
+Kubernetes StatefulSet with both probes wired — live in
+[`deploy/`](../deploy/README.md).
+
 ## The `/_cluster/*` operator surface
 
 These ride the **cluster port** and require the cluster credential — not the

@@ -15,6 +15,10 @@ rift-enterprise/
 │   ├── rift-ee/            # enterprise facade: OSS crates + extension seams
 │   ├── rift-cluster/       # distributed clustering (control plane, membership)
 │   └── rift-ee-server/     # the enterprise binary: OSS server + cluster backends
+├── deploy/
+│   ├── Dockerfile          # the rift-ee-server image
+│   ├── compose/            # a real 3-node cluster, with a verify script
+│   └── k8s/                # StatefulSet + Services + probes
 ├── scripts/
 │   ├── sync-upstream.sh    # bump vendor/rift to upstream master
 │   └── upstream-pr.sh      # open a cross-repo PR against public Rift
@@ -38,8 +42,15 @@ Run the enterprise server — identical to the open-source `rift` without
 cargo run -p rift-ee-server -- --port 2525 --datadir ./data
 ```
 
+Or run a real 3-node cluster:
+
+```sh
+deploy/compose/verify.sh   # builds, starts 3 nodes, asserts they form one cluster
+```
+
 See [`docs/rift-ee-server.md`](docs/rift-ee-server.md) for its flags, startup
-guards, probes and the `/_cluster/*` operator surface, and
+guards, probes and the `/_cluster/*` operator surface,
+[`deploy/README.md`](deploy/README.md) for containers and Kubernetes, and
 [`docs/dev-workflow.md`](docs/dev-workflow.md) for syncing the core, adding
 features, and the cross-repo PR flow.
 

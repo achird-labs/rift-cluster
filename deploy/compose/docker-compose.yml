@@ -1,0 +1,135 @@
+# A real 3-node Rift Enterprise cluster, for local development and for the
+# container-based chaos work that needs more than the in-process harness.
+#
+#     docker compose -f deploy/compose/docker-compose.yml up --build
+#
+# Then, once all three report ready:
+#     curl -s localhost:12525/imposters   # admin API on rift-1
+#     curl -s localhost:12526/readyz      # probes  on rift-1
+#
+# Node 1 founds the cluster (`--cluster-init` semantics via --cluster-allow-solo);
+# nodes 2 and 3 join through it. That asymmetry is a bootstrap property, not a
+# role: once joined, every node is an equal member and any of them can lead.
+
+name: rift-ee-cluster
+
+# Static addresses, because `--cluster-advertise` takes a socket address and not
+# a DNS name: it is what peers are told to dial, and it is stored in the
+# replicated membership, so it has to be an IP. `--cluster-seeds` DOES accept
+# names (it resolves them on every attempt), but seeds and advertise are
+# different things and only one of them can be a name today.
+networks:
+  rift:
+    ipam:
+      config:
+        - subnet: 172.28.7.0/24
+
+x-node: &node
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+    args:
+      # Set by verify.sh; empty locally just means the banner says
+      # `rift unknown`, which is a cosmetic loss, not a broken image.
+      RIFT_UPSTREAM_VERSION: "${RIFT_UPSTREAM_VERSION:-}"
+  # The shared secret authenticates the cluster port. It is inline here because
+  # this file is for local development; a real deployment injects it from a
+  # secret store (see deploy/k8s/statefulset.yaml).
+  environment: &node-env
+    RIFT_CLUSTER: "true"
+    RIFT_CLUSTER_SECRET: "local-development-cluster-secret"
+    RIFT_CLUSTER_PROBE_BIND: "0.0.0.0:2526"
+    # Deliberately short so a `docker compose stop` demonstrates the drain
+    # rather than waiting on it. Production wants more; see the k8s manifest.
+    RIFT_CLUSTER_LEAVE_TIMEOUT: "5"
+    RIFT_CLUSTER_STATE_DIR: "/var/lib/rift/_cluster"
+    MB_DATADIR: "/var/lib/rift/data"
+  # Compose sends SIGTERM and then waits this long before SIGKILL. It must
+  # exceed RIFT_CLUSTER_LEAVE_TIMEOUT or the drain is cut short and the graceful
+  # leave becomes a hard one — the same rule as terminationGracePeriodSeconds.
+  stop_grace_period: 15s
+  restart: unless-stopped
+
+services:
+  rift-1:
+    <<: *node
+    container_name: rift-1
+    hostname: rift-1
+    networks:
+      rift:
+        ipv4_address: 172.28.7.11
+    environment:
+      <<: *node-env
+      # Bind every interface inside the container; advertise the address peers
+      # actually dial.
+      RIFT_CLUSTER_BIND: "0.0.0.0:4790"
+      RIFT_CLUSTER_BIND_PUBLIC_OK: "true"
+      RIFT_CLUSTER_ADVERTISE: "172.28.7.11:4790"
+      RIFT_CLUSTER_NODE_NAME: "rift-1"
+      # No seeds: this node founds the cluster. Without --cluster-allow-solo a
+      # seedless node refuses to start rather than silently forming a second
+      # cluster beside the real one.
+      RIFT_CLUSTER_ALLOW_SOLO: "true"
+    ports:
+      - "12525:2525"   # admin API
+      - "12526:2526"   # probes
+      - "19090:9090"   # metrics
+    healthcheck: &probe
+      test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  rift-2:
+    <<: *node
+    container_name: rift-2
+    hostname: rift-2
+    networks:
+      rift:
+        ipv4_address: 172.28.7.12
+    environment:
+      <<: *node-env
+      # Bind every interface inside the container; advertise the address peers
+      # actually dial.
+      RIFT_CLUSTER_BIND: "0.0.0.0:4790"
+      RIFT_CLUSTER_BIND_PUBLIC_OK: "true"
+      RIFT_CLUSTER_ADVERTISE: "172.28.7.12:4790"
+      RIFT_CLUSTER_NODE_NAME: "rift-2"
+      RIFT_CLUSTER_SEEDS: "172.28.7.11:4790"
+    ports:
+      - "22525:2525"
+      - "22526:2526"
+      - "29090:9090"
+    healthcheck: *probe
+    # Only that rift-1 is *running* — not that it is ready. The seed join
+    # retries with backoff for 30s, so a node that starts a little early joins
+    # on a later attempt rather than failing the deployment.
+    depends_on:
+      rift-1:
+        condition: service_started
+
+  rift-3:
+    <<: *node
+    container_name: rift-3
+    hostname: rift-3
+    networks:
+      rift:
+        ipv4_address: 172.28.7.13
+    environment:
+      <<: *node-env
+      # Bind every interface inside the container; advertise the address peers
+      # actually dial.
+      RIFT_CLUSTER_BIND: "0.0.0.0:4790"
+      RIFT_CLUSTER_BIND_PUBLIC_OK: "true"
+      RIFT_CLUSTER_ADVERTISE: "172.28.7.13:4790"
+      RIFT_CLUSTER_NODE_NAME: "rift-3"
+      RIFT_CLUSTER_SEEDS: "172.28.7.11:4790"
+    ports:
+      - "32525:2525"
+      - "32526:2526"
+      - "39090:9090"
+    healthcheck: *probe
+    depends_on:
+      rift-1:
+        condition: service_started
