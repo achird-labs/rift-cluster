@@ -29,9 +29,11 @@ enterprise decorator translates annotations into response headers. The OSS
 handlers never learn cluster vocabulary — which is what keeps the seams
 honestly generic and upstreamable.
 
-Two seams are queued for RFC-002 (Chapter 8): U-9 `AdminAuthorizer` and U-10
-principal-on-events. Same rules: generic names, `Local` defaults, independently
-justifiable to an OSS maintainer.
+Four further seams are queued, same rules — generic names, `Local`/default-off
+behavior, independently justifiable to an OSS maintainer: U-9 `AdminAuthorizer`
+and U-10 principal-on-events (RFC-002, Chapter 8), U-11 the front-door route
+table and listener (#19, Chapter 13), and U-12 the `ImposterSource` provider
+trait with `file`/`https` built-ins (#20, Chapter 13).
 
 ## The dependency architecture
 

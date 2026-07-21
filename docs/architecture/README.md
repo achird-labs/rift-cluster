@@ -42,6 +42,8 @@ If you read only three chapters, read **1 (Overview)**, **4 (Write Path)**, and
 | 10 | [Operations](10-operations.md) | Deployment, probes, metrics, runbooks, rolling upgrades, sizing |
 | 11 | [The Open-Core Boundary](11-open-core.md) | What lives upstream, what stays enterprise, and how Cargo enforces it |
 | 12 | [Testing & Correctness](12-testing.md) | The harness, chaos scenarios, and phase exit criteria |
+| 13 | [The Front Door & Imposter Sources](13-front-door-and-sources.md) | Single-port content routing; pulling mocks from Git/S3/registries, cluster-correctly |
+| 14 | [Deploying on AWS](14-cloud-deployment.md) | EKS reference deployment, ECS/Fargate caveats, EC2, cost & checklist |
 
 ## Status and source of truth
 
@@ -52,6 +54,7 @@ If you read only three chapters, read **1 (Overview)**, **4 (Write Path)**, and
 | ADR-001 (issue #14) | Control-plane decision: embedded Raft (`openraft`) + `redb` |
 | Issues #6–#11 (epic #12) | Phase 1 implementation, re-scoped per ADR-001 |
 | Issues #15, #16, #17 | Enable/disable replication, flow-state consistency+durability, RFC-002 tenancy |
+| Issues #19, #20 | Front door (U-11), imposter source SPI (U-12) |
 | `vendor/rift` @ v0.14.0-64 (`919495e`) | Ground truth for every upstream citation |
 
 When this guide and an RFC/issue disagree, the RFC/issue wins and the guide has

@@ -46,7 +46,11 @@ transparency:
 
 On Kubernetes, gateway-fronted mode is effectively mandatory — Service ports
 are static, so runtime-minted imposter ports cannot be exposed any other way
-(Chapter 10).
+(Chapter 10). And for callers that cannot be asked to name a port at all — an
+unmodified system-under-test calling what it believes is a real hostname — the
+**front door** (Chapter 13) extends this listener with a content-based route
+table: host/path/header rules select the imposter, and the existing gateway
+addressing remains as the fallback on the same port.
 
 ```mermaid
 flowchart TB
