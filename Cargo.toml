@@ -62,3 +62,6 @@ parking_lot = "0.12"
 # their Serialize/Deserialize impls so they can be persisted.
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 redb = "4"
+# Stable, fast hash for rendezvous (HRW) ownership — must be identical across
+# nodes and versions, so a fixed algorithm (not the std default hasher) is used.
+xxhash-rust = { version = "0.8", features = ["xxh64"] }

@@ -20,6 +20,7 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 
 use super::network::{self, CLUSTER_JOIN_PATH, JoinRequest, RaftSlot, RpcNetwork};
+use super::ring::Ring;
 use super::store::{self, RedbStateMachine};
 use super::{ControlOp, NodeId, TypeConfig};
 use crate::rpc::client::AlwaysHealthy;
@@ -34,6 +35,14 @@ const RAFT_DB_FILE: &str = "raft.redb";
 /// before giving up. A single voter wins immediately; this only bounds a stuck
 /// startup.
 const INIT_LEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The upper election timeout the Raft config uses; also the basis for the
+/// isolated-owner window below.
+const ELECTION_TIMEOUT_MAX_MS: u64 = 300;
+
+/// A leader that a quorum has not acknowledged within this window is treated as
+/// isolated (the isolated-owner rule, RFC-001 §7.2): 3× the election timeout.
+const ISOLATION_WINDOW_MS: u64 = 3 * ELECTION_TIMEOUT_MAX_MS;
 
 /// Everything a [`RaftNode`] needs to start.
 #[derive(Clone)]
@@ -148,7 +157,7 @@ impl RaftNode {
             Config {
                 cluster_name: "rift-control-plane".to_owned(),
                 election_timeout_min: 150,
-                election_timeout_max: 300,
+                election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
                 heartbeat_interval: 50,
                 ..Default::default()
             }
@@ -323,6 +332,44 @@ impl RaftNode {
         }
     }
 
+    /// The ownership ring computed from this node's applied membership. Its
+    /// `m_idx` is the membership log index, so every node at the same index
+    /// derives byte-identical ownership.
+    #[must_use]
+    pub fn ring(&self) -> Ring {
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow();
+        let m_idx = metrics
+            .membership_config
+            .log_id()
+            .map_or(0, |log_id| log_id.index);
+        Ring::new(metrics.membership_config.voter_ids(), m_idx)
+    }
+
+    /// Whether this node is isolated from the cluster's quorum and must refuse
+    /// owner-side stateful operations (the isolated-owner rule, RFC-001 §7.2).
+    ///
+    /// This is a safety gate, so it **fails closed** — every uncertain state
+    /// reports isolated. A node is isolated when it knows no current leader (a
+    /// follower partitioned away loses its leader once the election timeout
+    /// elapses), or when it *is* the leader but does not currently hold a quorum
+    /// lease: openraft reports `millis_since_quorum_ack == None` for a leader that
+    /// no quorum has acknowledged (a just-elected leader before its first
+    /// `AppendEntries` round, or one partitioned from its followers), so that case
+    /// is treated as isolated too, not healthy.
+    #[must_use]
+    pub fn is_isolated(&self) -> bool {
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow();
+        match metrics.current_leader {
+            None => true,
+            Some(leader) if leader == self.id => metrics
+                .millis_since_quorum_ack
+                .is_none_or(|ms| ms > ISOLATION_WINDOW_MS),
+            Some(_) => false,
+        }
+    }
+
     /// Stop the Raft runtime and release the cluster port. Any in-flight client
     /// writes fail.
     ///
@@ -423,6 +470,57 @@ mod tests {
         assert_eq!(status.current_leader, Some(1));
         assert_eq!(status.voters, vec![1]);
         assert_eq!(node.get_imposter(9999).unwrap(), None);
+        node.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initialized_leader_owns_its_ring_and_is_not_isolated() {
+        use crate::raft::ring::{OwnStatus, OwnedKey};
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+
+        let ring = node.ring();
+        assert_eq!(
+            ring.members(),
+            &[1],
+            "ring members come from the applied voters"
+        );
+        assert_eq!(
+            ring.i_own(1, OwnedKey::config("cfg:8080")),
+            Some(OwnStatus::Owner),
+            "the sole voter owns every config key"
+        );
+        // The gate fails closed, so a just-elected leader reads isolated until it
+        // establishes its first quorum lease — poll for it to clear.
+        assert!(
+            wait_until(|| !node.is_isolated()).await,
+            "a healthy single-node leader must stop reporting isolated"
+        );
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// Poll a predicate, bounded, returning whether it became true within ~5s.
+    async fn wait_until(mut pred: impl FnMut() -> bool) -> bool {
+        for _ in 0..50 {
+            if pred() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        pred()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uninitialized_node_is_isolated_with_empty_ring() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        // Never initialized: no leader, no membership.
+        assert!(
+            node.is_isolated(),
+            "a node with no known leader must report isolated"
+        );
+        assert!(node.ring().is_empty(), "no applied membership → empty ring");
         node.shutdown().await.expect("shutdown");
     }
 
@@ -541,6 +639,43 @@ mod tests {
         for node in [&n1, &n2, &n3] {
             node.shutdown().await.expect("shutdown");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_becomes_isolated_when_it_loses_quorum() {
+        let (d1, d2, d3) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+        n2.join_via(n1.advertise_addr()).await.expect("n2 join");
+        n3.join_via(n1.advertise_addr()).await.expect("n3 join");
+        // n1 (the bootstrapping leader) keeps leadership; wait until it holds a
+        // quorum lease so the "was healthy, then lost it" transition is real.
+        assert!(
+            wait_until(|| n1.status().is_leader && !n1.is_isolated()).await,
+            "leader should hold a quorum lease once the cluster is formed"
+        );
+        // A healthy follower connected to the leader is not isolated.
+        assert!(
+            !n2.is_isolated(),
+            "a follower that hears the leader is not isolated"
+        );
+
+        // Kill both followers: the leader can no longer reach a quorum and must
+        // report isolated (whether by losing its lease or stepping down) so it
+        // refuses owner-side ops — the isolated-owner safety property.
+        n2.shutdown().await.ok();
+        n3.shutdown().await.ok();
+        assert!(
+            wait_until(|| n1.is_isolated()).await,
+            "a leader that lost its quorum must report isolated"
+        );
+        n1.shutdown().await.ok();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
