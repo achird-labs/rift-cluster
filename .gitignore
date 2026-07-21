@@ -4,3 +4,4 @@ Cargo.lock.orig
 .DS_Store
 # Local knowledge-graph tooling output (graphify)
 /graphify-out
+/.rift-ship
