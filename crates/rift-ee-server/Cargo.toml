@@ -1,0 +1,48 @@
+[package]
+name = "rift-ee-server"
+description = "The Rift Enterprise server binary: the open-source server composed with cluster backends."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The composition lives in the library so it can be driven from integration
+# tests (and, later, the container chaos harness) without spawning a process;
+# the binary is a thin caller, exactly as the open-source `rift` binary is.
+[lib]
+name = "rift_ee_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rift-ee-server"
+path = "src/main.rs"
+
+[dependencies]
+# Same fence as rift-cluster: `rift-ee` is the only path into the open-source
+# core, so this crate carries no direct rift-mock-core / rift-http-proxy dep.
+rift-ee = { path = "../rift-ee" }
+rift-cluster = { path = "../rift-cluster" }
+
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+# Same fixed hash the ring uses: a node id derived from a name must be identical
+# on every node and across versions, which the std hasher does not promise.
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile = "3"
+# Drives the composed admin API / probe listeners over real HTTP, the way an
+# operator, a load balancer and the upstream integration suites all do.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

@@ -59,6 +59,13 @@ pub struct NodeConfig {
     /// Shared HMAC secret for the cluster port. `None` runs it unauthenticated
     /// (only via an explicit insecure acknowledgment elsewhere).
     pub secret: Option<String>,
+    /// Endpoints to serve on the cluster port alongside the control-plane ones.
+    ///
+    /// The cluster port is a single authenticated listener, so anything an
+    /// embedder wants to expose there (the operator `/_cluster/*` surface, later
+    /// phases' state endpoints) is registered here rather than on a second port
+    /// with its own credential.
+    pub routes: Router,
 }
 
 // Hand-written so the shared secret never lands in a log line — matching the
@@ -71,6 +78,7 @@ impl std::fmt::Debug for NodeConfig {
             .field("advertise", &self.advertise)
             .field("data_dir", &self.data_dir)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("routes", &self.routes.len())
             .finish()
     }
 }
@@ -169,7 +177,9 @@ impl RaftNode {
         // needs the handlers — so the router reads the node through a slot filled
         // in once construction below completes.
         let slot: RaftSlot = Arc::new(OnceCell::new());
-        let router = network::control_routes(Router::new(), slot.clone());
+        // Control-plane routes register last so a caller's route table can never
+        // shadow the Raft endpoints the cluster itself depends on.
+        let router = network::control_routes(config.routes.clone(), slot.clone());
 
         let (signer, verifier) = match &config.secret {
             Some(secret) => (
@@ -318,6 +328,14 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// Every port this node has a committed config for, ascending. Like
+    /// [`Self::get_imposter`], this answers from applied local state.
+    pub fn configured_ports(&self) -> Result<Vec<u16>, NodeError> {
+        self.sm_reader
+            .configured_ports()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// A snapshot of the node's current status, from Raft metrics.
     #[must_use]
     pub fn status(&self) -> StatusReport {
@@ -416,6 +434,7 @@ mod tests {
             advertise: None,
             data_dir: dir.path().to_path_buf(),
             secret: Some(SECRET.to_owned()),
+            routes: Router::new(),
         }
     }
 

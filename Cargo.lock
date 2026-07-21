@@ -2466,8 +2466,10 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lazy_static",
  "openraft",
  "parking_lot",
+ "prometheus",
  "rand 0.8.6",
  "redb",
  "rift-ee",
@@ -2491,6 +2493,27 @@ dependencies = [
  "rift-types",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rift-ee-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "rift-cluster",
+ "rift-ee",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "xxhash-rust",
 ]
 
 [[package]]
