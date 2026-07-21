@@ -10,10 +10,10 @@ It is written to be read before the implementation exists — its purpose is to
 close design gaps and misunderstandings *now*, when they are cheap. Where a
 chapter states a guarantee, it also states the mechanism that provides it and
 the failure modes that bound it. Nothing in here should be taken on faith: the
-normative sources are RFC-001 (v3), the ADR on the control plane
-([#14](https://github.com/achird-labs/rift-enterprise/issues/14)), the gap
-analyses in the design vault, and — above all — the tracked issues, which carry
-the machine-checkable acceptance criteria.
+normative sources are RFC-001 (v3), the control-plane decision
+([ADR-001](../adr/ADR-001-raft-control-plane.md), accepted), the gap analyses in
+the design vault, and — above all — the tracked issues, which carry the
+machine-checkable acceptance criteria.
 
 ## How to read this guide
 
@@ -51,11 +51,11 @@ If you read only three chapters, read **1 (Overview)**, **4 (Write Path)**, and
 |---|---|
 | This guide | Explanatory — the *why* and the *how it fits together* |
 | RFC-001 v3 (PR #3 / issue #5) | Normative design |
-| ADR-001 (issue #14) | Control-plane decision: embedded Raft (`openraft`) + `redb` |
+| [ADR-001](../adr/ADR-001-raft-control-plane.md) (accepted) | Control-plane decision: embedded Raft (`openraft`) + `redb` |
 | Issues #6–#11 (epic #12) | Phase 1 implementation, re-scoped per ADR-001 |
 | Issues #15, #16, #17 | Enable/disable replication, flow-state consistency+durability, RFC-002 tenancy |
 | Issues #19, #20 | Front door (U-11), imposter source SPI (U-12) |
-| `vendor/rift` @ v0.14.0-64 (`919495e`) | Ground truth for every upstream citation |
+| `vendor/rift` @ v0.15.0 (`aaa6042`) | Ground truth for every upstream citation |
 
 When this guide and an RFC/issue disagree, the RFC/issue wins and the guide has
 a bug — file it.
