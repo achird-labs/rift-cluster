@@ -1,13 +1,42 @@
-# RFC-001 — Self-Clustering Distributed Rift (v2)
+# RFC-001 — Self-Clustering Distributed Rift (v3)
 
 | | |
 |---|---|
-| **Status** | v2 (review cycles 1–2 applied) — implementation-ready |
-| **Tracking issue** | [EtaCassiopeia/rift-enterprise#1](https://github.com/EtaCassiopeia/rift-enterprise/issues/1) |
+| **Status** | v3 (re-grounded at v0.15.0; control plane decided by ADR-001) — implementation-ready |
+| **Tracking issue** | [achird-labs/rift-enterprise#1](https://github.com/achird-labs/rift-enterprise/issues/1) |
 | **Canonical location** | `rift-enterprise:docs/rfc/RFC-001-self-clustering-rift.md` |
-| **Ground truth** | All code citations resolve against `vendor/rift` @ `54eb2df` (v0.8.0-3-g54eb2df) |
+| **Ground truth** | All code citations resolve against `vendor/rift` @ `aaa6042` (v0.15.0). `imposter/core.rs` was split upstream into the `imposter/core/{mod,matching,lifecycle,recording,responses,proxy}.rs` module tree and the crate renamed `rift-core` → `rift-mock-core`; line-number citations below are approximate against v0.15.0. |
 | **Author** | Mohsen Zainalpour |
-| **Date** | 2026-07-01 |
+| **Date** | 2026-07-01 (v3: 2026-07-21) |
+
+**Changelog v2 → v3** (re-grounding + control-plane decision)
+
+- **The requirements are now explicit (R1–R4).** Fleet-wide read-after-write config visibility
+  (R1), immediate cross-node flow-state visibility (R2), full-cluster-restart durability of
+  configs *and* flow state (R3), and no-lost-admin-requests (R4). §1.1 states them; they are
+  what drove the control-plane decision below.
+- **Control plane decided — ADR-001 (accepted).** The cluster control plane is an **embedded
+  Raft group** (`openraft`, in-process over the HMAC cluster port) with `redb` for durability;
+  flow state stays off consensus (HRW + WAL). **This supersedes the gossip mechanism in §7.1,
+  §7.2 and §7.4** (and decisions D-1, D-2). Those three sections carry a superseded-by-ADR-001
+  banner and are retained for context and for the parts that survive unchanged (the ownership
+  *contract*, the partition table, the seam usage); their *mechanism* is ADR-001's. New decision
+  entries D-15/D-16/D-17 in Appendix C.
+- **Phase 0 is complete.** All eight upstream seams shipped as `achird-labs/rift#311–#318`
+  (v0.14.0); Appendix B is now a *filed-and-merged* mapping, not a to-file list. The Phase-0
+  kill gate is discharged. The transport substrate (internal RPC + sync/async bridge, #8) is
+  merged (`rift-enterprise#21`).
+- **Re-grounded at v0.15.0.** Crate rename and module split applied throughout (see Ground
+  truth). Two new upstream facts folded in: the per-core runtime topology (RFC-712) is
+  incompatible with the sync bridge and is **rejected at startup** (D-14); the error envelope
+  gained a stable `type` slug (#797), so §7.6's degraded responses use the existing
+  `ErrorKind` slugs (`unavailable`, `timeout`) rather than inventing cluster error types.
+- **Two new capabilities from the wrapper (Mimemo/Solo) analysis:** the **front door** —
+  single-port content-based routing to imposters (upstream seam U-11, #19) — and the
+  **imposter source SPI** — pluggable providers with cluster-correct pulls (U-12, #20). Added
+  to §2/§6.3 and the Appendix A seam inventory.
+- **RFC-002 carved out.** Multi-tenancy + RBAC + audit is its own RFC (#17), referenced from
+  §11.2; it was absent from v2 and from upstream.
 
 **Changelog v1 → v2**
 
@@ -87,17 +116,40 @@
 
 Run Rift as a **fully distributed, self-clustering application** — a fleet of active-active
 nodes behind a load balancer that share one imposter set and behave correctly for stateful
-features cluster-wide, **without any mandatory external dependency**. Coordination is via
-**embedded gossip**; Redis remains an optional *coordination backend* behind the same
-traits — and is the **supported path for customers who require strict sequencing /
-exactly-once semantics** (gossip-native strict variants are demand-gated experimental,
-Appendix C D-12).
+features cluster-wide, **without any mandatory external dependency**. The control plane
+(membership, configs, tenancy, admin intents) is an **embedded Raft group** (`openraft`,
+in-process; ADR-001); the data plane's flow state stays off consensus (single-writer
+rendezvous-hash ownership + write-ahead durability). Redis remains an optional backend behind
+the same traits — the **supported path for customers who require strict sequencing /
+exactly-once semantics** (Appendix C D-12).
+
+> **v2 → v3 note.** v2 coordinated the *whole* cluster via embedded gossip. v3 keeps gossip's
+> instinct for the data plane (no consensus between a request and its response) but replaces
+> the gossip **control plane** with Raft, because the four requirements below demand strong
+> consistency there — see ADR-001 and §1.1. The §7.1/§7.2/§7.4 gossip mechanism is superseded;
+> those sections are retained for the parts that survive (the ownership *contract*, the
+> partition table, seam usage).
 
 This is an **open-core feature**: a small set of *generic* extension seams goes upstream to
 Apache-2.0 Rift (Appendix A); everything cluster-aware lives in the proprietary
 `rift-enterprise` repo (`rift-cluster`, `rift-ee-server`). Phased so the high-value,
 low-risk slice (membership + config-sync) ships first and each later phase is gated on
 demonstrated demand.
+
+## 1.1 Requirements (R1–R4)
+
+The design is shaped by four requirements; each eliminates a class of simpler designs, and
+together they are why the control plane is Raft (ADR-001).
+
+- **R1 — read-after-write config visibility.** A config change acknowledged on any node is
+  servable from *every* node by the time the client receives its 2xx. (§7.4 write barrier.)
+- **R2 — immediate cross-node flow state.** A flow-state change made while serving a request is
+  visible to the very next request, whichever node serves it. (§7.2.4 owner-authoritative
+  reads — independent of the load balancer.)
+- **R3 — full-restart durability.** Nothing is lost on a full-cluster restart: imposter configs
+  *and* flow state (at the chosen durability level). (ADR-001 + §7.4.5, #16.)
+- **R4 — no lost admin requests.** An accepted admin request is never lost, even if the node
+  handling it dies mid-flight. (§7.4.2 durable intent log + op-id dedup.)
 
 ## 2. Motivation
 
@@ -115,31 +167,40 @@ RPS, so raw throughput is rarely the driver — four goals justify a cluster:
 
 ### 2.1 Non-goals
 
-- **Not a database.** Durability is limited to the persisted desired-state (§7.4.5);
-  runtime state (cursors, journals, claims) is test-run-scoped.
-- **Not cross-region.** Single failure domain / one LAN; WAN gossip is out of scope.
-- **Not linearizable under partition.** Rift-EE is **AP with bounded staleness and
-  single-writer keys**; the partition decision table (§7.6) defines exact behavior, and
-  the handoff windows in §7.2 are documented, not hidden.
-- **Not unbounded scale.** Design target 3–9 nodes, documented ceiling 16.
+- **Not a database.** Durability covers configs, tenancy, admin intents, and — at the chosen
+  per-imposter level (#16) — flow state. Response cursors, the recorded-request journal, and
+  in-flight proxy claims stay deliberately volatile (v3: flow state is *no longer* volatile,
+  correcting v2 — see R3, ADR-001, and #16; the survival matrix is architecture-guide Ch. 9).
+- **Not cross-region.** Single failure domain / one LAN; WAN is out of scope (the Raft election
+  and heartbeat timeouts assume LAN RTT).
+- **Not linearizable end-to-end.** The **control plane is linearizable** (Raft); the **data
+  plane is single-writer-per-key** with bounded, counted, flagged degradation (§7.6). A minority
+  partition rejects control-plane writes rather than diverging (ADR-001).
+- **Not unbounded scale.** Design target 3–9 **voters**, documented ceiling 16 nodes (extra
+  nodes join as non-voting learners).
 - **No enterprise concepts upstream.** The OSS surface stays generic (gate B3).
 - **No owner-affinity guarantee at the LB.** Header-hash affinity gives stickiness, not
   owner co-location (§6.2); the design budgets one LAN RPC per stateful op.
+- **No intercept mode, injection gate, or TUI in cluster mode** (v3). These are single-node
+  OSS surfaces; `--cluster` with intercept mode is rejected at startup, alongside the per-core
+  runtime rejection (D-14).
+- **No multi-tenancy in this RFC.** Tenant-scoped configs, per-user RBAC, and audit are
+  **RFC-002** (#17) — orthogonal, and absent from both v2 and upstream.
 
-## 3. Current state (grounding — verified at `54eb2df`)
+## 3. Current state (grounding — verified at `aaa6042` (v0.15.0))
 
 All paths relative to `vendor/rift/crates/`.
 
 ### 3.1 Data plane
 
 hyper 1.5 + tokio; **one `TcpListener` per imposter**. `ImposterManager` holds
-`imposters: RwLock<HashMap<u16, Arc<Imposter>>>` (`rift-core/src/imposter/manager.rs:88`).
+`imposters: RwLock<HashMap<u16, Arc<Imposter>>>` (`rift-mock-core/src/imposter/manager.rs:88`).
 Stateless matching is fully in-process. Auto-assigned ports scan the dynamic range
 **49152–65535** for the lowest bindable port (`manager.rs:316`), deliberately not `bind(0)`.
 
 ### 3.2 The one existing state abstraction: `FlowStore`
 
-`rift-core/src/extensions/flow_state.rs:10`:
+`rift-mock-core/src/extensions/flow_state.rs:10`:
 
 ```rust
 pub trait FlowStore: Send + Sync {
@@ -152,11 +213,11 @@ pub trait FlowStore: Send + Sync {
 }
 ```
 
-Impls: `NoOpFlowStore` (same file), `InMemoryFlowStore` (`rift-core/src/backends/inmemory.rs`),
-`RedisFlowStore` (`rift-core/src/backends/redis.rs`, feature `redis-backend`). Scenario FSM
-state and flow KV route through it (`rift-core/src/imposter/core.rs:369-412`). Lua scripting
+Impls: `NoOpFlowStore` (same file), `InMemoryFlowStore` (`rift-mock-core/src/backends/inmemory.rs`),
+`RedisFlowStore` (`rift-mock-core/src/backends/redis.rs`, feature `redis-backend`). Scenario FSM
+state and flow KV route through it (`rift-mock-core/src/imposter/core.rs:369-412`). Lua scripting
 binds it synchronously, executing on dedicated non-tokio worker threads
-(`rift-core/src/scripting/script_pool.rs:78`, `thread::Builder`). **This is the template to
+(`rift-mock-core/src/scripting/script_pool.rs:78`, `thread::Builder`). **This is the template to
 generalize** — but note two problems:
 
 - **No injection seam.** The imposter's store is built inside the *private*
@@ -173,7 +234,7 @@ Also corrected from v1: `RedisFlowStore::set_ttl` is a **logging no-op**
 ### 3.3 Everything else is per-node, in-memory, no abstraction
 
 - **Response cyclers** — `RuleCycler(AtomicU64)` packs `resp_idx`/`repeat_idx` into
-  high/low 32 bits (`rift-core/src/behaviors/cycler.rs:10,20,56`). Cursor lifetime = the
+  high/low 32 bits (`rift-mock-core/src/behaviors/cycler.rs:10,20,56`). Cursor lifetime = the
   stub's `StubState` *slot*: **stub replace (by id or index) swaps the stub in place and
   deliberately keeps the slot's cycling state** (`imposter/core.rs:1186-1197,1223-1229`);
   only stub deletion, bulk stub replacement, and imposter replace drop the state.
@@ -184,7 +245,7 @@ Also corrected from v1: `RedisFlowStore::set_ttl` is a **logging no-op**
   does not (`imposter/core.rs:1130-1142`).
 - **Proxy recordings + proxyOnce dedup** — `RecordingStore` with
   `pending: Mutex<HashSet<RequestSignature>>` for exactly-once claims
-  (`rift-core/src/recording/store.rs:25`); caps 1 000/signature, 10 000 signatures
+  (`rift-mock-core/src/recording/store.rs:25`); caps 1 000/signature, 10 000 signatures
   (`store.rs:13,16`). `RequestSignature` is **port-less** (`recording/types.rs`) —
   uniqueness today comes from each imposter owning its own store. Known bug at the pin: a
   failed upstream call leaves the signature stuck in `pending` (no release on the error
@@ -209,7 +270,7 @@ it with incremental reconciliation.
 ### 3.5 What already helps
 
 - **Space-based isolation (issue #223) is implemented**: `Stub.space`
-  (`rift-core/src/imposter/types.rs:181`) gates matching on the request's resolved
+  (`rift-mock-core/src/imposter/types.rs:181`) gates matching on the request's resolved
   `flow_id`; `flowIdSource` supports `"imposter_port"` (default) or `"header:<Name>"`
   (`types.rs:795`). `teardown_space` exists (`manager.rs:485`).
 - **Stable stub identity (issue #202) is implemented**: `Stub.id: Option<String>`
@@ -219,7 +280,7 @@ it with incremental reconciliation.
 - **A single-port gateway exists**: `/__rift/:port/<path>` on the admin API dispatches
   in-process to the imposter on `:port` (issue #212, `admin_api/router.rs:94,158-170`).
   The gateway-fronted mode (§6.3) promotes this pattern to the data plane.
-- **rift-core is an embeddable, CLI-free library** (issue #203); `rift-http-proxy` is
+- **rift-mock-core is an embeddable, CLI-free library** (issue #203); `rift-http-proxy` is
   lib+bin, re-exporting `admin_api` and `config_loader`, so the admin API
   (`AdminApiServer::new(addr, manager, api_key)`, `admin_api/server.rs:27`) is reusable
   from an enterprise binary. Caveat: the metrics server and the bootstrap composition
@@ -272,7 +333,7 @@ it away.
  - persisted cluster-state dir: desired-state (configs, revisions, tombstones, generations)
 ```
 
-Every node runs identical roles (no leader). The OSS engine (`rift-core`) is unmodified at
+Every node runs identical roles (no leader). The OSS engine (`rift-mock-core`) is unmodified at
 runtime; cluster behavior enters exclusively through the seams of Appendix A, implemented
 by `rift-cluster` and wired by `rift-ee-server` (§9).
 
@@ -351,6 +412,15 @@ fallback dispatch, §7.4.6) stay enterprise.
 
 ### 7.1 Membership & gossip
 
+> ⚠️ **Superseded by ADR-001 (v3).** Membership is now a value in the **Raft log**, not gossip:
+> at any log index every node computes byte-identical membership (and therefore ownership).
+> chitchat, node incarnations, and the versioned-KV budget below are **removed**; bootstrap is
+> `--cluster-init` (not `--cluster-allow-solo`), identity is a leader-minted `u64`, and join is
+> `add_learner` → snapshot catch-up → auto-promote to voter (< 9 voters). The lifecycle
+> *contract* (Joining→Ready gate, graceful-leave handoff, never-serve-stale) is unchanged and
+> carried by the Raft membership; only the mechanism moved. See ADR-001 §Membership and issue
+> #6. The text below is retained for the surviving contract and for context.
+
 - **Library:** [`chitchat`](https://github.com/quickwit-oss/chitchat) (MIT; Quickwit's
   SWIM-with-phi-accrual + versioned key-value gossip). It covers membership *and*
   small-value dissemination in one dependency. Fallback if chitchat proves unsuitable:
@@ -419,6 +489,17 @@ an LB as if healthy. Operators opt into serving alone with `--cluster-allow-solo
 Phase-1 exit test: "unreachable seeds ⇒ never Ready" (§10).
 
 ### 7.2 Ring, ownership, epochs, handoff
+
+> ⚠️ **Partly superseded by ADR-001 (v3).** The ownership *contract* survives verbatim — one
+> authoritative owner per key by rendezvous (HRW) hashing, owner-serialized writes, and the
+> §7.2.4 owner-authoritative reads that make R2 hold under any load balancer. What is **removed**
+> is the machinery that existed only because gossip membership was not agreed: the ring epoch
+> `xxh3(roster)` + `EPOCH_MISMATCH` retries, the 3 s settle delay, and per-key-class ownership
+> generations + persisted floors. Under Raft the ring is a pure function of the **applied**
+> membership, and the fencing token is `m_idx` (the log index of the last applied membership
+> change); the one residual window is closed by the **isolated-owner rule** (a node that has not
+> heard a leader heartbeat within 3× the election timeout rejects owner-side ops). See ADR-001
+> §Ring & fencing and issue #7. Read `(g, v, origin)` below as `(m_idx, v, origin)`.
 
 - **Ring:** rendezvous (HRW) hashing: `owner(key) = argmax_{n ∈ eligible} h(n.node_id, key)`
   with xxhash64, where `eligible = Live ∪ Suspect − Leaving` (Suspect nodes keep ownership
@@ -537,9 +618,24 @@ Connection pooling per peer.
 
 ### 7.4 Config replication
 
-**Design rules: gossip carries pointers, not payloads; writes are serialized at a per-port
-owner** (v1's accept-anywhere LWW destroyed concurrent stub mutations — notably proxy
-recordings landing on two nodes within one gossip round — even without a partition).
+> ⚠️ **Superseded by ADR-001 (v3).** Config is now a **Raft state machine**: an admin write is a
+> `ControlOp` that is validated on the leader, appended, replicated to a fsync'd majority
+> (commit = R3 durability), applied everywhere via the incremental `apply_config` (#316), and
+> gated by a **read-after-write barrier** (leader waits for every Ready node's applied index ≥
+> the entry's, R1). `op_id` dedup in the state machine gives retries exactly-once *effect* (R4),
+> and an admin write that cannot reach quorum is durably parked and replayed on heal rather than
+> lost. This **removes** the gossip pointers, content-addressed body fetch/anti-entropy,
+> per-port `(g, revision)` counters, and tombstone ack-vector GC below; `revision` becomes the
+> Raft log index. The client-visible contract (revision/warning headers, degraded semantics via
+> §7.6) and the bind-divergence handling (§7.4.6) survive. Degraded/failed responses use the
+> upstream v0.15.0 error slugs (`unavailable`, `timeout`; #797) via `error_response_typed` — no
+> cluster-specific error types. See ADR-001 §Write path and issue #9. Text retained for context
+> and the surviving contract.
+
+**Design rules (v2, superseded mechanism): gossip carries pointers, not payloads; writes are
+serialized at a per-port owner** (v1's accept-anywhere LWW destroyed concurrent stub mutations —
+notably proxy recordings landing on two nodes within one gossip round — even without a
+partition).
 
 #### 7.4.1 Desired-state pointers in gossip KV
 
@@ -797,7 +893,7 @@ call site — Appendix C D-9).
 The full seam inventory with justifications and API sketches is **Appendix A** (normative
 for gate B). Summary:
 
-### 8.1 Trait family (upstream, generic; `rift-core` unless noted)
+### 8.1 Trait family (upstream, generic; `rift-mock-core` unless noted)
 
 | Trait / seam (crate::module) | Supersedes | Cluster impl (enterprise) |
 |---|---|---|
@@ -860,7 +956,7 @@ fleet operations.
   occurrence index among byte-identical siblings (the first occurrence is always `#1`).
   The `~` prefix keeps generated keys disjoint from user-supplied ids. Deterministic
   across nodes because it derives only from replicated config bytes. Upstreamed as
-  `rift_core::imposter::stub_key(&Stub, occurrence)` (U-6 needs it for keyless-stub
+  `rift_mock_core::imposter::stub_key(&Stub, occurrence)` (U-6 needs it for keyless-stub
   diffing; enterprise reuses it — one definition).
 - **Sequence key** (cursor identity): `SequenceKey { port, slot, stub_key, scope }` where
   `scope = stub.space.clone().unwrap_or_default()` — **per-stub, not per-flow** (an
@@ -893,9 +989,9 @@ fleet operations.
 
 ```
 crates/
-  rift-ee            # facade (exists): re-exports rift_core/rift_types AND the seam traits;
+  rift-ee            # facade (exists): re-exports rift_mock_core/rift_types AND the seam traits;
                      #   rift-cluster/rift-ee-server import ONLY rift-ee — enforced
-                     #   structurally: their Cargo.tomls drop the direct rift-core/
+                     #   structurally: their Cargo.tomls drop the direct rift-mock-core/
                      #   rift-types deps they carry today (Cargo, not lints, is the fence)
   rift-cluster       # all cluster logic (proprietary)
     src/membership/  #   chitchat wrapper (DNS re-resolving seeds, Leaving state), identity
@@ -916,9 +1012,9 @@ crates/
 ```
 
 Consumption mechanics (per `docs/dev-workflow.md`): each upstream seam PR (Appendix A)
-merges to `EtaCassiopeia/rift` first → `vendor/rift` submodule bump → the corresponding
+merges to `achird-labs/rift` first → `vendor/rift` submodule bump → the corresponding
 enterprise phase unblocks. Workspace mechanics: add `rift-http-proxy` to
-`[workspace.dependencies]` as a path dep (missing today); `rift-core` is consumed with its
+`[workspace.dependencies]` as a path dep (missing today); `rift-mock-core` is consumed with its
 default features; feature unification with `rift-http-proxy`'s `default-features = false`
 core dep is verified by the existing CI `cargo check --workspace`.
 
@@ -935,9 +1031,9 @@ Phase 1 is not blocked by seams it doesn't need.
 
 | Phase | Deliverable | Preconditions (upstream) | Machine-checkable exit criteria | Rollback |
 |---|---|---|---|---|
-| **0a — enabling seams** | U-6 (apply_config + events + stub_key + move_stub), U-7 (embeddable server), U-8 (decoration — Phase 1's revision/warning headers need it) merged; submodule bumped | — | OSS suite green; `matcher_bench` within 2 % of pre-seam baseline; `cargo public-api` diff = documented additions only | Additive, default-off |
-| **0b — backend seams** (parallel with Phase 1) | U-1…U-5 merged | — | Same bars per PR | Same |
-| **1 — Membership + config-sync** | `--cluster*` CLI; gossip membership incl. graceful leave; owner-serialized config writes; digest gossip + anti-entropy + order-aware reconciler; persisted state dir + cold start; `/_cluster/{members,config,health,imposters}`; `/readyz` | 0a | 3-node harness: `POST /imposters` on A visible & serving on B/C ≤ 5 s (`test_config_sync_converges`); kill B mid-run → A/C unaffected, B rejoin converges (`test_node_rejoin`); sibling-port config change preserves scenario state (`test_reconcile_preserves_state`); stub reorder converges order-correct (`test_reconcile_reorder`); unreachable seeds ⇒ never Ready (`test_no_seeds_not_ready`); full-cluster cold restart restores config incl. tombstones (`test_cold_start`); SIGTERM leave under load → zero data-plane errors on survivors AND zero lost acknowledged writes (CAS ladder across the leave) (`test_graceful_leave`). Chaos: C4, C5, C6, C7 | `--cluster` off → OSS single node. **Truth scope:** a de-clustered node serves the full fleet config only if it ran with `--datadir` (the OSS write-through) — with `--configfile`-only deployments, export a snapshot from `--cluster-state-dir` first. Rollback is per-fleet: mixed on/off nodes behind one LB diverge immediately |
+| **0a — enabling seams** ✅ **DONE** | U-6 (#316), U-7 (#317), U-8 (#318) — **merged upstream v0.14.0** | — | OSS suite green; `matcher_bench` within 2 % of pre-seam baseline | Additive, default-off |
+| **0b — backend seams** ✅ **DONE** | U-1…U-5 (#311–#315) — **merged upstream v0.14.0** | — | Same bars per PR | Same |
+| **1 — Membership + config-sync** (v3: **Raft**, ADR-001) | `--cluster*` CLI; Raft membership incl. graceful leave; `ControlOp` config writes + read-after-write barrier + durable intent log + op-id dedup (replaces the v2 gossip mechanism); redb log/vote/snapshot + cold start; `/_cluster/{members,config,health,imposters,ops}`; `/readyz`. Transport substrate (#8) merged. | 0a ✅ | 3-node harness: `POST /imposters` on A visible & serving on B/C ≤ 5 s (`test_config_sync_converges`); kill B mid-run → A/C unaffected, B rejoin converges (`test_node_rejoin`); sibling-port config change preserves scenario state (`test_reconcile_preserves_state`); stub reorder converges order-correct (`test_reconcile_reorder`); unreachable seeds ⇒ never Ready (`test_no_seeds_not_ready`); full-cluster cold restart restores config incl. tombstones (`test_cold_start`); SIGTERM leave under load → zero data-plane errors on survivors AND zero lost acknowledged writes (`test_graceful_leave`). Chaos: C4, C5, C6, C7, **C14, C15** | 3-node harness: `POST /imposters` on A visible & serving on B/C ≤ 5 s (`test_config_sync_converges`); kill B mid-run → A/C unaffected, B rejoin converges (`test_node_rejoin`); sibling-port config change preserves scenario state (`test_reconcile_preserves_state`); stub reorder converges order-correct (`test_reconcile_reorder`); unreachable seeds ⇒ never Ready (`test_no_seeds_not_ready`); full-cluster cold restart restores config incl. tombstones (`test_cold_start`); SIGTERM leave under load → zero data-plane errors on survivors AND zero lost acknowledged writes (CAS ladder across the leave) (`test_graceful_leave`). Chaos: C4, C5, C6, C7 | `--cluster` off → OSS single node. **Truth scope:** a de-clustered node serves the full fleet config only if it ran with `--datadir` (the OSS write-through) — with `--configfile`-only deployments, export a snapshot from `--cluster-state-dir` first. Rollback is per-fleet: mixed on/off nodes behind one LB diverge immediately |
 | **2 — Scenario/flow state** | `ClusteredFlowStore`: owner-serialized reads (match gate) + CAS, successor replication, adoption; `/_cluster/kv/{flow_id}`; stuck-scenario & split-brain runbooks | U-1, U-2 (+0a) | multi-step scenario round-robin across 3 nodes at 10 ms pacing: transitions linear per flow, zero illegal transitions, zero lost updates over 10 k iterations (`test_scenario_cluster_linear`); owner kill mid-scenario → adopt within 1 replication round or flagged reset, never an illegal transition (`test_scenario_handoff`). Chaos: C1, C8, C9, C12, C13 | `--cluster-features` without `flow-state` → local stores |
 | **3 — Recorded-request verification** | `ClusteredJournal`: sharded log, watermarks, pull-on-read, generation clears; count G-counter | U-4 (+0a) | spray N (< shard-cap) requests across 3 nodes → `GET .../requests` on each node returns exactly N (`test_journal_merge_exact`); `DELETE savedRequests` clears cluster-wide ≤ 5 s incl. concurrent appends, clock-skew-immune (`test_journal_clear`); `numberOfRequests` = N on every node (`test_count_merge`) | `--cluster-features` without `journal` → local Vec |
 | **4 — Response sequencing (strict = Redis first)** | `RedisSequencer` (strict, requires `--cluster-redis <url>`); `ClusteredSequencer` (gossip-native, experimental flag) | U-3 (+0a); **named customer request on file for gossip-native strict** | Redis mode: cyclic stub sprayed across nodes → global sequence no dup/skip incl. during single-node kill (`test_sequence_redis_strict`); gossip mode: no dup/skip while membership stable, documented reset on handoff (`test_sequence_no_dup_no_skip`, `test_sequence_handoff_reset`). Chaos: C2, C13 | feature flag off → per-node cursors (today's behavior) |
@@ -1101,7 +1197,7 @@ parallelized compose stacks); **nightly full** = 100 iterations across parallel 
 **invariant violations never retry** — they file as bugs; persistently flaky scenarios get
 quarantined behind an issue, not deleted.
 
-Regression: entire existing `rift-core`/`rift-http-proxy` test suite runs against
+Regression: entire existing `rift-mock-core`/`rift-http-proxy` test suite runs against
 `rift-ee-server` with `--cluster` **off** → byte-identical behavior; hot-path
 micro-benches (`matcher_bench`) within 2 %. Pipeline: `cargo fmt`,
 `cargo clippy -- -D warnings`, `cargo test` (both repos).
@@ -1143,9 +1239,8 @@ cross-node flows; fleet-wide config + verification.
 
 ### 13.3 Kill criteria (checked at each phase gate)
 
-- **Phase 0 gate:** if U-6/U-7 are not merged upstream within 6 weeks of PR, ship the
-  seams via a temporary patched submodule branch, record the open-core-boundary debt in
-  the decision log, and re-evaluate.
+- **Phase 0 gate:** ✅ **discharged.** All seams merged upstream in v0.14.0 (#311–#318); no
+  patched-submodule debt was incurred. The Phase-0 timeline risk is closed.
 - **Phase 1 gate:** if no design partner runs a ≥ 3-node Phase-1 cluster against real
   workloads within one quarter of release, **pause 2–5; resume only when a named design
   partner commits to a paid pilot** (config-sync + HA may be the whole sellable feature).
@@ -1169,7 +1264,7 @@ framing when filed: *"pluggable runtime-state backends & response decoration for
 embedders (#203)"* — so five trait-extraction PRs from one author read as a coherent
 embeddability program, not an unexplained seam campaign.
 
-### U-1 — `FlowStore::compare_and_set` (crate `rift-core`, `extensions::flow_state`)
+### U-1 — `FlowStore::compare_and_set` (crate `rift-mock-core`, `extensions::flow_state`)
 
 ```rust
 pub enum CasOutcome { Applied, Conflict(Option<Value>) }
@@ -1205,7 +1300,7 @@ impl ImposterManager {
 
 `Imposter::create_flow_store` (`imposter/core.rs:152`) consults the provider first;
 `Imposter::new`'s single production call site (`manager.rs:209`) threads it through.
-*OSS justification:* rift-core is an embeddable library (issue #203) with FFI consumers;
+*OSS justification:* rift-mock-core is an embeddable library (issue #203) with FFI consumers;
 embedders supply custom stores (own persistence, test fakes). Also fixes the documented
 construction-time caveat (`imposter/core.rs:148-151`): a manager-scoped provider serves
 stores to imposters whose scenario stubs arrive after creation. *Compat:* no provider →
@@ -1413,9 +1508,19 @@ driver, journal shards/watermarks/generation clears, proxyOnce Pending/Recorded 
 Redis impls of U-3/U-4/U-5, the `ResponseDecorator` impl, `/_cluster/*` endpoints,
 `--cluster*` CLI, cluster-aware gateway fallback, k8s manifests, chaos harness.
 
-## Appendix B — sanitized upstream issue/PR drafts
+## Appendix B — upstream seams (FILED AND MERGED)
 
-Ready to file on `EtaCassiopeia/rift` (generic wording; no enterprise references). One
+> **v3 status: Phase 0 complete.** All eight seams below shipped upstream in v0.14.0 as
+> `achird-labs/rift#311–#318` — this is now a *merged mapping*, not a to-file list:
+> U-1→#311 (`compare_and_set`), U-2→#312 (`FlowStoreProvider`), U-3→#313 (`ResponseSequencer`),
+> U-4→#314 (`RequestJournal`), U-5→#315 (`ProxyRecordingStore`), U-6→#316 (`apply_config` +
+> events + `stub_key`), U-7→#317 (embeddable `ServerBuilder`/gateway/metrics), U-8→#318
+> (`ResponseDecorator` + `BackendUnavailable`). Two further seams are queued for later phases:
+> **U-11** the front-door route table (#19) and **U-12** the `ImposterSource` provider trait
+> (#20); and RFC-002 adds **U-9** (admin authorizer) + **U-10** (principal on events). The
+> original drafts are retained below for provenance.
+
+Filed on `achird-labs/rift` (generic wording; no enterprise references). One
 umbrella issue — *"Pluggable runtime-state backends & embeddable server (#203
 follow-up)"* — then one PR per seam:
 
@@ -1450,8 +1555,8 @@ follow-up)"* — then one PR per seam:
 
 | # | Decision | Alternatives rejected & why |
 |---|---|---|
-| D-1 | No consensus layer (no Raft/etcd); AP + single-writer-by-ownership + settle/generations | Raft (openraft) gives linearizable handoff but adds quorum ops to the request path, a WAL, and real operational complexity — disproportionate for test-run-scoped state; external etcd violates the zero-dependency premise. Customers needing strict-today take D-12's Redis path |
-| D-2 | chitchat (MIT) for membership + small-KV gossip; wrapped behind `rift-cluster::membership` | foca (github.com/caio/foca) = membership only (would need hand-rolled KV); memberlist ports immature; wrapping contains the swap risk |
+| ~~D-1~~ | ~~No consensus layer; AP + single-writer-by-ownership + settle/generations~~ **SUPERSEDED by D-15 (ADR-001).** | The four requirements R1–R4 (§1.1) are a request for a strongly consistent *control plane*, which D-1 declined. D-1's premise — "quorum ops on the request path" — was the error: Raft carries only the control plane (human/CI-frequency), never the data path. Retained for history. |
+| ~~D-2~~ | ~~chitchat (MIT) for membership + small-KV gossip~~ **SUPERSEDED by D-15/D-16 (ADR-001).** | Membership is now a Raft-log value (`openraft`); the versioned-KV gossip it provided is replaced by the Raft state machine. Retained for history. |
 | D-3 | HRW hashing, no vnodes | Consistent-hash rings with vnodes shine at N≫16 and weighted nodes; HRW is simpler, minimal churn on membership change, O(N) fine at our scale |
 | D-4 | Config bodies via content-addressed RPC fetch, not gossip | Gossiping full configs blows the SWIM payload budget and re-floods every round; digests converge fast and bodies transfer once per node |
 | D-5 | Two-level, order-aware reconcile (LCS edit script) on top of by-id/positional stub CRUD | Whole-imposter replace per change resets runtime state cluster-wide; set-diff (v2 draft 1) missed reorders and reordered keyless edits — order is match priority, so the edit script must be order-aware |
@@ -1463,3 +1568,7 @@ follow-up)"* — then one PR per seam:
 | D-11 | Plain gateway listener upstreams with U-7 (promotion of #212); only cluster-aware dispatch (bind-failure fallback) stays enterprise | Keeping a generic single-node convenience enterprise-only has bad optics, zero moat (community can promote #212 trivially), and weakens U-7's story |
 | D-12 | Strict sequencing/proxyOnce ship **Redis-backed first**; gossip-native single-writer versions are demand-gated experimental follow-ons | Gossip-exact semantics are the hardest engineering in the RFC aimed at the least-demanded guarantee; the trait seams make the backend invisible to customers; target customers already operate Redis. The zero-dependency premise stays intact for Phases 1–3 (membership, config-sync, scenario state, verification) |
 | D-13 | LB header affinity treated as stickiness only; owner co-location is NOT assumed (one LAN RPC per stateful op is the budget) | v1/v2-draft claimed "receiving node is usually the owner" — false: LBs hash onto their own ring. A future sticky-owner lease (first-touch ownership) could align them but is a separate design with its own fencing story; recorded as future work, not assumed |
+| D-14 | `--cluster` + `--runtime per-core` rejected at startup; `--cluster` + intercept mode likewise | Upstream RFC-712's per-core topology runs single-threaded pinned worker runtimes; the §7.7 sync bridge parks caller threads, and a per-core worker has only one thread to park, so a single owner outage would stall every connection pinned to it. Enforced in the #8 config guard. |
+| **D-15** | **Embedded Raft (`openraft`) control plane over gossip (ADR-001).** Membership + configs + tenancy + admin intents in a Raft log; flow state stays off consensus. | Bolting a barrier + persist-before-ack + intent log + dedup onto v2 gossip = four hand-rolled protocols atop the settle/generation machinery that only existed because membership wasn't agreed — a worse consensus by hand. External Temporal/etcd violates the zero-dependency premise (revisit only as an *optional* integration, D-12 pattern). **Supersedes D-1, D-2.** |
+| **D-16** | **`redb` for all cluster durability** (Raft log/vote/snapshot + the #16 flow WAL). | Hand-rolled WAL is error-prone; `sled` rejected on maintenance; `fjall` kept as the LSM fallback if write-amplification bites. Pure Rust — static-musl/`FROM scratch` safe. `Durability` is `Immediate`-only since redb 2.0, so #16's `async` flow durability is group-commit (batch one `Immediate` per interval), not an `Eventual` mode. |
+| **D-17** | **Flow state stays off consensus** (HRW ownership + successor replication + WAL); ownership derived from *committed* membership. | A quorum write per scenario transition at 20–40k RPS is an outage. D-8 (cursor reset on ownership move) and D-12 (Redis-strict path) both still stand. |
