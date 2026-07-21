@@ -597,6 +597,10 @@ impl RedbStateMachine {
         write_txn
             .commit()
             .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        // Counted per call, not per new row: a same-key re-park (idempotent
+        // overwrite) can over-report the pending gauge until the next replay
+        // sweep resamples it from the ledger.
+        crate::metrics::intent_parked();
         Ok(())
     }
 
@@ -610,17 +614,21 @@ impl RedbStateMachine {
             .db
             .begin_write()
             .map_err(|e| StorageIOError::write_state_machine(&e))?;
-        {
+        let removed = {
             let mut table = write_txn
                 .open_table(PENDING_INTENTS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             table
                 .remove(key.as_str())
-                .map_err(|e| StorageIOError::write_state_machine(&e))?;
-        }
+                .map_err(|e| StorageIOError::write_state_machine(&e))?
+                .is_some()
+        };
         write_txn
             .commit()
             .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        if removed {
+            crate::metrics::intent_unparked();
+        }
         Ok(())
     }
 
@@ -821,6 +829,11 @@ impl RedbStateMachine {
     /// Mutate `sm_configs` for one validated op and return the engine actions it
     /// implies. `Ok(Err(reason))` is a deterministic domain refusal (recorded as
     /// a `Failed` outcome); `Err(_)` is real storage I/O and fails apply.
+    ///
+    /// The metric gauges set here fire before the batch's commit; they are
+    /// observe-only (never inputs to any decision), and an apply that fails
+    /// after them is fatal to the node — the process-local registry dies with
+    /// the process that briefly over-reported.
     #[allow(clippy::result_large_err)]
     fn mutate_tables(
         configs: &mut Table<'_, (&'static str, u16), &'static str>,
@@ -849,6 +862,7 @@ impl RedbStateMachine {
                 configs
                     .insert((tenant.as_str(), port), value.as_str())
                     .map_err(io)?;
+                crate::metrics::config_applied(port, index);
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
             ControlOp::PatchStubs { tenant, port, edit } => {
@@ -880,6 +894,7 @@ impl RedbStateMachine {
                 configs
                     .insert((tenant.as_str(), *port), value.as_str())
                     .map_err(io)?;
+                crate::metrics::config_applied(*port, index);
                 Ok(Ok(vec![EngineAction::Patch {
                     port: *port,
                     edit: edit.clone(),
@@ -890,11 +905,26 @@ impl RedbStateMachine {
                 // idempotent at the state-machine level (the admin-surface 404
                 // for a missing imposter is the write path's concern).
                 configs.remove((tenant.as_str(), *port)).map_err(io)?;
+                crate::metrics::config_removed(*port);
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
             ControlOp::DeleteAll { tenant } => {
                 let tenant = tenant.as_str();
+                let removed: Vec<u16> = {
+                    let mut removed = Vec::new();
+                    for item in configs.iter().map_err(io)? {
+                        let (key, _) = item.map_err(io)?;
+                        let (t, port) = key.value();
+                        if t == tenant {
+                            removed.push(port);
+                        }
+                    }
+                    removed
+                };
                 configs.retain(|(t, _), _| t != tenant).map_err(io)?;
+                for port in removed {
+                    crate::metrics::config_removed(port);
+                }
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
             // `validate` refused these before mutation is reached; keep a
@@ -957,6 +987,7 @@ impl RedbStateMachine {
                 }
             }
         }
+        crate::metrics::observe_apply_failures(&self.apply_failures.lock());
     }
 
     async fn drive_patch(
@@ -1156,6 +1187,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                         if let Some(previous) = previous {
                             // Replayed intent: return the original response —
                             // same revision both times — and change nothing.
+                            crate::metrics::dedup_hit();
                             responses.push(previous.response);
                             continue;
                         }

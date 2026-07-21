@@ -19,7 +19,9 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
-use prometheus::{Gauge, GaugeVec, register_gauge, register_gauge_vec};
+use prometheus::{
+    Gauge, GaugeVec, IntCounter, register_gauge, register_gauge_vec, register_int_counter,
+};
 
 use crate::raft::{Ring, StatusReport};
 
@@ -52,6 +54,138 @@ lazy_static! {
         "1 when this node's cluster port runs without authentication"
     )
     .expect("rift_cluster_insecure registers once");
+
+    // -- config-sync (issue #9) ---------------------------------------------
+
+    /// `rift_cluster_write_forwards_total` — writes this node accepted and
+    /// handed to the leader (one per hop, so a chased leadership counts twice).
+    static ref WRITE_FORWARDS: IntCounter = register_int_counter!(
+        "rift_cluster_write_forwards_total",
+        "Admin writes forwarded from this node toward the leader"
+    )
+    .expect("rift_cluster_write_forwards_total registers once");
+
+    /// `rift_cluster_barrier_waits_total` — write barriers run.
+    static ref BARRIER_WAITS: IntCounter = register_int_counter!(
+        "rift_cluster_barrier_waits_total",
+        "Read-after-write barriers run on this node"
+    )
+    .expect("rift_cluster_barrier_waits_total registers once");
+
+    /// `rift_cluster_barrier_timeouts_total` — barriers that gave up with
+    /// unapplied nodes (the write still answered 2xx, with a warning header).
+    static ref BARRIER_TIMEOUTS: IntCounter = register_int_counter!(
+        "rift_cluster_barrier_timeouts_total",
+        "Barriers that timed out with at least one unapplied node"
+    )
+    .expect("rift_cluster_barrier_timeouts_total registers once");
+
+    /// `rift_cluster_intents_parked_total` / `_replayed_total` — the R4 ledger's
+    /// traffic; `rift_cluster_intents_pending` — its current depth, resampled by
+    /// every replay sweep so a restart's carried-over ledger reads true.
+    static ref INTENTS_PARKED: IntCounter = register_int_counter!(
+        "rift_cluster_intents_parked_total",
+        "Admin intents durably parked on this node"
+    )
+    .expect("rift_cluster_intents_parked_total registers once");
+    static ref INTENTS_REPLAYED: IntCounter = register_int_counter!(
+        "rift_cluster_intents_replayed_total",
+        "Parked intents replayed to completion by this node"
+    )
+    .expect("rift_cluster_intents_replayed_total registers once");
+    static ref INTENTS_PENDING: Gauge = register_gauge!(
+        "rift_cluster_intents_pending",
+        "Parked intents currently awaiting replay on this node"
+    )
+    .expect("rift_cluster_intents_pending registers once");
+
+    /// `rift_cluster_dedup_hits_total` — replayed ops the state machine
+    /// collapsed to their original response instead of re-applying.
+    static ref DEDUP_HITS: IntCounter = register_int_counter!(
+        "rift_cluster_dedup_hits_total",
+        "Replayed ops collapsed by op-id dedup"
+    )
+    .expect("rift_cluster_dedup_hits_total registers once");
+
+    /// `rift_cluster_config_revision{port}` — the log index that last wrote
+    /// each applied config. Two nodes disagreeing here have not converged.
+    static ref CONFIG_REVISION: GaugeVec = register_gauge_vec!(
+        "rift_cluster_config_revision",
+        "Applied config revision (log index) by imposter port",
+        &["port"]
+    )
+    .expect("rift_cluster_config_revision registers once");
+
+    /// `rift_cluster_bind_failures{port}` — 1 while the local engine cannot
+    /// realize a committed config (port 0 is the set-level slot). Resampled
+    /// after every engine drive, so a healed port clears.
+    static ref BIND_FAILURES: GaugeVec = register_gauge_vec!(
+        "rift_cluster_bind_failures",
+        "1 while a committed config cannot be realized locally, by port",
+        &["port"]
+    )
+    .expect("rift_cluster_bind_failures registers once");
+}
+
+/// One write handed toward the leader (per hop).
+pub(crate) fn write_forwarded() {
+    WRITE_FORWARDS.inc();
+}
+
+/// A barrier ran; `unapplied` is how many members had not confirmed by its
+/// deadline (0 = clean).
+pub(crate) fn barrier_observed(unapplied: usize) {
+    BARRIER_WAITS.inc();
+    if unapplied > 0 {
+        BARRIER_TIMEOUTS.inc();
+    }
+}
+
+pub(crate) fn intent_parked() {
+    INTENTS_PARKED.inc();
+    INTENTS_PENDING.inc();
+}
+
+pub(crate) fn intent_unparked() {
+    INTENTS_PENDING.dec();
+}
+
+pub fn intent_replayed() {
+    INTENTS_REPLAYED.inc();
+}
+
+/// Resample the pending-intents depth from the ledger itself. The inc/dec pair
+/// drifts across a restart (the gauge resets, the ledger persists), so every
+/// replay sweep sets the truth.
+pub fn intents_pending_sampled(depth: usize) {
+    INTENTS_PENDING.set(depth as f64);
+}
+
+pub(crate) fn dedup_hit() {
+    DEDUP_HITS.inc();
+}
+
+pub(crate) fn config_applied(port: u16, revision: u64) {
+    CONFIG_REVISION
+        .with_label_values(&[&port.to_string()])
+        .set(revision as f64);
+}
+
+pub(crate) fn config_removed(port: u16) {
+    // A port with no config has no revision; an error here just means the
+    // label was never set.
+    let _ = CONFIG_REVISION.remove_label_values(&[&port.to_string()]);
+}
+
+/// Resample the engine-drive failure map after a drive: set 1 for every
+/// failing port, clearing everything else.
+pub(crate) fn observe_apply_failures(failures: &std::collections::BTreeMap<u16, String>) {
+    BIND_FAILURES.reset();
+    for port in failures.keys() {
+        BIND_FAILURES
+            .with_label_values(&[&port.to_string()])
+            .set(1.0);
+    }
 }
 
 /// Record whether this node's cluster port is unauthenticated. Set once at
@@ -319,6 +453,71 @@ mod tests {
         assert_eq!(
             gauge_from_registry("rift_cluster_insecure", None),
             Some(0.0)
+        );
+    }
+
+    /// Issue #9: the config-sync families reach the global registry (the one
+    /// the OSS `/metrics` endpoint serves), and the resampled gauges converge
+    /// to the sampled truth rather than accumulating drift.
+    #[test]
+    fn config_sync_families_reach_the_registry() {
+        let _guard = counter_guard();
+        write_forwarded();
+        barrier_observed(0);
+        barrier_observed(2);
+        intent_parked();
+        intent_unparked();
+        intent_replayed();
+        intents_pending_sampled(3);
+        dedup_hit();
+        config_applied(8080, 7);
+        let mut failures = std::collections::BTreeMap::new();
+        failures.insert(8080_u16, "bind".to_owned());
+        observe_apply_failures(&failures);
+
+        let families: std::collections::HashSet<String> = prometheus::gather()
+            .into_iter()
+            .map(|f| f.get_name().to_owned())
+            .collect();
+        for name in [
+            "rift_cluster_write_forwards_total",
+            "rift_cluster_barrier_waits_total",
+            "rift_cluster_barrier_timeouts_total",
+            "rift_cluster_intents_parked_total",
+            "rift_cluster_intents_replayed_total",
+            "rift_cluster_intents_pending",
+            "rift_cluster_dedup_hits_total",
+            "rift_cluster_config_revision",
+            "rift_cluster_bind_failures",
+        ] {
+            assert!(families.contains(name), "{name} missing from the registry");
+        }
+
+        assert_eq!(
+            gauge_from_registry("rift_cluster_intents_pending", None),
+            Some(3.0),
+            "the sweep sample overrides inc/dec drift"
+        );
+        assert_eq!(
+            gauge_from_registry("rift_cluster_config_revision", Some(("port", "8080"))),
+            Some(7.0)
+        );
+        assert_eq!(
+            gauge_from_registry("rift_cluster_bind_failures", Some(("port", "8080"))),
+            Some(1.0)
+        );
+
+        // A drive with no failures clears the vector; a removed config drops
+        // its revision label.
+        observe_apply_failures(&std::collections::BTreeMap::new());
+        assert_eq!(
+            gauge_from_registry("rift_cluster_bind_failures", Some(("port", "8080"))),
+            None
+        );
+        config_removed(8080);
+        assert_eq!(
+            gauge_from_registry("rift_cluster_config_revision", Some(("port", "8080"))),
+            None
         );
     }
 }
