@@ -72,6 +72,8 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-node-name <NAME>` | Operator-facing node name; seeds the first node id only |
 | `--cluster-leave-timeout <SECONDS>` | Drain window after SIGTERM (default `10`) |
 | `--cluster-probe-bind <ADDR>` | Address for `/readyz` and `/healthz` (default `0.0.0.0:2526`) |
+| `--cluster-write-barrier <MODE>` | What a committed admin write waits for before its 2xx: `ready-nodes` (default — every Ready node has applied it, so any node serves it) or `none` (committed and applied locally) |
+| `--cluster-write-barrier-timeout <SECONDS>` | How long the barrier waits (default `2`) before answering anyway with a `Rift-Cluster-Warnings: unapplied=<node,…>` header |
 
 Each flag also has an environment-variable spelling (`RIFT_CLUSTER_BIND`,
 `RIFT_CLUSTER_SECRET_FILE`, …), which is the intended vehicle for the secret.
@@ -191,21 +193,48 @@ The mapping is structural: an annotation `cluster.revision` becomes
 `Rift-Cluster-Revision`. Repeated notes (warnings, above all) are appended as
 separate header lines rather than collapsed.
 
-## What lands later
+## The clustered admin write path
 
-This binary is the Phase-1 composition. Config replication itself — the write
-path, digest gossip, anti-entropy fetch and incremental reconcile — arrives with
-the config-sync work, which registers its own `/readyz` gate so a node is not
-Ready until its initial reconcile completes. Until then the only gate is
-`cluster-joined`.
+Under `--cluster`, the public admin address is served by a thin front: the
+config-mutating routes (`POST/PUT/DELETE /imposters`, `DELETE
+/imposters/:port`, stub CRUD) become replicated control ops committed through
+the Raft leader — submitted on any node, forwarded automatically — and
+everything else (reads, scenario state, recorded requests, enable/disable) is
+reverse-proxied to the local engine unchanged. A 2xx from a mutating route
+means the write is durable on a majority and, with the default
+`--cluster-write-barrier=ready-nodes`, applied on every Ready node; if the
+barrier times out the response still succeeds and names the lagging nodes in
+`Rift-Cluster-Warnings`. Every mutating response carries
+`Rift-Cluster-Revision` (`<tenant>:<port>@<log-index>`) and
+`Rift-Cluster-Op-Id`. With no reachable leader, writes answer `503` with the
+`unavailable` error type (durable intent parking arrives with the intents
+slice of #9).
+
+Cluster-mode divergences from a single node: an imposter must carry an explicit
+`port` (an auto-assigned port cannot replicate), and `file:`/`ref:` script
+sources are not yet resolved on the replicated path (they are still gated by
+`--allowInjection`). Concurrent writers to the *same* imposter are
+last-writer-wins for now — an expected-revision precondition on
+`Rift-Cluster-Revision` is planned follow-up; serialize per-imposter writers
+until it lands. `PUT /imposters` commits as a sequence (upserts first, then
+prunes), so a write interrupted by a leadership change can transiently leave a
+superset of old and new imposters — a retry converges it.
+
+A node is not Ready until its `cluster-reconciled` gate opens: its applied
+state has caught up to the leader's and its imposters are bound (or their
+failures reported on `GET /_cluster/imposters`).
+
+## What lands later
 
 Two flags from the Phase-1 plan are deliberately **not** accepted yet, because
 nothing behind them exists and this codebase refuses flags that quietly do
 nothing (that is the same principle the startup guards enforce):
 
-- `--cluster-degraded-mode` — governs what a config write does when its owner is
-  unreachable, and there is no config write path until config-sync lands.
-- `--cluster-features` — there is no feature namespace to gate.
+- `--cluster-degraded-mode` — the degradation table gives admin writes exactly
+  one behavior (`503`, durably parked, replayed), so this flag belongs to the
+  flow-state features (#16) that actually have a `local` mode to choose.
+- `--cluster-features` — the namespace gates nothing until a second clustered
+  feature (#16) exists.
 
 Both arrive with the code that reads them.
 

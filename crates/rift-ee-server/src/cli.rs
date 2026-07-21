@@ -95,6 +95,38 @@ pub struct ClusterArgs {
         env = "RIFT_CLUSTER_PROBE_BIND"
     )]
     pub cluster_probe_bind: SocketAddr,
+
+    /// What a committed admin write waits for before its 2xx: every Ready
+    /// node's applied index (read-your-write anywhere), or nothing beyond the
+    /// Raft commit itself
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        default_value_t = WriteBarrier::ReadyNodes,
+        env = "RIFT_CLUSTER_WRITE_BARRIER"
+    )]
+    pub cluster_write_barrier: WriteBarrier,
+
+    /// Seconds the write barrier waits before answering anyway with a
+    /// Rift-Cluster-Warnings header naming the unapplied nodes
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 2,
+        env = "RIFT_CLUSTER_WRITE_BARRIER_TIMEOUT"
+    )]
+    pub cluster_write_barrier_timeout: u64,
+}
+
+/// `--cluster-write-barrier` modes (issue #9 §4).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteBarrier {
+    /// Wait until every Ready node has applied the write (the default): a 2xx
+    /// means any node serves the new config.
+    ReadyNodes,
+    /// Answer as soon as the write is committed and applied locally.
+    None,
 }
 
 /// What `--version` prints: this build's version, its edition, and the

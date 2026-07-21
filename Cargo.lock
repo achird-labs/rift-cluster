@@ -2508,12 +2508,15 @@ dependencies = [
  "reqwest",
  "rift-cluster",
  "rift-ee",
+ "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "xxhash-rust",
 ]
 

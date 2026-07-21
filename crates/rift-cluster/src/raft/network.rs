@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
 
 use super::{NodeId, TypeConfig};
+use crate::control::{ControlRequest, ControlResponse};
 use crate::rpc::{HandlerFuture, Router, RpcClient, RpcError};
 
 /// AppendEntries receiving endpoint.
@@ -36,6 +37,13 @@ pub(crate) const RAFT_VOTE_PATH: &str = "/internal/v1/raft/vote";
 pub(crate) const RAFT_SNAPSHOT_PATH: &str = "/internal/v1/raft/snapshot";
 /// Seed-join endpoint: a starting node asks an existing member to admit it.
 pub(crate) const CLUSTER_JOIN_PATH: &str = "/internal/v1/cluster/join";
+/// Write-forward endpoint: a non-leader node hands a [`ControlRequest`] to the
+/// leader (issue #9). The reply distinguishes "committed" from "I am not the
+/// leader either — try there", so the forwarder can chase a moved leadership.
+pub(crate) const CLUSTER_WRITE_PATH: &str = "/internal/v1/cluster/write";
+/// Applied-index endpoint: reports how far this node's state machine has
+/// applied, for the write barrier (issue #9).
+pub(crate) const CLUSTER_APPLIED_PATH: &str = "/internal/v1/applied";
 
 /// The maximum voter count the cluster auto-promotes a joining learner up to.
 /// Beyond this a larger quorum costs more than it buys, so extra members stay
@@ -182,9 +190,36 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot) -> Router {
     let append = slot.clone();
     let vote = slot.clone();
     let snapshot = slot.clone();
+    let write = slot.clone();
+    let applied = slot.clone();
     let join = slot;
 
     router
+        .route(
+            "POST",
+            CLUSTER_WRITE_PATH,
+            Arc::new(move |body: Vec<u8>| -> HandlerFuture {
+                let slot = write.clone();
+                Box::pin(async move {
+                    let raft = raft_of(&slot)?;
+                    let request = decode::<ControlRequest>(&body)?;
+                    let reply = local_write(raft, request).await?;
+                    encode(&reply)
+                })
+            }),
+        )
+        .route(
+            "POST",
+            CLUSTER_APPLIED_PATH,
+            Arc::new(move |_body: Vec<u8>| -> HandlerFuture {
+                let slot = applied.clone();
+                Box::pin(async move {
+                    let raft = raft_of(&slot)?;
+                    let applied = raft.metrics().borrow().last_applied.map(|id| id.index);
+                    encode(&AppliedReply { applied })
+                })
+            }),
+        )
         .route(
             "POST",
             RAFT_APPEND_PATH,
@@ -252,6 +287,42 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot) -> Router {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JoinAccepted {
     admitted: bool,
+}
+
+/// Reply to a forwarded write ([`CLUSTER_WRITE_PATH`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum WriteReply {
+    /// The op committed (or deduped); this is the state machine's response.
+    Done(ControlResponse),
+    /// The contacted node is not the leader. Carries its current hint so the
+    /// forwarder can chase a leadership that moved mid-flight.
+    ForwardTo { leader_addr: Option<String> },
+}
+
+/// Reply to an applied-index probe ([`CLUSTER_APPLIED_PATH`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AppliedReply {
+    pub applied: Option<u64>,
+}
+
+/// Run a client write on the local Raft, mapping openraft's not-the-leader
+/// refusal into [`WriteReply::ForwardTo`] and everything else into a handler
+/// error. Shared by the receiving endpoint and [`super::node::RaftNode`]'s own
+/// submit path so both classify leadership movement identically.
+pub(crate) async fn local_write(
+    raft: &Raft<TypeConfig>,
+    request: ControlRequest,
+) -> Result<WriteReply, RpcError> {
+    use openraft::error::{ClientWriteError, RaftError};
+    match raft.client_write(request).await {
+        Ok(response) => Ok(WriteReply::Done(response.data)),
+        Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
+            Ok(WriteReply::ForwardTo {
+                leader_addr: forward.leader_node.map(|node| node.addr),
+            })
+        }
+        Err(e) => Err(RpcError::Handler(e.to_string())),
+    }
 }
 
 /// Admit `id`@`advertise` to the cluster: add it as a learner, wait for it to

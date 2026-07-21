@@ -200,7 +200,7 @@ impl ControlResponse {
 ///
 /// `Err` carries the reason recorded in the `Failed` outcome. It must depend
 /// only on the op itself, never on per-node state.
-pub(crate) fn validate(op: &ControlOp) -> Result<(), String> {
+pub fn validate(op: &ControlOp) -> Result<(), String> {
     match op {
         ControlOp::PutImposter { tenant, config } => {
             require_default_tenant(tenant)?;

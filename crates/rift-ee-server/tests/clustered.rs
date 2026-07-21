@@ -85,9 +85,20 @@ async fn allow_solo_bootstraps_a_single_node_cluster_and_opens_the_gate() {
     let probes = server.probe_addr().expect("probes bound under --cluster");
     assert!(server.cluster_addr().is_some());
 
-    let (status, body) = probe(&probes.to_string(), "/readyz").await;
-    assert_eq!(status, 200, "a bootstrapped solo node is ready: {body}");
-    assert_eq!(body["pending"], serde_json::json!([]));
+    // The reconcile gate opens asynchronously just after start, so poll.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = probe(&probes.to_string(), "/readyz").await;
+        if status == 200 {
+            assert_eq!(body["pending"], serde_json::json!([]));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a bootstrapped solo node must become ready: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     server.shutdown().await;
 }
@@ -268,7 +279,10 @@ async fn probes_answer_while_the_node_is_still_joining() {
     let (status, body) = probe(&probe_bind, "/readyz").await;
     assert_eq!(status, 503, "the node has not joined yet: {body}");
     assert_eq!(body["status"], "not-ready");
-    assert_eq!(body["pending"], serde_json::json!(["cluster-joined"]));
+    assert_eq!(
+        body["pending"],
+        serde_json::json!(["cluster-joined", "cluster-reconciled"])
+    );
 
     assert!(
         !starting.is_finished(),

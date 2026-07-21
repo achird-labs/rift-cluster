@@ -16,6 +16,7 @@
 //! * [`cluster_api`] — the authenticated `/_cluster/*` operator surface on the
 //!   cluster port.
 
+pub mod admin_front;
 pub mod cli;
 pub mod cluster_api;
 pub mod compose;

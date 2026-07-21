@@ -16,6 +16,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// The node has joined the control plane and knows a leader.
 pub const GATE_JOINED: &str = "cluster-joined";
 
+/// The node's applied state has caught up to the leader's commit index
+/// observed at join, and the local engine has been reconciled to it — its
+/// imposters are bound or their failures reported (issue #9, ADR-001 §5.2).
+pub const GATE_RECONCILED: &str = "cluster-reconciled";
+
 /// What `/readyz` reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadyState {

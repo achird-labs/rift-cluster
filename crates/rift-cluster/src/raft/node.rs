@@ -21,7 +21,10 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::network::{self, CLUSTER_JOIN_PATH, JoinRequest, RaftSlot, RpcNetwork};
+use super::network::{
+    self, CLUSTER_APPLIED_PATH, CLUSTER_JOIN_PATH, CLUSTER_WRITE_PATH, JoinRequest, RaftSlot,
+    RpcNetwork, WriteReply,
+};
 use super::ring::Ring;
 use super::store::{self, RedbStateMachine};
 use super::{NodeId, TypeConfig};
@@ -118,6 +121,12 @@ pub enum NodeError {
     /// A client write did not commit (not leader, timed out, or the runtime died).
     #[error("client write: {0}")]
     Write(String),
+
+    /// No leader is reachable to accept a write — no quorum, or leadership is
+    /// moving faster than the forwarder can chase it. The admin surface maps
+    /// this to a `503` with the `unavailable` error slug.
+    #[error("no reachable leader: {0}")]
+    Unavailable(String),
 
     /// A membership change (add-learner, promote, join) failed.
     #[error("membership: {0}")]
@@ -259,6 +268,16 @@ impl RaftNode {
         self.advertise
     }
 
+    /// Whether this node's log already carries a cluster membership — i.e. it
+    /// has bootstrapped or joined before and a restart should simply resume
+    /// from its durable state rather than re-initialize or re-join.
+    pub async fn is_initialized(&self) -> Result<bool, NodeError> {
+        self.raft
+            .is_initialized()
+            .await
+            .map_err(|e| NodeError::Runtime(e.to_string()))
+    }
+
     /// Bootstrap a brand-new single-node cluster with this node as the sole
     /// voter, then wait for it to elect itself leader.
     ///
@@ -355,6 +374,168 @@ impl RaftNode {
             },
         })
         .await
+    }
+
+    /// Submit a control op from *any* node: run it locally when this node is
+    /// the leader, otherwise forward it to the leader over the authenticated
+    /// cluster port — chasing a moving leadership through up to
+    /// [`Self::FORWARD_ATTEMPTS`] hops (issue #9, Ch. 4 write path).
+    ///
+    /// A committed refusal is still `Ok` (see [`Self::write`]); `Unavailable`
+    /// means no leader could be reached at all — the no-quorum shape.
+    pub async fn submit(&self, request: ControlRequest) -> Result<ControlResponse, NodeError> {
+        // Local first: on the leader this is the whole path, and on a follower
+        // openraft's refusal carries the freshest leader hint. Cloned because
+        // the original is re-serialized for each forward hop below.
+        let mut next = match network::local_write(&self.raft, request.clone())
+            .await
+            .map_err(|e| NodeError::Write(e.to_string()))?
+        {
+            WriteReply::Done(response) => return Ok(response),
+            WriteReply::ForwardTo { leader_addr } => leader_addr,
+        };
+
+        let mut detail = String::from("local write refused: not the leader");
+        for _ in 0..Self::FORWARD_ATTEMPTS {
+            let Some(addr) = next.take() else { break };
+            let peer: SocketAddr = match addr.parse() {
+                Ok(peer) => peer,
+                Err(e) => {
+                    detail = format!("leader hint {addr:?} does not parse: {e}");
+                    break;
+                }
+            };
+            let body = serde_json::to_vec(&request)
+                .map_err(|e| NodeError::Write(format!("encode forwarded write: {e}")))?;
+            match self
+                .client
+                .call(peer, "POST", CLUSTER_WRITE_PATH, body)
+                .await
+            {
+                Ok(reply) => {
+                    let reply: WriteReply = serde_json::from_slice(&reply)
+                        .map_err(|e| NodeError::Write(format!("decode forwarded write: {e}")))?;
+                    match reply {
+                        WriteReply::Done(response) => return Ok(response),
+                        WriteReply::ForwardTo { leader_addr } => {
+                            detail = format!("{peer} is not the leader");
+                            next = leader_addr;
+                        }
+                    }
+                }
+                Err(e) => {
+                    detail = format!("forward to {peer}: {e}");
+                    break;
+                }
+            }
+        }
+        Err(NodeError::Unavailable(detail))
+    }
+
+    /// How many leader hops [`Self::submit`] chases before reporting the
+    /// cluster unavailable. Bounded so a flapping election cannot park a client
+    /// indefinitely (issue #9: "3 bounded retries").
+    pub const FORWARD_ATTEMPTS: usize = 3;
+
+    /// Wait until every cluster member's applied index has reached `revision`,
+    /// or `timeout` elapses — the read-after-write barrier (issue #9). Returns
+    /// the ids of members that had NOT confirmed by the deadline; empty means
+    /// the whole fleet has applied the write.
+    ///
+    /// Peers report over [`CLUSTER_APPLIED_PATH`]; this node answers from its
+    /// own state machine. A member that cannot be reached is simply unconfirmed
+    /// — the barrier degrades to a warning, never an error (the write is
+    /// already durable and committed). "Members" is the full membership,
+    /// voters and learners alike: the barrier cannot see a remote node's
+    /// readiness gate, so a deliberately draining node may be named in the
+    /// warning — informational, not a failure.
+    pub async fn await_applied(&self, revision: u64, timeout: Duration) -> Vec<NodeId> {
+        let members: Vec<(NodeId, String)> = {
+            let receiver = self.raft.metrics();
+            let metrics = receiver.borrow();
+            metrics
+                .membership_config
+                .nodes()
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect()
+        };
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut pending: BTreeMap<NodeId, String> = members.into_iter().collect();
+        loop {
+            let confirmed: Vec<NodeId> = {
+                let mut confirmed = Vec::new();
+                for (id, addr) in &pending {
+                    if *id == self.id {
+                        let applied = self.raft.metrics().borrow().last_applied.map(|l| l.index);
+                        if applied.is_some_and(|a| a >= revision) {
+                            confirmed.push(*id);
+                        }
+                        continue;
+                    }
+                    let Ok(peer) = addr.parse::<SocketAddr>() else {
+                        continue;
+                    };
+                    if let Ok(reply) = self
+                        .client
+                        .call(peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
+                        .await
+                        && let Ok(reply) = serde_json::from_slice::<network::AppliedReply>(&reply)
+                        && reply.applied.is_some_and(|a| a >= revision)
+                    {
+                        confirmed.push(*id);
+                    }
+                }
+                confirmed
+            };
+            for id in confirmed {
+                pending.remove(&id);
+            }
+            if pending.is_empty() || tokio::time::Instant::now() >= deadline {
+                return pending.into_keys().collect();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The leader's applied index as it reports it right now — the catch-up
+    /// target the reconciled readiness gate waits on. `None` means no leader is
+    /// known or it could not be asked; callers treat that as "not yet" and
+    /// retry, so the swallowed transport detail costs nothing but a log line
+    /// the rpc layer already writes.
+    pub async fn leader_applied(&self) -> Option<u64> {
+        let (leader_id, addr) = {
+            let receiver = self.raft.metrics();
+            let metrics = receiver.borrow();
+            let leader_id = metrics.current_leader?;
+            let addr = metrics
+                .membership_config
+                .nodes()
+                .find(|(id, _)| **id == leader_id)
+                .map(|(_, node)| node.addr.clone())?;
+            (leader_id, addr)
+        };
+        if leader_id == self.id {
+            return self.raft.metrics().borrow().last_applied.map(|l| l.index);
+        }
+        let peer: SocketAddr = addr.parse().ok()?;
+        let reply = self
+            .client
+            .call(peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
+            .await
+            .ok()?;
+        serde_json::from_slice::<network::AppliedReply>(&reply)
+            .ok()
+            .and_then(|reply| reply.applied)
+    }
+
+    /// Drive the attached engine to the currently applied state — the
+    /// cold-start / post-join reconcile. A no-op without an engine.
+    pub async fn reconcile_engine(&self) -> Result<(), NodeError> {
+        self.sm_reader
+            .reconcile_engine()
+            .await
+            .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
     /// Read the committed imposter-config JSON for the default tenant's `port`

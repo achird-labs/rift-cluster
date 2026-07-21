@@ -27,6 +27,16 @@ pub const NOTE_WARNINGS: &str = "cluster.warnings";
 /// The node that owned the key this request was serialized through.
 pub const NOTE_OWNER: &str = "cluster.owner";
 
+/// Header names the admin write path sets directly on responses it builds
+/// itself (issue #9): the front terminates mutating routes outside the OSS
+/// handler pipeline, so no annotation scope exists there — but the names stay
+/// exactly what the decorator would have produced for the matching notes.
+pub const HEADER_REVISION: &str = "rift-cluster-revision";
+/// The op id a write carried (minted or client-supplied), for correlation.
+pub const HEADER_OP_ID: &str = "rift-cluster-op-id";
+/// Non-fatal write warnings, e.g. `unapplied=<node,…>` on a barrier timeout.
+pub const HEADER_WARNINGS: &str = "rift-cluster-warnings";
+
 /// Translates `cluster.*` annotations into `Rift-Cluster-*` response headers.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterDecorator;
