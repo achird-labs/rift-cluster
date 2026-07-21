@@ -79,6 +79,19 @@ pub fn snapshot() -> Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // The counters are process-global, so tests that read a baseline, mutate,
+    // and assert an exact delta race each other under `cargo test`'s default
+    // parallelism (one test's increment lands inside another's before/after
+    // window). Serialize exactly those tests through this lock; the recover
+    // ignores poisoning so one panicking test doesn't cascade into failures in
+    // the rest.
+    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
+
+    fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn failures_for(snapshot: &Snapshot, reason: &str) -> u64 {
         snapshot
@@ -125,6 +138,7 @@ mod tests {
 
     #[test]
     fn counters_record_and_snapshot() {
+        let _guard = counter_guard();
         let before = snapshot();
         bridge_rejected();
         rpc_failure("timeout");
@@ -141,6 +155,7 @@ mod tests {
 
     #[test]
     fn unknown_reasons_land_in_the_handler_bucket_rather_than_vanishing() {
+        let _guard = counter_guard();
         let before = failures_for(&snapshot(), "handler");
         rpc_failure("something-nobody-declared");
         assert_eq!(failures_for(&snapshot(), "handler"), before + 1);
@@ -151,6 +166,7 @@ mod tests {
         // `shed` is the capacity signal an operator sizes the fleet on, so a
         // downstream handler fault must never inflate it.
         use crate::rpc::RpcError;
+        let _guard = counter_guard();
         let before = failures_for(&snapshot(), "shed");
         rpc_failure(RpcError::Handler("downstream blew up".into()).reason());
         rpc_failure(RpcError::BodyTooLarge { limit: 1 }.reason());

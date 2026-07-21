@@ -142,8 +142,14 @@ impl Bridge {
                 Ok(outcome) => outcome,
                 Err(_) => Err(RpcError::Timeout),
             };
-            let _ = tx.send(outcome);
+            // Release the permit *before* handing the result back, not after:
+            // the op is done, so its capacity is free now, and dropping first
+            // establishes a happens-before so a caller that has received its
+            // result also sees the permit returned (a caller that timed out is
+            // already gone, and the op simply finishes and frees the permit
+            // whenever it completes — the slow-op capacity bound is unchanged).
             drop(permit);
+            let _ = tx.send(outcome);
         });
 
         let result = match rx.recv_timeout(deadline) {
