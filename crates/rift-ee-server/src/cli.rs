@@ -117,6 +117,12 @@ pub struct ClusterArgs {
         env = "RIFT_CLUSTER_WRITE_BARRIER_TIMEOUT"
     )]
     pub cluster_write_barrier_timeout: u64,
+
+    /// Answer admin writes with an immediate 202 + op id after durably parking
+    /// them, instead of waiting for commit + barrier. Poll
+    /// `GET /_cluster/ops/:id` for the outcome.
+    #[arg(long, env = "RIFT_CLUSTER_ADMIN_ASYNC")]
+    pub cluster_admin_async: bool,
 }
 
 /// `--cluster-write-barrier` modes (issue #9 §4).

@@ -61,7 +61,9 @@ use rift_ee::seams::{ApplyReport, ImposterConfig, ImposterError, ImposterManager
 use serde::{Deserialize, Serialize};
 
 use super::TypeConfig;
-use crate::control::{self, ControlOp, ControlResponse, DEFAULT_TENANT, StubEdit, StubEditScript};
+use crate::control::{
+    self, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, StubEdit, StubEditScript,
+};
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
 
@@ -72,6 +74,10 @@ const SNAPSHOT_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_sn
 const SM_CONFIGS_TABLE: TableDefinition<(&str, u16), &str> = TableDefinition::new("sm_configs");
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
+/// Node-local durable intents (issue #9 R4): ops this node accepted but has
+/// not yet seen commit. NOT replicated state — never in snapshots, never
+/// touched by apply; each node parks and replays only what it accepted.
+const PENDING_INTENTS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("pending_intents");
 
 /// How long an applied op's response is retained for dedup: 24 h (issue #9).
 /// After expiry a replay of the same `op_id` re-applies — the durable-intent
@@ -168,6 +174,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_CONFIGS_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
+        write_txn.open_table(PENDING_INTENTS_TABLE).map_err(io)?;
         write_txn
             .commit()
             .map_err(|e| StorageError::from(StorageIOError::write(&e)))?;
@@ -561,6 +568,143 @@ impl RedbStateMachine {
     #[must_use]
     pub fn apply_failures(&self) -> BTreeMap<u16, String> {
         self.apply_failures.lock().clone()
+    }
+
+    /// Durably park an accepted intent (issue #9 R4). Runs with `Immediate`
+    /// durability because this write IS the acceptance boundary: once the
+    /// client hears anything other than a hard error, the op must survive a
+    /// crash. Parking the same op id twice overwrites — idempotent by key.
+    #[allow(clippy::result_large_err)]
+    pub fn park_intent(&self, request: &ControlRequest) -> StorageResult<()> {
+        let key = request.op_id.to_string();
+        let value =
+            serde_json::to_string(request).map_err(|e| StorageIOError::write_state_machine(&e))?;
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        {
+            let mut table = write_txn
+                .open_table(PENDING_INTENTS_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            table
+                .insert(key.as_str(), value.as_str())
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        Ok(())
+    }
+
+    /// Remove a parked intent once its op is terminal (applied or refused —
+    /// both are recorded in `sm_op_dedup`). Removing an absent key is a no-op:
+    /// the front and the replay loop can both retire the same intent.
+    #[allow(clippy::result_large_err)]
+    pub fn unpark_intent(&self, op_id: &uuid::Uuid) -> StorageResult<()> {
+        let key = op_id.to_string();
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        {
+            let mut table = write_txn
+                .open_table(PENDING_INTENTS_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            table
+                .remove(key.as_str())
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        Ok(())
+    }
+
+    /// Every parked intent, parsed. An entry that no longer parses cannot ever
+    /// be replayed, so it is dropped — loudly, at error level — rather than
+    /// wedging the replay loop forever on an unrecoverable row.
+    #[allow(clippy::result_large_err)]
+    pub fn parked_intents(&self) -> StorageResult<Vec<ControlRequest>> {
+        let rows = {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let table = read_txn
+                .open_table(PENDING_INTENTS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut rows = Vec::new();
+            for item in table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                rows.push((key.value().to_owned(), value.value().to_owned()));
+            }
+            rows
+        };
+        let mut intents = Vec::new();
+        for (key, value) in rows {
+            match serde_json::from_str::<ControlRequest>(&value) {
+                Ok(request) => intents.push(request),
+                Err(e) => {
+                    tracing::error!(op_id = %key, error = %e, "dropping unparseable parked intent");
+                    // Best-effort cleanup: a bad row whose delete ALSO fails
+                    // must not abort the batch — that would starve every
+                    // healthy parked intent behind one corrupt one, forever.
+                    if let Ok(op_id) = key.parse::<uuid::Uuid>()
+                        && let Err(e) = self.unpark_intent(&op_id)
+                    {
+                        tracing::error!(op_id = %key, error = %e, "could not remove the corrupt row");
+                    }
+                }
+            }
+        }
+        Ok(intents)
+    }
+
+    /// The recorded outcome of an applied op, if the dedup window still holds
+    /// it: what `GET /_cluster/ops/:id` reports for terminal ops.
+    #[allow(clippy::result_large_err)]
+    pub fn read_op(&self, op_id: &uuid::Uuid) -> StorageResult<Option<ControlResponse>> {
+        let key = op_id.to_string();
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_DEDUP_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        table
+            .get(key.as_str())
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|g| {
+                serde_json::from_str::<DedupEntry>(g.value())
+                    .map(|entry| entry.response)
+                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))
+            })
+            .transpose()
+    }
+
+    /// Whether this node still holds a parked intent for `op_id`.
+    #[allow(clippy::result_large_err)]
+    pub fn intent_parked(&self, op_id: &uuid::Uuid) -> StorageResult<bool> {
+        let key = op_id.to_string();
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(PENDING_INTENTS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Ok(table
+            .get(key.as_str())
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .is_some())
     }
 
     /// Drive the attached engine to the currently applied state — the
@@ -1760,6 +1904,36 @@ mod tests {
         );
 
         engine.shutdown().await;
+    }
+
+    /// Issue #9 slice 3: the node-local intent ledger — park, report, retire.
+    #[tokio::test]
+    async fn intents_park_retire_and_report() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let request = put(0xB0B, 8080, json!([]));
+        let op_id = request.op_id;
+        sm.park_intent(&request).expect("park");
+        assert!(sm.intent_parked(&op_id).expect("parked"));
+        assert_eq!(sm.parked_intents().expect("list").len(), 1);
+        assert!(
+            sm.read_op(&op_id).expect("read").is_none(),
+            "accepted but not applied: no recorded outcome yet"
+        );
+
+        sm.apply(vec![entry(1, request.clone())])
+            .await
+            .expect("apply");
+        assert_eq!(
+            sm.read_op(&op_id).expect("read"),
+            Some(ControlResponse::applied(1)),
+            "the ops surface reads the dedup record"
+        );
+
+        sm.unpark_intent(&op_id).expect("unpark");
+        assert!(!sm.intent_parked(&op_id).expect("parked"));
+        assert!(sm.parked_intents().expect("list").is_empty());
+        sm.unpark_intent(&op_id)
+            .expect("unparking twice is a no-op");
     }
 
     /// A bind-failed port that is then deleted must not leave a phantom entry

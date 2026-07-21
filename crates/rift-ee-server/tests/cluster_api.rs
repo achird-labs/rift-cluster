@@ -158,3 +158,101 @@ async fn control_plane_routes_are_not_shadowed_by_the_operator_surface() {
     .await
     .expect("node keeps leadership with the operator routes registered");
 }
+
+/// Issue #9 slice 3: `GET /_cluster/ops/:id` reports the three states, and an
+/// unknown (or lapsed) id is a 404, not an empty success.
+#[tokio::test]
+async fn ops_endpoint_reports_applied_pending_and_unknown() {
+    use rift_cluster::{ControlOp, ControlOutcome, ControlRequest, TenantId};
+
+    let fixture = start().await;
+    let client = client(Some(SECRET));
+
+    // Applied: submit with a known op id, then read it back.
+    let applied_id = uuid::Uuid::from_u128(0xA11D);
+    let response = fixture
+        .node
+        .write(ControlRequest {
+            op_id: applied_id,
+            principal: None,
+            issued_at_secs: 0,
+            op: ControlOp::PutImposter {
+                tenant: TenantId::default(),
+                config: serde_json::from_value(
+                    serde_json::json!({ "port": 4546, "protocol": "http" }),
+                )
+                .expect("config parses"),
+            },
+        })
+        .await
+        .expect("write commits");
+    assert_eq!(response.outcome, ControlOutcome::Applied);
+
+    let reported = get(
+        &client,
+        fixture.addr,
+        &format!("/_cluster/ops/{applied_id}"),
+    )
+    .await;
+    assert_eq!(reported["state"], "applied");
+    assert_eq!(reported["revision"], response.revision);
+
+    // Failed ops are terminal and queryable too.
+    let failed_id = uuid::Uuid::from_u128(0xFA11);
+    fixture
+        .node
+        .write(ControlRequest {
+            op_id: failed_id,
+            principal: None,
+            issued_at_secs: 0,
+            op: ControlOp::DeleteAll {
+                tenant: TenantId::new("acme"),
+            },
+        })
+        .await
+        .expect("write commits (with a failed outcome)");
+    let reported = get(&client, fixture.addr, &format!("/_cluster/ops/{failed_id}")).await;
+    assert_eq!(reported["state"], "failed");
+    assert!(
+        reported["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("tenant"),
+        "{reported}"
+    );
+
+    // Pending: parked but never submitted.
+    let pending_id = uuid::Uuid::from_u128(0x9E4D);
+    fixture
+        .node
+        .park_intent(&ControlRequest {
+            op_id: pending_id,
+            principal: None,
+            issued_at_secs: 0,
+            op: ControlOp::DeleteImposter {
+                tenant: TenantId::default(),
+                port: 4547,
+            },
+        })
+        .expect("park");
+    let reported = get(
+        &client,
+        fixture.addr,
+        &format!("/_cluster/ops/{pending_id}"),
+    )
+    .await;
+    assert_eq!(reported["state"], "pending");
+
+    // Unknown id → the request errors rather than fabricating a state.
+    let unknown = uuid::Uuid::from_u128(0xDEAD);
+    let err = client
+        .call(
+            fixture.addr,
+            "GET",
+            &format!("/_cluster/ops/{unknown}"),
+            Vec::new(),
+        )
+        .await
+        .expect_err("unknown op must not answer 200");
+    assert!(format!("{err}").contains("route"), "{err}");
+}

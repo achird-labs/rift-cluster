@@ -215,13 +215,11 @@ async fn dispatch(config: &RpcServerConfig, req: Request<Incoming>) -> Result<Ve
         )?;
     }
 
-    let handler = config
-        .router
-        .lookup(&method, &path)
-        .ok_or_else(|| RpcError::UnknownRoute {
-            method: method.clone(),
-            path: path.clone(),
-        })?;
-
-    handler.call(body.to_vec()).await
+    if let Some(handler) = config.router.lookup(&method, &path) {
+        return handler.call(body.to_vec()).await;
+    }
+    if let Some((handler, suffix)) = config.router.lookup_prefix(&method, &path) {
+        return handler.call(suffix, body.to_vec()).await;
+    }
+    Err(RpcError::UnknownRoute { method, path })
 }

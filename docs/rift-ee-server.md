@@ -74,6 +74,7 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-probe-bind <ADDR>` | Address for `/readyz` and `/healthz` (default `0.0.0.0:2526`) |
 | `--cluster-write-barrier <MODE>` | What a committed admin write waits for before its 2xx: `ready-nodes` (default — every Ready node has applied it, so any node serves it) or `none` (committed and applied locally) |
 | `--cluster-write-barrier-timeout <SECONDS>` | How long the barrier waits (default `2`) before answering anyway with a `Rift-Cluster-Warnings: unapplied=<node,…>` header |
+| `--cluster-admin-async` | Answer admin writes with an immediate `202` + op id after durably parking them; poll `GET /_cluster/ops/:id` for the outcome |
 
 Each flag also has an environment-variable spelling (`RIFT_CLUSTER_BIND`,
 `RIFT_CLUSTER_SECRET_FILE`, …), which is the intended vehicle for the secret.
@@ -206,9 +207,23 @@ means the write is durable on a majority and, with the default
 barrier times out the response still succeeds and names the lagging nodes in
 `Rift-Cluster-Warnings`. Every mutating response carries
 `Rift-Cluster-Revision` (`<tenant>:<port>@<log-index>`) and
-`Rift-Cluster-Op-Id`. With no reachable leader, writes answer `503` with the
-`unavailable` error type (durable intent parking arrives with the intents
-slice of #9).
+`Rift-Cluster-Op-Id`.
+
+Acceptance is never lost (R4): every mutation is durably parked on the
+accepting node *before* it is submitted. With no reachable leader the write
+answers `503` (`unavailable` type) with `Retry-After` and its
+`Rift-Cluster-Op-Id` — and the parked intent is replayed automatically when a
+leader returns, on startup, and on every leader change; the op-id dedup in the
+state machine makes replay exactly-once-in-effect. A client-supplied
+`Idempotency-Key` header becomes the op id (verbatim when it is a UUID, hashed
+into one otherwise), so retrying the same key can never double-apply.
+`GET /_cluster/ops/:id` on the cluster port reports
+`{"state": "pending" | "applied" | "failed", "revision"?, "detail"?}` for any
+accepted op (404 once the 24 h dedup window has lapsed). With
+`--cluster-admin-async`, mutations answer
+`202 {"opId": …, "opIds": […]}` immediately after parking and the commit
+happens in the background — poll each entry of `opIds` (a multi-op mutation
+such as `PUT /imposters` commits several ops; `opId` is the correlation id).
 
 Cluster-mode divergences from a single node: an imposter must carry an explicit
 `port` (an auto-assigned port cannot replicate), and `file:`/`ref:` script
