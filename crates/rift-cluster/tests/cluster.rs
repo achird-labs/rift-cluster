@@ -60,6 +60,7 @@ async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> RaftNode {
         data_dir: dir.to_path_buf(),
         secret: Some(SECRET.to_owned()),
         routes: Router::new(),
+        engine: None,
     };
     // A restart can momentarily race the previous instance's async teardown
     // releasing the redb file lock: a real process restart frees it on exit, but
@@ -168,15 +169,25 @@ impl TestCluster {
         }
     }
 
-    /// Poll, bounded, until every live node's applied config for `port` equals
-    /// `want`. Returns false on timeout (never a synthetic pass).
+    /// Poll, bounded, until every live node's applied config for `port` carries
+    /// `want` as its name tag. Returns false on timeout (never a synthetic pass).
     async fn wait_converged(&self, port: u16, want: &str, deadline: Duration) -> bool {
+        let name_of = |body: String| {
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("name")?.as_str().map(str::to_owned))
+        };
         let start = Instant::now();
         loop {
             let mut live = self.live().peekable();
             let converged = live.peek().is_some()
-                && live
-                    .all(|n| n.get_imposter(port).expect("read config").as_deref() == Some(want));
+                && live.all(|n| {
+                    n.get_imposter(port)
+                        .expect("read config")
+                        .and_then(name_of)
+                        .as_deref()
+                        == Some(want)
+                });
             if converged {
                 return true;
             }
@@ -204,13 +215,27 @@ impl TestCluster {
         }
     }
 
-    /// Write `body` for `port` on the current leader, returning its revision.
-    async fn write_on_leader(&self, port: u16, body: &str) -> u64 {
+    /// Write a minimal config for `port`, name-tagged `want`, on the current
+    /// leader, returning its revision.
+    async fn write_on_leader(&self, port: u16, want: &str) -> u64 {
         let leader = self.leader().expect("a leader to accept the write");
-        leader
-            .put_imposter(port, body.to_owned())
+        let config = serde_json::from_value(serde_json::json!({
+            "port": port,
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "name": want,
+        }))
+        .expect("test config parses");
+        let response = leader
+            .put_imposter(config)
             .await
-            .expect("leader commits the write")
+            .expect("leader commits the write");
+        assert_eq!(
+            response.outcome,
+            rift_cluster::ControlOutcome::Applied,
+            "a valid write must apply"
+        );
+        response.revision
     }
 
     /// Stop node `id` and drop it, leaving its data directory intact for a later

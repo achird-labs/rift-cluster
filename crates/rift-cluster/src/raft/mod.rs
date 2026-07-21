@@ -1,17 +1,17 @@
-//! ADR-001 milestone 1 spike: prove that `redb` can back `openraft`'s storage traits.
+//! The Raft control plane (ADR-001): redb-backed storage for `openraft`, the
+//! node lifecycle, and the state machine that applies committed
+//! [`ControlRequest`]s to the local engine.
 //!
-//! This module is deliberately self-contained. [`ControlOp`] and [`ControlResponse`]
-//! are spike stand-ins for the real control-plane op log and admin response types —
-//! they are NOT wired into the rest of the cluster runtime, and `body: String` stands
-//! in for the real `ImposterConfig` on purpose (see the ADR at
-//! `docs/adr/ADR-001-raft-control-plane.md`).
+//! The log's application payload is [`crate::control::ControlRequest`] — the
+//! real ADR §4.1 op set over the upstream `ImposterConfig` — and the response is
+//! [`crate::control::ControlResponse`], carrying the applying log index as the
+//! revision. See [`store`] for the state-machine semantics (deterministic
+//! tables first, best-effort engine drive after) and [`crate::control`] for the
+//! op set and its validation rules.
 //!
-//! The only claim this module makes is: a `redb`-backed pairing of
-//! [`openraft::storage::RaftLogStorage`] and [`openraft::storage::RaftStateMachine`]
-//! satisfies openraft's own storage conformance suite,
-//! `openraft::testing::Suite::test_all`. See [`store`] for the implementation and
-//! its `#[cfg(test)]` wiring of that suite — that test is the acceptance gate for
-//! this spike, not a hand-rolled smoke test.
+//! Pre-#9 state directories carried a spike-era log format (`PutImposter` over
+//! an opaque string body); they are wiped, not migrated — the format changed
+//! before any release shipped.
 
 pub mod identity;
 pub mod network;
@@ -26,7 +26,8 @@ pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
 use std::io::Cursor;
 
 use openraft::BasicNode;
-use serde::{Deserialize, Serialize};
+
+use crate::control::{ControlRequest, ControlResponse};
 
 /// A cluster node's identity in the Raft group: a `u64` minted by the leader at
 /// first join and persisted locally (ADR-001). Replaces the earlier
@@ -34,25 +35,10 @@ use serde::{Deserialize, Serialize};
 /// so a node needs only a stable numeric handle.
 pub type NodeId = u64;
 
-/// Application-level operation carried by the Raft log.
-///
-/// `body` is a spike stand-in for the real `ImposterConfig` — kept as an opaque
-/// string so this module does not need to depend on the real config type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ControlOp {
-    PutImposter { port: u16, body: String },
-}
-
-/// Application-level response returned from applying a [`ControlOp`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ControlResponse {
-    pub revision: u64,
-}
-
 openraft::declare_raft_types!(
-    /// The openraft type configuration for the spike's control-plane group.
+    /// The openraft type configuration for the control-plane group.
     pub TypeConfig:
-        D = ControlOp,
+        D = ControlRequest,
         R = ControlResponse,
         NodeId = u64,
         Node = BasicNode,
