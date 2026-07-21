@@ -379,6 +379,31 @@ impl RedbStateMachine {
     }
 }
 
+impl RedbStateMachine {
+    /// Read the applied imposter-config body for `port`, or `None` if no config
+    /// has been applied for it.
+    ///
+    /// This is the node's read path: reads answer from the applied state machine
+    /// directly and never go through Raft, so a follower or a restarted node can
+    /// serve committed config without waiting to become leader. Openraft owns the
+    /// state machine as `&mut self`, so the node keeps a cheap `Clone` of this
+    /// handle (both share one `Arc<Database>`) purely for reads.
+    #[allow(clippy::result_large_err)]
+    pub fn read_config(&self, port: u16) -> StorageResult<Option<String>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Ok(table
+            .get(port)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|g| g.value().to_string()))
+    }
+}
+
 impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
     async fn build_snapshot(&mut self) -> StorageResult<Snapshot<TypeConfig>> {
         let applied = self.read_applied()?;
