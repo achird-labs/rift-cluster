@@ -54,3 +54,11 @@ sha2 = "0.10"
 subtle = "2"
 rand = "0.8"
 parking_lot = "0.12"
+
+# Control plane (ADR-001): embedded Raft (openraft) over an embedded ACID store
+# (redb). `storage-v2` is required to implement the split RaftLogStorage +
+# RaftStateMachine traits — without it they are sealed to everything except
+# openraft's own deprecated `RaftStorage`. `serde` gives Entry/Vote/SnapshotMeta
+# their Serialize/Deserialize impls so they can be persisted.
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+redb = "4"
