@@ -168,7 +168,14 @@ there is nothing extra to scrape:
 
 These are sampled from Raft metrics every 5s rather than pushed, because
 leadership and membership change without the cluster crate being called; an
-event-driven gauge would silently go stale.
+event-driven gauge would silently go stale. (If you are asserting on them right
+after a node reports ready, poll — the gauge can lag readiness by one sample.)
+
+They reach `/metrics` by registering into the `prometheus` crate's global
+default registry, which is what the open-source metrics server already serves.
+That works only while the whole build links **one** copy of that crate; a second
+one would carry its own registry and these gauges would silently reach no
+endpoint. `scripts/check-single-prometheus.sh` enforces it in CI.
 
 The config-sync families the Phase-1 plan also lists —
 `rift_cluster_config_revision{port}`, `rift_cluster_config_converged`,
