@@ -26,7 +26,10 @@ pub mod rpc;
 
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
-pub use raft::{ControlOp, ControlResponse, NodeId, TypeConfig};
+pub use raft::{
+    ControlOp, ControlResponse, NodeConfig, NodeError, NodeId, NodeIdentity, RaftNode,
+    StatusReport, TypeConfig,
+};
 pub use rpc::{Router, RpcClient, RpcError, RpcServer};
 
 use serde::{Deserialize, Serialize};

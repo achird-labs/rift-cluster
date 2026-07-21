@@ -13,7 +13,12 @@
 //! its `#[cfg(test)]` wiring of that suite — that test is the acceptance gate for
 //! this spike, not a hand-rolled smoke test.
 
+pub mod identity;
+pub mod node;
 pub mod store;
+
+pub use identity::NodeIdentity;
+pub use node::{NodeConfig, NodeError, RaftNode, StatusReport};
 
 use std::io::Cursor;
 
