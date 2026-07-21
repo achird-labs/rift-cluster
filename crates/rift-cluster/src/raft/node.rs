@@ -529,6 +529,41 @@ impl RaftNode {
             .and_then(|reply| reply.applied)
     }
 
+    /// Durably park an accepted intent before it is submitted (issue #9 R4).
+    pub fn park_intent(&self, request: &ControlRequest) -> Result<(), NodeError> {
+        self.sm_reader
+            .park_intent(request)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Retire a parked intent once its op is terminal.
+    pub fn unpark_intent(&self, op_id: &Uuid) -> Result<(), NodeError> {
+        self.sm_reader
+            .unpark_intent(op_id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Every intent this node accepted that has not been retired yet.
+    pub fn parked_intents(&self) -> Result<Vec<ControlRequest>, NodeError> {
+        self.sm_reader
+            .parked_intents()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The recorded outcome of `op_id`, if applied within the dedup window.
+    pub fn read_op(&self, op_id: &Uuid) -> Result<Option<ControlResponse>, NodeError> {
+        self.sm_reader
+            .read_op(op_id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Whether this node still holds a parked intent for `op_id`.
+    pub fn intent_parked(&self, op_id: &Uuid) -> Result<bool, NodeError> {
+        self.sm_reader
+            .intent_parked(op_id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// Drive the attached engine to the currently applied state — the
     /// cold-start / post-join reconcile. A no-op without an engine.
     pub async fn reconcile_engine(&self) -> Result<(), NodeError> {

@@ -150,6 +150,18 @@ async fn post_imposter_commits_binds_and_carries_cluster_headers() {
     );
     assert!(wait_served(port, "from-a").await, "imposter must be bound");
 
+    // R4 hygiene: a write that answered success retired its intent — nothing
+    // stays parked to replay later.
+    assert!(
+        server
+            .node()
+            .expect("clustered")
+            .parked_intents()
+            .expect("read intents")
+            .is_empty(),
+        "a successful write must leave nothing parked"
+    );
+
     server.shutdown().await;
 }
 
@@ -760,5 +772,400 @@ async fn a_dead_follower_is_named_in_the_warnings_header() {
     );
 
     f1.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// A fixed-bind variant so a node can restart on the same cluster address —
+/// membership entries carry the address, so a restarted peer must reclaim it.
+fn cluster_cli_at(state: &TempDir, bind: &str, extra: &[&str]) -> EeCli {
+    let mut args = vec![
+        "rift-ee-server".to_owned(),
+        "--port".to_owned(),
+        "0".to_owned(),
+        "--metrics-port".to_owned(),
+        "0".to_owned(),
+        "--cluster".to_owned(),
+        "--cluster-bind".to_owned(),
+        bind.to_owned(),
+        "--cluster-probe-bind".to_owned(),
+        "127.0.0.1:0".to_owned(),
+        "--cluster-secret".to_owned(),
+        SECRET.to_owned(),
+        "--cluster-state-dir".to_owned(),
+        state.path().to_string_lossy().into_owned(),
+    ];
+    args.extend(extra.iter().map(|s| (*s).to_owned()));
+    EeCli::try_parse_from(args).expect("parses")
+}
+
+/// Issue #9 slice 3: retrying with the same Idempotency-Key is exactly once —
+/// same revision back, single application.
+#[tokio::test]
+async fn an_idempotency_key_makes_retries_exactly_once() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(created.status().as_u16(), 201);
+
+    let add = || {
+        client
+            .post(format!("http://{admin}/imposters/{port}/stubs"))
+            .header("idempotency-key", "retry-me-please")
+            .json(&json!({
+                "stub": {
+                    "id": "b",
+                    "responses": [{ "is": { "statusCode": 200, "body": "from-b" } }],
+                },
+            }))
+            .send()
+    };
+    let first = add().await.expect("first add");
+    assert_eq!(first.status().as_u16(), 200);
+    let first_revision = first
+        .headers()
+        .get("rift-cluster-revision")
+        .and_then(|v| v.to_str().ok())
+        .expect("revision header")
+        .to_owned();
+
+    let retry = add().await.expect("retried add");
+    assert_eq!(retry.status().as_u16(), 200);
+    let retry_revision = retry
+        .headers()
+        .get("rift-cluster-revision")
+        .and_then(|v| v.to_str().ok())
+        .expect("revision header");
+    assert_eq!(
+        retry_revision, first_revision,
+        "the retry must collapse to the original application"
+    );
+
+    let read: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get imposter")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        read["stubs"].as_array().expect("stubs").len(),
+        2,
+        "stub b applied exactly once: {read}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #9 slice 3, R4 end to end: a write refused for lack of quorum is
+/// parked — with its op id on the 503 — and applies BY ITSELF once quorum
+/// returns, with no client retry.
+#[tokio::test]
+async fn a_parked_write_replays_when_quorum_returns() {
+    let leader_bind = {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve");
+        held.local_addr().expect("addr").to_string()
+    };
+    let leader_state = TempDir::new().expect("tempdir");
+    let leader = compose::start(cluster_cli_at(
+        &leader_state,
+        &leader_bind,
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+
+    let follower_state = TempDir::new().expect("tempdir");
+    let follower = compose::start(cluster_cli(&follower_state, &["--cluster-seeds", &seed]))
+        .await
+        .expect("follower joins");
+    wait_ready(&follower).await;
+
+    leader.shutdown().await;
+
+    // Park a write on the quorum-less survivor: 503, but with the op id.
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = client
+            .post(format!("http://{}/imposters", follower.admin_addr()))
+            .json(&minimal_imposter(port))
+            .send()
+            .await
+            .expect("post without quorum");
+        if response.status().as_u16() == 503 {
+            assert!(
+                response.headers().get("rift-cluster-op-id").is_some(),
+                "the 503 must carry the parked op id"
+            );
+            assert!(response.headers().get("retry-after").is_some());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no-quorum write never surfaced 503"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Quorum returns: the old leader restarts on its fixed address and resumes
+    // from its log. The survivor's replay loop must apply the parked intent
+    // with NO further client action.
+    let leader = compose::start(cluster_cli_at(
+        &leader_state,
+        &leader_bind,
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("leader restarts");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) =
+            reqwest::get(format!("http://{}/imposters/{port}", follower.admin_addr())).await
+            && response.status().as_u16() == 200
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked intent never replayed after quorum returned"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// Issue #9 slice 3: `--cluster-admin-async` answers 202 + op id after parking
+/// and the write applies in the background.
+#[tokio::test]
+async fn async_mode_answers_202_and_applies_in_the_background() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--cluster-admin-async"],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let post = || {
+        reqwest::Client::new()
+            .post(format!("http://{admin}/imposters"))
+            .header("idempotency-key", "async-once")
+            .json(&minimal_imposter(port))
+            .send()
+    };
+    let response = post().await.expect("post imposter");
+    assert_eq!(response.status().as_u16(), 202);
+    assert!(response.headers().get("rift-cluster-op-id").is_some());
+    let body: serde_json::Value = response.json().await.expect("json");
+    let op_id = body["opId"].as_str().expect("opId").to_owned();
+    uuid::Uuid::parse_str(&op_id).expect("op id is a uuid");
+    assert_eq!(
+        body["opIds"],
+        json!([op_id]),
+        "single-op mutations poll the base id itself"
+    );
+
+    // The same Idempotency-Key answers the same op id — a client retrying the
+    // 202 keeps polling one op, and dedup keeps the apply single.
+    let retry: serde_json::Value = post()
+        .await
+        .expect("retried post")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(retry["opId"].as_str().expect("opId"), op_id);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(read) = reqwest::get(format!("http://{admin}/imposters/{port}")).await
+            && read.status().as_u16() == 200
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the async write never applied"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        wait_served(port, "from-a").await,
+        "and the engine serves it"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #9 slice 3: a keyed multi-op mutation (`PUT /imposters`) retried with
+/// the same Idempotency-Key stays exactly-once for the whole sequence.
+#[tokio::test]
+async fn a_keyed_replace_all_retries_exactly_once() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let (a, b) = (reserve_port(), reserve_port());
+    let client = reqwest::Client::new();
+
+    let put = || {
+        client
+            .put(format!("http://{admin}/imposters"))
+            .header("idempotency-key", "replace-once")
+            .json(&json!({ "imposters": [minimal_imposter(a), minimal_imposter(b)] }))
+            .send()
+    };
+    let first = put().await.expect("first put");
+    assert_eq!(first.status().as_u16(), 200);
+    let first_revision = first
+        .headers()
+        .get("rift-cluster-revision")
+        .and_then(|v| v.to_str().ok())
+        .expect("revision header")
+        .to_owned();
+
+    let retry = put().await.expect("retried put");
+    assert_eq!(retry.status().as_u16(), 200);
+    assert_eq!(
+        retry
+            .headers()
+            .get("rift-cluster-revision")
+            .and_then(|v| v.to_str().ok())
+            .expect("revision header"),
+        first_revision,
+        "every op in the sequence must dedup, so the last revision is unchanged"
+    );
+
+    let list: serde_json::Value = reqwest::get(format!("http://{admin}/imposters"))
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        list["imposters"].as_array().expect("imposters").len(),
+        2,
+        "{list}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #9 slice 3, the crash half of R4: the node that PARKED the intent
+/// restarts, and its own on-disk ledger — not the client — is what completes
+/// the write once quorum returns.
+#[tokio::test]
+async fn a_restarted_node_replays_its_own_parked_intents() {
+    let reserve_addr = || {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve");
+        held.local_addr().expect("addr").to_string()
+    };
+    let (leader_bind, follower_bind) = (reserve_addr(), reserve_addr());
+    let leader_state = TempDir::new().expect("tempdir");
+    let follower_state = TempDir::new().expect("tempdir");
+
+    let leader = compose::start(cluster_cli_at(
+        &leader_state,
+        &leader_bind,
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+
+    let follower = compose::start(cluster_cli_at(
+        &follower_state,
+        &follower_bind,
+        &["--cluster-seeds", &seed],
+    ))
+    .await
+    .expect("follower joins");
+    wait_ready(&follower).await;
+
+    // Lose quorum, park a write on the follower.
+    leader.shutdown().await;
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = client
+            .post(format!("http://{}/imposters", follower.admin_addr()))
+            .json(&minimal_imposter(port))
+            .send()
+            .await
+            .expect("post without quorum");
+        if response.status().as_u16() == 503 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never saw the 503");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !follower
+            .node()
+            .expect("clustered")
+            .parked_intents()
+            .expect("intents")
+            .is_empty(),
+        "the refused write must be parked"
+    );
+
+    // Kill the parking node itself, then bring the whole cluster back.
+    follower.shutdown().await;
+    let leader = compose::start(cluster_cli_at(
+        &leader_state,
+        &leader_bind,
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("leader restarts");
+    let follower = compose::start(cluster_cli_at(
+        &follower_state,
+        &follower_bind,
+        &["--cluster-seeds", &seed],
+    ))
+    .await
+    .expect("follower restarts from its durable state");
+
+    // No client in sight: the follower's replay loop must finish the write
+    // from its on-disk ledger.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) =
+            reqwest::get(format!("http://{}/imposters/{port}", follower.admin_addr())).await
+            && response.status().as_u16() == 200
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restarted node never replayed its own parked intent"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    follower.shutdown().await;
     leader.shutdown().await;
 }

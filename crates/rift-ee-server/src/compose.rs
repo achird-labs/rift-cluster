@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rift_cluster::rpc::Router;
-use rift_cluster::{ClusterDecorator, NodeConfig, NodeIdentity, RaftNode, metrics};
+use rift_cluster::{ClusterDecorator, NodeConfig, NodeError, NodeIdentity, RaftNode, metrics};
 use rift_ee::seams::{ImposterManager, RunningServer, ServerBuilder, TlsDefaults};
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -51,6 +51,9 @@ pub struct ComposedServer {
     /// Reconciles the engine and satisfies [`GATE_RECONCILED`]; aborted on
     /// shutdown for the same reason as the sampler.
     reconciler: Option<tokio::task::JoinHandle<()>>,
+    /// Replays parked intents on leader changes (issue #9 R4); same lifecycle
+    /// rules as the reconciler.
+    intent_replayer: Option<tokio::task::JoinHandle<()>>,
     cluster_addr: Option<SocketAddr>,
     readiness: Arc<Readiness>,
     leave_timeout: Duration,
@@ -85,6 +88,14 @@ impl ComposedServer {
         &self.readiness
     }
 
+    /// The control-plane node, when clustering is on. The composition root
+    /// hands this out for embedders and tests that need the node's own view
+    /// (parked intents, status) rather than the HTTP surfaces.
+    #[must_use]
+    pub fn node(&self) -> Option<&Arc<RaftNode>> {
+        self.node.as_ref()
+    }
+
     /// Serve until the admin API stops.
     pub async fn join(self) -> anyhow::Result<()> {
         self.server.join().await
@@ -97,6 +108,9 @@ impl ComposedServer {
         }
         if let Some(reconciler) = self.reconciler {
             reconciler.abort();
+        }
+        if let Some(replayer) = self.intent_replayer {
+            replayer.abort();
         }
         if let Some(probes) = self.probes {
             probes.shutdown().await;
@@ -176,6 +190,7 @@ pub async fn start_with_runtimes(
             front: None,
             metrics_sampler: None,
             reconciler: None,
+            intent_replayer: None,
             cluster_addr: None,
             readiness: Arc::new(Readiness::awaiting([])),
             leave_timeout: Duration::ZERO,
@@ -263,6 +278,7 @@ pub async fn start_with_runtimes(
             front: Some(front),
             metrics_sampler: Some(spawn_metrics_sampler(Arc::clone(&node))),
             reconciler: Some(reconciler),
+            intent_replayer: Some(spawn_intent_replayer(Arc::clone(&node))),
             node: Some(node),
             cluster_addr: Some(cluster_addr),
             readiness,
@@ -302,6 +318,7 @@ async fn attach_data_plane(
 
     let barrier = cli.cluster.cluster_write_barrier;
     let barrier_timeout = Duration::from_secs(cli.cluster.cluster_write_barrier_timeout);
+    let admin_async = cli.cluster.cluster_admin_async;
 
     let server = ServerBuilder::from_cli(cli.oss)
         .manager(manager)
@@ -327,6 +344,7 @@ async fn attach_data_plane(
             allow_injection,
             barrier,
             barrier_timeout,
+            admin_async,
         },
         node,
     )
@@ -433,6 +451,66 @@ fn cluster_manager(
         })
         .with_accept_runtimes(accept_runtimes)
         .with_response_decorator(Arc::new(ClusterDecorator)))
+}
+
+/// Replay parked intents (issue #9 R4): drain whenever a leader (re)appears —
+/// which includes startup, once the join completes — plus a slow periodic
+/// sweep as a safety net. The state machine's dedup makes a replay of an
+/// already-applied op collapse to its original response, so replaying is
+/// always safe, never a double-apply.
+fn spawn_intent_replayer(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
+    let node = Arc::downgrade(&node);
+    tokio::spawn(async move {
+        let mut last_leader = None;
+        let mut ticks: u32 = 0;
+        loop {
+            let Some(node) = node.upgrade() else { return };
+            let leader = node.status().current_leader;
+            ticks = ticks.wrapping_add(1);
+            let leader_appeared = leader.is_some() && leader != last_leader;
+            last_leader = leader;
+            if leader_appeared || (leader.is_some() && ticks.is_multiple_of(120)) {
+                drain_parked_intents(&node).await;
+            }
+            drop(node);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+}
+
+async fn drain_parked_intents(node: &RaftNode) {
+    let intents = match node.parked_intents() {
+        Ok(intents) => intents,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot read parked intents");
+            return;
+        }
+    };
+    for request in intents {
+        let op_id = request.op_id;
+        match node.submit(request).await {
+            // Terminal either way — an op the state machine refused is refused
+            // identically on every replay, so it retires like a success and
+            // stays queryable through GET /_cluster/ops/:id. An unpark that
+            // keeps failing is retried every sweep; dedup keeps each retry a
+            // no-op inside its 24 h window (a metric for over-aged intents is
+            // the metrics slice's job).
+            Ok(_) => match node.unpark_intent(&op_id) {
+                Ok(()) => tracing::info!(%op_id, "replayed parked intent"),
+                Err(e) => tracing::error!(%op_id, error = %e, "replayed but could not unpark"),
+            },
+            // No quorum fails every intent identically — stop the sweep. Any
+            // other error is this op's own (encode, fatal runtime): log it and
+            // keep going, or one poisoned intent starves the rest.
+            Err(e @ NodeError::Unavailable(_)) => {
+                tracing::warn!(%op_id, error = %e, "no quorum; intents stay parked for the next sweep");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(%op_id, error = %e, "replay failed for this intent; continuing");
+            }
+        }
+    }
 }
 
 /// Attach to an existing cluster through the seeds, or found one when the

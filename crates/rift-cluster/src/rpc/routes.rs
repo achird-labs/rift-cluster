@@ -90,10 +90,28 @@ where
     }
 }
 
+/// A prefix-registered endpoint: called with the path remainder after its
+/// prefix (query string included, if any) plus the request body. Exists for
+/// the id-addressed operator routes (`/_cluster/ops/:id`) the exact-match
+/// table cannot express.
+pub trait PrefixHandler: Send + Sync {
+    fn call(&self, suffix: String, body: Vec<u8>) -> HandlerFuture;
+}
+
+impl<F> PrefixHandler for F
+where
+    F: Fn(String, Vec<u8>) -> HandlerFuture + Send + Sync,
+{
+    fn call(&self, suffix: String, body: Vec<u8>) -> HandlerFuture {
+        self(suffix, body)
+    }
+}
+
 /// Method + path registry for the cluster port.
 #[derive(Default, Clone)]
 pub struct Router {
     routes: HashMap<(String, String), Arc<dyn Handler>>,
+    prefix_routes: Vec<(String, String, Arc<dyn PrefixHandler>)>,
 }
 
 impl Router {
@@ -116,15 +134,43 @@ impl Router {
             .get(&(method.to_ascii_uppercase(), path.to_owned()))
     }
 
+    /// Register a prefix endpoint. Exact routes always win over prefixes, and
+    /// the longest matching prefix wins among prefixes, so registration order
+    /// never matters.
+    #[must_use]
+    pub fn route_prefix(
+        mut self,
+        method: &str,
+        prefix: &str,
+        handler: Arc<dyn PrefixHandler>,
+    ) -> Self {
+        self.prefix_routes
+            .push((method.to_ascii_uppercase(), prefix.to_owned(), handler));
+        self
+    }
+
+    pub(crate) fn lookup_prefix(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Option<(&Arc<dyn PrefixHandler>, String)> {
+        let method = method.to_ascii_uppercase();
+        self.prefix_routes
+            .iter()
+            .filter(|(m, prefix, _)| *m == method && path.starts_with(prefix.as_str()))
+            .max_by_key(|(_, prefix, _)| prefix.len())
+            .map(|(_, prefix, handler)| (handler, path[prefix.len()..].to_owned()))
+    }
+
     /// Number of registered endpoints.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.routes.len()
+        self.routes.len() + self.prefix_routes.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+        self.routes.is_empty() && self.prefix_routes.is_empty()
     }
 }
 

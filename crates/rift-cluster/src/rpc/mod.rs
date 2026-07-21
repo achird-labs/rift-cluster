@@ -12,7 +12,7 @@ pub mod server;
 
 pub use auth::{AuthError, SignedRequest, Signer, Verifier};
 pub use client::{AlwaysHealthy, PeerHealth, RpcClient, RpcClientConfig};
-pub use routes::{Handler, HandlerFuture, PROTO_VERSION, ProtocolVersion, Router};
+pub use routes::{Handler, HandlerFuture, PROTO_VERSION, PrefixHandler, ProtocolVersion, Router};
 pub use server::{DEFAULT_MAX_BODY_BYTES, RpcServer, RpcServerConfig};
 
 /// Connect timeout for a peer RPC.

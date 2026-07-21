@@ -80,6 +80,9 @@ pub struct FrontConfig {
     pub allow_injection: bool,
     pub barrier: WriteBarrier,
     pub barrier_timeout: Duration,
+    /// `--cluster-admin-async`: answer 202 + op id right after parking, and
+    /// let the submit run in the background.
+    pub admin_async: bool,
 }
 
 /// A bound, serving admin front.
@@ -116,6 +119,7 @@ struct FrontState {
     allow_injection: bool,
     barrier: WriteBarrier,
     barrier_timeout: Duration,
+    admin_async: bool,
     /// Streams proxied requests through unchanged (SSE included).
     proxy: Client<hyper_util::client::legacy::connect::HttpConnector, Incoming>,
     /// Issues the internal re-reads mutation responses are rendered from.
@@ -139,6 +143,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         allow_injection: config.allow_injection,
         barrier: config.barrier,
         barrier_timeout: config.barrier_timeout,
+        admin_async: config.admin_async,
         proxy: Client::builder(TokioExecutor::new()).build_http(),
         fetch: Client::builder(TokioExecutor::new()).build_http(),
     });
@@ -337,6 +342,11 @@ async fn terminate(
     }
 
     let host = req.headers().get("host").cloned();
+    let idempotency = req
+        .headers()
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
         .collect()
         .await
@@ -351,7 +361,17 @@ async fn terminate(
         }
     };
 
-    match build_and_run(&state, &node, kind, &body, auth.as_deref(), host.as_ref()).await {
+    match build_and_run(
+        &state,
+        &node,
+        kind,
+        &body,
+        auth.as_deref(),
+        host.as_ref(),
+        idempotency.as_deref(),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(response) => response,
     }
@@ -381,12 +401,13 @@ enum Render {
 /// Build the mutation for `kind`, pre-validate it, commit it op by op, run the
 /// barrier, and render the response. Errors are already client-shaped.
 async fn build_and_run(
-    state: &FrontState,
+    state: &Arc<FrontState>,
     node: &Arc<RaftNode>,
     kind: Terminated,
     body: &[u8],
     auth: Option<&str>,
     host: Option<&HeaderValue>,
+    idempotency: Option<&str>,
 ) -> Result<Response<FrontBody>, Response<FrontBody>> {
     let mutation = build_mutation(state, node, kind, body, auth, host).await?;
 
@@ -407,41 +428,111 @@ async fn build_and_run(
         }
     }
 
+    // Mint deterministically from the client's Idempotency-Key (when given),
+    // then park every op durably BEFORE submitting any (R4): once parked, the
+    // op survives a crash and the replay loop finishes what this request
+    // cannot — including the tail of a multi-op sequence.
+    let base = base_op_id(idempotency);
+    let total = mutation.ops.len();
+    let requests: Vec<ControlRequest> = mutation
+        .ops
+        .into_iter()
+        .enumerate()
+        .map(|(index, op)| mint(op_id_for(base, index, total), op))
+        .collect();
+    for request in &requests {
+        if let Err(e) = node.park_intent(request) {
+            // Refusing is the only honest answer: R4's promise is exactly that
+            // an accepted op is durable, and this one could not be made so.
+            return Err(typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorKind::InternalError,
+                &format!("cannot durably accept the write: {e}"),
+            ));
+        }
+    }
+
+    if state.admin_async {
+        let node = Arc::clone(node);
+        let op_ids: Vec<Uuid> = requests.iter().map(|request| request.op_id).collect();
+        let background = requests;
+        tokio::spawn(async move {
+            for request in background {
+                let op_id = request.op_id;
+                match node.submit(request).await {
+                    Ok(_) => {
+                        if let Err(e) = node.unpark_intent(&op_id) {
+                            tracing::error!(%op_id, error = %e, "applied but could not unpark");
+                        }
+                    }
+                    Err(e) => {
+                        // The replay loop owns it from here.
+                        tracing::warn!(%op_id, error = %e, "async submit failed; intent stays parked");
+                        return;
+                    }
+                }
+            }
+        });
+        // `opIds` is what `GET /_cluster/ops/:id` can actually answer for: a
+        // multi-op mutation parks only the derived ids, never the base — a
+        // client polling the bare base of a PUT /imposters would 404 forever.
+        let body = serde_json::json!({
+            "opId": base.to_string(),
+            "opIds": op_ids.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let mut response =
+            buffered_response(StatusCode::ACCEPTED, Bytes::from(body), json_content_type())?;
+        set_header(&mut response, HEADER_OP_ID, &base.to_string());
+        return Ok(response);
+    }
+
     let mut last: Option<(Uuid, ControlResponse)> = None;
-    for op in mutation.ops {
-        let request = mint(op);
+    for request in requests {
         let op_id = request.op_id;
         let submitted = tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await;
         let response = match submitted {
             Err(_) => {
-                return Err(typed_error(
+                // Parked, so not lost: the replay loop retries it. Tell the
+                // client which op to poll.
+                let mut response = typed_error(
                     StatusCode::GATEWAY_TIMEOUT,
                     ErrorKind::Timeout,
-                    "write did not commit within the deadline",
-                ));
+                    "write did not commit within the deadline; parked for replay",
+                );
+                set_header(&mut response, HEADER_OP_ID, &base.to_string());
+                return Err(response);
             }
             Ok(Err(NodeError::Unavailable(detail))) => {
+                // R4: refused only AFTER parking — the op is durable here and
+                // the replay loop applies it once a quorum returns.
                 let mut response = typed_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorKind::Unavailable,
-                    &format!("no quorum / leader unreachable: {detail}"),
+                    &format!("no quorum / leader unreachable (parked for replay): {detail}"),
                 );
-                // Durable parking + op-id replay arrive with the intents slice;
-                // until then the client's move is simply to retry.
                 response
                     .headers_mut()
                     .insert("retry-after", HeaderValue::from_static("1"));
+                set_header(&mut response, HEADER_OP_ID, &base.to_string());
                 return Err(response);
             }
             Ok(Err(e)) => {
-                return Err(typed_error(
+                let mut response = typed_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorKind::InternalError,
                     &e.to_string(),
-                ));
+                );
+                set_header(&mut response, HEADER_OP_ID, &base.to_string());
+                return Err(response);
             }
             Ok(Ok(response)) => response,
         };
+        // Terminal either way (a Failed outcome replays to the identical
+        // refusal), so the intent retires now.
+        if let Err(e) = node.unpark_intent(&op_id) {
+            tracing::error!(%op_id, error = %e, "op terminal but could not unpark");
+        }
         if let ControlOutcome::Failed { reason } = &response.outcome {
             return Err(refusal_response(reason));
         }
@@ -737,7 +828,7 @@ fn stored_config(node: &Arc<RaftNode>, port: u16) -> Result<ImposterConfig, Resp
     serde_json::from_str(&stored).map_err(|e| internal(&format!("stored config for {port}: {e}")))
 }
 
-fn mint(op: ControlOp) -> ControlRequest {
+fn mint(op_id: Uuid, op: ControlOp) -> ControlRequest {
     // Pre-epoch clocks mint 0: only this op's dedup TTL weakens, never its
     // response (same reasoning as the node's own mint site).
     let issued_at_secs = std::time::SystemTime::now()
@@ -745,11 +836,48 @@ fn mint(op: ControlOp) -> ControlRequest {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     ControlRequest {
-        op_id: Uuid::new_v4(),
+        op_id,
         principal: None,
         issued_at_secs,
         op,
     }
+}
+
+/// Fixed namespace for deriving op ids from `Idempotency-Key` values that are
+/// not themselves UUIDs. Changing it would break every in-flight client key,
+/// so: never.
+const IDEMPOTENCY_NAMESPACE: Uuid = Uuid::from_u128(0x52_49_46_54_2d_45_45_2d_49_44_45_4d_50_4f_54);
+
+/// The mutation's base op id: the client's `Idempotency-Key` verbatim when it
+/// is a UUID, a v5 derivation of it otherwise, or a fresh v4 when absent.
+fn base_op_id(idempotency: Option<&str>) -> Uuid {
+    match idempotency.map(str::trim) {
+        Some(key) if !key.is_empty() => key
+            .parse()
+            .unwrap_or_else(|_| Uuid::new_v5(&IDEMPOTENCY_NAMESPACE, key.as_bytes())),
+        _ => Uuid::new_v4(),
+    }
+}
+
+/// Per-op ids for a multi-op mutation, derived deterministically from the base
+/// so a retried Idempotency-Key dedups every op in the sequence, not just the
+/// first.
+///
+/// Stability caveat: ids shift if the same key later yields a different op
+/// COUNT (a prune set that changed flips `base` ↔ `v5(base, 0)`). That cannot
+/// double-apply today because every op that appears in a multi-op mutation
+/// (Put/Delete/DeleteAll) is idempotent — the one non-idempotent op
+/// (`PatchStubs` append) is always single-op. Keep it that way.
+fn op_id_for(base: Uuid, index: usize, total: usize) -> Uuid {
+    if total == 1 {
+        base
+    } else {
+        Uuid::new_v5(&base, &index.to_be_bytes())
+    }
+}
+
+fn json_content_type() -> Option<HeaderValue> {
+    Some(HeaderValue::from_static("application/json"))
 }
 
 /// Whether a terminated op would introduce a scripting surface — the same
@@ -991,5 +1119,32 @@ mod tests {
 
         // An unparseable port is not this surface's route at all.
         assert!(classify(&Method::DELETE, "/imposters/not-a-port").is_none());
+    }
+
+    #[test]
+    fn op_ids_derive_deterministically_from_the_idempotency_key() {
+        // A UUID key is used verbatim; a non-UUID key derives stably; absent
+        // keys mint fresh (and therefore differ).
+        let uuid_key = "0189dcf0-0454-4e0b-a10c-8a8f8dccce1f";
+        assert_eq!(
+            base_op_id(Some(uuid_key)),
+            uuid_key.parse::<Uuid>().expect("uuid"),
+        );
+        assert_eq!(base_op_id(Some("my-key")), base_op_id(Some("  my-key  ")));
+        assert_ne!(base_op_id(Some("my-key")), base_op_id(Some("other-key")));
+        assert_ne!(base_op_id(None), base_op_id(None));
+        assert_ne!(
+            base_op_id(Some("")),
+            base_op_id(Some("")),
+            "an empty key is no key"
+        );
+
+        // Single-op mutations use the base verbatim (the pollable id); multi-op
+        // sequences derive per-index ids that never collide with the base.
+        let base = base_op_id(Some("my-key"));
+        assert_eq!(op_id_for(base, 0, 1), base);
+        assert_ne!(op_id_for(base, 0, 2), base);
+        assert_ne!(op_id_for(base, 0, 2), op_id_for(base, 1, 2));
+        assert_eq!(op_id_for(base, 1, 3), op_id_for(base, 1, 3));
     }
 }

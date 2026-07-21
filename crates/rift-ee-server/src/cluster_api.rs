@@ -64,9 +64,55 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
     let members = slot.clone();
     let config = slot.clone();
     let imposters = slot.clone();
+    let ops = slot.clone();
     let health = slot;
 
-    base.route(
+    base.route_prefix(
+        "GET",
+        "/_cluster/ops/",
+        Arc::new(move |suffix: String, _body: Vec<u8>| -> HandlerFuture {
+            let slot = ops.clone();
+            Box::pin(async move {
+                let node = slot.node()?;
+                // The suffix may carry a query string; the id is the path part.
+                let id = suffix.split('?').next().unwrap_or_default();
+                // A malformed id names no op the same way an unknown one
+                // does: 404, never the internal-failure bucket.
+                let Ok(op_id) = id.parse::<uuid::Uuid>() else {
+                    return Err(RpcError::UnknownRoute {
+                        method: "GET".to_owned(),
+                        path: format!("/_cluster/ops/{id}"),
+                    });
+                };
+                let value = match node.read_op(&op_id).map_err(handler_error)? {
+                    Some(response) => match response.outcome {
+                        rift_cluster::ControlOutcome::Applied => serde_json::json!({
+                            "state": "applied",
+                            "revision": response.revision,
+                        }),
+                        rift_cluster::ControlOutcome::Failed { reason } => serde_json::json!({
+                            "state": "failed",
+                            "revision": response.revision,
+                            "detail": reason,
+                        }),
+                    },
+                    None if node.intent_parked(&op_id).map_err(handler_error)? => {
+                        serde_json::json!({ "state": "pending" })
+                    }
+                    // Unknown ids and ops whose dedup window has lapsed are
+                    // indistinguishable; both answer 404.
+                    None => {
+                        return Err(RpcError::UnknownRoute {
+                            method: "GET".to_owned(),
+                            path: format!("/_cluster/ops/{id}"),
+                        });
+                    }
+                };
+                serde_json::to_vec(&value).map_err(handler_error)
+            })
+        }),
+    )
+    .route(
         "GET",
         "/_cluster/members",
         json_handler(move || {
