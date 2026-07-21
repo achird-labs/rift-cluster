@@ -325,13 +325,25 @@ impl RaftNode {
 
     /// Stop the Raft runtime and release the cluster port. Any in-flight client
     /// writes fail.
+    ///
+    /// Waits for the accept loop to actually stop before returning, so the port
+    /// is released by the time this resolves — otherwise a fast restart on the
+    /// same address races a listener that has been aborted but not yet dropped.
     pub async fn shutdown(&self) -> Result<(), NodeError> {
-        self.raft
+        let raft_stopped = self
+            .raft
             .shutdown()
             .await
-            .map_err(|e| NodeError::Runtime(e.to_string()))?;
+            .map_err(|e| NodeError::Runtime(e.to_string()));
+        // Release the cluster port regardless of how the Raft core stopped: a
+        // failed core shutdown must not *also* leak the listener, or the next
+        // start on this address fails with a misleading bind error that hides the
+        // real cause.
         self.server_task.abort();
-        Ok(())
+        while !self.server_task.is_finished() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        raft_stopped
     }
 }
 

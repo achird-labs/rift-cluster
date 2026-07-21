@@ -42,3 +42,7 @@ futures-lite = "2"
 # Each openraft storage-suite store and each membership test gets its own temp
 # `redb` database file, cleaned up when the guard drops.
 tempfile = "3"
+# The 3-node integration harness (tests/cluster.rs) drives real nodes directly,
+# so it needs tokio in its own right — integration tests do not inherit the
+# library's normal dependencies.
+tokio.workspace = true
