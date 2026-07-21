@@ -16,10 +16,12 @@
 pub mod identity;
 pub mod network;
 pub mod node;
+pub mod ring;
 pub mod store;
 
 pub use identity::NodeIdentity;
 pub use node::{NodeConfig, NodeError, RaftNode, StatusReport};
+pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
 
 use std::io::Cursor;
 

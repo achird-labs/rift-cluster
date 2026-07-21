@@ -27,8 +27,8 @@ pub mod rpc;
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use raft::{
-    ControlOp, ControlResponse, NodeConfig, NodeError, NodeId, NodeIdentity, RaftNode,
-    StatusReport, TypeConfig,
+    ControlOp, ControlResponse, KeyClass, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus,
+    OwnedKey, RaftNode, Ring, StatusReport, TypeConfig,
 };
 pub use rpc::{Router, RpcClient, RpcError, RpcServer};
 
