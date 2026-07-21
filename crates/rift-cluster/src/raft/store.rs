@@ -488,6 +488,14 @@ impl RedbStateMachine {
         self
     }
 
+    /// How many live handles share this state machine's `redb::Database`. The
+    /// node uses this to tell when openraft has dropped its own storage clones on
+    /// shutdown — while any remain, the redb file lock is still held and a restart
+    /// on the same directory would fail to acquire it.
+    pub(crate) fn db_refs(&self) -> usize {
+        Arc::strong_count(&self.db)
+    }
+
     // `StorageResult` wraps openraft's `StorageError<u64>`, which is inherently
     // large (an `AnyError` plus an optional backtrace); every trait method here
     // returns it because the trait mandates it, and this private helper matches

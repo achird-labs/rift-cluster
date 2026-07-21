@@ -37,6 +37,20 @@ use crate::rpc::{
 /// Log-file name for the Raft storage inside the node's data directory.
 const RAFT_DB_FILE: &str = "raft.redb";
 
+/// How long [`RaftNode::shutdown`] waits for the openraft core to drop its
+/// storage handles. The core stops within a few scheduler ticks of acknowledging
+/// the shutdown; this only bounds a pathologically stuck teardown so shutdown can
+/// never hang forever.
+const STORAGE_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The number of `Arc<redb::Database>` clones a stopped `RaftNode` still holds
+/// itself: exactly one, the `sm_reader` state-machine handle. Once
+/// [`RedbStateMachine::db_refs`] falls to this, every clone openraft owned has
+/// been dropped and the redb lock is releasable. Asserted in the tests so a
+/// future field that clones the database fails loudly here instead of hanging the
+/// shutdown wait.
+const NODE_HELD_DB_REFS: usize = 1;
+
 /// How long `--cluster-init` waits for the founding node to elect itself leader
 /// before giving up. A single voter wins immediately; this only bounds a stuck
 /// startup.
@@ -652,12 +666,19 @@ impl RaftNode {
         }
     }
 
-    /// Stop the Raft runtime and release the cluster port. Any in-flight client
-    /// writes fail.
+    /// Stop the Raft runtime, release the cluster port, and wait for storage to
+    /// be released. Any in-flight client writes fail.
     ///
-    /// Waits for the accept loop to actually stop before returning, so the port
-    /// is released by the time this resolves — otherwise a fast restart on the
-    /// same address races a listener that has been aborted but not yet dropped.
+    /// Waits for two teardown steps so that by the time this resolves a fast
+    /// restart on the same address *and* data directory cannot race the stopping
+    /// node:
+    /// - the accept loop actually stops, so the cluster port is free (otherwise a
+    ///   restart races a listener that has been aborted but not yet dropped);
+    /// - the openraft core drops its `Arc<redb::Database>` clones, so the redb
+    ///   file lock is releasable. `Raft::shutdown()` returns once the core
+    ///   acknowledges the stop, but the core drops its storage a few ticks later;
+    ///   until it does, the last database handle keeps the lock and an immediate
+    ///   restart fails with "Database already open" (#41).
     pub async fn shutdown(&self) -> Result<(), NodeError> {
         let raft_stopped = self
             .raft
@@ -672,7 +693,46 @@ impl RaftNode {
         while !self.server_task.is_finished() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        raft_stopped
+        // Prefer a Raft-core shutdown failure over the storage-release outcome: a
+        // core that failed to stop cleanly never drops its storage, so the wait
+        // below would time out and mask the actual cause. When the core stopped
+        // cleanly, a storage-release timeout is the real (and only) failure.
+        let storage_released = self.await_storage_release().await;
+        raft_stopped.and(storage_released)
+    }
+
+    /// Wait until the only remaining handle on the storage database is this node's
+    /// own `sm_reader`, i.e. openraft has dropped its log-store and state-machine
+    /// clones. Bounded by [`STORAGE_RELEASE_TIMEOUT`] so a stuck teardown surfaces
+    /// as an error instead of hanging shutdown.
+    async fn await_storage_release(&self) -> Result<(), NodeError> {
+        let deadline = tokio::time::Instant::now() + STORAGE_RELEASE_TIMEOUT;
+        while self.sm_reader.db_refs() > NODE_HELD_DB_REFS {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(NodeError::Runtime(format!(
+                    "raft core did not release storage within {STORAGE_RELEASE_TIMEOUT:?} \
+                     ({} database handles still live)",
+                    self.sm_reader.db_refs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        Ok(())
+    }
+
+    /// Live `Arc<redb::Database>` clone count, for tests asserting the shutdown
+    /// storage-release contract.
+    #[cfg(test)]
+    fn storage_refs(&self) -> usize {
+        self.sm_reader.db_refs()
+    }
+
+    /// A test-only extra handle on the storage database, standing in for a clone
+    /// openraft has not yet dropped, so a test can force the shutdown
+    /// storage-release wait to observe an outstanding reference.
+    #[cfg(test)]
+    fn clone_storage_handle(&self) -> RedbStateMachine {
+        self.sm_reader.clone()
     }
 }
 
@@ -899,6 +959,72 @@ mod tests {
             "applied index must be recovered from durable state after restart"
         );
         node.shutdown().await.expect("shutdown");
+    }
+
+    /// The storage-release contract shutdown promises: when it returns, openraft
+    /// has dropped every database handle it held, leaving only the node's own
+    /// `sm_reader`. On the old shutdown, which returned before the core wound
+    /// down, this count could still be above one until the core caught up — the
+    /// window the #41 restart raced. Here it is the guaranteed postcondition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_storage_release() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+        node.shutdown().await.expect("shutdown");
+
+        assert_eq!(
+            node.storage_refs(),
+            NODE_HELD_DB_REFS,
+            "shutdown must not return until openraft has released its storage clones"
+        );
+    }
+
+    /// The wait is bounded: if a storage handle is never released (here forced by
+    /// holding an extra clone for the whole shutdown), shutdown returns a typed
+    /// error within the timeout rather than hanging forever. This also
+    /// deterministically gates the wait's *existence* — with no wait, shutdown
+    /// returns `Ok` and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_times_out_if_storage_is_never_released() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+
+        // Stand in for an openraft clone that never drops, so the release wait can
+        // never reach NODE_HELD_DB_REFS.
+        let pin = node.clone_storage_handle();
+        let started = tokio::time::Instant::now();
+        let err = node.shutdown().await;
+        assert!(
+            matches!(&err, Err(NodeError::Runtime(m)) if m.contains("release storage")),
+            "a pinned storage handle must make shutdown time out, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < STORAGE_RELEASE_TIMEOUT * 3,
+            "shutdown must return near the release timeout, not hang"
+        );
+        drop(pin);
+    }
+
+    /// The end-to-end guarantee: because shutdown waits for the lock to be
+    /// releasable, dropping the node and restarting immediately on the same
+    /// directory succeeds every time — no retry-on-lock-contention needed. The
+    /// old shutdown made this intermittently fail with "Database already open".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn immediate_restart_after_shutdown_never_races_the_lock() {
+        let dir = TempDir::new().expect("tempdir");
+        {
+            let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+            node.cluster_init().await.expect("cluster init");
+            node.shutdown().await.expect("shutdown");
+        }
+        for attempt in 0..20 {
+            let node = RaftNode::start(config_in(&dir, 1))
+                .await
+                .unwrap_or_else(|e| panic!("restart {attempt} raced the redb lock: {e}"));
+            node.shutdown().await.expect("shutdown");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
