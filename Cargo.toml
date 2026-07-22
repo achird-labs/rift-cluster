@@ -4,6 +4,11 @@ members = [
     "crates/rift-ee",
     "crates/rift-cluster",
     "crates/rift-ee-server",
+    # Container-tier chaos scenarios (issue #11). A workspace member so it is
+    # type-checked and linted with everything else; its tests are `#[ignore]`d
+    # because they need a container runtime, so a plain `cargo test` on a
+    # machine without one still passes.
+    "tests/cluster-chaos",
 ]
 # The vendored open-source Rift is its own workspace; keep it out of ours and
 # consume its crates purely as path dependencies (see [workspace.dependencies]).

@@ -36,3 +36,44 @@ jobs:
       # cluster metrics that silently never reach /metrics.
       - name: Single prometheus copy
         run: scripts/check-single-prometheus.sh
+
+  # The container tier (issue #11): real processes, killed and restarted. Its
+  # own job because it needs Docker and takes minutes, and because a container
+  # runtime failure must not read as "the code is broken".
+  #
+  # Only on changes that could plausibly break a cluster — the whole tier costs
+  # several minutes, and running it on a README edit trains people to ignore it.
+  cluster-smoke:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Which paths changed
+        id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if git diff --name-only "$base"...HEAD \
+            | grep -qE '^(crates/rift-cluster/|crates/rift-ee-server/|deploy/|tests/cluster-chaos/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.changed.outputs.run == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changed.outputs.run == 'true'
+
+      # Serial by necessity, not by preference: the compose file publishes fixed
+      # host ports, so two stacks cannot coexist on one runner.
+      - name: Container chaos scenarios
+        if: steps.changed.outputs.run == 'true'
+        run: cargo test -p cluster-chaos -- --ignored --test-threads=1
+
+      - name: Cluster logs on failure
+        if: failure() && steps.changed.outputs.run == 'true'
+        run: docker compose -f deploy/compose/docker-compose.yml logs --tail=100 || true
