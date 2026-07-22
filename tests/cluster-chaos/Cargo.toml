@@ -1,0 +1,19 @@
+[package]
+name = "cluster-chaos"
+description = "Container-tier chaos harness: real rift-ee-server processes, killed and restarted for real."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
