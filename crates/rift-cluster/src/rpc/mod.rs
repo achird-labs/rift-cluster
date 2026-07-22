@@ -11,7 +11,10 @@ pub mod routes;
 pub mod server;
 
 pub use auth::{AuthError, SignedRequest, Signer, Verifier};
-pub use client::{AlwaysHealthy, PeerHealth, RpcClient, RpcClientConfig};
+pub use client::{
+    AlwaysHealthy, DnsResolver, PeerHealth, PeerResolver, RpcClient, RpcClientConfig,
+    TrackedPeerHealth,
+};
 pub use routes::{Handler, HandlerFuture, PROTO_VERSION, PrefixHandler, ProtocolVersion, Router};
 pub use server::{DEFAULT_MAX_BODY_BYTES, RpcServer, RpcServerConfig};
 
@@ -100,6 +103,18 @@ impl RpcError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Timeout | Self::Transport(_))
+    }
+
+    /// Whether this failure says anything about the *peer being reachable*, as
+    /// opposed to the peer answering and declining.
+    ///
+    /// Only these count against a peer's health. A `Handler` error is proof the
+    /// peer is alive — it replied — and an `Unauthorized`/`VersionSkew`/
+    /// `UnknownRoute` is a configuration fault that a health cooldown cannot
+    /// help with and would only obscure.
+    #[must_use]
+    pub fn is_liveness_failure(&self) -> bool {
+        matches!(self, Self::Timeout | Self::Transport(_) | Self::Shed)
     }
 }
 

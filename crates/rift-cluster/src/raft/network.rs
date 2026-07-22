@@ -32,7 +32,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use super::{NodeId, TypeConfig};
 use crate::control::{ControlRequest, ControlResponse};
-use crate::rpc::{HandlerFuture, Router, RpcClient, RpcError};
+use crate::rpc::{HandlerFuture, PeerResolver, Router, RpcClient, RpcError};
 
 /// AppendEntries receiving endpoint.
 pub(crate) const RAFT_APPEND_PATH: &str = "/internal/v1/raft/append";
@@ -42,6 +42,9 @@ pub(crate) const RAFT_VOTE_PATH: &str = "/internal/v1/raft/vote";
 pub(crate) const RAFT_SNAPSHOT_PATH: &str = "/internal/v1/raft/snapshot";
 /// Seed-join endpoint: a starting node asks an existing member to admit it.
 pub(crate) const CLUSTER_JOIN_PATH: &str = "/internal/v1/cluster/join";
+/// Leave endpoint (issue #6): a leaving node (or whoever is completing its
+/// departure on its behalf) asks the leader to finish evicting it.
+pub(crate) const CLUSTER_LEAVE_PATH: &str = "/internal/v1/cluster/leave";
 /// Write-forward endpoint: a non-leader node hands a [`ControlRequest`] to the
 /// leader (issue #9). The reply distinguishes "committed" from "I am not the
 /// leader either — try there", so the forwarder can chase a moved leadership.
@@ -85,6 +88,13 @@ pub(crate) struct JoinRequest {
     pub advertise: String,
 }
 
+/// A node's request to be fully removed from the cluster, sent to the leader
+/// (issue #6). Mirrors [`JoinRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LeaveRequest {
+    pub node_id: NodeId,
+}
+
 /// A shared, late-filled handle to a node's [`Raft`]. The router captures a clone
 /// before the `Raft` exists; the node sets it once, after construction.
 pub(crate) type RaftSlot = Arc<OnceCell<Raft<TypeConfig>>>;
@@ -93,11 +103,12 @@ pub(crate) type RaftSlot = Arc<OnceCell<Raft<TypeConfig>>>;
 #[derive(Clone)]
 pub(crate) struct RpcNetwork {
     client: RpcClient,
+    resolver: Arc<dyn PeerResolver>,
 }
 
 impl RpcNetwork {
-    pub(crate) fn new(client: RpcClient) -> Self {
-        Self { client }
+    pub(crate) fn new(client: RpcClient, resolver: Arc<dyn PeerResolver>) -> Self {
+        Self { client, resolver }
     }
 }
 
@@ -109,6 +120,7 @@ impl RaftNetworkFactory<TypeConfig> for RpcNetwork {
             client: self.client.clone(),
             target,
             addr: node.addr.clone(),
+            resolver: Arc::clone(&self.resolver),
         }
     }
 }
@@ -119,6 +131,7 @@ pub(crate) struct PeerClient {
     client: RpcClient,
     target: NodeId,
     addr: String,
+    resolver: Arc<dyn PeerResolver>,
 }
 
 impl PeerClient {
@@ -132,17 +145,12 @@ impl PeerClient {
         Resp: DeserializeOwned,
         E: std::error::Error,
     {
-        // A peer address that does not parse is a configuration fault, not a
-        // transient outage, but openraft has no "misconfigured" class; Unreachable
-        // (which backs off) is the least-wrong mapping and keeps the target's id
-        // in the log for diagnosis.
-        let peer: SocketAddr = self.addr.parse().map_err(|e: std::net::AddrParseError| {
-            RPCError::Unreachable(Unreachable::new(&AddrError {
-                target: self.target,
-                addr: self.addr.clone(),
-                source: e,
-            }))
-        })?;
+        // Resolved fresh on every send (never cached), so a peer's advertise
+        // address that is a hostname (a StatefulSet's headless DNS entry) picks
+        // up a changed pod IP on the very next attempt.
+        let peer = resolve_peer(&self.resolver, self.target, &self.addr)
+            .await
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         let body = serde_json::to_vec(req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let response = self
             .client
@@ -150,6 +158,38 @@ impl PeerClient {
             .await
             .map_err(map_rpc_err)?;
         serde_json::from_slice(&response).map_err(|e| RPCError::Network(NetworkError::new(&e)))
+    }
+}
+
+/// Resolve `authority` through `resolver`, fresh for this one call. The
+/// resolver's own lookup can block (the default does a real DNS/hosts lookup),
+/// so it always runs on the blocking pool rather than the async runtime.
+async fn resolve_peer(
+    resolver: &Arc<dyn PeerResolver>,
+    target: NodeId,
+    authority: &str,
+) -> Result<SocketAddr, AddrError> {
+    // A literal `IP:port` needs no resolver, and today every membership address
+    // is one (`--cluster-advertise` is typed `SocketAddr`). Short-circuiting it
+    // keeps replication — an append_entries per heartbeat per peer — off the
+    // blocking pool entirely, and costs a parse the resolver would do anyway.
+    if let Ok(addr) = authority.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let resolver = Arc::clone(resolver);
+    let owned = authority.to_owned();
+    match tokio::task::spawn_blocking(move || resolver.resolve(&owned)).await {
+        Ok(Ok(addr)) => Ok(addr),
+        Ok(Err(source)) => Err(AddrError {
+            target,
+            addr: authority.to_owned(),
+            source,
+        }),
+        Err(join_err) => Err(AddrError {
+            target,
+            addr: authority.to_owned(),
+            source: std::io::Error::other(join_err.to_string()),
+        }),
     }
 }
 
@@ -182,13 +222,13 @@ impl RaftNetwork<TypeConfig> for PeerClient {
     }
 }
 
-/// Error carrying which peer's address failed to parse.
+/// Error carrying which peer's address failed to resolve.
 #[derive(Debug, thiserror::Error)]
-#[error("peer {target} has unparseable address {addr:?}: {source}")]
+#[error("peer {target} has unresolvable address {addr:?}: {source}")]
 struct AddrError {
     target: NodeId,
     addr: String,
-    source: std::net::AddrParseError,
+    source: std::io::Error,
 }
 
 /// Map a transport failure onto openraft's RPC error space.
@@ -225,6 +265,7 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot) -> Router {
     let snapshot = slot.clone();
     let write = slot.clone();
     let applied = slot.clone();
+    let leave = slot.clone();
     let join = slot;
     let admission_gate: AdmissionGate = Arc::new(Mutex::new(()));
 
@@ -316,12 +357,31 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot) -> Router {
                 })
             }),
         )
+        .route(
+            "POST",
+            CLUSTER_LEAVE_PATH,
+            Arc::new(move |body: Vec<u8>| -> HandlerFuture {
+                let slot = leave.clone();
+                Box::pin(async move {
+                    let raft = raft_of(&slot)?;
+                    let req = decode::<LeaveRequest>(&body)?;
+                    evict(raft, req.node_id).await?;
+                    encode(&LeaveAccepted { evicted: true })
+                })
+            }),
+        )
 }
 
 /// Reply to a successful [`JoinRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JoinAccepted {
     admitted: bool,
+}
+
+/// Reply to a successful [`LeaveRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LeaveAccepted {
+    evicted: bool,
 }
 
 /// Reply to a forwarded write ([`CLUSTER_WRITE_PATH`]).
@@ -438,6 +498,79 @@ async fn committed_voters(
     })
     .await
     .map_err(|e| RpcError::Handler(format!("admit {id}: reading committed membership: {e}")))
+}
+
+/// Leader-side: demote `node_id` from voter to learner if it currently is one
+/// — the first half of a graceful departure (issue #6), the second being
+/// [`remove_member`]. A no-op if `node_id` is not currently a voter, so a
+/// retried leave (or a leave of a node that was only ever a learner) is
+/// idempotent.
+///
+/// Demoting the *leader itself* does not hand off leadership: openraft's own
+/// model allows a leader to be a non-voter (see `RaftState::is_leading` in the
+/// vendored source — leadership requires only *membership*, checked via
+/// `MembershipState::contains`, not `is_voter`), so a leader that demotes
+/// itself keeps leading right through this step. It only steps down once
+/// [`remove_member`] drops it from membership entirely — which is exactly why
+/// [`super::node::RaftNode::leave`] can run both steps as one local call when
+/// it is itself the leaving leader, with no separate transfer step needed.
+async fn demote_voter(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), RpcError> {
+    let is_voter = raft
+        .with_raft_state(move |state| {
+            state
+                .membership_state
+                .committed()
+                .voter_ids()
+                .any(|id| id == node_id)
+        })
+        .await
+        .map_err(|e| RpcError::Handler(format!("demote {node_id}: reading membership: {e}")))?;
+    if !is_voter {
+        return Ok(());
+    }
+    membership_change(
+        raft,
+        &format!("demote {node_id}: remove from voters"),
+        || raft.change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([node_id])), true),
+    )
+    .await
+}
+
+/// Leader-side: drop `node_id` from membership entirely. Must run after
+/// [`demote_voter`] — openraft refuses to remove a node that is still a voter
+/// (`LearnerNotFound`) — which [`evict`] enforces by sequencing the two. A
+/// no-op if `node_id` is already gone, so a retried leave is idempotent.
+async fn remove_member(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), RpcError> {
+    let is_member = raft
+        .with_raft_state(move |state| {
+            state
+                .membership_state
+                .committed()
+                .nodes()
+                .any(|(id, _)| *id == node_id)
+        })
+        .await
+        .map_err(|e| RpcError::Handler(format!("evict {node_id}: reading membership: {e}")))?;
+    if !is_member {
+        return Ok(());
+    }
+    membership_change(raft, &format!("evict {node_id}: remove node"), || {
+        raft.change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node_id])), false)
+    })
+    .await
+}
+
+/// Leader-side: fully evict `node_id` from the cluster — demote it from voter
+/// to learner if needed, then drop it from membership (issue #6). Mirrors
+/// [`admit`]'s use of [`membership_change`] so both admission and departure
+/// share the same commit barrier and `InProgress` retry (#38). Must run on the
+/// leader — on any other node openraft returns `ForwardToLeader`, surfaced
+/// here so the caller (the [`CLUSTER_LEAVE_PATH`] handler) can retry against
+/// the leader. Idempotent: retried, or called against a node already gone, is
+/// `Ok`.
+pub(crate) async fn evict(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), RpcError> {
+    demote_voter(raft, node_id).await?;
+    remove_member(raft, node_id).await
 }
 
 /// The soft auto-promotion gate: promote while under the ceiling, never
@@ -612,5 +745,61 @@ mod tests {
             !should_promote(&voters, 2, 3),
             "an existing voter is never re-promoted"
         );
+    }
+
+    /// A resolver that counts invocations and always resolves to a fixed
+    /// address, standing in for the mock the DNS re-resolution gate needs.
+    struct CountingResolver {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        addr: SocketAddr,
+    }
+
+    impl PeerResolver for CountingResolver {
+        fn resolve(&self, _authority: &str) -> std::io::Result<SocketAddr> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.addr)
+        }
+    }
+
+    /// #6 gate: the resolver must be consulted on every send, not resolved
+    /// once and cached — a cached resolution would keep dialing a pod's old IP
+    /// after a rollout moved it.
+    #[tokio::test]
+    async fn resolver_is_consulted_per_send() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver: Arc<dyn PeerResolver> = Arc::new(CountingResolver {
+            calls: calls.clone(),
+            addr: "127.0.0.1:1".parse().expect("valid addr"),
+        });
+
+        resolve_peer(&resolver, 1, "some-peer:4790")
+            .await
+            .expect("resolves");
+        resolve_peer(&resolver, 1, "some-peer:4790")
+            .await
+            .expect("resolves");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each send must consult the resolver again, never reuse a cached result"
+        );
+    }
+
+    /// #6 gate: a hostname advertise address (the shape a StatefulSet's
+    /// headless-service DNS entry takes) now resolves, where the old bare
+    /// `parse::<SocketAddr>()` rejected anything but a literal IP.
+    #[tokio::test]
+    async fn hostname_advertise_address_resolves_where_bare_parse_would_fail() {
+        assert!(
+            "localhost:0".parse::<SocketAddr>().is_err(),
+            "sanity: a hostname must not parse as a literal SocketAddr — that is the bug this fixes"
+        );
+
+        let resolver: Arc<dyn PeerResolver> = Arc::new(crate::rpc::DnsResolver);
+        let addr = resolve_peer(&resolver, 1, "localhost:4790")
+            .await
+            .expect("the default resolver must resolve a hostname:port authority");
+        assert_eq!(addr.port(), 4790);
     }
 }

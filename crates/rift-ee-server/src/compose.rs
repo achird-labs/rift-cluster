@@ -153,7 +153,32 @@ impl ComposedServer {
             timeout_secs = self.leave_timeout.as_secs(),
             "graceful leave: reporting not-ready and draining in-flight work"
         );
-        tokio::time::sleep(self.leave_timeout).await;
+
+        // The whole departure shares one budget: the orchestrator's grace period
+        // is sized against `--cluster-leave-timeout`, so leaving the membership
+        // and draining must fit inside it together, not take it each.
+        let deadline = tokio::time::Instant::now() + self.leave_timeout;
+
+        if let Some(node) = self.node.as_ref() {
+            // Before the drain, not after: until the removal commits the fleet
+            // still counts this node toward quorum, so a node that drained first
+            // would spend the whole window as a member that answers nothing.
+            match node.leave(self.leave_timeout).await {
+                Ok(()) => tracing::info!("left the cluster membership"),
+                // Error, not warn: this node is exiting while the fleet still
+                // counts it toward quorum, so a rolling restart can shrink the
+                // effective quorum without anything else reporting it.
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "could not leave the cluster membership; exiting anyway with this node still \
+                     in the membership"
+                ),
+            }
+        }
+
+        // Whatever is left of the window drains in-flight work. Already past it
+        // (a slow leave) means no drain rather than an overrun.
+        tokio::time::sleep_until(deadline).await;
         self.shutdown().await;
     }
 

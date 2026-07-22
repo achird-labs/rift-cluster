@@ -166,11 +166,28 @@ gate can re-open it.
 
 ## Graceful leave (SIGTERM)
 
-On SIGTERM the node fails readiness *first*, so the balancer sheds it before any
-socket closes; waits `--cluster-leave-timeout` for in-flight work; and only then
-closes the listeners and stops the control-plane node. Closing sockets first
-would turn every in-flight request into a client-visible error, which is exactly
-what the leave exists to avoid.
+On SIGTERM the node, in this order:
+
+1. **fails readiness**, so the balancer sheds it before any socket closes;
+2. **leaves the Raft membership** — demote-then-remove, performed by the leader
+   (the departing node asks it over the cluster port). Until that commits the
+   fleet still counts this node toward quorum, so leaving before the drain is
+   what keeps a rolling restart from shrinking the effective quorum;
+3. **drains** whatever is left of the `--cluster-leave-timeout` window;
+4. **closes the listeners** and stops the control-plane node.
+
+Closing sockets first would turn every in-flight request into a client-visible
+error, which is exactly what the leave exists to avoid.
+
+Steps 2 and 3 **share** the `--cluster-leave-timeout` budget rather than taking
+it each, so the total stays inside the window the orchestrator's grace period is
+sized against. A node that cannot reach a leader within the budget logs a warning
+and exits anyway — the cluster then handles it as a dead node, which is strictly
+better than a shutdown that hangs.
+
+If the departing node is itself the **leader**, leadership moves as part of the
+departure: openraft keeps a node leading while it is merely demoted to learner,
+and hands off once the second write drops it from membership entirely.
 
 > **Set the orchestrator's grace period to at least twice
 > `--cluster-leave-timeout`** (`terminationGracePeriodSeconds` on Kubernetes).

@@ -303,3 +303,75 @@ async fn probes_answer_while_the_node_is_still_joining() {
         "the failure must be the seed, not the probe listener: {err}"
     );
 }
+
+/// Issue #6: the SIGTERM path must actually leave the Raft membership.
+///
+/// Every other test here runs `--cluster-allow-solo`, and a sole voter cannot
+/// leave (openraft refuses to empty the voter set), so `graceful_leave` skips
+/// the departure entirely on those — a no-op regression in the wiring would
+/// leave them all green. This is the only test that puts a second node behind
+/// the leave and reads the survivor's membership afterwards.
+#[tokio::test]
+async fn graceful_leave_removes_this_node_from_a_real_membership() {
+    let founder_state = TempDir::new().expect("tempdir");
+    let joiner_state = TempDir::new().expect("tempdir");
+    let founder_bind = reserve_port();
+
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("founder starts");
+
+    let joiner = compose::start(cluster_on(
+        &joiner_state,
+        &reserve_port(),
+        "127.0.0.1:0",
+        &[
+            "--cluster-seeds",
+            &founder_bind,
+            "--cluster-leave-timeout",
+            "5",
+        ],
+    ))
+    .await
+    .expect("joiner starts");
+
+    let founder_node = founder.node().expect("founder is clustered").clone();
+    let joiner_id = joiner.node().expect("joiner is clustered").id();
+
+    // Both nodes are voters before the leave, or the assertion afterwards proves
+    // nothing.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if founder_node.status().voters.len() == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the joiner never became a voter: {:?}",
+            founder_node.status().voters
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    joiner.graceful_leave().await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let voters = founder_node.status().voters;
+        if !voters.contains(&joiner_id) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SIGTERM did not remove the departing node from the membership: {voters:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    founder.shutdown().await;
+}

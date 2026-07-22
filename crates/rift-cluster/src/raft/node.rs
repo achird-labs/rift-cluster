@@ -12,10 +12,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use openraft::error::{ClientWriteError, InitializeError, RaftError};
 use openraft::{BasicNode, Config, Raft, ServerState};
 use rift_ee::seams::{ImposterConfig, ImposterManager};
 use tokio::sync::OnceCell;
@@ -23,16 +24,16 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::network::{
-    self, CLUSTER_APPLIED_PATH, CLUSTER_JOIN_PATH, CLUSTER_WRITE_PATH, JoinRequest, RaftSlot,
-    RpcNetwork, WriteReply,
+    self, CLUSTER_APPLIED_PATH, CLUSTER_JOIN_PATH, CLUSTER_LEAVE_PATH, CLUSTER_WRITE_PATH,
+    JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
 };
 use super::ring::Ring;
 use super::store::{self, RedbStateMachine};
 use super::{NodeId, TypeConfig};
 use crate::control::{ControlOp, ControlRequest, ControlResponse, TenantId};
-use crate::rpc::client::AlwaysHealthy;
 use crate::rpc::{
-    Router, RpcClient, RpcClientConfig, RpcServer, RpcServerConfig, Signer, Verifier,
+    DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer, RpcServerConfig,
+    Signer, TrackedPeerHealth, Verifier,
 };
 
 /// Log-file name for the Raft storage inside the node's data directory.
@@ -64,6 +65,12 @@ const ELECTION_TIMEOUT_MAX_MS: u64 = 300;
 /// A leader that a quorum has not acknowledged within this window is treated as
 /// isolated (the isolated-owner rule, RFC-001 §7.2): 3× the election timeout.
 const ISOLATION_WINDOW_MS: u64 = 3 * ELECTION_TIMEOUT_MAX_MS;
+
+/// How long [`RaftNode::leave`] waits between polls while chasing a leader
+/// hint that is moving (a demote just committed but the new leader has not
+/// settled, or metrics have not caught up yet). Small relative to typical
+/// caller deadlines, so a bounded `leave` still gets several tries.
+const LEAVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Everything a [`RaftNode`] needs to start.
 #[derive(Clone)]
@@ -150,6 +157,17 @@ pub enum NodeError {
     /// Timed out waiting for an expected state (e.g. leadership after init).
     #[error("timed out waiting for {what}: {detail}")]
     Timeout { what: &'static str, detail: String },
+
+    /// A write or init was attempted on a node that is not the leader.
+    /// `leader` is this node's current best hint, if it has one — never
+    /// openraft's `BasicNode`, so this stays a plain, stable id.
+    #[error("not leader (leader: {leader:?})")]
+    NotLeader { leader: Option<NodeId> },
+
+    /// `--cluster-init` was refused because this node's log already carries a
+    /// membership entry (a restart, or a second `--cluster-init`).
+    #[error("this node is already initialized")]
+    AlreadyInitialized,
 }
 
 /// A point-in-time view of the node, derived from Raft metrics. This is the
@@ -176,6 +194,11 @@ pub struct RaftNode {
     // Authenticated client for node-driven admin RPCs (e.g. seed join). Shares
     // the same signer/pool the Raft network uses.
     client: RpcClient,
+    // The same resolver the Raft network sends through, so a peer address the
+    // node dials directly (the leader it asks to evict it) is resolved exactly
+    // as replication resolves it — a DNS advertise address must not work for
+    // one and silently fail for the other.
+    resolver: Arc<dyn PeerResolver>,
     // A read-only handle onto the same state machine openraft owns as `&mut`, so
     // the node can answer committed-config reads without going through Raft.
     sm_reader: RedbStateMachine,
@@ -186,6 +209,9 @@ pub struct RaftNode {
     // dropped without the shutdown-then-drop contract — storage release is only
     // guaranteed through shutdown() (see Drop).
     shutdown_invoked: AtomicBool,
+    // The most recent reason a leave attempt failed, so the deadline's error can
+    // name a cause instead of only reporting that time ran out.
+    last_leave_error: Mutex<Option<String>>,
 }
 
 impl RaftNode {
@@ -248,8 +274,13 @@ impl RaftNode {
             .map_err(|e| NodeError::Bind(e.to_string()))?;
         let advertise = config.advertise.unwrap_or(local);
 
-        let client = RpcClient::new(signer, Arc::new(AlwaysHealthy), RpcClientConfig::default());
-        let network = RpcNetwork::new(client.clone());
+        let client = RpcClient::new(
+            signer,
+            Arc::new(TrackedPeerHealth::new()),
+            RpcClientConfig::default(),
+        );
+        let resolver: Arc<dyn PeerResolver> = Arc::new(DnsResolver);
+        let network = RpcNetwork::new(client.clone(), Arc::clone(&resolver));
 
         let raft = Raft::new(
             config.node_id,
@@ -270,9 +301,11 @@ impl RaftNode {
             advertise,
             raft,
             client,
+            resolver,
             sm_reader,
             server_task,
             shutdown_invoked: AtomicBool::new(false),
+            last_leave_error: Mutex::new(None),
         })
     }
 
@@ -302,14 +335,12 @@ impl RaftNode {
     /// voter, then wait for it to elect itself leader.
     ///
     /// Initializing a node that already has a membership entry is refused by
-    /// openraft and surfaced as [`NodeError::Init`], so a second `--cluster-init`
-    /// (including after a restart) does not silently fork a new cluster.
+    /// openraft and surfaced as [`NodeError::AlreadyInitialized`], so a second
+    /// `--cluster-init` (including after a restart) does not silently fork a
+    /// new cluster.
     pub async fn cluster_init(&self) -> Result<(), NodeError> {
         let members = BTreeMap::from([(self.id, BasicNode::new(self.advertise.to_string()))]);
-        self.raft
-            .initialize(members)
-            .await
-            .map_err(|e| NodeError::Init(e.to_string()))?;
+        self.raft.initialize(members).await.map_err(map_init_err)?;
 
         self.raft
             .wait(Some(INIT_LEADER_TIMEOUT))
@@ -360,6 +391,155 @@ impl RaftNode {
         Ok(())
     }
 
+    /// Best-effort, deadline-bounded departure from the cluster (issue #6).
+    ///
+    /// If this node is currently the leader, it evicts itself in one local
+    /// call: openraft's own model allows a leader to be a non-voter (see
+    /// `RaftState::is_leading` in the vendored openraft source — leadership
+    /// only requires *membership*, and a leader stays "leading" through the
+    /// demote-to-learner half of the departure, only actually handing off once
+    /// the *second* write drops it from membership entirely). If that local
+    /// attempt fails partway (leadership moved mid-flight) — or this node was
+    /// never leader to begin with — completion falls back to asking whichever
+    /// node the current leader hint names, chasing it while leadership settles.
+    /// Never blocks past `timeout`: on elapse this returns
+    /// [`NodeError::Timeout`] rather than hanging shutdown.
+    pub async fn leave(&self, timeout: Duration) -> Result<(), NodeError> {
+        tokio::time::timeout(timeout, self.leave_inner())
+            .await
+            .unwrap_or_else(|_| {
+                // The loop's last real cause, not just "it timed out": auth
+                // failure, protocol skew and an unreachable leader all look the
+                // same from out here, and they need different operator actions.
+                let cause = self
+                    .last_leave_error
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                    .unwrap_or_else(|| "no attempt reported a cause".to_owned());
+                Err(NodeError::Timeout {
+                    what: "cluster leave",
+                    detail: format!("did not complete within {timeout:?}; last cause: {cause}"),
+                })
+            })
+    }
+
+    async fn leave_inner(&self) -> Result<(), NodeError> {
+        if !self.is_member() {
+            return Ok(());
+        }
+
+        // openraft refuses a membership change that would empty the voter set
+        // (`EmptyMembership`), so a sole voter can never leave. Spinning until
+        // the deadline would burn the entire budget `graceful_leave` shares
+        // between leaving and draining, leaving a solo node — a supported mode —
+        // with no drain at all.
+        if self.is_sole_voter() {
+            return Ok(());
+        }
+
+        // Why the leader retries *inside* the loop rather than once before it:
+        // if the demote commits but the removal does not, this node is a learner
+        // that is still leading, and then `current_leader` reports `None` on
+        // every node including this one — so the RPC path has nothing to chase
+        // and could never finish what the local path started.
+        loop {
+            if !self.is_member() {
+                return Ok(());
+            }
+
+            let attempt = if self.status().is_leader {
+                network::evict(&self.raft, self.id)
+                    .await
+                    .map_err(|e| format!("local eviction: {e}"))
+            } else if let Some(authority) = self.leader_authority() {
+                self.leave_via(&authority).await
+            } else {
+                Err("no leader is known".to_owned())
+            };
+
+            match attempt {
+                Ok(()) => return Ok(()),
+                Err(cause) => self.record_leave_error(cause),
+            }
+            tokio::time::sleep(LEAVE_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Ask the node at `authority` to evict this one. Errors are returned as
+    /// text so the retry loop can keep the most recent cause for the timeout —
+    /// an operator whose fleet stopped leaving needs to know whether it was
+    /// auth, protocol skew, or an unreachable leader.
+    async fn leave_via(&self, authority: &str) -> Result<(), String> {
+        let addr = self
+            .resolve(authority)
+            .await
+            .map_err(|e| format!("resolve leader {authority}: {e}"))?;
+        let request = LeaveRequest { node_id: self.id };
+        let body = serde_json::to_vec(&request).map_err(|e| format!("encode leave: {e}"))?;
+        self.client
+            .call(addr, "POST", CLUSTER_LEAVE_PATH, body)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("leave via {authority}: {e}"))
+    }
+
+    /// Keep the latest failure so the deadline's error can name a cause. A
+    /// poisoned lock loses the diagnostic, never the departure.
+    fn record_leave_error(&self, cause: String) {
+        if let Ok(mut slot) = self.last_leave_error.lock() {
+            *slot = Some(cause);
+        }
+    }
+
+    /// Whether this node is the only voter, i.e. there is no one to hand to.
+    fn is_sole_voter(&self) -> bool {
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow();
+        let voters: Vec<_> = metrics.membership_config.voter_ids().collect();
+        voters == [self.id]
+    }
+
+    /// Whether this node's id still appears anywhere in the currently
+    /// effective membership (voter or learner) — whether there is anything
+    /// left to leave.
+    fn is_member(&self) -> bool {
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow();
+        metrics
+            .membership_config
+            .nodes()
+            .any(|(id, _)| *id == self.id)
+    }
+
+    /// The current leader's advertise authority, if metrics know one right now.
+    ///
+    /// Deliberately returns the *unresolved* string: resolution blocks, and a
+    /// blocking call cannot be interrupted by the `tokio::time::timeout` that
+    /// bounds [`leave`](Self::leave) — doing it here would make the "never
+    /// blocks past `timeout`" contract false and stall a runtime worker for the
+    /// OS resolver's own timeout, on exactly the degraded-DNS pod this is for.
+    fn leader_authority(&self) -> Option<String> {
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow();
+        let leader_id = metrics.current_leader?;
+        metrics
+            .membership_config
+            .nodes()
+            .find(|(id, _)| **id == leader_id)
+            .map(|(_, node)| node.addr.clone())
+    }
+
+    /// Resolve a peer authority off the runtime thread, via the same resolver
+    /// replication uses.
+    async fn resolve(&self, authority: &str) -> std::io::Result<SocketAddr> {
+        let resolver = Arc::clone(&self.resolver);
+        let owned = authority.to_owned();
+        tokio::task::spawn_blocking(move || resolver.resolve(&owned))
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+
     /// Submit a control op through Raft and return the state machine's
     /// committed response. Fails if this node is not the leader or the entry
     /// does not commit; a *committed* refusal (validation, absent port) is the
@@ -369,7 +549,7 @@ impl RaftNode {
             .raft
             .client_write(request)
             .await
-            .map_err(|e| NodeError::Write(e.to_string()))?;
+            .map_err(map_write_err)?;
         Ok(response.data)
     }
 
@@ -754,6 +934,31 @@ impl RaftNode {
     }
 }
 
+/// Map openraft's `initialize` failure onto the typed surface: an
+/// already-initialized node is its own variant, matched structurally against
+/// openraft's typed error (never its rendered message) so a reworded error
+/// text can't silently stop this from firing. Every other failure keeps its
+/// raw detail.
+fn map_init_err(e: RaftError<NodeId, InitializeError<NodeId, BasicNode>>) -> NodeError {
+    match e {
+        RaftError::APIError(InitializeError::NotAllowed(_)) => NodeError::AlreadyInitialized,
+        other => NodeError::Init(other.to_string()),
+    }
+}
+
+/// Map openraft's `client_write` failure onto the typed surface: a refusal
+/// because this node is not the leader carries the leader hint as a plain
+/// `Option<NodeId>` — [`NodeError`] is public API and must never leak
+/// openraft's `BasicNode`. Matched structurally, like [`map_init_err`].
+fn map_write_err(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> NodeError {
+    match e {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => NodeError::NotLeader {
+            leader: forward.leader_id,
+        },
+        other => NodeError::Write(other.to_string()),
+    }
+}
+
 impl Drop for RaftNode {
     /// Best-effort teardown, deliberately asymmetric with [`RaftNode::shutdown`]:
     /// only the listener is released here. The Raft core stops and drops its
@@ -1077,8 +1282,8 @@ mod tests {
         node.cluster_init().await.expect("first init");
         let second = node.cluster_init().await;
         assert!(
-            matches!(second, Err(NodeError::Init(_))),
-            "second cluster-init must be refused, got {second:?}"
+            matches!(second, Err(NodeError::AlreadyInitialized)),
+            "second cluster-init must be refused as AlreadyInitialized, got {second:?}"
         );
         node.shutdown().await.expect("shutdown");
     }
@@ -1173,11 +1378,12 @@ mod tests {
         n2.join_via(n1.advertise_addr()).await.expect("n2 join");
 
         // A write submitted to the follower must not silently succeed: openraft
-        // refuses it (forward-to-leader), surfaced as a typed error.
+        // refuses it (forward-to-leader), surfaced as a typed NotLeader error
+        // carrying the leader hint, not a generic Write string.
         let err = n2.put_imposter(imposter(8080, "on-follower")).await;
         assert!(
-            matches!(err, Err(NodeError::Write(_))),
-            "follower write must be rejected, got {err:?}"
+            matches!(err, Err(NodeError::NotLeader { leader: Some(1) })),
+            "follower write must be rejected as NotLeader with a leader hint, got {err:?}"
         );
 
         n1.shutdown().await.ok();
