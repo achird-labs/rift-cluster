@@ -1,8 +1,9 @@
 //! The peer-facing RPC client: pooled connections, signed requests, fast-fail.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
@@ -25,6 +26,15 @@ use crate::metrics;
 /// burning the full connect+request deadline on every request during an outage.
 pub trait PeerHealth: Send + Sync {
     fn is_healthy(&self, peer: SocketAddr) -> bool;
+
+    /// Record a call to `peer` that completed successfully. Default no-op:
+    /// most health sources (tests, [`AlwaysHealthy`]) don't track outcomes:
+    /// only a tracking implementation needs to act on this.
+    fn record_success(&self, _peer: SocketAddr) {}
+
+    /// Record a call to `peer` that failed. Default no-op; see
+    /// [`Self::record_success`].
+    fn record_failure(&self, _peer: SocketAddr) {}
 }
 
 /// Health source for single-node and test use: never fast-fails.
@@ -33,6 +43,116 @@ pub struct AlwaysHealthy;
 impl PeerHealth for AlwaysHealthy {
     fn is_healthy(&self, _peer: SocketAddr) -> bool {
         true
+    }
+}
+
+/// Number of consecutive failures [`TrackedPeerHealth`] tolerates before
+/// marking a peer unhealthy.
+const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
+
+/// How long [`TrackedPeerHealth`] keeps a tripped peer marked unhealthy.
+const DEFAULT_COOLDOWN: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct PeerState {
+    consecutive_failures: u32,
+    unhealthy_until: Option<Instant>,
+}
+
+/// A real, locally observed [`PeerHealth`]: after
+/// [`DEFAULT_FAILURE_THRESHOLD`] consecutive failed calls to a peer, it reports
+/// unhealthy for a bounded cooldown so [`RpcClient::call`] fast-fails instead
+/// of burning the full connect+request timeout on a peer already known to be
+/// down. A success clears the streak immediately; a cooldown that elapses
+/// without one also clears it (the peer gets a fresh run at the threshold
+/// rather than staying flagged forever on stale failures).
+pub struct TrackedPeerHealth {
+    state: Mutex<HashMap<SocketAddr, PeerState>>,
+    threshold: u32,
+    cooldown: Duration,
+}
+
+impl Default for TrackedPeerHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrackedPeerHealth {
+    /// A tracker using the default threshold (3) and cooldown (5s).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_params(DEFAULT_FAILURE_THRESHOLD, DEFAULT_COOLDOWN)
+    }
+
+    /// A tracker with an explicit threshold and cooldown, for callers (and
+    /// tests) that need to tune the sensitivity.
+    #[must_use]
+    pub fn with_params(threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+            threshold,
+            cooldown,
+        }
+    }
+}
+
+impl PeerHealth for TrackedPeerHealth {
+    fn is_healthy(&self, peer: SocketAddr) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.get(&peer) {
+            Some(entry) => match entry.unhealthy_until {
+                Some(until) if Instant::now() < until => false,
+                Some(_) => {
+                    // Cooldown elapsed on its own: treat it as recovered, same
+                    // as an explicit success, so a later failure needs a fresh
+                    // run at the threshold rather than tripping on the very
+                    // next attempt.
+                    state.remove(&peer);
+                    true
+                }
+                None => true,
+            },
+            None => true,
+        }
+    }
+
+    fn record_success(&self, peer: SocketAddr) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.remove(&peer);
+    }
+
+    fn record_failure(&self, peer: SocketAddr) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = state.entry(peer).or_default();
+        entry.consecutive_failures += 1;
+        if entry.consecutive_failures >= self.threshold {
+            entry.unhealthy_until = Some(Instant::now() + self.cooldown);
+        }
+    }
+}
+
+/// Resolves a peer's advertised authority (`host:port`) to a dialable
+/// [`SocketAddr`], fresh on every call — no caching, so a changed pod IP (a
+/// StatefulSet rollout, a service mesh reassigning an address) is picked up on
+/// the very next attempt rather than baked in once at connection time.
+/// Injectable so tests can substitute a mock without doing real DNS.
+pub trait PeerResolver: Send + Sync {
+    fn resolve(&self, authority: &str) -> std::io::Result<SocketAddr>;
+}
+
+/// The production resolver: standard OS/DNS resolution via
+/// [`std::net::ToSocketAddrs`], which — unlike a bare [`str::parse`] — accepts
+/// hostnames as well as literal addresses.
+pub struct DnsResolver;
+
+impl PeerResolver for DnsResolver {
+    fn resolve(&self, authority: &str) -> std::io::Result<SocketAddr> {
+        use std::net::ToSocketAddrs;
+        authority
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| std::io::Error::other(format!("no address found for {authority}")))
     }
 }
 
@@ -107,12 +227,26 @@ impl RpcClient {
         loop {
             let result = self.attempt(peer, method, path, body.clone()).await;
             match result {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    self.health.record_success(peer);
+                    return Ok(response);
+                }
                 Err(e) if e.is_retryable() && attempt < self.config.max_retries => {
                     attempt += 1;
                     tokio::time::sleep(backoff(attempt)).await;
                 }
                 Err(e) => {
+                    // Only liveness failures count against a peer's health. A
+                    // `Handler` 500 proves the opposite — the peer answered — and
+                    // counting it would fast-fail a live node for refusing a
+                    // request it was right to refuse: a still-booting seed
+                    // ("raft not yet initialized"), or a leader legitimately
+                    // rejecting an eviction while a membership change is in
+                    // flight. Three of those in a row must not blind us to the
+                    // one node we actually need.
+                    if e.is_liveness_failure() {
+                        self.health.record_failure(peer);
+                    }
                     metrics::rpc_failure(e.reason());
                     return Err(e);
                 }
@@ -308,6 +442,58 @@ mod tests {
                 "body {body}"
             );
         }
+    }
+
+    #[test]
+    fn tracked_health_trips_after_threshold_consecutive_failures() {
+        let health = TrackedPeerHealth::with_params(3, Duration::from_secs(5));
+        let peer: SocketAddr = "127.0.0.1:4001".parse().expect("valid addr");
+        assert!(health.is_healthy(peer), "unknown peer starts healthy");
+        health.record_failure(peer);
+        health.record_failure(peer);
+        assert!(
+            health.is_healthy(peer),
+            "under the threshold, the peer must stay healthy"
+        );
+        health.record_failure(peer);
+        assert!(
+            !health.is_healthy(peer),
+            "the Nth consecutive failure must trip it unhealthy"
+        );
+    }
+
+    #[test]
+    fn tracked_health_short_circuits_during_cooldown_and_recovers_after() {
+        let health = TrackedPeerHealth::with_params(3, Duration::from_millis(50));
+        let peer: SocketAddr = "127.0.0.1:4002".parse().expect("valid addr");
+        for _ in 0..3 {
+            health.record_failure(peer);
+        }
+        assert!(
+            !health.is_healthy(peer),
+            "must short-circuit immediately after tripping"
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            health.is_healthy(peer),
+            "must recover once the cooldown elapses, even without a success"
+        );
+    }
+
+    #[test]
+    fn tracked_health_success_clears_the_failure_streak() {
+        let health = TrackedPeerHealth::with_params(3, Duration::from_secs(5));
+        let peer: SocketAddr = "127.0.0.1:4003".parse().expect("valid addr");
+        health.record_failure(peer);
+        health.record_failure(peer);
+        health.record_success(peer);
+        health.record_failure(peer);
+        health.record_failure(peer);
+        assert!(
+            health.is_healthy(peer),
+            "a success must reset the streak, not merely pause it \
+             (2 + success + 2 must never reach the threshold of 3)"
+        );
     }
 
     #[test]

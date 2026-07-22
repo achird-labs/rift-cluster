@@ -253,6 +253,25 @@ impl TestCluster {
             }
         }
     }
+
+    /// Have member `id` gracefully leave the Raft membership, then shut down
+    /// its own node process (a node that left has no further cluster role).
+    /// Its data directory is left in place, but a fresh `join_via` needs a
+    /// fresh directory — see `test_rejoin_after_leave`.
+    async fn leave_gracefully(
+        &mut self,
+        id: NodeId,
+        timeout: Duration,
+    ) -> Result<(), rift_cluster::NodeError> {
+        let result = {
+            let node = self.member(id).node.as_ref().expect("member is running");
+            node.leave(timeout).await
+        };
+        if let Some(node) = self.member_mut(id).node.take() {
+            node.shutdown().await.ok();
+        }
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -476,5 +495,211 @@ async fn barrier_names_exactly_the_unapplied_node() {
         vec![victim],
         "the barrier must name the dead node and nothing else"
     );
+    cluster.shutdown_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #6: graceful membership departure.
+// ---------------------------------------------------------------------------
+
+/// `test_graceful_leave`: a follower leaves; membership shrinks to 2 voters,
+/// the survivors still have a leader, and a write submitted after the leave
+/// still commits and converges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_graceful_leave() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let follower = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader)
+        .expect("a follower to leave");
+
+    cluster
+        .leave_gracefully(follower, Duration::from_secs(5))
+        .await
+        .expect("a follower must be able to leave gracefully");
+
+    let remaining: BTreeSet<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != follower)
+        .collect();
+    assert!(
+        cluster.wait_voters(&remaining, CONVERGE_DEADLINE).await,
+        "membership did not shrink to the surviving two voters"
+    );
+    assert!(
+        cluster.wait_for_leader(LEADER_DEADLINE).await.is_some(),
+        "the survivors must still have a leader after the leave"
+    );
+
+    cluster.write_on_leader(8080, "after-leave").await;
+    assert!(
+        cluster
+            .wait_converged(8080, "after-leave", CONVERGE_DEADLINE)
+            .await,
+        "a write submitted after the leave must still commit and converge"
+    );
+    cluster.shutdown_all().await;
+}
+
+/// `test_graceful_leave_of_the_leader`: the leader leaves; a new leader
+/// appears within 3s and membership shrinks to 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_graceful_leave_of_the_leader() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let old_leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    cluster
+        .leave_gracefully(old_leader, Duration::from_secs(5))
+        .await
+        .expect("the leader must be able to leave gracefully");
+
+    let remaining: BTreeSet<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != old_leader)
+        .collect();
+    assert!(
+        cluster.wait_voters(&remaining, CONVERGE_DEADLINE).await,
+        "membership did not shrink to the surviving two voters"
+    );
+
+    let new_leader = cluster.wait_for_leader(Duration::from_secs(3)).await;
+    assert!(
+        matches!(new_leader, Some(id) if id != old_leader),
+        "a new leader must appear within 3s of the old leader leaving, got {new_leader:?}"
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// `test_leave_is_bounded_without_a_leader`: a node with no reachable leader
+/// must return from `leave` within a couple of seconds, not hang — a timeout
+/// error is the expected (and only possible) outcome here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_leave_is_bounded_without_a_leader() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let followers: Vec<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != leader)
+        .collect();
+    let (isolated, other_follower) = (followers[0], followers[1]);
+
+    // Kill the leader and the other follower: `isolated` is a plain follower
+    // that can never see a leader again — no quorum is possible with one of
+    // three left standing.
+    cluster.kill(leader).await;
+    cluster.kill(other_follower).await;
+
+    let started = Instant::now();
+    let result = {
+        let node = cluster.member(isolated).node.as_ref().expect("running");
+        node.leave(Duration::from_millis(500)).await
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "leave() must return promptly even with no reachable leader, took {elapsed:?}"
+    );
+    assert!(
+        matches!(result, Err(rift_cluster::NodeError::Timeout { .. })),
+        "leave without any reachable leader must time out, got {result:?}"
+    );
+
+    cluster.kill(isolated).await;
+}
+
+/// `test_rejoin_after_leave`: a node that left can `join_via` a seed again and
+/// catch up on writes it missed while it was away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rejoin_after_leave() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let departed = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader)
+        .expect("a follower to leave");
+
+    cluster
+        .leave_gracefully(departed, Duration::from_secs(5))
+        .await
+        .expect("graceful leave");
+
+    let remaining: BTreeSet<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != departed)
+        .collect();
+    assert!(
+        cluster.wait_voters(&remaining, CONVERGE_DEADLINE).await,
+        "membership did not shrink after the leave"
+    );
+
+    // Write while the departed node is away, so rejoining has to catch up.
+    cluster
+        .write_on_leader(9090, "written-while-departed")
+        .await;
+    assert!(
+        cluster
+            .wait_converged(9090, "written-while-departed", CONVERGE_DEADLINE)
+            .await,
+        "the surviving quorum did not converge while the departed node was away"
+    );
+
+    // Rejoin fresh: a genuinely new data directory reusing the vacated id,
+    // exactly like a redeployed pod would.
+    let new_dir = TempDir::new().expect("tempdir");
+    let addr = cluster.member(departed).addr;
+    let seed = cluster
+        .leader()
+        .expect("a leader to seed off")
+        .advertise_addr();
+    let rejoined = spawn(departed, addr, new_dir.path()).await;
+    rejoined.join_via(seed).await.expect("rejoin via seed");
+    cluster.member_mut(departed).node = Some(rejoined);
+    // Keep the fresh directory alive for the rest of the test (and
+    // shutdown_all afterwards); the old one is no longer used.
+    cluster.member_mut(departed).dir = new_dir;
+
+    let full: BTreeSet<NodeId> = cluster.members.iter().map(|m| m.id).collect();
+    assert!(
+        cluster.wait_voters(&full, CONVERGE_DEADLINE).await,
+        "rejoined node did not converge back to full voter membership"
+    );
+    assert!(
+        cluster
+            .wait_converged(9090, "written-while-departed", CONVERGE_DEADLINE)
+            .await,
+        "rejoined node did not catch up on the write made while it was away"
+    );
+
     cluster.shutdown_all().await;
 }
