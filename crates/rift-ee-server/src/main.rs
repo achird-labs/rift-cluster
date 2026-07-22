@@ -141,13 +141,15 @@ async fn serve(cli: EeCli, accept_runtimes: Vec<tokio::runtime::Handle>) -> anyh
     // SIGTERM is the orchestrator's "you are going away" and must start the
     // graceful leave rather than drop connections; the pod's grace period is
     // what bounds it, so set it to at least twice --cluster-leave-timeout.
+    //
+    // The admin plane is raced against the signal, so an accept loop that dies
+    // on its own ends this node too — and its error is what `serve` returns.
     server
         .serve_until(async {
             termination_signal().await;
             info!("termination signal received; beginning graceful leave");
         })
-        .await;
-    Ok(())
+        .await
 }
 
 #[cfg(unix)]

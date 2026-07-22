@@ -157,18 +157,30 @@ impl ComposedServer {
         self.shutdown().await;
     }
 
-    /// Serve until `signal` resolves, then leave gracefully.
+    /// Serve until either the admin plane stops or `signal` resolves, then leave
+    /// gracefully; returns the admin plane's outcome.
     ///
-    /// The listeners are already accepting in their own tasks by the time
-    /// [`start`] returns, so this awaits the signal rather than the admin plane.
-    /// Racing the two is not expressible against the upstream `RunningServer`:
-    /// both `join` and `shutdown` consume it, so a future built from one cannot
-    /// give it back for the other. The consequence is that an admin accept-loop
-    /// failure does not end the clustered process on its own — it surfaces as a
-    /// failing `/readyz` and a dead admin port instead.
-    pub async fn serve_until(self, signal: impl Future<Output = ()>) {
-        signal.await;
+    /// Racing the two is the point (issue #42). Awaiting only the signal left a
+    /// node whose admin accept loop had died running as a cluster member until
+    /// someone sent SIGTERM — the failure was not merely unpropagated, it was
+    /// unobserved.
+    ///
+    /// The leave runs on **both** arms, in RFC-001 §7.1.2 order. A dead admin
+    /// plane leaves the imposter listeners serving, so the balancer must still be
+    /// told to shed this node before any socket closes.
+    pub async fn serve_until(self, signal: impl Future<Output = ()>) -> anyhow::Result<()> {
+        let outcome = tokio::select! {
+            // Biased so a death that is already observable wins over a signal
+            // arriving in the same poll. Under `select!`'s default random order
+            // the signal could take that tie, dropping the wait future before it
+            // reads the outcome — and upstream delivers that error to the first
+            // caller only, so the node would exit 0 on a dead admin plane.
+            biased;
+            result = self.server.wait() => result,
+            () = signal => Ok(()),
+        };
         self.graceful_leave().await;
+        outcome
     }
 }
 
@@ -603,4 +615,126 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
         SEED_JOIN_DEADLINE.as_secs(),
         failures.join("; ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    //! The clustered path must *observe* the admin plane (issue #42).
+    //!
+    //! These live in the module rather than `tests/` because stopping the OSS
+    //! admin plane out of band is the only way to simulate the accept loop dying,
+    //! and the handle to do it is private. `tests/clustered.rs` owns the signal
+    //! arm of the same race.
+
+    use std::time::Duration;
+
+    use clap::Parser;
+    use tempfile::TempDir;
+
+    use super::{ComposedServer, EeCli, start};
+
+    /// A solo clustered node with a short drain, so the leave window is a test
+    /// timescale rather than the 10 s production default.
+    fn solo_cli(state: &TempDir, leave_timeout: &str) -> EeCli {
+        EeCli::try_parse_from([
+            "rift-ee-server",
+            "--port",
+            "0",
+            "--metrics-port",
+            "0",
+            "--cluster",
+            "--cluster-bind",
+            "127.0.0.1:0",
+            "--cluster-probe-bind",
+            "127.0.0.1:0",
+            "--cluster-secret",
+            "issue-42-secret",
+            "--cluster-allow-solo",
+            "--cluster-leave-timeout",
+            leave_timeout,
+            "--cluster-state-dir",
+            &state.path().to_string_lossy(),
+        ])
+        .expect("parses")
+    }
+
+    async fn probe_status(base: &str, path: &str) -> u16 {
+        reqwest::get(format!("http://{base}{path}"))
+            .await
+            .expect("probe request")
+            .status()
+            .as_u16()
+    }
+
+    /// AC1 + AC2: the accept loop exiting is enough to end the clustered server.
+    ///
+    /// Before #42 this test could not even be written: `serve_until` awaited only
+    /// the signal, so a node whose admin plane had died stayed a live cluster
+    /// member until someone sent SIGTERM. The assertion that matters is the
+    /// timeout — reaching it means the node is exactly the zombie this fixes.
+    #[tokio::test]
+    async fn admin_plane_death_ends_the_clustered_server() {
+        let state = TempDir::new().expect("tempdir");
+        let composed: ComposedServer = start(solo_cli(&state, "1")).await.expect("solo starts");
+
+        // End the admin accept loop before handing ownership over. `shutdown`
+        // takes `&self`, so this needs no second handle — and a `wait()` on an
+        // already-stopped plane returns immediately, which is the same arm of
+        // the race a mid-flight death takes.
+        composed.server.shutdown().await;
+
+        // A signal that never fires: the only way out is the admin plane dying.
+        let serving = tokio::spawn(composed.serve_until(std::future::pending::<()>()));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(20), serving)
+            .await
+            .expect("serve_until must return when the admin plane dies, without a signal")
+            .expect("the serve task did not panic");
+
+        // A clean stop publishes no accept-loop error, so the raced result is Ok
+        // — what is under test is that the result travels at all.
+        assert!(
+            outcome.is_ok(),
+            "a clean admin-plane stop must not be reported as a failure: {outcome:?}"
+        );
+    }
+
+    /// AC3: §7.1.2 ordering holds on the *wait* arm too.
+    ///
+    /// A dead admin plane leaves the imposter listeners serving, so the balancer
+    /// must still be told to shed this node before any socket closes. Closing
+    /// first would turn every in-flight data-plane request into a client error.
+    #[tokio::test]
+    async fn admin_plane_death_drains_before_closing_listeners() {
+        let state = TempDir::new().expect("tempdir");
+        let composed: ComposedServer = start(solo_cli(&state, "3")).await.expect("solo starts");
+        let probes = composed.probe_addr().expect("probes bound").to_string();
+
+        assert_eq!(probe_status(&probes, "/readyz").await, 200);
+
+        // Kill the admin plane, then hand ownership over: the drain that follows
+        // is driven by the death, not by any signal.
+        composed.server.shutdown().await;
+        let serving = tokio::spawn(composed.serve_until(std::future::pending::<()>()));
+
+        // Inside the drain window the node reports itself away, but liveness must
+        // stay up or the orchestrator kills it mid-leave.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            probe_status(&probes, "/readyz").await,
+            503,
+            "the wait arm must fail readiness before it closes anything"
+        );
+        assert_eq!(
+            probe_status(&probes, "/healthz").await,
+            200,
+            "liveness must survive the drain triggered by an admin-plane death"
+        );
+
+        tokio::time::timeout(Duration::from_secs(20), serving)
+            .await
+            .expect("the leave completes")
+            .expect("the serve task did not panic")
+            .expect("a clean admin-plane stop is not an error");
+    }
 }
