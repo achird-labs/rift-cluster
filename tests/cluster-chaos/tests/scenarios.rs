@@ -22,8 +22,9 @@ use std::time::Duration;
 use cluster_chaos::{
     CONVERGE_TIMEOUT, Cluster, FRONT_PORT, NODES, add_toxic, backend_failing_health_check,
     clear_toxics, config_revision, exec_probe, get_json, imposter_ports, metric, probe,
-    put_imposter, put_imposter_with_key, put_stubs, wait_admin_reachable, wait_backend_ejected,
-    wait_converged, wait_converged_on, wait_revisions_agree, wait_single_leader, wait_voters,
+    put_imposter, put_imposter_with_key, put_stubs, toxic_count, wait_admin_reachable,
+    wait_backend_ejected, wait_converged, wait_converged_on, wait_revisions_agree,
+    wait_single_leader, wait_voters,
 };
 
 /// The imposter port a scenario configures. Inside the container network
@@ -560,6 +561,22 @@ async fn c6_loss_and_jitter_do_not_flap_or_lose_writes() {
         )
         .await
         .expect("add connection resets");
+    }
+
+    // Confirm the links are actually degraded before concluding anything from
+    // the stability that follows. Without this the scenario passes just as
+    // happily against a cluster nobody perturbed -- "no flapping under load"
+    // asserted over an untouched fleet.
+    for node in &NODES {
+        let attached = toxic_count(node.proxy)
+            .await
+            .unwrap_or_else(|e| panic!("read toxics on {}: {e}", node.proxy));
+        assert_eq!(
+            attached, 3,
+            "{} should carry latency-up, latency-down and reset_peer; the toxic \
+             window means nothing if they did not land",
+            node.proxy
+        );
     }
 
     // Every port whose write was acknowledged. Only these are asserted on: a

@@ -600,6 +600,23 @@ pub async fn add_toxic(proxy: &str, toxic: serde_json::Value) -> anyhow::Result<
     Ok(())
 }
 
+/// How many toxics are currently attached to a listener.
+///
+/// A scenario that degrades a link should assert this before concluding
+/// anything from the calm that follows: if the toxics never landed, "nothing
+/// flapped" is a statement about an untouched cluster and the scenario passes
+/// while testing nothing.
+pub async fn toxic_count(proxy: &str) -> anyhow::Result<usize> {
+    let toxics: serde_json::Value = reqwest::Client::new()
+        .get(format!("{TOXIPROXY_API}/proxies/{proxy}/toxics"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(toxics.as_array().map(Vec::len).unwrap_or(0))
+}
+
 /// Remove every toxic from a listener, restoring a clean link.
 pub async fn clear_toxics(proxy: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
