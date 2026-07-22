@@ -1,0 +1,76 @@
+# Envoy front door for the chaos tier (issue #73).
+#
+# Exercises the fleet the way a deployment does: one address, round-robined over
+# the three admin APIs, with the backends actively health checked so an unready
+# node is taken out of rotation rather than served through.
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: front
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: front
+                route_config:
+                  name: all
+                  virtual_hosts:
+                    - name: rift
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: rift_admin
+                            # A cluster write goes to the leader via an internal
+                            # forward, which has its own 10s deadline; the front
+                            # must not time out before the node has answered, or
+                            # the scenario would be asserting on Envoy's clock
+                            # rather than on Rift's.
+                            timeout: 30s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: rift_admin
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      connect_timeout: 2s
+      load_assignment:
+        cluster_name: rift_admin
+        endpoints:
+          - lb_endpoints:
+              # Traffic goes to the admin port (2525); health is read from the
+              # probe port (2526). They are different ports on purpose --
+              # `/readyz` lives on the probe listener, and asking the admin port
+              # for it would 404 and mark every backend permanently unhealthy.
+              - endpoint:
+                  address:
+                    socket_address: { address: 172.28.7.11, port_value: 2525 }
+                  health_check_config: { port_value: 2526 }
+              - endpoint:
+                  address:
+                    socket_address: { address: 172.28.7.12, port_value: 2525 }
+                  health_check_config: { port_value: 2526 }
+              - endpoint:
+                  address:
+                    socket_address: { address: 172.28.7.13, port_value: 2525 }
+                  health_check_config: { port_value: 2526 }
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          # Deliberately impatient: a scenario asserts that the front notices a
+          # dead backend, and at the shipped 5s/3-failure defaults that assertion
+          # would spend most of its budget waiting on Envoy rather than on Rift.
+          unhealthy_threshold: 2
+          healthy_threshold: 1
+          http_health_check:
+            path: /readyz

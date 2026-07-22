@@ -1,0 +1,58 @@
+[
+  {
+    "name": "cluster-rift-1",
+    "listen": "0.0.0.0:4791",
+    "upstream": "172.28.7.11:4790",
+    "enabled": true
+  },
+  {
+    "name": "cluster-rift-2",
+    "listen": "0.0.0.0:4792",
+    "upstream": "172.28.7.12:4790",
+    "enabled": true
+  },
+  {
+    "name": "cluster-rift-3",
+    "listen": "0.0.0.0:4793",
+    "upstream": "172.28.7.13:4790",
+    "enabled": true
+  },
+
+  {
+    "name": "admin-rift-1",
+    "listen": "0.0.0.0:5251",
+    "upstream": "172.28.9.11:2525",
+    "enabled": true
+  },
+  {
+    "name": "admin-rift-2",
+    "listen": "0.0.0.0:5252",
+    "upstream": "172.28.9.12:2525",
+    "enabled": true
+  },
+  {
+    "name": "admin-rift-3",
+    "listen": "0.0.0.0:5253",
+    "upstream": "172.28.9.13:2525",
+    "enabled": true
+  },
+
+  {
+    "name": "metrics-rift-1",
+    "listen": "0.0.0.0:5261",
+    "upstream": "172.28.9.11:9090",
+    "enabled": true
+  },
+  {
+    "name": "metrics-rift-2",
+    "listen": "0.0.0.0:5262",
+    "upstream": "172.28.9.12:9090",
+    "enabled": true
+  },
+  {
+    "name": "metrics-rift-3",
+    "listen": "0.0.0.0:5263",
+    "upstream": "172.28.9.13:9090",
+    "enabled": true
+  }
+]

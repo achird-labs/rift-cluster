@@ -1,0 +1,149 @@
+# Nightly soak of the container chaos tier (issue #73).
+#
+# `cluster-smoke` on a PR runs each scenario once, which catches a scenario that
+# is broken but not one that is *flaky*. Rare failures only show up under
+# iteration, and iteration does not fit in a PR's latency budget -- so it lives
+# here, one job per scenario so the nightly's wall clock is the slowest single
+# scenario rather than the sum of all of them.
+
+name: nightly-chaos
+
+on:
+  schedule:
+    # 02:17 UTC — off the hour, where scheduled-workflow queueing is lighter.
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Run only this scenario (exact test name); blank runs the full matrix"
+        required: false
+        default: ""
+      iterations:
+        description: "Override the per-scenario iteration count (0 = use the table)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+# A nightly still running when the next one fires means the box is the
+# bottleneck; keep the newer one and drop the old.
+concurrency:
+  group: nightly-chaos
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      # One scenario's flake must not cancel the others' evidence.
+      fail-fast: false
+      matrix:
+        include:
+          # Iterations are sized so each job lands under ~100 min of the 120 min
+          # cap: every iteration pays stack-up plus teardown on top of its body,
+          # and C6 additionally carries an irreducible 60s toxic window.
+          - scenario: test_config_sync_converges
+            iterations: 100
+          - scenario: test_reconcile_preserves_state
+            iterations: 100
+          - scenario: test_reconcile_reorder
+            iterations: 100
+          - scenario: test_no_seeds_not_ready
+            iterations: 100
+          - scenario: test_graceful_leave
+            iterations: 80
+          - scenario: test_front_routes_around_an_unready_node
+            iterations: 80
+          - scenario: c7_joining_node_serves_nothing_until_reconciled
+            iterations: 80
+          - scenario: test_node_rejoin
+            iterations: 60
+          - scenario: c14_leader_kill_keeps_every_acknowledged_write
+            iterations: 60
+          - scenario: c4_partition_parks_minority_writes_and_replays_on_heal
+            iterations: 60
+          - scenario: c5_rolling_restart_never_stops_accepting_writes
+            iterations: 60
+          - scenario: whole_fleet_sigterm_then_cold_start_converges
+            iterations: 50
+          - scenario: test_cold_start
+            iterations: 50
+          - scenario: c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes
+            iterations: 50
+          - scenario: c6_loss_and_jitter_do_not_flap_or_lose_writes
+            iterations: 40
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A quarantine pointing at a closed issue means the bug was fixed and the
+      # scenario was never turned back on. Only the nightly has a token, so only
+      # the nightly can catch it.
+      - name: Chaos quarantine tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/chaos-quarantine.sh check
+
+      - name: Should this scenario run
+        id: gate
+        run: |
+          set -euo pipefail
+          want='${{ github.event.inputs.scenario }}'
+          if [ -n "$want" ] && [ "$want" != '${{ matrix.scenario }}' ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif scripts/chaos-quarantine.sh list | grep -qw -- '${{ matrix.scenario }}'; then
+            echo "::notice::${{ matrix.scenario }} is quarantined; skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Once per job rather than once per iteration: the image is identical
+      # across iterations, and rebuilding it 100 times would dominate the budget.
+      - name: Build the image once
+        if: steps.gate.outputs.run == 'true'
+        run: docker compose -f deploy/compose/docker-compose.yml build
+
+      - name: Soak
+        if: steps.gate.outputs.run == 'true'
+        env:
+          CHAOS_LOG_DIR: ${{ runner.temp }}/chaos-logs
+        run: |
+          set -euo pipefail
+          override='${{ github.event.inputs.iterations }}'
+          n='${{ matrix.iterations }}'
+          if [ -n "$override" ] && [ "$override" != "0" ]; then n="$override"; fi
+          echo "running ${{ matrix.scenario }} x$n"
+          start=$(date +%s)
+          for i in $(seq 1 "$n"); do
+            echo "::group::iteration $i/$n"
+            # A single failure is the whole point of the soak -- stop at it, so
+            # the uploaded logs belong to the failure and not to a later run
+            # that overwrote them.
+            cargo test -p cluster-chaos --test scenarios -- \
+              --ignored --exact '${{ matrix.scenario }}'
+            echo "::endgroup::"
+          done
+          elapsed=$(( $(date +%s) - start ))
+          # Published so the iteration table above can be tuned against measured
+          # wall clock rather than guesses.
+          {
+            echo "### ${{ matrix.scenario }}"
+            echo ""
+            echo "\`$n\` iterations in \`${elapsed}s\` (\`$(( elapsed / n ))s\`/iteration)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload failure logs
+        if: failure() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-logs-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/chaos-logs
+          if-no-files-found: ignore

@@ -1,0 +1,130 @@
+# Chaos overlay for the container tier (issue #73, slice 2).
+#
+# Layered over the shipped topology, never a copy of it:
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/chaos.overlay.yml up -d
+#
+# It adds two things the shipped file has no business carrying: a TCP proxy in
+# front of every cluster port (so a scenario can degrade the links between
+# nodes) and an Envoy load balancer (so the fleet is exercised through a front
+# door, as deployed).
+
+networks:
+  # A second, test-only network that every node also sits on, used purely to
+  # observe a node that has been cut off `rift`.
+  #
+  # A partitioned node has to stay assertable: C4 needs its admin API (to make
+  # the write that parks) and its metrics (to watch the intent drain). Reaching
+  # it on its own published host ports does not survive the cut -- Docker
+  # programs a published port's DNAT against a single container IP, and
+  # disconnecting that network takes the published ports with it. Ordering the
+  # attach so DNAT lands here instead *mostly* works, but was measured flaking
+  # on Docker 29.5.2 under sustained create/destroy churn, which is a red CI run
+  # nobody can reproduce.
+  #
+  # So the harness does not depend on it: it reaches a partitioned node through
+  # toxiproxy, whose listeners are published from a container that is never
+  # disconnected and whose upstreams are the `mgmt` addresses below. Neither leg
+  # touches `rift`. Nothing but the harness may talk on this network -- it is an
+  # observation channel, not a second data path.
+  mgmt:
+    ipam:
+      config:
+        - subnet: 172.28.9.0/24
+
+x-chaos-node: &chaos-node
+  depends_on:
+    toxiproxy:
+      condition: service_started
+
+services:
+  # All inter-node cluster traffic is re-pointed through here, so C6 can add
+  # latency/jitter/resets to real Raft links. One listener per destination node:
+  # a node's peers all dial the same listener, because a node has exactly one
+  # advertised address.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    container_name: rift-toxiproxy
+    # Proxies are seeded from the config file rather than created over the API
+    # after the fact, so there is no window where a node dials a listener that
+    # does not exist yet and fails its seed join.
+    command: ["-host", "0.0.0.0", "-config", "/etc/toxiproxy.json"]
+    volumes:
+      # Relative to `deploy/compose/`, NOT to this file. Compose resolves every
+      # relative path against the project directory, which is the directory of
+      # the *first* `-f` file -- so a sibling-looking `./toxiproxy.json` here
+      # silently means `deploy/compose/toxiproxy.json` and fails to mount.
+      - ../../tests/cluster-chaos/compose/toxiproxy.json:/etc/toxiproxy.json:ro
+    networks:
+      rift:
+        ipv4_address: 172.28.7.100
+      mgmt:
+        ipv4_address: 172.28.9.100
+    ports:
+      - "48474:8474"   # toxiproxy API, driven by the harness
+      # Observation paths into each node over `mgmt`, so a partitioned node
+      # stays assertable. No toxic is ever attached to these: they are how the
+      # harness watches, not what it perturbs.
+      - "45251:5251"   # rift-1 admin
+      - "45252:5252"   # rift-2 admin
+      - "45253:5253"   # rift-3 admin
+      - "45261:5261"   # rift-1 metrics
+      - "45262:5262"   # rift-2 metrics
+      - "45263:5263"   # rift-3 metrics
+
+  # The front door. Round-robins over the three admin ports and actively health
+  # checks them, so `test_front_routes_around_an_unready_node` can assert the
+  # front stops using a backend that is not ready.
+  envoy:
+    image: envoyproxy/envoy@sha256:caa5b411be1633b90023592a34a7e010c933d6e60206c758f631485e53006865
+    container_name: rift-envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--service-cluster", "rift-front"]
+    volumes:
+      # Relative to `deploy/compose/` -- see the note on toxiproxy's mount.
+      - ../../tests/cluster-chaos/compose/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    networks:
+      rift: {}
+      mgmt: {}
+    ports:
+      - "42525:8080"   # the front door itself
+      - "49901:9901"   # Envoy admin, for /clusters health assertions
+    depends_on:
+      - rift-1
+      - rift-2
+      - rift-3
+
+  rift-1:
+    <<: *chaos-node
+    networks:
+      rift:
+        ipv4_address: 172.28.7.11
+      mgmt:
+        ipv4_address: 172.28.9.11
+    environment:
+      # Peers are told to dial the proxy, not the node. Valid under today's
+      # `SocketAddr`-typed advertise because it is an IP literal -- this overlay
+      # deliberately does not depend on hostname advertise (#68).
+      RIFT_CLUSTER_ADVERTISE: "172.28.7.100:4791"
+
+  rift-2:
+    <<: *chaos-node
+    networks:
+      rift:
+        ipv4_address: 172.28.7.12
+      mgmt:
+        ipv4_address: 172.28.9.12
+    environment:
+      RIFT_CLUSTER_ADVERTISE: "172.28.7.100:4792"
+      RIFT_CLUSTER_SEEDS: "172.28.7.100:4791"
+
+  rift-3:
+    <<: *chaos-node
+    networks:
+      rift:
+        ipv4_address: 172.28.7.13
+      mgmt:
+        ipv4_address: 172.28.9.13
+    environment:
+      RIFT_CLUSTER_ADVERTISE: "172.28.7.100:4793"
+      RIFT_CLUSTER_SEEDS: "172.28.7.100:4791"

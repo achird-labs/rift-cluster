@@ -28,6 +28,24 @@ pub struct Node {
     pub admin: u16,
     pub probe: u16,
     pub metrics: u16,
+    /// Its fixed address on the `rift` network. Needed to re-pin the address on
+    /// [`Cluster::heal`]: toxiproxy's upstreams name these, so a node that came
+    /// back on a DHCP-assigned address would be unreachable to its peers.
+    pub ip: &'static str,
+    /// The toxiproxy listener that fronts this node's cluster port under the
+    /// chaos overlay — the handle C6 attaches toxics to.
+    pub proxy: &'static str,
+    /// This node's admin API reached over `mgmt`, via toxiproxy.
+    ///
+    /// Use this, not [`Node::admin`], to assert on a node that is currently
+    /// partitioned: a published port's DNAT is programmed against one network,
+    /// and `docker network disconnect` takes it down with that network. This
+    /// path is published from a container that is never disconnected and hops
+    /// to the node over `mgmt`, so neither leg depends on `rift`. Chaos overlay
+    /// only.
+    pub admin_via_mgmt: u16,
+    /// This node's metrics endpoint over `mgmt` — same reasoning.
+    pub metrics_via_mgmt: u16,
 }
 
 /// The fleet, in the order the compose file founds it: node 1 bootstraps, the
@@ -38,20 +56,43 @@ pub const NODES: [Node; 3] = [
         admin: 12525,
         probe: 12526,
         metrics: 19090,
+        ip: "172.28.7.11",
+        proxy: "cluster-rift-1",
+        admin_via_mgmt: 45251,
+        metrics_via_mgmt: 45261,
     },
     Node {
         name: "rift-2",
         admin: 22525,
         probe: 22526,
         metrics: 29090,
+        ip: "172.28.7.12",
+        proxy: "cluster-rift-2",
+        admin_via_mgmt: 45252,
+        metrics_via_mgmt: 45262,
     },
     Node {
         name: "rift-3",
         admin: 32525,
         probe: 32526,
         metrics: 39090,
+        ip: "172.28.7.13",
+        proxy: "cluster-rift-3",
+        admin_via_mgmt: 45253,
+        metrics_via_mgmt: 45263,
     },
 ];
+
+/// The compose project's `rift` network, as Docker names it (`<project>_<net>`).
+/// Partitioning detaches a node from this one and leaves `mgmt` attached.
+const RIFT_NETWORK: &str = "rift-ee-cluster_rift";
+
+/// Toxiproxy's API, published by the chaos overlay.
+const TOXIPROXY_API: &str = "http://127.0.0.1:48474";
+
+/// Envoy's front door and admin interface, published by the chaos overlay.
+pub const FRONT_PORT: u16 = 42525;
+pub const ENVOY_ADMIN_PORT: u16 = 49901;
 
 /// How long a whole fleet gets to come up from cold. Generous: the first run on
 /// a machine builds the image.
@@ -72,6 +113,11 @@ fn stack_lock() -> &'static Mutex<()> {
 /// A running 3-node cluster. Dropping it tears the stack down, so a scenario
 /// that panics mid-assertion still cleans up after itself.
 pub struct Cluster {
+    /// The `-f` list this stack came up with. Held so teardown and every
+    /// per-node command address the same topology: tearing a chaos stack down
+    /// with only the base file leaves toxiproxy and Envoy running, and the next
+    /// scenario inherits them.
+    files: Vec<String>,
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -81,19 +127,115 @@ impl Cluster {
     /// Readiness, not liveness: a node answers `/healthz` long before it has
     /// joined, so waiting on that would prove nothing about a cluster forming.
     pub async fn up() -> anyhow::Result<Self> {
+        Self::start_stack(vec![base_file()]).await
+    }
+
+    /// [`Cluster::up`] with the chaos overlay layered on: every cluster link
+    /// runs through toxiproxy, an Envoy front is published, and every node also
+    /// sits on the `mgmt` network so it stays reachable from the host while
+    /// partitioned.
+    pub async fn up_with_chaos() -> anyhow::Result<Self> {
+        Self::start_stack(vec![base_file(), overlay_file()]).await
+    }
+
+    /// Bring up exactly one node, on the shipped topology, and do **not** wait
+    /// for readiness.
+    ///
+    /// `--no-deps` so `depends_on` does not quietly drag the seed up and make
+    /// the node's seeds reachable after all — which would turn a scenario about
+    /// never becoming ready into one that passes by becoming ready.
+    pub async fn up_isolated(name: &str) -> anyhow::Result<Self> {
+        let guard = stack_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let cluster = Self {
+            files: vec![base_file()],
+            _guard: guard,
+        };
+        compose_with(
+            &[base_file(), overlay_file()],
+            &["down", "-v", "--remove-orphans"],
+        )
+        .ok();
+        wait_stack_gone();
+        cluster
+            .compose(&["up", "-d", "--build", "--no-deps", name])
+            .context("compose up single node")?;
+        Ok(cluster)
+    }
+
+    async fn start_stack(files: Vec<String>) -> anyhow::Result<Self> {
         // Poisoning only means a previous scenario panicked; the stack is torn
         // down by `Drop` either way, so the lock still hands over a clean slate.
         let guard = stack_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let cluster = Self { _guard: guard };
+        let cluster = Self {
+            files,
+            _guard: guard,
+        };
 
         // Down first: a stack left behind by an interrupted run would otherwise
         // be silently reused, and its state dirs would make `test_cold_start`
         // pass for the wrong reason.
-        compose(&["down", "-v", "--remove-orphans"]).ok();
-        compose(&["up", "-d", "--build"]).context("compose up")?;
+        //
+        // Torn down with BOTH files regardless of which this stack wants, so a
+        // chaos stack left behind by an interrupted run cannot survive into a
+        // plain one.
+        compose_with(
+            &[base_file(), overlay_file()],
+            &["down", "-v", "--remove-orphans"],
+        )
+        .ok();
+        wait_stack_gone();
+        cluster
+            .compose(&["up", "-d", "--build"])
+            .context("compose up")?;
 
         cluster.wait_all_ready(UP_TIMEOUT).await?;
+        cluster.wait_cluster_formed(UP_TIMEOUT).await?;
         Ok(cluster)
+    }
+
+    /// Wait until the fleet has actually formed a cluster, not merely started.
+    ///
+    /// `/readyz` going 200 on all three is necessary but not sufficient: the
+    /// Raft-derived gauges are resampled on a 5s timer, so a node that founded
+    /// solo and has since been joined still *publishes* one voter for up to a
+    /// sampling interval. A scenario that begins asserting on that window reads
+    /// a stale gauge as a membership change -- which is how C6 failed before
+    /// this existed, and it would have been reported as the product flapping.
+    pub async fn wait_cluster_formed(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut voters_ok = 0;
+            let mut leaders = 0;
+            for node in &NODES {
+                if metric(node.metrics, VOTER_GAUGE)
+                    .await
+                    .is_ok_and(|v| v == NODES.len() as f64)
+                {
+                    voters_ok += 1;
+                }
+                if metric(node.metrics, LEADER_GAUGE)
+                    .await
+                    .is_ok_and(|v| v == 1.0)
+                {
+                    leaders += 1;
+                }
+            }
+            if voters_ok == NODES.len() && leaders == 1 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "fleet started but never formed a cluster: {voters_ok}/{} nodes see a \
+                     full voter set, {leaders} leaders",
+                    NODES.len()
+                );
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
+    fn compose(&self, args: &[&str]) -> anyhow::Result<Output> {
+        compose_with(&self.files, args)
     }
 
     /// Wait until every node reports ready.
@@ -110,7 +252,7 @@ impl Cluster {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let _ = compose(&["ps"]);
+                let _ = self.compose(&["ps"]);
                 bail!("only {ready}/{} nodes became ready", NODES.len());
             }
             tokio::time::sleep(POLL).await;
@@ -120,7 +262,8 @@ impl Cluster {
     /// SIGTERM a node and wait for it to exit — the graceful-leave path, with a
     /// real signal handler answering a real signal.
     pub fn stop(&self, name: &str) -> anyhow::Result<()> {
-        compose(&["stop", name]).with_context(|| format!("stop {name}"))?;
+        self.compose(&["stop", name])
+            .with_context(|| format!("stop {name}"))?;
         Ok(())
     }
 
@@ -133,33 +276,165 @@ impl Cluster {
 
     /// Start a stopped/killed node again, keeping its state directory.
     pub fn start(&self, name: &str) -> anyhow::Result<()> {
-        compose(&["start", name]).with_context(|| format!("start {name}"))?;
+        self.compose(&["start", name])
+            .with_context(|| format!("start {name}"))?;
+        Ok(())
+    }
+
+    /// Cut a node off from every peer by detaching it from the `rift` network.
+    ///
+    /// This is a whole-node isolation and it is symmetric — inbound and
+    /// outbound die together, because they were the same interface. That
+    /// matters: a cut that only blocks inbound leaves the isolated node
+    /// campaigning at a majority that can still hear it, which destabilises the
+    /// majority and is the opposite of what a partition scenario asserts.
+    ///
+    /// Toxiproxy cannot express this. Every peer dials a node at its single
+    /// advertised address, so one listener carries all of them; disabling it
+    /// cuts inbound only. Per-link proxies would need per-source addressing,
+    /// i.e. hostname advertise, which is #68.
+    ///
+    /// The node stays reachable from the host over `mgmt` — see the network
+    /// comment in `chaos.overlay.yml`. Chaos overlay only.
+    pub fn partition(&self, name: &str) -> anyhow::Result<()> {
+        run("docker", &["network", "disconnect", RIFT_NETWORK, name])
+            .with_context(|| format!("partition {name}"))?;
+        Ok(())
+    }
+
+    /// Undo [`Cluster::partition`], restoring the node's fixed address.
+    ///
+    /// The address is re-pinned rather than left to Docker: toxiproxy's
+    /// upstreams name these IPs, so a node that healed onto a different one
+    /// would be reachable by nobody and the scenario would misread that as a
+    /// failure to converge.
+    pub fn heal(&self, node: &Node) -> anyhow::Result<()> {
+        run(
+            "docker",
+            &[
+                "network",
+                "connect",
+                "--ip",
+                node.ip,
+                RIFT_NETWORK,
+                node.name,
+            ],
+        )
+        .with_context(|| format!("heal {}", node.name))?;
+        Ok(())
+    }
+
+    /// Replace a node with a brand-new container, discarding its state.
+    ///
+    /// `rm -sf` then `up`, not `restart`: the compose file declares no volumes,
+    /// so state lives in the container's own filesystem and only destroying it
+    /// produces the empty `/var/lib/rift` that a first-time joiner has.
+    pub fn recreate(&self, name: &str) -> anyhow::Result<()> {
+        self.compose(&["rm", "-sf", name])
+            .with_context(|| format!("rm {name}"))?;
+        self.compose(&["up", "-d", "--no-deps", name])
+            .with_context(|| format!("recreate {name}"))?;
         Ok(())
     }
 }
 
 impl Drop for Cluster {
     fn drop(&mut self) {
+        // A nightly soak that fails at 3am and tears the evidence down with it
+        // is a failure nobody can act on, so capture first -- but only when
+        // something actually went wrong, and only where the runner asked for it.
+        if std::thread::panicking()
+            && let Ok(dir) = std::env::var("CHAOS_LOG_DIR")
+        {
+            let _ = self.dump_logs(&dir);
+        }
         // Best effort by construction: this runs during unwind on a failed
         // assertion, where a second failure would replace the real one.
-        let _ = compose(&["down", "-v", "--remove-orphans"]);
+        let _ = self.compose(&["down", "-v", "--remove-orphans"]);
     }
 }
 
-/// Run a `docker compose` subcommand against the shipped deployment file.
-fn compose(args: &[&str]) -> anyhow::Result<Output> {
-    let file = compose_file();
-    let mut full = vec!["compose", "-f", &file];
+impl Cluster {
+    /// Write `compose ps` and `compose logs` to `$CHAOS_LOG_DIR` before
+    /// teardown. Named for the failing test, so a matrix job's artifact says
+    /// which scenario produced it.
+    fn dump_logs(&self, dir: &str) -> anyhow::Result<()> {
+        std::fs::create_dir_all(dir).context("create log dir")?;
+        let scenario = std::thread::current()
+            .name()
+            .unwrap_or("unknown")
+            .to_owned();
+        let path = std::path::Path::new(dir).join(format!("{scenario}.log"));
+
+        let mut out = String::new();
+        for args in [
+            &["ps", "-a"][..],
+            &["logs", "--no-color", "--timestamps"][..],
+        ] {
+            out.push_str(&format!("===== docker compose {} =====\n", args.join(" ")));
+            match self.compose(args) {
+                Ok(o) => {
+                    out.push_str(&String::from_utf8_lossy(&o.stdout));
+                    out.push_str(&String::from_utf8_lossy(&o.stderr));
+                }
+                Err(e) => out.push_str(&format!("<capture failed: {e}>\n")),
+            }
+            out.push('\n');
+        }
+        std::fs::write(&path, out).context("write log dump")
+    }
+}
+
+/// Block until the previous stack's containers are actually gone.
+///
+/// `compose down` returns once it has *asked* for removal, and a container
+/// still shutting down keeps its published ports bound and keeps answering
+/// probes. The next scenario then reads the dying stack as its own -- which is
+/// how a chaos scenario came to see a fleet it never started, and read a stale
+/// one-voter membership as a real one.
+fn wait_stack_gone() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        let remaining = Command::new("docker")
+            .args([
+                "ps",
+                "-aq",
+                "--filter",
+                "label=com.docker.compose.project=rift-ee-cluster",
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(true);
+        if remaining {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Run a `docker compose` subcommand against a given `-f` list.
+fn compose_with(files: &[String], args: &[&str]) -> anyhow::Result<Output> {
+    let mut full = vec!["compose"];
+    for file in files {
+        full.push("-f");
+        full.push(file);
+    }
     full.extend_from_slice(args);
     run("docker", &full)
 }
 
-fn compose_file() -> String {
+/// The shipped topology — tested as deployed, never as a copy.
+fn base_file() -> String {
     // CARGO_MANIFEST_DIR is `<repo>/tests/cluster-chaos`.
     format!(
         "{}/../../deploy/compose/docker-compose.yml",
         env!("CARGO_MANIFEST_DIR")
     )
+}
+
+/// The chaos-only additions, layered over it.
+fn overlay_file() -> String {
+    format!("{}/compose/chaos.overlay.yml", env!("CARGO_MANIFEST_DIR"))
 }
 
 fn run(program: &str, args: &[&str]) -> anyhow::Result<Output> {
@@ -187,6 +462,53 @@ pub async fn probe(port: u16, path: &str) -> anyhow::Result<u16> {
     Ok(response.status().as_u16())
 }
 
+/// GET a JSON document from any published HTTP port.
+pub async fn get_json(port: u16, path: &str) -> anyhow::Result<(u16, serde_json::Value)> {
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}{path}"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(serde_json::Value::Null);
+    Ok((status, body))
+}
+
+/// Poll until a node's admin API answers, and fail with the last error if it
+/// never does.
+///
+/// Retried rather than asked once, because `docker network disconnect`
+/// reprograms the published-port DNAT rules and an in-flight connection during
+/// that window hangs rather than being refused. A single request issued right
+/// after a partition therefore times out on a node that is perfectly reachable
+/// a second later -- which reads as "the mgmt network did not hold" and is
+/// wrong. A genuinely unreachable node still fails, just after the timeout.
+pub async fn wait_admin_reachable(admin: u16, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let attempt = match get_json(admin, "/imposters").await {
+            Ok((200, _)) => return Ok(()),
+            Ok((status, _)) => format!("status {status}"),
+            Err(e) => e.to_string(),
+        };
+        if Instant::now() >= deadline {
+            bail!("admin :{admin} never answered ({attempt})");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Replace an imposter's stub list, for the reorder scenario.
+pub async fn put_stubs(admin: u16, port: u16, stubs: serde_json::Value) -> anyhow::Result<u16> {
+    let response = reqwest::Client::new()
+        .put(format!("http://127.0.0.1:{admin}/imposters/{port}/stubs"))
+        .timeout(Duration::from_secs(30))
+        .json(&serde_json::json!({ "stubs": stubs }))
+        .send()
+        .await?;
+    Ok(response.status().as_u16())
+}
+
 /// Create an imposter through a node's admin API, returning the response status.
 pub async fn put_imposter(admin: u16, port: u16, body_text: &str) -> anyhow::Result<u16> {
     let body = serde_json::json!({
@@ -203,6 +525,119 @@ pub async fn put_imposter(admin: u16, port: u16, body_text: &str) -> anyhow::Res
         .send()
         .await?;
     Ok(response.status().as_u16())
+}
+
+/// [`put_imposter`] carrying an `Idempotency-Key`, returning the status and the
+/// response headers.
+///
+/// The headers are the point: a write that cannot reach a leader is answered
+/// `503`/`504` with a `rift-cluster-op-id`, and that id is the receipt proving
+/// the intent was parked durably rather than dropped.
+pub async fn put_imposter_with_key(
+    admin: u16,
+    port: u16,
+    body_text: &str,
+    idempotency_key: &str,
+) -> anyhow::Result<(u16, reqwest::header::HeaderMap, serde_json::Value)> {
+    let body = serde_json::json!({
+        "port": port,
+        "protocol": "http",
+        "stubs": [{
+            "responses": [{ "is": { "statusCode": 200, "body": body_text } }]
+        }]
+    });
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{admin}/imposters"))
+        // Must outlast the server's own 10s forward deadline, or the client
+        // gives up first and the scenario cannot tell a parked 504 from a hang.
+        .timeout(Duration::from_secs(30))
+        .header("Idempotency-Key", idempotency_key)
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    // A body that is not JSON is itself a finding, so it surfaces as null
+    // rather than as an error that would mask the status the caller came for.
+    let envelope = response.json().await.unwrap_or(serde_json::Value::Null);
+    Ok((status, headers, envelope))
+}
+
+/// Probe a URL from *inside* a container, answering with success/failure.
+///
+/// Imposter ports are not published to the host, so the data plane is only
+/// reachable this way. The runtime image ships no curl on purpose; the binary's
+/// own `healthcheck` subcommand is the sanctioned in-container probe.
+pub fn exec_probe(container: &str, url: &str) -> bool {
+    Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "rift-ee-server",
+            "healthcheck",
+            "--url",
+            url,
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Add a toxic to one of the cluster listeners.
+pub async fn add_toxic(proxy: &str, toxic: serde_json::Value) -> anyhow::Result<()> {
+    let response = reqwest::Client::new()
+        .post(format!("{TOXIPROXY_API}/proxies/{proxy}/toxics"))
+        .timeout(Duration::from_secs(10))
+        .json(&toxic)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        bail!(
+            "add toxic to {proxy}: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// How many toxics are currently attached to a listener.
+///
+/// A scenario that degrades a link should assert this before concluding
+/// anything from the calm that follows: if the toxics never landed, "nothing
+/// flapped" is a statement about an untouched cluster and the scenario passes
+/// while testing nothing.
+pub async fn toxic_count(proxy: &str) -> anyhow::Result<usize> {
+    let toxics: serde_json::Value = reqwest::Client::new()
+        .get(format!("{TOXIPROXY_API}/proxies/{proxy}/toxics"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(toxics.as_array().map(Vec::len).unwrap_or(0))
+}
+
+/// Remove every toxic from a listener, restoring a clean link.
+pub async fn clear_toxics(proxy: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let toxics: serde_json::Value = client
+        .get(format!("{TOXIPROXY_API}/proxies/{proxy}/toxics"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?
+        .json()
+        .await?;
+    for toxic in toxics.as_array().into_iter().flatten() {
+        let Some(name) = toxic["name"].as_str() else {
+            continue;
+        };
+        client
+            .delete(format!("{TOXIPROXY_API}/proxies/{proxy}/toxics/{name}"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+    }
+    Ok(())
 }
 
 /// The ports a node currently has configured, read from its admin API.
@@ -319,6 +754,88 @@ pub async fn wait_single_leader(timeout: Duration) -> anyhow::Result<usize> {
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// `rift_cluster_config_revision{port}` on one node — the log index that last
+/// wrote that imposter's config.
+pub async fn config_revision(metrics: u16, port: u64) -> anyhow::Result<f64> {
+    metric(
+        metrics,
+        &format!(r#"rift_cluster_config_revision{{port="{port}"}}"#),
+    )
+    .await
+}
+
+/// Poll until every node reports the *same* applied revision for `port`.
+///
+/// Stronger than [`wait_converged`], which only asks whether a port is present:
+/// two nodes can both serve a port while one is still on an older config for
+/// it. Equal revisions is the real "these nodes agree" surface.
+pub async fn wait_revisions_agree(port: u64, timeout: Duration) -> anyhow::Result<f64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut revisions = Vec::new();
+        for node in &NODES {
+            match config_revision(node.metrics, port).await {
+                Ok(v) => revisions.push(v),
+                Err(_) => break,
+            }
+        }
+        if revisions.len() == NODES.len() && revisions.iter().all(|v| *v == revisions[0]) {
+            return Ok(revisions[0]);
+        }
+        if Instant::now() >= deadline {
+            bail!("nodes disagree on the revision of port {port}: {revisions:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Poll Envoy's admin API until `ip` is failing its active health check — i.e.
+/// the front has actually taken the backend out of rotation.
+///
+/// Waiting for this is not politeness: round-robin keeps offering the dead
+/// backend its share of requests until the check trips, so asserting "the front
+/// routes around it" any earlier measures Envoy's health-check interval rather
+/// than its routing.
+pub async fn wait_backend_ejected(ip: &str, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if backend_failing_health_check(ip).await.unwrap_or(false) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("envoy never marked {ip} as failing its active health check");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Whether Envoy currently reports `ip` as failing its active health check.
+pub async fn backend_failing_health_check(ip: &str) -> anyhow::Result<bool> {
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{ENVOY_ADMIN_PORT}/clusters?format=json"
+        ))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    for cluster in body["cluster_statuses"].as_array().into_iter().flatten() {
+        for host in cluster["host_statuses"].as_array().into_iter().flatten() {
+            if host["address"]["socket_address"]["address"].as_str() == Some(ip) {
+                // Read the active-check flag, not `eds_health_status`: the
+                // latter reports what service discovery said and stays HEALTHY
+                // for a backend Envoy has already stopped using.
+                return Ok(host["health_status"]["failed_active_health_check"]
+                    .as_bool()
+                    .unwrap_or(false));
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Wait until `node` reports the effective voter set has reached `expected`.

@@ -20,8 +20,11 @@
 use std::time::Duration;
 
 use cluster_chaos::{
-    CONVERGE_TIMEOUT, Cluster, NODES, imposter_ports, probe, put_imposter, wait_converged,
-    wait_converged_on, wait_single_leader, wait_voters,
+    CONVERGE_TIMEOUT, Cluster, FRONT_PORT, NODES, add_toxic, backend_failing_health_check,
+    clear_toxics, config_revision, exec_probe, get_json, imposter_ports, metric, probe,
+    put_imposter, put_imposter_with_key, put_stubs, toxic_count, wait_admin_reachable,
+    wait_backend_ejected, wait_converged, wait_converged_on, wait_revisions_agree,
+    wait_single_leader, wait_voters,
 };
 
 /// The imposter port a scenario configures. Inside the container network
@@ -358,4 +361,702 @@ async fn whole_fleet_sigterm_then_cold_start_converges() {
     wait_converged(u64::from(port), CONVERGE_TIMEOUT)
         .await
         .expect("the write taken before the teardown must survive it");
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2 (issue #73): the scenarios that need degraded links, a real network
+// partition, and a front door. All of these run on the chaos overlay, so every
+// cluster link transits toxiproxy and every node also sits on `mgmt`.
+// ---------------------------------------------------------------------------
+
+/// C4 — a partitioned minority parks its writes and replays them on heal.
+///
+/// The property is that a write to a node that cannot reach a leader is neither
+/// served nor lost: it is refused with a receipt (`rift-cluster-op-id`), parked
+/// durably, and replayed when a leader comes back — and a duplicate of it that
+/// reached the majority meanwhile collapses instead of applying twice.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c4_partition_parks_minority_writes_and_replays_on_heal() {
+    let cluster = Cluster::up_with_chaos().await.expect("fleet comes up");
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("a leader settles");
+
+    // Partition a follower. Isolating the leader would be a different scenario
+    // (the majority elects a new one); this one is about the minority side.
+    let minority = NODES
+        .iter()
+        .enumerate()
+        .find(|(i, _)| *i != leader)
+        .map(|(_, n)| n)
+        .expect("a non-leader exists");
+    let majority: Vec<_> = NODES.iter().filter(|n| n.name != minority.name).collect();
+
+    let first = 6001_u16;
+    assert_eq!(
+        put_imposter(majority[0].admin, first, "before")
+            .await
+            .expect("admin write"),
+        201,
+        "the pre-partition write must be accepted"
+    );
+    wait_converged(u64::from(first), CONVERGE_TIMEOUT)
+        .await
+        .expect("the fleet converges before anything is broken");
+
+    cluster
+        .partition(minority.name)
+        .expect("cut the minority off");
+
+    // The whole scenario depends on this: `mgmt` must keep the isolated node
+    // reachable from the host, or none of the assertions below can be made at
+    // all. Fail loudly and specifically rather than as a confusing timeout.
+    wait_admin_reachable(minority.admin_via_mgmt, Duration::from_secs(30))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} must stay assertable over `mgmt` while partitioned ({e})",
+                minority.name
+            )
+        });
+
+    let parked = 6002_u16;
+    let key = "c4-duplicate-key";
+    let (status, headers, envelope) =
+        put_imposter_with_key(minority.admin_via_mgmt, parked, "parked", key)
+            .await
+            .expect("the minority answers rather than hanging");
+    // Both are correct parks: no reachable quorum answers 503 immediately, and
+    // a forward that hangs to the write deadline answers 504. Either way the
+    // intent is durable and the receipt is the proof.
+    assert!(
+        status == 503 || status == 504,
+        "a minority write must be refused, got {status}"
+    );
+    assert!(
+        headers.contains_key("rift-cluster-op-id"),
+        "a refused write must carry the op-id that proves it was parked"
+    );
+    let slug = envelope["errors"][0]["type"]
+        .as_str()
+        .or_else(|| envelope["type"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        slug == "unavailable" || slug == "timeout",
+        "the error envelope must name the typed slug, got {slug:?} from {envelope}"
+    );
+
+    let pending = metric(minority.metrics_via_mgmt, "rift_cluster_intents_pending")
+        .await
+        .expect("the intent gauge is published");
+    assert!(
+        pending >= 1.0,
+        "the parked intent must be pending, got {pending}"
+    );
+
+    // The same write, same key, through the majority: this is the duplicate
+    // that dedup has to collapse when the parked copy replays.
+    let (dup_status, _, _) = put_imposter_with_key(majority[0].admin, parked, "parked", key)
+        .await
+        .expect("the majority is still writable");
+    assert_eq!(dup_status, 201, "the majority must still accept writes");
+
+    cluster.heal(minority).expect("heal the partition");
+
+    wait_converged(u64::from(parked), CONVERGE_TIMEOUT)
+        .await
+        .expect("the parked write must be present fleet-wide after heal");
+
+    // The parked copy drains, and the fleet agrees on one applied revision for
+    // the port -- which is what "the duplicate collapsed" looks like from
+    // outside. Two applications would leave different revisions behind.
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let pending = metric(minority.metrics_via_mgmt, "rift_cluster_intents_pending")
+            .await
+            .unwrap_or(f64::INFINITY);
+        if pending == 0.0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked intent never drained: pending={pending}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let dedup = metric(NODES[leader].metrics, "rift_cluster_dedup_hits_total")
+        .await
+        .expect("the dedup counter is published");
+    assert!(
+        dedup >= 1.0,
+        "the replayed duplicate must have been collapsed, dedup_hits={dedup}"
+    );
+
+    for port in [first, parked] {
+        wait_revisions_agree(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("nodes disagree on port {port} after heal: {e}"));
+    }
+
+    // Exactly one imposter for the deduplicated port, on every node.
+    for node in &NODES {
+        let ports = imposter_ports(node.admin).await.expect("list imposters");
+        let copies = ports.iter().filter(|p| **p == u64::from(parked)).count();
+        assert_eq!(
+            copies, 1,
+            "{} has {copies} copies of the deduplicated write",
+            node.name
+        );
+    }
+}
+
+/// C6 — heavy latency, jitter and connection resets do not flap membership or
+/// lose an acknowledged write.
+///
+/// Toxiproxy is an L4 proxy and cannot drop packets, so "lossy" is modelled as
+/// latency+jitter on every byte plus `reset_peer` on a third of connections —
+/// the TCP-level analogue of loss bursts.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c6_loss_and_jitter_do_not_flap_or_lose_writes() {
+    let cluster = Cluster::up_with_chaos().await.expect("fleet comes up");
+    wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("a leader settles before the links degrade");
+
+    for node in &NODES {
+        add_toxic(
+            node.proxy,
+            serde_json::json!({
+                "type": "latency",
+                "stream": "upstream",
+                "toxicity": 1.0,
+                "attributes": { "latency": 100, "jitter": 100 }
+            }),
+        )
+        .await
+        .expect("add upstream latency");
+        add_toxic(
+            node.proxy,
+            serde_json::json!({
+                "type": "latency",
+                "stream": "downstream",
+                "toxicity": 1.0,
+                "attributes": { "latency": 100, "jitter": 100 }
+            }),
+        )
+        .await
+        .expect("add downstream latency");
+        add_toxic(
+            node.proxy,
+            serde_json::json!({
+                "type": "reset_peer",
+                "stream": "upstream",
+                "toxicity": 0.3,
+                "attributes": { "timeout": 0 }
+            }),
+        )
+        .await
+        .expect("add connection resets");
+    }
+
+    // Confirm the links are actually degraded before concluding anything from
+    // the stability that follows. Without this the scenario passes just as
+    // happily against a cluster nobody perturbed -- "no flapping under load"
+    // asserted over an untouched fleet.
+    for node in &NODES {
+        let attached = toxic_count(node.proxy)
+            .await
+            .unwrap_or_else(|e| panic!("read toxics on {}: {e}", node.proxy));
+        assert_eq!(
+            attached, 3,
+            "{} should carry latency-up, latency-down and reset_peer; the toxic \
+             window means nothing if they did not land",
+            node.proxy
+        );
+    }
+
+    // Every port whose write was acknowledged. Only these are asserted on: a
+    // write refused with a park receipt is allowed to be absent until it
+    // replays, and asserting on it here would be asserting the wrong contract.
+    let mut acked: Vec<u16> = Vec::new();
+    let window = Duration::from_secs(60);
+    let started = std::time::Instant::now();
+    let mut next_write = std::time::Instant::now();
+    let mut leader_samples: Vec<usize> = Vec::new();
+
+    while started.elapsed() < window {
+        for node in &NODES {
+            let voters = metric(node.metrics, r#"rift_cluster_members{state="voter"}"#)
+                .await
+                .unwrap_or(f64::NAN);
+            assert_eq!(
+                voters, 3.0,
+                "{} saw the voter set change to {voters} under load -- membership \
+                 must not flap just because links are slow",
+                node.name
+            );
+        }
+
+        // Who currently claims leadership. The gauge is resampled on a 5s timer,
+        // so this bounds resolution rather than catching every transition; it is
+        // enough to catch a fleet that is re-electing continuously.
+        let mut leaders = Vec::new();
+        for (i, node) in NODES.iter().enumerate() {
+            if metric(node.metrics, r#"rift_cluster_members{state="leader"}"#)
+                .await
+                .is_ok_and(|v| v == 1.0)
+            {
+                leaders.push(i);
+            }
+        }
+        if let [only] = leaders[..]
+            && leader_samples.last() != Some(&only)
+        {
+            leader_samples.push(only);
+        }
+
+        if std::time::Instant::now() >= next_write {
+            let port = 6100 + acked.len() as u16;
+            if let Ok((status, _, _)) =
+                put_imposter_with_key(NODES[0].admin, port, "under-load", &format!("c6-{port}"))
+                    .await
+                && status == 201
+            {
+                acked.push(port);
+            }
+            next_write = std::time::Instant::now() + Duration::from_secs(5);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let transitions = leader_samples.len().saturating_sub(1);
+    assert!(
+        transitions <= 1,
+        "leadership changed {transitions} times under load (sequence {leader_samples:?}); \
+         openraft may time out once, but repeated elections mean the fleet is flapping"
+    );
+    assert!(
+        !acked.is_empty(),
+        "no write was acknowledged during the toxic window -- the scenario proved nothing"
+    );
+
+    for node in &NODES {
+        clear_toxics(node.proxy).await.expect("clear toxics");
+    }
+
+    for port in &acked {
+        wait_converged(u64::from(*port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("acknowledged write {port} was lost: {e}"));
+        wait_revisions_agree(u64::from(*port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("nodes disagree on port {port} after healing: {e}"));
+    }
+
+    for node in &NODES {
+        let pending = metric(node.metrics, "rift_cluster_intents_pending")
+            .await
+            .unwrap_or(0.0);
+        assert_eq!(pending, 0.0, "{} still has parked intents", node.name);
+    }
+    drop(cluster);
+}
+
+/// C7 — a node joining with an empty state directory serves nothing until its
+/// reconciliation gate opens, then serves exactly what everyone else does.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c7_joining_node_serves_nothing_until_reconciled() {
+    let cluster = Cluster::up_with_chaos().await.expect("fleet comes up");
+
+    let port = 6200_u16;
+    assert_eq!(
+        put_imposter(NODES[0].admin, port, "reconciled")
+            .await
+            .expect("admin write"),
+        201
+    );
+    // Several more, so the joiner has real reconciliation work to do. With a
+    // single imposter the gated window can close faster than it can be
+    // observed, and the scenario then fails on its own "never saw the gate"
+    // guard rather than on anything about the product.
+    for extra in 1..5 {
+        assert_eq!(
+            put_imposter(NODES[0].admin, port + extra, "reconciled")
+                .await
+                .expect("admin write"),
+            201
+        );
+    }
+    wait_converged(u64::from(port + 4), CONVERGE_TIMEOUT)
+        .await
+        .expect("the fleet converges before the join");
+
+    let joiner = &NODES[2];
+    cluster
+        .recreate(joiner.name)
+        .expect("replace the node with an empty one");
+
+    // Catch it before its gate opens. The observation is required rather than
+    // best-effort: if the gated state is never seen, the scenario never watched
+    // a join and would pass just as happily against a node with no gate at all.
+    //
+    // Two things keep that window catchable. The poll is cheap and tight --
+    // reading `/readyz` only -- because a `docker exec` costs a few hundred ms
+    // and doing one per poll burns the very window being watched. And the probe
+    // runs once, on the first gated reading, rather than every time.
+    // What must never happen is a node answering the data plane out of state it
+    // does not have. Note this is NOT the same as "does not serve until ready":
+    // a node legitimately binds its imposters *before* flipping the readiness
+    // gate -- that ordering is the safe one, since the reverse would have a load
+    // balancer routing to ports that are not listening yet. Asserting on the
+    // gate alone therefore fails intermittently on correct behaviour.
+    //
+    // `rift_cluster_config_revision{port}` is the precise question: it is absent
+    // until this node has applied that config. Serving while it is absent means
+    // answering out of empty state, which is the actual defect C7 guards.
+    let mut saw_gated = false;
+    let mut served_unapplied = false;
+    let mut probed = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while std::time::Instant::now() < deadline {
+        match get_json(joiner.probe, "/readyz").await {
+            Ok((503, body)) if body["pending"].to_string().contains("cluster-reconciled") => {
+                saw_gated = true;
+                let unapplied = config_revision(joiner.metrics, u64::from(port))
+                    .await
+                    .is_err();
+                if unapplied && !probed {
+                    probed = true;
+                    let served = exec_probe(joiner.name, &format!("http://127.0.0.1:{port}/"));
+                    // Re-read afterwards: the probe costs a few hundred ms, long
+                    // enough for the node to apply the config underneath it, and
+                    // a node that applied mid-probe is allowed to serve.
+                    let still_unapplied = config_revision(joiner.metrics, u64::from(port))
+                        .await
+                        .is_err();
+                    served_unapplied = served && still_unapplied;
+                }
+            }
+            Ok((200, _)) => break,
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !served_unapplied,
+        "{} answered on the data plane for a config it had not applied -- a \
+         joining node must not serve out of empty state",
+        joiner.name
+    );
+    assert!(
+        saw_gated,
+        "never observed {} gated on `cluster-reconciled` -- the scenario did not \
+         witness a join and would pass even if the gate did not exist",
+        joiner.name
+    );
+
+    cluster
+        .wait_all_ready(Duration::from_secs(120))
+        .await
+        .expect("the joiner becomes ready");
+
+    assert!(
+        exec_probe(joiner.name, &format!("http://127.0.0.1:{port}/")),
+        "{} must serve the imposter once reconciled",
+        joiner.name
+    );
+    wait_revisions_agree(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the joiner lands on the same applied revision as everyone else");
+}
+
+/// Applying a config must not rebuild imposters it did not change.
+///
+/// Recorded requests are the visible proxy for that: they live in the running
+/// imposter, so a sibling write that recreated it would reset the count to
+/// zero. This is the incrementality property, asserted from outside.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn test_reconcile_preserves_state() {
+    let cluster = Cluster::up_with_chaos().await.expect("fleet comes up");
+    let port = 6300_u16;
+
+    let body = serde_json::json!({
+        "port": port,
+        "protocol": "http",
+        "recordRequests": true,
+        "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": "recorded" } }] }]
+    });
+    let status = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/imposters", NODES[0].admin))
+        .timeout(Duration::from_secs(30))
+        .json(&body)
+        .send()
+        .await
+        .expect("create the recording imposter")
+        .status()
+        .as_u16();
+    assert_eq!(status, 201);
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the recording imposter converges");
+
+    assert!(
+        exec_probe(NODES[0].name, &format!("http://127.0.0.1:{port}/")),
+        "the imposter must answer on the data plane"
+    );
+
+    let recorded = |admin: u16| async move {
+        get_json(admin, &format!("/imposters/{port}"))
+            .await
+            .map(|(_, b)| b["numberOfRequests"].as_u64().unwrap_or(0))
+    };
+    let before = recorded(NODES[0].admin).await.expect("read the imposter");
+    assert_eq!(before, 1, "the data-plane request must have been recorded");
+
+    // A sibling write: it changes the config set, but not this imposter.
+    let sibling = 6301_u16;
+    assert_eq!(
+        put_imposter(NODES[1].admin, sibling, "sibling")
+            .await
+            .expect("sibling write"),
+        201
+    );
+    wait_converged(u64::from(sibling), CONVERGE_TIMEOUT)
+        .await
+        .expect("the sibling converges");
+
+    let after = recorded(NODES[0].admin).await.expect("read the imposter");
+    assert_eq!(
+        after, before,
+        "the sibling write recreated the untouched imposter -- recorded requests \
+         went from {before} to {after}"
+    );
+
+    for node in &NODES {
+        let failures = metric(node.metrics, r#"rift_cluster_bind_failures{port="0"}"#)
+            .await
+            .unwrap_or(0.0);
+        assert_eq!(failures, 0.0, "{} reported a bind failure", node.name);
+    }
+    drop(cluster);
+}
+
+/// Reordering an imposter's stubs propagates fleet-wide and preserves state.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn test_reconcile_reorder() {
+    let cluster = Cluster::up_with_chaos().await.expect("fleet comes up");
+    let port = 6400_u16;
+
+    let body = serde_json::json!({
+        "port": port,
+        "protocol": "http",
+        "recordRequests": true,
+        "stubs": [
+            { "responses": [{ "is": { "statusCode": 200, "body": "first" } }] },
+            { "responses": [{ "is": { "statusCode": 201, "body": "second" } }] }
+        ]
+    });
+    let status = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/imposters", NODES[0].admin))
+        .timeout(Duration::from_secs(30))
+        .json(&body)
+        .send()
+        .await
+        .expect("create the two-stub imposter")
+        .status()
+        .as_u16();
+    assert_eq!(status, 201);
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the imposter converges");
+    assert!(exec_probe(
+        NODES[0].name,
+        &format!("http://127.0.0.1:{port}/")
+    ));
+
+    let reversed = serde_json::json!([
+        { "responses": [{ "is": { "statusCode": 201, "body": "second" } }] },
+        { "responses": [{ "is": { "statusCode": 200, "body": "first" } }] }
+    ]);
+    let status = put_stubs(NODES[0].admin, port, reversed)
+        .await
+        .expect("reorder the stubs");
+    assert_eq!(status, 200, "the stub replacement must be accepted");
+
+    // Every node must show the new order -- read from the admin API, so this is
+    // the committed config rather than one node's local memory.
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let mut agreed = 0;
+        for node in &NODES {
+            if let Ok((_, body)) = get_json(node.admin, &format!("/imposters/{port}")).await
+                && body["stubs"][0]["responses"][0]["is"]["body"].as_str() == Some("second")
+            {
+                agreed += 1;
+            }
+        }
+        if agreed == NODES.len() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {agreed}/{} nodes show the reordered stubs",
+            NODES.len()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let (_, body) = get_json(NODES[0].admin, &format!("/imposters/{port}"))
+        .await
+        .expect("read the imposter");
+    assert_eq!(
+        body["numberOfRequests"].as_u64().unwrap_or(0),
+        1,
+        "reordering stubs must not rebuild the imposter and lose its recorded requests"
+    );
+    wait_revisions_agree(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the reorder lands at the same revision everywhere");
+    drop(cluster);
+}
+
+/// A node whose seeds are unreachable stays live but never ready, and never
+/// accepts a write.
+///
+/// The failure this guards against is a node that gives up joining and quietly
+/// founds a cluster of one — which would look healthy and serve divergent state.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn test_no_seeds_not_ready() {
+    // rift-2 seeds from rift-1, which is not running.
+    let _cluster = Cluster::up_isolated("rift-2")
+        .await
+        .expect("start one node");
+    let node = &NODES[1];
+
+    // Give it time to boot far enough to answer at all.
+    let boot = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < boot {
+        if probe(node.probe, "/healthz").await.is_ok_and(|s| s == 200) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let observe = std::time::Instant::now() + Duration::from_secs(30);
+    let mut checks = 0;
+    while std::time::Instant::now() < observe {
+        let health = probe(node.probe, "/healthz").await;
+        assert_eq!(
+            health.ok(),
+            Some(200),
+            "a seedless node must stay live -- it is running, just not joined"
+        );
+        let ready = probe(node.probe, "/readyz").await;
+        assert_eq!(
+            ready.ok(),
+            Some(503),
+            "a node that never reached its seeds must never report ready"
+        );
+        let write = put_imposter(node.admin, 6500, "must-not-apply").await;
+        assert_ne!(
+            write.ok(),
+            Some(201),
+            "a node that never joined must not accept a write -- doing so means \
+             it founded a cluster of one"
+        );
+        checks += 1;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert!(
+        checks >= 5,
+        "only {checks} observations made; the window did not run"
+    );
+}
+
+/// The front door stops routing to a backend that is no longer ready.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn test_front_routes_around_an_unready_node() {
+    let cluster = Cluster::up_with_chaos().await.expect("fleet comes up");
+    let port = 6600_u16;
+
+    let status = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{FRONT_PORT}/imposters"))
+        .timeout(Duration::from_secs(30))
+        .json(&serde_json::json!({
+            "port": port,
+            "protocol": "http",
+            "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": "front" } }] }]
+        }))
+        .send()
+        .await
+        .expect("write through the front")
+        .status()
+        .as_u16();
+    assert_eq!(
+        status, 201,
+        "the front must accept a write while all backends are up"
+    );
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the write converges");
+
+    let dead = &NODES[1];
+    cluster.kill(dead.name).expect("kill a backend");
+
+    // Wait for the front to actually eject it. Round-robin keeps offering the
+    // dead backend its share until the health check trips, so writing before
+    // this would measure Envoy's check interval, not its routing.
+    wait_backend_ejected(dead.ip, Duration::from_secs(60))
+        .await
+        .expect("envoy must notice the dead backend");
+
+    for i in 0..10 {
+        let status = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{FRONT_PORT}/imposters"))
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({
+                "port": 6610 + i,
+                "protocol": "http",
+                "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": "f" } }] }]
+            }))
+            .send()
+            .await
+            .expect("write through the front")
+            .status()
+            .as_u16();
+        assert_eq!(
+            status, 201,
+            "write {i} through the front hit the ejected backend"
+        );
+    }
+
+    cluster.start(dead.name).expect("restart the backend");
+    cluster
+        .wait_all_ready(Duration::from_secs(120))
+        .await
+        .expect("the fleet comes back");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if !backend_failing_health_check(dead.ip).await.unwrap_or(true) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "envoy never marked the restarted backend healthy again"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the fleet reconverges after the backend returns");
 }
