@@ -382,6 +382,7 @@ impl RaftNode {
             op_id: Uuid::new_v4(),
             principal: None,
             issued_at_secs,
+            expected_revision: None,
             op: ControlOp::PutImposter {
                 tenant: TenantId::default(),
                 config: Box::new(config),

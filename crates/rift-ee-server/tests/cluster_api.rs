@@ -176,6 +176,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             op_id: applied_id,
             principal: None,
             issued_at_secs: 0,
+            expected_revision: None,
             op: ControlOp::PutImposter {
                 tenant: TenantId::default(),
                 config: serde_json::from_value(
@@ -205,6 +206,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             op_id: failed_id,
             principal: None,
             issued_at_secs: 0,
+            expected_revision: None,
             op: ControlOp::DeleteAll {
                 tenant: TenantId::new("acme"),
             },
@@ -229,6 +231,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             op_id: pending_id,
             principal: None,
             issued_at_secs: 0,
+            expected_revision: None,
             op: ControlOp::DeleteImposter {
                 tenant: TenantId::default(),
                 port: 4547,

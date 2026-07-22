@@ -244,12 +244,33 @@ every node that can receive admin writes. A resolution failure is upstream's
 400 (`bad data` type, `Script resolution failed: …` message); without
 `--allowInjection` nothing about this changes — the injection gate still
 refuses all script surfaces first, before resolution ever runs. Concurrent
-writers to the *same* imposter are last-writer-wins for now — an
-expected-revision precondition on `Rift-Cluster-Revision` is planned
-follow-up; serialize per-imposter writers until it lands. `PUT /imposters`
-commits as a sequence (upserts first, then prunes), so a write interrupted by
-a leadership change can transiently leave a superset of old and new
-imposters — a retry converges it.
+writers to the *same* imposter are last-writer-wins by default; a
+single-imposter write may carry an `If-Match` header to condition on the
+record's current revision instead — either the exact `Rift-Cluster-Revision`
+value (`default:<port>@<revision>`) or a bare revision integer, optionally
+quoted like a normal ETag. A stale or mismatched `If-Match` is refused with
+`409` (`resource conflict` type, message starting `revision conflict`); a
+collection-wide mutation (`PUT /imposters`, `DELETE /imposters`) has no single
+record to condition on and refuses an `If-Match` with `400` (`bad data`
+type). The precondition is checked inside the state machine's `apply`, so it
+holds even when the write is accepted by a follower and forwarded to the
+leader. One residual window remains: the precondition guards the record's
+*revision*, not the accepting node's read basis — an index-addressed stub edit
+conditioned on the current revision but accepted by a node whose applied state
+still lags that revision is synthesized from the stale local read and passes
+the check. The default `ready-nodes` write barrier keeps that window to the
+barrier timeout; route conditioned index-addressed edits to the leader (or
+prefer by-id stub edits, which replicate only the edited stub) when it
+matters. A keyed retry (the same `Idempotency-Key`) of a `409` dedups to that
+same `409` by design — the op-id dedup returns the original response, it does
+not re-evaluate the precondition — so recovering from a conflict means
+re-reading the current revision and retrying with a **fresh** key. Mixed-version
+rollout: a replica still running a pre-#46 binary ignores `expected_revision`
+and applies unconditionally, so don't send `If-Match` from any client until
+every node in the fleet has upgraded. `PUT /imposters` commits as a sequence
+(upserts first, then prunes), so a write interrupted by a leadership change
+can transiently leave a superset of old and new imposters — a retry converges
+it.
 
 A node is not Ready until its `cluster-reconciled` gate opens: its applied
 state has caught up to the leader's and its imposters are bound (or their

@@ -840,6 +840,52 @@ impl RedbStateMachine {
         })
     }
 
+    /// Check op's `expected_revision` (#46) against the stored revision of the
+    /// record it addresses. `Ok(Err(reason))` is a deterministic domain refusal
+    /// — recorded as the same committed `Failed` outcome `validate` and
+    /// `mutate_tables` refusals use — never a mutation; `Err(_)` is real
+    /// storage I/O and fails apply.
+    ///
+    /// Every *precondition* reason starts with `"revision conflict"`: that
+    /// prefix is the front's dispatch key to a 409, so it must never collide
+    /// with a message from an unrelated refusal. The one exception is a
+    /// corrupt stored record, which keeps `mutate_tables`' existing
+    /// `"corrupt stored record"` shape (and its 400 mapping) — corruption is
+    /// not a revision conflict and must not read as one.
+    #[allow(clippy::result_large_err)]
+    fn check_expected_revision(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+        op: &ControlOp,
+        expected: u64,
+    ) -> StorageResult<Result<(), String>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let Some((tenant, port)) = control::precondition_target(op) else {
+            return Ok(Err(
+                "revision conflict: expected-revision preconditions apply to single-imposter \
+                 operations only"
+                    .to_owned(),
+            ));
+        };
+        match configs.get((tenant.as_str(), port)).map_err(io)? {
+            None => Ok(Err(format!(
+                "revision conflict: expected revision {expected} but no imposter on port {port}"
+            ))),
+            Some(guard) => match serde_json::from_str::<StoredImposter>(guard.value()) {
+                Ok(record) if record.revision == expected => Ok(Ok(())),
+                Ok(record) => Ok(Err(format!(
+                    "revision conflict: expected revision {expected}, stored revision {actual} \
+                     on port {port}",
+                    actual = record.revision
+                ))),
+                Err(e) => {
+                    tracing::error!(port, error = %e, "corrupt stored record");
+                    Ok(Err(format!("corrupt stored record for port {port}: {e}")))
+                }
+            },
+        }
+    }
+
     /// Mutate `sm_configs` for one validated op and return the engine actions it
     /// implies. `Ok(Err(reason))` is a deterministic domain refusal (recorded as
     /// a `Failed` outcome); `Err(_)` is real storage I/O and fails apply.
@@ -1266,7 +1312,23 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
                         let outcome = match control::validate(&request.op) {
                             Err(reason) => Err(reason),
-                            Ok(()) => Self::mutate_tables(&mut configs, &request.op, log_id.index)?,
+                            Ok(()) => match request.expected_revision {
+                                Some(expected) => match Self::check_expected_revision(
+                                    &configs,
+                                    &request.op,
+                                    expected,
+                                )? {
+                                    Err(reason) => Err(reason),
+                                    Ok(()) => Self::mutate_tables(
+                                        &mut configs,
+                                        &request.op,
+                                        log_id.index,
+                                    )?,
+                                },
+                                None => {
+                                    Self::mutate_tables(&mut configs, &request.op, log_id.index)?
+                                }
+                            },
                         };
                         let response = match outcome {
                             Ok(actions) => {
@@ -1513,6 +1575,7 @@ mod tests {
             op_id: Uuid::from_u128(op_id),
             principal: None,
             issued_at_secs,
+            expected_revision: None,
             op,
         }
     }
@@ -2161,5 +2224,143 @@ mod tests {
         );
 
         engine.shutdown().await;
+    }
+    /// #46 gate: the expected-revision precondition is checked inside apply,
+    /// so every replica computes the identical refusal from the same entry.
+    #[tokio::test]
+    async fn expected_revision_gates_apply_deterministically() {
+        let conditioned = |op_id: u128, expected: u64, op: ControlOp| ControlRequest {
+            expected_revision: Some(expected),
+            ..request(op_id, op)
+        };
+        let add = |id: &str| ControlOp::PatchStubs {
+            tenant: TenantId::default(),
+            port: 8080,
+            edit: StubEditScript(vec![StubEdit::Add {
+                stub: serde_json::from_value(json!({ "id": id })).expect("parses"),
+                index: None,
+            }]),
+        };
+
+        let (_td, mut sm) = fresh_sm(None).await;
+        let (_td2, mut sm2) = fresh_sm(None).await;
+        for s in [&mut sm, &mut sm2] {
+            s.apply(vec![entry(1, put(1, 8080, json!([])))])
+                .await
+                .expect("put");
+        }
+
+        // A matching expectation applies: the record's revision is 1 (the put).
+        let first = sm
+            .apply(vec![entry(2, conditioned(2, 1, add("a")))])
+            .await
+            .expect("apply");
+        let second = sm2
+            .apply(vec![entry(2, conditioned(2, 1, add("a")))])
+            .await
+            .expect("apply");
+        assert_eq!(first, second, "replicas must agree");
+        assert_eq!(first, vec![ControlResponse::applied(2)]);
+
+        // A stale expectation (record is now at revision 2) refuses — same
+        // committed Failed on both replicas, tables untouched.
+        let refused = sm
+            .apply(vec![entry(3, conditioned(3, 1, add("b")))])
+            .await
+            .expect("apply");
+        let refused2 = sm2
+            .apply(vec![entry(3, conditioned(3, 1, add("b")))])
+            .await
+            .expect("apply");
+        assert_eq!(refused, refused2, "replicas must agree");
+        match &refused[0].outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(reason.starts_with("revision conflict"), "{reason}");
+                assert!(
+                    reason.contains('1') && reason.contains('2'),
+                    "the refusal names expected and stored revisions: {reason}"
+                );
+            }
+            other => panic!("expected a committed refusal, got {other:?}"),
+        }
+        assert_eq!(stored_stub_ids(&sm, 8080), vec!["a"], "nothing mutated");
+
+        // Expecting a revision on an absent record cannot hold.
+        let absent = sm
+            .apply(vec![entry(
+                4,
+                conditioned(
+                    4,
+                    5,
+                    ControlOp::DeleteImposter {
+                        tenant: TenantId::default(),
+                        port: 9999,
+                    },
+                ),
+            )])
+            .await
+            .expect("apply");
+        match &absent[0].outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(reason.starts_with("revision conflict"), "{reason}");
+                assert!(reason.contains("9999"), "{reason}");
+            }
+            other => panic!("expected a committed refusal, got {other:?}"),
+        }
+
+        // A precondition on an op with no single-imposter target is refused
+        // deterministically (the front already answers 400 before minting one).
+        let multi = sm
+            .apply(vec![entry(
+                5,
+                conditioned(
+                    5,
+                    1,
+                    ControlOp::DeleteAll {
+                        tenant: TenantId::default(),
+                    },
+                ),
+            )])
+            .await
+            .expect("apply");
+        assert!(
+            matches!(&multi[0].outcome, ControlOutcome::Failed { reason }
+                if reason.starts_with("revision conflict")),
+            "{multi:?}"
+        );
+    }
+
+    /// #46 gate: a conflicted op replayed under the same op_id collapses to the
+    /// original refusal — a keyed retry of a 409 stays a 409, never re-applies.
+    #[tokio::test]
+    async fn revision_conflict_replay_dedups_to_the_original_refusal() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, put(1, 8080, json!([])))])
+            .await
+            .expect("put");
+
+        let stale = |op_id: u128| ControlRequest {
+            expected_revision: Some(99),
+            ..request(
+                op_id,
+                ControlOp::SetEnabled {
+                    tenant: TenantId::default(),
+                    port: 8080,
+                    enabled: false,
+                },
+            )
+        };
+        let first = sm.apply(vec![entry(2, stale(7))]).await.expect("apply");
+        assert!(
+            matches!(&first[0].outcome, ControlOutcome::Failed { reason }
+                if reason.starts_with("revision conflict")),
+            "{first:?}"
+        );
+
+        let replay = sm.apply(vec![entry(3, stale(7))]).await.expect("replay");
+        assert_eq!(
+            replay, first,
+            "the replay must return the ORIGINAL refusal, not re-evaluate"
+        );
     }
 }

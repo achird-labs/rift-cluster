@@ -68,6 +68,15 @@ pub struct ControlRequest {
     /// collapse on another, diverging their applied state.
     #[serde(default)]
     pub issued_at_secs: u64,
+    /// Apply only if the addressed record's stored revision equals this;
+    /// `None` = unconditional (last-writer-wins, the pre-#46 behavior).
+    ///
+    /// Mixed-version caveat: a replica running a pre-#46 binary ignores this
+    /// field and applies unconditionally, so operators must not send
+    /// `If-Match` until every node runs an upgraded binary — the feature is
+    /// inert until a client opts in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
     pub op: ControlOp,
 }
 
@@ -250,6 +259,29 @@ fn require_default_tenant(tenant: &TenantId) -> Result<(), String> {
     }
 }
 
+/// The single-imposter `(tenant, port)` record `op` addresses, or `None` if
+/// `op` has no such target (a bulk op, or a reserved RFC-002 variant). Used by
+/// the state machine's expected-revision check (#46): a precondition can only
+/// ever hold against one stored record, so every op without a single target
+/// refuses a precondition deterministically rather than silently ignoring it.
+pub(crate) fn precondition_target(op: &ControlOp) -> Option<(&TenantId, u16)> {
+    match op {
+        // `config.port` is validated to be present before this ever matters,
+        // but a `None` here must still yield `None`, not a bogus target.
+        ControlOp::PutImposter { tenant, config } => config.port.map(|port| (tenant, port)),
+        ControlOp::PatchStubs { tenant, port, .. }
+        | ControlOp::DeleteImposter { tenant, port }
+        | ControlOp::SetEnabled { tenant, port, .. } => Some((tenant, *port)),
+        ControlOp::DeleteAll { .. }
+        | ControlOp::TenantPut { .. }
+        | ControlOp::TenantDelete { .. }
+        | ControlOp::PrincipalPut { .. }
+        | ControlOp::PrincipalDelete { .. }
+        | ControlOp::BindingPut { .. }
+        | ControlOp::BindingDelete { .. } => None,
+    }
+}
+
 /// Apply `script` to `stubs` deterministically, mirroring the upstream stub
 /// lifecycle semantics exactly: `Add` rejects a duplicate explicit id and
 /// clamps `index` to the list length; `ReplaceById` keeps the slot's position
@@ -348,6 +380,7 @@ mod tests {
             op_id: uuid(1),
             principal: None,
             issued_at_secs: 42,
+            expected_revision: None,
             op: ControlOp::DeleteImposter {
                 tenant: TenantId::default(),
                 port: 8080,
@@ -369,6 +402,18 @@ mod tests {
         }))
         .expect("legacy envelope parses");
         assert_eq!(legacy.issued_at_secs, 0);
+        assert_eq!(
+            legacy.expected_revision, None,
+            "a pre-#46 envelope decodes to an unconditional apply"
+        );
+
+        // A conditioned envelope carries the expectation as a plain integer.
+        let conditioned = ControlRequest {
+            expected_revision: Some(17),
+            ..request
+        };
+        let value = serde_json::to_value(&conditioned).expect("serialize");
+        assert_eq!(value["expected_revision"], json!(17));
     }
 
     /// Every variant tag in the log format, including the reserved ones whose
@@ -443,6 +488,7 @@ mod tests {
             op_id: uuid(2),
             principal: None,
             issued_at_secs: 0,
+            expected_revision: None,
             op: ControlOp::DeleteAll {
                 tenant: TenantId::default(),
             },
