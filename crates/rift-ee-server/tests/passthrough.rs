@@ -87,3 +87,72 @@ async fn startup_guards_run_before_anything_binds() {
     let rendered = format!("{err:#}");
     assert!(rendered.contains("--cluster-bind"), "{rendered}");
 }
+
+/// Issue #67: `replay` actually replays.
+///
+/// It parsed and was then refused with an explanatory error, so the one thing
+/// an operator wants from the subcommand — the saved imposters coming back —
+/// did not happen. Driven through `dispatch` and `compose::start` together
+/// because that pairing *is* the feature: dispatch rewrites the config file and
+/// the normal serve path does the rest, exactly as upstream does it.
+#[tokio::test]
+async fn replay_loads_the_saved_imposters() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let imposter_port = {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        held.local_addr().expect("addr").port()
+    };
+
+    let saved = dir.path().join("saved.json");
+    std::fs::write(
+        &saved,
+        serde_json::json!({
+            "imposters": [{
+                "port": imposter_port,
+                "protocol": "http",
+                "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": "replayed" } }] }]
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write the saved snapshot");
+
+    let mut parsed = cli(&["replay", "--configfile", &saved.to_string_lossy()]);
+    assert_eq!(
+        rift_ee_server::bootstrap::dispatch(&mut parsed).expect("replay dispatches"),
+        rift_ee_server::bootstrap::AfterBootstrap::Serve
+    );
+
+    let server = compose::start(parsed)
+        .await
+        .expect("the replayed server starts");
+    let admin = server.admin_addr();
+
+    let listed: serde_json::Value = reqwest::get(format!("http://{admin}/imposters"))
+        .await
+        .expect("list imposters")
+        .json()
+        .await
+        .expect("imposters json");
+    assert!(
+        listed["imposters"]
+            .as_array()
+            .expect("imposters array")
+            .iter()
+            .any(|i| i["port"].as_u64() == Some(u64::from(imposter_port))),
+        "the replayed imposter must be present: {listed}"
+    );
+
+    let body = reqwest::get(format!("http://127.0.0.1:{imposter_port}/"))
+        .await
+        .expect("the replayed imposter answers")
+        .text()
+        .await
+        .expect("body");
+    assert_eq!(
+        body, "replayed",
+        "the replayed imposter must serve its stub"
+    );
+
+    server.shutdown().await;
+}

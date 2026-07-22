@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
 
     // `save` and `stop` are complete programs; `restart` stops the old process
     // and then falls through to start a new one.
-    if bootstrap::dispatch(&cli)? == bootstrap::AfterBootstrap::Done {
+    if bootstrap::dispatch(&mut cli)? == bootstrap::AfterBootstrap::Done {
         return Ok(());
     }
 
