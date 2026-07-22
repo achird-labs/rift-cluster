@@ -1252,4 +1252,112 @@ mod tests {
             n3.shutdown().await.ok();
         }
     }
+    /// #55 gate: with a ceiling of 2 and two concurrent admissions against a
+    /// one-voter cluster, exactly one may promote — the committed voter set
+    /// must never exceed the ceiling, and the loser must still join as a
+    /// learner. Pre-fix, both admissions read the same pre-promotion count and
+    /// both promote. Repeated like the #38 gate: one pass can get lucky.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admissions_never_exceed_the_ceiling() {
+        use crate::raft::network;
+
+        for round in 0..4 {
+            let (d1, d2, d3) = (
+                TempDir::new().unwrap(),
+                TempDir::new().unwrap(),
+                TempDir::new().unwrap(),
+            );
+            let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+            n1.cluster_init().await.expect("init n1");
+            let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+            let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+
+            let gate = tokio::sync::Mutex::new(());
+            let (r2, r3) = tokio::join!(
+                network::admit(&n1.raft, &gate, 2, n2.advertise_addr().to_string(), 2),
+                network::admit(&n1.raft, &gate, 3, n3.advertise_addr().to_string(), 2),
+            );
+            r2.unwrap_or_else(|e| {
+                panic!("round {round}: losing the promotion race must not fail the join: {e}")
+            });
+            r3.unwrap_or_else(|e| {
+                panic!("round {round}: losing the promotion race must not fail the join: {e}")
+            });
+
+            let voters = n1.status().voters;
+            assert_eq!(
+                voters.len(),
+                2,
+                "round {round}: auto-promotion exceeded the ceiling: {voters:?}"
+            );
+            assert!(
+                voters.contains(&1),
+                "round {round}: the founder stays a voter"
+            );
+            let promoted: Vec<NodeId> = [2, 3]
+                .into_iter()
+                .filter(|id| voters.contains(id))
+                .collect();
+            assert_eq!(
+                promoted.len(),
+                1,
+                "round {round}: exactly one joiner wins the promotion slot, got {promoted:?}"
+            );
+
+            let members: BTreeSet<NodeId> = n1
+                .raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .nodes()
+                .map(|(id, _)| *id)
+                .collect();
+            assert!(
+                members.contains(&2) && members.contains(&3),
+                "round {round}: the ceiling loser must remain a learner, got {members:?}"
+            );
+
+            n1.shutdown().await.ok();
+            n2.shutdown().await.ok();
+            n3.shutdown().await.ok();
+        }
+    }
+
+    /// #55 gate: a joiner admitted at the ceiling is a functioning replica —
+    /// the admission succeeds, the voter set is unchanged, and replicated
+    /// config still reaches it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_at_ceiling_still_admits_learner() {
+        use crate::raft::network;
+
+        let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+
+        let gate = tokio::sync::Mutex::new(());
+        network::admit(&n1.raft, &gate, 2, n2.advertise_addr().to_string(), 1)
+            .await
+            .expect("a ceiling-capped admission must still succeed as learner");
+
+        assert_eq!(n1.status().voters, vec![1], "the ceiling holds at 1 voter");
+
+        // A retried join (the joiner timed out and re-sent) is idempotent:
+        // still Ok, still learner-only.
+        network::admit(&n1.raft, &gate, 2, n2.advertise_addr().to_string(), 1)
+            .await
+            .expect("a retried ceiling-capped admission must stay idempotent");
+        assert_eq!(n1.status().voters, vec![1], "the retry must not promote");
+
+        n1.put_imposter(imposter(8080, "ceiling-learner"))
+            .await
+            .expect("leader write");
+        assert!(
+            wait_config(&n2, 8080, "ceiling-learner").await,
+            "a ceiling-capped learner must still replicate config"
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+    }
 }

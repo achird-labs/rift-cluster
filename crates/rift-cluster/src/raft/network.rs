@@ -28,7 +28,7 @@ use openraft::raft::{
 use openraft::{BasicNode, ChangeMembers, Raft, RaftNetwork, RaftNetworkFactory};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 
 use super::{NodeId, TypeConfig};
 use crate::control::{ControlRequest, ControlResponse};
@@ -59,15 +59,20 @@ pub(crate) const MAX_AUTO_VOTERS: usize = 9;
 /// [`DEFAULT_REQUEST_TIMEOUT`] so the wait expires *inside* the joiner's own RPC
 /// budget: a longer bound would be unobservable — the joiner would give up
 /// first, drop this handler mid-admission, and retry, piling a second concurrent
-/// admission onto the leader it was already contending with.
+/// admission onto the leader it was already contending with. Promotions also
+/// hold the admission gate (#55), so a slow one delays queued admissions past
+/// their own budgets transitively; that only re-triggers the same cheap,
+/// idempotent retry, and a leader too wedged to commit promptly cannot admit
+/// anyone anyway.
 const ADMIT_COMMIT_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// How many times a membership change re-submits after losing the slot to a
 /// concurrent admission. Each attempt waits for the competing entry rather than
-/// spinning, and every attempt but the last lets exactly one competitor through,
-/// so the ceiling only needs to exceed the number of nodes that can be admitted
-/// at once — [`MAX_AUTO_VOTERS`] — with room to spare. Uncontended joins never
-/// reach attempt 2.
+/// spinning, and every attempt but the last lets exactly one competitor through.
+/// Promotions are serialized on the admission gate (#55), so the contention this
+/// absorbs is concurrent *learner-add* entries — bounded by how many nodes can
+/// be admitted at once, [`MAX_AUTO_VOTERS`], with room to spare. Uncontended
+/// joins never reach attempt 2.
 const ADMIT_MAX_ATTEMPTS: usize = 12;
 
 /// openraft's error type for the two membership entry points used here.
@@ -206,6 +211,11 @@ where
     }
 }
 
+/// Serializes the promotion phase of seed-join admissions on this node. One
+/// per router, and admissions only succeed on the leader, so the leader's gate
+/// is the cluster-wide serialization point for auto-promotions — see [`admit`].
+type AdmissionGate = Arc<Mutex<()>>;
+
 /// Register the control-plane receiving endpoints (Raft RPCs + seed join) onto
 /// `router`, all reading the node through `slot`.
 #[must_use]
@@ -216,6 +226,7 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot) -> Router {
     let write = slot.clone();
     let applied = slot.clone();
     let join = slot;
+    let admission_gate: AdmissionGate = Arc::new(Mutex::new(()));
 
     router
         .route(
@@ -296,10 +307,11 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot) -> Router {
             CLUSTER_JOIN_PATH,
             Arc::new(move |body: Vec<u8>| -> HandlerFuture {
                 let slot = join.clone();
+                let gate = Arc::clone(&admission_gate);
                 Box::pin(async move {
                     let raft = raft_of(&slot)?;
                     let req = decode::<JoinRequest>(&body)?;
-                    admit(raft, req.node_id, req.advertise).await?;
+                    admit(raft, &gate, req.node_id, req.advertise, MAX_AUTO_VOTERS).await?;
                     encode(&JoinAccepted { admitted: true })
                 })
             }),
@@ -349,38 +361,89 @@ pub(crate) async fn local_write(
 }
 
 /// Admit `id`@`advertise` to the cluster: add it as a learner, wait for it to
-/// catch up, then promote it to voter if the cluster is still under
-/// [`MAX_AUTO_VOTERS`]. Must run on the leader — on any other node openraft
-/// returns a `ForwardToLeader` error, surfaced here so the caller can retry the
-/// leader.
-async fn admit(raft: &Raft<TypeConfig>, id: NodeId, advertise: String) -> Result<(), RpcError> {
+/// catch up, then promote it to voter if the cluster is still under the
+/// ceiling — at the ceiling the joiner is admitted as a learner only (#55).
+/// Must run on the leader — on any other node openraft returns a
+/// `ForwardToLeader` error, surfaced here so the caller can retry the leader.
+///
+/// The handler passes [`MAX_AUTO_VOTERS`]; tests pass a small ceiling to
+/// provoke the race without an 11-node cluster.
+pub(crate) async fn admit(
+    raft: &Raft<TypeConfig>,
+    gate: &Mutex<()>,
+    id: NodeId,
+    advertise: String,
+    max_voters: usize,
+) -> Result<(), RpcError> {
     // Concurrent joins are the normal case (a StatefulSet rollout seeds every
     // pod off the same node), so failures name the candidate they belong to.
+    // The learner add — the slow, replication-bound phase — deliberately stays
+    // outside the gate so concurrent joins still parallelize catch-up.
     membership_change(raft, &format!("admit {id}: add learner"), || {
         raft.add_learner(id, BasicNode::new(advertise.clone()), true)
     })
     .await?;
 
     // Promote incrementally with `AddVoterIds`, never by replacing the whole
-    // voter set: the voter count read from the metrics *watch* lags the committed
-    // membership, so building a `ReplaceAllVoters` set from it would let two
-    // concurrent joins each overwrite the other's just-added voter — demoting a
-    // live member with no error. `AddVoterIds` only ever adds, so the ceiling
-    // read below is a soft gate on *whether* to auto-promote, never the source of
-    // the new membership.
-    let voters: BTreeSet<NodeId> = raft
-        .metrics()
-        .borrow()
-        .membership_config
-        .voter_ids()
-        .collect();
-    if voters.len() < MAX_AUTO_VOTERS && !voters.contains(&id) {
+    // voter set: building a `ReplaceAllVoters` set from any local view would
+    // let two concurrent joins each overwrite the other's just-added voter —
+    // demoting a live member with no error. `AddVoterIds` only ever adds, so
+    // the ceiling read below is a soft gate on *whether* to auto-promote,
+    // never the source of the new membership.
+    //
+    // The gate makes the ceiling exact rather than best-effort (#55): every
+    // promotion ends with a wait for its entry to apply (applied ⇒ committed),
+    // so by the time a guard drops, the next holder's committed read includes
+    // all prior auto-promotions. Without it, N concurrent admissions each read
+    // a pre-promotion count and all pass the `< max_voters` check.
+    let _serialized = gate.lock().await;
+    let voters = committed_voters(raft, id).await?;
+    if should_promote(&voters, id, max_voters) {
         membership_change(raft, &format!("admit {id}: promote to voter"), || {
             raft.change_membership(ChangeMembers::AddVoterIds(BTreeSet::from([id])), false)
         })
         .await?;
+    } else if voters.contains(&id) {
+        // A retried join from a node that is already a voter: nothing to do,
+        // but leave a trace so the three-way outcome is always greppable.
+        tracing::debug!(
+            node_id = id,
+            "join for an existing voter; membership unchanged"
+        );
+    } else {
+        tracing::info!(
+            node_id = id,
+            voters = voters.len(),
+            max_voters,
+            "auto-voter ceiling reached; admitted as learner only"
+        );
     }
     Ok(())
+}
+
+/// The committed voter set, read inside the RaftCore loop — the only read that
+/// is exact under the admission gate. The metrics watch lags the state it
+/// mirrors, and *effective* membership can carry an uncommitted entry from a
+/// deposed leader that later truncates; committed-under-gate is neither.
+async fn committed_voters(
+    raft: &Raft<TypeConfig>,
+    id: NodeId,
+) -> Result<BTreeSet<NodeId>, RpcError> {
+    raft.with_raft_state(|state| {
+        state
+            .membership_state
+            .committed()
+            .voter_ids()
+            .collect::<BTreeSet<_>>()
+    })
+    .await
+    .map_err(|e| RpcError::Handler(format!("admit {id}: reading committed membership: {e}")))
+}
+
+/// The soft auto-promotion gate: promote while under the ceiling, never
+/// re-promote an existing voter.
+fn should_promote(voters: &BTreeSet<NodeId>, id: NodeId, max_voters: usize) -> bool {
+    voters.len() < max_voters && !voters.contains(&id)
 }
 
 /// Submit one membership change, waiting out whatever change currently holds the
@@ -529,5 +592,25 @@ mod tests {
                 "must not be treated as retryable: {e}"
             );
         }
+    }
+    #[test]
+    fn should_promote_gates_on_ceiling_and_membership() {
+        let voters: BTreeSet<NodeId> = BTreeSet::from([1, 2]);
+        assert!(
+            should_promote(&voters, 3, 3),
+            "under the ceiling, a non-member promotes"
+        );
+        assert!(
+            !should_promote(&voters, 3, 2),
+            "at the ceiling, no promotion"
+        );
+        assert!(
+            !should_promote(&voters, 3, 1),
+            "an already-over-grown voter set must never keep growing"
+        );
+        assert!(
+            !should_promote(&voters, 2, 3),
+            "an existing voter is never re-promoted"
+        );
     }
 }
