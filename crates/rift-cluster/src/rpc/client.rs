@@ -682,7 +682,14 @@ mod tests {
             !health.is_healthy(peer),
             "must short-circuit immediately after tripping"
         );
-        std::thread::sleep(Duration::from_millis(80));
+        // Polled, not slept: a fixed 80 ms against a 50 ms cooldown left a
+        // 30 ms margin, which a loaded CI box eats. Waiting longer than needed
+        // costs nothing here, but failing on scheduler jitter costs a rerun and
+        // teaches people to ignore the suite.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !health.is_healthy(peer) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             health.is_healthy(peer),
             "must recover once the cooldown elapses, even without a success"
