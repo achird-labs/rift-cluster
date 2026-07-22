@@ -72,6 +72,9 @@ const ISOLATION_WINDOW_MS: u64 = 3 * ELECTION_TIMEOUT_MAX_MS;
 /// caller deadlines, so a bounded `leave` still gets several tries.
 const LEAVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How often [`RaftNode::await_membership_loaded`] re-reads the metrics watch.
+const MEMBERSHIP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Everything a [`RaftNode`] needs to start.
 #[derive(Clone)]
 pub struct NodeConfig {
@@ -184,6 +187,24 @@ pub struct StatusReport {
     pub last_applied: Option<u64>,
     /// The voter ids in the currently effective membership.
     pub voters: Vec<NodeId>,
+}
+
+/// What a [`RaftNode::leave`] actually did.
+///
+/// `Ok` alone cannot say: leaving is a no-op when this node is already out of
+/// the membership, and it is *declined* when this node is the only voter —
+/// openraft refuses to empty a voter set, so a solo node stays a full member.
+/// Callers that record a departure must distinguish the two, or they persist
+/// "this node left" about a node that is still a member and strand it on the
+/// next start (issue #72).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaveOutcome {
+    /// This node is out of the membership — it was evicted just now, or it
+    /// already was.
+    Departed,
+    /// This node is still a member and deliberately did not leave. Its exit is
+    /// crash-equivalent: the fleet still counts it, and a restart resumes.
+    Retained,
 }
 
 /// The control-plane Raft node.
@@ -404,7 +425,7 @@ impl RaftNode {
     /// node the current leader hint names, chasing it while leadership settles.
     /// Never blocks past `timeout`: on elapse this returns
     /// [`NodeError::Timeout`] rather than hanging shutdown.
-    pub async fn leave(&self, timeout: Duration) -> Result<(), NodeError> {
+    pub async fn leave(&self, timeout: Duration) -> Result<LeaveOutcome, NodeError> {
         tokio::time::timeout(timeout, self.leave_inner())
             .await
             .unwrap_or_else(|_| {
@@ -424,9 +445,9 @@ impl RaftNode {
             })
     }
 
-    async fn leave_inner(&self) -> Result<(), NodeError> {
-        if !self.is_member() {
-            return Ok(());
+    async fn leave_inner(&self) -> Result<LeaveOutcome, NodeError> {
+        if !self.in_membership() {
+            return Ok(LeaveOutcome::Departed);
         }
 
         // openraft refuses a membership change that would empty the voter set
@@ -435,7 +456,7 @@ impl RaftNode {
         // between leaving and draining, leaving a solo node — a supported mode —
         // with no drain at all.
         if self.is_sole_voter() {
-            return Ok(());
+            return Ok(LeaveOutcome::Retained);
         }
 
         // Why the leader retries *inside* the loop rather than once before it:
@@ -444,8 +465,8 @@ impl RaftNode {
         // every node including this one — so the RPC path has nothing to chase
         // and could never finish what the local path started.
         loop {
-            if !self.is_member() {
-                return Ok(());
+            if !self.in_membership() {
+                return Ok(LeaveOutcome::Departed);
             }
 
             let attempt = if self.status().is_leader {
@@ -459,7 +480,7 @@ impl RaftNode {
             };
 
             match attempt {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(LeaveOutcome::Departed),
                 Err(cause) => self.record_leave_error(cause),
             }
             tokio::time::sleep(LEAVE_POLL_INTERVAL).await;
@@ -503,13 +524,76 @@ impl RaftNode {
     /// Whether this node's id still appears anywhere in the currently
     /// effective membership (voter or learner) — whether there is anything
     /// left to leave.
-    fn is_member(&self) -> bool {
+    ///
+    /// This is *local* knowledge, read from the membership the durable log
+    /// carries, and it can be stale-true: eviction is two committed entries and
+    /// the leader stops replicating to a node once its removal takes effect, so
+    /// a departing node routinely shuts down without ever receiving the entry
+    /// that removed it. A restart therefore cannot treat `true` as proof of
+    /// membership — that is what the departure marker in `rift-ee-server` is
+    /// for (issue #72). `false`, on the other hand, is conclusive.
+    #[must_use]
+    pub fn in_membership(&self) -> bool {
         let receiver = self.raft.metrics();
         let metrics = receiver.borrow();
         metrics
             .membership_config
             .nodes()
             .any(|(id, _)| *id == self.id)
+    }
+
+    /// Wait, bounded, for the durable membership to reach this node's metrics.
+    /// Returns whether it became visible.
+    ///
+    /// [`RaftNode::start`] returns once the core is running, but the membership
+    /// its log carries lands in the metrics watch a moment later. Until it does,
+    /// [`in_membership`](Self::in_membership) and [`known_peers`](Self::known_peers)
+    /// both read empty — which is indistinguishable from "this node was removed",
+    /// and acting on that would send a perfectly good node down the rejoin path
+    /// or, with nothing to rejoin through, refuse its start outright.
+    ///
+    /// An initialized node always has a non-empty membership — openraft refuses
+    /// to commit an empty one — so "non-empty" is the signal that it has loaded.
+    pub async fn await_membership_loaded(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.membership_is_loaded() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(MEMBERSHIP_POLL_INTERVAL).await;
+        }
+    }
+
+    fn membership_is_loaded(&self) -> bool {
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow();
+        metrics.membership_config.nodes().next().is_some()
+    }
+
+    /// The advertise authorities of every *other* node in the membership this
+    /// node's durable log carries.
+    ///
+    /// A node that has to rejoin needs somewhere to ask, and its own log already
+    /// records the fleet it belonged to. That is what makes a **founder**
+    /// recoverable: it has no `--cluster-seeds` by construction — it founded the
+    /// cluster, so there was nothing to seed from — and without this it would
+    /// have no way back after a graceful leave (issue #72).
+    ///
+    /// Entries can be stale, which costs a failed attempt and nothing else: the
+    /// caller tries the next peer.
+    #[must_use]
+    pub fn known_peers(&self) -> Vec<String> {
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow();
+        metrics
+            .membership_config
+            .nodes()
+            .filter(|(id, _)| **id != self.id)
+            .map(|(_, node)| node.addr.clone())
+            .collect()
     }
 
     /// The current leader's advertise authority, if metrics know one right now.
@@ -1328,6 +1412,107 @@ mod tests {
         }
 
         for node in [&n1, &n2, &n3] {
+            node.shutdown().await.expect("shutdown");
+        }
+    }
+
+    /// Issue #72: a sole voter declines to leave, and says so.
+    ///
+    /// openraft refuses a membership change that would empty the voter set, so
+    /// there is nothing to hand this node's votes to and it stays a full member.
+    /// Reporting that as a departure is what would let a caller record "this
+    /// node left" about a node that did not — and then refuse its next start.
+    #[tokio::test]
+    async fn a_sole_voter_declines_to_leave_rather_than_reporting_a_departure() {
+        let dir = TempDir::new().unwrap();
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        node.cluster_init().await.expect("init");
+
+        assert_eq!(
+            node.leave(Duration::from_secs(1))
+                .await
+                .expect("leave resolves"),
+            LeaveOutcome::Retained,
+            "a sole voter cannot leave, so it must not report a departure"
+        );
+        assert!(
+            node.in_membership(),
+            "and it is still a member afterwards, so its next start must resume"
+        );
+
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// Issue #72: a node evicted **while it was down** comes back believing it
+    /// is still a member, and it can name the peers that can readmit it.
+    ///
+    /// This is the precondition the whole reconciler rejoin fallback rests on.
+    /// Nothing at startup can tell such a node it is out — there is no
+    /// departure marker (it never left) and its own log never received the
+    /// entry that removed it, so `in_membership()` is stale-true. If either half
+    /// of that stopped holding, the fallback would be either unnecessary or
+    /// useless, and the node would sit at `/readyz` 503 forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_evicted_while_down_returns_stale_in_membership_and_knows_its_peers() {
+        let (d1, d2, d3) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+        n2.join_via(n1.advertise_addr()).await.expect("n2 join");
+        n3.join_via(n1.advertise_addr()).await.expect("n3 join");
+
+        let all = BTreeSet::from([1, 2, 3]);
+        assert_eq!(wait_voters(&n1, &all).await, all, "three voters to start");
+
+        // n3 goes away first, so it can never observe what happens next. It is
+        // dropped as well as shut down: the redb lock outlives `shutdown` until
+        // the node itself is gone, and the restart below reopens the same store.
+        n3.shutdown().await.expect("shutdown n3");
+        drop(n3);
+
+        crate::raft::network::evict(&n1.raft, 3)
+            .await
+            .expect("evict the node that is down");
+        let survivors = BTreeSet::from([1, 2]);
+        assert_eq!(
+            wait_voters(&n1, &survivors).await,
+            survivors,
+            "the eviction must land while n3 is down"
+        );
+
+        // Back on its retained directory: its log stopped before the removal.
+        let returned = RaftNode::start(config_in(&d3, 3))
+            .await
+            .expect("restart n3");
+        assert!(
+            returned
+                .await_membership_loaded(Duration::from_secs(5))
+                .await,
+            "the durable membership must surface after a restart, or every startup decision that \
+             reads it is guessing"
+        );
+        assert!(
+            returned.in_membership(),
+            "a node evicted while down cannot know it is out — this stale-true reading is \
+             precisely why the departure marker alone is not enough"
+        );
+        let peers = returned.known_peers();
+        assert_eq!(
+            peers.len(),
+            2,
+            "it must still name the peers that can readmit it, got {peers:?}"
+        );
+        assert!(
+            peers.contains(&n1.advertise_addr().to_string()),
+            "the surviving leader must be among them, got {peers:?}"
+        );
+
+        for node in [&n1, &n2, &returned] {
             node.shutdown().await.expect("shutdown");
         }
     }

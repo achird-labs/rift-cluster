@@ -9,12 +9,15 @@
 //! documented embedding seam.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rift_cluster::rpc::Router;
-use rift_cluster::{ClusterDecorator, NodeConfig, NodeError, NodeIdentity, RaftNode, metrics};
+use rift_cluster::{
+    ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, RaftNode, metrics,
+};
 use rift_ee::seams::{ImposterManager, RunningServer, ServerBuilder, TlsDefaults};
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -35,6 +38,96 @@ const SEED_JOIN_DEADLINE: Duration = Duration::from_secs(30);
 /// a leadership change is visible within a scrape interval, slow enough to stay
 /// invisible next to the data plane.
 const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long startup waits for the durable membership to reach the node's
+/// metrics before deciding whether this node is still a member.
+///
+/// Sub-second in practice; the budget is generous because guessing wrong here
+/// costs a node its start, while waiting costs a moment of an already-slow boot.
+const MEMBERSHIP_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The file a confirmed departure leaves behind in the cluster state directory.
+///
+/// Presence is the whole signal; the contents are informational.
+const DEPARTED_MARKER: &str = "departed";
+
+/// How long a resumed node must see no leader at all before it starts offering
+/// itself to its seeds again (issue #72, third signal).
+///
+/// This is the last-resort path, for the two windows the marker and the
+/// membership check cannot cover: a SIGKILL between the leader committing this
+/// node's eviction and the marker reaching disk, and an eviction that happened
+/// while this node was down. Both leave a node whose *local* membership still
+/// contains it, so nothing at startup can tell it is out.
+///
+/// Long, because a healthy fleet elects in well under a second and a node that
+/// legitimately resumed must not spam joins while its peers are still booting;
+/// firing early is harmless (`admit` is idempotent for an existing member) but
+/// noisy.
+///
+/// Note what this does *not* cover: the reconciler exits once `GATE_RECONCILED`
+/// opens, so a node evicted after it has already reconciled keeps running as a
+/// phantom member. Both windows this fallback exists for are startup windows.
+const RECONCILE_REJOIN_FALLBACK: Duration = Duration::from_secs(60);
+
+/// Spacing between rejoin sweeps once the fallback is active, so a leaderless
+/// node retries steadily rather than in a tight loop.
+const REJOIN_ATTEMPT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Where a confirmed departure is recorded, inside the cluster state directory.
+fn departed_marker(state_dir: &Path) -> PathBuf {
+    state_dir.join(DEPARTED_MARKER)
+}
+
+/// Record that this node's departure was accepted by the cluster.
+///
+/// Written before the drain so the drain window absorbs the flush. A failure is
+/// logged rather than propagated: the node has already left and is exiting
+/// anyway, and the reconciler's rejoin fallback recovers the next start.
+fn write_departed_marker(state_dir: &Path) {
+    let path = departed_marker(state_dir);
+    match std::fs::File::create(&path).and_then(|file| file.sync_all()) {
+        Ok(()) => tracing::info!(marker = %path.display(), "recorded the departure"),
+        // Error, not warn: without this marker a restart resumes into a
+        // membership the cluster has moved past, and only the 60 s fallback
+        // gets it back.
+        Err(e) => tracing::error!(
+            error = %e,
+            marker = %path.display(),
+            "could not record the departure; this node will rely on the rejoin fallback if it \
+             restarts"
+        ),
+    }
+}
+
+/// Whether a previous run of this node left the cluster.
+///
+/// The error is propagated rather than read as "no marker": a stat this node
+/// cannot perform would otherwise silently select the resume path, which is
+/// exactly the wedge issue #72 exists to remove.
+fn has_departed_marker(state_dir: &Path) -> anyhow::Result<bool> {
+    let path = departed_marker(state_dir);
+    std::fs::exists(&path)
+        .with_context(|| format!("checking for the departure marker {}", path.display()))
+}
+
+/// Drop the marker once this node is back in the membership.
+///
+/// A failure here is a warning, not a start failure: the node has already
+/// rejoined, and a marker left behind only costs the next start a redundant
+/// seed-join, which `admit` collapses to a no-op for an existing member.
+fn clear_departed_marker(state_dir: &Path) {
+    let path = departed_marker(state_dir);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            error = %e,
+            marker = %path.display(),
+            "could not clear the departure marker; the next start will seed-join again"
+        );
+    }
+}
 
 /// A running enterprise server: the open-source planes, plus the cluster ones
 /// when clustering is on.
@@ -62,6 +155,9 @@ pub struct ComposedServer {
     manager: Option<Arc<ImposterManager>>,
     readiness: Arc<Readiness>,
     leave_timeout: Duration,
+    /// The cluster state directory, when clustering is on: where a confirmed
+    /// departure is recorded so the next start knows to rejoin (issue #72).
+    state_dir: Option<PathBuf>,
 }
 
 impl ComposedServer {
@@ -164,7 +260,23 @@ impl ComposedServer {
             // still counts this node toward quorum, so a node that drained first
             // would spend the whole window as a member that answers nothing.
             match node.leave(self.leave_timeout).await {
-                Ok(()) => tracing::info!("left the cluster membership"),
+                // Only a real departure is recorded. `Retained` means this node
+                // deliberately did not leave — a sole voter cannot, openraft
+                // refuses to empty the voter set — so it is still a full member
+                // and must *resume* on the next start. Marking it would refuse
+                // that start outright, which turns a graceful stop of a solo
+                // node, or of a whole fleet, into a cluster that cannot come
+                // back at all.
+                Ok(LeaveOutcome::Departed) => {
+                    tracing::info!("left the cluster membership");
+                    if let Some(state_dir) = self.state_dir.as_deref() {
+                        write_departed_marker(state_dir);
+                    }
+                }
+                Ok(LeaveOutcome::Retained) => tracing::info!(
+                    "still a member on exit (nothing to hand this node's votes to); the next \
+                     start resumes from the durable log"
+                ),
                 // Error, not warn: this node is exiting while the fleet still
                 // counts it toward quorum, so a rolling restart can shrink the
                 // effective quorum without anything else reporting it.
@@ -240,6 +352,7 @@ pub async fn start_with_runtimes(
             manager: None,
             readiness: Arc::new(Readiness::awaiting([])),
             leave_timeout: Duration::ZERO,
+            state_dir: None,
         });
     }
 
@@ -289,7 +402,9 @@ pub async fn start_with_runtimes(
         node_id: identity.node_id(),
         bind,
         advertise: cli.cluster.cluster_advertise,
-        data_dir: state_dir,
+        // Cloned because the composed server keeps its own handle on the state
+        // directory: it is where a departure gets recorded on the way out.
+        data_dir: state_dir.clone(),
         secret: cluster.secret,
         routes: cluster_api::routes(Router::new(), slot.clone(), Arc::clone(&readiness)),
         engine: Some(Arc::clone(&manager)),
@@ -330,6 +445,7 @@ pub async fn start_with_runtimes(
             manager: Some(manager),
             readiness,
             leave_timeout,
+            state_dir: Some(state_dir),
         }),
         Err(e) => {
             probes.shutdown().await;
@@ -367,6 +483,7 @@ async fn attach_data_plane(
     let barrier = cli.cluster.cluster_write_barrier;
     let barrier_timeout = Duration::from_secs(cli.cluster.cluster_write_barrier_timeout);
     let admin_async = cli.cluster.cluster_admin_async;
+    let seeds = cli.cluster.cluster_seeds.clone();
 
     let server = ServerBuilder::from_cli(cli.oss)
         .manager(manager)
@@ -408,7 +525,95 @@ async fn attach_data_plane(
         }
     };
 
-    Ok((server, front, spawn_reconciler(node, readiness)))
+    Ok((server, front, spawn_reconciler(node, readiness, seeds)))
+}
+
+/// Everywhere this node may offer itself when it needs to (re)join: the
+/// configured seeds first, then the peers its own durable membership names.
+///
+/// The second half only ever matters to a node that already has state, and it
+/// is what makes the founder of a cluster recoverable — `--cluster-seeds` is
+/// empty for it by construction, so a graceful leave would otherwise strand it
+/// with nowhere to ask (issue #72). Seeds keep priority: they are the
+/// operator's stated entry points, and they re-resolve per attempt.
+///
+/// Remembered peers are a fallback, never an override, because they name the
+/// cluster this node *used* to belong to. Pointing a node at a different
+/// cluster while keeping its old state directory could otherwise let a stale
+/// peer answer first; seeds-first ordering plus the shared cluster secret
+/// narrow that to two clusters that share a secret, which is its own
+/// misconfiguration.
+fn rejoin_targets(seeds: &[String], node: &RaftNode) -> Vec<String> {
+    let mut targets = seeds.to_vec();
+    for peer in node.known_peers() {
+        if !targets.contains(&peer) {
+            targets.push(peer);
+        }
+    }
+    targets
+}
+
+/// Whether a leaderless node should offer itself to its seeds again.
+///
+/// Split out from the reconciler because this is the part that regresses
+/// silently — a reset that stops firing, or a window that collapses to zero,
+/// both leave a loop that still *looks* right.
+fn rejoin_fallback_due(
+    leaderless_for: Option<Duration>,
+    since_last_attempt: Option<Duration>,
+    has_targets: bool,
+) -> bool {
+    if !has_targets {
+        return false;
+    }
+    let Some(leaderless_for) = leaderless_for else {
+        return false;
+    };
+    if leaderless_for < RECONCILE_REJOIN_FALLBACK {
+        return false;
+    }
+    since_last_attempt.is_none_or(|since| since >= REJOIN_ATTEMPT_INTERVAL)
+}
+
+/// Offer this node to its seeds again.
+///
+/// Every failure is expected traffic here — the usual reason there is no leader
+/// is that the fleet is still coming up — so they are logged at debug and the
+/// next sweep retries. `admit` is idempotent for a node that is already a
+/// member, so an unnecessary attempt costs one round trip and changes nothing.
+async fn attempt_rejoin(node: &RaftNode, targets: &[String]) {
+    let mut last_failure = None;
+    for seed in targets {
+        let resolved = match tokio::net::lookup_host(seed).await {
+            Ok(addrs) => addrs.collect::<Vec<_>>(),
+            Err(e) => {
+                last_failure = Some(format!("{seed}: {e}"));
+                continue;
+            }
+        };
+        for addr in resolved {
+            match node.join_via(addr).await {
+                Ok(()) => {
+                    tracing::info!(%addr, "rejoined through a peer after the fallback window");
+                    return;
+                }
+                Err(e) => last_failure = Some(format!("{addr}: {e}")),
+            }
+        }
+    }
+
+    // The cause rides on the warning, not on a debug line. This loop has no
+    // terminal failure — unlike the startup seed loop, which surfaces its
+    // failures in an error at the deadline — so a node kept out by a rotated
+    // secret or a stale seed record would otherwise retry forever behind one
+    // repeating warning, and an operator staring at 503 would have to turn on
+    // debug logging to find out why.
+    tracing::warn!(
+        window_secs = RECONCILE_REJOIN_FALLBACK.as_secs(),
+        targets = targets.len(),
+        last_failure = last_failure.as_deref().unwrap_or("none reported"),
+        "no leader for the whole fallback window and no peer admitted this node; retrying"
+    );
 }
 
 /// Catch up to the leader's applied index as observed at join, project the
@@ -418,11 +623,14 @@ async fn attach_data_plane(
 fn spawn_reconciler(
     node: &Arc<RaftNode>,
     readiness: &Arc<Readiness>,
+    seeds: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
     let node = Arc::downgrade(node);
     let readiness = Arc::clone(readiness);
     tokio::spawn(async move {
         let mut quiet_ticks: u32 = 0;
+        let mut leaderless_since: Option<Instant> = None;
+        let mut last_rejoin: Option<Instant> = None;
         loop {
             let Some(node) = node.upgrade() else { return };
             // A wedged reconcile must be diagnosable from the logs, not only
@@ -434,6 +642,32 @@ fn spawn_reconciler(
                     "still reconciling: no leader reachable or applied state behind"
                 );
             }
+
+            // Last resort for a node whose local membership still lists it but
+            // whose cluster has moved on — the one shape neither the departure
+            // marker nor the membership check can see at startup (issue #72).
+            let now = Instant::now();
+            if node.status().current_leader.is_some() {
+                leaderless_since = None;
+            } else if leaderless_since.is_none() {
+                leaderless_since = Some(now);
+            }
+            // Only while there is no leader — the common case costs nothing.
+            // Recomputed per sweep rather than captured once: membership moves,
+            // so the peer able to admit this node may not be the one it started
+            // with.
+            if let Some(since) = leaderless_since {
+                let targets = rejoin_targets(&seeds, &node);
+                if rejoin_fallback_due(
+                    Some(now.duration_since(since)),
+                    last_rejoin.map(|at| now.duration_since(at)),
+                    !targets.is_empty(),
+                ) {
+                    last_rejoin = Some(now);
+                    attempt_rejoin(&node, &targets).await;
+                }
+            }
+
             if let Some(target) = node.leader_applied().await
                 && node.status().last_applied.unwrap_or(0) >= target
             {
@@ -569,28 +803,82 @@ async fn drain_parked_intents(node: &RaftNode) {
 /// Attach to an existing cluster through the seeds, or found one when the
 /// operator has said that is what they want.
 async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
-    // A restart resumes: the durable log already carries the membership, and
-    // both re-initializing (refused by openraft) and re-joining (already a
-    // member) would fail a node that is perfectly able to come back on its own.
-    if node
+    let state_dir = cli.cluster_state_dir();
+    let departed = has_departed_marker(&state_dir)?;
+    let initialized = node
         .is_initialized()
         .await
-        .context("reading cluster initialization state")?
-    {
-        tracing::info!("cluster state present; resuming membership from the durable log");
-        return Ok(());
-    }
+        .context("reading cluster initialization state")?;
 
-    if cli.cluster.cluster_seeds.is_empty() {
+    // Where this node may offer itself. Seeds alone until the durable
+    // membership is known to have loaded — see below.
+    let mut targets = cli.cluster.cluster_seeds.clone();
+
+    if initialized {
+        // Every membership read below is meaningless until the durable
+        // membership has reached the metrics watch, and an unloaded one reads
+        // exactly like "this node was removed".
+        let loaded = node.await_membership_loaded(MEMBERSHIP_LOAD_TIMEOUT).await;
+        if !loaded {
+            tracing::warn!(
+                timeout_secs = MEMBERSHIP_LOAD_TIMEOUT.as_secs(),
+                "the durable membership did not surface in time; treating this node as still a \
+                 member, which is what it was when it stopped"
+            );
+        }
+        targets = rejoin_targets(&cli.cluster.cluster_seeds, node);
+
+        // Having state is not the same as still being a member. Before issue #6
+        // it was — nothing ever removed a node — so resuming on `initialized`
+        // alone was sound. Now a node can hold a complete log for a membership
+        // it has been evicted from, and resuming into it is a permanent wedge:
+        // the leader never contacts a removed node, so the reconcile gate never
+        // opens and `/readyz` stays 503 forever (issue #72).
+        //
+        // Resume unless there is *positive* evidence this node is out: its own
+        // departure marker, or a membership that actually loaded and does not
+        // list it. "Could not tell" is not evidence — treating it as one would
+        // send a healthy node down the rejoin path and, with nothing to rejoin
+        // through, refuse the start of a node that was fine.
+        let out_of_membership = loaded && !node.in_membership();
+        if !departed && !out_of_membership {
+            tracing::info!("cluster state present; resuming membership from the durable log");
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            !targets.is_empty(),
+            "this node is no longer part of the cluster it holds state for, and its log names no \
+             surviving peer to rejoin through; give it --cluster-seeds to rejoin, or delete {} to \
+             start it fresh",
+            state_dir.display()
+        );
+        tracing::info!(
+            departed,
+            out_of_membership,
+            targets = targets.len(),
+            "cluster state present but this node is not a member; rejoining through its seeds and \
+             the peers its log remembers"
+        );
+        // Falls through to the seed loop with the state directory intact: the
+        // retained log is a prefix of the cluster's, so re-admission catches up
+        // by ordinary replication instead of a full snapshot — and wiping it
+        // would throw away parked intents and this node's identity.
+    } else if cli.cluster.cluster_seeds.is_empty() {
         anyhow::ensure!(
             cli.cluster.cluster_allow_solo,
             "--cluster with no --cluster-seeds would found a new single-node cluster; \
              pass --cluster-allow-solo if that is intended, or give it seeds to join"
         );
-        return node
-            .cluster_init()
+        node.cluster_init()
             .await
-            .context("bootstrapping a single-node cluster");
+            .context("bootstrapping a single-node cluster")?;
+        // A marker beside a log that no longer carries a cluster is left over
+        // from a previous life of this directory. Founding a fresh cluster
+        // makes it a lie, and one that bites on the *next* start rather than
+        // this one.
+        clear_departed_marker(&state_dir);
+        return Ok(());
     }
 
     // Retried, and re-resolved on every attempt rather than once at parse time.
@@ -604,7 +892,7 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
     let mut failures;
     loop {
         failures = Vec::new();
-        for seed in &cli.cluster.cluster_seeds {
+        for seed in &targets {
             let resolved = match tokio::net::lookup_host(seed).await {
                 Ok(addrs) => addrs.collect::<Vec<_>>(),
                 Err(e) => {
@@ -616,6 +904,7 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
                 match node.join_via(addr).await {
                     Ok(()) => {
                         tracing::info!(%addr, "joined the cluster through seed");
+                        clear_departed_marker(&state_dir);
                         return Ok(());
                     }
                     Err(e) => failures.push(format!("{addr}: {e}")),
@@ -656,7 +945,56 @@ mod tests {
     use clap::Parser;
     use tempfile::TempDir;
 
-    use super::{ComposedServer, EeCli, start};
+    use super::{
+        ComposedServer, EeCli, RECONCILE_REJOIN_FALLBACK, REJOIN_ATTEMPT_INTERVAL,
+        rejoin_fallback_due, start,
+    };
+
+    /// Issue #72: the rejoin fallback's timing rule.
+    ///
+    /// Tested as a pure function because the loop around it cannot fail
+    /// visibly — a reset that stops firing or a window that collapses to zero
+    /// both leave a reconciler that still looks correct and either never
+    /// recovers an evicted node or floods its seeds.
+    #[test]
+    fn rejoin_fallback_waits_for_the_window_then_paces_itself() {
+        assert!(
+            !rejoin_fallback_due(None, None, true),
+            "a node that can see a leader must never offer itself to seeds"
+        );
+        assert!(
+            !rejoin_fallback_due(Some(RECONCILE_REJOIN_FALLBACK / 2), None, true),
+            "leaderless for less than the window is the normal case during a cold start"
+        );
+        assert!(
+            rejoin_fallback_due(Some(RECONCILE_REJOIN_FALLBACK), None, true),
+            "the first attempt is due as soon as the window elapses"
+        );
+        assert!(
+            !rejoin_fallback_due(
+                Some(RECONCILE_REJOIN_FALLBACK * 2),
+                Some(REJOIN_ATTEMPT_INTERVAL / 2),
+                true
+            ),
+            "attempts must be paced, not run every tick"
+        );
+        assert!(
+            rejoin_fallback_due(
+                Some(RECONCILE_REJOIN_FALLBACK * 2),
+                Some(REJOIN_ATTEMPT_INTERVAL),
+                true
+            ),
+            "a paced-out attempt is due again"
+        );
+    }
+
+    #[test]
+    fn rejoin_fallback_never_fires_without_seeds() {
+        assert!(
+            !rejoin_fallback_due(Some(RECONCILE_REJOIN_FALLBACK * 10), None, false),
+            "with no seeds there is nowhere to offer this node; the loop must not spin on it"
+        );
+    }
 
     /// A solo clustered node with a short drain, so the leave window is a test
     /// timescale rather than the 10 s production default.

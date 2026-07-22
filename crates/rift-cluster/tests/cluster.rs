@@ -256,13 +256,15 @@ impl TestCluster {
 
     /// Have member `id` gracefully leave the Raft membership, then shut down
     /// its own node process (a node that left has no further cluster role).
-    /// Its data directory is left in place, but a fresh `join_via` needs a
-    /// fresh directory — see `test_rejoin_after_leave`.
+    /// Its data directory is left in place and can be reused: rejoining works
+    /// on either a fresh directory (`test_rejoin_after_leave`, the redeployed-pod
+    /// shape) or the retained one (`test_rejoin_after_leave_with_retained_state_dir`,
+    /// the rolling-restart shape).
     async fn leave_gracefully(
         &mut self,
         id: NodeId,
         timeout: Duration,
-    ) -> Result<(), rift_cluster::NodeError> {
+    ) -> Result<rift_cluster::LeaveOutcome, rift_cluster::NodeError> {
         let result = {
             let node = self.member(id).node.as_ref().expect("member is running");
             node.leave(timeout).await
@@ -699,6 +701,100 @@ async fn test_rejoin_after_leave() {
             .wait_converged(9090, "written-while-departed", CONVERGE_DEADLINE)
             .await,
         "rejoined node did not catch up on the write made while it was away"
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// Issue #72: the same rejoin, but on the node's **retained** directory.
+///
+/// This is the rolling-restart shape — a Docker volume or k8s PVC outlives the
+/// container, so the returning node has its whole Raft log, including a
+/// membership it is no longer part of. `test_rejoin_after_leave` deliberately
+/// uses a fresh directory and so never exercises this path; nothing did, in
+/// process, until this test.
+///
+/// The retained log is a safe *prefix* of the cluster's, so re-admission as a
+/// learner reconciles it by ordinary append/conflict handling rather than
+/// needing the directory wiped. The final write is the half that matters most:
+/// a returning node carrying a stale term must not disturb the quorum it
+/// rejoins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rejoin_after_leave_with_retained_state_dir() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let departed = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader)
+        .expect("a follower to leave");
+
+    cluster
+        .leave_gracefully(departed, Duration::from_secs(5))
+        .await
+        .expect("graceful leave");
+
+    let remaining: BTreeSet<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != departed)
+        .collect();
+    assert!(
+        cluster.wait_voters(&remaining, CONVERGE_DEADLINE).await,
+        "membership did not shrink after the leave"
+    );
+
+    // Written while it is away, so rejoining has to catch up on it.
+    cluster
+        .write_on_leader(9091, "written-while-departed")
+        .await;
+    assert!(
+        cluster
+            .wait_converged(9091, "written-while-departed", CONVERGE_DEADLINE)
+            .await,
+        "the surviving quorum did not converge while the departed node was away"
+    );
+
+    // The retained directory, not a fresh one: this is the whole point.
+    let dir = cluster.member(departed).dir.path().to_path_buf();
+    let addr = cluster.member(departed).addr;
+    let seed = cluster
+        .leader()
+        .expect("a leader to seed off")
+        .advertise_addr();
+    let rejoined = spawn(departed, addr, &dir).await;
+    rejoined
+        .join_via(seed)
+        .await
+        .expect("a node that left must rejoin on its retained directory");
+    cluster.member_mut(departed).node = Some(rejoined);
+
+    let full: BTreeSet<NodeId> = cluster.members.iter().map(|m| m.id).collect();
+    assert!(
+        cluster.wait_voters(&full, CONVERGE_DEADLINE).await,
+        "rejoined node did not converge back to full voter membership"
+    );
+    assert!(
+        cluster
+            .wait_converged(9091, "written-while-departed", CONVERGE_DEADLINE)
+            .await,
+        "rejoined node did not catch up on the write made while it was away"
+    );
+
+    // The survivors were not destabilized by the returning node's stale state:
+    // the cluster still commits after the rejoin.
+    cluster.write_on_leader(9092, "after-rejoin").await;
+    assert!(
+        cluster
+            .wait_converged(9092, "after-rejoin", CONVERGE_DEADLINE)
+            .await,
+        "the cluster stopped committing after the retained-state rejoin"
     );
 
     cluster.shutdown_all().await;

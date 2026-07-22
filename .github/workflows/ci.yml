@@ -81,16 +81,11 @@ jobs:
       # Serial by necessity, not by preference: the compose file publishes fixed
       # host ports, so two stacks cannot coexist on one runner.
       #
-      # `--ignored` runs the ignored tests, which includes the committed
-      # reproduction for issue #72 (a graceful leave prevents rejoin when the
-      # state directory is retained). It is expected to fail until that is
-      # fixed, so it is skipped by name rather than deleted — drop the `--skip`
-      # when #72 lands, and the scenario starts guarding the fix.
+      # `--ignored` runs the ignored tests: the whole tier is gated on a
+      # container runtime, so `--ignored` is how it runs at all.
       - name: Container chaos scenarios
         if: steps.changed.outputs.run == 'true'
-        run: |
-          cargo test -p cluster-chaos -- --ignored --test-threads=1 \
-            --skip c5_rolling_restart_never_stops_accepting_writes
+        run: cargo test -p cluster-chaos -- --ignored --test-threads=1
 
       - name: Cluster logs on failure
         if: failure() && steps.changed.outputs.run == 'true'

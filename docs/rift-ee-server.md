@@ -173,8 +173,12 @@ On SIGTERM the node, in this order:
    (the departing node asks it over the cluster port). Until that commits the
    fleet still counts this node toward quorum, so leaving before the drain is
    what keeps a rolling restart from shrinking the effective quorum;
-3. **drains** whatever is left of the `--cluster-leave-timeout` window;
-4. **closes the listeners** and stops the control-plane node.
+3. **records the departure** in the state directory (a `departed` marker file),
+   so the next start knows to rejoin rather than resume — see
+   [Restarting a node](#restarting-a-node). Written only when the cluster
+   actually accepted the departure;
+4. **drains** whatever is left of the `--cluster-leave-timeout` window;
+5. **closes the listeners** and stops the control-plane node.
 
 Closing sockets first would turn every in-flight request into a client-visible
 error, which is exactly what the leave exists to avoid.
@@ -197,6 +201,50 @@ and hands off once the second write drops it from membership entirely.
 Manifests that encode this rule — a Dockerfile, a 3-node compose cluster, and a
 Kubernetes StatefulSet with both probes wired — live in
 [`deploy/`](../deploy/README.md).
+
+## Restarting a node
+
+A restarting node either **resumes** its place in the membership or **rejoins**
+through its seeds, and it decides from three inputs: whether its state directory
+carries a cluster (`initialized`), whether that directory holds a `departed`
+marker from a graceful leave, and whether its own id is still in the membership
+its durable log carries.
+
+| initialized | `departed` marker | still in membership | somewhere to rejoin | what happens |
+|---|---|---|---|---|
+| no | — | — | seeds given | seed-join |
+| no | — | — | no seeds | founds a cluster, but only with `--cluster-allow-solo` |
+| yes | no | yes | — | **resume** from the durable log — the cold-start path |
+| yes | yes | any | yes | **rejoin**, state retained |
+| yes | no | no | yes | **rejoin**, state retained |
+| yes | yes / not a member | — | nothing | **start is refused**, naming both recoveries |
+
+"Somewhere to rejoin" is `--cluster-seeds` **plus every other member the node's
+own durable log remembers**, seeds first. That second half is not a nicety: the
+node that *founds* a cluster has no seeds by construction — there was nothing to
+seed from — so after a graceful leave it would have no way back at all. Its log
+still names the peers that outlived it, and that is what it asks.
+
+Two more things that are easy to get wrong:
+
+- **The state directory is never wiped.** It holds the applied state, parked
+  intents and this node's minted identity, so a rejoin reuses the retained log —
+  which is a prefix of the cluster's — and catches up by ordinary replication.
+  If you genuinely want a clean node, delete the directory yourself; that takes
+  the first row.
+- **"Still in membership" is local knowledge and can be stale.** A departing
+  node often never receives the entry that removes it, so its own log still
+  lists it. That is why the marker exists, and why a node that resumes but then
+  sees **no leader at all for 60 s** starts offering itself to its seeds again —
+  the last-resort path for a node evicted while it was down.
+
+A node whose start is refused shows this shape:
+
+```
+this node is no longer part of the cluster it holds state for, and its log
+names no surviving peer to rejoin through; give it --cluster-seeds to rejoin,
+or delete <state-dir> to start it fresh
+```
 
 ## The `/_cluster/*` operator surface
 
