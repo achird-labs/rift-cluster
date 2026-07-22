@@ -8,13 +8,14 @@
 use clap::Parser;
 use rift_ee::rift_http_proxy::{healthcheck, runtime, script_cli};
 use rift_ee::seams::Commands;
+use rift_ee_server::bootstrap;
 use rift_ee_server::cli::EeCli;
 use rift_ee_server::compose;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 fn main() -> anyhow::Result<()> {
-    let cli = EeCli::parse();
+    let mut cli = EeCli::parse();
 
     // Both of these must run before any bootstrap: `script` wants only its own
     // exit code, and `healthcheck` would otherwise clobber the running server's
@@ -27,13 +28,24 @@ fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
+    // Before tracing, because an rcfile may carry `logLevel` — the open-source
+    // binary applies it here for the same reason. Any complaint is held until
+    // there is a subscriber, so it lands in the log pipeline and not only on a
+    // stderr nobody is collecting.
+    let rcfile_warning = bootstrap::apply_rcfile(&mut cli);
+
     rift_ee::rift_http_proxy::install_default_crypto_provider();
     init_tracing(&cli);
+    if let Some(warning) = rcfile_warning {
+        warn!("{warning}");
+    }
+    bootstrap::write_pidfile(&cli)?;
 
-    let cli = match unsupported_reason(&cli) {
-        Some(reason) => anyhow::bail!("{reason}"),
-        None => cli,
-    };
+    // `save` and `stop` are complete programs; `restart` stops the old process
+    // and then falls through to start a new one.
+    if bootstrap::dispatch(&cli)? == bootstrap::AfterBootstrap::Done {
+        return Ok(());
+    }
 
     info!(
         version = %rift_ee::version_banner(),
@@ -42,37 +54,6 @@ fn main() -> anyhow::Result<()> {
     );
 
     run(cli)
-}
-
-/// Everything the open-source binary supports that this one does not (yet).
-///
-/// Declining loudly is the point: each of these is implemented in a private
-/// function of the open-source binary's `main.rs` rather than behind a library
-/// seam, and copying it here would fork behaviour that is meant to stay shared.
-/// The gap is tracked upstream as a bootstrap-seam request; until it lands, the
-/// `rift` binary is the answer, and an operator is told so rather than getting
-/// silently different behaviour.
-fn unsupported_reason(cli: &EeCli) -> Option<String> {
-    if cli.oss.rcfile.is_some() {
-        return Some(
-            "--rcfile is not supported by rift-ee-server (the open-source binary owns rcfile \
-             parsing); pass the equivalent flags directly"
-                .to_owned(),
-        );
-    }
-    match &cli.oss.command {
-        Some(Commands::Stop { .. }) => Some("`stop`"),
-        Some(Commands::Restart { .. }) => Some("`restart`"),
-        Some(Commands::Save { .. }) => Some("`save`"),
-        _ => None,
-    }
-    .map(|subcommand| {
-        format!(
-            "{subcommand} is not supported by rift-ee-server; use the open-source `rift` binary \
-             for it (it drives a running server over its admin API and PID file, and does not \
-             depend on the enterprise composition)"
-        )
-    })
 }
 
 fn run(cli: EeCli) -> anyhow::Result<()> {
