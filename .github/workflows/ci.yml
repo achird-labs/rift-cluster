@@ -37,6 +37,12 @@ jobs:
       - name: Single prometheus copy
         run: scripts/check-single-prometheus.sh
 
+      # Cheap, and it runs here rather than in `cluster-smoke` so it is enforced
+      # on every PR: `cluster-smoke` is path-filtered, and a quarantine tag can
+      # be added by a change that touches nothing it watches.
+      - name: Chaos quarantine tags
+        run: scripts/chaos-quarantine.sh check
+
   # No openraft in `rift-cluster`'s public API — an acceptance criterion of
   # issue #6 that the compiler cannot check. Why it matters, and why the check
   # has no exemptions, is documented in the script itself; this job only
@@ -117,9 +123,16 @@ jobs:
       #
       # `--ignored` runs the ignored tests: the whole tier is gated on a
       # container runtime, so `--ignored` is how it runs at all.
+      # Skips are derived from the quarantine tags in the source, never
+      # hardcoded here: a hardcoded skip outlives the reason for it, and the
+      # scenario stays silently un-run long after its bug is fixed.
       - name: Container chaos scenarios
         if: steps.changed.outputs.run == 'true'
-        run: cargo test -p cluster-chaos -- --ignored --test-threads=1
+        run: |
+          set -euo pipefail
+          skips="$(scripts/chaos-quarantine.sh list)"
+          echo "quarantine skips: ${skips:-<none>}"
+          cargo test -p cluster-chaos -- --ignored --test-threads=1 $skips
 
       - name: Cluster logs on failure
         if: failure() && steps.changed.outputs.run == 'true'
