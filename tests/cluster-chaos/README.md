@@ -74,9 +74,11 @@ Implemented and passing: `test_config_sync_converges`, `test_node_rejoin`,
 `c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes`.
 
 `c5_rolling_restart_never_stops_accepting_writes` is committed **failing**, as
-the reproduction for a real defect it found: a node that gracefully left cannot
-rejoin when its state directory is retained, which is every rolling restart. See
-its doc comment.
+the reproduction for a real defect it found (#72): a node that gracefully left
+cannot rejoin when its state directory is retained, which is every rolling
+restart. CI skips it by name; drop the `--skip` in `.github/workflows/ci.yml`
+when #72 is fixed, and the scenario starts guarding the fix instead of
+reporting the bug.
 
 Not yet implemented — they need toxiproxy and an Envoy front the compose file
 does not carry yet: **C4** (partition during writes → 503 + parked intent →
