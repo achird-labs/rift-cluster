@@ -236,14 +236,20 @@ happens in the background — poll each entry of `opIds` (a multi-op mutation
 such as `PUT /imposters` commits several ops; `opId` is the correlation id).
 
 Cluster-mode divergences from a single node: an imposter must carry an explicit
-`port` (an auto-assigned port cannot replicate), and `file:`/`ref:` script
-sources are not yet resolved on the replicated path (they are still gated by
-`--allowInjection`). Concurrent writers to the *same* imposter are
-last-writer-wins for now — an expected-revision precondition on
-`Rift-Cluster-Revision` is planned follow-up; serialize per-imposter writers
-until it lands. `PUT /imposters` commits as a sequence (upserts first, then
-prunes), so a write interrupted by a leadership change can transiently leave a
-superset of old and new imposters — a retry converges it.
+`port` (an auto-assigned port cannot replicate). `_rift.script` `file:`/`ref:`
+sources resolve on the node that accepts the write, under that node's
+`--scripts-dir`, before replication (upstream #356) — followers receive
+inline code and need no scripts dir of their own, so deploy script files to
+every node that can receive admin writes. A resolution failure is upstream's
+400 (`bad data` type, `Script resolution failed: …` message); without
+`--allowInjection` nothing about this changes — the injection gate still
+refuses all script surfaces first, before resolution ever runs. Concurrent
+writers to the *same* imposter are last-writer-wins for now — an
+expected-revision precondition on `Rift-Cluster-Revision` is planned
+follow-up; serialize per-imposter writers until it lands. `PUT /imposters`
+commits as a sequence (upserts first, then prunes), so a write interrupted by
+a leadership change can transiently leave a superset of old and new
+imposters — a retry converges it.
 
 A node is not Ready until its `cluster-reconciled` gate opens: its applied
 state has caught up to the leader's and its imposters are bound (or their
