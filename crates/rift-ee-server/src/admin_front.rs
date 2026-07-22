@@ -662,8 +662,14 @@ async fn build_and_run(
                         }
                     }
                     Err(e) => {
-                        // The replay loop owns it from here.
+                        // The replay loop owns it from here — and is woken now
+                        // rather than left to its periodic sweep. Nothing else
+                        // will rouse it: this node has a leader (the submit
+                        // reached one to fail against), so the leader-transition
+                        // trigger will not fire, and the client is holding a 202
+                        // that promised this would apply (#83).
                         tracing::warn!(%op_id, error = %e, "async submit failed; intent stays parked");
+                        node.request_replay();
                         return;
                     }
                 }
@@ -689,8 +695,12 @@ async fn build_and_run(
         let submitted = tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await;
         let response = match submitted {
             Err(_) => {
-                // Parked, so not lost: the replay loop retries it. Tell the
-                // client which op to poll.
+                // Parked, so not lost: the replay loop retries it, and is woken
+                // now rather than left to its ~30s sweep — a submit that timed
+                // out reached a leader to time out against, so no leader
+                // transition is coming to rouse it (#83). Tell the client which
+                // op to poll.
+                node.request_replay();
                 let mut response = typed_error(
                     StatusCode::GATEWAY_TIMEOUT,
                     ErrorKind::Timeout,
@@ -701,7 +711,11 @@ async fn build_and_run(
             }
             Ok(Err(NodeError::Unavailable(detail))) => {
                 // R4: refused only AFTER parking — the op is durable here and
-                // the replay loop applies it once a quorum returns.
+                // the replay loop applies it once a quorum returns. The wake is
+                // a no-op while there is no leader (the replayer skips a drain
+                // without one) and costs nothing; it earns its keep when the
+                // leader is present but was momentarily unreachable.
+                node.request_replay();
                 let mut response = typed_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorKind::Unavailable,
@@ -714,6 +728,8 @@ async fn build_and_run(
                 return Err(response);
             }
             Ok(Err(e)) => {
+                // Also parked-and-unapplied, so it gets the same wake.
+                node.request_replay();
                 let mut response = typed_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorKind::InternalError,

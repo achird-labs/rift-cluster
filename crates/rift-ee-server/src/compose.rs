@@ -774,17 +774,37 @@ fn spawn_intent_replayer(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_leader = None;
         let mut ticks: u32 = 0;
+        let mut woken = false;
         loop {
-            let Some(node) = node.upgrade() else { return };
-            let leader = node.status().current_leader;
+            let Some(strong) = node.upgrade() else { return };
+            let leader = strong.status().current_leader;
             ticks = ticks.wrapping_add(1);
             let leader_appeared = leader.is_some() && leader != last_leader;
             last_leader = leader;
-            if leader_appeared || (leader.is_some() && ticks.is_multiple_of(120)) {
-                drain_parked_intents(&node).await;
+            // A wake drains on its own account. Without it, an intent left
+            // parked by a failed submit waits for one of the other two
+            // triggers — and on a node whose leader never changes there is no
+            // transition, so that means the ~30s sweep, with a healthy leader
+            // sitting right there (#83).
+            if leader.is_some() && (leader_appeared || woken || ticks.is_multiple_of(120)) {
+                drain_parked_intents(&strong).await;
             }
-            drop(node);
-            tokio::time::sleep(Duration::from_millis(250)).await;
+
+            // Sleep *or* wake, whichever lands first. `Notify` holds one
+            // permit, so a wake raised *during* the drain above is not lost —
+            // it resolves immediately here rather than being swallowed.
+            //
+            // The node stays held across the wait: dropping it first would need
+            // a second upgrade, and a wake arriving in that gap would be
+            // delivered to a `Notify` nobody is waiting on. Holding an `Arc`
+            // here cannot leak the node, because the wait is bounded by the
+            // 250ms sleep.
+            woken = tokio::select! {
+                biased;
+                () = strong.replay_requested() => true,
+                () = tokio::time::sleep(Duration::from_millis(250)) => false,
+            };
+            drop(strong);
         }
     })
 }
