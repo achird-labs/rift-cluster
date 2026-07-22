@@ -2305,3 +2305,356 @@ async fn a_stale_if_match_cannot_clobber_through_a_follower() {
     follower.shutdown().await;
     leader.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #57: resolved scripts are validated at admin time (upstream's 400 gate),
+// before anything is parked or replicated.
+// ---------------------------------------------------------------------------
+
+/// Rhai that resolves fine but does not parse.
+const BROKEN_RHAI: &str = r#"fn respond(ctx) { let x = ; }"#;
+
+fn inline_script_imposter(port: u16, code: &str) -> serde_json::Value {
+    json!({
+        "port": port,
+        "protocol": "http",
+        "stubs": [{
+            "responses": [{ "_rift": { "script": { "code": code, "engine": "rhai" } } }],
+        }],
+    })
+}
+
+async fn script_cluster(state: &TempDir, scripts: &TempDir) -> ComposedServer {
+    let scripts_dir = scripts.path().to_string_lossy().into_owned();
+    let server = compose::start(cluster_cli(
+        state,
+        &[
+            "--cluster-allow-solo",
+            "--allowInjection",
+            "--scripts-dir",
+            &scripts_dir,
+        ],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    server
+}
+
+fn assert_validation_refusal(status: u16, body: &serde_json::Value) {
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errors"][0]["code"], "400", "{body}");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("Script validation failed:"),
+        "upstream's message text: {body}"
+    );
+}
+
+#[tokio::test]
+async fn inline_scripts_are_validated_before_replication() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    let server = script_cluster(&state, &scripts).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&inline_script_imposter(port, BROKEN_RHAI))
+        .send()
+        .await
+        .expect("post imposter");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_validation_refusal(status, &body);
+
+    let (status, _) = rendered_imposter(admin, port).await;
+    assert_eq!(status, 404, "a refused imposter must not be committed");
+
+    server.shutdown().await;
+}
+
+/// The regression heart of #57: a `file:` script that RESOLVES cleanly but does
+/// not parse. Validation only sees syntax once the source is inline, so a
+/// validate-before-resolve (or absent) pass lets this reach the log and fail at
+/// bind time on every node instead.
+#[tokio::test]
+async fn file_scripts_are_validated_after_resolution() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    std::fs::write(scripts.path().join("broken.rhai"), BROKEN_RHAI).expect("write script");
+    std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
+    let server = script_cluster(&state, &scripts).await;
+    let admin = server.admin_addr();
+    let broken_port = reserve_port();
+    let good_port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&file_script_imposter(broken_port, "broken.rhai"))
+        .send()
+        .await
+        .expect("post imposter");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_validation_refusal(status, &body);
+    let (status, _) = rendered_imposter(admin, broken_port).await;
+    assert_eq!(status, 404, "a refused imposter must not be committed");
+
+    // A resolvable, well-formed file: script still lands — the pass must not
+    // reject what upstream accepts.
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&file_script_imposter(good_port, "greet.rhai"))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+    let (status, rendered) = rendered_imposter(admin, good_port).await;
+    assert_eq!(status, 200, "{rendered}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn batch_validation_failure_names_the_imposter_index() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    let server = script_cluster(&state, &scripts).await;
+    let admin = server.admin_addr();
+    let good_port = reserve_port();
+    let bad_port = reserve_port();
+
+    let response = reqwest::Client::new()
+        .put(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "imposters": [
+                minimal_imposter(good_port),
+                inline_script_imposter(bad_port, BROKEN_RHAI),
+            ],
+        }))
+        .send()
+        .await
+        .expect("put imposters");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with(&format!(
+            "Script validation failed in imposter[1] (port Some({bad_port}))"
+        )),
+        "{body}"
+    );
+    let (status, _) = rendered_imposter(admin, good_port).await;
+    assert_eq!(status, 404, "a refused batch must commit nothing");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stub_routes_validate_scripts() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    let server = script_cluster(&state, &scripts).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "port": port,
+            "protocol": "http",
+            "stubs": [{ "id": "a", "responses": [{ "is": { "statusCode": 200, "body": "a" } }] }],
+        }))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+
+    let broken_stub = json!({ "responses": [{ "_rift": { "script": { "code": BROKEN_RHAI, "engine": "rhai" } } }] });
+
+    // POST /:port/stubs (PatchStubs::Add)
+    let response = client
+        .post(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({ "stub": broken_stub }))
+        .send()
+        .await
+        .expect("add stub");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_validation_refusal(status, &body);
+
+    // PUT /:port/stubs/by-id/:id (PatchStubs::ReplaceById)
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/by-id/a"))
+        .json(&broken_stub)
+        .send()
+        .await
+        .expect("replace stub by id");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_validation_refusal(status, &body);
+
+    // PUT /:port/stubs/:index (PutImposter of the edited config)
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .json(&broken_stub)
+        .send()
+        .await
+        .expect("replace stub at index");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_validation_refusal(status, &body);
+
+    // PUT /:port/stubs (list replace, also a PutImposter)
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({ "stubs": [broken_stub] }))
+        .send()
+        .await
+        .expect("replace stubs");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_validation_refusal(status, &body);
+
+    // Every refusal left the stored config untouched.
+    let (_, rendered) = rendered_imposter(admin, port).await;
+    assert_eq!(
+        rendered["stubs"].as_array().map(Vec::len),
+        Some(1),
+        "{rendered}"
+    );
+    assert_eq!(rendered["stubs"][0]["id"], "a", "{rendered}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn broken_inject_scripts_are_refused() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    let server = script_cluster(&state, &scripts).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "port": port,
+            "protocol": "http",
+            "stubs": [{ "responses": [{ "inject": "(req) => { return {" }] }],
+        }))
+        .send()
+        .await
+        .expect("post imposter");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_validation_refusal(status, &body);
+
+    let (status, _) = rendered_imposter(admin, port).await;
+    assert_eq!(status, 404, "a refused imposter must not be committed");
+
+    server.shutdown().await;
+}
+
+/// No false positives: valid scripts and script-free configs are untouched by
+/// the new pass.
+#[tokio::test]
+async fn valid_and_script_free_configs_still_land() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    let server = script_cluster(&state, &scripts).await;
+    let admin = server.admin_addr();
+    let scripted = reserve_port();
+    let plain = reserve_port();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&inline_script_imposter(scripted, GREET_RHAI))
+        .send()
+        .await
+        .expect("post scripted imposter");
+    assert_eq!(response.status().as_u16(), 201);
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(plain))
+        .send()
+        .await
+        .expect("post plain imposter");
+    assert_eq!(response.status().as_u16(), 201);
+    assert!(
+        wait_served(plain, "from-a").await,
+        "a script-free imposter still serves"
+    );
+
+    server.shutdown().await;
+}
+
+/// The whole-config revalidation that index-addressed edits perform must not
+/// reject a *valid* scripted sibling — the false-positive risk the divergence
+/// from upstream's incoming-stub-only validation introduces.
+#[tokio::test]
+async fn index_addressed_edits_survive_valid_scripted_siblings() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    let server = script_cluster(&state, &scripts).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "port": port,
+            "protocol": "http",
+            "stubs": [
+                {
+                    "id": "scripted",
+                    "responses": [{
+                        "_rift": { "script": { "code": GREET_RHAI, "engine": "rhai" } },
+                    }],
+                },
+                { "id": "plain", "responses": [{ "is": { "statusCode": 200, "body": "b" } }] },
+            ],
+        }))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+
+    // Deleting the plain stub re-validates the scripted survivor: it must pass.
+    let response = client
+        .delete(format!("http://{admin}/imposters/{port}/stubs/1"))
+        .send()
+        .await
+        .expect("delete stub at index");
+    assert_eq!(response.status().as_u16(), 200);
+    let (_, rendered) = rendered_imposter(admin, port).await;
+    assert_eq!(
+        rendered["stubs"].as_array().map(Vec::len),
+        Some(1),
+        "{rendered}"
+    );
+    assert_eq!(rendered["stubs"][0]["id"], "scripted", "{rendered}");
+
+    // So does replacing it in place with another valid script.
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .json(&json!({
+            "id": "scripted",
+            "responses": [{ "_rift": { "script": { "code": GREET_RHAI, "engine": "rhai" } } }],
+        }))
+        .send()
+        .await
+        .expect("replace stub at index");
+    assert_eq!(response.status().as_u16(), 200);
+
+    server.shutdown().await;
+}

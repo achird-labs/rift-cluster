@@ -65,7 +65,7 @@ use rift_cluster::decorate::{HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS};
 use rift_cluster::{ControlOutcome, ControlResponse, NodeError, RaftNode, TenantId};
 use rift_ee::seams::{
     ErrorKind, ImposterConfig, RiftScriptConfig, ScriptBaseDir, Stub, config_uses_script_surface,
-    error_response_typed, resolve_scripts, resolve_stub_scripts,
+    error_response_typed, resolve_scripts, resolve_stub_scripts, validate_stub, validate_stubs,
 };
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -495,20 +495,35 @@ async fn build_and_run(
         }
     }
 
-    // Resolve `_rift.script` file:/ref: sources (upstream #356) after the
-    // gate and before parking: nothing unresolved is ever parked, replayed,
-    // or replicated, and a gated request never touches the filesystem.
+    // Resolve `_rift.script` file:/ref: sources (upstream #356), then validate
+    // what resolution produced (#57) — both after the gate and before parking,
+    // so nothing unresolved or unparseable is ever parked, replayed, or
+    // replicated, and a gated request never touches the filesystem.
     let script_base = front_script_base(state.scripts_dir.as_deref());
-    let mut put_index = 0usize;
-    for op in &mut mutation.ops {
-        let batch_index = if is_batch && matches!(op, ControlOp::PutImposter { .. }) {
-            let index = put_index;
-            put_index += 1;
-            Some(index)
-        } else {
-            None
-        };
-        resolve_op_scripts(op, node, &script_base, batch_index)?;
+    // Payload index for each `PUT /imposters` op — upstream's
+    // `imposter[{idx}]` label. Upserts precede prune deletes in
+    // `build_mutation`, so counting `PutImposter`s reproduces it.
+    let mut next_put = 0usize;
+    let batch_indices: Vec<Option<usize>> = mutation
+        .ops
+        .iter()
+        .map(|op| {
+            (is_batch && matches!(op, ControlOp::PutImposter { .. })).then(|| {
+                let index = next_put;
+                next_put += 1;
+                index
+            })
+        })
+        .collect();
+    // Two passes, not one interleaved: upstream resolves every imposter in a
+    // batch before validating any of them, so a payload carrying both an
+    // unresolvable ref and an unparseable script reports the *resolution*
+    // failure. Interleaving would report whichever op came first instead.
+    for (op, batch_index) in mutation.ops.iter_mut().zip(&batch_indices) {
+        resolve_op_scripts(op, node, &script_base, *batch_index)?;
+    }
+    for (op, batch_index) in mutation.ops.iter().zip(&batch_indices) {
+        validate_op_scripts(op, *batch_index)?;
     }
 
     // Mint deterministically from the client's Idempotency-Key (when given),
@@ -1146,6 +1161,70 @@ fn resolve_op_scripts(
     }
 }
 
+/// Validate one *resolved* op's scripts; `Err` is the client-shaped 400 with
+/// upstream's exact message. `batch_index` is `Some` for `PUT /imposters` ops.
+///
+/// Must run after [`resolve_op_scripts`]: upstream's validator only parses a
+/// script it can see as inline `code`, so validating an unresolved `file:`/
+/// `ref:` source silently checks nothing. Running it here — before the op is
+/// minted or parked — is what keeps a syntactically broken script out of the
+/// log entirely, rather than failing at bind time on every node (#57).
+///
+/// Two deliberate divergences from upstream. First, upstream mints a stub id
+/// *before* validating an id-less added stub, so its error names a random UUID
+/// where this names `stub[{index}]` — a label difference only.
+///
+/// Second, the stub edits that commit as a whole `PutImposter` (list replace,
+/// and the index-addressed replace/delete) re-validate the full post-edit
+/// config rather than just the incoming stub, which costs one script parse per
+/// scripted response on every such edit. That only *rejects* differently when
+/// stored state already holds a broken script — impossible for anything
+/// written since this gate landed, because both op shapes now validate what
+/// they commit. Legacy state with two broken sibling stubs cannot be repaired
+/// by index-addressed deletes (each leaves the other behind); delete by id or
+/// replace the whole stub list, neither of which validates the siblings.
+#[allow(clippy::result_large_err)]
+fn validate_op_scripts(
+    op: &ControlOp,
+    batch_index: Option<usize>,
+) -> Result<(), Response<FrontBody>> {
+    let refuse =
+        |message: String| typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &message);
+    match op {
+        ControlOp::PutImposter { config, .. } => {
+            let result = validate_stubs(&config.stubs);
+            if result.is_valid() {
+                return Ok(());
+            }
+            let detail = result.into_error_message().unwrap_or_default();
+            Err(refuse(match batch_index {
+                Some(idx) => format!(
+                    "Script validation failed in imposter[{idx}] (port {:?}): {detail}",
+                    config.port
+                ),
+                None => format!("Script validation failed: {detail}"),
+            }))
+        }
+        ControlOp::PatchStubs { edit, .. } => {
+            for step in &edit.0 {
+                // Upstream labels an added stub by its insertion index and a
+                // by-id replacement by 0; match both.
+                let result = match step {
+                    StubEdit::Add { stub, index } => validate_stub(stub, index.unwrap_or(0)),
+                    StubEdit::ReplaceById { stub, .. } => validate_stub(stub, 0),
+                    StubEdit::DeleteById { .. } | StubEdit::Move { .. } => continue,
+                };
+                if !result.is_valid() {
+                    let detail = result.into_error_message().unwrap_or_default();
+                    return Err(refuse(format!("Script validation failed: {detail}")));
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// `GET` a loopback admin path, forwarding the caller's authorization header.
 /// Returns status, content type, and the collected body.
 async fn fetch(
@@ -1486,6 +1565,74 @@ mod tests {
         );
 
         node.shutdown().await.expect("shutdown");
+    }
+
+    /// #57: a script that resolution left inline but the engine cannot parse is
+    /// refused with upstream's message, and the batch variant names the index.
+    #[tokio::test]
+    async fn validation_refuses_unparseable_resolved_scripts() {
+        let broken = |port: u16| -> ControlOp {
+            ControlOp::PutImposter {
+                tenant: TenantId::default(),
+                config: Box::new(
+                    serde_json::from_value(serde_json::json!({
+                        "port": port,
+                        "protocol": "http",
+                        "stubs": [{
+                            "id": "a",
+                            "responses": [{
+                                "_rift": {
+                                    "script": { "code": "fn respond(ctx) { let x = ; }", "engine": "rhai" },
+                                },
+                            }],
+                        }],
+                    }))
+                    .expect("config parses"),
+                ),
+            }
+        };
+
+        let text = body_text(
+            validate_op_scripts(&broken(4545), None).expect_err("broken rhai must be refused"),
+        )
+        .await;
+        assert!(text.contains("Script validation failed:"), "{text}");
+
+        let text = body_text(
+            validate_op_scripts(&broken(4545), Some(1)).expect_err("broken rhai must be refused"),
+        )
+        .await;
+        assert!(
+            text.contains("Script validation failed in imposter[1] (port Some(4545)):"),
+            "{text}"
+        );
+    }
+
+    /// #57: ops that carry no stub payload are never validated — including the
+    /// stub-edit steps that only move or delete.
+    #[test]
+    fn validation_skips_ops_without_stub_payloads() {
+        for op in [
+            ControlOp::DeleteImposter {
+                tenant: TenantId::default(),
+                port: 4545,
+            },
+            ControlOp::SetEnabled {
+                tenant: TenantId::default(),
+                port: 4545,
+                enabled: false,
+            },
+            ControlOp::PatchStubs {
+                tenant: TenantId::default(),
+                port: 4545,
+                edit: StubEditScript(vec![
+                    StubEdit::Move { from: 1, to: 0 },
+                    StubEdit::DeleteById { id: "a".to_owned() },
+                ]),
+            },
+        ] {
+            assert!(validate_op_scripts(&op, None).is_ok());
+        }
     }
     #[test]
     fn parse_if_match_accepts_the_emitted_token_and_bare_integers() {
