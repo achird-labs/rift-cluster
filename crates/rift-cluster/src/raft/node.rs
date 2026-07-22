@@ -2183,15 +2183,26 @@ mod tests {
 
         // Move leadership without losing quorum. Killing n1 would leave one of
         // two voters, which cannot elect.
-        n2.raft
-            .trigger()
-            .elect()
-            .await
-            .expect("trigger an election");
-        assert!(
-            wait_until(|| n2.status().is_leader).await,
-            "n2 must take over before the retry"
-        );
+        //
+        // Retried, not triggered once: `elect` only *starts* a campaign, and a
+        // campaign can lose — n1 is still a healthy leader, and on a loaded
+        // runner n2's timers slip far enough that a single nudge decides
+        // nothing. Asserting on one trigger made this test flaky in CI (it went
+        // red on an unrelated PR), which is worse than not having it.
+        let took_over = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if n2.status().is_leader {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                n2.raft.trigger().elect().await.expect("trigger an election");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        assert!(took_over, "n2 must take over before the retry");
 
         // Pin the no-op guard directly, before the eviction below. Every other
         // assertion in this test passes without it: an unguarded `demote_voter`
