@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rift_cluster::{NodeConfig, NodeId, RaftNode, Router};
+use rift_cluster::{Authority, NodeConfig, NodeId, RaftNode, Router};
 use tempfile::TempDir;
 
 const SECRET: &str = "harness-cluster-secret";
@@ -56,7 +56,7 @@ async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> RaftNode {
     let config = NodeConfig {
         node_id: id,
         bind: addr,
-        advertise: Some(addr),
+        advertise: Some(Authority::from(addr)),
         data_dir: dir.to_path_buf(),
         secret: Some(SECRET.to_owned()),
         routes: Router::new(),
@@ -95,10 +95,10 @@ impl TestCluster {
         n1.cluster_init().await.expect("bootstrap node 1");
         members[0].node = Some(n1);
 
-        let seed = members[0].addr;
+        let seed = Authority::from(members[0].addr);
         for member in members.iter_mut().skip(1) {
             let node = spawn(member.id, member.addr, member.dir.path()).await;
-            node.join_via(seed)
+            node.join_via(&seed)
                 .await
                 .unwrap_or_else(|e| panic!("node {} join: {e}", member.id));
             member.node = Some(node);
@@ -872,10 +872,7 @@ async fn test_rejoin_after_leave() {
     // exactly like a redeployed pod would.
     let new_dir = TempDir::new().expect("tempdir");
     let addr = cluster.member(departed).addr;
-    let seed = cluster
-        .leader()
-        .expect("a leader to seed off")
-        .advertise_addr();
+    let seed = cluster.leader().expect("a leader to seed off").advertise();
     let rejoined = spawn(departed, addr, new_dir.path()).await;
     rejoined.join_via(seed).await.expect("rejoin via seed");
     cluster.member_mut(departed).node = Some(rejoined);
@@ -956,10 +953,7 @@ async fn test_rejoin_after_leave_with_retained_state_dir() {
     // The retained directory, not a fresh one: this is the whole point.
     let dir = cluster.member(departed).dir.path().to_path_buf();
     let addr = cluster.member(departed).addr;
-    let seed = cluster
-        .leader()
-        .expect("a leader to seed off")
-        .advertise_addr();
+    let seed = cluster.leader().expect("a leader to seed off").advertise();
     let rejoined = spawn(departed, addr, &dir).await;
     rejoined
         .join_via(seed)

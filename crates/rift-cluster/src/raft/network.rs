@@ -32,7 +32,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use super::{NodeId, TypeConfig};
 use crate::control::{ControlRequest, ControlResponse};
-use crate::rpc::{HandlerFuture, PeerResolver, Router, RpcClient, RpcError};
+use crate::rpc::{Authority, HandlerFuture, PeerResolver, Router, RpcClient, RpcError};
 
 /// AppendEntries receiving endpoint.
 pub(crate) const RAFT_APPEND_PATH: &str = "/internal/v1/raft/append";
@@ -179,33 +179,47 @@ impl PeerClient {
 /// Resolve `authority` through `resolver`, fresh for this one call. The
 /// resolver's own lookup can block (the default does a real DNS/hosts lookup),
 /// so it always runs on the blocking pool rather than the async runtime.
-async fn resolve_peer(
+///
+/// The one seam every peer-address resolution in the crate goes through, so a
+/// hostname advertise address (issue #68) is resolved identically whether the
+/// caller is Raft replication, a seed join, or a leader-hint chase.
+pub(crate) async fn resolve_authority(
     resolver: &Arc<dyn PeerResolver>,
-    target: NodeId,
     authority: &str,
-) -> Result<SocketAddr, AddrError> {
-    // A literal `IP:port` needs no resolver, and today every membership address
-    // is one (`--cluster-advertise` is typed `SocketAddr`). Short-circuiting it
-    // keeps replication — an append_entries per heartbeat per peer — off the
-    // blocking pool entirely, and costs a parse the resolver would do anyway.
+) -> std::io::Result<SocketAddr> {
+    // A literal `IP:port` needs no resolver. This is now the backward-compat
+    // short-circuit for clusters that advertise a literal address rather than
+    // a claim that hostnames never occur — #68 makes a hostname an equally
+    // valid membership address. It still earns its keep: replication (an
+    // append_entries per heartbeat per peer) stays off the blocking pool for
+    // that common case, at the cost of only a parse the resolver would do
+    // anyway.
     if let Ok(addr) = authority.parse::<SocketAddr>() {
         return Ok(addr);
     }
     let resolver = Arc::clone(resolver);
     let owned = authority.to_owned();
     match tokio::task::spawn_blocking(move || resolver.resolve(&owned)).await {
-        Ok(Ok(addr)) => Ok(addr),
-        Ok(Err(source)) => Err(AddrError {
+        Ok(result) => result,
+        Err(join_err) => Err(std::io::Error::other(join_err.to_string())),
+    }
+}
+
+/// Resolve `authority` for `target`, adding which peer the failure belongs to
+/// — [`resolve_authority`] itself has no notion of *whose* address it was
+/// asked to resolve.
+async fn resolve_peer(
+    resolver: &Arc<dyn PeerResolver>,
+    target: NodeId,
+    authority: &str,
+) -> Result<SocketAddr, AddrError> {
+    resolve_authority(resolver, authority)
+        .await
+        .map_err(|source| AddrError {
             target,
             addr: authority.to_owned(),
             source,
-        }),
-        Err(join_err) => Err(AddrError {
-            target,
-            addr: authority.to_owned(),
-            source: std::io::Error::other(join_err.to_string()),
-        }),
-    }
+        })
 }
 
 impl RaftNetwork<TypeConfig> for PeerClient {
@@ -485,12 +499,20 @@ pub(crate) async fn admit(
     advertise: String,
     max_voters: usize,
 ) -> Result<(), RpcError> {
+    // Validated here as well as at the joiner's CLI, because this is the path
+    // that actually writes an address into the replicated log: whatever arrives
+    // on the wire becomes a durable membership entry, and one that can never
+    // resolve is removable only by an admin membership change (issue #68).
+    let advertise = advertise
+        .parse::<Authority>()
+        .map_err(|e| RpcError::Handler(format!("admit {id}: {e}")))?;
+
     // Concurrent joins are the normal case (a StatefulSet rollout seeds every
     // pod off the same node), so failures name the candidate they belong to.
     // The learner add — the slow, replication-bound phase — deliberately stays
     // outside the gate so concurrent joins still parallelize catch-up.
     membership_change(raft, &format!("admit {id}: add learner"), || {
-        raft.add_learner(id, BasicNode::new(advertise.clone()), true)
+        raft.add_learner(id, BasicNode::new(advertise.to_string()), true)
     })
     .await?;
 
@@ -896,6 +918,41 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.addr)
         }
+    }
+
+    /// Issue #68 gate: a literal address never reaches the resolver.
+    ///
+    /// This runs per `append_entries`, per heartbeat, per peer, so the fast
+    /// path is what keeps replication off the blocking pool for every cluster
+    /// that advertises literal IPs — which is every cluster that existed before
+    /// hostnames were allowed. Nothing else pins it: a refactor that always
+    /// went through `spawn_blocking` would still be *correct*, and every other
+    /// test would still pass, while quietly moving the hot path onto a
+    /// thread pool.
+    #[tokio::test]
+    async fn a_literal_address_skips_the_resolver_entirely() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver: Arc<dyn PeerResolver> = Arc::new(CountingResolver {
+            calls: calls.clone(),
+            addr: "127.0.0.1:9".parse().expect("valid addr"),
+        });
+
+        for literal in ["127.0.0.1:4790", "[::1]:4790"] {
+            let resolved = resolve_peer(&resolver, 1, literal)
+                .await
+                .expect("a literal resolves without DNS");
+            assert_eq!(
+                resolved,
+                literal.parse::<SocketAddr>().expect("literal"),
+                "the fast path must return the literal itself, not the resolver's answer"
+            );
+        }
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a literal address must never reach the resolver"
+        );
     }
 
     /// #6 gate: the resolver must be consulted on every send, not resolved

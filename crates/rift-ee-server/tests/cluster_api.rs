@@ -36,7 +36,11 @@ async fn start() -> Fixture {
     slot.set(&node).expect("the slot is bound exactly once");
     node.cluster_init().await.expect("bootstrap");
     readiness.satisfy(GATE_JOINED);
-    let addr = node.advertise_addr();
+    let addr: SocketAddr = node
+        .advertise()
+        .as_str()
+        .parse()
+        .expect("advertise is a literal address in tests");
     Fixture {
         node,
         addr,

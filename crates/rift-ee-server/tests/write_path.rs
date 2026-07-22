@@ -2181,7 +2181,12 @@ async fn an_async_conditioned_conflict_is_parked_then_refused() {
         Arc::new(AlwaysHealthy),
         RpcClientConfig::default(),
     );
-    let ops_addr = server.cluster_addr().expect("cluster addr");
+    let ops_addr: std::net::SocketAddr = server
+        .cluster_addr()
+        .expect("cluster addr")
+        .as_str()
+        .parse()
+        .expect("cluster addr is a literal address in tests");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let reported = loop {
         let raw = rpc

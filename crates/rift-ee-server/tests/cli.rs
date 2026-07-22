@@ -290,3 +290,41 @@ fn the_binary_no_longer_declines_rcfile_or_the_pidfile_subcommands() {
         "`--rcfile` is honoured now; it must not be declined: {stderr}"
     );
 }
+
+/// Issue #68: `--cluster-advertise` takes a host:port authority, not only a
+/// literal address.
+///
+/// This is the gate at the CLI boundary — before it, clap rejected every
+/// hostname at parse time, so the DNS re-resolution the cluster already
+/// implements could never be reached from a real deployment.
+#[test]
+fn cluster_advertise_accepts_hostname() {
+    let cli = EeCli::try_parse_from([
+        "rift-ee-server",
+        "--cluster",
+        "--cluster-advertise",
+        "rift-0.rift-headless.ns.svc.cluster.local:4790",
+    ])
+    .expect("a Kubernetes headless-service name must be accepted");
+    assert_eq!(
+        cli.cluster
+            .cluster_advertise
+            .as_ref()
+            .map(std::string::ToString::to_string),
+        Some("rift-0.rift-headless.ns.svc.cluster.local:4790".to_owned())
+    );
+}
+
+#[test]
+fn cluster_advertise_rejects_a_value_without_a_port() {
+    assert!(
+        EeCli::try_parse_from([
+            "rift-ee-server",
+            "--cluster",
+            "--cluster-advertise",
+            "rift-0.rift-headless",
+        ])
+        .is_err(),
+        "peers dial a port, so an authority without one must be refused at parse time"
+    );
+}

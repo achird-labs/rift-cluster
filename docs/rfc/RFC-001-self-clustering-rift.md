@@ -437,7 +437,10 @@ fallback dispatch, §7.4.6) stay enterprise.
   - `--cluster-bind <ip:port>` — **required with `--cluster`** (no default): UDP gossip +
     TCP internal RPC (same port number, two sockets). Binding `0.0.0.0` requires the
     explicit `--cluster-bind-public-ok` acknowledgment.
-  - `--cluster-advertise <ip:port>` — address peers should use (NAT/container).
+  - `--cluster-advertise <host:port>` — address peers should use (NAT/container). A hostname
+    is accepted, as well as a literal address (IPv6 literals must be bracketed,
+    `[::1]:4790`), and is **re-resolved on every send** — not just at join time — so it
+    tracks a DNS record that changes underneath it.
   - `--cluster-seeds <addr,addr,...>` — DNS names allowed and **re-resolved on every
     (re)join attempt** (required for Kubernetes, §11.5). Mutual seeding supported.
   - `--cluster-allow-solo` — explicit opt-in to form/serve a cluster of one (see §7.1.3).
