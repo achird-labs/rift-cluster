@@ -191,10 +191,17 @@ pub struct StatusReport {
 
 /// What a [`RaftNode::leave`] actually did.
 ///
-/// `Ok` alone cannot say: leaving is a no-op when this node is already out of
-/// the membership, and it is *declined* when this node is the only voter —
-/// openraft refuses to empty a voter set, so a solo node stays a full member.
-/// Callers that record a departure must distinguish the two, or they persist
+/// `Ok` alone cannot say, because a leave has three successful shapes and only
+/// one of them removes this node:
+///
+/// - it was evicted just now, or was already out of the membership;
+/// - it is the only voter, so there is nothing to hand its votes to — openraft
+///   refuses to commit an empty voter set, and a solo node stays a full member;
+/// - the leader **refused** it, because removing this node would drop the
+///   cluster below its voter floor (issue #69) — the common case in a
+///   whole-fleet teardown, where every node is asked to leave at once.
+///
+/// Callers that record a departure must distinguish these, or they persist
 /// "this node left" about a node that is still a member and strand it on the
 /// next start (issue #72).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +240,11 @@ pub struct RaftNode {
     // The most recent reason a leave attempt failed, so the deadline's error can
     // name a cause instead of only reporting that time ran out.
     last_leave_error: Mutex<Option<String>>,
+    // Serializes the membership changes this node arbitrates as leader. Shared
+    // with the control routes so a departure this node evicts locally and one
+    // it evicts for a peer take the same lock — the voter floor and the
+    // auto-voter ceiling are only exact if every path holds it (#55, #69).
+    membership_gate: network::MembershipGate,
 }
 
 impl RaftNode {
@@ -267,7 +279,12 @@ impl RaftNode {
         let slot: RaftSlot = Arc::new(OnceCell::new());
         // Control-plane routes register last so a caller's route table can never
         // shadow the Raft endpoints the cluster itself depends on.
-        let router = network::control_routes(config.routes.clone(), slot.clone());
+        let membership_gate: network::MembershipGate = Arc::new(tokio::sync::Mutex::new(()));
+        let router = network::control_routes(
+            config.routes.clone(),
+            slot.clone(),
+            Arc::clone(&membership_gate),
+        );
 
         let (signer, verifier) = match &config.secret {
             Some(secret) => (
@@ -327,6 +344,7 @@ impl RaftNode {
             server_task,
             shutdown_invoked: AtomicBool::new(false),
             last_leave_error: Mutex::new(None),
+            membership_gate,
         })
     }
 
@@ -425,6 +443,12 @@ impl RaftNode {
     /// node the current leader hint names, chasing it while leadership settles.
     /// Never blocks past `timeout`: on elapse this returns
     /// [`NodeError::Timeout`] rather than hanging shutdown.
+    ///
+    /// **Succeeding is not the same as having left.** The leader refuses a
+    /// departure that would drop the cluster below its voter floor (issue #69),
+    /// and a sole voter cannot leave at all; both return
+    /// [`LeaveOutcome::Retained`]. Match on the outcome — never on `Ok` — before
+    /// recording anywhere that this node departed.
     pub async fn leave(&self, timeout: Duration) -> Result<LeaveOutcome, NodeError> {
         tokio::time::timeout(timeout, self.leave_inner())
             .await
@@ -470,8 +494,12 @@ impl RaftNode {
             }
 
             let attempt = if self.status().is_leader {
-                network::evict(&self.raft, self.id)
+                network::evict(&self.raft, &self.membership_gate, self.id)
                     .await
+                    .map(|outcome| match outcome {
+                        network::EvictOutcome::Removed => LeaveOutcome::Departed,
+                        network::EvictOutcome::HeldByFloor => LeaveOutcome::Retained,
+                    })
                     .map_err(|e| format!("local eviction: {e}"))
             } else if let Some(authority) = self.leader_authority() {
                 self.leave_via(&authority).await
@@ -479,8 +507,11 @@ impl RaftNode {
                 Err("no leader is known".to_owned())
             };
 
+            // A floor refusal ends the loop rather than retrying it: the answer
+            // is deterministic while the membership is unchanged, so spinning
+            // would only burn the drain budget this shares with the shutdown.
             match attempt {
-                Ok(()) => return Ok(LeaveOutcome::Departed),
+                Ok(outcome) => return Ok(outcome),
                 Err(cause) => self.record_leave_error(cause),
             }
             tokio::time::sleep(LEAVE_POLL_INTERVAL).await;
@@ -491,18 +522,30 @@ impl RaftNode {
     /// text so the retry loop can keep the most recent cause for the timeout —
     /// an operator whose fleet stopped leaving needs to know whether it was
     /// auth, protocol skew, or an unreachable leader.
-    async fn leave_via(&self, authority: &str) -> Result<(), String> {
+    async fn leave_via(&self, authority: &str) -> Result<LeaveOutcome, String> {
         let addr = self
             .resolve(authority)
             .await
             .map_err(|e| format!("resolve leader {authority}: {e}"))?;
         let request = LeaveRequest { node_id: self.id };
         let body = serde_json::to_vec(&request).map_err(|e| format!("encode leave: {e}"))?;
-        self.client
+        let reply = self
+            .client
             .call(addr, "POST", CLUSTER_LEAVE_PATH, body)
             .await
-            .map(|_| ())
-            .map_err(|e| format!("leave via {authority}: {e}"))
+            .map_err(|e| format!("leave via {authority}: {e}"))?;
+
+        // The leader answers whether it actually removed this node: the voter
+        // floor can refuse a departure and still reply successfully (#69).
+        // Reading it wrong in the safe direction matters — a refusal misread as
+        // a departure would record a marker for a node that is still a member.
+        let accepted: network::LeaveAccepted = serde_json::from_slice(&reply)
+            .map_err(|e| format!("decode leave reply from {authority}: {e}"))?;
+        Ok(if accepted.evicted {
+            LeaveOutcome::Departed
+        } else {
+            LeaveOutcome::Retained
+        })
     }
 
     /// Keep the latest failure so the deadline's error can name a cause. A
@@ -1475,7 +1518,8 @@ mod tests {
         n3.shutdown().await.expect("shutdown n3");
         drop(n3);
 
-        crate::raft::network::evict(&n1.raft, 3)
+        // Three voters, so the floor permits this removal (#69).
+        crate::raft::network::evict(&n1.raft, &n1.membership_gate, 3)
             .await
             .expect("evict the node that is down");
         let survivors = BTreeSet::from([1, 2]);
@@ -1755,6 +1799,42 @@ mod tests {
             n2.shutdown().await.ok();
             n3.shutdown().await.ok();
         }
+    }
+
+    /// Issue #69: the voter floor guards voters, not members.
+    ///
+    /// Removing a learner cannot cost the cluster a quorum member, so it is
+    /// never refused — even when the voter set is already at or below the
+    /// floor, as it is here. A floor that counted learners would strand every
+    /// ceiling-capped node permanently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicting_a_learner_is_never_held_by_the_floor() {
+        use crate::raft::network::{self, EvictOutcome};
+
+        let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+
+        let gate = tokio::sync::Mutex::new(());
+        // A ceiling of 1 keeps n2 a learner, leaving n1 the only voter — which
+        // is already below the floor, so a floor that ignored the voter/learner
+        // distinction would refuse this.
+        network::admit(&n1.raft, &gate, 2, n2.advertise_addr().to_string(), 1)
+            .await
+            .expect("admit as learner");
+        assert_eq!(n1.status().voters, vec![1], "n2 must be a learner");
+
+        assert_eq!(
+            network::evict(&n1.raft, &gate, 2)
+                .await
+                .expect("evicting a learner must succeed"),
+            EvictOutcome::Removed,
+            "a learner's removal costs no quorum, so the floor must not refuse it"
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
     }
 
     /// #55 gate: a joiner admitted at the ceiling is a functioning replica —

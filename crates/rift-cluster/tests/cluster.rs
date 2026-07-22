@@ -552,6 +552,198 @@ async fn test_graceful_leave() {
     cluster.shutdown_all().await;
 }
 
+/// Issue #69: the second departure from a three-node fleet is refused.
+///
+/// A whole-fleet teardown SIGTERMs every node, and without a floor each one
+/// removes itself in turn: 3 → 2 → 1. The fleet ends with its entire control
+/// plane on a single authoritative volume, and a cold start that has to wait
+/// for *that* node before anything else can join. The floor stops the walk at
+/// two; the refused node exits crash-equivalent and resumes on its next start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_leave_holds_the_voter_floor() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let followers: Vec<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != leader)
+        .collect();
+
+    // The first departure is permitted: it lands at two voters, which is the
+    // floor, not below it.
+    assert_eq!(
+        cluster
+            .leave_gracefully(followers[0], Duration::from_secs(5))
+            .await
+            .expect("the first leave must be permitted"),
+        rift_cluster::LeaveOutcome::Departed,
+        "leaving a three-voter fleet is above the floor and must be allowed"
+    );
+    let remaining: BTreeSet<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != followers[0])
+        .collect();
+    assert!(
+        cluster.wait_voters(&remaining, CONVERGE_DEADLINE).await,
+        "membership did not shrink to two after the first leave"
+    );
+
+    // The second is refused: it would leave a single voter. Asked directly
+    // rather than through `leave_gracefully`, because that also shuts the node
+    // down — and a refused node leaving the *process* while still holding a
+    // vote is exactly what costs the survivors their quorum. Here the point is
+    // the outcome, so the node stays up.
+    //
+    // It travels over the leave RPC (this node is not the leader), so it also
+    // pins the reply's wire shape: a refusal is reported on the same
+    // `LeaveAccepted` body an older client would simply ignore.
+    let refused = {
+        let node = cluster.member(followers[1]).node.as_ref().expect("running");
+        node.leave(Duration::from_secs(5))
+            .await
+            .expect("a refused leave is an outcome, not an error")
+    };
+    assert_eq!(
+        refused,
+        rift_cluster::LeaveOutcome::Retained,
+        "a leave that would drop the fleet to one voter must be refused"
+    );
+    assert!(
+        cluster.wait_voters(&remaining, CONVERGE_DEADLINE).await,
+        "the refused leave must leave the membership untouched"
+    );
+
+    // The two survivors are still a working cluster, not a wedged one.
+    assert!(
+        cluster.wait_for_leader(LEADER_DEADLINE).await.is_some(),
+        "the survivors must still have a leader"
+    );
+    cluster.write_on_leader(8081, "after-floor").await;
+    assert!(
+        cluster
+            .wait_converged(8081, "after-floor", CONVERGE_DEADLINE)
+            .await,
+        "a write must still commit after the floor refused a departure"
+    );
+    cluster.shutdown_all().await;
+}
+
+/// Issue #69: two nodes SIGTERMed at once must not both slip through.
+///
+/// The floor is read and acted on under the leader's membership gate — the
+/// same serialization the auto-promote ceiling uses (#55). Without it both
+/// departures read a pre-removal voter count, both pass the check, and the
+/// fleet walks to one anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_leaves_never_walk_below_the_floor() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let followers: Vec<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != leader)
+        .collect();
+
+    let (first, second) = {
+        let a = cluster.member(followers[0]).node.as_ref().expect("running");
+        let b = cluster.member(followers[1]).node.as_ref().expect("running");
+        tokio::join!(
+            a.leave(Duration::from_secs(5)),
+            b.leave(Duration::from_secs(5))
+        )
+    };
+
+    let outcomes = [
+        first.expect("a concurrent leave must not error"),
+        second.expect("a concurrent leave must not error"),
+    ];
+    let departed = outcomes
+        .iter()
+        .filter(|o| **o == rift_cluster::LeaveOutcome::Departed)
+        .count();
+    assert_eq!(
+        departed, 1,
+        "exactly one of two concurrent departures may land, got {outcomes:?}"
+    );
+
+    // Whichever one lost, the fleet is at two voters and still writable.
+    let voters = cluster
+        .leader()
+        .expect("a surviving leader")
+        .status()
+        .voters
+        .len();
+    assert_eq!(voters, 2, "the floor must hold under concurrent departures");
+
+    cluster.shutdown_all().await;
+}
+
+/// Issue #69: a two-node fleet cannot shed a voter at all.
+///
+/// Both of its nodes are load-bearing, so every graceful leave is refused and
+/// every node resumes on restart. This is the behaviour change the floor
+/// introduces for N=2, and it is the intended one: dropping to a single voter
+/// is exactly the redundancy collapse the floor exists to prevent.
+///
+/// The **leader** is the one asked to leave, deliberately. A leader evicts
+/// itself through the local path rather than the leave RPC, and that is the
+/// mapping whose inversion would be worst: a leader reporting `Departed` after
+/// being refused would write a departure marker for a node that is still a
+/// member, and then refuse its own next start — the shape of the defect found
+/// in #72. Every other floor test refuses a follower, so without this one the
+/// local branch is never exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_two_node_leave_is_refused_by_the_floor() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(2).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let other = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader)
+        .expect("the other node");
+
+    assert_eq!(
+        cluster
+            .leave_gracefully(leader, Duration::from_secs(5))
+            .await
+            .expect("a refused leave is an outcome, not an error"),
+        rift_cluster::LeaveOutcome::Retained,
+        "a two-node fleet has no voter to spare, and a leader refusing itself must say so"
+    );
+
+    let both: BTreeSet<NodeId> = cluster.members.iter().map(|m| m.id).collect();
+    let survivor = cluster.member(other).node.as_ref().expect("running");
+    assert_eq!(
+        survivor
+            .status()
+            .voters
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        both,
+        "the survivor's membership must still name both nodes"
+    );
+
+    cluster.shutdown_all().await;
+}
+
 /// `test_graceful_leave_of_the_leader`: the leader leaves; a new leader
 /// appears within 3s and membership shrinks to 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

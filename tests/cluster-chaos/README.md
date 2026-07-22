@@ -71,14 +71,22 @@ Published host ports:
 
 Implemented and passing: `test_config_sync_converges`, `test_node_rejoin`,
 `test_graceful_leave`, `test_cold_start`, `c14_leader_kill_keeps_every_acknowledged_write`,
-`c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes`.
+`c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes`,
+`c5_rolling_restart_never_stops_accepting_writes`,
+`whole_fleet_sigterm_then_cold_start_converges`.
 
-`c5_rolling_restart_never_stops_accepting_writes` is committed **failing**, as
-the reproduction for a real defect it found (#72): a node that gracefully left
-cannot rejoin when its state directory is retained, which is every rolling
-restart. CI skips it by name; drop the `--skip` in `.github/workflows/ci.yml`
-when #72 is fixed, and the scenario starts guarding the fix instead of
-reporting the bug.
+`c5_rolling_restart_never_stops_accepting_writes` was committed **failing**, as
+the reproduction for a real defect this tier found (#72): a node that gracefully
+left could not rejoin when its state directory was retained, which is every
+rolling restart. Fixed, un-ignored, and no longer skipped in CI — it now guards
+that fix. It remains the example worth copying: a scenario that reproduces a
+defect belongs in the tree, failing and named, not deleted.
+
+`whole_fleet_sigterm_then_cold_start_converges` covers the invariant #69 and #72
+share and neither proves alone — a graceful stop of the *whole* fleet, then a
+cold start, converging without operator action. It is deliberately a SIGTERM
+rather than C15's hard kill: a kill leaves the membership untouched and so
+exercises neither the voter floor nor the rejoin path.
 
 Not yet implemented — they need toxiproxy and an Envoy front the compose file
 does not carry yet: **C4** (partition during writes → 503 + parked intent →

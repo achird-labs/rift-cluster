@@ -58,6 +58,21 @@ pub(crate) const CLUSTER_APPLIED_PATH: &str = "/internal/v1/applied";
 /// learners until an operator changes membership explicitly.
 pub(crate) const MAX_AUTO_VOTERS: usize = 9;
 
+/// The fewest voters a graceful departure may leave behind.
+///
+/// A whole-fleet teardown SIGTERMs every node, and each one leaving in turn
+/// walks a three-node membership to a single voter — the entire control plane
+/// on one authoritative volume, and a cold start that cannot proceed until
+/// exactly that node returns. Two is the smallest floor that stops the walk
+/// while leaving every rolling restart of a fleet of three or more untouched:
+/// there, only one node leaves at a time and the fleet never drops past two.
+///
+/// This is availability and durability hardening, not a safety invariant —
+/// Raft's joint consensus keeps each individual membership change safe on its
+/// own, and openraft's refusal to commit an empty voter set is the hard
+/// backstop underneath.
+pub(crate) const MIN_VOTERS: usize = 2;
+
 /// How long a membership change waits for an entry to commit. Kept under
 /// [`DEFAULT_REQUEST_TIMEOUT`] so the wait expires *inside* the joiner's own RPC
 /// budget: a longer bound would be unobservable — the joiner would give up
@@ -251,15 +266,28 @@ where
     }
 }
 
-/// Serializes the promotion phase of seed-join admissions on this node. One
-/// per router, and admissions only succeed on the leader, so the leader's gate
-/// is the cluster-wide serialization point for auto-promotions — see [`admit`].
-type AdmissionGate = Arc<Mutex<()>>;
+/// Serializes every membership change this node arbitrates — the promotion
+/// phase of seed-join admissions and the eviction phase of departures.
+///
+/// Both need the same thing: a committed read that no concurrent change can
+/// invalidate between the read and the write. Admissions need it so the
+/// auto-voter ceiling is exact (#55); departures need it so the voter floor is
+/// (#69). They share one gate because they are the same critical section over
+/// the same state — two gates would let a join and a leave interleave and each
+/// see a count the other was about to change.
+///
+/// One per node, and both operations only succeed on the leader, so the
+/// leader's gate is the cluster-wide serialization point for its term.
+pub(crate) type MembershipGate = Arc<Mutex<()>>;
 
 /// Register the control-plane receiving endpoints (Raft RPCs + seed join) onto
 /// `router`, all reading the node through `slot`.
+///
+/// `gate` is supplied by the caller rather than created here because the node
+/// itself also evicts locally — when the departing node *is* the leader — and
+/// that path has to share this serialization to keep the floor exact.
 #[must_use]
-pub(crate) fn control_routes(router: Router, slot: RaftSlot) -> Router {
+pub(crate) fn control_routes(router: Router, slot: RaftSlot, gate: MembershipGate) -> Router {
     let append = slot.clone();
     let vote = slot.clone();
     let snapshot = slot.clone();
@@ -267,7 +295,13 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot) -> Router {
     let applied = slot.clone();
     let leave = slot.clone();
     let join = slot;
-    let admission_gate: AdmissionGate = Arc::new(Mutex::new(()));
+    let admission_gate = Arc::clone(&gate);
+    let eviction_gate = gate;
+    // Two names, one gate — each route closure needs its own handle, and the
+    // names say which critical section each one serves. They must stay the same
+    // lock: admissions and departures both read the committed voter set and act
+    // on it, so splitting them would let a join and a leave each see a count the
+    // other was about to change.
 
     router
         .route(
@@ -362,11 +396,18 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot) -> Router {
             CLUSTER_LEAVE_PATH,
             Arc::new(move |body: Vec<u8>| -> HandlerFuture {
                 let slot = leave.clone();
+                let gate = Arc::clone(&eviction_gate);
                 Box::pin(async move {
                     let raft = raft_of(&slot)?;
                     let req = decode::<LeaveRequest>(&body)?;
-                    evict(raft, req.node_id).await?;
-                    encode(&LeaveAccepted { evicted: true })
+                    let outcome = evict(raft, &gate, req.node_id).await?;
+                    // A floor refusal is a normal reply on the same shape, not
+                    // an error: the departing node needs to learn it is still a
+                    // member so it exits crash-equivalent rather than recording
+                    // a departure it did not make.
+                    encode(&LeaveAccepted {
+                        evicted: outcome == EvictOutcome::Removed,
+                    })
                 })
             }),
         )
@@ -378,10 +419,19 @@ struct JoinAccepted {
     admitted: bool,
 }
 
-/// Reply to a successful [`LeaveRequest`].
+/// Reply to a [`LeaveRequest`] the leader accepted for consideration.
+///
+/// `evicted` distinguishes the two normal outcomes: the node was removed, or
+/// the voter floor refused the removal and it is still a member (#69).
+///
+/// The shape is unchanged, so an older client still decodes it — but it reads
+/// every reply as a departure, which against a refusing leader means it records
+/// one for a node that is still a member. Recoverable (that node rejoins
+/// through the peers its log names) and moot when #69 and #72 ship together,
+/// but it is a reason not to mix versions across a fleet mid-teardown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LeaveAccepted {
-    evicted: bool,
+pub(crate) struct LeaveAccepted {
+    pub(crate) evicted: bool,
 }
 
 /// Reply to a forwarded write ([`CLUSTER_WRITE_PATH`]).
@@ -560,23 +610,81 @@ async fn remove_member(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), R
     .await
 }
 
-/// Leader-side: fully evict `node_id` from the cluster — demote it from voter
-/// to learner if needed, then drop it from membership (issue #6). Mirrors
+/// Leader-side: evict `node_id` from the cluster — demote it from voter to
+/// learner if needed, then drop it from membership (issue #6). Mirrors
 /// [`admit`]'s use of [`membership_change`] so both admission and departure
 /// share the same commit barrier and `InProgress` retry (#38). Must run on the
 /// leader — on any other node openraft returns `ForwardToLeader`, surfaced
 /// here so the caller (the [`CLUSTER_LEAVE_PATH`] handler) can retry against
-/// the leader. Idempotent: retried, or called against a node already gone, is
-/// `Ok`.
-pub(crate) async fn evict(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), RpcError> {
+/// the leader.
+///
+/// **`Ok` does not mean the node was removed.** The voter floor
+/// ([`MIN_VOTERS`], [`held_by_floor`]) refuses a departure that would leave the
+/// cluster with too few voters, and that refusal is a successful outcome —
+/// [`EvictOutcome::HeldByFloor`] — not an error. Callers that record a
+/// departure must match on the outcome, never on `Ok` alone: treating a refusal
+/// as a departure persists "this node left" about a node that is still a
+/// member (issue #69, and the shape of the bug that did this in #72).
+///
+/// Idempotent otherwise: retried, or called against a node already gone, is
+/// [`EvictOutcome::Removed`].
+pub(crate) async fn evict(
+    raft: &Raft<TypeConfig>,
+    gate: &Mutex<()>,
+    node_id: NodeId,
+) -> Result<EvictOutcome, RpcError> {
+    // Held across the read and both writes, for the reason the ceiling is
+    // (#55): the floor is only exact if no other departure can commit between
+    // this node counting the voters and acting on that count. Two nodes
+    // SIGTERMed together would otherwise both read three voters and both leave.
+    let _serialized = gate.lock().await;
+
+    let voters = committed_voters(raft, node_id).await?;
+    // The permit path validates itself — `change_membership` below answers
+    // `ForwardToLeader` on a node that only thinks it leads, so a stale read can
+    // never commit a removal. The refusal path returns before any write and so
+    // has no such check, which is deliberate: confirming leadership means
+    // openraft's `is_leader`, a quorum round trip, inside this lock and on every
+    // departure. A stale refusal costs nothing — the node exits still a member
+    // and resumes — so the asymmetry buys robustness that is already there.
+    if held_by_floor(&voters, node_id) {
+        tracing::info!(
+            node_id,
+            voters = voters.len(),
+            min_voters = MIN_VOTERS,
+            "refusing a departure that would drop the cluster below the voter floor"
+        );
+        return Ok(EvictOutcome::HeldByFloor);
+    }
+
     demote_voter(raft, node_id).await?;
-    remove_member(raft, node_id).await
+    remove_member(raft, node_id).await?;
+    Ok(EvictOutcome::Removed)
+}
+
+/// What [`evict`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvictOutcome {
+    /// The node is out of the membership — removed now, or already gone.
+    Removed,
+    /// The voter floor refused the removal; the node is still a member.
+    HeldByFloor,
 }
 
 /// The soft auto-promotion gate: promote while under the ceiling, never
 /// re-promote an existing voter.
 fn should_promote(voters: &BTreeSet<NodeId>, id: NodeId, max_voters: usize) -> bool {
     voters.len() < max_voters && !voters.contains(&id)
+}
+
+/// The departure floor: refuse a **voter**'s removal when it would leave fewer
+/// than [`MIN_VOTERS`] behind.
+///
+/// Only voters are counted and only voters are refused: removing a learner
+/// costs the cluster no quorum member, and a floor that refused learners would
+/// strand every node the auto-voter ceiling capped.
+fn held_by_floor(voters: &BTreeSet<NodeId>, node_id: NodeId) -> bool {
+    voters.contains(&node_id) && voters.len() <= MIN_VOTERS
 }
 
 /// Submit one membership change, waiting out whatever change currently holds the
@@ -744,6 +852,35 @@ mod tests {
         assert!(
             !should_promote(&voters, 2, 3),
             "an existing voter is never re-promoted"
+        );
+    }
+
+    /// Issue #69: the departure floor, as a predicate.
+    ///
+    /// Tested here rather than only through a cluster because the two ways to
+    /// get it wrong are both silent: counting learners strands every
+    /// ceiling-capped node, and an off-by-one at the boundary either lets the
+    /// fleet walk to one voter or freezes a healthy three-node membership.
+    #[test]
+    fn held_by_floor_refuses_only_a_voter_that_would_breach_the_floor() {
+        let three: BTreeSet<NodeId> = BTreeSet::from([1, 2, 3]);
+        let two: BTreeSet<NodeId> = BTreeSet::from([1, 2]);
+
+        assert!(
+            !held_by_floor(&three, 3),
+            "leaving three voters lands on the floor, not below it — permitted"
+        );
+        assert!(
+            held_by_floor(&two, 2),
+            "leaving two voters would drop to one — refused"
+        );
+        assert!(
+            !held_by_floor(&two, 9),
+            "a learner is not a voter, so its removal costs no quorum member"
+        );
+        assert!(
+            held_by_floor(&BTreeSet::from([1]), 1),
+            "a sole voter is refused by the floor as well as by openraft"
         );
     }
 

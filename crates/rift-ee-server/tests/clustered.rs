@@ -337,17 +337,24 @@ async fn probes_answer_while_the_node_is_still_joining() {
     );
 }
 
-/// Issue #6: the SIGTERM path must actually leave the Raft membership.
+/// Issue #6 and #69: the SIGTERM path must actually leave the Raft membership —
+/// and must stop doing so once the fleet has no voter to spare.
 ///
 /// Every other test here runs `--cluster-allow-solo`, and a sole voter cannot
 /// leave (openraft refuses to empty the voter set), so `graceful_leave` skips
 /// the departure entirely on those — a no-op regression in the wiring would
-/// leave them all green. This is the only test that puts a second node behind
-/// the leave and reads the survivor's membership afterwards.
+/// leave them all green. This is the only test that puts real peers behind the
+/// leave and reads the survivor's membership afterwards.
+///
+/// Three nodes, so both halves are visible in one run: the first departure is
+/// above the floor and lands, the second would drop the fleet to a single voter
+/// and is refused. Two nodes could only ever show the refusal, and would leave
+/// the wiring that performs a real departure untested.
 #[tokio::test]
-async fn graceful_leave_removes_this_node_from_a_real_membership() {
+async fn graceful_leave_removes_this_node_until_the_voter_floor_stops_it() {
     let founder_state = TempDir::new().expect("tempdir");
-    let joiner_state = TempDir::new().expect("tempdir");
+    let first_state = TempDir::new().expect("tempdir");
+    let second_state = TempDir::new().expect("tempdir");
     let founder_bind = reserve_port();
 
     let founder = compose::start(cluster_on(
@@ -359,44 +366,45 @@ async fn graceful_leave_removes_this_node_from_a_real_membership() {
     .await
     .expect("founder starts");
 
-    let joiner = compose::start(cluster_on(
-        &joiner_state,
+    let joiner_args = [
+        "--cluster-seeds",
+        &founder_bind,
+        "--cluster-leave-timeout",
+        "5",
+    ];
+    let first = compose::start(cluster_on(
+        &first_state,
         &reserve_port(),
         "127.0.0.1:0",
-        &[
-            "--cluster-seeds",
-            &founder_bind,
-            "--cluster-leave-timeout",
-            "5",
-        ],
+        &joiner_args,
     ))
     .await
-    .expect("joiner starts");
+    .expect("first joiner starts");
+    let second = compose::start(cluster_on(
+        &second_state,
+        &reserve_port(),
+        "127.0.0.1:0",
+        &joiner_args,
+    ))
+    .await
+    .expect("second joiner starts");
 
     let founder_node = founder.node().expect("founder is clustered").clone();
-    let joiner_id = joiner.node().expect("joiner is clustered").id();
+    let first_id = first.node().expect("first is clustered").id();
+    let second_id = second.node().expect("second is clustered").id();
+    wait_voter_count(
+        &founder_node,
+        3,
+        "all three must be voters before the leave",
+    )
+    .await;
 
-    // Both nodes are voters before the leave, or the assertion afterwards proves
-    // nothing.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if founder_node.status().voters.len() == 2 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the joiner never became a voter: {:?}",
-            founder_node.status().voters
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    joiner.graceful_leave().await;
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Above the floor: this one really departs.
+    first.graceful_leave().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         let voters = founder_node.status().voters;
-        if !voters.contains(&joiner_id) {
+        if !voters.contains(&first_id) {
             break;
         }
         assert!(
@@ -405,6 +413,21 @@ async fn graceful_leave_removes_this_node_from_a_real_membership() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    // At the floor: this one drains and exits, but keeps its vote, so the
+    // membership the survivors hold still names it and a cold start can form a
+    // quorum without it having to come back first.
+    second.graceful_leave().await;
+    let voters = founder_node.status().voters;
+    assert!(
+        voters.contains(&second_id),
+        "the voter floor must keep the last departing node in the membership: {voters:?}"
+    );
+    assert_eq!(
+        voters.len(),
+        2,
+        "the fleet must stop at two voters, not walk to one: {voters:?}"
+    );
 
     founder.shutdown().await;
 }
@@ -629,10 +652,14 @@ async fn a_solo_node_survives_a_graceful_leave_and_restarts() {
 /// **whole fleet** must leave a cluster that can start again.
 ///
 /// This is the amplified form of the solo regression above. Nodes SIGTERM in
-/// sequence, so the last one standing is a sole voter that cannot leave; if
-/// every node recorded itself as departed, none could resume and there would be
-/// no one left to elect — the fleet would need its state directories deleted to
-/// come back at all.
+/// sequence, and if every node recorded itself as departed, none could resume
+/// and there would be no one left to elect — the fleet would need its state
+/// directories deleted to come back at all.
+///
+/// Two nodes, so the voter floor (#69) refuses **both** departures and the
+/// membership survives the teardown whole. The three-node shape, where one node
+/// really departs and the other two are floor-refused, needs real processes and
+/// lives in the container tier as `whole_fleet_sigterm_then_cold_start_converges`.
 #[tokio::test]
 async fn a_graceful_stop_of_the_whole_fleet_can_cold_start_again() {
     let founder_state = TempDir::new().expect("tempdir");
@@ -675,8 +702,10 @@ async fn a_graceful_stop_of_the_whole_fleet_can_cold_start_again() {
     joiner.graceful_leave().await;
     founder.graceful_leave().await;
 
-    // Cold start in the same order. The founder holds the surviving membership;
-    // the joiner rejoins through it if its own departure landed.
+    // Cold start in the same order. Since the voter floor (#69) neither node of
+    // a two-voter fleet may leave, so both take the resume row and the whole
+    // membership survives the teardown intact — which is the point: nothing has
+    // to rejoin before a quorum can form.
     let founder = compose::start(cluster_on(
         &founder_state,
         &founder_bind,
