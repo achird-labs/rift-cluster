@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use openraft::{BasicNode, Config, Raft, ServerState};
@@ -181,6 +182,10 @@ pub struct RaftNode {
     // The cluster server accept loop. Aborted on shutdown/drop so the listener is
     // released with the node.
     server_task: JoinHandle<()>,
+    // Whether shutdown() was ever invoked, so Drop can warn when a node is
+    // dropped without the shutdown-then-drop contract — storage release is only
+    // guaranteed through shutdown() (see Drop).
+    shutdown_invoked: AtomicBool,
 }
 
 impl RaftNode {
@@ -267,6 +272,7 @@ impl RaftNode {
             client,
             sm_reader,
             server_task,
+            shutdown_invoked: AtomicBool::new(false),
         })
     }
 
@@ -680,7 +686,18 @@ impl RaftNode {
     ///   acknowledges the stop, but the core drops its storage a few ticks later;
     ///   until it does, the last database handle keeps the lock and an immediate
     ///   restart fails with "Database already open" (#41).
+    ///
+    /// After this returns `Ok`, the node's own `sm_reader` holds the *last*
+    /// database handle, so dropping the node afterwards releases the redb file
+    /// lock synchronously — shutdown-then-drop is the contract. (Behind an
+    /// `Arc`, the lock is finally released when the last clone drops.) Dropping
+    /// a node *without* calling this gives no such guarantee — see the `Drop`
+    /// impl (#54).
     pub async fn shutdown(&self) -> Result<(), NodeError> {
+        // Set on invocation, not success: a failed shutdown already returned
+        // its error to the caller — a second warn from Drop would point at the
+        // wrong contract.
+        self.shutdown_invoked.store(true, Ordering::Relaxed);
         let raft_stopped = self
             .raft
             .shutdown()
@@ -738,10 +755,26 @@ impl RaftNode {
 }
 
 impl Drop for RaftNode {
+    /// Best-effort teardown, deliberately asymmetric with [`RaftNode::shutdown`]:
+    /// only the listener is released here. The Raft core stops and drops its
+    /// `Arc<redb::Database>` clones asynchronously, a few scheduler ticks later,
+    /// so — unlike shutdown-then-drop — a plain drop gives NO guarantee the redb
+    /// file lock is free when this returns (#54). Drop cannot await, and a
+    /// blocking wait here would stall the very runtime the core needs to finish
+    /// tearing down, so callers that will reopen the same data directory must
+    /// call [`RaftNode::shutdown`] first. A drop without one is a bug worth a
+    /// log line, not a panic (Drop can run mid-unwind).
     fn drop(&mut self) {
-        // Best-effort: release the listener if the node is dropped without an
-        // explicit shutdown. The Raft core's own tasks stop when `raft` drops.
         self.server_task.abort();
+        if !self.shutdown_invoked.load(Ordering::Relaxed) {
+            tracing::warn!(
+                node_id = self.id,
+                db_refs = self.sm_reader.db_refs(),
+                "RaftNode dropped without shutdown(): redb storage releases \
+                 asynchronously, so an immediate restart on this data directory \
+                 may race the file lock — call shutdown() before dropping"
+            );
+        }
     }
 }
 
@@ -1004,6 +1037,15 @@ mod tests {
         assert!(
             started.elapsed() < STORAGE_RELEASE_TIMEOUT * 3,
             "shutdown must return near the release timeout, not hang"
+        );
+        // #54: shutdown WAS invoked — its failure already reached the caller,
+        // so the drop-without-shutdown tripwire must stay silent here.
+        let (messages, capture) = WarnCapture::new();
+        tracing::subscriber::with_default(capture, || drop(node));
+        assert!(
+            messages.lock().expect("lock").is_empty(),
+            "a failed-but-invoked shutdown must not warn on drop: {:?}",
+            messages.lock().expect("lock")
         );
         drop(pin);
     }
@@ -1360,5 +1402,110 @@ mod tests {
 
         n1.shutdown().await.ok();
         n2.shutdown().await.ok();
+    }
+    /// #54: WARN-level messages recorded so drop-path tripwires are assertable.
+    struct WarnCapture {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl WarnCapture {
+        fn new() -> (std::sync::Arc<std::sync::Mutex<Vec<String>>>, Self) {
+            let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let capture = Self {
+                messages: std::sync::Arc::clone(&messages),
+            };
+            (messages, capture)
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor<'a>(&'a mut String);
+            impl tracing::field::Visit for MessageVisitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        use std::fmt::Write;
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+            }
+            let mut message = String::new();
+            event.record(&mut MessageVisitor(&mut message));
+            self.messages.lock().expect("capture lock").push(message);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// #54 gate: the guarantee a plain drop DOES provide — openraft's storage
+    /// clones are released eventually — locked in so it cannot regress into a
+    /// leak. Eventual, not synchronous: only shutdown-then-drop is prompt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drop_without_shutdown_eventually_releases_storage() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+
+        let pin = node.clone_storage_handle();
+        drop(node);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // > 1: the pin itself is the one handle that legitimately remains —
+        // deliberately not NODE_HELD_DB_REFS, whose 1 is the dropped node's own
+        // sm_reader.
+        while pin.db_refs() > 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "openraft never released storage after a plain drop"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// #54 gate: dropping a node that was never shut down trips the warn — the
+    /// one log line that turns the #41 redb-lock flake into a diagnosis.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_without_shutdown_warns() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+
+        let (messages, capture) = WarnCapture::new();
+        tracing::subscriber::with_default(capture, || drop(node));
+        let messages = messages.lock().expect("lock");
+        assert_eq!(messages.len(), 1, "exactly one warn: {messages:?}");
+        assert!(
+            messages[0].contains("dropped without shutdown"),
+            "{messages:?}"
+        );
+    }
+
+    /// #54 gate: the shutdown-then-drop contract stays silent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_after_shutdown_does_not_warn() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+        node.shutdown().await.expect("shutdown");
+
+        let (messages, capture) = WarnCapture::new();
+        tracing::subscriber::with_default(capture, || drop(node));
+        assert!(
+            messages.lock().expect("lock").is_empty(),
+            "a shut-down node must drop silently: {:?}",
+            messages.lock().expect("lock")
+        );
     }
 }
