@@ -50,6 +50,39 @@ fn reserve_port() -> String {
     held.local_addr().expect("addr").to_string()
 }
 
+/// Poll `node`'s membership until it holds exactly `want` voters, bounded.
+async fn wait_voter_count(node: &rift_cluster::RaftNode, want: usize, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let voters = node.status().voters;
+        if voters.len() == want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: expected {want} voters, saw {voters:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll `/readyz` until it answers 200, bounded.
+async fn wait_ready(probes: &str, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) = reqwest::get(format!("http://{probes}/readyz")).await
+            && response.status().as_u16() == 200
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: /readyz never reached 200"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn probe(base: &str, path: &str) -> (u16, serde_json::Value) {
     let response = reqwest::get(format!("http://{base}{path}"))
         .await
@@ -374,4 +407,382 @@ async fn graceful_leave_removes_this_node_from_a_real_membership() {
     }
 
     founder.shutdown().await;
+}
+
+/// Issue #72: a node that gracefully left must come back when it restarts on its
+/// **retained** state directory — the rolling-restart shape, since a Docker
+/// volume or a k8s PVC outlives the container.
+///
+/// Three nodes, not two, so the departure lands with a voter to spare: issue #69
+/// adds a floor that refuses a leave which would drop the fleet below two
+/// voters, and this test must keep proving the rejoin after that lands.
+///
+/// It also pins the marker's on-disk name, which
+/// `a_departed_node_without_seeds_fails_startup_with_guidance` relies on.
+#[tokio::test]
+async fn departed_node_with_retained_state_dir_rejoins_on_restart() {
+    let founder_state = TempDir::new().expect("tempdir");
+    let keeper_state = TempDir::new().expect("tempdir");
+    let roller_state = TempDir::new().expect("tempdir");
+    let founder_bind = reserve_port();
+    let roller_bind = reserve_port();
+
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("founder starts");
+    let keeper = compose::start(cluster_on(
+        &keeper_state,
+        &reserve_port(),
+        "127.0.0.1:0",
+        &["--cluster-seeds", &founder_bind],
+    ))
+    .await
+    .expect("keeper starts");
+    let roller = compose::start(cluster_on(
+        &roller_state,
+        &roller_bind,
+        "127.0.0.1:0",
+        &[
+            "--cluster-seeds",
+            &founder_bind,
+            "--cluster-leave-timeout",
+            "5",
+        ],
+    ))
+    .await
+    .expect("roller starts");
+
+    let founder_node = founder.node().expect("founder is clustered").clone();
+    let roller_id = roller.node().expect("roller is clustered").id();
+    wait_voter_count(
+        &founder_node,
+        3,
+        "all three must be voters before the leave",
+    )
+    .await;
+
+    roller.graceful_leave().await;
+    wait_voter_count(
+        &founder_node,
+        2,
+        "the graceful leave must shrink the membership",
+    )
+    .await;
+
+    let marker = roller_state.path().join("departed");
+    assert!(
+        marker.exists(),
+        "a confirmed departure must leave a durable marker in the state dir"
+    );
+
+    // Same state directory, same address: the pod came back, its volume intact.
+    let rejoined = compose::start(cluster_on(
+        &roller_state,
+        &roller_bind,
+        "127.0.0.1:0",
+        &["--cluster-seeds", &founder_bind],
+    ))
+    .await
+    .expect("a departed node must start and rejoin on its retained state dir");
+
+    // Nothing was wiped: the node kept its minted identity, so its parked
+    // intents and applied state came back with it.
+    assert_eq!(
+        rejoined.node().expect("rejoined is clustered").id(),
+        roller_id,
+        "the rejoin must reuse the node's identity, not mint a new one"
+    );
+
+    let probes = rejoined.probe_addr().expect("probes bound").to_string();
+    wait_ready(&probes, "the rejoined node").await;
+    wait_voter_count(&founder_node, 3, "the rejoined node must be a voter again").await;
+    assert!(
+        !marker.exists(),
+        "the marker must be cleared once the rejoin succeeds, or every later restart re-joins"
+    );
+
+    rejoined.shutdown().await;
+    keeper.shutdown().await;
+    founder.shutdown().await;
+}
+
+/// Issue #72 AC4: the fix must not break the path it is carving around.
+///
+/// A member that stopped **without** leaving still owns its place in the
+/// membership, so it has to resume from its durable log — that is how a whole
+/// fleet cold-starts. Restarting it with no seeds *and* no `--cluster-allow-solo`
+/// makes the assertion sharp: the resume row is the only row that can start this
+/// node at all, so a regression that sent it down the seed-join path would fail
+/// here rather than pass quietly.
+#[tokio::test]
+async fn cold_start_resumes_from_durable_state_without_seed_joining() {
+    let state = TempDir::new().expect("tempdir");
+    let bind = reserve_port();
+
+    let first = compose::start(cluster_on(
+        &state,
+        &bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("solo cluster starts");
+    let probes = first.probe_addr().expect("probes bound").to_string();
+    wait_ready(&probes, "the founding node").await;
+    // No leave: this is a crash/stop, so no departure marker is written.
+    first.shutdown().await;
+
+    let resumed = compose::start(cluster_on(&state, &bind, "127.0.0.1:0", &[]))
+        .await
+        .expect("a node still in the membership must resume without seeds");
+    let probes = resumed.probe_addr().expect("probes bound").to_string();
+    wait_ready(&probes, "the resumed node").await;
+
+    resumed.shutdown().await;
+}
+
+/// Issue #72 AC5: a node that is out of its cluster with nowhere at all to
+/// rejoin fails loudly instead of resuming into the wedge.
+///
+/// The marker is placed by hand **on purpose**, and this is the one test where
+/// that is legitimate: no ordinary path produces it. A node that genuinely
+/// departs learns its survivors from its own log, so it has somewhere to go and
+/// takes the rejoin row instead. This asserts the last-resort guard for a state
+/// directory that has been hand-edited or half-restored — the marker's name is
+/// pinned by `departed_node_with_retained_state_dir_rejoins_on_restart`, which
+/// produces a real one.
+#[tokio::test]
+async fn a_node_marked_departed_with_nowhere_to_rejoin_fails_startup_with_guidance() {
+    let state = TempDir::new().expect("tempdir");
+    let bind = reserve_port();
+
+    let first = compose::start(cluster_on(
+        &state,
+        &bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("solo cluster starts");
+    first.shutdown().await;
+
+    std::fs::write(state.path().join("departed"), b"").expect("place the departure marker");
+
+    let err = match compose::start(cluster_on(&state, &bind, "127.0.0.1:0", &[])).await {
+        Ok(_) => panic!("a departed node with nowhere to rejoin must not silently resume"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("--cluster-seeds"),
+        "the refusal must name the flag that recovers it: {err}"
+    );
+}
+
+/// Issue #72 regression: a **solo** node must survive its own SIGTERM.
+///
+/// A sole voter cannot leave — openraft refuses to empty a voter set — so
+/// `leave` declines and the node exits still a member. Recording that as a
+/// departure would refuse its next start outright, which is a hard regression
+/// on `--cluster-allow-solo`: before any of this it restarted fine. This is why
+/// `leave` reports `Departed` vs `Retained` rather than just `Ok`.
+#[tokio::test]
+async fn a_solo_node_survives_a_graceful_leave_and_restarts() {
+    let state = TempDir::new().expect("tempdir");
+    let bind = reserve_port();
+
+    let solo = compose::start(cluster_on(
+        &state,
+        &bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo", "--cluster-leave-timeout", "2"],
+    ))
+    .await
+    .expect("solo cluster starts");
+    let probes = solo.probe_addr().expect("probes bound").to_string();
+    wait_ready(&probes, "the solo node").await;
+
+    solo.graceful_leave().await;
+    assert!(
+        !state.path().join("departed").exists(),
+        "a sole voter never leaves, so nothing may record it as departed"
+    );
+
+    let restarted = compose::start(cluster_on(
+        &state,
+        &bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("a solo node must come back after its own graceful stop");
+    let probes = restarted.probe_addr().expect("probes bound").to_string();
+    wait_ready(&probes, "the restarted solo node").await;
+    restarted.shutdown().await;
+}
+
+/// Issue #72 / #69 shared invariant, in-process half: a graceful stop of the
+/// **whole fleet** must leave a cluster that can start again.
+///
+/// This is the amplified form of the solo regression above. Nodes SIGTERM in
+/// sequence, so the last one standing is a sole voter that cannot leave; if
+/// every node recorded itself as departed, none could resume and there would be
+/// no one left to elect — the fleet would need its state directories deleted to
+/// come back at all.
+#[tokio::test]
+async fn a_graceful_stop_of_the_whole_fleet_can_cold_start_again() {
+    let founder_state = TempDir::new().expect("tempdir");
+    let joiner_state = TempDir::new().expect("tempdir");
+    let founder_bind = reserve_port();
+    let joiner_bind = reserve_port();
+
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo", "--cluster-leave-timeout", "2"],
+    ))
+    .await
+    .expect("founder starts");
+    let joiner = compose::start(cluster_on(
+        &joiner_state,
+        &joiner_bind,
+        "127.0.0.1:0",
+        &[
+            "--cluster-seeds",
+            &founder_bind,
+            "--cluster-leave-timeout",
+            "2",
+        ],
+    ))
+    .await
+    .expect("joiner starts");
+
+    let founder_node = founder.node().expect("founder is clustered").clone();
+    wait_voter_count(
+        &founder_node,
+        2,
+        "both nodes must be voters before the teardown",
+    )
+    .await;
+    drop(founder_node);
+
+    // Whole-fleet stop, one after the other, exactly as `compose stop` does.
+    joiner.graceful_leave().await;
+    founder.graceful_leave().await;
+
+    // Cold start in the same order. The founder holds the surviving membership;
+    // the joiner rejoins through it if its own departure landed.
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("the fleet must be able to cold-start after a graceful stop");
+    let founder_probes = founder.probe_addr().expect("probes bound").to_string();
+    wait_ready(&founder_probes, "the restarted founder").await;
+
+    let joiner = compose::start(cluster_on(
+        &joiner_state,
+        &joiner_bind,
+        "127.0.0.1:0",
+        &["--cluster-seeds", &founder_bind],
+    ))
+    .await
+    .expect("the joiner must come back after the fleet's graceful stop");
+    let joiner_probes = joiner.probe_addr().expect("probes bound").to_string();
+    wait_ready(&joiner_probes, "the restarted joiner").await;
+
+    let founder_node = founder.node().expect("founder is clustered").clone();
+    wait_voter_count(
+        &founder_node,
+        2,
+        "the fleet must converge back to both voters",
+    )
+    .await;
+    drop(founder_node);
+
+    joiner.shutdown().await;
+    founder.shutdown().await;
+}
+
+/// Issue #72: the **founder** must be able to come back too, and it is the one
+/// node that cannot be given seeds.
+///
+/// It founded the cluster, so `--cluster-seeds` is empty by construction. After
+/// a graceful leave its only route back is the peer list its own durable log
+/// remembers. Without that it restarts into a permanent refusal — which is what
+/// the container tier caught, and what this test guards in-process, since the
+/// container tier does not run on every change.
+#[tokio::test]
+async fn a_departed_founder_rejoins_through_the_peers_its_log_remembers() {
+    let founder_state = TempDir::new().expect("tempdir");
+    let keeper_state = TempDir::new().expect("tempdir");
+    let extra_state = TempDir::new().expect("tempdir");
+    let founder_bind = reserve_port();
+
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo", "--cluster-leave-timeout", "5"],
+    ))
+    .await
+    .expect("founder starts");
+    let keeper = compose::start(cluster_on(
+        &keeper_state,
+        &reserve_port(),
+        "127.0.0.1:0",
+        &["--cluster-seeds", &founder_bind],
+    ))
+    .await
+    .expect("keeper starts");
+    // A third node so the founder's departure keeps two voters behind it.
+    let extra = compose::start(cluster_on(
+        &extra_state,
+        &reserve_port(),
+        "127.0.0.1:0",
+        &["--cluster-seeds", &founder_bind],
+    ))
+    .await
+    .expect("third node starts");
+
+    let keeper_node = keeper.node().expect("keeper is clustered").clone();
+    wait_voter_count(
+        &keeper_node,
+        3,
+        "all three must be voters before the founder leaves",
+    )
+    .await;
+
+    founder.graceful_leave().await;
+    wait_voter_count(&keeper_node, 2, "the founder's departure must land").await;
+    assert!(
+        founder_state.path().join("departed").exists(),
+        "the founder really departed, so it must be recorded"
+    );
+
+    // No seeds, exactly as the founder is configured in the shipped topology.
+    let founder = compose::start(cluster_on(
+        &founder_state,
+        &founder_bind,
+        "127.0.0.1:0",
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("a departed founder must rejoin through the peers its log remembers");
+    let probes = founder.probe_addr().expect("probes bound").to_string();
+    wait_ready(&probes, "the returning founder").await;
+    wait_voter_count(&keeper_node, 3, "the founder must be a voter again").await;
+    drop(keeper_node);
+
+    founder.shutdown().await;
+    extra.shutdown().await;
+    keeper.shutdown().await;
 }

@@ -263,22 +263,13 @@ async fn c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes() {
 /// two hold quorum. The bar is that a write is accepted at every point in the
 /// roll — a window where the fleet takes nothing is an outage, however brief.
 ///
-/// **Currently fails, deliberately committed as the reproduction.** A node that
-/// gracefully left cannot rejoin when it restarts with its state directory
-/// intact — which is exactly what a rolling restart does, since the volume
-/// outlives the container. `join_or_bootstrap` short-circuits on
-/// `is_initialized()`, and before issue #6 that was sound because nothing ever
-/// removed a node from membership; now the node resumes into a configuration
-/// the cluster has moved past, never seed-joins, and sits at `/readyz` 503
-/// forever. The in-process `test_rejoin_after_leave` misses it because it
-/// rejoins on a *fresh* directory.
-///
-/// Kept rather than deleted: this scenario is the bug report. Restore the
-/// plain "needs a container runtime" reason once the fix lands, so it runs with
-/// the rest of the tier.
+/// This scenario was committed failing, as the reproduction for issue #72: a
+/// node that gracefully left could not rejoin when it restarted with its state
+/// directory intact, because `join_or_bootstrap` resumed on `is_initialized()`
+/// alone. Fixed by the departure marker and the membership check, so it now
+/// guards that fix rather than reporting the bug.
 #[tokio::test]
-#[ignore = "KNOWN FAILURE — reproduces a real defect: a graceful leave prevents rejoin when the \
-            state directory is retained, i.e. every rolling restart"]
+#[ignore = "needs a container runtime"]
 async fn c5_rolling_restart_never_stops_accepting_writes() {
     let cluster = Cluster::up().await.expect("fleet comes up");
 

@@ -20,7 +20,7 @@ pub mod ring;
 pub mod store;
 
 pub use identity::NodeIdentity;
-pub use node::{NodeConfig, NodeError, RaftNode, StatusReport};
+pub use node::{LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport};
 pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
 
 use std::io::Cursor;

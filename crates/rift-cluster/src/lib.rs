@@ -36,8 +36,8 @@ pub use control::{
 };
 pub use decorate::ClusterDecorator;
 pub use raft::{
-    KeyClass, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey, RaftNode, Ring,
-    StatusReport, TypeConfig,
+    KeyClass, LeaveOutcome, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey,
+    RaftNode, Ring, StatusReport, TypeConfig,
 };
 pub use rpc::{Router, RpcClient, RpcError, RpcServer};
 
