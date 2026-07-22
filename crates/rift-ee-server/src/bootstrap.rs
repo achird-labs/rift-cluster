@@ -15,7 +15,7 @@ use std::path::Path;
 
 use rift_ee::rift_http_proxy::bootstrap::{apply_rcfile_defaults, save_imposters, stop_server};
 use rift_ee::seams::Commands;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cli::EeCli;
 
@@ -119,7 +119,7 @@ fn stop_via_pidfile(pidfile: &Path) -> anyhow::Result<()> {
 /// this build on the next pin bump rather than quietly degrade to "start a
 /// server and ignore the arguments" — `tests/cli.rs` compares flag *names* and
 /// would stay green through exactly that.
-pub fn dispatch(cli: &EeCli) -> anyhow::Result<AfterBootstrap> {
+pub fn dispatch(cli: &mut EeCli) -> anyhow::Result<AfterBootstrap> {
     match &cli.oss.command {
         Some(Commands::Stop { pidfile }) => {
             stop_via_pidfile(pidfile)?;
@@ -144,14 +144,45 @@ pub fn dispatch(cli: &EeCli) -> anyhow::Result<AfterBootstrap> {
             save_imposters(&cli.oss.host, cli.oss.port, savefile, *remove_proxies)?;
             Ok(AfterBootstrap::Done)
         }
-        // Parses (the CLI is a superset by construction) but is not wired up.
-        // Failing here is the point: falling through would start an empty server
-        // and silently discard the `--configfile` the operator asked to replay.
-        Some(Commands::Replay { configfile }) => anyhow::bail!(
-            "`replay` is not implemented by rift-ee-server yet; it would ignore {configfile:?}. \
-             Pass --configfile {configfile:?} to start instead, or use the open-source `rift` \
-             binary."
-        ),
+        // Upstream's whole implementation of replay is to start normally with
+        // `configfile` replaced, so that is what this does. The override is
+        // unconditional — upstream builds `Cli { configfile: Some(..), ..cli }`,
+        // so a top-level `--configfile` loses rather than conflicting.
+        Some(Commands::Replay { configfile }) => {
+            // Replay loads a file straight into one node's engine. Clustered,
+            // imposter state belongs to the replicated log, so those imposters
+            // would exist on one node only — and the reconciler, which treats
+            // the replicated set as authoritative, then deletes the ones it
+            // does not know about.
+            anyhow::ensure!(
+                !cli.cluster.cluster,
+                "`replay` loads a node-local config file and cannot be combined with --cluster: \
+                 the imposters would never reach the replicated log, and the reconciler would \
+                 then delete them. A saved file is already a PUT body, so replay it through the \
+                 admin API instead: curl -X PUT http://<admin>/imposters -d @{}",
+                configfile.display()
+            );
+            let replayed = configfile.clone();
+            // Upstream builds `Cli { configfile: Some(..), ..cli }`, so the
+            // replayed file wins outright rather than conflicting. Warned about
+            // because losing a flag the operator typed should not be silent —
+            // the same reason `--rcfile` problems are surfaced rather than
+            // swallowed. Diagnostics only; the behaviour still matches upstream.
+            if cli
+                .oss
+                .configfile
+                .as_ref()
+                .is_some_and(|current| *current != replayed)
+            {
+                warn!(
+                    replacing = %cli.oss.configfile.as_ref().map_or_else(String::new, |p| p.display().to_string()),
+                    with = %replayed.display(),
+                    "`replay` overrides --configfile"
+                );
+            }
+            cli.oss.configfile = Some(replayed);
+            Ok(AfterBootstrap::Serve)
+        }
         // Both must run before any bootstrap — `script` wants only its own exit
         // code and `healthcheck` would clobber a running server's --pidfile — so
         // the caller dispatches them and they can never arrive here.
@@ -303,10 +334,10 @@ mod tests {
             .spawn()
             .expect("spawn a child to restart");
         let pidfile = write(&dir, "rift.pid", &child.id().to_string());
-        let c = cli(&["restart", "--pidfile", &pidfile.to_string_lossy()]);
+        let mut c = cli(&["restart", "--pidfile", &pidfile.to_string_lossy()]);
 
         assert_eq!(
-            dispatch(&c).expect("restart dispatches"),
+            dispatch(&mut c).expect("restart dispatches"),
             AfterBootstrap::Serve,
             "restart must fall through to the start path"
         );
@@ -326,9 +357,12 @@ mod tests {
             .spawn()
             .expect("spawn a child to stop");
         let pidfile = write(&dir, "rift.pid", &child.id().to_string());
-        let c = cli(&["stop", "--pidfile", &pidfile.to_string_lossy()]);
+        let mut c = cli(&["stop", "--pidfile", &pidfile.to_string_lossy()]);
 
-        assert_eq!(dispatch(&c).expect("stop dispatches"), AfterBootstrap::Done);
+        assert_eq!(
+            dispatch(&mut c).expect("stop dispatches"),
+            AfterBootstrap::Done
+        );
 
         let status = child.wait().expect("reap the child");
         assert!(
@@ -390,15 +424,100 @@ mod tests {
         );
     }
 
-    /// `replay` must fail loudly rather than start an empty server and discard
-    /// the configfile the operator asked to replay.
+    /// Issue #67: replay is `start` with the config file overridden.
+    ///
+    /// That is the whole of upstream's implementation — it hands the normal
+    /// serve path a `Cli` with `configfile` replaced. Anything more elaborate
+    /// here would be a divergence, not a feature.
     #[test]
-    fn replay_is_refused_rather_than_silently_ignored() {
-        let c = cli(&["replay", "--configfile", "saved.json"]);
-        let err = dispatch(&c).expect_err("replay is not wired up and must say so");
+    fn replay_overrides_the_configfile_and_serves() {
+        let mut c = cli(&["replay", "--configfile", "saved.json"]);
+        assert_eq!(
+            dispatch(&mut c).expect("replay dispatches"),
+            AfterBootstrap::Serve,
+            "replay must fall through to the normal serve path"
+        );
+        assert_eq!(
+            c.oss.configfile.as_deref(),
+            Some(std::path::Path::new("saved.json")),
+            "the replayed file must become the config the server loads"
+        );
+    }
+
+    /// Upstream builds `Cli { configfile: Some(replayed), ..cli }`, so the
+    /// replayed file wins unconditionally over a top-level `--configfile`
+    /// rather than being merged or refused as a conflict.
+    #[test]
+    fn replay_beats_a_top_level_configfile() {
+        let mut c = cli(&[
+            "--configfile",
+            "other.json",
+            "replay",
+            "--configfile",
+            "saved.json",
+        ]);
+        assert_eq!(
+            dispatch(&mut c).expect("replay dispatches"),
+            AfterBootstrap::Serve
+        );
+        assert_eq!(
+            c.oss.configfile.as_deref(),
+            Some(std::path::Path::new("saved.json")),
+            "replay's file must win over the top-level one"
+        );
+    }
+
+    /// The subtle half of the precedence rule: an rcfile may also supply
+    /// `configfile`, and rcfile application runs *before* dispatch. Replay must
+    /// still win. Nothing else pins this, so a future reordering of
+    /// `apply_rcfile` and `dispatch` would silently change which file loads.
+    #[test]
+    fn replay_beats_an_rcfile_supplied_configfile() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let rc = dir.path().join("rift.rc");
+        std::fs::write(&rc, r#"{"configfile": "from-rcfile.json"}"#).expect("write rcfile");
+
+        let mut c = cli(&["--rcfile", &rc.to_string_lossy()]);
         assert!(
-            err.to_string().contains("saved.json"),
-            "the refusal must name the file being ignored: {err}"
+            apply_rcfile(&mut c).is_none(),
+            "a well-formed rcfile must apply without complaint"
+        );
+        assert_eq!(
+            c.oss.configfile.as_deref(),
+            Some(std::path::Path::new("from-rcfile.json")),
+            "the rcfile must land first, or this test proves nothing"
+        );
+
+        c.oss.command = Some(rift_ee::seams::Commands::Replay {
+            configfile: std::path::PathBuf::from("saved.json"),
+        });
+        assert_eq!(
+            dispatch(&mut c).expect("replay dispatches"),
+            AfterBootstrap::Serve
+        );
+        assert_eq!(
+            c.oss.configfile.as_deref(),
+            Some(std::path::Path::new("saved.json")),
+            "replay must override a configfile the rcfile supplied"
+        );
+    }
+
+    /// Replay loads a node-local file straight into one node's engine. Under
+    /// `--cluster` that would create imposters outside the replicated log —
+    /// exactly the divergence the write path exists to prevent — so it is
+    /// refused before anything binds.
+    #[test]
+    fn replay_with_cluster_is_refused() {
+        let mut c = cli(&["--cluster", "replay", "--configfile", "saved.json"]);
+        let err = dispatch(&mut c).expect_err("replay cannot run clustered");
+        let message = err.to_string();
+        assert!(
+            message.contains("--cluster"),
+            "the refusal must name the flag that caused it: {message}"
+        );
+        assert!(
+            message.contains("admin"),
+            "and must point at the supported way to restore a cluster: {message}"
         );
     }
 
@@ -439,7 +558,7 @@ mod tests {
         });
 
         let port = ready_rx.recv().expect("server came up");
-        let c = cli(&[
+        let mut c = cli(&[
             "--port",
             &port.to_string(),
             "--host",
@@ -449,7 +568,7 @@ mod tests {
             &savefile.to_string_lossy(),
         ]);
 
-        let outcome = dispatch(&c).expect("save reaches the admin API from sync context");
+        let outcome = dispatch(&mut c).expect("save reaches the admin API from sync context");
 
         assert_eq!(outcome, AfterBootstrap::Done, "save is a complete program");
         let body = std::fs::read_to_string(&savefile).expect("savefile written");

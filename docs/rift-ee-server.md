@@ -54,6 +54,7 @@ implementation** rather than reimplementing or declining it:
 | `stop` | SIGTERM the PID in the subcommand's `--pidfile`, then remove the file |
 | `restart` | `stop`, then start a new server in the same process |
 | `save` | fetch `GET /imposters?replayable=true` from the configured `--host`/`--port` and write it to `--savefile` |
+| `replay` | start a server with `--configfile` set to the replayed file, overriding any top-level `--configfile`. Refused with `--cluster` — see below |
 
 The steps this binary implements run in **upstream's order**, which matters
 because the order is observable: `--rcfile` is applied before tracing
@@ -72,10 +73,24 @@ fixes them:
   never-rotated) alongside the console output. `--nologfile` overrides `--log`
   and suppresses the file even when one is named.
 
-`script`, `healthcheck` and `start` work exactly as upstream. `replay` parses but
-is not wired up, and now **fails with an explanatory error** rather than starting
-an empty server and discarding the `--configfile` you asked it to replay; pass
-`--configfile` to `start` instead, or use the open-source `rift` binary.
+`script`, `healthcheck`, `start` and `replay` all work exactly as upstream.
+`replay` is worth spelling out because it does less than the name suggests: it is
+`start` with `--configfile` pointed at the replayed file, and nothing else. In
+particular it performs no `removeProxies` transformation — that belongs to
+`save`, which is where upstream does it too.
+
+One deliberate divergence: **`replay` is refused with `--cluster`**. It loads a
+file straight into one node's engine, so clustered those imposters would never
+reach the replicated log — and the reconciler, which treats the replicated set
+as authoritative, would then delete them. A saved file is already a
+`PUT /imposters` body, so replay it through the admin API instead and the write
+replicates.
+
+Note what that guard does *not* cover: `--configfile` and `--datadir` reach the
+same node-local load with `--cluster` on and are **not** refused today, and
+`--datadir` is on the recommended clustered path because the cluster state
+directory defaults beneath it. Refusing `replay` removes one spelling of the
+hazard, not the hazard.
 
 ### PID-file caveats (upstream behaviour, reproduced)
 
