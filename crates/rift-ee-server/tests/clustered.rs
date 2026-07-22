@@ -235,7 +235,8 @@ async fn sigterm_fails_readiness_before_closing_any_listener() {
     tokio::time::timeout(Duration::from_secs(15), leaving)
         .await
         .expect("the leave completes")
-        .expect("the leave task did not panic");
+        .expect("the leave task did not panic")
+        .expect("a signal-driven leave is not an admin-plane failure");
 
     // And only then are the listeners actually gone.
     assert!(
