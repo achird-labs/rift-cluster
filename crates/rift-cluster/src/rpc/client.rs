@@ -132,13 +132,22 @@ impl PeerHealth for TrackedPeerHealth {
     }
 }
 
-/// Resolves a peer's advertised authority (`host:port`) to a dialable
-/// [`SocketAddr`], fresh on every call — no caching, so a changed pod IP (a
-/// StatefulSet rollout, a service mesh reassigning an address) is picked up on
-/// the very next attempt rather than baked in once at connection time.
+/// Resolves a peer's advertised authority (`host:port`) to the dialable
+/// [`SocketAddr`]s it names, fresh on every call — no caching, so a changed pod
+/// IP (a StatefulSet rollout, a service mesh reassigning an address) is picked
+/// up on the very next attempt rather than baked in once at connection time.
 /// Injectable so tests can substitute a mock without doing real DNS.
+///
+/// **Every** address is returned, in the resolver's own order, and callers try
+/// them in turn (#79). Returning only the first made a dual-stack name whose
+/// leading address nobody listens on permanently unreachable, even with a live
+/// address sitting second in the same answer.
+///
+/// An implementation must never answer `Ok` with an empty vec: no addresses is
+/// a resolution failure, and returning it as success would hand callers a list
+/// they silently loop zero times over.
 pub trait PeerResolver: Send + Sync {
-    fn resolve(&self, authority: &str) -> std::io::Result<SocketAddr>;
+    fn resolve(&self, authority: &str) -> std::io::Result<Vec<SocketAddr>>;
 }
 
 /// The production resolver: standard OS/DNS resolution via
@@ -147,12 +156,21 @@ pub trait PeerResolver: Send + Sync {
 pub struct DnsResolver;
 
 impl PeerResolver for DnsResolver {
-    fn resolve(&self, authority: &str) -> std::io::Result<SocketAddr> {
+    fn resolve(&self, authority: &str) -> std::io::Result<Vec<SocketAddr>> {
         use std::net::ToSocketAddrs;
-        authority
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| std::io::Error::other(format!("no address found for {authority}")))
+        // The OS resolver's order is preserved exactly. It implements RFC 6724
+        // destination-address selection and is the only component that knows
+        // this host's actual connectivity; re-sorting it here — "prefer IPv4",
+        // say — would pick a guaranteed-unreachable address on an IPv6-only
+        // host whose name still carries a stale A record. That is this bug
+        // mirrored, not fixed.
+        let addrs: Vec<SocketAddr> = authority.to_socket_addrs()?.collect();
+        if addrs.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "no address found for {authority}"
+            )));
+        }
+        Ok(addrs)
     }
 }
 
