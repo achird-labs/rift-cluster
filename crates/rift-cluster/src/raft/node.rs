@@ -2198,7 +2198,11 @@ mod tests {
                 if tokio::time::Instant::now() >= deadline {
                     break false;
                 }
-                n2.raft.trigger().elect().await.expect("trigger an election");
+                n2.raft
+                    .trigger()
+                    .elect()
+                    .await
+                    .expect("trigger an election");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         };
