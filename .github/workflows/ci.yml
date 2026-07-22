@@ -37,6 +37,40 @@ jobs:
       - name: Single prometheus copy
         run: scripts/check-single-prometheus.sh
 
+  # No openraft in `rift-cluster`'s public API — an acceptance criterion of
+  # issue #6 that the compiler cannot check. Why it matters, and why the check
+  # has no exemptions, is documented in the script itself; this job only
+  # supplies the toolchain.
+  #
+  # Nightly is confined to this one job because rustdoc JSON — the only
+  # machine-readable view of a crate's public surface — is nightly-only. The
+  # nightly and the cargo-public-api version are pinned so the check is
+  # reproducible, not because any specific pair is required. If you bump either,
+  # just re-run this job: an incompatibility shows up immediately as a parse
+  # error, not as a wrong answer.
+  public-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Nightly is the default toolchain here, so it is what both builds the
+      # tool and runs the check.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-01
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api --version 0.51.0 --locked
+
+      # The same script a developer can run locally, so what CI checks and what
+      # they can check cannot drift.
+      - name: No openraft in the public API
+        run: scripts/check-public-api.sh
+
   # The container tier (issue #11): real processes, killed and restarted. Its
   # own job because it needs Docker and takes minutes, and because a container
   # runtime failure must not read as "the code is broken".

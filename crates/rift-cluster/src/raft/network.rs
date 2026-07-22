@@ -586,7 +586,7 @@ async fn committed_voters(
 /// [`remove_member`] drops it from membership entirely — which is exactly why
 /// [`super::node::RaftNode::leave`] can run both steps as one local call when
 /// it is itself the leaving leader, with no separate transfer step needed.
-async fn demote_voter(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), RpcError> {
+pub(crate) async fn demote_voter(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), RpcError> {
     let is_voter = raft
         .with_raft_state(move |state| {
             state
@@ -960,23 +960,58 @@ mod tests {
     /// after a rollout moved it.
     #[tokio::test]
     async fn resolver_is_consulted_per_send() {
+        use crate::rpc::{AlwaysHealthy, RpcClientConfig};
+        use openraft::Vote;
+        use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+        use openraft::raft::VoteRequest;
+
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let resolver: Arc<dyn PeerResolver> = Arc::new(CountingResolver {
             calls: calls.clone(),
             addr: "127.0.0.1:1".parse().expect("valid addr"),
         });
 
-        resolve_peer(&resolver, 1, "some-peer:4790")
-            .await
-            .expect("resolves");
-        resolve_peer(&resolver, 1, "some-peer:4790")
-            .await
-            .expect("resolves");
+        // Nothing listens on the resolved address, so both sends fail — which is
+        // fine. What is under test is how many times the resolver was asked,
+        // not whether the RPC landed. No retries, so one send is one resolve.
+        let client = RpcClient::new(
+            None,
+            Arc::new(AlwaysHealthy),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(50),
+                request_timeout: Duration::from_millis(50),
+                max_retries: 0,
+            },
+        );
+        let mut network = RpcNetwork::new(client, resolver);
+
+        // Driven through one `PeerClient` from `new_client`, which is the whole
+        // point: calling the free `resolve_peer` twice would pass even if
+        // resolution were hoisted into `new_client` and cached here — the exact
+        // optimisation this test exists to forbid.
+        //
+        // A hostname, never a literal: `resolve_authority` short-circuits a
+        // literal without touching the resolver, so a literal would count zero
+        // and prove nothing.
+        let mut peer = network
+            .new_client(2, &BasicNode::new("some-peer:4790".to_owned()))
+            .await;
+
+        for _ in 0..2 {
+            let request = VoteRequest {
+                vote: Vote::new(1, 1),
+                last_log_id: None,
+            };
+            let _ = peer
+                .vote(request, RPCOption::new(Duration::from_millis(50)))
+                .await;
+        }
 
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "each send must consult the resolver again, never reuse a cached result"
+            "every send must re-resolve; resolution hoisted into new_client and cached would \
+             read 1 here, and would keep dialing a pod's old IP after a rollout moved it"
         );
     }
 

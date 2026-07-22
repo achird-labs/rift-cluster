@@ -5,19 +5,19 @@
 //! The log's application payload is [`crate::control::ControlRequest`] — the
 //! real ADR §4.1 op set over the upstream `ImposterConfig` — and the response is
 //! [`crate::control::ControlResponse`], carrying the applying log index as the
-//! revision. See [`store`] for the state-machine semantics (deterministic
-//! tables first, best-effort engine drive after) and [`crate::control`] for the
-//! op set and its validation rules.
+//! revision. See the `store` module for the state-machine semantics
+//! (deterministic tables first, best-effort engine drive after) and
+//! [`crate::control`] for the op set and its validation rules.
 //!
 //! Pre-#9 state directories carried a spike-era log format (`PutImposter` over
 //! an opaque string body); they are wiped, not migrated — the format changed
 //! before any release shipped.
 
 pub mod identity;
-pub mod network;
+pub(crate) mod network;
 pub mod node;
 pub mod ring;
-pub mod store;
+pub(crate) mod store;
 
 pub use identity::NodeIdentity;
 pub use node::{LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport};
@@ -37,7 +37,7 @@ pub type NodeId = u64;
 
 openraft::declare_raft_types!(
     /// The openraft type configuration for the control-plane group.
-    pub TypeConfig:
+    pub(crate) TypeConfig:
         D = ControlRequest,
         R = ControlResponse,
         NodeId = u64,

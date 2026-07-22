@@ -771,7 +771,7 @@ impl RaftNode {
     /// the ids of members that had NOT confirmed by the deadline; empty means
     /// the whole fleet has applied the write.
     ///
-    /// Peers report over [`CLUSTER_APPLIED_PATH`]; this node answers from its
+    /// Peers report over the cluster applied-index endpoint; this node answers from its
     /// own state machine. A member that cannot be reached is simply unconfirmed
     /// — the barrier degrades to a warning, never an error (the write is
     /// already durable and committed). "Members" is the full membership,
@@ -2066,6 +2066,189 @@ mod tests {
         );
 
         node.shutdown().await.ok();
+    }
+
+    /// Issue #71: a repeated eviction is a cheap no-op, not a second membership
+    /// change.
+    ///
+    /// The leave RPC handler re-runs `evict` on every retried leave, and
+    /// `leave_inner` retries the whole sequence from whichever node leads now,
+    /// so a second call against an already-departed node is the normal case —
+    /// not an edge one. It must return promptly without submitting anything;
+    /// a version that re-submitted would put a membership change on the log for
+    /// every retry a flaky network produced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evict_twice_is_a_cheap_no_op() {
+        use crate::raft::network::{self, EvictOutcome};
+
+        let (d1, d2, d3) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+        n2.join_via(n1.advertise()).await.expect("n2 join");
+        n3.join_via(n1.advertise()).await.expect("n3 join");
+        let all = BTreeSet::from([1, 2, 3]);
+        assert_eq!(wait_voters(&n1, &all).await, all, "three voters to start");
+
+        assert_eq!(
+            network::evict(&n1.raft, &n1.membership_gate, 3)
+                .await
+                .expect("first eviction"),
+            EvictOutcome::Removed
+        );
+        let survivors = BTreeSet::from([1, 2]);
+        assert_eq!(
+            wait_voters(&n1, &survivors).await,
+            survivors,
+            "the first eviction must land"
+        );
+        let membership_after_first = n1.raft.metrics().borrow().membership_config.clone();
+
+        // Bounded: a second eviction that tried to submit another membership
+        // change would block on the commit barrier rather than return.
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            network::evict(&n1.raft, &n1.membership_gate, 3),
+        )
+        .await
+        .expect("a repeated eviction must return promptly, not submit and wait")
+        .expect("a repeated eviction is not an error");
+        assert_eq!(second, EvictOutcome::Removed, "still gone is still removed");
+
+        assert_eq!(
+            n1.raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .log_id()
+                .map(|l| l.index),
+            membership_after_first.log_id().map(|l| l.index),
+            "the second eviction must not append another membership entry"
+        );
+
+        for node in [&n1, &n2, &n3] {
+            node.shutdown().await.ok();
+        }
+    }
+
+    /// Issue #71: a half-finished departure is completed by whoever leads next.
+    ///
+    /// `evict` is demote-then-remove, two committed entries. If leadership moves
+    /// between them the departing node is a learner that is still a member, and
+    /// `leave_inner` retries against the new leader. That retry only works
+    /// because both halves no-op when already done — this is the test for that
+    /// property, and nothing else exercises a leadership change mid-departure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evict_completes_from_a_new_leader_after_partial_departure() {
+        use crate::raft::network::{self, EvictOutcome};
+
+        let (d1, d2, d3) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+        n2.join_via(n1.advertise()).await.expect("n2 join");
+        n3.join_via(n1.advertise()).await.expect("n3 join");
+        let all = BTreeSet::from([1, 2, 3]);
+        assert_eq!(wait_voters(&n1, &all).await, all, "three voters to start");
+
+        // Half of the departure only: n3 is demoted but still a member.
+        network::demote_voter(&n1.raft, 3)
+            .await
+            .expect("demote the departing node");
+        let survivors = BTreeSet::from([1, 2]);
+        assert_eq!(
+            wait_voters(&n1, &survivors).await,
+            survivors,
+            "the demote must land"
+        );
+        assert!(
+            n1.raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .nodes()
+                .any(|(id, _)| *id == 3),
+            "n3 must still be a member — this is the half-finished state"
+        );
+
+        // Move leadership without losing quorum. Killing n1 would leave one of
+        // two voters, which cannot elect.
+        n2.raft
+            .trigger()
+            .elect()
+            .await
+            .expect("trigger an election");
+        assert!(
+            wait_until(|| n2.status().is_leader).await,
+            "n2 must take over before the retry"
+        );
+
+        // Pin the no-op guard directly, before the eviction below. Every other
+        // assertion in this test passes without it: an unguarded `demote_voter`
+        // against an already-demoted node submits a legal membership entry that
+        // commits fine, the removal still lands, and the final state is
+        // identical. The only visible difference is the entry that should never
+        // have been written — so that is what gets asserted.
+        let membership_index = |node: &RaftNode| {
+            node.raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .log_id()
+                .map(|l| l.index)
+        };
+        let before_redundant_demote = membership_index(&n2);
+        network::demote_voter(&n2.raft, 3)
+            .await
+            .expect("demoting an already-demoted node is not an error");
+        assert_eq!(
+            membership_index(&n2),
+            before_redundant_demote,
+            "a redundant demote must append no membership entry — without that guard, every \
+             retried departure writes to the log"
+        );
+
+        assert_eq!(
+            network::evict(&n2.raft, &n2.membership_gate, 3)
+                .await
+                .expect("the new leader finishes the departure"),
+            EvictOutcome::Removed,
+            "the demote half must no-op so the removal half can complete"
+        );
+
+        for node in [&n1, &n2] {
+            assert!(
+                wait_until(|| !node
+                    .raft
+                    .metrics()
+                    .borrow()
+                    .membership_config
+                    .nodes()
+                    .any(|(id, _)| *id == 3))
+                .await,
+                "node {} still lists the departed node",
+                node.id()
+            );
+        }
+
+        // The surviving quorum is live, not merely consistent.
+        n2.put_imposter(imposter(8080, "after-churn"))
+            .await
+            .expect("the new leader must still commit");
+
+        for node in [&n1, &n2, &n3] {
+            node.shutdown().await.ok();
+        }
     }
 
     /// Issue #69: the voter floor guards voters, not members.
