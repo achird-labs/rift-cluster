@@ -241,9 +241,13 @@ sources resolve on the node that accepts the write, under that node's
 `--scripts-dir`, before replication (upstream #356) — followers receive
 inline code and need no scripts dir of their own, so deploy script files to
 every node that can receive admin writes. A resolution failure is upstream's
-400 (`bad data` type, `Script resolution failed: …` message); without
-`--allowInjection` nothing about this changes — the injection gate still
-refuses all script surfaces first, before resolution ever runs. Concurrent
+400 (`bad data` type, `Script resolution failed: …` message). What resolution
+produces is then compiled before it is accepted, so a script that resolves but
+does not parse is refused the same way (`Script validation failed: …`) instead
+of replicating and failing at bind time on every node — upstream's admin-time
+gate, applied to the clustered path. Without `--allowInjection` nothing about
+either step changes — the injection gate still refuses all script surfaces
+first, before resolution ever runs. Concurrent
 writers to the *same* imposter are last-writer-wins by default; a
 single-imposter write may carry an `If-Match` header to condition on the
 record's current revision instead — either the exact `Rift-Cluster-Revision`

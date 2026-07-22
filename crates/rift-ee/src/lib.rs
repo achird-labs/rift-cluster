@@ -62,6 +62,13 @@ pub mod seams {
         RiftScriptConfig, ScriptBaseDir, ScriptResolveError, resolve_scripts, resolve_stub_scripts,
     };
 
+    /// Post-resolution script validation (upstream's admin-time 400 gate): the
+    /// clustered admin front validates resolved ops before parking, so nothing
+    /// syntactically broken is ever committed to the log. Only meaningful
+    /// *after* resolution — an unresolved `file:`/`ref:` source carries no
+    /// `code` to parse.
+    pub use rift_mock_core::scripting::{validate_stub, validate_stubs};
+
     /// The typed admin error envelope (upstream #797): a stable `type` slug
     /// plus the frozen legacy `code`. Client-visible cluster failures emit
     /// this, never a hand-rolled shape.
@@ -171,6 +178,7 @@ mod tests {
         _named::<ScriptBaseDir>();
         _named::<ScriptResolveError>();
         let _ = (resolve_scripts, resolve_stub_scripts);
+        let _ = (validate_stub, validate_stubs);
         let _ = ErrorKind::Unavailable;
         let _ = (error_response_typed, config_uses_script_surface);
         _named::<BackendUnavailable>();
