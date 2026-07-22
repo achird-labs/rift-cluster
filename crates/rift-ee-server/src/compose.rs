@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use rift_cluster::rpc::Router;
 use rift_cluster::{
-    ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, RaftNode, metrics,
+    Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, RaftNode,
+    metrics,
 };
 use rift_ee::seams::{ImposterManager, RunningServer, ServerBuilder, TlsDefaults};
 
@@ -147,7 +148,7 @@ pub struct ComposedServer {
     /// Replays parked intents on leader changes (issue #9 R4); same lifecycle
     /// rules as the reconciler.
     intent_replayer: Option<tokio::task::JoinHandle<()>>,
-    cluster_addr: Option<SocketAddr>,
+    cluster_addr: Option<Authority>,
     /// The clustered engine, held so shutdown can stop its imposters: their
     /// listeners are independent of the admin plane, and a composed shutdown
     /// that leaves them serving would strand every bound port (visible
@@ -179,8 +180,8 @@ impl ComposedServer {
 
     /// The bound cluster port, when clustering is on.
     #[must_use]
-    pub fn cluster_addr(&self) -> Option<SocketAddr> {
-        self.cluster_addr
+    pub fn cluster_addr(&self) -> Option<&Authority> {
+        self.cluster_addr.as_ref()
     }
 
     /// The readiness latch behind `/readyz`.
@@ -413,7 +414,9 @@ pub async fn start_with_runtimes(
     let node = match RaftNode::start(NodeConfig {
         node_id: identity.node_id(),
         bind,
-        advertise: cli.cluster.cluster_advertise,
+        // Cloned for the same reason as `data_dir` below: `cli` itself is
+        // still needed whole, by `attach_data_plane`.
+        advertise: cli.cluster.cluster_advertise.clone(),
         // Cloned because the composed server keeps its own handle on the state
         // directory: it is where a departure gets recorded on the way out.
         data_dir: state_dir.clone(),
@@ -437,7 +440,7 @@ pub async fn start_with_runtimes(
         return Err(anyhow::Error::new(e).context("binding the operator surface to the node"));
     }
 
-    let cluster_addr = node.advertise_addr();
+    let cluster_addr = node.advertise().clone();
     let leave_timeout = Duration::from_secs(cli.cluster.cluster_leave_timeout);
 
     // Everything from here can fail with a live node and, later, a live server.
@@ -604,7 +607,7 @@ async fn attempt_rejoin(node: &RaftNode, targets: &[String]) {
             }
         };
         for addr in resolved {
-            match node.join_via(addr).await {
+            match node.join_via(&Authority::from(addr)).await {
                 Ok(()) => {
                     tracing::info!(%addr, "rejoined through a peer after the fallback window");
                     return;
@@ -913,7 +916,7 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
                 }
             };
             for addr in resolved {
-                match node.join_via(addr).await {
+                match node.join_via(&Authority::from(addr)).await {
                     Ok(()) => {
                         tracing::info!(%addr, "joined the cluster through seed");
                         clear_departed_marker(&state_dir);

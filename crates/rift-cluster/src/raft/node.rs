@@ -32,8 +32,8 @@ use super::store::{self, RedbStateMachine};
 use super::{NodeId, TypeConfig};
 use crate::control::{ControlOp, ControlRequest, ControlResponse, TenantId};
 use crate::rpc::{
-    DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer, RpcServerConfig,
-    Signer, TrackedPeerHealth, Verifier,
+    Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer,
+    RpcServerConfig, Signer, TrackedPeerHealth, Verifier,
 };
 
 /// Log-file name for the Raft storage inside the node's data directory.
@@ -82,9 +82,9 @@ pub struct NodeConfig {
     pub node_id: NodeId,
     /// The address to bind the cluster port on. `:0` binds an ephemeral port.
     pub bind: SocketAddr,
-    /// The address peers dial this node on. Defaults to the bound address, which
-    /// is correct when bind and advertise are the same host:port.
-    pub advertise: Option<SocketAddr>,
+    /// The authority peers dial this node on. Defaults to the bound address,
+    /// which is correct when bind and advertise are the same host:port.
+    pub advertise: Option<Authority>,
     /// Directory holding this node's Raft log/vote/snapshot database.
     pub data_dir: PathBuf,
     /// Shared HMAC secret for the cluster port. `None` runs it unauthenticated
@@ -217,7 +217,7 @@ pub enum LeaveOutcome {
 /// The control-plane Raft node.
 pub struct RaftNode {
     id: NodeId,
-    advertise: SocketAddr,
+    advertise: Authority,
     raft: Raft<TypeConfig>,
     // Authenticated client for node-driven admin RPCs (e.g. seed join). Shares
     // the same signer/pool the Raft network uses.
@@ -310,7 +310,7 @@ impl RaftNode {
         let local = server
             .local_addr()
             .map_err(|e| NodeError::Bind(e.to_string()))?;
-        let advertise = config.advertise.unwrap_or(local);
+        let advertise = config.advertise.unwrap_or_else(|| Authority::from(local));
 
         let client = RpcClient::new(
             signer,
@@ -354,10 +354,10 @@ impl RaftNode {
         self.id
     }
 
-    /// The address peers dial this node on.
+    /// The authority peers dial this node on.
     #[must_use]
-    pub fn advertise_addr(&self) -> SocketAddr {
-        self.advertise
+    pub fn advertise(&self) -> &Authority {
+        &self.advertise
     }
 
     /// Whether this node's log already carries a cluster membership — i.e. it
@@ -395,7 +395,7 @@ impl RaftNode {
     /// Leader-side: add `id`@`addr` as a learner, blocking until it has caught up
     /// via replication. Fails with [`NodeError::Membership`] if this node is not
     /// the leader.
-    pub async fn add_learner(&self, id: NodeId, addr: SocketAddr) -> Result<(), NodeError> {
+    pub async fn add_learner(&self, id: NodeId, addr: &Authority) -> Result<(), NodeError> {
         self.raft
             .add_learner(id, BasicNode::new(addr.to_string()), true)
             .await
@@ -416,7 +416,11 @@ impl RaftNode {
     /// Ask an existing cluster member `seed` to admit this node: the seed (if
     /// leader) adds it as a learner, waits for catch-up, and promotes it to voter
     /// while the cluster is under the auto-promote ceiling.
-    pub async fn join_via(&self, seed: SocketAddr) -> Result<(), NodeError> {
+    pub async fn join_via(&self, seed: &Authority) -> Result<(), NodeError> {
+        let peer = self
+            .resolve(seed.as_str())
+            .await
+            .map_err(|e| NodeError::Membership(format!("resolve seed {seed}: {e}")))?;
         let request = JoinRequest {
             node_id: self.id,
             advertise: self.advertise.to_string(),
@@ -424,7 +428,7 @@ impl RaftNode {
         let body =
             serde_json::to_vec(&request).map_err(|e| NodeError::Membership(e.to_string()))?;
         self.client
-            .call(seed, "POST", CLUSTER_JOIN_PATH, body)
+            .call(peer, "POST", CLUSTER_JOIN_PATH, body)
             .await
             .map_err(|e| NodeError::Membership(e.to_string()))?;
         Ok(())
@@ -658,13 +662,9 @@ impl RaftNode {
     }
 
     /// Resolve a peer authority off the runtime thread, via the same resolver
-    /// replication uses.
+    /// replication uses — including its literal-address fast path.
     async fn resolve(&self, authority: &str) -> std::io::Result<SocketAddr> {
-        let resolver = Arc::clone(&self.resolver);
-        let owned = authority.to_owned();
-        tokio::task::spawn_blocking(move || resolver.resolve(&owned))
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?
+        network::resolve_authority(&self.resolver, authority).await
     }
 
     /// Submit a control op through Raft and return the state machine's
@@ -726,10 +726,10 @@ impl RaftNode {
         let mut detail = String::from("local write refused: not the leader");
         for _ in 0..Self::FORWARD_ATTEMPTS {
             let Some(addr) = next.take() else { break };
-            let peer: SocketAddr = match addr.parse() {
+            let peer = match self.resolve(&addr).await {
                 Ok(peer) => peer,
                 Err(e) => {
-                    detail = format!("leader hint {addr:?} does not parse: {e}");
+                    detail = format!("leader hint {addr:?} does not resolve: {e}");
                     break;
                 }
             };
@@ -790,11 +790,43 @@ impl RaftNode {
         };
 
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut pending: BTreeMap<NodeId, String> = members.into_iter().collect();
+
+        // Resolved once, before the retry loop — not per round. Resolution is a
+        // blocking call on the pool, and `spawn_blocking` cannot be cancelled,
+        // so a name that is slow or dead would add the OS resolver's own
+        // timeout to *every* pass and push this past the `timeout` this
+        // function promises to honour. It is the same hazard `leader_authority`
+        // documents for `leave`. Freshness is not lost that matters: a barrier
+        // is one write, and no address usefully changes inside its window.
+        let mut pending: BTreeMap<NodeId, Option<SocketAddr>> = BTreeMap::new();
+        for (id, addr) in members {
+            if id == self.id {
+                pending.insert(id, None);
+                continue;
+            }
+            match self.resolve(&addr).await {
+                Ok(peer) => {
+                    pending.insert(id, Some(peer));
+                }
+                Err(e) => {
+                    // Not inserted, so it can never be confirmed — it is
+                    // reported unapplied, which is the barrier's documented
+                    // degrade. Logged once, not once per 25 ms round.
+                    tracing::debug!(
+                        node_id = id,
+                        %addr,
+                        error = %e,
+                        "await_applied: peer address did not resolve; leaving it unconfirmed"
+                    );
+                    pending.insert(id, None);
+                }
+            }
+        }
+
         loop {
             let confirmed: Vec<NodeId> = {
                 let mut confirmed = Vec::new();
-                for (id, addr) in &pending {
+                for (id, peer) in &pending {
                     if *id == self.id {
                         let applied = self.raft.metrics().borrow().last_applied.map(|l| l.index);
                         if applied.is_some_and(|a| a >= revision) {
@@ -802,9 +834,7 @@ impl RaftNode {
                         }
                         continue;
                     }
-                    let Ok(peer) = addr.parse::<SocketAddr>() else {
-                        continue;
-                    };
+                    let Some(peer) = *peer else { continue };
                     if let Ok(reply) = self
                         .client
                         .call(peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
@@ -848,7 +878,17 @@ impl RaftNode {
         if leader_id == self.id {
             return self.raft.metrics().borrow().last_applied.map(|l| l.index);
         }
-        let peer: SocketAddr = addr.parse().ok()?;
+        let peer = match self.resolve(&addr).await {
+            Ok(peer) => peer,
+            Err(e) => {
+                tracing::debug!(
+                    %addr,
+                    error = %e,
+                    "leader_applied: leader address did not resolve; reporting not-yet"
+                );
+                return None;
+            }
+        };
         let reply = self
             .client
             .call(peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
@@ -1428,8 +1468,8 @@ mod tests {
         let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
 
         // Seed-join both followers against the leader.
-        n2.join_via(n1.advertise_addr()).await.expect("n2 join");
-        n3.join_via(n1.advertise_addr()).await.expect("n3 join");
+        n2.join_via(n1.advertise()).await.expect("n2 join");
+        n3.join_via(n1.advertise()).await.expect("n3 join");
 
         // The join path auto-promotes, so all three converge on the same voters.
         let want = BTreeSet::from([1, 2, 3]);
@@ -1506,8 +1546,8 @@ mod tests {
         n1.cluster_init().await.expect("init n1");
         let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
         let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
-        n2.join_via(n1.advertise_addr()).await.expect("n2 join");
-        n3.join_via(n1.advertise_addr()).await.expect("n3 join");
+        n2.join_via(n1.advertise()).await.expect("n2 join");
+        n3.join_via(n1.advertise()).await.expect("n3 join");
 
         let all = BTreeSet::from([1, 2, 3]);
         assert_eq!(wait_voters(&n1, &all).await, all, "three voters to start");
@@ -1552,7 +1592,7 @@ mod tests {
             "it must still name the peers that can readmit it, got {peers:?}"
         );
         assert!(
-            peers.contains(&n1.advertise_addr().to_string()),
+            peers.contains(&n1.advertise().to_string()),
             "the surviving leader must be among them, got {peers:?}"
         );
 
@@ -1572,8 +1612,8 @@ mod tests {
         n1.cluster_init().await.expect("init n1");
         let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
         let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
-        n2.join_via(n1.advertise_addr()).await.expect("n2 join");
-        n3.join_via(n1.advertise_addr()).await.expect("n3 join");
+        n2.join_via(n1.advertise()).await.expect("n2 join");
+        n3.join_via(n1.advertise()).await.expect("n3 join");
         // n1 (the bootstrapping leader) keeps leadership; wait until it holds a
         // quorum lease so the "was healthy, then lost it" transition is real.
         assert!(
@@ -1604,7 +1644,7 @@ mod tests {
         let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
         n1.cluster_init().await.expect("init n1");
         let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
-        n2.join_via(n1.advertise_addr()).await.expect("n2 join");
+        n2.join_via(n1.advertise()).await.expect("n2 join");
 
         // A write submitted to the follower must not silently succeed: openraft
         // refuses it (forward-to-leader), surfaced as a typed NotLeader error
@@ -1630,8 +1670,8 @@ mod tests {
         n1.cluster_init().await.expect("init n1");
         let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
         let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
-        n2.join_via(n1.advertise_addr()).await.expect("n2 join");
-        n3.join_via(n1.advertise_addr()).await.expect("n3 join");
+        n2.join_via(n1.advertise()).await.expect("n2 join");
+        n3.join_via(n1.advertise()).await.expect("n3 join");
 
         // Kill the leader; the remaining two must elect a new one.
         n1.shutdown().await.expect("shutdown n1");
@@ -1680,7 +1720,7 @@ mod tests {
         let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
         let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
 
-        let seed = n1.advertise_addr();
+        let seed = n1.advertise();
         let (r2, r3) = tokio::join!(n2.join_via(seed), n3.join_via(seed));
         r2.expect("n2 join must not lose the admission race");
         r3.expect("n3 join must not lose the admission race");
@@ -1714,7 +1754,7 @@ mod tests {
             let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
             let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
 
-            let seed = n1.advertise_addr();
+            let seed = n1.advertise();
             let (r2, r3) = tokio::join!(n2.join_via(seed), n3.join_via(seed));
             r2.unwrap_or_else(|e| panic!("round {round}: n2 join lost the admission race: {e}"));
             r3.unwrap_or_else(|e| panic!("round {round}: n3 join lost the admission race: {e}"));
@@ -1752,8 +1792,8 @@ mod tests {
 
             let gate = tokio::sync::Mutex::new(());
             let (r2, r3) = tokio::join!(
-                network::admit(&n1.raft, &gate, 2, n2.advertise_addr().to_string(), 2),
-                network::admit(&n1.raft, &gate, 3, n3.advertise_addr().to_string(), 2),
+                network::admit(&n1.raft, &gate, 2, n2.advertise().to_string(), 2),
+                network::admit(&n1.raft, &gate, 3, n3.advertise().to_string(), 2),
             );
             r2.unwrap_or_else(|e| {
                 panic!("round {round}: losing the promotion race must not fail the join: {e}")
@@ -1801,6 +1841,233 @@ mod tests {
         }
     }
 
+    /// Reserve a currently-free localhost port and release it, so a config can
+    /// name a fixed port before anything binds it.
+    fn reserved_port() -> u16 {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a free port");
+        held.local_addr().expect("read reserved port").port()
+    }
+
+    /// A free port on whatever address `localhost` actually resolves to.
+    ///
+    /// A node that advertises `localhost:<port>` must *bind* what that name
+    /// resolves to, or the two disagree and nothing can reach it. Which family
+    /// wins is host-dependent — RFC 6724 ordering puts `::1` first on many
+    /// systems — so this asks rather than assumes, and reserves the port on the
+    /// same address it returns. Reserving on `127.0.0.1` and then binding
+    /// `[::1]` would prove nothing about the port that actually gets used.
+    fn localhost_bind() -> SocketAddr {
+        use std::net::ToSocketAddrs;
+        let resolved = ("localhost", 0)
+            .to_socket_addrs()
+            .expect("localhost resolves")
+            .next()
+            .expect("localhost resolves to at least one address");
+        let held = std::net::TcpListener::bind(SocketAddr::new(resolved.ip(), 0))
+            .expect("reserve a free port on the address localhost resolves to");
+        held.local_addr().expect("read reserved port")
+    }
+
+    /// Issue #68: a hostname advertise reaches membership and is resolved on
+    /// every send.
+    ///
+    /// This is the gate the whole issue rests on. Before it, `--cluster-advertise`
+    /// was typed `SocketAddr`, so no name could ever enter membership and the
+    /// per-send re-resolution added by #6 had nothing to re-resolve. Two things
+    /// have to hold: the membership must store the **name verbatim** (storing a
+    /// resolved address would pin the peer to whatever DNS said once, which is
+    /// the bug this prevents), and replication must still reach that peer —
+    /// which it can only do by resolving the name per send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hostname_advertise_round_trips_membership_and_replicates() {
+        let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+
+        // A fixed port on whatever `localhost` resolves to, so the advertised
+        // name and the bound address cannot disagree.
+        let bind = localhost_bind();
+        let port = bind.port();
+        let mut config = config_in(&d2, 2);
+        config.bind = bind;
+        config.advertise = Some(
+            format!("localhost:{port}")
+                .parse::<Authority>()
+                .expect("hostname authority"),
+        );
+        let n2 = RaftNode::start(config).await.expect("start n2");
+
+        n2.join_via(n1.advertise()).await.expect("n2 join");
+        let want = BTreeSet::from([1, 2]);
+        assert_eq!(wait_voters(&n1, &want).await, want, "both must be voters");
+
+        let stored = {
+            let receiver = n1.raft.metrics();
+            let metrics = receiver.borrow();
+            metrics
+                .membership_config
+                .nodes()
+                .find(|(id, _)| **id == 2)
+                .map(|(_, node)| node.addr.clone())
+                .expect("n2 is in the membership")
+        };
+        assert_eq!(
+            stored,
+            format!("localhost:{port}"),
+            "membership must keep the advertised name verbatim, not a resolved address"
+        );
+
+        n1.put_imposter(imposter(8080, "via-hostname"))
+            .await
+            .expect("leader write");
+        assert!(
+            wait_config(&n2, 8080, "via-hostname").await,
+            "replication must reach a peer whose membership address is a hostname"
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+    }
+
+    /// A two-node cluster whose **leader** advertises a name that does not
+    /// resolve, while binding a real port.
+    ///
+    /// The follower joins through the bound address, so the cluster forms — but
+    /// the leader's membership entry carries the unresolvable name, which is
+    /// exactly what a stale or misconfigured DNS record leaves behind. Every
+    /// path on the follower that has to dial the leader then has to cope with a
+    /// resolution failure. The returned `TempDir`s must be held for the lifetime
+    /// of the nodes.
+    async fn cluster_with_unresolvable_leader() -> (RaftNode, RaftNode, (TempDir, TempDir)) {
+        let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let port = reserved_port();
+        let mut c1 = config_in(&d1, 1);
+        c1.bind = format!("127.0.0.1:{port}").parse().expect("bind addr");
+        c1.advertise = Some(
+            "no-such-host.invalid:4790"
+                .parse::<Authority>()
+                .expect("authority parses even though it will not resolve"),
+        );
+        let n1 = RaftNode::start(c1).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        let bound = format!("127.0.0.1:{port}")
+            .parse::<Authority>()
+            .expect("bound authority");
+        n2.join_via(&bound)
+            .await
+            .expect("join through the bound address");
+        (n1, n2, (d1, d2))
+    }
+
+    /// Issue #68: a leader hint that cannot be resolved is reported, not
+    /// panicked on and not silently treated as success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn submit_reports_unavailable_when_leader_hint_cannot_resolve() {
+        let (n1, n2, _dirs) = cluster_with_unresolvable_leader().await;
+
+        let err = n2
+            .submit(ControlRequest {
+                op_id: Uuid::new_v4(),
+                principal: None,
+                issued_at_secs: 0,
+                expected_revision: None,
+                op: ControlOp::PutImposter {
+                    tenant: TenantId::default(),
+                    config: Box::new(imposter(8080, "never-lands")),
+                },
+            })
+            .await
+            .expect_err("a write cannot be forwarded to a leader that does not resolve");
+        assert!(
+            matches!(err, NodeError::Unavailable(_)),
+            "an unresolvable leader hint must surface as Unavailable, got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("no-such-host.invalid"),
+            "the error must name the authority that failed to resolve: {err}"
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+    }
+
+    /// Issue #68: the write barrier must report a member it cannot resolve as
+    /// **unapplied**, never as confirmed.
+    ///
+    /// This is the most dangerous of the resolve-failure paths. `await_applied`
+    /// backs the read-after-write guarantee, so counting an unreachable member
+    /// as confirmed would have the barrier claim a durability it never
+    /// established — wrong and quiet, which the project's error rules single out
+    /// as worse than failing loudly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn await_applied_reports_a_member_that_does_not_resolve_as_unapplied() {
+        let (n1, n2, _dirs) = cluster_with_unresolvable_leader().await;
+
+        let revision = n1
+            .put_imposter(imposter(8080, "barrier"))
+            .await
+            .expect("leader write")
+            .revision;
+
+        // From n2's side the only other member is n1, whose advertised name
+        // does not resolve, so it can never be confirmed.
+        let unapplied = n2.await_applied(revision, Duration::from_millis(500)).await;
+        assert!(
+            unapplied.contains(&1),
+            "an unresolvable member must be reported unapplied, got {unapplied:?}"
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+    }
+
+    /// Issue #68: the readiness gate reports "not yet" when the leader's
+    /// address does not resolve — it must not report a catch-up target it
+    /// never actually read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_applied_is_none_when_the_leader_address_does_not_resolve() {
+        let (n1, n2, _dirs) = cluster_with_unresolvable_leader().await;
+
+        assert_eq!(
+            n2.leader_applied().await,
+            None,
+            "an unresolvable leader address must read as not-yet, not as a target"
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+    }
+
+    /// Issue #68: a seed whose name does not resolve fails the join with a
+    /// membership error, rather than surfacing as a generic RPC failure that
+    /// reads like "the seed is not up yet".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_via_reports_membership_error_when_the_seed_does_not_resolve() {
+        let dir = TempDir::new().unwrap();
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+
+        let seed = "no-such-host.invalid:4790"
+            .parse::<Authority>()
+            .expect("authority parses even though it will not resolve");
+        let err = node
+            .join_via(&seed)
+            .await
+            .expect_err("an unresolvable seed cannot be joined");
+
+        assert!(
+            matches!(err, NodeError::Membership(_)),
+            "an unresolvable seed must be a membership error, got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("no-such-host.invalid"),
+            "the error must name the seed that failed to resolve: {err}"
+        );
+
+        node.shutdown().await.ok();
+    }
+
     /// Issue #69: the voter floor guards voters, not members.
     ///
     /// Removing a learner cannot cost the cluster a quorum member, so it is
@@ -1820,7 +2087,7 @@ mod tests {
         // A ceiling of 1 keeps n2 a learner, leaving n1 the only voter — which
         // is already below the floor, so a floor that ignored the voter/learner
         // distinction would refuse this.
-        network::admit(&n1.raft, &gate, 2, n2.advertise_addr().to_string(), 1)
+        network::admit(&n1.raft, &gate, 2, n2.advertise().to_string(), 1)
             .await
             .expect("admit as learner");
         assert_eq!(n1.status().voters, vec![1], "n2 must be a learner");
@@ -1850,7 +2117,7 @@ mod tests {
         let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
 
         let gate = tokio::sync::Mutex::new(());
-        network::admit(&n1.raft, &gate, 2, n2.advertise_addr().to_string(), 1)
+        network::admit(&n1.raft, &gate, 2, n2.advertise().to_string(), 1)
             .await
             .expect("a ceiling-capped admission must still succeed as learner");
 
@@ -1858,7 +2125,7 @@ mod tests {
 
         // A retried join (the joiner timed out and re-sent) is idempotent:
         // still Ok, still learner-only.
-        network::admit(&n1.raft, &gate, 2, n2.advertise_addr().to_string(), 1)
+        network::admit(&n1.raft, &gate, 2, n2.advertise().to_string(), 1)
             .await
             .expect("a retried ceiling-capped admission must stay idempotent");
         assert_eq!(n1.status().voters, vec![1], "the retry must not promote");

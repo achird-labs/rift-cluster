@@ -39,7 +39,7 @@ pub use raft::{
     KeyClass, LeaveOutcome, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey,
     RaftNode, Ring, StatusReport, TypeConfig,
 };
-pub use rpc::{Router, RpcClient, RpcError, RpcServer};
+pub use rpc::{Authority, AuthorityError, Router, RpcClient, RpcError, RpcServer};
 
 use serde::{Deserialize, Serialize};
 

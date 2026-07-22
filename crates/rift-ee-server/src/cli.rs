@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-use rift_cluster::{ClusterConfig, ConfigError, RuntimeTopology};
+use rift_cluster::{Authority, ClusterConfig, ConfigError, RuntimeTopology};
 use rift_ee::seams::Cli as OssCli;
 
 /// The `--cluster*` flags.
@@ -29,9 +29,11 @@ pub struct ClusterArgs {
     pub cluster_bind_public_ok: bool,
 
     /// Address peers dial this node on, when it differs from --cluster-bind
-    /// (NAT, port mapping, a pod behind a service)
-    #[arg(long, value_name = "ADDR", env = "RIFT_CLUSTER_ADVERTISE")]
-    pub cluster_advertise: Option<SocketAddr>,
+    /// (NAT, port mapping, a pod behind a service). Accepts a hostname as well
+    /// as a literal address; a hostname is re-resolved on every send, so a
+    /// StatefulSet's headless-service DNS entry stays valid across rollouts.
+    #[arg(long, value_name = "HOST:PORT", env = "RIFT_CLUSTER_ADVERTISE")]
+    pub cluster_advertise: Option<Authority>,
 
     /// Existing cluster members to join through (comma-separated). Re-resolved
     /// on each attempt, so a DNS name that gains members is picked up.

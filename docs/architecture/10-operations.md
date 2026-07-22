@@ -12,7 +12,8 @@ rift-ee-server \
   --cluster                          # master switch; everything below inert without it
   --cluster-init                     # FIRST node of a NEW cluster, exactly once
   --cluster-bind 10.0.0.5:4790       # required: Raft + owner RPC (TCP, one port)
-  --cluster-advertise <ip:port>      # NAT/container address peers should dial
+  --cluster-advertise <host:port>    # NAT/container address peers should dial; a hostname
+                                      # is re-resolved on every send, IPv6 literals bracketed
   --cluster-seeds rift-0.rift-hs:4790,rift-1.rift-hs:4790   # DNS re-resolved per attempt
   --cluster-secret-file /secrets/cluster.key                # required (or --cluster-insecure)
   --cluster-state-dir /var/lib/rift  # redb: raft log/vote/snapshot + flow shard

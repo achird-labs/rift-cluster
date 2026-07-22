@@ -156,6 +156,106 @@ impl PeerResolver for DnsResolver {
     }
 }
 
+/// A validated `host:port` authority — anything a peer can be dialed at:
+/// hostname, IPv4 literal, or bracketed IPv6 literal (issue #68). Stored and
+/// displayed byte-for-byte as given, never normalised: membership persists
+/// this string verbatim, and [`PeerResolver::resolve`] must receive exactly
+/// what an operator wrote so a hostname is re-resolved, not pinned to
+/// whichever address it happened to mean at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authority(String);
+
+impl Authority {
+    /// The authority exactly as parsed or built.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Authority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<SocketAddr> for Authority {
+    fn from(addr: SocketAddr) -> Self {
+        // `SocketAddr::to_string` already brackets IPv6, so this round-trips
+        // losslessly through `FromStr`'s literal fast path.
+        Self(addr.to_string())
+    }
+}
+
+impl std::str::FromStr for Authority {
+    type Err = AuthorityError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // A literal `SocketAddr` — IPv4, or IPv6 in the required `[..]:port`
+        // form — is always a valid authority; accept it verbatim rather than
+        // re-deriving it from the host/port split below.
+        if s.parse::<SocketAddr>().is_ok() {
+            return Ok(Self(s.to_owned()));
+        }
+
+        let Some((host, port)) = s.rsplit_once(':') else {
+            return Err(AuthorityError::MissingPort(s.to_owned()));
+        };
+        if host.is_empty() {
+            return Err(AuthorityError::EmptyHost(s.to_owned()));
+        }
+        // Only a host that is *neither* bracketed nor scheme-prefixed can be a
+        // mis-typed IPv6 literal. Testing for a colon alone claimed everything
+        // from `[::1]:` to `http://rift-0:4790` was an unbracketed IPv6 address
+        // — telling an operator to bracket something they never wrote.
+        if host.contains(':') && !host.starts_with('[') && !host.contains("//") {
+            // `::1:4790` is ambiguous: it could equally be the unbracketed
+            // IPv6 literal `::1:4790` with no port at all. Refuse it rather
+            // than guess — the operator must bracket it, exactly as
+            // `SocketAddr`'s own parser already requires.
+            return Err(AuthorityError::UnbracketedIpv6(s.to_owned()));
+        }
+        // A hostname or bracketed literal, and nothing else. Without this a
+        // pasted URL or a typo parses, reaches the Raft log, and becomes a
+        // membership entry that can never resolve — removable only by an admin
+        // membership change. Rejecting it at the boundary is the whole reason
+        // this is a validated type rather than a `String`.
+        if !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '[' | ']' | ':'))
+        {
+            return Err(AuthorityError::InvalidHost(s.to_owned()));
+        }
+        port.parse::<u16>()
+            .map_err(|_| AuthorityError::InvalidPort(s.to_owned()))?;
+
+        Ok(Self(s.to_owned()))
+    }
+}
+
+/// Why a `host:port` authority was refused, so clap's error names the
+/// specific problem rather than a generic parse failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AuthorityError {
+    /// No `:` at all, so there is no port to read.
+    #[error("{0:?} has no port; expected host:port")]
+    MissingPort(String),
+    /// The host half was empty (`:4790`).
+    #[error("{0:?} has an empty host; expected host:port")]
+    EmptyHost(String),
+    /// The host half contains a character no hostname or IP literal has —
+    /// whitespace, a URL scheme or path, or any other non-ASCII-hostname byte.
+    #[error("{0:?} has an invalid host; expected host:port")]
+    InvalidHost(String),
+    /// The port half did not parse as a `u16`.
+    #[error("{0:?} has an invalid port; expected host:port")]
+    InvalidPort(String),
+    /// An unbracketed IPv6 literal — ambiguous with a bare host containing a
+    /// colon. Write it as `[addr]:port`.
+    #[error("{0:?} looks like an unbracketed IPv6 address; write it as [addr]:port")]
+    UnbracketedIpv6(String),
+}
+
 /// Timeouts and retry budget for peer calls.
 #[derive(Debug, Clone, Copy)]
 pub struct RpcClientConfig {
@@ -361,6 +461,115 @@ fn backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #68: what an advertise address is allowed to be.
+    ///
+    /// The whole point is that a *name* is now allowed, so the accepting half
+    /// matters as much as the rejecting half.
+    #[test]
+    fn authority_accepts_hostname_ipv4_and_bracketed_ipv6() {
+        for good in [
+            "rift-0.rift-headless.ns.svc.cluster.local:4790",
+            "localhost:4790",
+            "127.0.0.1:4790",
+            "[::1]:4790",
+            "[2001:db8::1]:4790",
+        ] {
+            let authority: Authority = good.parse().unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert_eq!(
+                authority.as_str(),
+                good,
+                "an authority must round-trip verbatim — membership stores this string"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_rejects_missing_port_empty_host_and_unbracketed_ipv6() {
+        for bad in [
+            "rift-0",
+            "rift-0:",
+            ":4790",
+            "rift-0:notaport",
+            "host:70000",
+        ] {
+            assert!(
+                bad.parse::<Authority>().is_err(),
+                "{bad:?} must not parse as an authority"
+            );
+        }
+
+        // Ambiguous rather than merely malformed: `::1:4790` could be read as
+        // the IPv6 address `::1:4790` with no port, so it is refused with the
+        // bracketing spelled out instead of guessed at.
+        let err = "::1:4790"
+            .parse::<Authority>()
+            .expect_err("an unbracketed IPv6 literal is ambiguous");
+        assert!(
+            format!("{err}").contains('['),
+            "the error must tell the operator to bracket it: {err}"
+        );
+    }
+
+    /// A value that parses becomes a durable membership entry, so anything the
+    /// resolver could never answer must be refused at the boundary rather than
+    /// written to the Raft log and left for an admin membership change.
+    #[test]
+    fn authority_rejects_url_shaped_and_structurally_invalid_hosts() {
+        for bad in [
+            "http://rift-0:4790",
+            "user@rift-0:4790",
+            "//rift-0:4790",
+            "rift-0/foo:4790",
+            "*:4790",
+            "münchen:4790",
+            "rift 0:4790",
+        ] {
+            assert!(
+                bad.parse::<Authority>().is_err(),
+                "{bad:?} can never resolve, so it must not reach membership"
+            );
+        }
+    }
+
+    /// The bracketing advice must be reserved for values it actually applies
+    /// to — telling an operator to bracket an IPv6 address they never wrote
+    /// sends them chasing the wrong problem.
+    #[test]
+    fn authority_blames_the_real_problem_not_ipv6_bracketing() {
+        for (input, expect_brackets) in [
+            ("::1:4790", true),
+            ("http://rift-0:4790", false),
+            ("[::1]:", false),
+            ("[::1]:99999", false),
+        ] {
+            let err = input
+                .parse::<Authority>()
+                .expect_err("all of these are invalid");
+            assert_eq!(
+                format!("{err}").contains("unbracketed IPv6"),
+                expect_brackets,
+                "{input:?} was blamed on the wrong thing: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_from_socket_addr_round_trips() {
+        for addr in ["127.0.0.1:4790", "[::1]:4790"] {
+            let socket: SocketAddr = addr.parse().expect("socket addr");
+            let authority = Authority::from(socket);
+            assert_eq!(
+                authority.as_str().parse::<SocketAddr>().ok(),
+                Some(socket),
+                "a literal must survive the newtype so the fast path still fires"
+            );
+            assert!(
+                authority.as_str().parse::<Authority>().is_ok(),
+                "and must re-parse as an authority — this is the default-advertise path"
+            );
+        }
+    }
 
     struct NeverHealthy;
     impl PeerHealth for NeverHealthy {
