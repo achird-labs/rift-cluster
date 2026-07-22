@@ -307,30 +307,43 @@ impl ComposedServer {
         self.shutdown().await;
     }
 
-    /// Serve until either the admin plane stops or `signal` resolves, then leave
-    /// gracefully; returns the admin plane's outcome.
+    /// Serve until the admin plane stops, the clustered admin front stops, or
+    /// `signal` resolves, then leave gracefully; returns whichever arm's
+    /// outcome.
     ///
-    /// Racing the two is the point (issue #42). Awaiting only the signal left a
-    /// node whose admin accept loop had died running as a cluster member until
-    /// someone sent SIGTERM — the failure was not merely unpropagated, it was
-    /// unobserved.
+    /// Racing all three is the point (issue #42, extended by issue #64 to cover
+    /// the clustered front). Awaiting only the signal left a node whose admin
+    /// accept loop had died running as a cluster member until someone sent
+    /// SIGTERM — the failure was not merely unpropagated, it was unobserved.
+    /// The same was true of the front: it is the port operators actually talk
+    /// to when clustering is on, and #42 alone only covered the loopback OSS
+    /// admin behind it.
     ///
-    /// The leave runs on **both** arms, in RFC-001 §7.1.2 order. A dead admin
-    /// plane leaves the imposter listeners serving, so the balancer must still be
-    /// told to shed this node before any socket closes.
+    /// The leave runs on **every** arm, in RFC-001 §7.1.2 order. A dead admin
+    /// plane — either one — leaves the imposter listeners serving, so the
+    /// balancer must still be told to shed this node before any socket closes.
     pub async fn serve_until(self, signal: impl Future<Output = ()>) -> anyhow::Result<()> {
         let outcome = tokio::select! {
             // Biased so a death that is already observable wins over a signal
             // arriving in the same poll. Under `select!`'s default random order
-            // the signal could take that tie, dropping the wait future before it
-            // reads the outcome — and upstream delivers that error to the first
-            // caller only, so the node would exit 0 on a dead admin plane.
+            // the signal could take that tie, dropping either wait future before
+            // it reads its outcome — and both planes deliver that error to the
+            // first caller only, so the node would exit 0 on a dead admin plane.
             biased;
             result = self.server.wait() => result,
+            result = front_wait(self.front.as_ref()) => result,
             () = signal => Ok(()),
         };
         self.graceful_leave().await;
         outcome
+    }
+}
+
+/// Resolves when the clustered admin front dies; never resolves without one.
+async fn front_wait(front: Option<&AdminFront>) -> anyhow::Result<()> {
+    match front {
+        Some(front) => front.wait().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1074,6 +1087,83 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "a clean admin-plane stop must not be reported as a failure: {outcome:?}"
+        );
+    }
+
+    /// Issue #64: the *clustered* admin front dying ends the server too.
+    ///
+    /// #42 raced the loopback OSS admin against the signal, which covers the
+    /// plane behind the front — not the port operators actually talk to. A dead
+    /// front left a zombie: public admin gone, node still a Raft voter, data
+    /// plane still serving, `/readyz` still 200, and `serve_until` waiting
+    /// forever. Reaching the timeout below *is* that zombie.
+    ///
+    /// Unlike the clean OSS-plane stop above, this death is an error and must
+    /// travel out of `serve_until`.
+    #[tokio::test]
+    async fn front_death_ends_the_clustered_server() {
+        let state = TempDir::new().expect("tempdir");
+        let composed: ComposedServer = start(solo_cli(&state, "1")).await.expect("solo starts");
+
+        composed
+            .front
+            .as_ref()
+            .expect("clustered mode binds a front")
+            .abort_without_shutdown();
+
+        let serving = tokio::spawn(composed.serve_until(std::future::pending::<()>()));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(20), serving)
+            .await
+            .expect("serve_until must return when the admin front dies, without a signal")
+            .expect("the serve task did not panic");
+
+        let err = outcome
+            .expect_err("an unrequested front death must be reported as a failure, not swallowed");
+        assert!(
+            format!("{err}").contains("terminated unexpectedly"),
+            "the error must be the front's, not some other arm's: {err}"
+        );
+    }
+
+    /// Issue #64: §7.1.2 ordering holds on the front-death arm as well.
+    ///
+    /// The front is dead but the imposter listeners are still serving, so the
+    /// balancer must be told to shed this node before anything closes.
+    #[tokio::test]
+    async fn front_death_drains_before_closing_listeners() {
+        let state = TempDir::new().expect("tempdir");
+        let composed: ComposedServer = start(solo_cli(&state, "3")).await.expect("solo starts");
+        let probes = composed.probe_addr().expect("probes bound").to_string();
+
+        assert_eq!(probe_status(&probes, "/readyz").await, 200);
+
+        composed
+            .front
+            .as_ref()
+            .expect("clustered mode binds a front")
+            .abort_without_shutdown();
+        let serving = tokio::spawn(composed.serve_until(std::future::pending::<()>()));
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            probe_status(&probes, "/readyz").await,
+            503,
+            "the front-death arm must fail readiness before it closes anything"
+        );
+        assert_eq!(
+            probe_status(&probes, "/healthz").await,
+            200,
+            "liveness must survive the drain triggered by a front death"
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_secs(20), serving)
+            .await
+            .expect("the leave completes")
+            .expect("the serve task did not panic");
+        assert!(
+            outcome.is_err(),
+            "the front death is still an error: {outcome:?}"
         );
     }
 

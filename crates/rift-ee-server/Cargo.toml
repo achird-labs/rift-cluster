@@ -39,6 +39,7 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 subtle.workspace = true
 uuid.workspace = true
+tokio-util.workspace = true
 # Same fixed hash the ring uses: a node id derived from a name must be identical
 # on every node and across versions, which the std hasher does not promise.
 xxhash-rust.workspace = true

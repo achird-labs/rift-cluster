@@ -50,7 +50,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
@@ -71,6 +71,7 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::cli::WriteBarrier;
@@ -114,6 +115,21 @@ pub struct FrontConfig {
 pub struct AdminFront {
     local_addr: SocketAddr,
     task: JoinHandle<()>,
+    /// Cancelled by `shutdown` BEFORE it aborts, so the drop guard can tell an
+    /// expected ending from a death.
+    ///
+    /// Known limit: a panic landing in the window between this being cancelled
+    /// and the abort taking effect is classified as the requested stop, so
+    /// `wait` answers `Ok`. It is still logged — `shutdown` inspects the
+    /// `JoinError` itself and reports a non-cancelled one — and it can only
+    /// happen while the process is already tearing down on purpose, so it
+    /// cannot produce the live-but-deaf node this seam exists to catch.
+    shutdown_requested: CancellationToken,
+    /// Fired once the accept loop's outcome has been published.
+    done: CancellationToken,
+    /// The first `wait` caller takes the error; later callers get `Ok(())`
+    /// (`anyhow::Error` is not `Clone`).
+    outcome: Arc<Mutex<Option<anyhow::Result<()>>>>,
 }
 
 impl AdminFront {
@@ -125,12 +141,72 @@ impl AdminFront {
 
     /// Stop serving and release the port.
     pub async fn shutdown(self) {
+        self.shutdown_requested.cancel();
         self.task.abort();
         if let Err(e) = self.task.await
             && !e.is_cancelled()
         {
             tracing::error!(error = %e, "admin front accept task ended abnormally");
         }
+        // Defensive: an abort that kills the task before the drop guard
+        // publishes must not strand a waiter.
+        self.done.cancel();
+    }
+
+    /// Resolves when the accept loop stops. `Err` means it died without anyone
+    /// asking it to; a requested shutdown resolves `Ok(())`.
+    ///
+    /// Takes `&self`, not `self`: `serve_until` races this and must still own
+    /// the front afterwards so the graceful leave can shut it down.
+    ///
+    /// The error goes to the first caller only (`anyhow::Error` is not
+    /// `Clone`); later callers get `Ok(())`.
+    pub async fn wait(&self) -> anyhow::Result<()> {
+        self.done.cancelled().await;
+        // Recovered, not asserted, for the same reason the drop guard recovers:
+        // this seam exists to turn a dead accept loop into an error a caller can
+        // act on, so it must never become a panic in that caller instead.
+        self.outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or(Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort_without_shutdown(&self) {
+        self.task.abort();
+    }
+}
+
+/// Releases `AdminFront::wait` callers however the accept-loop task ends —
+/// normal exit (never happens by design), panic unwind, or `shutdown`'s abort.
+///
+/// The accept loop backs off and retries forever on systemic accept failure,
+/// by design — it does not exit normally. That leaves this guard as the sole
+/// publisher of an outcome, mirroring the upstream `ReleaseWaiters` idiom in
+/// `rift-http-proxy::admin_api::server`.
+struct ReleaseWaiters {
+    done: CancellationToken,
+    outcome: Arc<Mutex<Option<anyhow::Result<()>>>>,
+    shutdown_requested: CancellationToken,
+}
+
+impl Drop for ReleaseWaiters {
+    fn drop(&mut self) {
+        // Recover from a poisoned lock rather than panicking: this runs during
+        // unwind, where a second panic would abort the process.
+        let mut slot = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() && !self.shutdown_requested.is_cancelled() {
+            *slot = Some(Err(anyhow::anyhow!(
+                "admin front accept loop terminated unexpectedly"
+            )));
+        }
+        drop(slot);
+        self.done.cancel();
     }
 }
 
@@ -175,7 +251,23 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         fetch: Client::builder(TokioExecutor::new()).build_http(),
     });
 
+    let shutdown_requested = CancellationToken::new();
+    let done = CancellationToken::new();
+    let outcome: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+    // Built here, *before* the spawn, and moved into the task. `tokio::spawn`
+    // only queues a future, so one aborted before its first poll is dropped
+    // without a line of its body running — a guard constructed inside would
+    // never exist, and the death `wait` reports would be lost in silence. A
+    // captured value lives in the future's initial state instead, so dropping
+    // it unpolled still runs this `Drop`.
+    let release = ReleaseWaiters {
+        done: done.clone(),
+        outcome: Arc::clone(&outcome),
+        shutdown_requested: shutdown_requested.clone(),
+    };
+
     let task = tokio::spawn(async move {
+        let _release = release;
         // Same accept-loop shape as the probe listener: back off on systemic
         // accept failure, reap finished connections, never orphan a task.
         let mut backoff = Duration::from_millis(1);
@@ -222,7 +314,13 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         }
     });
 
-    Ok(AdminFront { local_addr, task })
+    Ok(AdminFront {
+        local_addr,
+        task,
+        shutdown_requested,
+        done,
+        outcome,
+    })
 }
 
 /// The config-mutating routes the front terminates. Everything else proxies.
@@ -1499,6 +1597,96 @@ mod tests {
         };
         let node = RaftNode::start(config).await.expect("node starts");
         (Arc::new(node), dir)
+    }
+
+    /// A bound front over a throwaway node, for the accept-loop observation
+    /// tests. `upstream_admin` is never dialled — nothing sends a request.
+    async fn test_front() -> (AdminFront, Arc<RaftNode>, tempfile::TempDir) {
+        let (node, dir) = test_node().await;
+        let front = bind(
+            FrontConfig {
+                public_addr: "127.0.0.1:0".to_owned(),
+                upstream_admin: "127.0.0.1:1".parse().expect("addr"),
+                api_key: None,
+                allow_injection: false,
+                scripts_dir: None,
+                barrier: crate::cli::WriteBarrier::None,
+                barrier_timeout: Duration::from_secs(1),
+                admin_async: false,
+            },
+            &node,
+        )
+        .await
+        .expect("front binds");
+        (front, node, dir)
+    }
+
+    /// Issue #64: the accept loop dying is *observable*.
+    ///
+    /// Before this, the front held a bare `JoinHandle` that was only ever
+    /// aborted. A panic in the loop left the node a zombie cluster member —
+    /// public admin dead, still a Raft voter, `/readyz` still 200 — and nothing
+    /// waiting on it, so `serve_until` never returned. An abort that `shutdown`
+    /// did not request takes byte-for-byte the same path as a panic unwind:
+    /// the drop guard runs and classifies it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_reports_unexpected_accept_loop_death() {
+        let (front, node, _dir) = test_front().await;
+
+        front.task.abort();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), front.wait())
+            .await
+            .expect("wait must resolve when the accept loop dies, not hang");
+        let err = outcome.expect_err("an unrequested death is an error, not a clean stop");
+        assert!(
+            format!("{err}").contains("terminated unexpectedly"),
+            "the error must name what happened: {err}"
+        );
+
+        // Take-once, asserted where there is genuinely something to lose: the
+        // error above was moved out of the slot, so a second waiter must get
+        // `Ok` rather than a clone that `anyhow::Error` cannot provide.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), front.wait())
+                .await
+                .expect("a second wait must resolve")
+                .is_ok(),
+            "the error goes to the first caller only"
+        );
+
+        node.shutdown().await.expect("node shuts down");
+    }
+
+    /// Issue #64: an operator shutdown is not an error.
+    ///
+    /// The same abort that means "died" above means "asked to stop" here; the
+    /// only difference is that `shutdown` records the intent first. A guard that
+    /// could not tell them apart would make every clean shutdown exit nonzero.
+    ///
+    /// `wait` is called *without* pre-cancelling `done`, so it blocks until the
+    /// guard has actually run and classified the ending. Cancelling `done` here
+    /// would let `wait` read an empty slot before the aborted task was even
+    /// dropped, and the assertion would hold no matter how the guard behaved —
+    /// including with the classification deleted outright.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_after_shutdown_is_ok() {
+        let (front, node, _dir) = test_front().await;
+
+        // What `shutdown` does, minus consuming the front, so `wait` can still
+        // be called: record the intent, then end the task.
+        front.shutdown_requested.cancel();
+        front.task.abort();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), front.wait())
+                .await
+                .expect("wait must resolve once the guard runs")
+                .is_ok(),
+            "a requested shutdown must not publish an error"
+        );
+
+        node.shutdown().await.expect("node shuts down");
     }
 
     async fn body_text(response: Response<FrontBody>) -> String {

@@ -56,6 +56,11 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 hyper = { version = "1.5", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1"] }
 http-body-util = "0.1"
+# `CancellationToken` for the admin front's death-observation seam (issue #64),
+# mirroring the upstream idiom in `rift-http-proxy::admin_api::server`. `sync`
+# (CancellationToken) is unconditional as of 0.7 — there is no such feature to
+# request; the crate resolves with default features only.
+tokio-util = "0.7"
 
 # Cluster RPC authentication (RFC-001 §11.2): keyed MAC over each request.
 hmac = "0.12"
