@@ -59,12 +59,18 @@ The steps this binary implements run in **upstream's order**, which matters
 because the order is observable: `--rcfile` is applied before tracing
 initialises, or an rcfile carrying `logLevel` would be silently ignored.
 
-Two upstream bootstrap steps are **not implemented here** (both parse, so
-`tests/cli.rs` stays green while they do nothing):
+Two more flags now match upstream exactly, both fixed the same way upstream
+fixes them:
 
-- `--debug` does not set `RIFT_DEBUG`, which the engine reads directly — so
-  `rift --debug` and `rift-ee-server --debug` can render differently.
-- `--log` / `--nologfile` build no file-log layer; logs go to stderr only.
+- `--debug` sets the tracing filter to `debug` **and** sets `RIFT_DEBUG=1` for
+  the engine, which reads that variable directly (cached in a `OnceLock`, so it
+  is set before the runtime starts). This is what makes an unknown template
+  token in a stub response a loud `500` carrying `x-rift-template-error`
+  instead of silently substituting empty — `rift --debug` and
+  `rift-ee-server --debug` now render the same imposter identically.
+- `--log <path>` adds a file layer (via `tracing-appender`, non-blocking,
+  never-rotated) alongside the console output. `--nologfile` overrides `--log`
+  and suppresses the file even when one is named.
 
 `script`, `healthcheck` and `start` work exactly as upstream. `replay` parses but
 is not wired up, and now **fails with an explanatory error** rather than starting

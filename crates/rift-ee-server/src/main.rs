@@ -12,7 +12,7 @@ use rift_ee_server::bootstrap;
 use rift_ee_server::cli::EeCli;
 use rift_ee_server::compose;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 
 fn main() -> anyhow::Result<()> {
     let mut cli = EeCli::parse();
@@ -26,6 +26,19 @@ fn main() -> anyhow::Result<()> {
             return healthcheck::dispatch(url, &cli.oss.host, cli.oss.port, timeout);
         }
         _ => {}
+    }
+
+    // `--debug` is the server-flag spelling of debug mode; `RIFT_DEBUG` is the
+    // env-var spelling the engine reads through a `OnceLock`-cached read
+    // (mirrors upstream's `rift-http-proxy`). Setting it here, before that
+    // first read can happen, makes both spellings equivalent.
+    //
+    // SAFETY: single-threaded — `main` is not `#[tokio::main]`, no runtime is
+    // built until `run`, and no thread has been spawned. Placed before anything
+    // calls `rift_debug_env()`, which caches its first read, so the flag cannot
+    // be observed inconsistently afterwards.
+    if cli.oss.debug {
+        unsafe { std::env::set_var("RIFT_DEBUG", "1") };
     }
 
     // Before tracing, because an rcfile may carry `logLevel` — the open-source
@@ -173,8 +186,34 @@ fn init_tracing(cli: &EeCli) {
     };
     let filter = if cli.oss.debug { "debug" } else { level };
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
+
+    // `--nologfile` wins over `--log`, matching upstream. A path with no file
+    // name yields no layer rather than a logfile named after a directory.
+    //
+    // Note this is not a general guard: `rolling::never` still panics if the
+    // directory cannot be created (`--log /nonexistent-root/x.log`). Upstream
+    // behaves identically, and diverging here would be the drift this crate
+    // exists to prevent, so it is left alone deliberately.
+    let file_layer: Option<Box<dyn Layer<_> + Send + Sync>> = if !cli.oss.nologfile {
+        cli.oss.log.as_ref().and_then(|log_path| {
+            let dir = log_path.parent().unwrap_or(std::path::Path::new("."));
+            let filename = log_path.file_name()?.to_string_lossy().into_owned();
+            let file_appender = tracing_appender::rolling::never(dir, filename);
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            // Leaked so the writer outlives this function, mirroring upstream.
+            // Returning the guard for `main` to hold would work here — this
+            // binary does have shutdown paths — but would diverge; the cost is
+            // that the tail of the log is not flushed on exit.
+            Box::leak(Box::new(guard));
+            Some(fmt::layer().with_writer(non_blocking).boxed())
+        })
+    } else {
+        None
+    };
+
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(env_filter)
+        .with(file_layer)
         .init();
 }
