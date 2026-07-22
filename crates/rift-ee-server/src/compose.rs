@@ -260,22 +260,34 @@ impl ComposedServer {
             // still counts this node toward quorum, so a node that drained first
             // would spend the whole window as a member that answers nothing.
             match node.leave(self.leave_timeout).await {
-                // Only a real departure is recorded. `Retained` means this node
-                // deliberately did not leave — a sole voter cannot, openraft
-                // refuses to empty the voter set — so it is still a full member
-                // and must *resume* on the next start. Marking it would refuse
-                // that start outright, which turns a graceful stop of a solo
-                // node, or of a whole fleet, into a cluster that cannot come
-                // back at all.
+                // Only a real departure is recorded. `Retained` means the
+                // cluster deliberately kept this node — a sole voter cannot
+                // leave (openraft refuses to empty the voter set) and the
+                // leader refuses one that would breach the voter floor (#69) —
+                // so it is still a full member and must *resume* on the next
+                // start. Marking it would refuse that start outright, which
+                // turns a graceful stop of a solo node, or of a whole fleet,
+                // into a cluster that cannot come back at all.
                 Ok(LeaveOutcome::Departed) => {
                     tracing::info!("left the cluster membership");
                     if let Some(state_dir) = self.state_dir.as_deref() {
                         write_departed_marker(state_dir);
                     }
                 }
+                // Info, not error: the cluster declined on purpose, either
+                // because there is nobody to hand this node's votes to or
+                // because removing it would drop the fleet below the voter
+                // floor (#69). The exit is crash-equivalent and the next start
+                // resumes, so nothing is wrong.
+                // The voter count separates the two reasons a departure is
+                // declined, which otherwise read identically here: one voter
+                // means there was nobody to hand this node's votes to, two
+                // means the floor refused. The operator action is the same
+                // either way, but the diagnosis is not.
                 Ok(LeaveOutcome::Retained) => tracing::info!(
-                    "still a member on exit (nothing to hand this node's votes to); the next \
-                     start resumes from the durable log"
+                    voters = node.status().voters.len(),
+                    "still a member on exit — the cluster kept this node's vote; the next start \
+                     resumes from the durable log"
                 ),
                 // Error, not warn: this node is exiting while the fleet still
                 // counts it toward quorum, so a rolling restart can shrink the

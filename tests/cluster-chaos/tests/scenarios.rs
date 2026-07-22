@@ -308,3 +308,54 @@ async fn c5_rolling_restart_never_stops_accepting_writes() {
             .unwrap_or_else(|e| panic!("a write taken mid-roll was lost: {e}"));
     }
 }
+
+/// Issues #69 and #72 together: a graceful stop of the whole fleet, then a cold
+/// start, converges on its own.
+///
+/// This is the composed invariant the two issues share, and neither one proves
+/// it alone. A `docker compose stop` SIGTERMs every node, so each one in turn
+/// tries to leave: #69's voter floor is what stops that walking the membership
+/// down to a single authoritative volume, and #72's marker-and-rejoin is what
+/// gets the node that *did* depart back in afterwards. Get either half wrong
+/// and the fleet either cold-starts on one voter or never re-forms at all.
+///
+/// Deliberately a graceful stop rather than C15's hard kill: a kill leaves the
+/// membership untouched, so it exercises none of this.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn whole_fleet_sigterm_then_cold_start_converges() {
+    let cluster = Cluster::up().await.expect("fleet comes up");
+
+    let port = IMPOSTER_PORT;
+    let status = put_imposter(NODES[0].admin, port, "pre-teardown")
+        .await
+        .expect("write before the teardown");
+    assert_eq!(status, 201, "the pre-teardown write must be acknowledged");
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the pre-teardown write converges");
+
+    // SIGTERM every node, in order, exactly as `docker compose stop` does.
+    for node in &NODES {
+        cluster.stop(node.name).expect("SIGTERM the node");
+    }
+    for node in &NODES {
+        cluster.start(node.name).expect("restart the node");
+    }
+
+    // Generous: a node whose departure landed rejoins through its seeds, and it
+    // may need a restart-policy retry if it boots before any quorum exists.
+    cluster
+        .wait_all_ready(Duration::from_secs(180))
+        .await
+        .expect("the whole fleet must come back after a graceful stop");
+
+    for node in &NODES {
+        wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("{} did not converge on 3 voters: {e}", node.name));
+    }
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the write taken before the teardown must survive it");
+}

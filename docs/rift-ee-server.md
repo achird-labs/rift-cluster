@@ -172,7 +172,10 @@ On SIGTERM the node, in this order:
 2. **leaves the Raft membership** — demote-then-remove, performed by the leader
    (the departing node asks it over the cluster port). Until that commits the
    fleet still counts this node toward quorum, so leaving before the drain is
-   what keeps a rolling restart from shrinking the effective quorum;
+   what keeps a rolling restart from shrinking the effective quorum. The leader
+   **refuses** a departure that would leave fewer than **two voters**; the node
+   then drains and exits while still a member, and its next start resumes (see
+   [The voter floor](#the-voter-floor));
 3. **records the departure** in the state directory (a `departed` marker file),
    so the next start knows to rejoin rather than resume — see
    [Restarting a node](#restarting-a-node). Written only when the cluster
@@ -201,6 +204,51 @@ and hands off once the second write drops it from membership entirely.
 Manifests that encode this rule — a Dockerfile, a 3-node compose cluster, and a
 Kubernetes StatefulSet with both probes wired — live in
 [`deploy/`](../deploy/README.md).
+
+### The voter floor
+
+A departure that would leave the cluster with fewer than **two voters** is
+refused. The node still drains and exits — its exit is crash-equivalent — but it
+keeps its place in the membership, and its next start resumes from the durable
+log rather than rejoining.
+
+This exists because a whole-fleet teardown (`docker compose stop`,
+`kubectl delete statefulset`, scale-to-0) SIGTERMs every node, and without a
+floor each one leaves in turn: a three-node membership walks 3 → 2 → 1. That
+ends the outage with the entire control plane — configs, dedup state, parked
+intents — on a **single** authoritative volume, and a cold start that cannot
+make progress until exactly that node returns, even though two other volumes
+hold near-complete copies.
+
+Consequences worth knowing:
+
+- **A rolling restart is unaffected.** One node leaves at a time and the fleet
+  never drops below two, so every departure lands as before.
+- **A two-node cluster can no longer shed a voter at all.** Both of its nodes
+  are load-bearing; every graceful leave is refused and every node resumes.
+- **Learners are never refused.** Removing one costs no quorum member.
+- **A cold start after a full teardown now needs two nodes back, not one.**
+  This is the trade, and it is worth stating plainly: before the floor, a
+  teardown ended with a single voter and that one node could restart and serve
+  alone. Now it ends with two, and a quorum of two needs *both*. You gain a
+  second authoritative copy of the control plane; you lose the ability to
+  recover from a teardown with only one volume intact. If you have genuinely
+  lost a volume, the surviving node's state directory is still complete — the
+  recovery is to start it fresh as a new cluster and let the others seed-join,
+  not to wait for a node that is never coming back.
+- The floor is enforced by the leader, under the same lock that makes the
+  auto-voter ceiling exact, so two nodes SIGTERMed at the same instant cannot
+  both slip through. Across a *leader failover* mid-teardown it is best-effort:
+  two leaders can each judge one departure. openraft's refusal to commit an
+  empty voter set is the hard backstop underneath, and a node that ends up
+  outside the membership rejoins per [Restarting a node](#restarting-a-node).
+
+Refusals are logged at info, not as errors — the cluster declined on purpose:
+
+```
+still a member on exit — the cluster kept this node's vote; the next start
+resumes from the durable log
+```
 
 ## Restarting a node
 
