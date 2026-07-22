@@ -245,6 +245,12 @@ pub struct RaftNode {
     // it evicts for a peer take the same lock — the voter floor and the
     // auto-voter ceiling are only exact if every path holds it (#55, #69).
     membership_gate: network::MembershipGate,
+    // Signals that parked intents deserve a drain attempt now, rather than at
+    // the composition's next periodic sweep (#83). Lives here because this node
+    // owns the parked-intent ledger (`park_intent`/`parked_intents`/
+    // `unpark_intent`); whoever drains it is a composition concern, but the
+    // "there is something to drain" fact is this node's.
+    replay_wake: Arc<tokio::sync::Notify>,
 }
 
 impl RaftNode {
@@ -345,6 +351,7 @@ impl RaftNode {
             shutdown_invoked: AtomicBool::new(false),
             last_leave_error: Mutex::new(None),
             membership_gate,
+            replay_wake: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -897,6 +904,25 @@ impl RaftNode {
         serde_json::from_slice::<network::AppliedReply>(&reply)
             .ok()
             .and_then(|reply| reply.applied)
+    }
+
+    /// Ask whoever drains parked intents to do so now (#83).
+    ///
+    /// Called when an intent has been parked and the caller has *failed* to
+    /// apply it — never on the ordinary park-then-submit path, where the caller
+    /// is about to submit it anyway and a concurrent drain would duplicate the
+    /// submit on every single write.
+    ///
+    /// Best-effort by construction: a wake with no drainer listening is
+    /// dropped, and the periodic sweep remains the backstop.
+    pub fn request_replay(&self) {
+        self.replay_wake.notify_one();
+    }
+
+    /// Resolves when [`Self::request_replay`] is called — the drainer's side of
+    /// the signal.
+    pub async fn replay_requested(&self) {
+        self.replay_wake.notified().await;
     }
 
     /// Durably park an accepted intent before it is submitted (issue #9 R4).

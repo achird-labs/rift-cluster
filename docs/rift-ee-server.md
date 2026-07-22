@@ -412,6 +412,12 @@ accepted op (404 once the 24 h dedup window has lapsed). With
 happens in the background — poll each entry of `opIds` (a multi-op mutation
 such as `PUT /imposters` commits several ops; `opId` is the correlation id).
 
+A parked op whose commit fails — in either mode — is retried by the replay
+loop, which is woken as soon as that happens rather than waiting for its
+periodic sweep. So a transient failure costs roughly one submit round-trip, not
+the sweep interval. The sweep remains the backstop for anything that fails
+without a live node to notice it (a crash between parking and submitting).
+
 Cluster-mode divergences from a single node: an imposter must carry an explicit
 `port` (an auto-assigned port cannot replicate). `_rift.script` `file:`/`ref:`
 sources resolve on the node that accepts the write, under that node's

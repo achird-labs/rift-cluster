@@ -995,17 +995,28 @@ async fn async_mode_answers_202_and_applies_in_the_background() {
         .expect("json");
     assert_eq!(retry["opId"].as_str().expect("opId"), op_id);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // 30s, matching the generous end of this suite's bounded polls. With the
+    // replay wake (#83) a failed background submit no longer waits on the ~30s
+    // sweep, so this is slack rather than load-bearing — but a CPU-starved
+    // runner can still stretch a *successful* submit past 10s, and that half of
+    // the old flake is not the wake's to fix.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(read) = reqwest::get(format!("http://{admin}/imposters/{port}")).await
             && read.status().as_u16() == 200
         {
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the async write never applied"
-        );
+        if std::time::Instant::now() >= deadline {
+            // Say *why* it never applied. "Still pending" is a replayer
+            // problem; anything else is a submit/dedup problem, and without
+            // this the two are indistinguishable from a CI log.
+            let state = reqwest::get(format!("http://{admin}/_cluster/ops/{op_id}"))
+                .await
+                .ok()
+                .map(|r| r.status().as_u16());
+            panic!("the async write never applied (op {op_id}, ops endpoint: {state:?})");
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
@@ -2660,6 +2671,66 @@ async fn index_addressed_edits_survive_valid_scripted_siblings() {
         .await
         .expect("replace stub at index");
     assert_eq!(response.status().as_u16(), 200);
+
+    server.shutdown().await;
+}
+
+/// #83: an intent left parked by a failed submit is replayed promptly, not on
+/// the periodic sweep.
+///
+/// The async path answers 202 after parking and submits in the background; its
+/// failure arm hands ownership to the replay loop. But that loop only drained
+/// on a *leader transition* or a ~30 s sweep (120 ticks × 250 ms), and on a
+/// node whose leader never changes there is no transition to fire — so one
+/// transient submit failure parked the write for up to 30 s with a healthy
+/// leader sitting right there. That latency is what made
+/// `async_mode_answers_202_and_applies_in_the_background` flaky under load: its
+/// 10 s deadline is shorter than the sweep it was implicitly relying on.
+///
+/// Parked directly rather than through a forced submit failure: the state under
+/// test is "durable intent, never applied", and producing it directly keeps the
+/// test about the replayer's responsiveness instead of about how to make a
+/// submit fail.
+#[tokio::test]
+async fn a_parked_intent_replays_without_waiting_for_the_periodic_sweep() {
+    use rift_cluster::control::{ControlOp, ControlRequest, TenantId};
+
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered").clone();
+    let port = reserve_port();
+
+    let request = ControlRequest {
+        op_id: uuid::Uuid::from_u128(0x8300),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: serde_json::from_value(minimal_imposter(port)).expect("config parses"),
+        },
+    };
+    node.park_intent(&request).expect("park the intent");
+    node.request_replay();
+
+    // Well inside the sweep: a fix that only made the sweep faster, or no fix
+    // at all, cannot pass this. The leader was elected during startup and never
+    // changes here, so the transition trigger is unavailable by construction.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        if served_body(port).await.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked intent was not replayed within 8s; it is waiting for the \
+             ~30s sweep, which is the defect"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     server.shutdown().await;
 }
