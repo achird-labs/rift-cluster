@@ -126,7 +126,7 @@ it, so a stray flag on a single node is not an error.
 | `--cluster` | Run this node as part of a cluster |
 | `--cluster-bind <ADDR>` | Address to bind the cluster port on. **Required** — there is no default, because the cluster port must be a deliberate decision |
 | `--cluster-bind-public-ok` | Acknowledge that `--cluster-bind` names a publicly reachable interface |
-| `--cluster-advertise <HOST:PORT>` | Address peers dial, when it differs from the bind (NAT, port mapping, a pod behind a service). Accepts a hostname as well as a literal address (IPv6 literals must be bracketed, e.g. `[::1]:4790`); a hostname is re-resolved on every send, so it stays valid as DNS changes |
+| `--cluster-advertise <HOST:PORT>` | Address peers dial, when it differs from the bind (NAT, port mapping, a pod behind a service). Accepts a hostname as well as a literal address (IPv6 literals must be bracketed, e.g. `[::1]:4790`); a hostname is re-resolved on every send, so it stays valid as DNS changes. A name resolving to several addresses (dual-stack A + AAAA, a multi-A headless service) is dialed at each in the resolver's own order until one answers — the peer counts as unreachable only when all of them are |
 | `--cluster-seeds <ADDR[,ADDR...]>` | Existing members to join through. Retried and re-resolved for up to 30s, so a node that starts before its seeds during a rolling deploy still joins |
 | `--cluster-allow-solo` | Found a new single-node cluster when no seeds are given |
 | `--cluster-secret <SECRET>` | Shared secret authenticating the cluster port |

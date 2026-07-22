@@ -163,16 +163,43 @@ impl PeerClient {
         // Resolved fresh on every send (never cached), so a peer's advertise
         // address that is a hostname (a StatefulSet's headless DNS entry) picks
         // up a changed pod IP on the very next attempt.
-        let peer = resolve_peer(&self.resolver, self.target, &self.addr)
+        let addrs = resolve_peer(&self.resolver, self.target, &self.addr)
             .await
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         let body = serde_json::to_vec(req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        let response = self
-            .client
-            .call(peer, "POST", path, body)
-            .await
-            .map_err(map_rpc_err)?;
-        serde_json::from_slice(&response).map_err(|e| RPCError::Network(NetworkError::new(&e)))
+
+        // Try each resolved address in the resolver's order until one answers
+        // (#79).
+        //
+        // The steady-state cost of a permanently-dead address is bounded, not
+        // zero: `RpcClient` tracks health per `SocketAddr`, so after
+        // `DEFAULT_FAILURE_THRESHOLD` consecutive failures that address is
+        // fast-failed for the cooldown instead of burning a connect timeout,
+        // and the live one is reached without any pinning state of our own.
+        // Each cooldown expiry lets it be tried once more — which is the point,
+        // since an address that comes back must be usable again.
+        let mut last: Option<RpcError> = None;
+        for peer in &addrs {
+            match self.client.call(*peer, "POST", path, body.clone()).await {
+                Ok(response) => {
+                    return serde_json::from_slice(&response)
+                        .map_err(|e| RPCError::Network(NetworkError::new(&e)));
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+
+        // Classify on the last failure rather than flattening everything to
+        // `Unreachable`: a peer that is up but still booting answers `Handler`,
+        // which openraft retries promptly, and reporting that as unreachable
+        // would make it back off from a node that is seconds from ready.
+        let context = format!("{} ({} address(es) tried)", self.addr, addrs.len());
+        Err(match last {
+            Some(e) => map_rpc_err(&e, &context),
+            None => RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                "{context}: no addresses to try"
+            )))),
+        })
     }
 }
 
@@ -183,10 +210,12 @@ impl PeerClient {
 /// The one seam every peer-address resolution in the crate goes through, so a
 /// hostname advertise address (issue #68) is resolved identically whether the
 /// caller is Raft replication, a seed join, or a leader-hint chase.
+/// Returns every address the authority names, in resolver order; callers dial
+/// them in turn until one answers (#79).
 pub(crate) async fn resolve_authority(
     resolver: &Arc<dyn PeerResolver>,
     authority: &str,
-) -> std::io::Result<SocketAddr> {
+) -> std::io::Result<Vec<SocketAddr>> {
     // A literal `IP:port` needs no resolver. This is now the backward-compat
     // short-circuit for clusters that advertise a literal address rather than
     // a claim that hostnames never occur — #68 makes a hostname an equally
@@ -195,14 +224,24 @@ pub(crate) async fn resolve_authority(
     // that common case, at the cost of only a parse the resolver would do
     // anyway.
     if let Ok(addr) = authority.parse::<SocketAddr>() {
-        return Ok(addr);
+        return Ok(vec![addr]);
     }
     let resolver = Arc::clone(resolver);
     let owned = authority.to_owned();
-    match tokio::task::spawn_blocking(move || resolver.resolve(&owned)).await {
-        Ok(result) => result,
-        Err(join_err) => Err(std::io::Error::other(join_err.to_string())),
+    let addrs = match tokio::task::spawn_blocking(move || resolver.resolve(&owned)).await {
+        Ok(result) => result?,
+        Err(join_err) => return Err(std::io::Error::other(join_err.to_string())),
+    };
+    // The trait forbids an empty `Ok`, but a third-party or test resolver can
+    // still return one, and an empty list would degrade into a loop that tries
+    // nothing and reports no cause. Enforced here so every caller is covered by
+    // one check rather than each remembering it.
+    if addrs.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "resolver returned no addresses for {authority}"
+        )));
     }
+    Ok(addrs)
 }
 
 /// Resolve `authority` for `target`, adding which peer the failure belongs to
@@ -212,7 +251,7 @@ async fn resolve_peer(
     resolver: &Arc<dyn PeerResolver>,
     target: NodeId,
     authority: &str,
-) -> Result<SocketAddr, AddrError> {
+) -> Result<Vec<SocketAddr>, AddrError> {
     resolve_authority(resolver, authority)
         .await
         .map_err(|source| AddrError {
@@ -269,14 +308,20 @@ struct AddrError {
 /// mismatch, a protocol-major skew, an unknown route) — becomes `Unreachable` so
 /// openraft backs off rather than hammering a peer that will not answer any
 /// sooner for being asked again immediately.
-fn map_rpc_err<E>(e: RpcError) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>>
+/// `context` names the peer the failure belongs to. It is threaded in rather
+/// than left to the raw `RpcError` because a send now tries every address a
+/// name resolves to (#79), and the surviving error must say *which peer* was
+/// unreachable — the authority is what an operator configured; the addresses
+/// are a resolution detail they never wrote down.
+fn map_rpc_err<E>(e: &RpcError, context: &str) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>>
 where
     E: std::error::Error,
 {
+    let detail = std::io::Error::other(format!("{context}: {e}"));
     if matches!(e, RpcError::Handler(_)) {
-        RPCError::Network(NetworkError::new(&e))
+        RPCError::Network(NetworkError::new(&detail))
     } else {
-        RPCError::Unreachable(Unreachable::new(&e))
+        RPCError::Unreachable(Unreachable::new(&detail))
     }
 }
 
@@ -914,9 +959,24 @@ mod tests {
     }
 
     impl PeerResolver for CountingResolver {
-        fn resolve(&self, _authority: &str) -> std::io::Result<SocketAddr> {
+        fn resolve(&self, _authority: &str) -> std::io::Result<Vec<SocketAddr>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(self.addr)
+            Ok(vec![self.addr])
+        }
+    }
+
+    /// A resolver returning a fixed answer *set*, in the order given — the seam
+    /// the fan-out gate needs. Counts per-authority calls so a test can prove
+    /// how often resolution happened as well as what it yielded.
+    struct ListResolver {
+        addrs: Vec<SocketAddr>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PeerResolver for ListResolver {
+        fn resolve(&self, _authority: &str) -> std::io::Result<Vec<SocketAddr>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.addrs.clone())
         }
     }
 
@@ -943,7 +1003,7 @@ mod tests {
                 .expect("a literal resolves without DNS");
             assert_eq!(
                 resolved,
-                literal.parse::<SocketAddr>().expect("literal"),
+                vec![literal.parse::<SocketAddr>().expect("literal")],
                 "the fast path must return the literal itself, not the resolver's answer"
             );
         }
@@ -952,6 +1012,216 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a literal address must never reach the resolver"
+        );
+    }
+
+    /// A minimal listener that answers any request with a serialized
+    /// `VoteResponse`.
+    ///
+    /// Deliberately raw rather than a real `RpcServer`: the fan-out gate is
+    /// about which *address* got dialed, and a canned 200 keeps the test from
+    /// depending on server-side routing, auth, or Raft state that has nothing
+    /// to do with it. Dropping the returned guard stops the listener.
+    async fn spawn_vote_responder() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use openraft::Vote;
+        use openraft::raft::VoteResponse;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind responder");
+        let addr = listener.local_addr().expect("responder addr");
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let reply: VoteResponse<NodeId> = VoteResponse {
+                        vote: Vote::new(1, 1),
+                        vote_granted: true,
+                        last_log_id: None,
+                    };
+                    let body = serde_json::to_vec(&reply).expect("encode vote reply");
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        (addr, handle)
+    }
+
+    /// #79 gate: a peer whose name resolves to several addresses is dialed at
+    /// each until one answers.
+    ///
+    /// The failure this pins is silent and total: a dual-stack name whose first
+    /// address nobody listens on made every send fail forever, even though a
+    /// reachable address sat second in the very same answer. Committing to
+    /// `.next()` is what did it.
+    #[tokio::test]
+    async fn a_send_tries_every_resolved_address() {
+        use crate::rpc::{AlwaysHealthy, RpcClientConfig};
+        use openraft::Vote;
+        use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+        use openraft::raft::VoteRequest;
+
+        // A real listener that answers, so "reachable" means answered rather
+        // than merely connectable.
+        let (server_addr, _guard) = spawn_vote_responder().await;
+        // Port 1 is reserved and nothing binds it: a guaranteed-dead address,
+        // deliberately placed FIRST so a first-answer implementation fails.
+        let dead: SocketAddr = "127.0.0.1:1".parse().expect("valid addr");
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver: Arc<dyn PeerResolver> = Arc::new(ListResolver {
+            addrs: vec![dead, server_addr],
+            calls: calls.clone(),
+        });
+
+        let client = RpcClient::new(
+            None,
+            Arc::new(AlwaysHealthy),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(100),
+                request_timeout: Duration::from_millis(500),
+                max_retries: 0,
+            },
+        );
+        let mut network = RpcNetwork::new(client, resolver);
+        let mut peer = network
+            .new_client(2, &BasicNode::new("dual-stack-peer:4790".to_owned()))
+            .await;
+
+        let request = VoteRequest {
+            vote: Vote::new(1, 1),
+            last_log_id: None,
+        };
+        let reply = peer
+            .vote(request, RPCOption::new(Duration::from_millis(500)))
+            .await;
+
+        assert!(
+            reply.is_ok(),
+            "the second resolved address answers, so the send must succeed: {reply:?}"
+        );
+    }
+
+    /// #79: a dead address in the answer set stops costing a connect attempt
+    /// once the health tracker has seen enough failures.
+    ///
+    /// Fan-out would be a bad trade if every send re-paid a connect timeout on
+    /// a permanently-dead address. It does not, because health is keyed per
+    /// `SocketAddr` — but that is a property of how fan-out and the tracker
+    /// compose, which nothing else pins, so it is asserted rather than assumed.
+    #[tokio::test]
+    async fn a_dead_address_is_fast_failed_once_the_tracker_has_seen_it() {
+        use crate::rpc::{RpcClientConfig, TrackedPeerHealth};
+
+        let dead: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        // Threshold 1 so a single failure is enough; the production default is
+        // 3, and this test is about the composition, not the tuning.
+        let health = Arc::new(TrackedPeerHealth::with_params(1, Duration::from_secs(60)));
+        let client = RpcClient::new(
+            None,
+            health.clone(),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(200),
+                request_timeout: Duration::from_millis(200),
+                max_retries: 0,
+            },
+        );
+
+        // First call actually dials and fails, recording the failure.
+        let _ = client
+            .call(dead, "POST", "/internal/v1/raft/vote", Vec::new())
+            .await;
+
+        // Second call must be refused locally rather than dialing again: a
+        // fast-fail returns far faster than the connect timeout it replaces.
+        let started = std::time::Instant::now();
+        let second = client
+            .call(dead, "POST", "/internal/v1/raft/vote", Vec::new())
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(second.is_err(), "a dead address cannot succeed");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "the second attempt must be fast-failed by the health tracker, not \
+             re-dialed; took {elapsed:?}"
+        );
+    }
+
+    /// #79: when no resolved address answers, the error names the authority and
+    /// carries a per-address cause — an operator staring at an unreachable peer
+    /// needs to know it was tried, not just that it failed.
+    #[tokio::test]
+    async fn all_addresses_dead_reports_the_authority() {
+        use crate::rpc::{AlwaysHealthy, RpcClientConfig};
+        use openraft::Vote;
+        use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+        use openraft::raft::VoteRequest;
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver: Arc<dyn PeerResolver> = Arc::new(ListResolver {
+            addrs: vec![
+                "127.0.0.1:1".parse().expect("addr"),
+                "127.0.0.1:2".parse().expect("addr"),
+            ],
+            calls: calls.clone(),
+        });
+
+        let client = RpcClient::new(
+            None,
+            Arc::new(AlwaysHealthy),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(50),
+                request_timeout: Duration::from_millis(50),
+                max_retries: 0,
+            },
+        );
+        let mut network = RpcNetwork::new(client, resolver);
+        let mut peer = network
+            .new_client(2, &BasicNode::new("all-dead:4790".to_owned()))
+            .await;
+
+        let request = VoteRequest {
+            vote: Vote::new(1, 1),
+            last_log_id: None,
+        };
+        let reply = peer
+            .vote(request, RPCOption::new(Duration::from_millis(50)))
+            .await;
+        let err = reply.expect_err("no address answers");
+        assert!(
+            format!("{err}").contains("all-dead:4790"),
+            "the failure must name the authority that could not be reached, got: {err}"
+        );
+    }
+
+    /// #79: an empty answer set is an error, not an empty success — callers
+    /// must never receive a list they would silently loop zero times over.
+    #[tokio::test]
+    async fn an_empty_answer_set_is_an_error() {
+        struct EmptyResolver;
+        impl PeerResolver for EmptyResolver {
+            fn resolve(&self, _authority: &str) -> std::io::Result<Vec<SocketAddr>> {
+                Ok(Vec::new())
+            }
+        }
+        let resolver: Arc<dyn PeerResolver> = Arc::new(EmptyResolver);
+        let result = resolve_peer(&resolver, 1, "empty-name:4790").await;
+        assert!(
+            result.is_err(),
+            "an empty answer set must surface as an error, not as zero addresses to try"
         );
     }
 
@@ -1020,15 +1290,31 @@ mod tests {
     /// `parse::<SocketAddr>()` rejected anything but a literal IP.
     #[tokio::test]
     async fn hostname_advertise_address_resolves_where_bare_parse_would_fail() {
+        use std::net::ToSocketAddrs;
         assert!(
             "localhost:0".parse::<SocketAddr>().is_err(),
             "sanity: a hostname must not parse as a literal SocketAddr — that is the bug this fixes"
         );
 
         let resolver: Arc<dyn PeerResolver> = Arc::new(crate::rpc::DnsResolver);
-        let addr = resolve_peer(&resolver, 1, "localhost:4790")
+        let addrs = resolve_peer(&resolver, 1, "localhost:4790")
             .await
             .expect("the default resolver must resolve a hostname:port authority");
-        assert_eq!(addr.port(), 4790);
+        assert!(
+            !addrs.is_empty(),
+            "resolution must never succeed with an empty answer set"
+        );
+        assert!(
+            addrs.iter().all(|a| a.port() == 4790),
+            "every resolved address keeps the authority's port, got {addrs:?}"
+        );
+        // On a dual-stack host `localhost` is exactly the multi-address case
+        // #79 exists for, so this doubles as evidence the whole answer set
+        // survives rather than being truncated to one.
+        assert_eq!(
+            addrs.len(),
+            "localhost:4790".to_socket_addrs().expect("resolve").count(),
+            "the resolver must return every address the OS gave, not the first"
+        );
     }
 }

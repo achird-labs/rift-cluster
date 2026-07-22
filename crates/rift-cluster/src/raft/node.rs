@@ -417,20 +417,15 @@ impl RaftNode {
     /// leader) adds it as a learner, waits for catch-up, and promotes it to voter
     /// while the cluster is under the auto-promote ceiling.
     pub async fn join_via(&self, seed: &Authority) -> Result<(), NodeError> {
-        let peer = self
-            .resolve(seed.as_str())
-            .await
-            .map_err(|e| NodeError::Membership(format!("resolve seed {seed}: {e}")))?;
         let request = JoinRequest {
             node_id: self.id,
             advertise: self.advertise.to_string(),
         };
         let body =
             serde_json::to_vec(&request).map_err(|e| NodeError::Membership(e.to_string()))?;
-        self.client
-            .call(peer, "POST", CLUSTER_JOIN_PATH, body)
+        self.call_any(seed.as_str(), "POST", CLUSTER_JOIN_PATH, body)
             .await
-            .map_err(|e| NodeError::Membership(e.to_string()))?;
+            .map_err(NodeError::Membership)?;
         Ok(())
     }
 
@@ -527,17 +522,12 @@ impl RaftNode {
     /// an operator whose fleet stopped leaving needs to know whether it was
     /// auth, protocol skew, or an unreachable leader.
     async fn leave_via(&self, authority: &str) -> Result<LeaveOutcome, String> {
-        let addr = self
-            .resolve(authority)
-            .await
-            .map_err(|e| format!("resolve leader {authority}: {e}"))?;
         let request = LeaveRequest { node_id: self.id };
         let body = serde_json::to_vec(&request).map_err(|e| format!("encode leave: {e}"))?;
         let reply = self
-            .client
-            .call(addr, "POST", CLUSTER_LEAVE_PATH, body)
+            .call_any(authority, "POST", CLUSTER_LEAVE_PATH, body)
             .await
-            .map_err(|e| format!("leave via {authority}: {e}"))?;
+            .map_err(|e| format!("leave via {e}"))?;
 
         // The leader answers whether it actually removed this node: the voter
         // floor can refuse a departure and still reply successfully (#69).
@@ -663,8 +653,36 @@ impl RaftNode {
 
     /// Resolve a peer authority off the runtime thread, via the same resolver
     /// replication uses — including its literal-address fast path.
-    async fn resolve(&self, authority: &str) -> std::io::Result<SocketAddr> {
+    async fn resolve(&self, authority: &str) -> std::io::Result<Vec<SocketAddr>> {
         network::resolve_authority(&self.resolver, authority).await
+    }
+
+    /// Resolve `authority` and call it, trying every address the name yields
+    /// until one answers (#79).
+    ///
+    /// A name that resolves to several addresses — a dual-stack record, a
+    /// multi-A headless service — is only unreachable when *all* of them are.
+    /// Committing to the first is what made a peer permanently undialable while
+    /// a live address sat second in the same answer.
+    async fn call_any(
+        &self,
+        authority: &str,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        let addrs = self
+            .resolve(authority)
+            .await
+            .map_err(|e| format!("resolve {authority}: {e}"))?;
+        let mut last = String::from("no addresses to try");
+        for peer in &addrs {
+            match self.client.call(*peer, method, path, body.clone()).await {
+                Ok(reply) => return Ok(reply),
+                Err(e) => last = format!("{peer}: {e}"),
+            }
+        }
+        Err(format!("{authority} unreachable ({last})"))
     }
 
     /// Submit a control op through Raft and return the state machine's
@@ -726,34 +744,23 @@ impl RaftNode {
         let mut detail = String::from("local write refused: not the leader");
         for _ in 0..Self::FORWARD_ATTEMPTS {
             let Some(addr) = next.take() else { break };
-            let peer = match self.resolve(&addr).await {
-                Ok(peer) => peer,
-                Err(e) => {
-                    detail = format!("leader hint {addr:?} does not resolve: {e}");
-                    break;
-                }
-            };
             let body = serde_json::to_vec(&request)
                 .map_err(|e| NodeError::Write(format!("encode forwarded write: {e}")))?;
             crate::metrics::write_forwarded();
-            match self
-                .client
-                .call(peer, "POST", CLUSTER_WRITE_PATH, body)
-                .await
-            {
+            match self.call_any(&addr, "POST", CLUSTER_WRITE_PATH, body).await {
                 Ok(reply) => {
                     let reply: WriteReply = serde_json::from_slice(&reply)
                         .map_err(|e| NodeError::Write(format!("decode forwarded write: {e}")))?;
                     match reply {
                         WriteReply::Done(response) => return Ok(response),
                         WriteReply::ForwardTo { leader_addr } => {
-                            detail = format!("{peer} is not the leader");
+                            detail = format!("{addr} is not the leader");
                             next = leader_addr;
                         }
                     }
                 }
                 Err(e) => {
-                    detail = format!("forward to {peer}: {e}");
+                    detail = format!("forward to {e}");
                     break;
                 }
             }
@@ -798,15 +805,15 @@ impl RaftNode {
         // function promises to honour. It is the same hazard `leader_authority`
         // documents for `leave`. Freshness is not lost that matters: a barrier
         // is one write, and no address usefully changes inside its window.
-        let mut pending: BTreeMap<NodeId, Option<SocketAddr>> = BTreeMap::new();
+        let mut pending: BTreeMap<NodeId, Vec<SocketAddr>> = BTreeMap::new();
         for (id, addr) in members {
             if id == self.id {
-                pending.insert(id, None);
+                pending.insert(id, Vec::new());
                 continue;
             }
             match self.resolve(&addr).await {
-                Ok(peer) => {
-                    pending.insert(id, Some(peer));
+                Ok(peers) => {
+                    pending.insert(id, peers);
                 }
                 Err(e) => {
                     // Not inserted, so it can never be confirmed — it is
@@ -818,7 +825,7 @@ impl RaftNode {
                         error = %e,
                         "await_applied: peer address did not resolve; leaving it unconfirmed"
                     );
-                    pending.insert(id, None);
+                    pending.insert(id, Vec::new());
                 }
             }
         }
@@ -826,7 +833,7 @@ impl RaftNode {
         loop {
             let confirmed: Vec<NodeId> = {
                 let mut confirmed = Vec::new();
-                for (id, peer) in &pending {
+                for (id, peers) in &pending {
                     if *id == self.id {
                         let applied = self.raft.metrics().borrow().last_applied.map(|l| l.index);
                         if applied.is_some_and(|a| a >= revision) {
@@ -834,15 +841,22 @@ impl RaftNode {
                         }
                         continue;
                     }
-                    let Some(peer) = *peer else { continue };
-                    if let Ok(reply) = self
-                        .client
-                        .call(peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
-                        .await
-                        && let Ok(reply) = serde_json::from_slice::<network::AppliedReply>(&reply)
-                        && reply.applied.is_some_and(|a| a >= revision)
-                    {
-                        confirmed.push(*id);
+                    // Any of the peer's addresses confirming is the peer
+                    // confirming: they are the same process. A dead address in
+                    // the set costs one fast-failed call per round, not a
+                    // falsely-unconfirmed member (#79).
+                    for peer in peers {
+                        if let Ok(reply) = self
+                            .client
+                            .call(*peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
+                            .await
+                            && let Ok(reply) =
+                                serde_json::from_slice::<network::AppliedReply>(&reply)
+                            && reply.applied.is_some_and(|a| a >= revision)
+                        {
+                            confirmed.push(*id);
+                            break;
+                        }
                     }
                 }
                 confirmed
@@ -878,22 +892,20 @@ impl RaftNode {
         if leader_id == self.id {
             return self.raft.metrics().borrow().last_applied.map(|l| l.index);
         }
-        let peer = match self.resolve(&addr).await {
-            Ok(peer) => peer,
+        let reply = match self
+            .call_any(&addr, "POST", CLUSTER_APPLIED_PATH, Vec::new())
+            .await
+        {
+            Ok(reply) => reply,
             Err(e) => {
                 tracing::debug!(
                     %addr,
                     error = %e,
-                    "leader_applied: leader address did not resolve; reporting not-yet"
+                    "leader_applied: leader could not be reached; reporting not-yet"
                 );
                 return None;
             }
         };
-        let reply = self
-            .client
-            .call(peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
-            .await
-            .ok()?;
         serde_json::from_slice::<network::AppliedReply>(&reply)
             .ok()
             .and_then(|reply| reply.applied)
