@@ -38,19 +38,62 @@ The same string is logged at startup.
 ## Relationship to the `rift` binary
 
 Every open-source flag and subcommand parses here; a test in `tests/cli.rs`
-fails the build if that ever stops being true. Three subcommands and one flag
-are **declined with an explanatory error** rather than reimplemented, because
-the open-source binary implements them in private functions of its own `main.rs`
-rather than behind a library seam, and copying them would fork behaviour that is
-meant to stay shared:
+fails the build if that ever stops being true.
 
-| Not supported | Use instead |
+`stop`, `restart`, `save` and `--rcfile` used to be declined with an explanatory
+error, because the open-source binary implemented them in private functions of
+its own `main.rs` rather than behind a library seam — copying them would have
+forked behaviour that is meant to stay shared. Upstream promoted them to
+`rift_http_proxy::bootstrap` (rift#807), so this binary now **calls the same
+implementation** rather than reimplementing or declining it:
+
+| Subcommand / flag | Behaviour |
 |---|---|
-| `stop`, `restart` | the `rift` binary (drives a running server by PID file) |
-| `save` | the `rift` binary, or `GET /imposters?replayable=true` |
-| `--rcfile` | pass the equivalent flags directly |
+| `--rcfile` | Mountebank-compatible JSON defaults, applied only to fields left at their defaults. A missing or malformed rcfile warns and startup continues, exactly as upstream (the warning goes to stderr immediately and is repeated through `tracing` once the subscriber exists). |
+| `--pidfile` | written at startup, matching upstream's ordering — see the caveat below |
+| `stop` | SIGTERM the PID in the subcommand's `--pidfile`, then remove the file |
+| `restart` | `stop`, then start a new server in the same process |
+| `save` | fetch `GET /imposters?replayable=true` from the configured `--host`/`--port` and write it to `--savefile` |
 
-`script`, `healthcheck`, `replay` and `start` work exactly as upstream.
+The steps this binary implements run in **upstream's order**, which matters
+because the order is observable: `--rcfile` is applied before tracing
+initialises, or an rcfile carrying `logLevel` would be silently ignored.
+
+Two upstream bootstrap steps are **not implemented here** (both parse, so
+`tests/cli.rs` stays green while they do nothing):
+
+- `--debug` does not set `RIFT_DEBUG`, which the engine reads directly — so
+  `rift --debug` and `rift-ee-server --debug` can render differently.
+- `--log` / `--nologfile` build no file-log layer; logs go to stderr only.
+
+`script`, `healthcheck` and `start` work exactly as upstream. `replay` parses but
+is not wired up, and now **fails with an explanatory error** rather than starting
+an empty server and discarding the `--configfile` you asked it to replay; pass
+`--configfile` to `start` instead, or use the open-source `rift` binary.
+
+### PID-file caveats (upstream behaviour, reproduced)
+
+The global `--pidfile` and the `stop`/`restart` subcommands' own `--pidfile` are
+**separate** flags. Upstream writes the global one *before* dispatching the
+subcommand, and this binary does the same, so:
+
+- `rift-ee-server restart --pidfile p` leaves the newly started server with **no**
+  PID file, because the global flag was never set.
+- `rift-ee-server --pidfile p restart --pidfile p` makes the process SIGTERM
+  **itself**: it writes its own PID to `p`, then `restart` reads `p` and signals
+  it. Use distinct paths, or run `stop` and `start` separately.
+- `rift-ee-server --pidfile p save` overwrites a running server's PID file with
+  the short-lived `save` process's PID.
+
+These are upstream's semantics; this binary reproduces rather than repairs them,
+because `--cluster`-off parity is the point.
+
+One deliberate divergence, on the safe side: a PID file whose contents are not a
+positive integer is **refused** rather than passed to `kill(2)`, where `0` means
+"every process in my process group" and `-1` means "every process I may signal".
+The check is *advisory* — upstream re-reads and re-parses the file before
+signalling, so it defends a truncated or hand-edited file, not a concurrent
+writer. Tracked upstream as rift#822; the guard goes away when that lands.
 
 ## Cluster flags
 

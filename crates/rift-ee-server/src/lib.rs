@@ -6,6 +6,8 @@
 //!
 //! The shape of the thing:
 //!
+//! * [`bootstrap`] — the pre-serve steps shared with the open-source binary:
+//!   rcfile defaults, the PID file, and the `stop`/`restart`/`save` subcommands.
 //! * [`cli`] — the open-source CLI flattened into a `--cluster*` superset, plus
 //!   the startup guards that refuse a fleet which would be quietly wrong.
 //! * [`compose`] — the open-source [`ServerBuilder`](rift_ee::seams::ServerBuilder)
@@ -17,6 +19,7 @@
 //!   cluster port.
 
 pub mod admin_front;
+pub mod bootstrap;
 pub mod cli;
 pub mod cluster_api;
 pub mod compose;

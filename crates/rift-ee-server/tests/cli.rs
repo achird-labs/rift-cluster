@@ -239,3 +239,54 @@ fn version_reports_the_edition_and_the_embedded_upstream_rift() {
         "an empty pin renders as a formatting bug rather than missing info: {rendered}"
     );
 }
+
+/// Issue #43: the declines are gone, and they must stay gone.
+///
+/// The unit tests around `bootstrap` drive the library functions directly, so a
+/// guard reintroduced in `main.rs` *in front of* the bootstrap would leave them
+/// all green while the shipped binary refused the flag again. This runs the real
+/// artifact, which is the only thing that can catch that.
+#[test]
+fn the_binary_no_longer_declines_rcfile_or_the_pidfile_subcommands() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let rcfile = dir.path().join("rc.json");
+    std::fs::write(&rcfile, r#"{"port": 4321}"#).expect("write rcfile");
+
+    // `stop` against a PID file that does not exist: it must fail for that
+    // reason, not because the subcommand is refused outright.
+    let stopped = std::process::Command::new(env!("CARGO_BIN_EXE_rift-ee-server"))
+        .args([
+            "stop",
+            "--pidfile",
+            &dir.path().join("absent.pid").to_string_lossy(),
+        ])
+        .output()
+        .expect("run the binary");
+    let stderr = String::from_utf8_lossy(&stopped.stderr);
+    assert!(
+        !stderr.contains("not supported by rift-ee-server"),
+        "`stop` is implemented now; it must not be declined: {stderr}"
+    );
+    assert!(
+        stderr.contains("PID file not found"),
+        "expected the real not-found error, got: {stderr}"
+    );
+
+    // `--rcfile` with a bad PID file behind `stop` proves the flag was accepted
+    // and parsed rather than rejected before the subcommand ever ran.
+    let with_rcfile = std::process::Command::new(env!("CARGO_BIN_EXE_rift-ee-server"))
+        .args([
+            "--rcfile",
+            &rcfile.to_string_lossy(),
+            "stop",
+            "--pidfile",
+            &dir.path().join("absent.pid").to_string_lossy(),
+        ])
+        .output()
+        .expect("run the binary");
+    let stderr = String::from_utf8_lossy(&with_rcfile.stderr);
+    assert!(
+        !stderr.contains("not supported by rift-ee-server"),
+        "`--rcfile` is honoured now; it must not be declined: {stderr}"
+    );
+}
