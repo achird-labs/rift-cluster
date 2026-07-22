@@ -323,6 +323,7 @@ async fn attach_data_plane(
     let public_admin = format!("{}:{}", cli.oss.host, cli.oss.port);
     let api_key = cli.oss.api_key.clone();
     let allow_injection = cli.oss.allow_injection;
+    let scripts_dir = cli.oss.scripts_dir.clone();
     cli.oss.host = "127.0.0.1".to_owned();
     cli.oss.port = 0;
 
@@ -352,6 +353,7 @@ async fn attach_data_plane(
             upstream_admin: server.admin_addr(),
             api_key,
             allow_injection,
+            scripts_dir,
             barrier,
             barrier_timeout,
             admin_async,

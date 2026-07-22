@@ -55,6 +55,13 @@ pub mod seams {
     /// error the engine reports when an apply side-effect fails.
     pub use rift_mock_core::imposter::{ImposterConfig, ImposterError, Stub};
 
+    /// Config-time `_rift.script` `file:`/`ref:` resolution (upstream #356):
+    /// the clustered admin front resolves before replicating, so nothing
+    /// unresolved is ever committed to the log.
+    pub use rift_mock_core::imposter::{
+        RiftScriptConfig, ScriptBaseDir, ScriptResolveError, resolve_scripts, resolve_stub_scripts,
+    };
+
     /// The typed admin error envelope (upstream #797): a stable `type` slug
     /// plus the frozen legacy `code`. Client-visible cluster failures emit
     /// this, never a hand-rolled shape.
@@ -160,6 +167,10 @@ mod tests {
         _named::<ImposterConfig>();
         _named::<ImposterError>();
         _named::<Stub>();
+        _named::<RiftScriptConfig>();
+        _named::<ScriptBaseDir>();
+        _named::<ScriptResolveError>();
+        let _ = (resolve_scripts, resolve_stub_scripts);
         let _ = ErrorKind::Unavailable;
         let _ = (error_response_typed, config_uses_script_surface);
         _named::<BackendUnavailable>();

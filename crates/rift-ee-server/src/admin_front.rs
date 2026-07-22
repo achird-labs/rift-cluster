@@ -29,7 +29,9 @@
 //! is the planned fix and is tracked as follow-up work; until then, serialize
 //! writers per imposter.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -44,7 +46,8 @@ use rift_cluster::control::{self, ControlOp, ControlRequest, StubEdit, StubEditS
 use rift_cluster::decorate::{HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS};
 use rift_cluster::{ControlOutcome, ControlResponse, NodeError, RaftNode, TenantId};
 use rift_ee::seams::{
-    ErrorKind, ImposterConfig, Stub, config_uses_script_surface, error_response_typed,
+    ErrorKind, ImposterConfig, RiftScriptConfig, ScriptBaseDir, Stub, config_uses_script_surface,
+    error_response_typed, resolve_scripts, resolve_stub_scripts,
 };
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -79,6 +82,9 @@ pub struct FrontConfig {
     /// Whether `--allowInjection` is on. Terminated writes are gated on the
     /// same classifier the OSS admin applies before storing.
     pub allow_injection: bool,
+    /// Resolution base for `_rift.script` `file:` refs on terminated writes
+    /// (upstream #356); absent ⇒ any `file:` ref is refused.
+    pub scripts_dir: Option<PathBuf>,
     pub barrier: WriteBarrier,
     pub barrier_timeout: Duration,
     /// `--cluster-admin-async`: answer 202 + op id right after parking, and
@@ -118,6 +124,7 @@ struct FrontState {
     upstream_admin: SocketAddr,
     api_key: Option<String>,
     allow_injection: bool,
+    scripts_dir: Option<PathBuf>,
     barrier: WriteBarrier,
     barrier_timeout: Duration,
     admin_async: bool,
@@ -142,6 +149,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         upstream_admin: config.upstream_admin,
         api_key: config.api_key,
         allow_injection: config.allow_injection,
+        scripts_dir: config.scripts_dir,
         barrier: config.barrier,
         barrier_timeout: config.barrier_timeout,
         admin_async: config.admin_async,
@@ -413,7 +421,8 @@ async fn build_and_run(
     host: Option<&HeaderValue>,
     idempotency: Option<&str>,
 ) -> Result<Response<FrontBody>, Response<FrontBody>> {
-    let mutation = build_mutation(state, node, kind, body, auth, host).await?;
+    let is_batch = matches!(kind, Terminated::ReplaceAllImposters);
+    let mut mutation = build_mutation(state, node, kind, body, auth, host).await?;
 
     // Pre-validate every op before committing any: a multi-op mutation (PUT
     // /imposters) must not tear half the fleet's config down and then refuse
@@ -430,6 +439,22 @@ async fn build_and_run(
                 return Err(injection_disallowed());
             }
         }
+    }
+
+    // Resolve `_rift.script` file:/ref: sources (upstream #356) after the
+    // gate and before parking: nothing unresolved is ever parked, replayed,
+    // or replicated, and a gated request never touches the filesystem.
+    let script_base = front_script_base(state.scripts_dir.as_deref());
+    let mut put_index = 0usize;
+    for op in &mut mutation.ops {
+        let batch_index = if is_batch && matches!(op, ControlOp::PutImposter { .. }) {
+            let index = put_index;
+            put_index += 1;
+            Some(index)
+        } else {
+            None
+        };
+        resolve_op_scripts(op, node, &script_base, batch_index)?;
     }
 
     // Mint deterministically from the client's Idempotency-Key (when given),
@@ -941,6 +966,89 @@ fn op_uses_script_surface(op: &ControlOp) -> bool {
     }
 }
 
+/// Mirrors upstream's private `admin_script_base`: `--scripts-dir` when
+/// configured, else every `file:` ref is refused.
+fn front_script_base(scripts_dir: Option<&Path>) -> ScriptBaseDir {
+    match scripts_dir {
+        Some(dir) => ScriptBaseDir::ScriptsDir(dir.to_path_buf()),
+        None => ScriptBaseDir::Unconfigured,
+    }
+}
+
+/// The target imposter's already-resolved `_rift.scripts`, from applied
+/// state; empty when the imposter is absent (resolve → then not-found
+/// ordering: an unknown ref against an empty registry still fails with
+/// `UnknownRef`, the same observable order upstream produces for a genuinely
+/// missing imposter).
+#[allow(clippy::result_large_err)]
+fn stored_script_registry(
+    node: &Arc<RaftNode>,
+    port: u16,
+) -> Result<HashMap<String, RiftScriptConfig>, Response<FrontBody>> {
+    // An absent imposter is the domain-optional empty registry: an unknown ref
+    // then fails as UnknownRef, upstream's resolve-then-not-found order. A
+    // storage or parse failure is a real fault and must not masquerade as
+    // "unknown script ref" — it propagates as 500, same as stored_config.
+    let Some(stored) = node
+        .get_imposter(port)
+        .map_err(|e| internal(&e.to_string()))?
+    else {
+        return Ok(HashMap::new());
+    };
+    let config: ImposterConfig = serde_json::from_str(&stored)
+        .map_err(|e| internal(&format!("stored config for {port}: {e}")))?;
+    Ok(config.rift.map(|rift| rift.scripts).unwrap_or_default())
+}
+
+/// Resolve one terminated op in place; `Err` is the client-shaped 400 with
+/// upstream's exact message. `batch_index` is `Some` for `PUT /imposters`
+/// ops.
+#[allow(clippy::result_large_err)]
+fn resolve_op_scripts(
+    op: &mut ControlOp,
+    node: &Arc<RaftNode>,
+    base: &ScriptBaseDir,
+    batch_index: Option<usize>,
+) -> Result<(), Response<FrontBody>> {
+    match op {
+        ControlOp::PutImposter { config, .. } => resolve_scripts(config, base).map_err(|e| {
+            let message = match batch_index {
+                Some(idx) => format!(
+                    "Script resolution failed in imposter[{idx}] (port {:?}): {e}",
+                    config.port
+                ),
+                None => format!("Script resolution failed: {e}"),
+            };
+            typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &message)
+        }),
+        ControlOp::PatchStubs { port, edit, .. } => {
+            let needs_registry = edit
+                .0
+                .iter()
+                .any(|step| matches!(step, StubEdit::Add { .. } | StubEdit::ReplaceById { .. }));
+            if !needs_registry {
+                return Ok(());
+            }
+            let registry = stored_script_registry(node, *port)?;
+            for step in &mut edit.0 {
+                if let StubEdit::Add { stub, .. } | StubEdit::ReplaceById { stub, .. } = step {
+                    resolve_stub_scripts(std::slice::from_mut(stub), &registry, base).map_err(
+                        |e| {
+                            typed_error(
+                                StatusCode::BAD_REQUEST,
+                                ErrorKind::BadData,
+                                &format!("Script resolution failed: {e}"),
+                            )
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// `GET` a loopback admin path, forwarding the caller's authorization header.
 /// Returns status, content type, and the collected body.
 async fn fetch(
@@ -1178,5 +1286,103 @@ mod tests {
         assert_ne!(op_id_for(base, 0, 2), base);
         assert_ne!(op_id_for(base, 0, 2), op_id_for(base, 1, 2));
         assert_eq!(op_id_for(base, 1, 3), op_id_for(base, 1, 3));
+    }
+
+    #[test]
+    fn front_script_base_maps_the_flag() {
+        assert!(matches!(
+            front_script_base(None),
+            ScriptBaseDir::Unconfigured
+        ));
+
+        let dir = PathBuf::from("/tmp/rift-test-scripts");
+        match front_script_base(Some(dir.as_path())) {
+            ScriptBaseDir::ScriptsDir(got) => assert_eq!(got, dir),
+            other => panic!("expected ScriptsDir, got {other:?}"),
+        }
+    }
+
+    /// A `RaftNode` with empty applied state — real enough for `get_imposter`
+    /// (which "does not require leadership", per its own doc comment) without
+    /// paying for `cluster_init`/election. The `TempDir` must outlive the node.
+    async fn test_node() -> (Arc<RaftNode>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = rift_cluster::NodeConfig {
+            node_id: 1,
+            bind: "127.0.0.1:0".parse().expect("bind addr"),
+            advertise: None,
+            data_dir: dir.path().to_path_buf(),
+            secret: Some("admin-front-test-secret".to_owned()),
+            routes: rift_cluster::Router::new(),
+            engine: None,
+        };
+        let node = RaftNode::start(config).await.expect("node starts");
+        (Arc::new(node), dir)
+    }
+
+    async fn body_text(response: Response<FrontBody>) -> String {
+        let collected = response.into_body().collect().await.expect("collect body");
+        String::from_utf8(collected.to_bytes().to_vec()).expect("utf8 body")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_op_scripts_leaves_non_script_ops_untouched() {
+        let (node, _dir) = test_node().await;
+        let mut op = ControlOp::DeleteImposter {
+            tenant: TenantId::default(),
+            port: 4545,
+        };
+
+        let result = resolve_op_scripts(&mut op, &node, &ScriptBaseDir::Unconfigured, None);
+        assert!(result.is_ok());
+        assert!(matches!(op, ControlOp::DeleteImposter { port: 4545, .. }));
+
+        let mut op = ControlOp::SetEnabled {
+            tenant: TenantId::default(),
+            port: 4545,
+            enabled: false,
+        };
+        assert!(resolve_op_scripts(&mut op, &node, &ScriptBaseDir::Unconfigured, None).is_ok());
+
+        // Move/DeleteById steps carry no stub payload, so no registry read and
+        // no resolution — even against a port that has no imposter at all.
+        let mut op = ControlOp::PatchStubs {
+            tenant: TenantId::default(),
+            port: 4545,
+            edit: StubEditScript(vec![
+                StubEdit::Move { from: 1, to: 0 },
+                StubEdit::DeleteById { id: "a".to_owned() },
+            ]),
+        };
+        assert!(resolve_op_scripts(&mut op, &node, &ScriptBaseDir::Unconfigured, None).is_ok());
+
+        node.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_resolution_error_names_the_imposter_index_and_port() {
+        let (node, _dir) = test_node().await;
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+            "stubs": [{
+                "responses": [{ "_rift": { "script": { "file": "greet.rhai" } } }],
+            }],
+        }))
+        .expect("config parses");
+        let mut op = ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: Box::new(config),
+        };
+
+        let err = resolve_op_scripts(&mut op, &node, &ScriptBaseDir::Unconfigured, Some(1))
+            .expect_err("an Unconfigured base must refuse a file: ref");
+        let text = body_text(err).await;
+        assert!(
+            text.contains("Script resolution failed in imposter[1] (port Some(4545)):"),
+            "{text}"
+        );
+
+        node.shutdown().await.expect("shutdown");
     }
 }

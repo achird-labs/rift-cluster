@@ -1396,3 +1396,560 @@ async fn a_keyed_toggle_retries_exactly_once() {
 
     server.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #47: `_rift.script` `file:`/`ref:` sources resolve on the accepting
+// node before replication (upstream #356: nothing unresolved is ever stored).
+// ---------------------------------------------------------------------------
+
+fn file_script_imposter(port: u16, file: &str) -> serde_json::Value {
+    json!({
+        "port": port,
+        "protocol": "http",
+        "stubs": [{
+            "responses": [{ "_rift": { "script": { "file": file } } }],
+        }],
+    })
+}
+
+async fn rendered_imposter(admin: std::net::SocketAddr, port: u16) -> (u16, serde_json::Value) {
+    let response = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get imposter");
+    let status = response.status().as_u16();
+    let body = response.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+const GREET_RHAI: &str = r#"fn respond(ctx) { pass() }"#;
+
+#[tokio::test]
+async fn file_scripts_resolve_before_replication() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
+    let scripts_dir = scripts.path().to_string_lossy().into_owned();
+    let server = compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--allowInjection",
+            "--scripts-dir",
+            &scripts_dir,
+        ],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&file_script_imposter(port, "greet.rhai"))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+
+    // The render is the applied replicated state: inline code, no `file` left.
+    let (status, body) = rendered_imposter(admin, port).await;
+    assert_eq!(status, 200, "{body}");
+    let script = &body["stubs"][0]["responses"][0]["_rift"]["script"];
+    assert_eq!(script["code"], GREET_RHAI, "{body}");
+    assert_eq!(script["engine"], "rhai", "{body}");
+    assert!(
+        script.get("file").is_none(),
+        "unresolved file ref replicated: {body}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ref_scripts_resolve_before_replication() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
+    let scripts_dir = scripts.path().to_string_lossy().into_owned();
+    let server = compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--allowInjection",
+            "--scripts-dir",
+            &scripts_dir,
+        ],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "port": port,
+            "protocol": "http",
+            "_rift": { "scripts": { "greet": { "file": "greet.rhai" } } },
+            "stubs": [{
+                "responses": [{ "_rift": { "script": { "ref": "greet" } } }],
+            }],
+        }))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+
+    let (status, body) = rendered_imposter(admin, port).await;
+    assert_eq!(status, 200, "{body}");
+    let script = &body["stubs"][0]["responses"][0]["_rift"]["script"];
+    assert_eq!(script["code"], GREET_RHAI, "{body}");
+    assert!(
+        script.get("ref").is_none(),
+        "unresolved ref replicated: {body}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn add_stub_resolves_ref_against_the_stored_registry() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
+    let scripts_dir = scripts.path().to_string_lossy().into_owned();
+    let server = compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--allowInjection",
+            "--scripts-dir",
+            &scripts_dir,
+        ],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "port": port,
+            "protocol": "http",
+            "_rift": { "scripts": { "greet": { "file": "greet.rhai" } } },
+            "stubs": [{
+                "id": "a",
+                "responses": [{ "is": { "statusCode": 200, "body": "plain" } }],
+            }],
+        }))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+
+    // A ref: stub-add resolves against the stored, already-resolved registry.
+    let response = client
+        .post(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({
+            "stub": { "responses": [{ "_rift": { "script": { "ref": "greet" } } }] },
+        }))
+        .send()
+        .await
+        .expect("add stub");
+    assert_eq!(response.status().as_u16(), 200);
+    let (_, body) = rendered_imposter(admin, port).await;
+    let script = &body["stubs"][1]["responses"][0]["_rift"]["script"];
+    assert_eq!(script["code"], GREET_RHAI, "{body}");
+    assert!(
+        script.get("ref").is_none(),
+        "unresolved ref replicated: {body}"
+    );
+
+    // An unknown ref is refused with upstream's message; nothing is stored.
+    let response = client
+        .post(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({
+            "stub": { "responses": [{ "_rift": { "script": { "ref": "nope" } } }] },
+        }))
+        .send()
+        .await
+        .expect("add bad stub");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["code"], "400", "{body}");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("Script resolution failed:")
+            && message.contains("unknown script ref 'nope'"),
+        "{body}"
+    );
+    let (_, body) = rendered_imposter(admin, port).await;
+    assert_eq!(body["stubs"].as_array().map(Vec::len), Some(2), "{body}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn script_resolution_failure_is_upstream_400_and_nothing_is_stored() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    let scripts_dir = scripts.path().to_string_lossy().into_owned();
+    let server = compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--allowInjection",
+            "--scripts-dir",
+            &scripts_dir,
+        ],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+
+    // (a) missing file → upstream 400 shape, and nothing was committed.
+    let port = reserve_port();
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&file_script_imposter(port, "missing.rhai"))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["code"], "400", "{body}");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("Script resolution failed:"), "{body}");
+    let (status, _) = rendered_imposter(admin, port).await;
+    assert_eq!(status, 404, "a refused imposter must not be committed");
+
+    // (b) a path escaping --scripts-dir is rejected without reading.
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&file_script_imposter(port, "../escape.rhai"))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["code"], "400", "{body}");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("escapes the scripts root"), "{body}");
+    let (status, _) = rendered_imposter(admin, port).await;
+    assert_eq!(status, 404, "a refused imposter must not be committed");
+    server.shutdown().await;
+
+    // (c) file: with no --scripts-dir configured is refused outright.
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--allowInjection"],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&file_script_imposter(port, "greet.rhai"))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["code"], "400", "{body}");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("cannot be resolved: no --scripts-dir"),
+        "{body}"
+    );
+    let (status, _) = rendered_imposter(admin, port).await;
+    assert_eq!(status, 404, "a refused imposter must not be committed");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn batch_resolution_failure_refuses_the_whole_put() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    let scripts_dir = scripts.path().to_string_lossy().into_owned();
+    let server = compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--allowInjection",
+            "--scripts-dir",
+            &scripts_dir,
+        ],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let good_port = reserve_port();
+    let bad_port = reserve_port();
+
+    let response = reqwest::Client::new()
+        .put(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "imposters": [
+                minimal_imposter(good_port),
+                file_script_imposter(bad_port, "missing.rhai"),
+            ],
+        }))
+        .send()
+        .await
+        .expect("put imposters");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["code"], "400", "{body}");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with(&format!(
+            "Script resolution failed in imposter[1] (port Some({bad_port}))"
+        )),
+        "{body}"
+    );
+    // The whole batch is refused pre-park: imposter[0] must not exist either.
+    let (status, _) = rendered_imposter(admin, good_port).await;
+    assert_eq!(status, 404, "a refused batch must commit nothing");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_injection_gate_still_wins_over_resolution() {
+    let state = TempDir::new().expect("tempdir");
+    // Injection OFF and no scripts dir: a file: script surface must be refused
+    // by the gate (invalid injection), never reach resolution.
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&file_script_imposter(reserve_port(), "greet.rhai"))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["code"], "invalid injection", "{body}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn replace_stub_routes_resolve_scripts() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
+    let scripts_dir = scripts.path().to_string_lossy().into_owned();
+    let server = compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--allowInjection",
+            "--scripts-dir",
+            &scripts_dir,
+        ],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "port": port,
+            "protocol": "http",
+            "_rift": { "scripts": { "greet": { "file": "greet.rhai" } } },
+            "stubs": [
+                { "id": "a", "responses": [{ "is": { "statusCode": 200, "body": "a" } }] },
+                { "id": "b", "responses": [{ "is": { "statusCode": 200, "body": "b" } }] },
+            ],
+        }))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+
+    // ReplaceStubAt (index-addressed): a file: script resolves through the
+    // full-config PutImposter path.
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .json(&json!({ "responses": [{ "_rift": { "script": { "file": "greet.rhai" } } }] }))
+        .send()
+        .await
+        .expect("replace stub at 0");
+    assert_eq!(response.status().as_u16(), 200);
+    let (_, body) = rendered_imposter(admin, port).await;
+    let script = &body["stubs"][0]["responses"][0]["_rift"]["script"];
+    assert_eq!(script["code"], GREET_RHAI, "{body}");
+    assert!(
+        script.get("file").is_none(),
+        "unresolved file ref replicated: {body}"
+    );
+
+    // ReplaceStubById: a ref: script resolves against the stored registry
+    // through the PatchStubs path.
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/by-id/b"))
+        .json(&json!({ "responses": [{ "_rift": { "script": { "ref": "greet" } } }] }))
+        .send()
+        .await
+        .expect("replace stub by id");
+    assert_eq!(response.status().as_u16(), 200);
+    let (_, body) = rendered_imposter(admin, port).await;
+    let script = &body["stubs"][1]["responses"][0]["_rift"]["script"];
+    assert_eq!(script["code"], GREET_RHAI, "{body}");
+    assert!(
+        script.get("ref").is_none(),
+        "unresolved ref replicated: {body}"
+    );
+
+    // ReplaceStubs (list replace): resolves via the stored config's registry.
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({
+            "stubs": [{ "responses": [{ "_rift": { "script": { "ref": "greet" } } }] }],
+        }))
+        .send()
+        .await
+        .expect("replace stubs");
+    assert_eq!(response.status().as_u16(), 200);
+    let (_, body) = rendered_imposter(admin, port).await;
+    assert_eq!(body["stubs"].as_array().map(Vec::len), Some(1), "{body}");
+    let script = &body["stubs"][0]["responses"][0]["_rift"]["script"];
+    assert_eq!(script["code"], GREET_RHAI, "{body}");
+    assert!(
+        script.get("ref").is_none(),
+        "unresolved ref replicated: {body}"
+    );
+
+    // A failing replace leaves the stored stub untouched.
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .json(&json!({ "responses": [{ "_rift": { "script": { "file": "missing.rhai" } } }] }))
+        .send()
+        .await
+        .expect("replace stub with missing file");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["code"], "400", "{body}");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("Script resolution failed:"), "{body}");
+    let (_, body) = rendered_imposter(admin, port).await;
+    let script = &body["stubs"][0]["responses"][0]["_rift"]["script"];
+    assert_eq!(
+        script["code"], GREET_RHAI,
+        "a refused replace must change nothing: {body}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ref_against_absent_imposter_is_unknown_ref_400() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--allowInjection"],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    // Resolution runs before any imposter-exists check (upstream's observable
+    // order): an unknown ref against an absent imposter is 400, not 404.
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters/{port}/stubs"))
+        .json(&json!({
+            "stub": { "responses": [{ "_rift": { "script": { "ref": "nope" } } }] },
+        }))
+        .send()
+        .await
+        .expect("add stub to absent imposter");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["code"], "400", "{body}");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("Script resolution failed:")
+            && message.contains("unknown script ref 'nope'"),
+        "{body}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn batch_put_resolves_file_scripts() {
+    let state = TempDir::new().expect("tempdir");
+    let scripts = TempDir::new().expect("scripts dir");
+    std::fs::write(scripts.path().join("greet.rhai"), GREET_RHAI).expect("write script");
+    let scripts_dir = scripts.path().to_string_lossy().into_owned();
+    let server = compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--allowInjection",
+            "--scripts-dir",
+            &scripts_dir,
+        ],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let first = reserve_port();
+    let second = reserve_port();
+
+    let response = reqwest::Client::new()
+        .put(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "imposters": [
+                file_script_imposter(first, "greet.rhai"),
+                file_script_imposter(second, "greet.rhai"),
+            ],
+        }))
+        .send()
+        .await
+        .expect("put imposters");
+    assert_eq!(response.status().as_u16(), 200);
+    for port in [first, second] {
+        let (status, body) = rendered_imposter(admin, port).await;
+        assert_eq!(status, 200, "{body}");
+        let script = &body["stubs"][0]["responses"][0]["_rift"]["script"];
+        assert_eq!(script["code"], GREET_RHAI, "{body}");
+        assert!(
+            script.get("file").is_none(),
+            "unresolved file ref replicated: {body}"
+        );
+    }
+
+    server.shutdown().await;
+}
