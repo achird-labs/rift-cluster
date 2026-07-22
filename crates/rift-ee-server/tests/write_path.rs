@@ -1953,3 +1953,355 @@ async fn batch_put_resolves_file_scripts() {
 
     server.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #46: expected-revision preconditions (If-Match) on admin writes.
+// ---------------------------------------------------------------------------
+
+fn revision_of(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get("rift-cluster-revision")
+        .expect("mutation responses carry the revision header")
+        .to_str()
+        .expect("ascii")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn if_match_preconditions_guard_single_imposter_writes() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+    let rev1 = revision_of(&response);
+
+    // A matching If-Match applies and returns the new revision.
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .header("if-match", &rev1)
+        .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "first-writer" } }] }))
+        .send()
+        .await
+        .expect("conditioned edit");
+    assert_eq!(response.status().as_u16(), 200);
+    let rev2 = revision_of(&response);
+    assert_ne!(rev1, rev2, "a successful mutation advances the revision");
+
+    // Replaying the now-stale token is a 409 resource conflict, upstream shape.
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .header("if-match", &rev1)
+        .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "late-writer" } }] }))
+        .send()
+        .await
+        .expect("stale conditioned edit");
+    assert_eq!(response.status().as_u16(), 409);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["code"], "409", "{body}");
+    assert_eq!(body["errors"][0]["type"], "resource conflict", "{body}");
+    let message = body["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("revision conflict"), "{body}");
+
+    // The first edit won and stayed won.
+    let read: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        read["stubs"][0]["responses"][0]["is"]["body"], "first-writer",
+        "{read}"
+    );
+
+    // Without If-Match the write is unconditional: last-writer-wins unchanged.
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "unconditional" } }] }))
+        .send()
+        .await
+        .expect("unconditional edit");
+    assert_eq!(response.status().as_u16(), 200);
+
+    // A collection-wide mutation cannot be conditioned on a per-record token.
+    let response = client
+        .put(format!("http://{admin}/imposters"))
+        .header("if-match", &rev2)
+        .json(&json!({ "imposters": [minimal_imposter(port)] }))
+        .send()
+        .await
+        .expect("conditioned collection write");
+    assert_eq!(response.status().as_u16(), 400);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["errors"][0]["type"], "bad data", "{body}");
+
+    // Expecting a revision of an absent record cannot hold: committed 409.
+    let absent = reserve_port();
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .header("if-match", format!("default:{absent}@5"))
+        .json(&minimal_imposter(absent))
+        .send()
+        .await
+        .expect("conditioned create of an absent record");
+    assert_eq!(response.status().as_u16(), 409);
+
+    // Malformed preconditions refuse over HTTP too — never parse-and-ignore.
+    for bad in ["*", "not-a-revision"] {
+        let response = client
+            .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+            .header("if-match", bad)
+            .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "x" } }] }))
+            .send()
+            .await
+            .expect("malformed if-match");
+        assert_eq!(response.status().as_u16(), 400, "{bad:?}");
+        let body: serde_json::Value = response.json().await.expect("json");
+        assert_eq!(body["errors"][0]["type"], "bad data", "{bad:?}: {body}");
+    }
+    // A present-but-unreadable header must refuse, not degrade to
+    // unconditional (the silent-CAS-bypass failure mode).
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .header(
+            "if-match",
+            reqwest::header::HeaderValue::from_bytes(b"caf\xc3\xa9").expect("opaque bytes"),
+        )
+        .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "x" } }] }))
+        .send()
+        .await
+        .expect("non-ascii if-match");
+    assert_eq!(response.status().as_u16(), 400);
+
+    // DELETE honors the precondition like every other single-imposter route.
+    let response = client
+        .delete(format!("http://{admin}/imposters/{port}"))
+        .header("if-match", &rev1)
+        .send()
+        .await
+        .expect("stale conditioned delete");
+    assert_eq!(
+        response.status().as_u16(),
+        409,
+        "a stale delete must refuse"
+    );
+    let current = revision_of(
+        &client
+            .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+            .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "final" } }] }))
+            .send()
+            .await
+            .expect("refresh revision"),
+    );
+    let response = client
+        .delete(format!("http://{admin}/imposters/{port}"))
+        .header("if-match", &current)
+        .send()
+        .await
+        .expect("current conditioned delete");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "a current-token delete applies"
+    );
+
+    server.shutdown().await;
+}
+
+/// #46: a conditioned write in async-admin mode is parked, replayed by the
+/// background submit, and the state machine's refusal still holds — the
+/// conflicting edit never lands, and the ops surface reports the committed
+/// refusal.
+#[tokio::test]
+async fn an_async_conditioned_conflict_is_parked_then_refused() {
+    use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, Signer};
+    use std::sync::Arc;
+
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--cluster-admin-async"],
+    ))
+    .await
+    .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 202);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(read) = reqwest::get(format!("http://{admin}/imposters/{port}")).await
+            && read.status().as_u16() == 200
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the async create never applied"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A hopeless precondition still answers 202 (accepted-and-parked); the
+    // refusal is the SM's committed outcome, surfaced via the ops endpoint.
+    let response = client
+        .put(format!("http://{admin}/imposters/{port}/stubs/0"))
+        .header("if-match", "999999")
+        .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "clobber" } }] }))
+        .send()
+        .await
+        .expect("conditioned async edit");
+    assert_eq!(response.status().as_u16(), 202);
+    let body: serde_json::Value = response.json().await.expect("json");
+    let op_id = body["opId"].as_str().expect("opId").to_owned();
+
+    let rpc = RpcClient::new(
+        Some(Signer::new(SECRET)),
+        Arc::new(AlwaysHealthy),
+        RpcClientConfig::default(),
+    );
+    let ops_addr = server.cluster_addr().expect("cluster addr");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let reported = loop {
+        let raw = rpc
+            .call(
+                ops_addr,
+                "GET",
+                &format!("/_cluster/ops/{op_id}"),
+                Vec::new(),
+            )
+            .await
+            .expect("ops endpoint answers");
+        let reported: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        if reported["state"] != "pending" {
+            break reported;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked op never resolved"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(reported["state"], "failed", "{reported}");
+    let detail = reported["detail"].as_str().unwrap_or_default();
+    assert!(detail.starts_with("revision conflict"), "{reported}");
+
+    // And the conflicting edit never landed.
+    let read: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        read["stubs"][0]["responses"][0]["is"]["body"], "from-a",
+        "{read}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stale_if_match_cannot_clobber_through_a_follower() {
+    let leader_state = TempDir::new().expect("tempdir");
+    let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
+        .await
+        .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+
+    let follower_state = TempDir::new().expect("tempdir");
+    let follower = compose::start(cluster_cli(&follower_state, &["--cluster-seeds", &seed]))
+        .await
+        .expect("follower joins");
+    wait_ready(&follower).await;
+
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{}/imposters", leader.admin_addr()))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+    let rev1 = revision_of(&response);
+
+    // Writer A mutates through the leader unconditionally.
+    let response = client
+        .put(format!(
+            "http://{}/imposters/{port}/stubs/0",
+            leader.admin_addr()
+        ))
+        .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "writer-a" } }] }))
+        .send()
+        .await
+        .expect("writer A");
+    assert_eq!(response.status().as_u16(), 200);
+
+    // Writer B, holding the pre-A token, writes through the FOLLOWER: the
+    // precondition forwards intact and the state machine refuses it.
+    let response = client
+        .put(format!(
+            "http://{}/imposters/{port}/stubs/0",
+            follower.admin_addr()
+        ))
+        .header("if-match", &rev1)
+        .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "writer-b" } }] }))
+        .send()
+        .await
+        .expect("writer B via follower");
+    assert_eq!(
+        response.status().as_u16(),
+        409,
+        "the exact clobber the admin_front module doc documents as broken pre-#46"
+    );
+
+    let read: serde_json::Value =
+        reqwest::get(format!("http://{}/imposters/{port}", leader.admin_addr()))
+            .await
+            .expect("get")
+            .json()
+            .await
+            .expect("json");
+    assert_eq!(
+        read["stubs"][0]["responses"][0]["is"]["body"], "writer-a",
+        "{read}"
+    );
+
+    // The same write without If-Match remains last-writer-wins.
+    let response = client
+        .put(format!(
+            "http://{}/imposters/{port}/stubs/0",
+            follower.admin_addr()
+        ))
+        .json(&json!({ "responses": [{ "is": { "statusCode": 200, "body": "writer-b" } }] }))
+        .send()
+        .await
+        .expect("writer B unconditional");
+    assert_eq!(response.status().as_u16(), 200);
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}

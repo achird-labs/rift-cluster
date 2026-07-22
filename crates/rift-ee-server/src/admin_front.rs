@@ -21,13 +21,31 @@
 //! the loopback admin (`GET /imposters/:port` after the barrier), so the body
 //! shape is upstream's own — no parallel projection code to drift.
 //!
-//! Concurrency: index-addressed and list-replace stub edits are a
-//! read-modify-write of this node's applied state committed as a full
-//! `PutImposter` — two concurrent writers to the same imposter are
-//! last-writer-wins, and a lagging follower can base its write on stale state.
-//! An expected-revision precondition (`If-Match` on `Rift-Cluster-Revision`)
-//! is the planned fix and is tracked as follow-up work; until then, serialize
-//! writers per imposter.
+//! Concurrency (#46): a single-imposter write may carry an `If-Match` header
+//! naming the revision it expects — either the exact `Rift-Cluster-Revision`
+//! token (`default:<port>@<revision>`) or a bare revision integer. Absent, a
+//! write stays last-writer-wins (the pre-#46 default, unchanged): index-
+//! addressed and list-replace stub edits are a read-modify-write of this
+//! node's applied state committed as a full `PutImposter`, so two concurrent
+//! writers to the same imposter clobber each other and a lagging follower can
+//! base its write on stale state. A stale or mismatched `If-Match` refuses
+//! with `409 resource conflict`; a collection-wide mutation (`PUT
+//! /imposters`, `DELETE /imposters`) cannot carry one — there is no single
+//! record to condition on — and answers `400 bad data` instead. The
+//! precondition is evaluated inside the state machine's `apply` (not here),
+//! so it holds even when the write lands on a follower and forwards to the
+//! leader. Residual window: the precondition guards the *revision*, not this
+//! node's read basis — an index-addressed edit conditioned on the current
+//! revision but accepted by a node whose applied state still lags that
+//! revision synthesizes its `PutImposter` from the stale local read and
+//! passes the check. The default `ready-nodes` write barrier keeps that
+//! window to the barrier timeout; route conditioned index edits to the
+//! leader (or use by-id edits, which carry only the edited stub) when that
+//! matters. A keyed retry (same `Idempotency-Key`) of a `409` dedups to that
+//! same `409` by design — rebase and retry with a fresh key. Mixed-version
+//! caveat: a pre-#46 replica ignores `expected_revision` and applies
+//! unconditionally, so don't send `If-Match` until every node in the fleet
+//! has upgraded.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -359,6 +377,22 @@ async fn terminate(
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let if_match = match req.headers().get("if-match") {
+        None => None,
+        // A precondition the front cannot even read must refuse — silently
+        // treating it as absent would apply the write unconditionally, the
+        // exact lost-update the header exists to prevent.
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value.to_owned()),
+            Err(_) => {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    ErrorKind::BadData,
+                    "If-Match is not readable ASCII; expected default:<port>@<revision> or a bare revision",
+                );
+            }
+        },
+    };
     let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
         .collect()
         .await
@@ -381,6 +415,7 @@ async fn terminate(
         auth.as_deref(),
         host.as_ref(),
         idempotency.as_deref(),
+        if_match.as_deref(),
     )
     .await
     {
@@ -412,6 +447,7 @@ enum Render {
 
 /// Build the mutation for `kind`, pre-validate it, commit it op by op, run the
 /// barrier, and render the response. Errors are already client-shaped.
+#[allow(clippy::too_many_arguments)]
 async fn build_and_run(
     state: &Arc<FrontState>,
     node: &Arc<RaftNode>,
@@ -420,6 +456,7 @@ async fn build_and_run(
     auth: Option<&str>,
     host: Option<&HeaderValue>,
     idempotency: Option<&str>,
+    if_match: Option<&str>,
 ) -> Result<Response<FrontBody>, Response<FrontBody>> {
     let is_batch = matches!(kind, Terminated::ReplaceAllImposters);
     let mut mutation = build_mutation(state, node, kind, body, auth, host).await?;
@@ -432,6 +469,23 @@ async fn build_and_run(
             return Err(refusal_response(&reason));
         }
     }
+
+    // A precondition can only ever address one stored record: a collection-
+    // wide mutation (`mutation.port` is `None`) has no single record to
+    // condition on, so it is refused before anything is minted or parked.
+    let expected_revision = match if_match {
+        Some(raw) => {
+            let Some(port) = mutation.port else {
+                return Err(typed_error(
+                    StatusCode::BAD_REQUEST,
+                    ErrorKind::BadData,
+                    "If-Match applies to single-imposter operations only",
+                ));
+            };
+            Some(parse_if_match(raw, port)?)
+        }
+        None => None,
+    };
 
     if !state.allow_injection {
         for op in &mutation.ops {
@@ -467,7 +521,7 @@ async fn build_and_run(
         .ops
         .into_iter()
         .enumerate()
-        .map(|(index, op)| mint(op_id_for(base, index, total), op))
+        .map(|(index, op)| mint(op_id_for(base, index, total), op, expected_revision))
         .collect();
     for request in &requests {
         if let Err(e) = node.park_intent(request) {
@@ -885,7 +939,7 @@ fn stored_config(node: &Arc<RaftNode>, port: u16) -> Result<ImposterConfig, Resp
     serde_json::from_str(&stored).map_err(|e| internal(&format!("stored config for {port}: {e}")))
 }
 
-fn mint(op_id: Uuid, op: ControlOp) -> ControlRequest {
+fn mint(op_id: Uuid, op: ControlOp, expected_revision: Option<u64>) -> ControlRequest {
     // Pre-epoch clocks mint 0: only this op's dedup TTL weakens, never its
     // response (same reasoning as the node's own mint site).
     let issued_at_secs = std::time::SystemTime::now()
@@ -896,8 +950,51 @@ fn mint(op_id: Uuid, op: ControlOp) -> ControlRequest {
         op_id,
         principal: None,
         issued_at_secs,
+        expected_revision,
         op,
     }
+}
+
+/// Parse an `If-Match` header value against the [`HEADER_REVISION`] contract:
+/// the token this front itself emits (`default:<port>@<revision>`), a bare
+/// revision integer, or either wrapped in one pair of double quotes (a normal
+/// ETag convention some HTTP clients apply automatically). Anything else — a
+/// wildcard, a weak validator, a comma-separated list, a mismatched tenant or
+/// port — is refused: a precondition this front cannot evaluate must never
+/// silently pass as unconditional.
+#[allow(clippy::result_large_err)]
+fn parse_if_match(raw: &str, port: u16) -> Result<u64, Response<FrontBody>> {
+    let bad = || {
+        typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            &format!(
+                "If-Match must be the value from {HEADER_REVISION} (default:{port}@<revision>) \
+                 or a bare revision integer"
+            ),
+        )
+    };
+
+    let trimmed = raw.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed);
+
+    if let Ok(revision) = unquoted.parse::<u64>() {
+        return Ok(revision);
+    }
+
+    let (tenant_port, revision) = unquoted.split_once('@').ok_or_else(bad)?;
+    let (tenant, token_port) = tenant_port.split_once(':').ok_or_else(bad)?;
+    if tenant != TenantId::default().as_str() {
+        return Err(bad());
+    }
+    let token_port: u16 = token_port.parse().map_err(|_| bad())?;
+    if token_port != port {
+        return Err(bad());
+    }
+    revision.parse::<u64>().map_err(|_| bad())
 }
 
 /// Fixed namespace for deriving op ids from `Idempotency-Key` values that are
@@ -1127,7 +1224,12 @@ fn buffered_response(
 /// Map a committed (or pre-validated) refusal reason to the client shape:
 /// absent targets are 404s, everything else is bad data.
 fn refusal_response(reason: &str) -> Response<FrontBody> {
-    if reason.contains("no imposter on port") || reason.contains("no stub with id") {
+    if reason.starts_with("revision conflict") {
+        // Checked first: an absent-record precondition refusal also contains
+        // "no imposter on port" and must stay a 409, not fall into the 404
+        // branch below.
+        typed_error(StatusCode::CONFLICT, ErrorKind::ResourceConflict, reason)
+    } else if reason.contains("no imposter on port") || reason.contains("no stub with id") {
         typed_error(StatusCode::NOT_FOUND, ErrorKind::NoSuchResource, reason)
     } else {
         typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, reason)
@@ -1384,5 +1486,31 @@ mod tests {
         );
 
         node.shutdown().await.expect("shutdown");
+    }
+    #[test]
+    fn parse_if_match_accepts_the_emitted_token_and_bare_integers() {
+        assert_eq!(parse_if_match("default:4545@17", 4545).expect("token"), 17);
+        assert_eq!(
+            parse_if_match("\"default:4545@17\"", 4545).expect("etag-quoted token"),
+            17
+        );
+        assert_eq!(parse_if_match("17", 4545).expect("bare revision"), 17);
+    }
+
+    #[test]
+    fn parse_if_match_rejects_wildcards_weak_validators_and_mismatches() {
+        for bad in [
+            "*",
+            "W/\"default:4545@17\"",
+            "default:9999@17",
+            "other:4545@17",
+            "default:4545@seventeen",
+            "default:4545@17, default:4545@18",
+            "",
+        ] {
+            let refused = parse_if_match(bad, 4545);
+            let response = refused.expect_err(&format!("{bad:?} must be refused"));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
     }
 }
