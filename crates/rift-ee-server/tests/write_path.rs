@@ -657,6 +657,154 @@ async fn barrier_none_answers_without_waiting_for_the_fleet() {
     server.shutdown().await;
 }
 
+/// `none` skips the *fleet* barrier, not local coherence.
+///
+/// **This has to run against a follower.** On a leader there is no race to
+/// lose: `client_write` resolves only after the state machine applies, and
+/// `apply` drives the engine before returning, so the imposter is already
+/// registered by the time the write returns. A follower forwards to the leader
+/// and applies asynchronously afterwards — which is exactly what the helper
+/// note above `wait_served` says ("the engine drive runs after the admin
+/// response on follower nodes without a barrier"). Point this at the leader and
+/// it passes with or without the fix.
+///
+/// The create is rendered by re-reading the resource just committed
+/// (`Render::FetchAfter`). Before #99 that re-read raced the follower's own
+/// apply, so a durably committed write could answer `404` — a status a client
+/// cannot tell apart from "no such imposter". Asserting the status alone would
+/// miss it, so the body is asserted too: a `201` must carry the imposter.
+#[tokio::test]
+async fn barrier_none_on_a_follower_renders_the_write_it_just_committed() {
+    let barrier_none: &[&str] = &["--cluster-write-barrier", "none"];
+
+    let leader_state = TempDir::new().expect("tempdir");
+    let mut leader_args = vec!["--cluster-allow-solo"];
+    leader_args.extend_from_slice(barrier_none);
+    let leader = compose::start(cluster_cli(&leader_state, &leader_args))
+        .await
+        .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+
+    let follower_state = TempDir::new().expect("tempdir");
+    let mut follower_args = vec!["--cluster-seeds", seed.as_str()];
+    follower_args.extend_from_slice(barrier_none);
+    let follower = compose::start(cluster_cli(&follower_state, &follower_args))
+        .await
+        .expect("follower joins");
+    wait_ready(&follower).await;
+
+    let admin = follower.admin_addr();
+    let client = reqwest::Client::new();
+
+    // Several rounds: the follower's apply usually wins the race even unfixed,
+    // so one create proves little.
+    for _ in 0..6 {
+        let port = reserve_port();
+        let response = client
+            .post(format!("http://{admin}/imposters"))
+            .json(&minimal_imposter(port))
+            .send()
+            .await
+            .expect("post on the follower");
+
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response.json().await.expect("imposter body");
+        assert_eq!(
+            status, 201,
+            "the follower committed this write and then rendered {status} — \
+             a create that committed must not answer as though it had not \
+             (body {body})"
+        );
+        assert_eq!(
+            body.get("port").and_then(serde_json::Value::as_u64),
+            Some(u64::from(port)),
+            "201 carried a body that is not the imposter just created: {body}"
+        );
+    }
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// The regression risk of the #99 fix: waiting for the *local* apply must not
+/// become waiting for the fleet.
+///
+/// Three nodes, one killed — deliberately not two. With two voters, quorum is
+/// two, so killing one stops the write from committing at all and the request
+/// fails for a reason that has nothing to do with the barrier (an earlier draft
+/// of this test asserted 201 and got 504). Three keeps quorum at two, so the
+/// write genuinely commits with a peer that will never confirm.
+///
+/// The barrier timeout is raised well above the assertion window so the two
+/// levels are far apart rather than adjacent: waiting on the fleet here would
+/// cost ~15 s, waiting locally costs a state-machine apply.
+#[tokio::test]
+async fn barrier_none_does_not_wait_on_an_unreachable_peer() {
+    let barrier_none: &[&str] = &[
+        "--cluster-write-barrier",
+        "none",
+        "--cluster-write-barrier-timeout",
+        "15",
+    ];
+
+    let leader_state = TempDir::new().expect("tempdir");
+    let mut leader_args = vec!["--cluster-allow-solo"];
+    leader_args.extend_from_slice(barrier_none);
+    let leader = compose::start(cluster_cli(&leader_state, &leader_args))
+        .await
+        .expect("leader starts");
+    wait_ready(&leader).await;
+
+    let seed = leader
+        .cluster_addr()
+        .expect("leader cluster addr")
+        .to_string();
+    let mut followers = Vec::new();
+    let mut states = Vec::new();
+    for _ in 0..2 {
+        let state = TempDir::new().expect("tempdir");
+        let mut args = vec!["--cluster-seeds", seed.as_str()];
+        args.extend_from_slice(barrier_none);
+        let node = compose::start(cluster_cli(&state, &args))
+            .await
+            .expect("follower starts");
+        wait_ready(&node).await;
+        followers.push(node);
+        states.push(state);
+    }
+
+    // Gone, but still in the membership the fleet barrier would consult.
+    followers.pop().expect("two followers").shutdown().await;
+
+    let admin = leader.admin_addr();
+    let port = reserve_port();
+    let started = std::time::Instant::now();
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post imposter");
+    let elapsed = started.elapsed();
+    let status = response.status().as_u16();
+
+    assert_eq!(
+        status, 201,
+        "quorum survives one death of three, so the write must commit"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "barrier=none took {elapsed:?} against a 15 s fleet-barrier timeout — \
+         it is waiting on the fleet, the one thing this level promises not to do"
+    );
+
+    for node in followers {
+        node.shutdown().await;
+    }
+    leader.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_injection_gate_fails_closed_on_terminated_routes() {
     let state = TempDir::new().expect("tempdir");
