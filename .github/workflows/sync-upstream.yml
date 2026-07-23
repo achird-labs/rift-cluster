@@ -29,9 +29,23 @@ jobs:
           echo "subject=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
-      - name: Verify enterprise workspace builds against new upstream
-        run: cargo check --workspace
+      - uses: Swatinem/rust-cache@v2
+
+      # The same gate `build` runs on a hand-written PR, minus `fmt --check`
+      # (a pointer bump cannot change first-party formatting). `cargo check`
+      # alone was weaker than the change class deserves: it does not run a
+      # single test, and `vendor/rift` IS the mock engine, so a bump can be
+      # perfectly type-correct and still break behaviour. The real gate is the
+      # chaos tier on the resulting PR (#93); this one just fails faster and
+      # keeps a broken bump from opening a PR at all.
+      - name: Verify enterprise workspace against new upstream
+        run: |
+          set -euo pipefail
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
 
       - name: Open sync PR
         uses: peter-evans/create-pull-request@v6
@@ -44,6 +58,8 @@ jobs:
 
             Upstream tip: `${{ steps.bump.outputs.rev }}` — ${{ steps.bump.outputs.subject }}
 
-            The workspace `cargo check` passed against this revision. Review the diff and merge.
+            Workspace clippy (`-D warnings`) and `cargo test --workspace` passed against this
+            revision. The container chaos tier runs on this PR like any other cluster-touching
+            change — review the diff and merge once it is green.
           labels: upstream-sync
           delete-branch: true

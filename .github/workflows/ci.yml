@@ -43,6 +43,13 @@ jobs:
       - name: Chaos quarantine tags
         run: scripts/chaos-quarantine.sh check
 
+      # Same reasoning, one level up: `cluster-smoke`'s path filter decides
+      # whether the chaos tier runs at all, and when it is wrong the tier is
+      # skipped and the check goes green having tested nothing. It has to be
+      # verified from a job the filter cannot skip — this one.
+      - name: cluster-smoke path filter
+        run: scripts/cluster-smoke-paths.sh --self-test
+
   # No openraft in `rift-cluster`'s public API — an acceptance criterion of
   # issue #6 that the compiler cannot check. Why it matters, and why the check
   # has no exemptions, is documented in the script itself; this job only
@@ -95,6 +102,14 @@ jobs:
           # as "nothing changed", and the job goes green having run nothing.
           fetch-depth: 0
 
+      # Runs here as well as in `build` deliberately. `build` and this job are
+      # independent — there is no `needs:` — so a broken filter would turn
+      # `build` red while THIS job still went green having skipped the tier,
+      # which is the failure this whole issue is about. Verifying it inside the
+      # job whose greenness depends on it needs no cross-job coordination.
+      - name: Verify the path filter before trusting it
+        run: scripts/cluster-smoke-paths.sh --self-test
+
       - name: Which paths changed
         id: changed
         run: |
@@ -103,14 +118,18 @@ jobs:
           # fail the job instead.
           set -euo pipefail
           base='${{ github.event.pull_request.base.sha }}'
-          changed="$(git diff --name-only "$base"...HEAD)"
+          # `core.quotePath=false`: git otherwise renders a non-ASCII path as
+          # "caf\303\251.md", quotes included, and the leading quote defeats
+          # both the `^` prefix anchor and the whole-line match.
+          # `--no-renames`: a rename reports only the destination, so moving a
+          # file OUT of a watched directory would read as "cluster untouched".
+          # Both errors point the same way — toward skipping.
+          changed="$(git -c core.quotePath=false diff --no-renames --name-only "$base"...HEAD)"
           echo "$changed"
-          if printf '%s\n' "$changed" \
-            | grep -qE '^(crates/rift-cluster/|crates/rift-ee-server/|deploy/|tests/cluster-chaos/)'; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
+          # Which paths count lives in the script, next to the case table that
+          # pins it — the set was wrong here for as long as it was untested
+          # (#93). `tee` so the decision is in the log, not just the output.
+          printf '%s\n' "$changed" | scripts/cluster-smoke-paths.sh | tee -a "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.changed.outputs.run == 'true'
