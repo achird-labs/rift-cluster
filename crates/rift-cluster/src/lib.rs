@@ -25,6 +25,7 @@ pub mod config;
 pub mod control;
 pub mod decorate;
 pub mod metrics;
+pub mod pull_on_miss;
 pub mod raft;
 pub mod rpc;
 
@@ -35,6 +36,7 @@ pub use control::{
     StubEditScript, TenantId,
 };
 pub use decorate::ClusterDecorator;
+pub use pull_on_miss::PullOnMissInterceptor;
 pub use raft::{
     KeyClass, LeaveOutcome, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey,
     RaftNode, Ring, StatusReport,

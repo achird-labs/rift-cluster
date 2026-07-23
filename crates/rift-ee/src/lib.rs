@@ -43,6 +43,13 @@ pub mod seams {
         ClaimOutcome, ClaimToken, LocalProxyStore, ProxyRecordingStore, ProxyStoreError,
     };
 
+    /// The last-chance hook consulted when a request matched no stub, before
+    /// the defaultForward / defaultResponse / empty-200 fallthrough. What the
+    /// cluster's pull-on-miss safety net hangs on.
+    pub use rift_mock_core::extensions::no_match::{
+        NoMatchContext, NoMatchDirective, NoMatchInterceptor,
+    };
+
     /// Incremental config reconciliation: the per-port / per-stub apply path
     /// that replaces reset-the-world reload, plus the change-event hook and the
     /// stable stub identity both sides key on.
@@ -148,6 +155,7 @@ mod tests {
         assert_object_safe::<dyn ProxyRecordingStore>();
         assert_object_safe::<dyn ImposterEventListener>();
         assert_object_safe::<dyn ResponseDecorator>();
+        assert_object_safe::<dyn NoMatchInterceptor>();
 
         // Built-in implementations the `--cluster`-off path keeps using.
         let _: fn() -> LocalSequencer = LocalSequencer::default;
@@ -177,6 +185,8 @@ mod tests {
         _named::<RiftScriptConfig>();
         _named::<ScriptBaseDir>();
         _named::<ScriptResolveError>();
+        _named::<NoMatchContext<'_>>();
+        let _ = NoMatchDirective::Proceed;
         let _ = (resolve_scripts, resolve_stub_scripts);
         let _ = (validate_stub, validate_stubs);
         let _ = ErrorKind::Unavailable;

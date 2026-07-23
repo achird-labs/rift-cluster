@@ -379,6 +379,15 @@ Phase-1 plan's `rift_cluster_config_converged` and
 fleet-level derivation (compare `config_revision` across nodes) and conflicts
 cannot exist until a non-Raft write mode does.
 
+The pull-on-miss family (issue #49): `rift_cluster_pull_on_miss_checks_total`
+(no-match requests the net evaluated), `_lagging_total` (of those, the ones
+that found this node behind the leader) and `_retries_total` (requests sent
+back through the matcher once). The useful reading is the ratio: `lagging /
+checks` persistently high means followers are serving while behind, which is a
+readiness-gate question rather than a matcher one. There is deliberately no
+`rescues_total` — the hook cannot see the retry's outcome, so such a counter
+would be a guess; use the response header below as rescue evidence.
+
 ## Response headers
 
 Under `--cluster`, cluster-aware code annotates a request and the enterprise
@@ -387,6 +396,50 @@ response boundary — so the open-source handlers stay entirely cluster-unaware.
 The mapping is structural: an annotation `cluster.revision` becomes
 `Rift-Cluster-Revision`. Repeated notes (warnings, above all) are appended as
 separate header lines rather than collapsed.
+
+`Rift-Cluster-Pull-On-Miss` is stamped when the pull-on-miss net (below) sent a
+request back through the matcher: `rescued-wait` when this node caught up to the
+leader within the budget, `retry-after-timeout` when it did not and the retry
+happened anyway. Its absence is the normal case — the header appears only on
+requests that missed *and* found this node lagging.
+
+## The pull-on-miss safety net
+
+A follower that falls behind **after** it has gone Ready is still in rotation,
+and a request for an imposter it has not applied yet would be answered as a
+no-match. The default `ready-nodes` write barrier (a 2xx implies fleet-wide
+apply) and the `cluster-reconciled` readiness gate (a catching-up node takes no
+traffic) both narrow that window; neither closes it.
+
+So on a **genuine no-match, and only then**, a clustered node asks whether it is
+behind the leader. If it is, it waits up to a **500 ms** total budget for the
+apply and asks the matcher to try exactly once more. The budget is not
+configurable: it bounds how much slower an already-failing request can get, and
+a knob there would be a knob for making misses arbitrarily slow.
+
+Three properties worth stating plainly:
+
+- **Matched requests are untouched.** The upstream seam is consulted only after
+  matching has already returned no hit, so the hot path never reaches this code.
+- **Every uncertainty proceeds.** No leader known, an unreachable leader, a
+  budget that expired before lag was confirmed — each answers exactly as a fleet
+  without the net would. It never parks a request on a leader that cannot reply.
+- **A burst costs one leader lookup, not one per request.** The catch-up target
+  is cached for 250 ms and the lookup is single-flight, so concurrent missers
+  queue behind one RPC rather than each issuing their own — a lagging follower
+  under load does not turn its lag into an RPC storm.
+
+One cost is **not** hidden, because it is real: a retry re-runs the whole
+matching pass, so a predicate `inject` script executes a second time and its
+persistent `state` mutations and `logger` output are committed twice. The honest
+worst case for a rescued request is the 500 ms budget **plus** a second
+`scriptEngine.timeoutMs`. For imposters whose predicates are pure this is
+invisible; for imposters whose predicates mutate state through `inject`, it is a
+duplicate mutation on every rescue, and worth knowing before relying on the net.
+
+A request to a port with **no imposter at all** is still outside this net: it
+reaches no imposter handler, so there is nothing to hook. Readiness gating is
+what covers that window.
 
 ## The clustered admin write path
 
@@ -473,13 +526,6 @@ state has caught up to the leader's and its imposters are bound (or their
 failures reported on `GET /_cluster/imposters`).
 
 ## What lands later
-
-The data-plane pull-on-miss safety net (retry a failing match once after
-waiting ≤ 500 ms for a lagging apply) needs an upstream no-match seam that
-the current pin does not expose; until that seam lands its window is kept
-small by the default `ready-nodes` barrier (a 2xx already implies fleet-wide
-apply) and the `cluster-reconciled` readiness gate (a catching-up node takes
-no traffic).
 
 Two flags from the Phase-1 plan are deliberately **not** accepted yet, because
 nothing behind them exists and this codebase refuses flags that quietly do
