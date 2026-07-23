@@ -15,3 +15,9 @@ rift-types.workspace = true
 rift-http-proxy.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Seam tests only. The facade itself carries no serialization of its own — it
+# re-exports upstream's types — but asserting that a seam still *behaves* (not
+# merely that it resolves) means driving it with real JSON.
+serde_json.workspace = true
