@@ -759,7 +759,30 @@ async fn build_and_run(
     };
 
     let unapplied = match state.barrier {
-        WriteBarrier::None => Vec::new(),
+        WriteBarrier::None => {
+            // `none` skips the *fleet* barrier, not local coherence. The render
+            // below re-reads the resource just committed, so a node that has
+            // not applied it yet would answer 404 for a write it durably holds
+            // (#99). No peer is consulted here, so the level keeps its promise:
+            // this waits for one apply, never for the fleet.
+            if node
+                .await_local_applied(committed.revision, state.barrier_timeout)
+                .await
+            {
+                Vec::new()
+            } else {
+                tracing::warn!(
+                    revision = committed.revision,
+                    "local apply did not land in time; the render below reports \
+                     what this node can actually show"
+                );
+                // Named in `unapplied` for the same reason `ready-nodes` names a
+                // straggler: the client should learn which node is behind from
+                // the response, not from someone reading our logs. Under `none`
+                // the only node that can be behind is this one.
+                vec![node.id()]
+            }
+        }
         WriteBarrier::ReadyNodes => {
             node.await_applied(committed.revision, state.barrier_timeout)
                 .await
@@ -775,10 +798,14 @@ async fn build_and_run(
         Render::FetchAfter { path, status } => {
             let (fetched, content_type, body) = fetch(state, &path, auth, host).await?;
             // The commit is real either way, but the render must not dress a
-            // non-2xx re-read (barrier timed out, or `--cluster-write-barrier
-            // none` outrunning the local apply) in the success code — a 201
-            // wrapping a 404 body would claim a state this node cannot show.
-            // The cluster headers below still carry the committed revision.
+            // non-2xx re-read in the success code — a 201 wrapping a 404 body
+            // would claim a state this node cannot show. Still load-bearing
+            // after #99: both barrier levels now await the local apply first,
+            // so *outrunning* it is no longer a way to get here, but a barrier
+            // that timed out is, and so is an apply that landed while the
+            // engine refused the op (a bind failure, §7.4.6) — the entry is
+            // applied and the port still is not there to read. The cluster
+            // headers below still carry the committed revision.
             let status = if fetched.is_success() {
                 status
             } else {

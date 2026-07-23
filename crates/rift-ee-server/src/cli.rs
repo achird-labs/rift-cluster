@@ -99,8 +99,8 @@ pub struct ClusterArgs {
     pub cluster_probe_bind: SocketAddr,
 
     /// What a committed admin write waits for before its 2xx: every Ready
-    /// node's applied index (read-your-write anywhere), or nothing beyond the
-    /// Raft commit itself
+    /// node's applied index (read-your-write anywhere), or only the answering
+    /// node's own (read-your-write here)
     #[arg(
         long,
         value_enum,
@@ -111,7 +111,9 @@ pub struct ClusterArgs {
     pub cluster_write_barrier: WriteBarrier,
 
     /// Seconds the write barrier waits before answering anyway with a
-    /// Rift-Cluster-Warnings header naming the unapplied nodes
+    /// Rift-Cluster-Warnings header naming the unapplied nodes. Bounds both
+    /// levels: under `none` it caps the wait for this node's own apply, and the
+    /// header then names this node
     #[arg(
         long,
         value_name = "SECONDS",
@@ -133,7 +135,10 @@ pub enum WriteBarrier {
     /// Wait until every Ready node has applied the write (the default): a 2xx
     /// means any node serves the new config.
     ReadyNodes,
-    /// Answer as soon as the write is committed and applied locally.
+    /// Answer as soon as the write is committed and applied *locally*. Never
+    /// waits on a peer — but not "waits for nothing" either: the answering node
+    /// renders the resource it just committed, so it waits for its own apply or
+    /// it would answer `404` for a write it durably holds (#99).
     None,
 }
 

@@ -86,6 +86,7 @@ corrupted silently). Hence op-ids, end to end:
 | Leader dies **before commit** | Entry never committed; new leader elected ≤ ~3 s; accepting node's forward retries against new leader | Slightly slower 2xx |
 | Leader dies **after commit, before responding** | Entry is committed — new leader has it; accepting node retries, dedup returns recorded outcome | Slightly slower 2xx, same revision |
 | A Ready follower is slow/wedged during barrier | Barrier caps at `--cluster-write-barrier-timeout` (2 s) | `201` + `Rift-Cluster-Warnings: unapplied=nodeC` — success with a named asterisk |
+| **The answering node's own apply is slow, under `barrier=none`** | Same cap; the node then renders what it can actually read | Usually `201`. If the apply still has not landed, the re-read's real status (a `404`) + `Rift-Cluster-Warnings: unapplied=<this node>` — **a non-2xx here is not proof the write failed**: it committed, and `Rift-Cluster-Revision` names it. Poll `GET /_cluster/ops/:op_id` to settle it |
 | **No quorum reachable** (minority side of a partition) | Intent stays parked; replay fires on leader-change/heal | `503` + `Retry-After` + `Rift-Cluster-Op-Id` — *"durably queued, will converge; poll GET /_cluster/ops/:id or retry with the same key"* |
 | Duplicate delivery (client retry + intent replay race) | Both hit the same dedup entry | One application, both callers get revision N |
 
@@ -97,7 +98,12 @@ for its own write deterministically; `--cluster-admin-async` flips the API to
 ## The barrier's escape hatches — and the net under them
 
 `--cluster-write-barrier=none` exists for mass-provisioning bursts that will
-poll convergence themselves. For that mode, for barrier-timeout stragglers, and
+poll convergence themselves. It drops the *fleet* barrier, not local coherence:
+the answering node still waits for its own apply, because it renders a create by
+re-reading what it just committed and would otherwise answer `404` for a write it
+durably holds (#99). "Read-your-write here" rather than "read-your-write
+anywhere" — never "no read-your-write at all". For that mode, for
+barrier-timeout stragglers, and
 for any window not yet imagined, the data plane carries a **pull-on-miss safety
 net**: when a mock request finds no imposter/no matching stub *and* the node's
 applied index trails the leader commit index it last heard, the node waits for

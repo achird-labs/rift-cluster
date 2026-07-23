@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openraft::error::{ClientWriteError, InitializeError, RaftError};
+use openraft::metrics::WaitError;
 use openraft::{BasicNode, Config, Raft, ServerState};
 use rift_ee::seams::{ImposterConfig, ImposterManager};
 use tokio::sync::OnceCell;
@@ -780,6 +781,47 @@ impl RaftNode {
     /// indefinitely (issue #9: "3 bounded retries").
     pub const FORWARD_ATTEMPTS: usize = 3;
 
+    /// Wait for **this node's own** state machine to apply `revision`, up to
+    /// `timeout`. Returns whether it landed.
+    ///
+    /// The local half of [`Self::await_applied`]: no peer is consulted, so it
+    /// costs a metrics-watch subscription and no RPC. Event-driven rather than
+    /// polled — openraft wakes it when the applied index moves.
+    ///
+    /// `--cluster-write-barrier none` needs exactly this and nothing more.
+    /// "none" means a write does not wait for the *fleet*; it never meant the
+    /// answering node may describe a state it cannot itself show. The admin
+    /// front renders a create by re-reading the resource it just committed, so
+    /// without this wait that re-read races the local apply and a durably
+    /// committed write can answer `404` — a status the client cannot tell
+    /// apart from "no such imposter" (#99).
+    pub async fn await_local_applied(&self, revision: u64, timeout: Duration) -> bool {
+        match self
+            .raft
+            .wait(Some(timeout))
+            .applied_index_at_least(Some(revision), "local write barrier")
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                // Both variants mean unconfirmed, but they mean very different
+                // things to an operator: every write in flight during a
+                // graceful drain reports `shutting_down`, and a rolling restart
+                // would otherwise emit a stream of warnings indistinguishable
+                // from a genuinely slow node. Structured so the two can be told
+                // apart without parsing the message. Reported, not swallowed:
+                // the caller decides what to render, and a silent false here
+                // would be indistinguishable from a fast apply.
+                let reason = match e {
+                    WaitError::Timeout(..) => "timeout",
+                    WaitError::ShuttingDown => "shutting_down",
+                };
+                tracing::debug!(revision, reason, error = %e, "local apply not confirmed");
+                false
+            }
+        }
+    }
+
     /// Wait until every cluster member's applied index has reached `revision`,
     /// or `timeout` elapses — the read-after-write barrier (issue #9). Returns
     /// the ids of members that had NOT confirmed by the deadline; empty means
@@ -1376,6 +1418,58 @@ mod tests {
             Some(rev),
             "applied index must reach the committed write"
         );
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// The primitive behind `--cluster-write-barrier none` (#99): a node must
+    /// be able to wait for *its own* apply without consulting a peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn await_local_applied_confirms_the_write_it_committed() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 7)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+
+        let rev = node
+            .put_imposter(imposter(8080, "local-apply"))
+            .await
+            .expect("write")
+            .revision;
+
+        assert!(
+            node.await_local_applied(rev, Duration::from_secs(5)).await,
+            "the node that committed revision {rev} must be able to confirm \
+             its own apply of it"
+        );
+        assert!(
+            node.status().last_applied.is_some_and(|a| a >= rev),
+            "await_local_applied returned true before the apply landed"
+        );
+
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// The honest-failure half: an index that will never arrive must time out
+    /// and say so, not hang and not report success. `admin_front` relies on
+    /// this to fall through to surfacing the re-read's real status.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn await_local_applied_times_out_on_an_index_that_never_lands() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 8)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+
+        let unreachable = node.status().last_applied.unwrap_or(0) + 10_000;
+        let started = tokio::time::Instant::now();
+        assert!(
+            !node
+                .await_local_applied(unreachable, Duration::from_millis(250))
+                .await,
+            "an index no write will produce must report unconfirmed"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "await_local_applied overran its own timeout"
+        );
+
         node.shutdown().await.expect("shutdown");
     }
 
