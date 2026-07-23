@@ -931,10 +931,17 @@ impl RaftNode {
         self.replay_wake.notify_one();
     }
 
-    /// Resolves when [`Self::request_replay`] is called — the drainer's side of
-    /// the signal.
-    pub async fn replay_requested(&self) {
-        self.replay_wake.notified().await;
+    /// A handle to wait on [`Self::request_replay`] — the drainer's side.
+    ///
+    /// Handed out as an `Arc` rather than awaited through `&self` on purpose:
+    /// the drainer holds this node by `Weak` precisely so it never keeps it
+    /// alive, and awaiting through `&self` would force it to hold a strong
+    /// reference across the wait. `RaftNode::Drop` releases the redb lock and
+    /// the cluster port, so delaying it by even one wait interval is a race for
+    /// anything that restarts a node onto the same state directory.
+    #[must_use]
+    pub fn replay_waker(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.replay_wake)
     }
 
     /// Durably park an accepted intent before it is submitted (issue #9 R4).

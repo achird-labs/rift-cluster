@@ -794,6 +794,11 @@ fn cluster_manager(
 /// already-applied op collapse to its original response, so replaying is
 /// always safe, never a double-apply.
 fn spawn_intent_replayer(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
+    // Taken once, up front, so the wait below needs no reference to the node.
+    // The `Weak` is the whole point of this task's lifetime contract: it must
+    // never keep the node alive, because `RaftNode::Drop` is what releases the
+    // redb lock and the cluster port.
+    let waker = node.replay_waker();
     let node = Arc::downgrade(&node);
     tokio::spawn(async move {
         let mut last_leader = None;
@@ -814,21 +819,21 @@ fn spawn_intent_replayer(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
                 drain_parked_intents(&strong).await;
             }
 
+            // Release the node BEFORE waiting. Holding it across the wait would
+            // keep it alive for up to an interval after the last external
+            // reference went away, delaying the `Drop` that releases the redb
+            // lock and the cluster port — a race for anything that restarts a
+            // node onto the same state directory.
+            drop(strong);
+
             // Sleep *or* wake, whichever lands first. `Notify` holds one
-            // permit, so a wake raised *during* the drain above is not lost —
+            // permit, so a wake raised *during* the drain above is not lost:
             // it resolves immediately here rather than being swallowed.
-            //
-            // The node stays held across the wait: dropping it first would need
-            // a second upgrade, and a wake arriving in that gap would be
-            // delivered to a `Notify` nobody is waiting on. Holding an `Arc`
-            // here cannot leak the node, because the wait is bounded by the
-            // 250ms sleep.
             woken = tokio::select! {
                 biased;
-                () = strong.replay_requested() => true,
+                () = waker.notified() => true,
                 () = tokio::time::sleep(Duration::from_millis(250)) => false,
             };
-            drop(strong);
         }
     })
 }
