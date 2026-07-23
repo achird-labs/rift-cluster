@@ -66,6 +66,18 @@ compile-time test in `rift-ee` (`seams_resolve`) names every re-exported seam,
 so an upstream rename breaks loudly at the facade with a one-line fix, instead
 of surfacing as a confusing error deep in cluster code.
 
+**One seam cannot be guarded that way, and gets its own tripwire.**
+`ServerBuilder::manager()` is all-or-nothing: injecting a manager replaces
+upstream's internal construction *wholesale*, so `compose::cluster_manager`
+hand-mirrors it. A rename breaks the build, but an upstream **addition** — a
+new `with_*` inside the `None` arm — does not: the clustered path just silently
+stops getting it, at a pin bump, in a file nobody here edited. `rift-ee-server`'s
+`manager_parity` test compares the set of builder calls at the two construction
+sites and fails naming the one that diverged (issue #30). When it fires during a
+bump, mirror the call into `cluster_manager` or record it in that test's
+`INTENTIONALLY_NOT_MIRRORED` with a reason — the point is that the divergence
+becomes a decision instead of an accident.
+
 Feature discipline rides the same manifest: `rift-http-proxy` is consumed
 without its binary-only allocator default, with `redis-backend` / `javascript`
 / `quamina-matching` forwarded *explicitly* — because upstream's own history
