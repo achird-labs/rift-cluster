@@ -256,5 +256,23 @@ On failure the harness writes `docker compose ps` and `logs` to `$CHAOS_LOG_DIR`
 tore its own evidence down is a failure nobody can act on. Set `CHAOS_LOG_DIR`
 locally to get the same dump; unset, teardown behaves exactly as before.
 
+### `cluster-smoke` is a required check
+
+Since #104, `master` carries a ruleset (`.github/rulesets/master.json`) that
+makes `build`, `public-api` and `cluster-smoke` required status checks: a PR
+cannot merge until they have **completed**, not merely started. This closes the
+hole that motivated it — PR #101 merged while its `cluster-smoke` job was still
+`in_progress`, so the tier never validated the change that landed, and nothing
+objected.
+
+This composes with the 1-iteration cadence above rather than fighting it. That
+decision was about how many times a scenario runs *within* a job, and it stands
+untouched; this one is about whether a merge may outrun the job at all. The
+per-PR cost is unchanged.
+
+It is also cheaper than it sounds. The job runs on every pull request and only
+its heavy steps sit behind the path filter, so a docs-only PR completes it in
+seconds. Requiring it delays exactly the changes it exists to guard.
+
 `workflow_dispatch` takes a `scenario` filter and an `iterations` override, so a
 single suspect scenario can be soaked on demand.
