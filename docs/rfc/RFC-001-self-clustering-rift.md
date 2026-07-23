@@ -1,13 +1,61 @@
-# RFC-001 — Self-Clustering Distributed Rift (v3.1)
+# RFC-001 — Self-Clustering Distributed Rift (v3.2)
 
 | | |
 |---|---|
-| **Status** | v3.1 (re-grounded at v0.15.0; control plane decided by ADR-001) — implementation-ready |
+| **Status** | v3.2 (re-grounded at v0.15.0; control plane decided by ADR-001) — implementation-ready |
 | **Tracking issue** | [achird-labs/rift-enterprise#1](https://github.com/achird-labs/rift-enterprise/issues/1) |
 | **Canonical location** | `rift-enterprise:docs/rfc/RFC-001-self-clustering-rift.md` |
 | **Ground truth** | All code citations resolve against `vendor/rift` @ `aaa6042` (v0.15.0). `imposter/core.rs` was split upstream into the `imposter/core/{mod,matching,lifecycle,recording,responses,proxy}.rs` module tree and the crate renamed `rift-core` → `rift-mock-core`; line-number citations below are approximate against v0.15.0. |
 | **Author** | Mohsen Zainalpour |
-| **Date** | 2026-07-01 (v3: 2026-07-21; v3.1: 2026-07-22) |
+| **Date** | 2026-07-01 (v3: 2026-07-21; v3.1: 2026-07-22; v3.2: 2026-07-23) |
+
+**Changelog v3.1 → v3.2** (the remaining pre-ADR-001 routing sites; metrics grounded in code)
+
+v3.1 re-grounded §7.6, §7.5.1, §7.5.3, §7.3, §11.1, §11.3 and §12, but sites kept
+pre-ADR-001 vocabulary — its non-goals excluded a full re-grounding sweep, so they were left
+deliberately rather than missed (#98). A reader arriving at any one of them would still have
+been told config writes go to a per-port owner. #98 named five; reviewing the fix found two
+more of the same kind, in §12's C10 and §7.5.3's closing bullet — C10 sits directly above the
+C11 row this pass rewrote, so §12 was contradicting itself across two adjacent rows. Both are
+included here rather than left for a third pass.
+
+- **§10's Phase-5 deliverable and §12's C11** said recordings are "config-owner writes" /
+  "owner-serialized config writes". Both now say what ships: a recording *is* a config write,
+  leader-serialized as a `PatchStubs` `ControlOp`, with `(port, signature)`-derived op-id
+  dedup.
+- **§12's C10 and §7.5.3's closing bullet** described killing "the *config* owner" between
+  upstream completion and stub publication; that write goes to the leader, so it is the
+  leader the scenario kills. C10's *duplicate* bound is deliberately untouched — duplicates
+  come from re-claiming, and claims are flow-shaped state ADR-001 keeps **off** consensus, so
+  the `1 + ownership changes` bound is still exactly right.
+- **§7.5.3's ordering rule** pointed at "the *port-config* owner (§7.4.2)" while the very
+  next clause already said "no leader reachable" — the bullet contradicted itself. It now
+  reads leader-serialized throughout, and names why the two owners differ: the claim is off
+  consensus, the stub is on it. §7.4.2's own body is left as-is under §7.4's banner; the
+  defect was live text *pointing into* superseded text, and that pointer is gone.
+- **§12's C9 is rewritten, not deleted.** It asserted a bound on a settle violation and
+  `(g,v)` fork arbitration, but ADR-001 records that the settle delay is "deleted, not
+  mitigated" and that the dual-owner fork class "stops being a scenario that can fail". A
+  scenario asserting a bound on an impossible event tests nothing, so C9 now asserts the
+  class is unrepresentable **by construction** and pins what the residual window still
+  needs: a deposed owner is exposed only until it applies the deposing entry, and
+  `(m_idx, v, origin)` totally orders anything written inside it, so a conflict is resolved
+  and counted rather than silently dropped. Deliberately **not** upgraded to C5's zero-loss
+  bar: flow values stay off consensus, so adoption keeps §7.2.3's honest staleness bound and
+  its flagged adopt-found-nothing case. C5 earns zero-loss from graceful leave's
+  drain-and-handoff; a rejoin has no equivalent, and ADR-001 did not give it one.
+- **§11.1 is grounded in `crates/rift-cluster/src/metrics.rs`.** The list mixed shipped,
+  planned and retired names with no way to tell them apart, and asserted two Phase-1
+  "replacements" that were never registered: `rift_cluster_ops_deduplicated_total` (the
+  shipped counter is `rift_cluster_dedup_hits_total`) and `rift_cluster_config_converged`
+  (convergence is read per-port from `rift_cluster_config_revision{port}`). Shipped metrics
+  are now a table whose every name greps verbatim in the code; four names that read as
+  shipped are moved to an explicit **planned** list (nothing exports them yet); and the
+  retired set grows from three names to six — `rift_cluster_generation{key_class}` and the
+  `owner_forwards`/`owner_failures` pair belong there too. Three counters that exist in
+  process but reach no scrape are called out as such, rather than offered as replacements a
+  dashboard cannot use. `rift_cluster_ring_epoch` keeps its name but is noted as re-meaning:
+  a Raft membership index, not a gossip epoch.
 
 **Changelog v3 → v3.1** (normative surfaces re-aligned with the issues that implement them)
 
@@ -949,11 +997,17 @@ Unclaimed ──try_claim──► Pending(holder, deadline) ──complete─�
   (stale token), not misattributed. If the owner dies, Pending dies with it; the next
   request re-claims at the new owner → possible duplicate upstream call, bounded by
   `1 + (ownership changes while claims in flight)` — stated honestly.
-- **Ordering rule (claim owner ≠ config owner):** the recorded stub's config write goes to
-  the *port-config* owner (§7.4.2) while the claim lives at the *(port, signature)* owner —
-  two different nodes in general, so "one logical publication" must be sequenced, not
-  assumed: the claim owner transitions `Pending → Recorded` **only after the config write
-  is acknowledged** by the config owner. If the config write does not land — no leader
+- **Ordering rule (claim owner ≠ leader):** the recorded stub's config write is a
+  leader-serialized `PatchStubs` `ControlOp` (§7.6, ADR-001) while the claim lives at the
+  *(port, signature)* owner — two different nodes in general, and deliberately so: the
+  claim is flow-shaped state that ADR-001 keeps *off* consensus, the stub is config that it
+  puts *on* it. "One logical publication" must therefore be sequenced, not assumed: the
+  claim owner transitions `Pending → Recorded` **only after the config write is
+  acknowledged** — commit plus the §7.6 write barrier, *including* a barrier that times out
+  and answers 2xx with `Rift-Cluster-Warnings: unapplied=<node>`. A timed-out barrier is
+  still an acknowledgement: the write is committed and will apply everywhere, so treating it
+  as a failure would release the claim and re-proxy a signature that was in fact recorded.
+  If the config write does not land — no leader
   reachable, so it returns `503` with a **parked** intent (§7.6) — the claim is `release`d
   so the signature stays retryable. **The recording's `op_id` is therefore derived from
   `(port, signature)`, not minted per attempt.** This matters because park-and-replay is
@@ -970,7 +1024,7 @@ Unclaimed ──try_claim──► Pending(holder, deadline) ──complete─�
   Two conflicting `Recorded` publications for one signature (partition, both sides
   completing) merge by `(g, v, origin)` like any versioned value.
 - Deadline default: `2 × upstream timeout`. All transitions idempotent; `release` of a
-  non-held claim is a no-op. Chaos C10 includes killing the *config* owner between
+  non-held claim is a no-op. Chaos C10 includes killing the **leader** between
   upstream completion and stub publication (claim must release, no wedge).
 
 ### 7.6 Partition & failure decision table
@@ -1204,7 +1258,7 @@ Phase 1 is not blocked by seams it doesn't need.
 | **2 — Scenario/flow state** | `ClusteredFlowStore`: owner-serialized reads (match gate) + CAS, successor replication, adoption; `/_cluster/kv/{flow_id}`; stuck-scenario & split-brain runbooks | U-1, U-2 (+0a) | multi-step scenario round-robin across 3 nodes at 10 ms pacing: transitions linear per flow, zero illegal transitions, zero lost updates over 10 k iterations (`test_scenario_cluster_linear`); owner kill mid-scenario → adopt within 1 replication round or flagged reset, never an illegal transition (`test_scenario_handoff`). Chaos: C1, C8, C9, C12, C13 | `--cluster-features` without `flow-state` → local stores |
 | **3 — Recorded-request verification** | `ClusteredJournal`: sharded log, watermarks, pull-on-read, generation clears; count G-counter | U-4 (+0a); **U-13** for the vector-cursor/streaming form (§7.5.1) | spray N (< shard-cap) requests across 3 nodes → `GET .../requests` on each node returns exactly N (`test_journal_merge_exact`); `DELETE savedRequests` clears cluster-wide ≤ 5 s incl. concurrent appends, clock-skew-immune (`test_journal_clear`); `numberOfRequests` = N on every node (`test_count_merge`); incremental reads with the returned vector cursor concatenate, **within one clear generation**, to exactly a full read of that generation — no duplicate, no gap — with `Rift-Cluster-Cursor-Reset` exactly once across a clear and `Rift-Cluster-Partial` for a node unreachable mid-sequence (`test_journal_cursor_merge`, §7.5.1; needs seam U-13) | `--cluster-features` without `journal` → local Vec |
 | **4 — Response sequencing (strict = Redis first)** | `RedisSequencer` (strict, requires `--cluster-redis <url>`); `ClusteredSequencer` (gossip-native, experimental flag) | U-3 (+0a); **named customer request on file for gossip-native strict** | Redis mode: cyclic stub sprayed across nodes → global sequence no dup/skip incl. during single-node kill (`test_sequence_redis_strict`); gossip mode: no dup/skip while membership stable, documented reset on handoff (`test_sequence_no_dup_no_skip`, `test_sequence_handoff_reset`). Chaos: C2, C13 | feature flag off → per-node cursors (today's behavior) |
-| **5 — Proxy + proxyOnce (strict = Redis first)** | `RedisProxyStore` (strict claims); `ClusteredProxyStore` (Pending/Recorded, experimental); recordings via config-owner writes | U-5 (+0a); same demand gate for gossip-native | Redis mode: 3 nodes, concurrent first-hits, 100-run soak incl. node kill → upstream called exactly once (`test_proxy_once_redis_strict`); gossip mode: exactly-once while membership stable, duplicates ≤ documented bound under owner kill, measured (`test_proxy_once_gossip_bound`); recorded stubs appear on all nodes (`test_recording_replicates`); concurrent recordings on 3 nodes, no partition → zero lost stubs (`test_recording_no_loss`). Chaos: C3, C10, C11 | feature flag off → local store (today) |
+| **5 — Proxy + proxyOnce (strict = Redis first)** | `RedisProxyStore` (strict claims); `ClusteredProxyStore` (Pending/Recorded, experimental); recordings as leader-serialized `PatchStubs` `ControlOp`s (ADR-001) | U-5 (+0a); same demand gate for gossip-native | Redis mode: 3 nodes, concurrent first-hits, 100-run soak incl. node kill → upstream called exactly once (`test_proxy_once_redis_strict`); gossip mode: exactly-once while membership stable, duplicates ≤ documented bound under owner kill, measured (`test_proxy_once_gossip_bound`); recorded stubs appear on all nodes (`test_recording_replicates`); concurrent recordings on 3 nodes, no partition → zero lost stubs (`test_recording_no_loss`). Chaos: C3, C10, C11 | feature flag off → local store (today) |
 
 **Phase 1 must land and be validated with a design partner before 2–5 proceed** (also a
 kill-criteria gate, §13.3). Every phase ships behind `--cluster` +
@@ -1233,26 +1287,55 @@ reconcile complete (what LBs and kubelet must probe); `GET /healthz` — process
 The existing OSS `/health` stays untouched.
 
 Prometheus (existing registry pattern, `extensions/metrics.rs`; served by the U-7 metrics
-server on `--metrics-port`): `rift_cluster_members{state}`, `rift_cluster_ring_epoch`,
-`rift_cluster_owner_forwards_total{op}`, `rift_cluster_owner_failures_total{op,reason}`,
-`rift_cluster_settle_waits_total` †, `rift_cluster_generation{key_class}`,
-`rift_cluster_gossip_lag_seconds` †, `rift_cluster_config_revision{port}`,
-`rift_cluster_config_converged` (0/1), `rift_cluster_config_conflicts_total` †,
-`rift_cluster_cas_conflicts_total`, `rift_cluster_degraded_ops_total{feature}`,
-`rift_cluster_partial_reads_total`, `rift_cluster_kv_evicted_flows_total`,
-`rift_cluster_bind_failures{port}`, `rift_cluster_bridge_inflight`,
-`rift_cluster_bridge_rejected_total`, `rift_cluster_insecure` (0/1).
+server on `--metrics-port`). **Shipped in Phase 1** — these names are normative and are
+registered in `crates/rift-cluster/src/metrics.rs`:
 
-† Three of those are v2-era and do not survive ADR-001 as written:
-`rift_cluster_config_conflicts_total` counted a config-write merge conflict, which the
-rewritten §7.6 config-write row makes unrepresentable — the control plane has a quorum, so
-there is nothing to arbitrate; `rift_cluster_settle_waits_total` counted the settle delay
-ADR-001 deletes rather than mitigates; and `rift_cluster_gossip_lag_seconds` names a
-transport the control plane no longer uses. The Phase-1 replacements are the
-intent/replay counters #9 actually ships — `rift_cluster_intents_pending`,
-`rift_cluster_intents_replayed_total`, `rift_cluster_ops_deduplicated_total` — plus
-`rift_cluster_config_converged`. Listed here rather than silently dropped, because a
-dashboard built on the old names should be told they will read zero forever.
+| Metric | Meaning |
+|---|---|
+| `rift_cluster_members{state}` | Members as seen by this node, by state |
+| `rift_cluster_ring_epoch` | Membership **log index** the ownership ring derives from. Two nodes reporting different values have not converged. (The name survives ADR-001; its meaning does not — it is a Raft index now, not a gossip epoch) |
+| `rift_cluster_insecure` (0/1) | 1 when the cluster port runs unauthenticated, so a fleet can be audited rather than trusted |
+| `rift_cluster_write_forwards_total` | Admin writes this node accepted and handed toward the leader (one per hop) |
+| `rift_cluster_barrier_waits_total`, `rift_cluster_barrier_timeouts_total` | Read-after-write barriers run, and those that timed out |
+| `rift_cluster_intents_pending`, `rift_cluster_intents_parked_total`, `rift_cluster_intents_replayed_total` | The durable intent log (R4): in flight, parked on `503`, replayed on heal |
+| `rift_cluster_dedup_hits_total` | Ops collapsed by op-id — a replay and a retry proving to be one operation |
+| `rift_cluster_pull_on_miss_checks_total`, `..._lagging_total`, `..._retries_total` | The lagging-follower safety net (#49): consulted, found behind, re-matched after catch-up |
+| `rift_cluster_config_revision{port}` | Applied config revision per port. **This is the convergence signal** — two nodes disagreeing here have not converged |
+| `rift_cluster_bind_failures{port}` | Ports that failed to bind |
+
+Three more are counted **in process only and do not yet reach `/metrics`**:
+`rift_cluster_bridge_inflight`, `rift_cluster_bridge_rejected_total`, and
+`rift_cluster_rpc_failures_total{reason}` (reason buckets enumerated in `metrics.rs`). They
+are maintained as atomics and readable via `metrics::snapshot()`, but the registry bridge
+that would expose them has no caller yet, so nothing scrapes them. Named here because the
+counters exist and the names are settled — not because a dashboard can use them today.
+
+**Planned, not yet built** — named here so later phases have a fixed target, but nothing
+exports them today: `rift_cluster_cas_conflicts_total` and
+`rift_cluster_kv_evicted_flows_total` (Phase 2, flow state),
+`rift_cluster_degraded_ops_total{feature}` (Phase 2+), `rift_cluster_partial_reads_total`
+(Phase 3, journal).
+
+† **Retired by ADR-001.** A dashboard built on these should be told they will read zero
+forever. `rift_cluster_config_conflicts_total` counted a config-write merge conflict, which
+the rewritten §7.6 config-write row makes unrepresentable — the control plane has a quorum,
+so there is nothing to arbitrate. `rift_cluster_settle_waits_total` counted the settle delay
+ADR-001 deletes rather than mitigates. `rift_cluster_gossip_lag_seconds` names a transport
+the control plane no longer uses. `rift_cluster_generation{key_class}` counted the per-key
+ownership generations ADR-001 deletes along with the ring epochs. And the owner-forward
+pair `rift_cluster_owner_forwards_total{op}` / `rift_cluster_owner_failures_total{op,reason}`
+described forwarding to a per-port config owner; what shipped is forwarding to the *leader*,
+counted by `rift_cluster_write_forwards_total`. Forward *failures* have no scraped successor
+today — `rift_cluster_rpc_failures_total{reason}` is the counter, but it is one of the three
+above that never reaches `/metrics`, so a dashboard replacing `owner_failures_total` has
+nothing to point at until that bridge lands.
+
+Two names this section previously asserted as Phase-1 replacements were never registered and
+are corrected here rather than left to be discovered at dashboard-build time:
+`rift_cluster_ops_deduplicated_total` does not exist — the shipped counter is
+`rift_cluster_dedup_hits_total`; and `rift_cluster_config_converged` does not exist —
+convergence is read from `rift_cluster_config_revision{port}`, which is per-port and
+therefore strictly more informative than the 0/1 gauge it replaces.
 
 ### 11.2 Security
 
@@ -1395,9 +1478,9 @@ timing-sensitive — **not** claimed deterministic):
 | C6 (redefined — was 30 % UDP drop, a gossip-transport scenario) | toxiproxy 30 % loss + 100 ms jitter on the **cluster TCP port** for 60 s | Voter set never changes; **leadership transitions bounded by rate, not count** — the injected jitter overlaps the 150–300 ms election timeout by design, so occasional elections are in spec and only a *continuously* re-electing fleet fails (#94); zero acknowledged-write loss; fleet converges when the toxics lift |
 | C7 | Joining node with stale/empty state | Serves no traffic until Ready; then identical config; publishes nothing while Joining |
 | C8 | **Round-robin scenario traffic, healthy cluster, 10 ms pacing, no affinity** | Zero illegal transitions, zero stale-read matches (owner-read path) |
-| C9 | **Node rejoin under CAS load (asymmetric views)** | No forked `(g,v)` histories: generation ordering yields one winner; any acknowledged-write loss ≤ documented settle-violation bound and counted |
-| C10 | **Owner kill during proxyOnce storm** — variants: kill the claim owner; kill the *config* owner between upstream completion and stub publication | Duplicates ≤ 1 + ownership changes (measured against the documented bound); zero permanently wedged signatures; failed config write ⇒ claim released, signature retryable |
-| C11 | **Concurrent proxy recording on 3 nodes, no partition** | Zero lost recorded stubs (owner-serialized config writes) |
+| C9 (rewritten per ADR-001) | **Node rejoin under CAS load (asymmetric views)** | No forked histories — **by construction, not by arbitration**. Membership is itself a Raft log entry, so at any log index every node computes byte-identical membership and therefore byte-identical ownership; ADR-001 records that the dual-owner fork class "stops being a scenario that can fail". There is no `(g,v)` winner to pick and **no settle-violation bound**, because the settle delay was deleted rather than mitigated. What C9 still asserts, and what the residual window still needs: a deposed owner is exposed only until it applies the entry deposing it, and `(m_idx, v, origin)` totally orders anything written inside that window, so a conflicting write is **resolved and counted, never silently dropped**. Flow values remain off consensus, so adoption keeps §7.2.3's honest bound — one replication round of staleness, and adopt-found-nothing flagged `Rift-Cluster-Degraded: kv-adopt` and counted. This is *not* C5's zero-loss bar: that one is earned by graceful leave's drain-and-handoff, which a rejoin has no equivalent of |
+| C10 | **Owner kill during proxyOnce storm** — variants: kill the claim owner; kill the **leader** between upstream completion and stub publication (the stub append is a config write, so it is the leader that must survive it, not a per-port owner) | Duplicates ≤ 1 + ownership changes (measured against the documented bound); zero permanently wedged signatures; failed config write ⇒ claim released, signature retryable |
+| C11 | **Concurrent proxy recording on 3 nodes, no partition** | Zero lost recorded stubs. A recording *is* a config write, so it is leader-serialized as a `PatchStubs` `ControlOp` and the log order is the publication order; op-id derived from `(port, signature)` (§7.5.3) collapses a replay and a retry into one operation |
 | C12 | **±5 s clock skew across nodes** | Journal clears exact (generation-based); HMAC window behavior per spec; no age-GC anomalies |
 | C13 | **Owner black-hole + 20 % stateful load** | Stateless p99 < 5 ms throughout (bridge semaphore + fast-fail); bounded rejected-op count |
 | C14 (from #9) | **Leader docker-kill mid 100-write storm** | Every write is either acked-and-present, or `503`-with-op-id and present after replay; zero duplicates; a new leader within 3 s |
