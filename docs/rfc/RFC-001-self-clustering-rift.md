@@ -1,13 +1,71 @@
-# RFC-001 — Self-Clustering Distributed Rift (v3)
+# RFC-001 — Self-Clustering Distributed Rift (v3.1)
 
 | | |
 |---|---|
-| **Status** | v3 (re-grounded at v0.15.0; control plane decided by ADR-001) — implementation-ready |
+| **Status** | v3.1 (re-grounded at v0.15.0; control plane decided by ADR-001) — implementation-ready |
 | **Tracking issue** | [achird-labs/rift-enterprise#1](https://github.com/achird-labs/rift-enterprise/issues/1) |
 | **Canonical location** | `rift-enterprise:docs/rfc/RFC-001-self-clustering-rift.md` |
 | **Ground truth** | All code citations resolve against `vendor/rift` @ `aaa6042` (v0.15.0). `imposter/core.rs` was split upstream into the `imposter/core/{mod,matching,lifecycle,recording,responses,proxy}.rs` module tree and the crate renamed `rift-core` → `rift-mock-core`; line-number citations below are approximate against v0.15.0. |
 | **Author** | Mohsen Zainalpour |
-| **Date** | 2026-07-01 (v3: 2026-07-21) |
+| **Date** | 2026-07-01 (v3: 2026-07-21; v3.1: 2026-07-22) |
+
+**Changelog v3 → v3.1** (normative surfaces re-aligned with the issues that implement them)
+
+v3 put supersession banners on §7.1/§7.2/§7.4 but left two normative surfaces carrying
+v2-era gossip semantics that contradicted decisions already recorded in the implementation
+issues — an implementer reading only the RFC would have built the wrong thing.
+
+- **§7.6 aligned with ADR-001, #9 and #16.** The blanket *"this design has no quorum"* is
+  corrected — the **control plane** has one, the data plane does not, and the section now
+  says which is which. **Both** config-write rows drop the `local` / `(g,revision,origin)`
+  heal-merge option: admin writes have exactly **one** degraded behaviour, `503` + op-id,
+  durably parked, auto-replayed (#9) — and a **proxy recording is a config write**, so its
+  row now says so instead of offering a merge. The **flow-KV read** row becomes
+  owner-authoritative by default with `readConsistency: "local"` as a per-imposter opt-in
+  (#16 Gap C); §7.2.4's cross-text follows. `--cluster-degraded-mode` is scoped to
+  **data-plane features** (flow state, Phase-4 sequences, Phase-5 proxyOnce) — matching
+  #9's flag decisions, and explicitly not config writes.
+- **§7.5.1 gained the journal vector cursor and SSE design**, which v3 omitted entirely: a
+  `(node_id → shard_seq)` map as the **opaque** `since` token (the admin layer round-trips
+  it and never parses it), clear-generation staleness detection, eviction-overtakes-cursor
+  handling, partial-shard handling, and the two acceptable SSE shapes with their honest
+  one-anti-entropy-interval latency bound. This needs a method U-4 does not carry, so
+  **U-13 (`RequestJournal::read_since`) is recorded as a queued seam** in Appendix B rather
+  than assumed. New Phase-3 exit criterion `test_journal_cursor_merge` (§10), stated **per
+  clear generation** — a cross-clear concatenation is supposed to exceed a final full read,
+  so asserting equality across a clear would have been unsatisfiable by construction.
+- **§11.3 states the sequencer cost honestly:** one `next` **plus up to a few `peek`s** per
+  request, since a template referencing the sequence several times pays per reference. The
+  RPC fan-out is stated as **inherent** — the only cache that could remove a round trip
+  would sit on the calling node, where it would reintroduce the stale read the design
+  exists to prevent; an owner-side cache bounds owner-side work, not RPC count.
+- **§12 re-synced with the harness (#11), which inherits its inventory from here.** C4 is
+  rewritten per ADR-001 (park-and-replay, not merge-arbitration); C5 gains the
+  leader-hand-off bound (≤ 3 s per roll) it was missing; C6 is redefined from gossip-era
+  UDP drop to toxiproxy TCP loss/jitter, bounding the leadership **rate** rather than the
+  count (#94); **C14/C15 added** from #9. The harness description is corrected to the
+  two-tier split that shipped, including why partitions are not toxiproxy.
+- **§10's Phase-1 row was malformed** — six cells in a five-column table, whose duplicate
+  exit-criteria cell listed a *different* chaos set (no C14/C15). Repaired, so §10 and §12
+  now show one Phase-1 chaos list rather than two.
+- **§7.3 gained a supersession banner** scoped to its two *config* rows — it was the last
+  section on the config path without one, and this pass made the contradiction sharper by
+  having §7.6 say "forward to the Raft leader" two pages after §7.3 still said
+  "port-config owner … assign `(g, revision)`". Its data-plane rows are untouched.
+- **§7.5.3 pins the proxy-recording `op_id` to `(port, signature)`.** Making the config
+  path park-and-replay changed a proxyOnce invariant: a parked write has not *failed*, so
+  releasing the claim and letting a retry re-record would produce two op-ids for one
+  signature — two upstream calls, which #9's dedup would not collapse and §7.5.3's stated
+  duplicate bound does not cover. A signature-derived op-id makes retry and replay the same
+  operation.
+- **§11.1 marks three metrics as not surviving ADR-001** —
+  `rift_cluster_config_conflicts_total` (counts a merge conflict now unrepresentable),
+  `rift_cluster_settle_waits_total`, `rift_cluster_gossip_lag_seconds` — rather than
+  leaving a dashboard silently reading zero.
+- **Small verifies:** achird-labs/rift#800 recorded as a dependency-not-blocker for the
+  backend-error door (§7.4 banner); the SDK conformance suite (upstream epic #458) named in
+  the §10 Phase-1 exit criteria and §12 regression bars; `--cluster-off` parity tracked
+  as #37.
 
 **Changelog v2 → v3** (re-grounding + control-plane decision)
 
@@ -581,8 +639,15 @@ Reading a local gossip/replica copy here is wrong under spraying — request 2 o
 reach node B milliseconds after node A's transition, long before any replication —
 so **scenario-state reads used for matching are forwarded to the owner** (one RPC),
 exactly like writes; `owner == self` short-circuits to memory. Generic flow-KV reads that
-do not gate matching (scripting `flow_store:get`) may use the local replica (bounded
-staleness, flagged when the owner is unreachable) — the split is per §7.6. Transitions
+do not gate matching (scripting `flow_store:get`) are **also owner-authoritative by
+default** (#16 Gap C): scripts drive response content and fault decisions off flow state,
+so a stale read is a wrong answer just as a stale match is. A per-imposter
+`readConsistency: "local"` opts a given imposter back into the local replica (bounded
+staleness, flagged when the owner is unreachable) — same polarity as
+`--cluster-degraded-mode reject`: correct by default, fast by choice. The cost argument
+that once justified replica reads is void, because scripts run on the dedicated
+script-pool threads §7.7 already sizes with their own larger permit pool precisely so they
+can park on RPC. The split is per §7.6. Transitions
 (`willSetStateTo`) execute as CAS at the owner and return the authoritative new state, so
 match-and-transition for a single request is one round trip total.
 
@@ -596,6 +661,14 @@ becomes the §7.6 503, never a silent wrong match. OSS behavior is unchanged in 
 (built-in stores don't fail).
 
 ### 7.3 Internal RPC
+
+> **Config endpoints superseded by ADR-001 (v3.1).** The transport, auth and epoch/proto
+> framing below are current (merged as #8). The two **config** rows are not: config writes
+> go to the **Raft leader** as a `ControlOp` (§7.6, #9), not to a per-port config owner
+> assigning `(g, revision)`, and ADR-001 deletes the content-addressed
+> `GET /internal/v1/config/{port}/{digest}` fetch along with the digest-gossip mechanism it
+> served. Retained for context, like §7.1/§7.2/§7.4. The KV, sequence, proxy and journal
+> rows are unaffected — they are data-plane, which stays off consensus.
 
 Hyper (already a dependency) over TCP on the cluster port. All bodies JSON; all requests
 carry `X-Rift-Cluster-Auth` (§11.2), `X-Rift-Cluster-Epoch`, and the sender's proto
@@ -632,8 +705,11 @@ Connection pooling per peer.
 > Raft log index. The client-visible contract (revision/warning headers, degraded semantics via
 > §7.6) and the bind-divergence handling (§7.4.6) survive. Degraded/failed responses use the
 > upstream v0.15.0 error slugs (`unavailable`, `timeout`; #797) via `error_response_typed` — no
-> cluster-specific error types. See ADR-001 §Write path and issue #9. Text retained for context
-> and the surviving contract.
+> cluster-specific error types. **Dependency, not a blocker:** achird-labs/rift#800 — the
+> backend-error door still serves the pre-#797 envelope shape, so a degraded-response
+> assertion aimed at *that* door must either wait for #800 or assert the headers only.
+> Everything else already carries the stable `type`. See ADR-001 §Write path and issue #9.
+> Text retained for context and the surviving contract.
 
 **Design rules (v2, superseded mechanism): gossip carries pointers, not payloads; writes are
 serialized at a per-port owner** (v1's accept-anywhere LWW destroyed concurrent stub mutations —
@@ -765,6 +841,69 @@ unrelated process). Semantics:
   `note_request`, which fires even when body recording is off — matching today's
   `AtomicU64` semantics); read = sum of slots (partial under partition, flagged).
 
+**Incremental reads — the vector cursor.** A sharded log has no single sequence number, so
+a scalar `since` cannot express "everything I have already seen": entries from different
+shards interleave by recorded timestamp, and a peer that was unreachable last poll may
+supply entries that sort *before* ones already returned. The cursor is therefore a
+**vector** — a map `(node_id → shard_seq)` naming the high-water mark consumed per shard —
+serialised into a single **opaque** token:
+
+```
+since = base64url(cbor({ "v": 1, "gen": <clear_gen>, "m": { "<node_id>": <shard_seq>, … } }))
+```
+
+- `read_since(cursor) -> (entries, next_cursor)` — a **new upstream method on
+  `RequestJournal`**, and therefore a queued seam (**U-13**, Appendix B), not part of the
+  already-merged U-4 (`achird-labs/rift#314`). Phase 3 cannot ship the fleet-wide form
+  until it lands; the interim below is what makes that a schedule constraint rather than a
+  blocker. Entries are the union of per-shard tails above each mark, k-way merged as for a
+  full read.
+- **`shard_seq` is monotone per shard for the life of the node and does *not* reset on a
+  clear** — clears advance `clear_gen`, never rewind `seq` (§7.5.2 is clock-free precisely
+  so nothing has to). The `gen` in the token therefore does not exist to prevent skipping;
+  it exists so a cursor minted before a clear is not silently used to *resume* into a
+  generation whose earlier entries have been discarded, which would return a suffix while
+  looking like a complete page.
+- **Eviction can overtake a lagging cursor.** If a shard's `evicted_below_seq` watermark
+  has passed the cursor's mark for that shard, the entries between are gone — the honest
+  answer is to report it, not to paper over it: the response carries
+  `Rift-Cluster-Cursor-Lapsed: <node_id>` and resumes from the watermark. A consumer that
+  must not miss entries polls faster than the shard cap turns over; one that only needs
+  recency ignores the header. Silently resuming from the watermark would manufacture
+  exactly the gap the Phase-3 criterion forbids.
+- **The admin layer treats the token as opaque** — it round-trips it and never parses it.
+  That is what lets the encoding change (a shard added, a node id retired, `v` bumped)
+  without an API break, and it is why the token carries `gen`: a cursor minted before a
+  clear (§7.5.2) is detected as stale and answered with a full re-read plus
+  `Rift-Cluster-Cursor-Reset: true`, rather than silently skipping the entries a naive
+  scalar comparison would drop.
+- Unreachable shards are omitted rather than guessed: the response carries
+  `Rift-Cluster-Partial: true` and `next_cursor` keeps the old mark for those shards, so
+  the entries arrive on a later poll instead of being lost.
+
+**Streaming (`GET /events`, `…/savedRequests/stream`).** SSE is fed by the same 5 s
+anti-entropy pull, so its honest latency bound is **one anti-entropy interval, not
+real-time**, and that must be documented on the endpoint rather than implied away. Two
+acceptable shapes, decided at implementation time:
+
+1. **Full fleet stream** — the vector cursor drives the pull; each SSE event carries the
+   `next_cursor` so a reconnecting client resumes exactly (`Last-Event-ID`).
+2. **Phase-3 interim** — stream **local shard only**, every event stamped
+   `Rift-Cluster-Partial: true`, until the vector cursor lands. Honest and useful; it must
+   not be described as a fleet stream.
+
+Phase-3 exit criterion: **`test_journal_cursor_merge`** — spray across 3 nodes while
+polling with the returned cursor. Stated per generation, because a clear deliberately
+discards data and a cross-clear concatenation is therefore *supposed* to exceed a final
+full read: within one `clear_gen`, the concatenation of pages equals a full read of that
+generation, with no duplicate and no gap **for a run sized below the shard cap** (as
+`test_journal_merge_exact` already requires) — above it, eviction legitimately outruns a
+lagging cursor and the run must observe `Rift-Cluster-Cursor-Lapsed` rather than a silent
+hole; a cursor spanning a clear yields
+`Rift-Cluster-Cursor-Reset` **exactly once** and then resumes cleanly in the new
+generation; a node going unreachable mid-sequence yields `Rift-Cluster-Partial` and its
+entries on a later poll rather than never.
+
 #### 7.5.2 Clears are generation bumps (clock-free)
 
 `DELETE .../savedRequests`, count resets, and `teardown_space` do **not** delete replicated
@@ -814,8 +953,18 @@ Unclaimed ──try_claim──► Pending(holder, deadline) ──complete─�
   the *port-config* owner (§7.4.2) while the claim lives at the *(port, signature)* owner —
   two different nodes in general, so "one logical publication" must be sequenced, not
   assumed: the claim owner transitions `Pending → Recorded` **only after the config write
-  is acknowledged** by the config owner. If the config write fails (unreachable, reject
-  mode), the claim is `release`d instead — the signature stays retryable and
+  is acknowledged** by the config owner. If the config write does not land — no leader
+  reachable, so it returns `503` with a **parked** intent (§7.6) — the claim is `release`d
+  so the signature stays retryable. **The recording's `op_id` is therefore derived from
+  `(port, signature)`, not minted per attempt.** This matters because park-and-replay is
+  not failure: the parked write is queued to *succeed*. With a per-attempt op-id, releasing
+  the claim would let a retry record the signature a second time and the parked intent
+  would later replay the first — two op-ids, so #9's dedup would not collapse them, and one
+  signature would produce two upstream calls and two stub appends. Deriving the op-id from
+  the signature makes the replay and the retry **the same operation**, which dedup does
+  collapse. (The alternative — hold the claim and poll `GET /_cluster/ops/:op_id` to a
+  terminal state before releasing — trades that duplicate for a claim pinned for the whole
+  partition, and is rejected for it.) With the derived op-id,
   "recorded-but-stubless" is unrepresentable. `Recorded(port, signature, response_digest)`
   then replicates as the monotone fact; adopters accept only complete `Recorded` entries.
   Two conflicting `Recorded` publications for one signature (partition, both sides
@@ -826,28 +975,43 @@ Unclaimed ──try_claim──► Pending(holder, deadline) ──complete─�
 
 ### 7.6 Partition & failure decision table
 
+> **Aligned with ADR-001 and #9 (v3.1).** The rows below were written for the v2 gossip
+> design, in which nothing had a quorum. Since ADR-001 the **control plane is a Raft group**
+> and therefore *does* have one; only the **data plane** (flow state, sequences, journal —
+> HRW-owned keys, off consensus) remains quorum-free. Three rows changed substantively as a
+> result: **config write** (one degraded behaviour, not two — #9), **proxy recording write**
+> (which *is* a config write, so it no longer offers a merge), and **flow-KV read**
+> (owner-authoritative by default — #16 Gap C).
+
 Global default `--cluster-degraded-mode reject` — correctness-critical ops fail fast and
 honestly rather than silently diverging; per-feature defaults below chosen for a mock
 server's practical needs. `local` mode trades correctness for availability and stamps
-responses `Rift-Cluster-Degraded: <feature>` (emitted via U-8). "Minority" is descriptive,
-not privileged — this design has no quorum; each side simply serializes the keys whose
-HRW owner is on that side.
+responses `Rift-Cluster-Degraded: <feature>` (emitted via U-8). `--cluster-degraded-mode`
+arrives with **#16** and governs **data-plane features only** — flow state (#16), Phase-4
+sequences, Phase-5 proxyOnce. It has **no effect on config writes** (including proxy
+recordings, which are config writes): those go through Raft, so their degraded behaviour is
+fixed rather than chosen — see the config-write row.
+
+**Quorum, precisely.** The *control plane* has a quorum: config writes are Raft-committed,
+so a minority side cannot commit at all. The *data plane* does not: for HRW-owned keys
+"minority" is descriptive rather than privileged, and each side simply serializes the keys
+whose owner is on that side.
 
 | Feature / op | Owner reachable (normal) | Owner unreachable (fast-fail on Suspect/Dead) | During partition (either side) |
 |---|---|---|---|
 | Scenario read (match gate) | Owner RPC (`for_match`); local if self | **reject**: 503 cluster/owner-unreachable; `local`: local replica, flagged degraded | Keys owned on this side: normal; other side's keys: as owner-unreachable |
 | Scenario CAS (transition) | Owner RPC; returns authoritative state | **reject** / `local` CAS on replica, flagged; `(g,v)`-merged on heal | Same pattern |
 | Flow KV write / incr | Owner RPC | **reject** / `local`, flagged | Same |
-| Flow KV read (scripting, non-gate) | Local replica (≤ 1 replication round stale) | Local replica, flagged when owner Dead | Same |
+| Flow KV read (scripting, non-gate) | **Owner RPC** (default); local replica only with per-imposter `readConsistency: "local"` (#16 Gap C) | **reject** / `local`, flagged | Same |
 | Sequence next | Owner RPC; local if self | **local** (default for this feature): node-local cursor so test traffic flows; duplicates possible across sides; flagged. `reject` available | Same |
 | Sequence reset / peek | Owner RPC (reset via generation bump; peek reads owner cursor) | reset: applied as generation bump (converges on heal); peek: local estimate, flagged | Same |
 | proxyOnce claim/complete/release | Owner RPC per §7.5.3 | **reject** (default): 503 rather than risk duplicate side effects; `local`: local Pending, duplicates possible | Same |
-| Proxy recording write (stub append) | Config-owner write (§7.4.2) | **reject** / `local` with heal-merge | Same |
+| Proxy recording write (stub append) | Leader-serialized config write (`PatchStubs` `ControlOp`) | **A config write, and governed by the config-write row below:** `503` + op-id, durably parked, auto-replayed. No mode choice, no heal-merge. The op-id is derived from `(port, signature)` so a replay and a retry dedup to one operation (§7.5.3) | Same as config write |
 | Journal append / `note_request` | Local shard (always) | Local (unaffected) | Local |
 | Journal read / count read | Pull-on-read merge, complete | Merge of reachable shards, `Rift-Cluster-Partial: true` | Same |
 | Journal clear / count reset | Generation bump (gossip) | Bump propagates on heal; local effect immediate | Same |
 | `teardown_space` | Generation bump + owner KV deletes | Same as clear + KV-write rules above | Same |
-| Config write (admin, recordings) | Forward to port-config owner | **reject** (default) / `local` with `(g,revision,origin)` heal-merge, conflicts counted | Each side serialized by its own owner; heal merges deterministically |
+| Config write (admin, recordings) | Forward to the Raft leader; 2xx after the write barrier | **One** behaviour, not a mode choice: `503` + `Rift-Cluster-Op-Id`, intent **durably parked**, auto-replayed when a leader returns (#9) | Majority side commits normally; minority side parks as above. Heal replays the parked intents; op-id dedup collapses duplicates. No `(g,revision,origin)` merge — that vocabulary is deleted |
 | Config read | Local (converged) | Local (possibly stale; convergence gauge exposes lag) | Same |
 
 Client-visible contract: degraded/partial responses always carry a `Rift-Cluster-*` header
@@ -1036,9 +1200,9 @@ Phase 1 is not blocked by seams it doesn't need.
 |---|---|---|---|---|
 | **0a — enabling seams** ✅ **DONE** | U-6 (#316), U-7 (#317), U-8 (#318) — **merged upstream v0.14.0** | — | OSS suite green; `matcher_bench` within 2 % of pre-seam baseline | Additive, default-off |
 | **0b — backend seams** ✅ **DONE** | U-1…U-5 (#311–#315) — **merged upstream v0.14.0** | — | Same bars per PR | Same |
-| **1 — Membership + config-sync** (v3: **Raft**, ADR-001) | `--cluster*` CLI; Raft membership incl. graceful leave; `ControlOp` config writes + read-after-write barrier + durable intent log + op-id dedup (replaces the v2 gossip mechanism); redb log/vote/snapshot + cold start; `/_cluster/{members,config,health,imposters,ops}`; `/readyz`. Transport substrate (#8) merged. | 0a ✅ | 3-node harness: `POST /imposters` on A visible & serving on B/C ≤ 5 s (`test_config_sync_converges`); kill B mid-run → A/C unaffected, B rejoin converges (`test_node_rejoin`); sibling-port config change preserves scenario state (`test_reconcile_preserves_state`); stub reorder converges order-correct (`test_reconcile_reorder`); unreachable seeds ⇒ never Ready (`test_no_seeds_not_ready`); full-cluster cold restart restores config incl. tombstones (`test_cold_start`); SIGTERM leave under load → zero data-plane errors on survivors AND zero lost acknowledged writes (`test_graceful_leave`). Chaos: C4, C5, C6, C7, **C14, C15** | 3-node harness: `POST /imposters` on A visible & serving on B/C ≤ 5 s (`test_config_sync_converges`); kill B mid-run → A/C unaffected, B rejoin converges (`test_node_rejoin`); sibling-port config change preserves scenario state (`test_reconcile_preserves_state`); stub reorder converges order-correct (`test_reconcile_reorder`); unreachable seeds ⇒ never Ready (`test_no_seeds_not_ready`); full-cluster cold restart restores config incl. tombstones (`test_cold_start`); SIGTERM leave under load → zero data-plane errors on survivors AND zero lost acknowledged writes (CAS ladder across the leave) (`test_graceful_leave`). Chaos: C4, C5, C6, C7 | `--cluster` off → OSS single node. **Truth scope:** a de-clustered node serves the full fleet config only if it ran with `--datadir` (the OSS write-through) — with `--configfile`-only deployments, export a snapshot from `--cluster-state-dir` first. Rollback is per-fleet: mixed on/off nodes behind one LB diverge immediately |
+| **1 — Membership + config-sync** (v3: **Raft**, ADR-001) | `--cluster*` CLI; Raft membership incl. graceful leave; `ControlOp` config writes + read-after-write barrier + durable intent log + op-id dedup (replaces the v2 gossip mechanism); redb log/vote/snapshot + cold start; `/_cluster/{members,config,health,imposters,ops}`; `/readyz`. Transport substrate (#8) merged. | 0a ✅ | 3-node harness: `POST /imposters` on A visible & serving on B/C ≤ 5 s (`test_config_sync_converges`); kill B mid-run → A/C unaffected, B rejoin converges (`test_node_rejoin`); sibling-port config change preserves scenario state (`test_reconcile_preserves_state`); stub reorder converges order-correct (`test_reconcile_reorder`); unreachable seeds ⇒ never Ready (`test_no_seeds_not_ready`); full-cluster cold restart restores config incl. tombstones (`test_cold_start`); SIGTERM leave under load → zero data-plane errors on survivors AND zero lost acknowledged writes (`test_graceful_leave`). Chaos: C4, C5, C6, C7, **C14, C15**. SDK conformance suite (upstream epic achird-labs/rift#458) green against a clustered fleet — an SDK must not be able to tell a 3-node fleet from a single node, which is R1 as a client sees it; `--cluster`-off parity of the full OSS suite tracked as #37. | `--cluster` off → OSS single node. **Truth scope:** a de-clustered node serves the full fleet config only if it ran with `--datadir` (the OSS write-through) — with `--configfile`-only deployments, export a snapshot from `--cluster-state-dir` first. Rollback is per-fleet: mixed on/off nodes behind one LB diverge immediately |
 | **2 — Scenario/flow state** | `ClusteredFlowStore`: owner-serialized reads (match gate) + CAS, successor replication, adoption; `/_cluster/kv/{flow_id}`; stuck-scenario & split-brain runbooks | U-1, U-2 (+0a) | multi-step scenario round-robin across 3 nodes at 10 ms pacing: transitions linear per flow, zero illegal transitions, zero lost updates over 10 k iterations (`test_scenario_cluster_linear`); owner kill mid-scenario → adopt within 1 replication round or flagged reset, never an illegal transition (`test_scenario_handoff`). Chaos: C1, C8, C9, C12, C13 | `--cluster-features` without `flow-state` → local stores |
-| **3 — Recorded-request verification** | `ClusteredJournal`: sharded log, watermarks, pull-on-read, generation clears; count G-counter | U-4 (+0a) | spray N (< shard-cap) requests across 3 nodes → `GET .../requests` on each node returns exactly N (`test_journal_merge_exact`); `DELETE savedRequests` clears cluster-wide ≤ 5 s incl. concurrent appends, clock-skew-immune (`test_journal_clear`); `numberOfRequests` = N on every node (`test_count_merge`) | `--cluster-features` without `journal` → local Vec |
+| **3 — Recorded-request verification** | `ClusteredJournal`: sharded log, watermarks, pull-on-read, generation clears; count G-counter | U-4 (+0a); **U-13** for the vector-cursor/streaming form (§7.5.1) | spray N (< shard-cap) requests across 3 nodes → `GET .../requests` on each node returns exactly N (`test_journal_merge_exact`); `DELETE savedRequests` clears cluster-wide ≤ 5 s incl. concurrent appends, clock-skew-immune (`test_journal_clear`); `numberOfRequests` = N on every node (`test_count_merge`); incremental reads with the returned vector cursor concatenate, **within one clear generation**, to exactly a full read of that generation — no duplicate, no gap — with `Rift-Cluster-Cursor-Reset` exactly once across a clear and `Rift-Cluster-Partial` for a node unreachable mid-sequence (`test_journal_cursor_merge`, §7.5.1; needs seam U-13) | `--cluster-features` without `journal` → local Vec |
 | **4 — Response sequencing (strict = Redis first)** | `RedisSequencer` (strict, requires `--cluster-redis <url>`); `ClusteredSequencer` (gossip-native, experimental flag) | U-3 (+0a); **named customer request on file for gossip-native strict** | Redis mode: cyclic stub sprayed across nodes → global sequence no dup/skip incl. during single-node kill (`test_sequence_redis_strict`); gossip mode: no dup/skip while membership stable, documented reset on handoff (`test_sequence_no_dup_no_skip`, `test_sequence_handoff_reset`). Chaos: C2, C13 | feature flag off → per-node cursors (today's behavior) |
 | **5 — Proxy + proxyOnce (strict = Redis first)** | `RedisProxyStore` (strict claims); `ClusteredProxyStore` (Pending/Recorded, experimental); recordings via config-owner writes | U-5 (+0a); same demand gate for gossip-native | Redis mode: 3 nodes, concurrent first-hits, 100-run soak incl. node kill → upstream called exactly once (`test_proxy_once_redis_strict`); gossip mode: exactly-once while membership stable, duplicates ≤ documented bound under owner kill, measured (`test_proxy_once_gossip_bound`); recorded stubs appear on all nodes (`test_recording_replicates`); concurrent recordings on 3 nodes, no partition → zero lost stubs (`test_recording_no_loss`). Chaos: C3, C10, C11 | feature flag off → local store (today) |
 
@@ -1071,13 +1235,24 @@ The existing OSS `/health` stays untouched.
 Prometheus (existing registry pattern, `extensions/metrics.rs`; served by the U-7 metrics
 server on `--metrics-port`): `rift_cluster_members{state}`, `rift_cluster_ring_epoch`,
 `rift_cluster_owner_forwards_total{op}`, `rift_cluster_owner_failures_total{op,reason}`,
-`rift_cluster_settle_waits_total`, `rift_cluster_generation{key_class}`,
-`rift_cluster_gossip_lag_seconds`, `rift_cluster_config_revision{port}`,
-`rift_cluster_config_converged` (0/1), `rift_cluster_config_conflicts_total`,
+`rift_cluster_settle_waits_total` †, `rift_cluster_generation{key_class}`,
+`rift_cluster_gossip_lag_seconds` †, `rift_cluster_config_revision{port}`,
+`rift_cluster_config_converged` (0/1), `rift_cluster_config_conflicts_total` †,
 `rift_cluster_cas_conflicts_total`, `rift_cluster_degraded_ops_total{feature}`,
 `rift_cluster_partial_reads_total`, `rift_cluster_kv_evicted_flows_total`,
 `rift_cluster_bind_failures{port}`, `rift_cluster_bridge_inflight`,
 `rift_cluster_bridge_rejected_total`, `rift_cluster_insecure` (0/1).
+
+† Three of those are v2-era and do not survive ADR-001 as written:
+`rift_cluster_config_conflicts_total` counted a config-write merge conflict, which the
+rewritten §7.6 config-write row makes unrepresentable — the control plane has a quorum, so
+there is nothing to arbitrate; `rift_cluster_settle_waits_total` counted the settle delay
+ADR-001 deletes rather than mitigates; and `rift_cluster_gossip_lag_seconds` names a
+transport the control plane no longer uses. The Phase-1 replacements are the
+intent/replay counters #9 actually ships — `rift_cluster_intents_pending`,
+`rift_cluster_intents_replayed_total`, `rift_cluster_ops_deduplicated_total` — plus
+`rift_cluster_config_converged`. Listed here rather than silently dropped, because a
+dashboard built on the old names should be told they will read zero forever.
 
 ### 11.2 Security
 
@@ -1108,6 +1283,19 @@ server on `--metrics-port`): `rift_cluster_members{state}`, `rift_cluster_ring_e
   requests cost one `kv/get(for_match)` (+ one CAS when transitioning, same round trip);
   sequence advances one `seq/next`; proxyOnce one claim + one complete. `owner == self`
   (~1/N) short-circuits to memory. There is no zero-hop assumption (§6.2).
+- **Sequencer honesty:** "one RPC per op" holds for `next`, but a response body that
+  interpolates the cursor without advancing it costs a `peek`, so the real budget is
+  **one `next` plus up to a few `peek`s per request** — a stub template referencing the
+  sequence several times pays per reference. State plainly what is and is not mitigable:
+  the **RPC fan-out is inherent**, because the only cache that could remove a round trip
+  would live on the *calling* node, and a non-owner cache reintroduces exactly the stale
+  read the owner-authoritative design exists to prevent. An optional short-lived (≈ 50 ms)
+  peek cache **on the owner** bounds owner-side cursor-store work under a peek-heavy
+  template — it does not reduce the number of RPCs. Templates that reference a sequence
+  many times per response are therefore a known cost, to be measured rather than designed
+  away — and no existing chaos scenario measures it (C13 loads the *stateless* path against
+  a black-holing owner, which is a different question), so Phase 4 owes a peek-amplification
+  benchmark rather than a citation.
 - Bridge capacity: semaphore `max(2, workers/2)`; fast-fail on Suspect/Dead owners keeps
   the parked-thread window to roughly one detection interval after a crash.
 - Sizing rules of thumb (per node): journal ≤ ports × shard-cap × avg-entry;
@@ -1171,9 +1359,21 @@ health checks in L4 mode (§6.1).
 
 ## 12. Verification & chaos plan
 
-Harness: `rift-enterprise` repo, `tests/cluster/` — 3-node docker-compose (+ `toxiproxy`
-for partitions, `tc netem` for skew/latency) driven by a Rust integration-test binary;
-every scenario asserts on admin API + metrics, not logs.
+Harness: `rift-enterprise` repo, **two tiers** (#11). *In-process* (`crates/rift-cluster`
+tests) drives real `RaftNode`s over localhost TCP — fast, deterministic, runs in PR CI.
+*Container* (`tests/cluster-chaos/`) runs 3× `rift-ee-server` containers behind an Envoy
+front with **toxiproxy between the nodes** — the only tier that can test real process
+death, partitions, and the admin write path end to end. Every scenario asserts on the
+admin API + Prometheus metrics, **never** log output, and never on the frozen legacy
+`code` field — degraded-behaviour assertions read the stable `type` slug (`unavailable`,
+`timeout`, upstream #797) plus the `Rift-Cluster-*` headers.
+
+Note on partitions: toxiproxy cannot express one. Every peer dials a node at its single
+advertised address, so disabling that listener cuts inbound only and leaves the
+"partitioned" node campaigning through its still-open outbound path — the opposite of what
+C4 asserts. Whole-node isolation (`docker network disconnect`) is symmetric, and for a
+3-node fleet that is the only partition that matters. Toxiproxy is used for C6's
+loss/jitter, where L4 latency injection is exactly the right tool.
 
 Functional exit criteria are named per phase in §10. Chaos scenarios (fault-injected,
 timing-sensitive — **not** claimed deterministic):
@@ -1183,9 +1383,9 @@ timing-sensitive — **not** claimed deterministic):
 | C1 | Partition A\|BC during scenario traffic, heal after 30 s | No illegal FSM transition on either side; keys owned on the reachable side stay serialized; other-side ops rejected (default) or flagged degraded; converges on heal; conflicts counted, never silent |
 | C2 | Kill sequence-owner mid-traffic (gossip mode) | No dup/skip before kill; documented reset after handoff; no wedged requests (complete or 503 within deadline) |
 | C3 | Concurrent proxyOnce first-hits on all 3 nodes, 100 signatures, membership stable | Upstream sees exactly 100 calls |
-| C4 | Config write during partition on both sides, heal | Deterministic `(g,revision,origin)` winner; conflict counter incremented; all nodes converge to identical digest |
-| C5 | Rolling restart under load (SIGTERM, one node at a time) | Zero data-plane errors on survivors; zero owner-unreachable rejections (graceful leave path); **zero lost acknowledged writes** (CAS ladder driven across each leave — catches handoff-ordering races); convergence gauge recovers ≤ 10 s per node |
-| C6 | Gossip flap (drop 30 % UDP for 60 s) | No ownership flapping (Suspect ≠ handoff); no false Dead; degraded-ops zero |
+| C4 (rewritten per ADR-001) | Config write during partition on both sides, heal | Minority answers `503` + `Rift-Cluster-Op-Id` with the intent **durably parked**; majority commits; on heal the parked intents **replay** and op-id dedup collapses duplicates; every node ends at an identical applied index. No `(g,revision,origin)` winner — the control plane has a quorum, so there is no merge to arbitrate |
+| C5 | Rolling restart under load (SIGTERM, one node at a time) | Zero data-plane errors on survivors; zero owner-unreachable rejections (graceful leave path); **zero lost acknowledged writes** (CAS ladder driven across each leave — catches handoff-ordering races); **leadership hand-offs bounded: a new leader within 3 s of each roll** (per #11 — a latency bound, measured directly, unlike C6's rate bound which exists because its quantity is only observable at the sampling resolution) |
+| C6 (redefined — was 30 % UDP drop, a gossip-transport scenario) | toxiproxy 30 % loss + 100 ms jitter on the **cluster TCP port** for 60 s | Voter set never changes; **leadership transitions bounded by rate, not count** — the injected jitter overlaps the 150–300 ms election timeout by design, so occasional elections are in spec and only a *continuously* re-electing fleet fails (#94); zero acknowledged-write loss; fleet converges when the toxics lift |
 | C7 | Joining node with stale/empty state | Serves no traffic until Ready; then identical config; publishes nothing while Joining |
 | C8 | **Round-robin scenario traffic, healthy cluster, 10 ms pacing, no affinity** | Zero illegal transitions, zero stale-read matches (owner-read path) |
 | C9 | **Node rejoin under CAS load (asymmetric views)** | No forked `(g,v)` histories: generation ordering yields one winner; any acknowledged-write loss ≤ documented settle-violation bound and counted |
@@ -1193,6 +1393,8 @@ timing-sensitive — **not** claimed deterministic):
 | C11 | **Concurrent proxy recording on 3 nodes, no partition** | Zero lost recorded stubs (owner-serialized config writes) |
 | C12 | **±5 s clock skew across nodes** | Journal clears exact (generation-based); HMAC window behavior per spec; no age-GC anomalies |
 | C13 | **Owner black-hole + 20 % stateful load** | Stateless p99 < 5 ms throughout (bridge semaphore + fast-fail); bounded rejected-op count |
+| C14 (from #9) | **Leader docker-kill mid 100-write storm** | Every write is either acked-and-present, or `503`-with-op-id and present after replay; zero duplicates; a new leader within 3 s |
+| C15 (from #9) | **`kill -9` all three nodes under load** | After restart, configs *and* parked intents are identical to the last acknowledgement — R3/R4 end to end |
 
 CI budget: **PR smoke** = 3 iterations of each phase-relevant scenario (~20 min,
 parallelized compose stacks); **nightly full** = 100 iterations across parallel stacks
@@ -1201,9 +1403,12 @@ parallelized compose stacks); **nightly full** = 100 iterations across parallel 
 quarantined behind an issue, not deleted.
 
 Regression: entire existing `rift-mock-core`/`rift-http-proxy` test suite runs against
-`rift-ee-server` with `--cluster` **off** → byte-identical behavior; hot-path
-micro-benches (`matcher_bench`) within 2 %. Pipeline: `cargo fmt`,
-`cargo clippy -- -D warnings`, `cargo test` (both repos).
+`rift-ee-server` with `--cluster` **off** → byte-identical behavior (tracked as #37);
+hot-path micro-benches (`matcher_bench`) within 2 %. The **SDK conformance suite**
+(upstream epic achird-labs/rift#458) runs against a clustered fleet as a Phase-1 exit
+criterion: an SDK cannot tell a clustered `rift-ee-server` from a single node, which is the
+externally visible form of R1. Pipeline: `cargo fmt`, `cargo clippy -- -D warnings`,
+`cargo test` (both repos).
 
 ## 13. Risks, alternatives, kill criteria
 
@@ -1518,10 +1723,13 @@ Redis impls of U-3/U-4/U-5, the `ResponseDecorator` impl, `/_cluster/*` endpoint
 > U-1→#311 (`compare_and_set`), U-2→#312 (`FlowStoreProvider`), U-3→#313 (`ResponseSequencer`),
 > U-4→#314 (`RequestJournal`), U-5→#315 (`ProxyRecordingStore`), U-6→#316 (`apply_config` +
 > events + `stub_key`), U-7→#317 (embeddable `ServerBuilder`/gateway/metrics), U-8→#318
-> (`ResponseDecorator` + `BackendUnavailable`). Two further seams are queued for later phases:
-> **U-11** the front-door route table (#19) and **U-12** the `ImposterSource` provider trait
-> (#20); and RFC-002 adds **U-9** (admin authorizer) + **U-10** (principal on events). The
-> original drafts are retained below for provenance.
+> (`ResponseDecorator` + `BackendUnavailable`). Three further seams are queued for later
+> phases: **U-11** the front-door route table (#19), **U-12** the `ImposterSource` provider
+> trait (#20), and **U-13** `RequestJournal::read_since` — the incremental-read method the
+> §7.5.1 vector cursor needs, which U-4 (#314, already merged) does not carry, so Phase 3's
+> fleet-wide streaming form is gated on it landing upstream. RFC-002 adds **U-9** (admin
+> authorizer) + **U-10** (principal on events). The original drafts are retained below for
+> provenance.
 
 Filed on `achird-labs/rift` (generic wording; no enterprise references). One
 umbrella issue — *"Pluggable runtime-state backends & embeddable server (#203
