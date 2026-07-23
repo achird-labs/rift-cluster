@@ -70,6 +70,13 @@ pub enum ConfigError {
     )]
     InterceptUnsupported,
 
+    #[error(
+        "--cluster is not supported with --configfile: the file's imposters would load into this \
+         node alone, outside the replicated log, and the reconciler would then delete them in \
+         favour of the cluster's set — restore state through the admin API of any member instead"
+    )]
+    ConfigfileUnsupported,
+
     /// The secret file could not be read or was empty. Kept distinct from
     /// [`Self::SecretRequired`] so an operator who *did* pass the flag is told
     /// about the file rather than about the flag — and so an unreadable secret
@@ -199,6 +206,18 @@ mod tests {
         let msg = ConfigError::InterceptUnsupported.to_string();
         assert!(msg.contains("--cluster"), "{msg}");
         assert!(msg.contains("intercept"), "{msg}");
+    }
+
+    /// #85: the message has to name both flags and the way out, because the
+    /// failure it replaces was silent — imposters loaded and then deleted, with
+    /// nothing logged. An operator meeting this for the first time needs to
+    /// know what to do instead, not just that they cannot do this.
+    #[test]
+    fn the_configfile_refusal_names_both_flags_and_the_alternative() {
+        let msg = ConfigError::ConfigfileUnsupported.to_string();
+        assert!(msg.contains("--configfile"), "{msg}");
+        assert!(msg.contains("--cluster"), "{msg}");
+        assert!(msg.contains("admin API"), "{msg}");
     }
 
     #[test]

@@ -2734,3 +2734,116 @@ async fn a_parked_intent_replays_without_waiting_for_the_periodic_sweep() {
 
     server.shutdown().await;
 }
+
+/// #85: `--configfile` under `--cluster` is refused before anything binds.
+///
+/// The file's imposters would load into this node's engine outside the
+/// replicated log, and the reconciler — which treats the replicated set as
+/// authoritative and deletes what it does not know — would then remove them.
+/// The operator saw imposters appear and vanish, with no error anywhere.
+/// #67 guarded only the `replay` spelling of this; the flag itself was open.
+#[tokio::test]
+async fn a_configfile_is_refused_under_cluster() {
+    let dir = TempDir::new().expect("tempdir");
+    let configfile = dir.path().join("saved.json");
+    std::fs::write(
+        &configfile,
+        serde_json::json!({ "imposters": [{ "port": 7301, "protocol": "http" }] }).to_string(),
+    )
+    .expect("write configfile");
+
+    let state = TempDir::new().expect("tempdir");
+    let started = compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--configfile",
+            &configfile.to_string_lossy(),
+        ],
+    ))
+    .await;
+    let err = match started {
+        Ok(server) => {
+            server.shutdown().await;
+            panic!("a clustered node must refuse --configfile, but it started");
+        }
+        Err(e) => e,
+    };
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("--configfile") && message.contains("--cluster"),
+        "the refusal must name both flags: {message}"
+    );
+    assert!(
+        message.contains("admin API"),
+        "the refusal must point at the supported way to restore state: {message}"
+    );
+}
+
+/// #85 regression guard: `--datadir` under `--cluster` starts and loads no
+/// imposters from the directory.
+///
+/// This pins behaviour that is already correct rather than fixing a defect.
+/// #85 reported `--datadir` as a second spelling of the `--configfile` hazard;
+/// it is not, measured on this tree. A datadir imposter is never loaded, bound,
+/// or listed under `--cluster`, and the operator's `{port}.json` is left
+/// untouched — while the identical fixture on a non-cluster server loads,
+/// lists and serves, so the fixture is valid and the difference is real.
+///
+/// Refusing the flag would be wrong regardless: it legitimately anchors the
+/// cluster state directory (`cluster_state_dir()` defaults to
+/// `<datadir>/_cluster`), so operators are steered onto it by the docs.
+///
+/// Worth keeping because nothing else states this. The suppression is a
+/// property of the clustered composition, not of any guard written for it, so
+/// a refactor could silently restore the load.
+#[tokio::test]
+async fn a_datadir_loads_no_imposters_under_cluster() {
+    let data = TempDir::new().expect("tempdir");
+    // `<datadir>/{port}.json` — upstream's layout (`read_and_parse_datadir`).
+    // Getting this wrong makes the test pass by loading nothing, which is
+    // indistinguishable from the fix working.
+    std::fs::write(
+        data.path().join("7302.json"),
+        serde_json::json!({ "port": 7302, "protocol": "http" }).to_string(),
+    )
+    .expect("write datadir imposter");
+
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--datadir",
+            &data.path().to_string_lossy(),
+        ],
+    ))
+    .await
+    .expect("a clustered node still starts with --datadir");
+    wait_ready(&server).await;
+
+    let listed: serde_json::Value =
+        reqwest::get(format!("http://{}/imposters", server.admin_addr()))
+            .await
+            .expect("list imposters")
+            .json()
+            .await
+            .expect("json");
+    let ports: Vec<u64> = listed["imposters"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|i| i["port"].as_u64()).collect())
+        .unwrap_or_default();
+    assert!(
+        ports.is_empty(),
+        "a clustered node must load nothing from --datadir; got {ports:?}"
+    );
+
+    // The flag still does the job it is needed for.
+    assert!(
+        state.path().exists(),
+        "the cluster state directory must still be usable"
+    );
+
+    server.shutdown().await;
+}

@@ -86,11 +86,17 @@ as authoritative, would then delete them. A saved file is already a
 `PUT /imposters` body, so replay it through the admin API instead and the write
 replicates.
 
-Note what that guard does *not* cover: `--configfile` and `--datadir` reach the
-same node-local load with `--cluster` on and are **not** refused today, and
-`--datadir` is on the recommended clustered path because the cluster state
-directory defaults beneath it. Refusing `replay` removes one spelling of the
-hazard, not the hazard.
+`--configfile` is refused under `--cluster` for the same reason and by the same
+error, wherever it comes from (#85). The check sits in the composition rather
+than in `replay`'s dispatch, so it also covers a bare `--configfile` and an
+embedder calling `compose::start` directly — `replay`'s refusal is now one
+spelling of a general rule rather than the only guard.
+
+`--datadir` is **not** refused: it legitimately anchors the cluster state
+directory (below), and under `--cluster` its imposters are not loaded — the
+directory's `{port}.json` files are left untouched and nothing from them is
+bound or listed. A regression test pins that, because the suppression is a
+property of the clustered composition rather than of an explicit guard.
 
 ### PID-file caveats (upstream behaviour, reproduced)
 

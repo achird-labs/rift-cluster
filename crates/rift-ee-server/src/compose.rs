@@ -382,6 +382,25 @@ pub async fn start_with_runtimes(
         });
     }
 
+    // `--configfile` cannot be honoured under `--cluster`, so it is refused
+    // rather than half-applied. Upstream's `start()` loads the file into the
+    // manager unconditionally — the injected-manager seam skips `--datadir`
+    // write-through but not the config-file load — and those imposters land
+    // outside the replicated log. The reconciler then treats the replicated set
+    // as authoritative and deletes what it does not know, so the operator
+    // watches imposters appear and vanish with no error anywhere.
+    //
+    // Here rather than in `ClusterConfig::validate()`: that sees only the
+    // cluster half of the CLI, and `configfile` is upstream's. Here rather than
+    // in `bootstrap::dispatch`, where #67 guards the `replay` spelling: this
+    // point also covers a caller who invokes `compose::start` directly, the
+    // embedding seam that never passes through dispatch at all.
+    if cli.oss.configfile.is_some() {
+        return Err(anyhow::Error::new(
+            rift_cluster::ConfigError::ConfigfileUnsupported,
+        ));
+    }
+
     let bind = cluster
         .bind
         .context("--cluster-bind is required with --cluster")?;
@@ -519,9 +538,14 @@ async fn attach_data_plane(
         .await?;
 
     // The config file's `intercept` block is the other spelling of the flag the
-    // startup guards already refuse, but it is only known once the builder has
-    // loaded the config — so it is caught here instead, before the node serves
-    // anything, rather than duplicating the loader to check it earlier.
+    // startup guards already refuse, and it is only knowable once the builder
+    // has loaded the config.
+    //
+    // Unreachable today: #85 refuses `--configfile` under `--cluster` before
+    // this point, so no config file is ever loaded here. Kept as
+    // defence-in-depth rather than deleted — it costs one field read, and it is
+    // the backstop if a future path ever loads a config another way. Do not
+    // read its presence as evidence that a config file can still arrive.
     if server.intercept_addr().is_some() {
         server.shutdown().await;
         return Err(anyhow::Error::new(
@@ -770,6 +794,11 @@ fn cluster_manager(
 /// already-applied op collapse to its original response, so replaying is
 /// always safe, never a double-apply.
 fn spawn_intent_replayer(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
+    // Taken once, up front, so the wait below needs no reference to the node.
+    // The `Weak` is the whole point of this task's lifetime contract: it must
+    // never keep the node alive, because `RaftNode::Drop` is what releases the
+    // redb lock and the cluster port.
+    let waker = node.replay_waker();
     let node = Arc::downgrade(&node);
     tokio::spawn(async move {
         let mut last_leader = None;
@@ -790,21 +819,21 @@ fn spawn_intent_replayer(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
                 drain_parked_intents(&strong).await;
             }
 
+            // Release the node BEFORE waiting. Holding it across the wait would
+            // keep it alive for up to an interval after the last external
+            // reference went away, delaying the `Drop` that releases the redb
+            // lock and the cluster port — a race for anything that restarts a
+            // node onto the same state directory.
+            drop(strong);
+
             // Sleep *or* wake, whichever lands first. `Notify` holds one
-            // permit, so a wake raised *during* the drain above is not lost —
+            // permit, so a wake raised *during* the drain above is not lost:
             // it resolves immediately here rather than being swallowed.
-            //
-            // The node stays held across the wait: dropping it first would need
-            // a second upgrade, and a wake arriving in that gap would be
-            // delivered to a `Notify` nobody is waiting on. Holding an `Arc`
-            // here cannot leak the node, because the wait is bounded by the
-            // 250ms sleep.
             woken = tokio::select! {
                 biased;
-                () = strong.replay_requested() => true,
+                () = waker.notified() => true,
                 () = tokio::time::sleep(Duration::from_millis(250)) => false,
             };
-            drop(strong);
         }
     })
 }
