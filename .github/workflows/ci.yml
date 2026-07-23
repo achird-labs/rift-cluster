@@ -50,6 +50,12 @@ jobs:
       - name: cluster-smoke path filter
         run: scripts/cluster-smoke-paths.sh --self-test
 
+      # The third guard on the same door: whether the tier, having run, actually
+      # ran anything. libtest exits 0 on a filter that matches nothing, so this
+      # is what stands between "the scenarios were skipped" and a green check.
+      - name: Empty-run guard
+        run: scripts/assert-scenarios-ran.sh --self-test
+
   # No openraft in `rift-cluster`'s public API — an acceptance criterion of
   # issue #6 that the compiler cannot check. Why it matters, and why the check
   # has no exemptions, is documented in the script itself; this job only
@@ -172,9 +178,19 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         run: |
           set -euo pipefail
-          skips="$(scripts/chaos-quarantine.sh list)"
-          echo "quarantine skips: ${skips:-<none>}"
-          cargo test -p cluster-chaos -- --ignored --test-threads=1 $skips
+          # An array, not a string. `list` emits one token per line precisely so
+          # this can be quoted: the old unquoted `$skips` worked only by
+          # word-splitting, which left SC2086 pointing here — and taking that
+          # advice hands libtest one argument beginning with `--`, which it
+          # rejects outright (`Unrecognized option`, exit 101). Red rather than
+          # silent, but broken either way, and the lint invited it (issue #116).
+          mapfile -t skips < <(scripts/chaos-quarantine.sh list)
+          echo "quarantine skips: ${skips[*]:-<none>}"
+          # Piped through the floor check so a run that matched no scenario is
+          # red rather than a green check that tested nothing. `pipefail` above
+          # keeps cargo's own failure from being masked by the pipe.
+          cargo test -p cluster-chaos -- --ignored --test-threads=1 "${skips[@]}" \
+            | scripts/assert-scenarios-ran.sh
 
       - name: Cluster logs on failure
         if: failure() && steps.changed.outputs.run == 'true'

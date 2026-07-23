@@ -260,8 +260,29 @@ when #72 was fixed.
 
 `scripts/chaos-quarantine.sh` makes the tag the single source of truth:
 
-- `list` emits `--skip <fn>` flags, which both `cluster-smoke` and the nightly
-  use. Nothing is hardcoded in a workflow, so a skip cannot outlive its reason.
+- `list` emits `--skip <fn>` flags — **one token per line** — which both
+  `cluster-smoke` and the nightly use. Nothing is hardcoded in a workflow, so a
+  skip cannot outlive its reason. One token per line so the caller can read them
+  into an array and pass `"${skips[@]}"`; the older space-separated form forced an
+  unquoted `$skips`, which left `SC2086` pointing at the call site inviting an
+  edit that stops the tier running (issue #116).
+- Both modes take an optional path to the scenarios file, so the parser is
+  exercised against a fixture rather than against whatever the tree happens to
+  hold — which today is nothing quarantined at all.
+
+### A run that tested nothing is not a pass
+
+`libtest` exits **0** when a filter matches no test: `--exact` naming a scenario
+that has since been renamed reports `0 passed; 0 failed` and succeeds. The
+nightly matrix names scenarios as literal strings, so that is one rename away at
+all times, and the soak would go green having soaked nothing indefinitely.
+
+Both tiers therefore pipe their run through `scripts/assert-scenarios-ran.sh`,
+which fails unless at least one test passed. It has a `--self-test` (run from the
+`build` job) covering the empty run, the multi-binary sum, and the nightly's
+one-scenario floor. Since #104 made `cluster-smoke` a required check, a
+green-but-empty run is worse than a red one — the ruleset then certifies what did
+not run.
 - `check` fails if a tag names no issue, and — where a `GH_TOKEN` exists, i.e.
   the nightly — if the issue it names is already **closed**. A quarantine on a
   closed issue means the bug was fixed and the scenario was never turned back

@@ -153,8 +153,13 @@ jobs:
             # A single failure is the whole point of the soak -- stop at it, so
             # the uploaded logs belong to the failure and not to a later run
             # that overwrote them.
+            # Through the floor check: `--exact` naming a scenario that has since
+            # been renamed matches nothing, and libtest then reports
+            # `0 passed` and exits 0 — a soak that soaked nothing, every night,
+            # indefinitely. One scenario per iteration, so the floor is 1.
             cargo test -p cluster-chaos --test scenarios -- \
-              --ignored --exact '${{ matrix.scenario }}'
+              --ignored --exact '${{ matrix.scenario }}' \
+              | scripts/assert-scenarios-ran.sh --assert 1
             echo "::endgroup::"
           done
           elapsed=$(( $(date +%s) - start ))
