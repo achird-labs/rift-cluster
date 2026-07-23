@@ -26,8 +26,16 @@ cargo check --workspace
 ## Syncing the open-source core
 
 Automatic: the **Sync upstream Rift** GitHub Action runs daily (and on demand),
-bumps `vendor/rift` to the latest public `master`, verifies the workspace still
-builds, and opens a PR.
+bumps `vendor/rift` to the latest public `master`, verifies the workspace against
+it (`clippy -D warnings` + `cargo test --workspace`), and opens a PR.
+
+Every run says what it did in its job summary, because a green run and a bump are
+different things — `create-pull-request` is a no-op when the pin is already at
+upstream's tip. **A failed run files an issue** titled `ci(sync-upstream): the
+scheduled vendor bump is failing`, reusing and re-commenting on the same issue
+for consecutive failures, and closes it on the next green run. Without that, a
+scheduled failure has no audience: nobody is watching a PR that was never opened,
+and the pin ages silently (it did, for ten days in July 2026).
 
 Manual/local:
 

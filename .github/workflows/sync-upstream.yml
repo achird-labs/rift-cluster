@@ -10,6 +10,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # For the failure report below. Without it a failing run cannot tell anyone it
+  # failed, which is the whole problem this workflow had (#106).
+  issues: write
 
 jobs:
   sync:
@@ -48,6 +51,7 @@ jobs:
           cargo test --workspace
 
       - name: Open sync PR
+        id: pr
         uses: peter-evans/create-pull-request@v6
         with:
           branch: sync/upstream-rift
@@ -63,3 +67,77 @@ jobs:
             change — review the diff and merge once it is green.
           labels: upstream-sync
           delete-branch: true
+
+      # A green run and a bump are different things. `create-pull-request` is a
+      # no-op when the submodule is already at upstream's tip, so "success" on
+      # the Actions tab covers both "opened a PR" and "there was nothing to do" —
+      # and for ten days it also covered neither, because the PR step failed. Say
+      # which one happened, where someone skimming the run will see it.
+      - name: Say what this run actually did
+        if: success()
+        run: |
+          set -euo pipefail
+          case "${{ steps.pr.outputs.pull-request-operation }}" in
+            created)  echo "### Opened [PR #${{ steps.pr.outputs.pull-request-number }}](${{ steps.pr.outputs.pull-request-url }}) for \`${{ steps.bump.outputs.rev }}\`" ;;
+            updated)  echo "### Updated [PR #${{ steps.pr.outputs.pull-request-number }}](${{ steps.pr.outputs.pull-request-url }}) to \`${{ steps.bump.outputs.rev }}\`" ;;
+            closed)   echo "### Closed the sync PR — upstream no longer differs" ;;
+            *)        echo "### No PR: \`vendor/rift\` is already at \`${{ steps.bump.outputs.rev }}\`" ;;
+          esac >> "$GITHUB_STEP_SUMMARY"
+
+      # The failure mode this workflow actually had: it went red every morning
+      # from 2026-07-12 to 07-21 with `GitHub Actions is not permitted to create
+      # or approve pull requests`, and nothing said so. A scheduled run has no
+      # audience — nobody is watching a PR, and a red run on the Actions tab
+      # looks exactly like a repo where nothing happened.
+      #
+      # One issue, reopened and re-commented rather than duplicated, so ten
+      # consecutive failures cost one notification instead of ten.
+      - name: Report a failed sync
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: "ci(sync-upstream): the scheduled vendor bump is failing"
+        run: |
+          set -euo pipefail
+
+          body="The scheduled \`vendor/rift\` bump failed: $RUN_URL
+
+          Until this is fixed the pin does not move, and no PR is opened. Common causes:
+
+          - **\`GitHub Actions is not permitted to create or approve pull requests\`** at the *Open sync PR* step — a repo/org setting (Settings -> Actions -> General -> Workflow permissions). This is what caused the 2026-07-12..07-21 run of failures.
+          - The verify step failing on first-party code that did not change: \`dtolnay/rust-toolchain@stable\` floats, so a new stable's clippy lints can fail \`-D warnings\` on their own.
+          - A genuinely broken upstream bump — the case this workflow exists to catch.
+
+          This issue is reused for every consecutive failure; it closes itself on the next green run."
+
+          # `--search` is fuzzy, so the exact-title match is done in jq — via
+          # $ENV, because jq does not see shell variables. Matching loosely would
+          # let an unrelated issue absorb the report and hide it again.
+          # shellcheck disable=SC2016  # $ENV.TITLE is jq's, and must not be expanded by the shell
+          existing="$(gh issue list --state all --limit 20 --search "$TITLE in:title" \
+            --json number,title \
+            --jq 'map(select(.title == $ENV.TITLE)) | first | .number // empty' || true)"
+
+          if [ -z "$existing" ]; then
+            gh issue create --title "$TITLE" --body "$body" --label bug --label upstream-sync
+          else
+            gh issue reopen "$existing" 2>/dev/null || true
+            gh issue comment "$existing" --body "Failed again: $RUN_URL"
+          fi
+
+      # Closing it on green is what keeps it a signal rather than wallpaper.
+      - name: Clear the failure report
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "ci(sync-upstream): the scheduled vendor bump is failing"
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016  # $ENV.TITLE is jq's, and must not be expanded by the shell
+          open="$(gh issue list --state open --limit 20 --search "$TITLE in:title" \
+            --json number,title \
+            --jq 'map(select(.title == $ENV.TITLE)) | first | .number // empty' || true)"
+          if [ -n "$open" ]; then
+            gh issue close "$open" --comment "Green again: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
