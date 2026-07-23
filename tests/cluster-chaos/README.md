@@ -172,6 +172,35 @@ Slice 2 (#73) added the scenarios that need the overlay:
 `test_reconcile_preserves_state`, `test_reconcile_reorder`,
 `test_no_seeds_not_ready`, `test_front_routes_around_an_unready_node`.
 
+`c16_pull_on_miss_rescues_lagging_follower` (#102) is the end-to-end proof the
+pull-on-miss safety net (#49) shipped without: its decision table was covered
+exhaustively at the unit level against a scripted `ClusterView`, so the *logic*
+was proven and the *wiring* — manager construction, `bind` on the node, the seam
+actually being consulted — was not.
+
+Two things make it deterministic rather than raced. The lag is **injected**: a
+250 ms latency toxic on the follower's inbound cluster link puts a floor under
+how far behind it is, while the hook's 500 ms budget puts a ceiling on how long
+it waits, so floor-below-ceiling means the rescue happens by construction.
+Constant latency with **zero jitter**, deliberately — jitter creates the gaps
+between heartbeats that C6 exists to bound, whereas a constant shift preserves
+the heartbeat rate and leaves leadership alone. And the evidence is
+**self-proving**: `rift-cluster-pull-on-miss: rescued-wait` is only ever set on
+the path where the node found itself behind and then caught up, so the header is
+the assertion that it lagged — no separate (and inherently racy) "is it lagging
+yet?" precondition.
+
+It is the one scenario that reads a **data-plane response header**, which is why
+`compose/pull-on-miss.overlay.yml` publishes one imposter port: `exec_probe`
+runs the binary's `healthcheck` subcommand inside the container and reports only
+success or failure, discarding headers. The port is published on all three nodes
+because the node that must lag has to be a follower, and the scenario asks who
+the leader is at run time rather than assuming it.
+
+It was verified to *fail* as well as pass: with `pull_on_miss.bind` removed, it
+fails on the header assertion. A scenario that has never been seen red is a
+scenario that has not been shown to test anything.
+
 Slice 3 (#11) closed the gap between *having* every row and each row asserting
 what the table actually specifies — five scenarios were passing on materially
 weaker properties:
