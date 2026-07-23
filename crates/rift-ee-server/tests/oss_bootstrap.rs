@@ -307,3 +307,45 @@ async fn nologfile_beats_log() {
         "--nologfile must suppress the file even when --log names one"
     );
 }
+
+/// Upstream #827: the PID file belongs to the **serving** path, so a transient
+/// subcommand must never write one.
+///
+/// A real-binary test on purpose. The write is ordered by `main.rs`, which the
+/// `bootstrap` unit tests cannot reach — they call `dispatch` directly, so
+/// re-hoisting the write above the dispatch would leave every one of them green
+/// while the shipped binary clobbered a running server's PID file again. That is
+/// the same reasoning `tests/cli.rs` gives for testing the artifact.
+///
+/// `save` is the cheapest transient subcommand to drive: pointed at a port
+/// nothing is listening on it fails fast, and its failure is beside the point —
+/// the assertion is on the PID file it must not have created.
+#[test]
+fn a_transient_subcommand_writes_no_pidfile() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let pidfile = dir.path().join("rift.pid");
+    let savefile = dir.path().join("saved.json");
+    let [dead] = free_ports();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rift-ee-server"))
+        .args([
+            "--pidfile",
+            &pidfile.to_string_lossy(),
+            "--port",
+            &dead.to_string(),
+            "save",
+            "--savefile",
+            &savefile.to_string_lossy(),
+        ])
+        .output()
+        .expect("run the binary");
+
+    assert!(
+        !out.status.success(),
+        "`save` against a port with no server must fail, or this test proves nothing"
+    );
+    assert!(
+        !pidfile.exists(),
+        "`save` must not write a PID file: doing so overwrites a running server's"
+    );
+}

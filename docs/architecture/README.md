@@ -55,7 +55,7 @@ If you read only three chapters, read **1 (Overview)**, **4 (Write Path)**, and
 | Issues #6–#11 (epic #12) | Phase 1 implementation, re-scoped per ADR-001 |
 | Issues #15, #16, #17 | Enable/disable replication, flow-state consistency+durability, RFC-002 tenancy |
 | Issues #19, #20 | Front door (U-11), imposter source SPI (U-12) |
-| `vendor/rift` @ v0.15.0 (`aaa6042`) | Ground truth for every upstream citation |
+| `vendor/rift` @ v0.16.0 (`c7da912`) | Ground truth for every upstream citation |
 
 When this guide and an RFC/issue disagree, the RFC/issue wins and the guide has
 a bug — file it.

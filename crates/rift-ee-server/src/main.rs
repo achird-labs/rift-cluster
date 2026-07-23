@@ -17,9 +17,12 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 fn main() -> anyhow::Result<()> {
     let mut cli = EeCli::parse();
 
-    // Both of these must run before any bootstrap: `script` wants only its own
-    // exit code, and `healthcheck` would otherwise clobber the running server's
-    // --pidfile with the probe's own PID on every container health check.
+    // Both of these must run before any bootstrap: they are self-contained
+    // programs that want only their own exit code, and neither should pay for
+    // (or perturb) a server bootstrap — `healthcheck` runs on every container
+    // health check. Since upstream #827 the PID file is written on the serving
+    // path only, so a transient subcommand can no longer clobber a running
+    // server's file; skipping the bootstrap is now the whole reason.
     match cli.oss.command.clone() {
         Some(Commands::Script { action }) => return script_cli::dispatch(action),
         Some(Commands::Healthcheck { url, timeout }) => {
@@ -52,13 +55,17 @@ fn main() -> anyhow::Result<()> {
     if let Some(warning) = rcfile_warning {
         warn!("{warning}");
     }
-    bootstrap::write_pidfile(&cli)?;
-
     // `save` and `stop` are complete programs; `restart` stops the old process
     // and then falls through to start a new one.
     if bootstrap::dispatch(&mut cli)? == bootstrap::AfterBootstrap::Done {
         return Ok(());
     }
+
+    // After the dispatch, not before it — the one place every serving entry
+    // converges, mirroring upstream #827. Written ahead of it, `restart` recorded
+    // its own PID and then SIGTERMed itself, and a transient `save` clobbered a
+    // running server's file.
+    bootstrap::write_pidfile(&cli)?;
 
     info!(
         version = %rift_ee::version_banner(),
