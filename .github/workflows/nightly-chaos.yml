@@ -86,6 +86,12 @@ jobs:
           # and the soak exists to find out whether that margin holds.
           - scenario: c16_pull_on_miss_rescues_lagging_follower
             iterations: 40
+          # Two full-fleet stop/starts' worth of work per iteration (the fleet
+          # comes down and back up once, plus 20 data-plane steps either side),
+          # measured at ~2 min — the same per-iteration cost as C16, so the same
+          # count lands in the same place against the 100 min budget.
+          - scenario: c15_flow_state_survives_a_full_cluster_restart
+            iterations: 40
 
     steps:
       - uses: actions/checkout@v4
@@ -125,11 +131,11 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: |
           set -euo pipefail
-          sudo sysctl -w net.ipv4.ip_local_reserved_ports=36300,39090,42525,45251-45253,45261-45263,48474,49901
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=36300,36400,39090,42525,45251-45253,45261-45263,48474,49901
           # Assert the read-back, do not merely print it: `sysctl <key>` exits 0
           # whatever the value is, so echoing it would prove nothing about a
           # partially applied or silently truncated write.
-          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "36300,39090,42525,45251-45253,45261-45263,48474,49901"
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "36300,36400,39090,42525,45251-45253,45261-45263,48474,49901"
 
       # Once per job rather than once per iteration: the image is identical
       # across iterations, and rebuilding it 100 times would dominate the budget.

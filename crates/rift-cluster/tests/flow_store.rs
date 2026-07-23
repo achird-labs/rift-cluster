@@ -152,6 +152,18 @@ async fn blocking<T: Send + 'static>(op: impl FnOnce() -> T + Send + 'static) ->
     tokio::task::spawn_blocking(op).await.expect("blocking op")
 }
 
+/// A gauge's value summed across this process's registry — both nodes' shards
+/// report into the same one, which is what makes "did *any* writer see this
+/// write" answerable.
+fn gauge(name: &str) -> u64 {
+    prometheus::gather()
+        .into_iter()
+        .filter(|family| family.get_name() == name)
+        .flat_map(|family| family.get_metric().to_owned())
+        .map(|metric| metric.get_gauge().get_value() as u64)
+        .sum()
+}
+
 fn counter(name: &str, label: (&str, &str)) -> u64 {
     prometheus::gather()
         .into_iter()
@@ -743,6 +755,69 @@ async fn a_new_owner_adopts_from_the_surviving_replica_on_takeover() {
         seen,
         Some(serde_json::json!("truth")),
         "the new owner must verify against the surviving replica before serving"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// #121: `durability: "none"` means none **fleet-wide**, not just at the owner.
+///
+/// The replication push carries the write's own durability, so a replica holds
+/// a `none` flow in memory exactly like the owner does. Until #121 the push was
+/// hardcoded `Async`, so both replicas persisted state the imposter had asked
+/// to keep off disk — and after a full restart the new owner adopted it back,
+/// which made `none` and `sync` indistinguishable. The chaos-tier C15 mutation
+/// is what caught it; this pins it where it is cheap to run.
+///
+/// The observable is the shard's own view: `flow()` reads the in-memory mirror,
+/// so it cannot tell disk from memory — the WAL-lag gauge can. A `none` write
+/// never reaches the shard writer at all, so the replica's lag must not move.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_none_durability_write_is_not_persisted_by_the_replica_either() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster_of(2, Duration::from_secs(60)).await;
+
+    let ring = members[0].node.ring();
+    let owner_id = ring
+        .owner(rift_cluster::OwnedKey::new(
+            rift_cluster::KeyClass::FlowKv,
+            "flow-none",
+        ))
+        .expect("two members");
+    let (owner, replica) = if members[0].node.id() == owner_id {
+        (&members[0], &members[1])
+    } else {
+        (&members[1], &members[0])
+    };
+
+    let lag_before = gauge("rift_cluster_flow_wal_lag_ops");
+
+    let store = store_on(owner, serde_json::json!({ "durability": "none" }));
+    {
+        let store = Arc::clone(&store);
+        blocking(move || store.set("flow-none", "k", serde_json::json!("ephemeral")))
+            .await
+            .expect("write");
+    }
+
+    // The push still happens — a `local` reader on the replica must see it —
+    // so wait for the value to arrive before judging what it cost.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while replica.shard.get("flow-none", "k").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the push never reached the replica"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        gauge("rift_cluster_flow_wal_lag_ops"),
+        lag_before,
+        "a `none` write reached a shard writer: the replica is persisting state \
+         the imposter asked to keep in memory"
     );
 
     for member in &members {

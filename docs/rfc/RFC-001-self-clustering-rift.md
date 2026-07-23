@@ -665,6 +665,12 @@ reads** (see §7.2.4), with replication for handoff continuity:
   gossip budget. **Deletes replicate as versioned tombstones** (#126), so a delayed push
   loses the ordinary version comparison instead of resurrecting the key; tombstones
   expire after 60 s via the ordinary sweep.
+  Each push carries the **origin write's durability** (#121), so a mode means
+  the same thing on every copy: a `none` flow stays in memory fleet-wide, a
+  `sync` flow is persisted by every holder. Repair traffic (adoption,
+  anti-entropy) writes memory-only — disk copies come from writes, never from
+  repairs, so a background loop cannot persist what an imposter asked to keep
+  off disk.
 - **Adoption (#126):** lazy, on the new owner's first serve of a flow under a changed
   membership: it pulls the flow from its fellow HRW holders, merges by highest
   `(m_idx, v, origin)`, and stamps the flow adopted-at-`m_idx`. Staleness bound: one

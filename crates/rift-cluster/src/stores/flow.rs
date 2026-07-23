@@ -101,6 +101,23 @@ const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(5);
 /// trips per owner.
 const SYNC_CHUNK: usize = 256;
 
+/// How a repair (adoption or anti-entropy) writes what it pulled: **memory
+/// only**.
+///
+/// The rule this encodes is that *disk copies come from writes, never from
+/// repairs*. A repair restores the in-memory view that serves reads; the
+/// durable copy is written by the write path, on the owner, at the mode the
+/// imposter actually chose, and reaches replicas through a replication push
+/// that now carries that same mode (#121).
+///
+/// The alternative — repairing at `Async` — is what this replaced, and it made
+/// `durability: "none"` meaningless: a flow the imposter asked to keep off disk
+/// was written to disk by every replica's repair loop within one tick, and then
+/// adopted back after a restart. A repair path does not know which imposter a
+/// `flow_id` belongs to, so it cannot ask; not persisting is the choice that is
+/// right for every mode rather than wrong for one.
+const REPAIR_DURABILITY: Durability = Durability::None;
+
 // ---------------------------------------------------------------------------
 // Wire types. JSON like every other cluster route; versioned implicitly by the
 // cluster port's protocol handshake.
@@ -223,6 +240,22 @@ enum ReplicaOp {
 struct ReplicateReq {
     flow_id: String,
     op: ReplicaOp,
+    /// The durability the *origin* write chose, carried so a replica persists a
+    /// flow exactly as much as the imposter asked for.
+    ///
+    /// This was hardcoded `Async` until #121, which made the mode a lie
+    /// fleet-wide: an imposter choosing `none` — documented as "in memory only,
+    /// a restart loses everything" — still had its state written to disk by
+    /// both replicas, and after a full-cluster restart the new owner adopted it
+    /// back (#126). Unasked-for disk traffic on the one mode whose purpose is
+    /// avoiding it, and it silently erased the distinction between `none` and
+    /// `sync`. C15's mutation test is what surfaced it: flipping the scenario to
+    /// `none` changed nothing.
+    ///
+    /// `serde(default)` is `Async`, exactly the old behaviour, so a push from a
+    /// peer that predates this field still applies.
+    #[serde(default)]
+    durability: Durability,
 }
 
 /// One request serves both repair paths (#126): adoption asks for a single
@@ -430,6 +463,7 @@ impl FlowNet {
                                 key: req.key,
                                 entry: entry.clone(),
                             },
+                            req.durability,
                         );
                         Ok(WriteReply::Applied {
                             entry: Some(entry),
@@ -465,6 +499,7 @@ impl FlowNet {
                                 key: req.key,
                                 entry,
                             },
+                            req.durability,
                         );
                         Ok(WriteReply::Applied {
                             entry: None,
@@ -509,6 +544,7 @@ impl FlowNet {
                                         key: req.key,
                                         entry,
                                     },
+                                    req.durability,
                                 );
                                 Ok(WriteReply::Applied {
                                     entry: None,
@@ -548,6 +584,7 @@ impl FlowNet {
                                     key: req.key,
                                     entry: entry.clone(),
                                 },
+                                req.durability,
                             );
                             Ok(WriteReply::Applied {
                                 entry: Some(entry),
@@ -566,7 +603,13 @@ impl FlowNet {
                 if ttl_seconds <= 0 {
                     match self.shard.clear_flow(flow, req.durability).await {
                         Ok(()) => {
-                            self.replicate(&node, &ring, flow, ReplicaOp::ClearFlow);
+                            self.replicate(
+                                &node,
+                                &ring,
+                                flow,
+                                ReplicaOp::ClearFlow,
+                                req.durability,
+                            );
                             Ok(WriteReply::Applied {
                                 entry: None,
                                 incremented: None,
@@ -614,6 +657,7 @@ impl FlowNet {
                                     key: req.key,
                                     entry,
                                 },
+                                req.durability,
                             );
                             Ok(WriteReply::Applied {
                                 entry: None,
@@ -642,7 +686,7 @@ impl FlowNet {
             }
             WriteOp::ClearFlow => match self.shard.clear_flow(flow, req.durability).await {
                 Ok(()) => {
-                    self.replicate(&node, &ring, flow, ReplicaOp::ClearFlow);
+                    self.replicate(&node, &ring, flow, ReplicaOp::ClearFlow, req.durability);
                     Ok(WriteReply::Applied {
                         entry: None,
                         incremented: None,
@@ -686,7 +730,7 @@ impl FlowNet {
             self.shard
                 .set(flow, &key, entry.clone(), durability)
                 .await?;
-            self.replicate(node, ring, flow, ReplicaOp::Put { key, entry });
+            self.replicate(node, ring, flow, ReplicaOp::Put { key, entry }, durability);
         }
         Ok(())
     }
@@ -701,6 +745,7 @@ impl FlowNet {
         ring: &Ring,
         flow_id: &str,
         op: ReplicaOp,
+        durability: Durability,
     ) {
         let successors: Vec<NodeId> = ring
             .owners(OwnedKey::new(KeyClass::FlowKv, flow_id), REPLICAS)
@@ -713,6 +758,7 @@ impl FlowNet {
         let body = match serde_json::to_vec(&ReplicateReq {
             flow_id: flow_id.to_owned(),
             op,
+            durability,
         }) {
             Ok(body) => body,
             Err(e) => {
@@ -742,14 +788,20 @@ impl FlowNet {
     /// comparison every repair path shares — push replication, adoption, and
     /// anti-entropy — so they cannot disagree about who wins. Returns whether
     /// the remote entry superseded the local record.
-    async fn merge_entry(&self, flow_id: &str, key: &str, entry: Versioned) -> bool {
+    async fn merge_entry(
+        &self,
+        flow_id: &str,
+        key: &str,
+        entry: Versioned,
+        durability: Durability,
+    ) -> bool {
         // `get_versioned`: the local record may be a tombstone, and it must win
         // against an older Put — that comparison IS the no-resurrect guarantee.
         let keep = self
             .shard
             .get_versioned(flow_id, key)
             .is_none_or(|current| current.superseded_by(&entry));
-        if keep && let Err(e) = self.shard.set(flow_id, key, entry, Durability::Async).await {
+        if keep && let Err(e) = self.shard.set(flow_id, key, entry, durability).await {
             tracing::error!(error = %e, "flow merge write failed");
             return false;
         }
@@ -806,7 +858,8 @@ impl FlowNet {
                         for (flow, entries) in reply.flows {
                             for (key, entry) in entries {
                                 entries_seen += 1;
-                                self.merge_entry(&flow, &key, entry).await;
+                                self.merge_entry(&flow, &key, entry, REPAIR_DURABILITY)
+                                    .await;
                             }
                         }
                     }
@@ -872,7 +925,10 @@ impl FlowNet {
                         Ok(reply) => {
                             for (flow, entries) in reply.flows {
                                 for (key, entry) in entries {
-                                    if self.merge_entry(&flow, &key, entry).await {
+                                    if self
+                                        .merge_entry(&flow, &key, entry, REPAIR_DURABILITY)
+                                        .await
+                                    {
                                         metrics::flow_repair();
                                     }
                                 }
@@ -895,19 +951,16 @@ impl FlowNet {
     async fn apply_replica(&self, req: ReplicateReq) {
         match req.op {
             ReplicaOp::Put { key, entry } => {
-                self.merge_entry(&req.flow_id, &key, entry).await;
+                self.merge_entry(&req.flow_id, &key, entry, req.durability)
+                    .await;
             }
             ReplicaOp::Delete { key } => {
-                if let Err(e) = self
-                    .shard
-                    .delete(&req.flow_id, &key, Durability::Async)
-                    .await
-                {
+                if let Err(e) = self.shard.delete(&req.flow_id, &key, req.durability).await {
                     tracing::error!(error = %e, "flow replica delete failed");
                 }
             }
             ReplicaOp::ClearFlow => {
-                if let Err(e) = self.shard.clear_flow(&req.flow_id, Durability::Async).await {
+                if let Err(e) = self.shard.clear_flow(&req.flow_id, req.durability).await {
                     tracing::error!(error = %e, "flow replica clear failed");
                 }
             }
