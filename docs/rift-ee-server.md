@@ -547,9 +547,23 @@ an unknown value is a `400` naming the key, never a silent default):
 The existing `flowState` fields (`backend`, `ttlSeconds`, `flowIdSource`) keep
 their upstream meaning; `ttlSeconds` bounds each entry's life fleet-wide.
 
+**Repair (#126).** Deletes replicate as *versioned tombstones*, so a delayed
+replication push cannot resurrect a deleted key — the stale push loses the same
+version comparison every merge uses. When a membership change moves a flow's
+ownership, the new owner **adopts** on its first serve: it pulls the flow from
+the surviving holders and merges before answering, so a takeover serves verified
+state rather than whatever its own replica held (if *no* holder is reachable it
+serves its local copy — bounded staleness, counted, retried on the next touch).
+And every node runs a 5-second **anti-entropy** loop pulling the flows it holds
+but does not own from their owners, so a replica that missed a push converges
+within one tick.
+
 Observability: `rift_cluster_flow_reads_total{path=owner|forward|local}` says
-where reads are answered, and `rift_cluster_cas_conflicts_total{reason=cas|fence}`
-counts owner-side refusals.
+where reads are answered, `rift_cluster_cas_conflicts_total{reason=cas|fence|misroute}`
+counts owner-side refusals, `rift_cluster_flow_adoptions_total{outcome}` makes
+takeovers visible (`unreachable` is the label worth alerting on), and
+`rift_cluster_flow_repairs_total` counts anti-entropy merges that actually fixed
+something — steady non-zero means pushes are being missed.
 
 ## What lands later
 

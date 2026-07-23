@@ -33,6 +33,7 @@ fn entry(value: &str) -> Versioned {
         origin: 7,
         expires_at: 0,
         value: serde_json::json!(value),
+        deleted: false,
     }
 }
 
@@ -359,6 +360,41 @@ async fn recovery_restores_lru_order() {
     shard.close();
 }
 
+/// A tombstone (#126) is a versioned *deleted* entry: `get` must hide it —
+/// readers see absence — while `flow` must still carry it, because replication
+/// and adoption are exactly the consumers that need to learn about the delete.
+#[tokio::test]
+async fn a_tombstone_hides_the_key_from_get_but_rides_the_flow_listing() {
+    let shard = FlowShard::in_memory(config(50));
+    let mut tombstone = entry("gone");
+    tombstone.deleted = true;
+    tombstone.v = 2;
+    shard
+        .set("flow-t", "k", tombstone, Durability::None)
+        .await
+        .expect("write tombstone");
+
+    assert_eq!(
+        shard.get("flow-t", "k"),
+        None,
+        "a reader must see a deleted key as absent"
+    );
+    let listed = shard.flow("flow-t");
+    assert_eq!(listed.len(), 1, "replication must still see the tombstone");
+    assert!(listed[0].1.deleted, "and it must say it is one");
+}
+
+/// #119 wrote disk rows without the `deleted` field. They must keep reading —
+/// a flow shard is durable state, and a format change that cannot read
+/// yesterday's file is a data loss with extra steps.
+#[test]
+fn a_pre_tombstone_disk_row_still_deserializes() {
+    let legacy = r#"{"m_idx":3,"v":7,"origin":2,"expires_at":0,"value":"kept"}"#;
+    let entry: Versioned = serde_json::from_str(legacy).expect("legacy row parses");
+    assert!(!entry.deleted, "absent field must mean not deleted");
+    assert_eq!(entry.value, serde_json::json!("kept"));
+}
+
 #[test]
 fn the_version_triple_orders_by_membership_then_counter_then_origin() {
     let base = Versioned {
@@ -367,6 +403,7 @@ fn the_version_triple_orders_by_membership_then_counter_then_origin() {
         origin: 1,
         expires_at: 0,
         value: serde_json::json!("base"),
+        deleted: false,
     };
 
     // A newer membership wins even with a lower per-key counter: an op minted

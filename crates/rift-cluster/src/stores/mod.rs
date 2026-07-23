@@ -17,6 +17,6 @@ pub mod flow;
 pub mod flow_config;
 pub mod shard;
 
-pub use flow::{ClusteredFlowStoreProvider, FlowNet, flow_routes};
+pub use flow::{ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, flow_routes};
 pub use flow_config::{FlowConfig, ReadConsistency};
 pub use shard::{Durability, FlowShard, ShardConfig, ShardError, Versioned};

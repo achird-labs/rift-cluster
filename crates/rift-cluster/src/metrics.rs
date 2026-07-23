@@ -206,6 +206,28 @@ lazy_static! {
     )
     .expect("rift_cluster_cas_conflicts_total registers once");
 
+    /// `rift_cluster_flow_adoptions_total{outcome}` — owner-side verification
+    /// pulls on first touch of a flow under a new membership (#126). `found` =
+    /// a fellow holder returned entries; `empty` = holders reachable, nothing
+    /// held (a genuinely new flow); `unreachable` = no holder answered and the
+    /// local copy was served unverified — RFC-001 §7.2.3's bounded-staleness
+    /// path, which is why this label is the one worth alerting on.
+    static ref FLOW_ADOPTIONS: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_flow_adoptions_total",
+        "Flow takeover verification pulls, by outcome",
+        &["outcome"]
+    )
+    .expect("rift_cluster_flow_adoptions_total registers once");
+
+    /// `rift_cluster_flow_repairs_total` — entries the anti-entropy loop merged
+    /// that superseded the local record (#126). Steady non-zero means pushes
+    /// are being missed — the loop is compensating for a fault worth finding.
+    static ref FLOW_REPAIRS: IntCounter = register_int_counter!(
+        "rift_cluster_flow_repairs_total",
+        "Anti-entropy merges that superseded the local record"
+    )
+    .expect("rift_cluster_flow_repairs_total registers once");
+
     /// `rift_cluster_config_revision{port}` — the log index that last wrote
     /// each applied config. Two nodes disagreeing here have not converged.
     static ref CONFIG_REVISION: GaugeVec = register_gauge_vec!(
@@ -288,6 +310,15 @@ pub(crate) fn flow_flows_evicted(flows: usize) {
 /// sites, so an unexpected label cannot explode cardinality.
 pub(crate) fn flow_read(path: &str) {
     FLOW_READS.with_label_values(&[path]).inc();
+}
+
+/// `outcome` ∈ `found` / `empty` / `unreachable` — closed at the call sites.
+pub(crate) fn flow_adoption(outcome: &str) {
+    FLOW_ADOPTIONS.with_label_values(&[outcome]).inc();
+}
+
+pub(crate) fn flow_repair() {
+    FLOW_REPAIRS.inc();
 }
 
 pub(crate) fn flow_conflict(reason: &str) {
@@ -616,6 +647,8 @@ mod tests {
         pull_on_miss_retry();
         flow_fsync_observed(std::time::Duration::from_micros(200));
         flow_wal_lag(4);
+        flow_adoption("empty");
+        flow_repair();
         flow_replayed(10);
         flow_flows_evicted(2);
         config_applied(8080, 7);

@@ -44,9 +44,16 @@
 //!   boundary. A strong read that cannot reach the owner therefore **errors**
 //!   (the engine propagates store errors per upstream #318); it never silently
 //!   serves the replica.
-//! - Anti-entropy pull is deferred (filed as a follow-up): without
-//!   owner-failover adoption it repairs nothing that push replication has not
-//!   already covered, and half of a repair protocol is dead code.
+//! - Repair shipped as one unit in #126 — lazy owner **adoption** on first
+//!   touch per membership epoch, the replica-side **anti-entropy** pull loop,
+//!   and versioned delete **tombstones** — because each is dead code without
+//!   the others. Full-content sync, no digests: scenario flows are a handful
+//!   of keys, and the simple protocol is the one whose failure modes fit in a
+//!   head. Known residual: a replica that missed a brand-new flow's every push
+//!   repairs at takeover, not by anti-entropy (it cannot pull what it never
+//!   heard of); and `ClearFlow` replication keeps its #120 semantics (the
+//!   owner's copy is always right, and flow-level tombstones are not worth
+//!   their complexity for a rare admin op).
 
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
@@ -67,6 +74,12 @@ use crate::stores::shard::{Durability, FlowShard, Versioned};
 /// timeout so the inner call times out with (not after) the outer one.
 const FLOW_OP_DEADLINE: Duration = Duration::from_secs(2);
 
+/// How long a delete's tombstone outlives the delete. Long enough that any
+/// delayed replication push (bounded by the RPC deadline and its retries) has
+/// lost the race before the record of the delete disappears; short enough that
+/// deleted keys do not accumulate. The sweep reaps them like any expired entry.
+const TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+
 /// Copies of each flow: the owner plus two successors. Matches the config
 /// plane's replication factor reasoning in RFC-001 §7.3 — survives one node
 /// loss with a copy to spare, and three is the whole fleet at minimum size.
@@ -75,6 +88,18 @@ const REPLICAS: usize = 3;
 const WRITE_PATH: &str = "/_cluster/flow/write";
 const GET_PATH: &str = "/_cluster/flow/get";
 const REPLICATE_PATH: &str = "/_cluster/flow/replicate";
+const SYNC_PATH: &str = "/_cluster/flow/sync";
+
+/// How often a replica pulls the flows it holds from their owners (#16's
+/// anti-entropy interval). A missed push heals within one tick. Deliberately
+/// not a CLI flag — it is a repair cadence, not an operator trade-off — but
+/// configurable through [`FlowBindConfig`] so tests need not wait 5 s.
+const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Flows per sync request. Bounds one request's body well under the
+/// transport's cap while keeping a whole node's repair to a handful of round
+/// trips per owner.
+const SYNC_CHUNK: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Wire types. JSON like every other cluster route; versioned implicitly by the
@@ -176,10 +201,18 @@ enum ReplicaOp {
         key: String,
         entry: Versioned,
     },
-    /// v1 limitation, deliberate: deletes are applied directly, without
-    /// tombstones, so a delayed `Put` can resurrect a deleted key on a replica
-    /// until the owner writes again. The owner's copy — the one `strong` reads
-    /// consult — is never affected.
+    /// **Inbound wire-compat only** (#126): a peer still on the pre-tombstone
+    /// build pushes deletes this way, and dropping the variant would turn its
+    /// pushes into decode errors mid-rolling-upgrade. Applied as a physical
+    /// delete, exactly as that peer expects. Never *sent* by this build —
+    /// deletes go out as versioned tombstone `Put`s, which is what makes
+    /// resurrection impossible.
+    ///
+    /// The reverse skew (this build pushing a tombstone to an old peer) is a
+    /// bounded transient: old `Versioned` ignores the unknown `deleted` field,
+    /// so the old node stores a live `null` visible to its *local* reads until
+    /// the entry's 60 s expiry reaps it. Rolling-upgrade-only, self-healing,
+    /// and the owner's copy — what `strong` reads consult — is never affected.
     Delete {
         key: String,
     },
@@ -190,6 +223,24 @@ enum ReplicaOp {
 struct ReplicateReq {
     flow_id: String,
     op: ReplicaOp,
+}
+
+/// One request serves both repair paths (#126): adoption asks for a single
+/// flow from each fellow holder; the anti-entropy loop asks an owner for every
+/// flow this node holds of theirs, chunked.
+#[derive(Debug, Serialize, Deserialize)]
+struct SyncReq {
+    flow_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SyncReply {
+    /// Full contents per flow, **tombstones included** — a repair that omitted
+    /// deletions would resurrect exactly what the tombstones exist to bury.
+    /// No digests in v1: scenario flows are a handful of keys, and full
+    /// content is simple to reason about. Bandwidth cost noted in the module
+    /// doc.
+    flows: Vec<(String, Vec<(String, Versioned)>)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +264,29 @@ pub struct FlowNet {
     /// volume is scripts, not the data plane. Sharding it is mechanical if
     /// contention ever shows in `flow_fsync_seconds`.
     rmw: tokio::sync::Mutex<()>,
+    /// Adoption markers (#126): the ring index each flow was last verified at.
+    /// An owner-side touch of a flow whose marker is behind the current
+    /// `m_idx` pulls the flow from its fellow holders first — which is what
+    /// makes a takeover serve verified state instead of whatever this node's
+    /// replica happened to hold.
+    adopted: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+/// What [`FlowNet::bind`] needs beyond the node itself.
+pub struct FlowBindConfig {
+    pub bridge: BridgeConfig,
+    /// How often the replica-side repair loop pulls the flows this node holds
+    /// but does not own. Tests shorten it; production keeps the default.
+    pub anti_entropy_interval: Duration,
+}
+
+impl Default for FlowBindConfig {
+    fn default() -> Self {
+        Self {
+            bridge: BridgeConfig::default(),
+            anti_entropy_interval: ANTI_ENTROPY_INTERVAL,
+        }
+    }
 }
 
 impl FlowNet {
@@ -223,6 +297,7 @@ impl FlowNet {
             node: OnceLock::new(),
             bridge: OnceLock::new(),
             rmw: tokio::sync::Mutex::new(()),
+            adopted: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -232,14 +307,36 @@ impl FlowNet {
     /// # Errors
     ///
     /// The bridge's private runtime could not start.
-    pub fn bind(&self, node: &Arc<RaftNode>, bridge_config: BridgeConfig) -> std::io::Result<()> {
+    pub fn bind(
+        self: &Arc<Self>,
+        node: &Arc<RaftNode>,
+        config: FlowBindConfig,
+    ) -> std::io::Result<()> {
+        let mut start_loop = false;
         if self.bridge.get().is_none() {
-            let bridge = Bridge::start(bridge_config)?;
+            let bridge = Bridge::start(config.bridge)?;
             // A racing second bind loses the set and drops its bridge — same
-            // contract as the node slot below.
-            let _ = self.bridge.set(bridge);
+            // contract as the node slot below. Only the bind that installed the
+            // bridge starts the repair loop, so it runs once.
+            start_loop = self.bridge.set(bridge).is_ok();
         }
         let _ = self.node.set(Arc::downgrade(node));
+
+        if start_loop && let Some(bridge) = self.bridge.get() {
+            // The anti-entropy loop (#126): the replica-side half of repair.
+            // Lives on the bridge's own runtime so it needs no ambient one, and
+            // holds only weak references — the loop must never keep the node
+            // (which owns ports and the redb lock) or the net alive.
+            let net = Arc::downgrade(self);
+            let interval = config.anti_entropy_interval;
+            bridge.handle().spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let Some(net) = net.upgrade() else { break };
+                    net.anti_entropy_tick().await;
+                }
+            });
+        }
         Ok(())
     }
 
@@ -289,6 +386,13 @@ impl FlowNet {
             }
         }
 
+        // Verify the copy before first serving it under this membership —
+        // outside the RMW lock, because adoption does RPC and holding the
+        // per-node lock across the network would stall every other flow's
+        // writes for the pull's duration. Racing first-touches both adopt;
+        // the merge is idempotent.
+        self.ensure_adopted(&node, &ring, &req.flow_id).await;
+
         let _serialize = self.rmw.lock().await;
         let flow = req.flow_id.as_str();
         let expiry = super::shard::expiry_from(
@@ -301,11 +405,16 @@ impl FlowNet {
             origin: node.id(),
             expires_at: expiry,
             value,
+            deleted: false,
         };
 
         let result: Result<WriteReply, super::shard::ShardError> = match req.op {
             WriteOp::Set { value } => {
-                let prev = self.shard.get(flow, &req.key);
+                // `get_versioned`, not `get`: a hidden tombstone still carries
+                // the highest version, and minting below it would make this
+                // write lose the replica merge to the very tombstone it is
+                // overwriting — an acknowledged write that never replicates.
+                let prev = self.shard.get_versioned(flow, &req.key);
                 let entry = mint(prev.as_ref(), value);
                 match self
                     .shard
@@ -331,24 +440,51 @@ impl FlowNet {
                     Err(e) => Err(e),
                 }
             }
-            WriteOp::Delete => match self.shard.delete(flow, &req.key, req.durability).await {
-                Ok(()) => {
-                    self.replicate(&node, &ring, flow, ReplicaOp::Delete { key: req.key });
-                    Ok(WriteReply::Applied {
-                        entry: None,
-                        incremented: None,
-                        existed: None,
-                    })
+            WriteOp::Delete => {
+                // A delete is a *versioned write* (#126): a tombstone that a
+                // delayed replication `Put` loses to by the ordinary version
+                // comparison. Minted above the hidden tombstone-aware version,
+                // pushed as a `Put` like any other entry — replicas need no
+                // delete-specific merge path, so resurrection is structurally
+                // impossible rather than guarded.
+                let prev = self.shard.get_versioned(flow, &req.key);
+                let mut entry = mint(prev.as_ref(), Value::Null);
+                entry.deleted = true;
+                entry.expires_at = super::shard::expiry_from(Some(TOMBSTONE_TTL));
+                match self
+                    .shard
+                    .set(flow, &req.key, entry.clone(), req.durability)
+                    .await
+                {
+                    Ok(()) => {
+                        self.replicate(
+                            &node,
+                            &ring,
+                            flow,
+                            ReplicaOp::Put {
+                                key: req.key,
+                                entry,
+                            },
+                        );
+                        Ok(WriteReply::Applied {
+                            entry: None,
+                            incremented: None,
+                            existed: None,
+                        })
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
             WriteOp::Incr { by } => {
-                let prev = self.shard.get(flow, &req.key);
+                let prev = self.shard.get_versioned(flow, &req.key);
                 // Absent ⇒ 0; a non-i64 current value coerces to 0. Upstream's
                 // default `increment_by` semantics, kept identical so a script
-                // behaves the same on one node and on a fleet.
+                // behaves the same on one node and on a fleet. A tombstone is
+                // value-absent (counts from 0) while its version still anchors
+                // the mint above it.
                 let current = prev
                     .as_ref()
+                    .filter(|entry| !entry.deleted)
                     .and_then(|entry| entry.value.as_i64())
                     .unwrap_or(0);
                 match current.checked_add(by) {
@@ -386,8 +522,14 @@ impl FlowNet {
                 }
             }
             WriteOp::Cas { expected, new } => {
-                let prev = self.shard.get(flow, &req.key);
-                let current = prev.as_ref().map(|entry| entry.value.clone());
+                let prev = self.shard.get_versioned(flow, &req.key);
+                // A tombstone is "not present" to CAS semantics — `expected:
+                // None` matches a deleted key — while its version anchors the
+                // mint above it.
+                let current = prev
+                    .as_ref()
+                    .filter(|entry| !entry.deleted)
+                    .map(|entry| entry.value.clone());
                 // Canonical-JSON equality, matching upstream's documented CAS
                 // comparison contract.
                 if current == expected {
@@ -452,9 +594,27 @@ impl FlowNet {
                         existed: Some(false),
                     })
                 } else if ttl_seconds <= 0 {
-                    match self.shard.delete(flow, &req.key, req.durability).await {
+                    // Expire-now is a delete, and a delete is a tombstone —
+                    // same reasoning and same wire shape as `WriteOp::Delete`.
+                    let prev = self.shard.get_versioned(flow, &req.key);
+                    let mut entry = mint(prev.as_ref(), Value::Null);
+                    entry.deleted = true;
+                    entry.expires_at = super::shard::expiry_from(Some(TOMBSTONE_TTL));
+                    match self
+                        .shard
+                        .set(flow, &req.key, entry.clone(), req.durability)
+                        .await
+                    {
                         Ok(()) => {
-                            self.replicate(&node, &ring, flow, ReplicaOp::Delete { key: req.key });
+                            self.replicate(
+                                &node,
+                                &ring,
+                                flow,
+                                ReplicaOp::Put {
+                                    key: req.key,
+                                    entry,
+                                },
+                            );
                             Ok(WriteReply::Applied {
                                 entry: None,
                                 incremented: None,
@@ -521,6 +681,7 @@ impl FlowNet {
                 origin: node.id(),
                 expires_at: expiry,
                 value: prev.value,
+                deleted: prev.deleted,
             };
             self.shard
                 .set(flow, &key, entry.clone(), durability)
@@ -577,21 +738,164 @@ impl FlowNet {
 
     /// A replica applying a pushed op. No fencing — versions decide, so a
     /// delayed push from a deposed owner loses to anything newer on arrival.
+    /// Merge one remote entry into the local shard by version. The single
+    /// comparison every repair path shares — push replication, adoption, and
+    /// anti-entropy — so they cannot disagree about who wins. Returns whether
+    /// the remote entry superseded the local record.
+    async fn merge_entry(&self, flow_id: &str, key: &str, entry: Versioned) -> bool {
+        // `get_versioned`: the local record may be a tombstone, and it must win
+        // against an older Put — that comparison IS the no-resurrect guarantee.
+        let keep = self
+            .shard
+            .get_versioned(flow_id, key)
+            .is_none_or(|current| current.superseded_by(&entry));
+        if keep && let Err(e) = self.shard.set(flow_id, key, entry, Durability::Async).await {
+            tracing::error!(error = %e, "flow merge write failed");
+            return false;
+        }
+        keep
+    }
+
+    /// Verify this owner's copy of a flow before first serving it under a new
+    /// membership (#126): pull the flow from its fellow holders and merge. A
+    /// takeover then serves state checked against every surviving replica
+    /// instead of whatever this node's own replica happened to hold.
+    ///
+    /// Lazy and once per `(flow, m_idx)`: the marker is stamped on success, so
+    /// steady-state owner ops pay one map lookup. An unreachable fleet leaves
+    /// the marker unstamped — the op proceeds on the local copy (bounded
+    /// staleness, RFC-001 §7.2.3's honest bound), counted and logged, and the
+    /// next touch retries the pull.
+    async fn ensure_adopted(&self, node: &Arc<RaftNode>, ring: &Ring, flow_id: &str) {
+        let m_idx = ring.m_idx();
+        if self.adopted.lock().get(flow_id) == Some(&m_idx) {
+            return;
+        }
+
+        let holders: Vec<NodeId> = ring
+            .owners(OwnedKey::new(KeyClass::FlowKv, flow_id), REPLICAS)
+            .into_iter()
+            .filter(|&id| id != node.id())
+            .collect();
+        if holders.is_empty() {
+            // Solo: nothing to consult, and nothing to be stale against.
+            self.adopted.lock().insert(flow_id.to_owned(), m_idx);
+            return;
+        }
+
+        let body = match serde_json::to_vec(&SyncReq {
+            flow_ids: vec![flow_id.to_owned()],
+        }) {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::error!(error = %e, "flow adoption: request did not encode");
+                return;
+            }
+        };
+
+        let mut reached = false;
+        let mut entries_seen = 0usize;
+        for holder in holders {
+            match node
+                .call_member(holder, "POST", SYNC_PATH, body.clone())
+                .await
+            {
+                Ok(reply) => match serde_json::from_slice::<SyncReply>(&reply) {
+                    Ok(reply) => {
+                        reached = true;
+                        for (flow, entries) in reply.flows {
+                            for (key, entry) in entries {
+                                entries_seen += 1;
+                                self.merge_entry(&flow, &key, entry).await;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(holder, error = %e, "flow adoption: bad sync reply"),
+                },
+                Err(e) => tracing::debug!(holder, error = %e, "flow adoption: holder unreachable"),
+            }
+        }
+
+        if reached {
+            metrics::flow_adoption(if entries_seen > 0 { "found" } else { "empty" });
+            self.adopted.lock().insert(flow_id.to_owned(), m_idx);
+        } else {
+            // Serve anyway, on the local copy: a takeover during a partition
+            // must not turn every flow op into an error. The staleness bound is
+            // one replication round (§7.2.3), the marker stays unstamped so the
+            // next touch retries, and the count is the observable.
+            metrics::flow_adoption("unreachable");
+            tracing::warn!(
+                flow_id,
+                m_idx,
+                "flow adoption: no fellow holder reachable; serving local copy unverified"
+            );
+        }
+    }
+
+    /// One pass of the replica-side repair loop (#126): pull every flow this
+    /// node holds but does not own from its owner, and merge. A replica that
+    /// missed a push converges one tick later; flows it never heard of at all
+    /// repair at takeover instead (`ensure_adopted`), because a replica cannot
+    /// pull what it does not know exists.
+    async fn anti_entropy_tick(self: &Arc<Self>) {
+        let Ok((node, ring)) = self.view() else {
+            return;
+        };
+
+        // Group the flows this node holds by their current owner.
+        let mut by_owner: std::collections::HashMap<NodeId, Vec<String>> =
+            std::collections::HashMap::new();
+        for flow_id in self.shard.flow_ids() {
+            let owned = OwnedKey::new(KeyClass::FlowKv, &flow_id);
+            match ring.owner(owned) {
+                Some(owner) if owner != node.id() => {
+                    by_owner.entry(owner).or_default().push(flow_id);
+                }
+                _ => {}
+            }
+        }
+
+        for (owner, flows) in by_owner {
+            for chunk in flows.chunks(SYNC_CHUNK) {
+                let body = match serde_json::to_vec(&SyncReq {
+                    flow_ids: chunk.to_vec(),
+                }) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::error!(error = %e, "flow anti-entropy: request did not encode");
+                        return;
+                    }
+                };
+                match node.call_member(owner, "POST", SYNC_PATH, body).await {
+                    Ok(reply) => match serde_json::from_slice::<SyncReply>(&reply) {
+                        Ok(reply) => {
+                            for (flow, entries) in reply.flows {
+                                for (key, entry) in entries {
+                                    if self.merge_entry(&flow, &key, entry).await {
+                                        metrics::flow_repair();
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(owner, error = %e, "flow anti-entropy: bad sync reply");
+                        }
+                    },
+                    // An unreachable owner is next tick's problem; the loop is
+                    // the retry.
+                    Err(e) => {
+                        tracing::debug!(owner, error = %e, "flow anti-entropy: owner unreachable")
+                    }
+                }
+            }
+        }
+    }
+
     async fn apply_replica(&self, req: ReplicateReq) {
         match req.op {
             ReplicaOp::Put { key, entry } => {
-                let keep = self
-                    .shard
-                    .get(&req.flow_id, &key)
-                    .is_none_or(|current| current.superseded_by(&entry));
-                if keep
-                    && let Err(e) = self
-                        .shard
-                        .set(&req.flow_id, &key, entry, Durability::Async)
-                        .await
-                {
-                    tracing::error!(error = %e, "flow replica put failed");
-                }
+                self.merge_entry(&req.flow_id, &key, entry).await;
             }
             ReplicaOp::Delete { key } => {
                 if let Err(e) = self
@@ -675,6 +979,7 @@ impl FlowNet {
                 })?;
                 if owner == node.id() {
                     metrics::flow_read("owner");
+                    net.ensure_adopted(&node, &ring, &req.flow_id).await;
                     Ok(net.shard.get(&req.flow_id, &req.key))
                 } else {
                     metrics::flow_read("forward");
@@ -699,7 +1004,8 @@ impl FlowNet {
 pub fn flow_routes(net: Arc<FlowNet>) -> Router {
     let get_net = Arc::clone(&net);
     let write_net = Arc::clone(&net);
-    let replicate_net = net;
+    let replicate_net = Arc::clone(&net);
+    let sync_net = net;
 
     Router::new()
         .route(
@@ -717,6 +1023,13 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
                     // accepts by contract. Not counted in `flow_reads_total`:
                     // the sender already counted this read as `forward`, and
                     // double-counting would make `owner` mean two things.
+                    //
+                    // Adoption runs here too (#126): a forwarded strong read is
+                    // an owner-side serve, and a fresh owner must verify its
+                    // copy before answering with it.
+                    if let Ok((node, ring)) = net.view() {
+                        net.ensure_adopted(&node, &ring, &req.flow_id).await;
+                    }
                     let reply = GetReply {
                         entry: net.shard.get(&req.flow_id, &req.key),
                     };
@@ -747,6 +1060,30 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
                         .map_err(|e| RpcError::Handler(format!("flow/replicate decode: {e}")))?;
                     net.apply_replica(req).await;
                     Ok(b"{}".to_vec())
+                })
+            }),
+        )
+        .route(
+            "POST",
+            SYNC_PATH,
+            Arc::new(move |body: Vec<u8>| -> HandlerFuture {
+                let net = Arc::clone(&sync_net);
+                Box::pin(async move {
+                    let req: SyncReq = serde_json::from_slice(&body)
+                        .map_err(|e| RpcError::Handler(format!("flow/sync decode: {e}")))?;
+                    // Serves whatever this shard holds for the asked flows —
+                    // tombstones included, because a repair that omitted
+                    // deletions would resurrect what they bury. No ownership
+                    // check: adoption deliberately asks *fellow replicas*, and
+                    // the answer is versioned, so a stale holder's reply loses
+                    // the merge rather than corrupting anyone.
+                    let flows = req
+                        .flow_ids
+                        .iter()
+                        .map(|flow_id| (flow_id.clone(), net.shard.flow(flow_id)))
+                        .collect();
+                    serde_json::to_vec(&SyncReply { flows })
+                        .map_err(|e| RpcError::Handler(e.to_string()))
                 })
             }),
         )

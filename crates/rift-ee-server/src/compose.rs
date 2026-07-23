@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rift_cluster::stores::{
-    ClusteredFlowStoreProvider, FlowNet, FlowShard, ShardConfig, flow_routes,
+    ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, FlowShard, ShardConfig, flow_routes,
 };
 use rift_cluster::{
-    Authority, BridgeConfig, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity,
+    Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity,
     PullOnMissInterceptor, RaftNode, metrics,
 };
 use rift_ee::seams::{ImposterManager, RunningServer, ServerBuilder, TlsDefaults};
@@ -514,7 +514,7 @@ pub async fn start_with_runtimes(
         return Err(anyhow::Error::new(e).context("binding the operator surface to the node"));
     }
     pull_on_miss.bind(&node);
-    if let Err(e) = flow_net.bind(&node, BridgeConfig::default()) {
+    if let Err(e) = flow_net.bind(&node, FlowBindConfig::default()) {
         probes.shutdown().await;
         if let Err(e) = node.shutdown().await {
             tracing::error!(error = %e, "cluster node shutdown reported an error");

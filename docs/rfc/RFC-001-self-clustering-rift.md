@@ -656,17 +656,28 @@ Phase-1 exit test: "unreachable seeds ⇒ never Ready" (§10).
 Scenario FSM state and flow KV are owner-serialized **for writes and for scenario-gate
 reads** (see §7.2.4), with replication for handoff continuity:
 
-- The owner holds the authoritative copy in memory. On each accepted write it
-  asynchronously pushes `(flow_id, key) → (g, v, value)` to its **k = 2 HRW successors**
-  over RPC (fire-and-forget + a 5 s anti-entropy pull by successors). Replication is
-  **not** via gossip — realistic scenario cardinality (hundreds–thousands of concurrent
-  flows) exceeds any sane gossip budget.
-- **Adoption:** a new owner (post-settle) pulls the key range from the former successors /
-  any replica, taking the highest `(g, v, origin)`. Staleness bound: one replication round
-  (typically ≤ 1 s) behind the failed owner's last accepted write. **Adopt-found-nothing**
+- The owner holds the authoritative copy (durable per the imposter's `durability`, #119).
+  On each accepted write it asynchronously pushes `(flow_id, key) → (m_idx, v, value)` to
+  its **k = 2 HRW successors** over RPC — fire-and-forget, plus a 5 s anti-entropy pull
+  *by* each replica of every flow it holds but does not own (#126; shipped as a bulk
+  `flow/sync` of full flow contents, no digests — scenario flows are a handful of keys).
+  Replication is **not** via gossip — realistic scenario cardinality exceeds any sane
+  gossip budget. **Deletes replicate as versioned tombstones** (#126), so a delayed push
+  loses the ordinary version comparison instead of resurrecting the key; tombstones
+  expire after 60 s via the ordinary sweep.
+- **Adoption (#126):** lazy, on the new owner's first serve of a flow under a changed
+  membership: it pulls the flow from its fellow HRW holders, merges by highest
+  `(m_idx, v, origin)`, and stamps the flow adopted-at-`m_idx`. Staleness bound: one
+  replication round behind the failed owner's last accepted write. **Adopt-found-nothing**
   (all replicas lost, or entry evicted): the entry is treated as unset — for a scenario
-  this means the FSM restarts; the response is flagged `Rift-Cluster-Degraded: kv-adopt`
-  and counted. This is a documented bounded loss, listed in §7.6.
+  this means the FSM restarts; counted as `rift_cluster_flow_adoptions_total{outcome}`.
+  (The `Rift-Cluster-Degraded: kv-adopt` response header once planned here is not
+  implementable at this seam — the engine reaches the store via `spawn_blocking`, where
+  the annotation scope does not exist; #120 records the same limitation for degraded
+  reads. The counter is the observable.) If **no** holder is reachable, the owner serves
+  its local copy unverified, unstamped (so the next touch retries), and counted under
+  `outcome="unreachable"` — availability under partition, with the staleness bound
+  unchanged. This is a documented bounded loss, listed in §7.6.
 - **Eviction:** owners and replicas apply per-flow TTL (from `set_ttl`/flowState config,
   default 1 h) and a max-entries bound (default 100 k entries/node, LRU by flow);
   hitting the bound sheds whole least-recently-used *flows* (never single keys, to avoid
@@ -1318,6 +1329,8 @@ registered in `crates/rift-cluster/src/metrics.rs`:
 | `rift_cluster_flow_wal_lag_ops` | `async` writes acknowledged but not yet fsynced — the loss window, measured (#119) |
 | `rift_cluster_flow_replay_entries_total` | Flow entries recovered from disk at startup (#119); zero after a restart that should have recovered is the durability alarm |
 | `rift_cluster_kv_evicted_flows_total` | Whole flows shed under the per-node cap (#119) — never single keys |
+| `rift_cluster_flow_adoptions_total{outcome}` | Takeover verification pulls (#126): `found`, `empty`, or `unreachable` (served unverified under partition — the label worth alerting on) |
+| `rift_cluster_flow_repairs_total` | Anti-entropy merges that superseded the local record (#126) — steady non-zero means pushes are being missed |
 
 Three more are counted **in process only and do not yet reach `/metrics`**:
 `rift_cluster_bridge_inflight`, `rift_cluster_bridge_rejected_total`, and
@@ -1495,7 +1508,7 @@ timing-sensitive — **not** claimed deterministic):
 | C6 (redefined — was 30 % UDP drop, a gossip-transport scenario) | toxiproxy 30 % loss + 100 ms jitter on the **cluster TCP port** for 60 s | Voter set never changes; **leadership transitions bounded by rate, not count** — the injected jitter overlaps the 150–300 ms election timeout by design, so occasional elections are in spec and only a *continuously* re-electing fleet fails (#94); zero acknowledged-write loss; fleet converges when the toxics lift |
 | C7 | Joining node with stale/empty state | Serves no traffic until Ready; then identical config; publishes nothing while Joining |
 | C8 | **Round-robin scenario traffic, healthy cluster, 10 ms pacing, no affinity** | Zero illegal transitions, zero stale-read matches (owner-read path) |
-| C9 (rewritten per ADR-001) | **Node rejoin under CAS load (asymmetric views)** | No forked histories — **by construction, not by arbitration**. Membership is itself a Raft log entry, so at any log index every node computes byte-identical membership and therefore byte-identical ownership; ADR-001 records that the dual-owner fork class "stops being a scenario that can fail". There is no `(g,v)` winner to pick and **no settle-violation bound**, because the settle delay was deleted rather than mitigated. What C9 still asserts, and what the residual window still needs: a deposed owner is exposed only until it applies the entry deposing it, and `(m_idx, v, origin)` totally orders anything written inside that window, so a conflicting write is **resolved and counted, never silently dropped**. Flow values remain off consensus, so adoption keeps §7.2.3's honest bound — one replication round of staleness, and adopt-found-nothing flagged `Rift-Cluster-Degraded: kv-adopt` and counted. This is *not* C5's zero-loss bar: that one is earned by graceful leave's drain-and-handoff, which a rejoin has no equivalent of |
+| C9 (rewritten per ADR-001) | **Node rejoin under CAS load (asymmetric views)** | No forked histories — **by construction, not by arbitration**. Membership is itself a Raft log entry, so at any log index every node computes byte-identical membership and therefore byte-identical ownership; ADR-001 records that the dual-owner fork class "stops being a scenario that can fail". There is no `(g,v)` winner to pick and **no settle-violation bound**, because the settle delay was deleted rather than mitigated. What C9 still asserts, and what the residual window still needs: a deposed owner is exposed only until it applies the entry deposing it, and `(m_idx, v, origin)` totally orders anything written inside that window, so a conflicting write is **resolved and counted, never silently dropped**. Flow values remain off consensus, so adoption keeps §7.2.3's honest bound — one replication round of staleness, and adopt-found-nothing counted (`rift_cluster_flow_adoptions_total`; the once-planned `kv-adopt` degraded header is not implementable at the spawn_blocking seam, per #120/#126). This is *not* C5's zero-loss bar: that one is earned by graceful leave's drain-and-handoff, which a rejoin has no equivalent of |
 | C10 | **Owner kill during proxyOnce storm** — variants: kill the claim owner; kill the **leader** between upstream completion and stub publication (the stub append is a config write, so it is the leader that must survive it, not a per-port owner) | Duplicates ≤ 1 + ownership changes (measured against the documented bound); zero permanently wedged signatures; failed config write ⇒ claim released, signature retryable |
 | C11 | **Concurrent proxy recording on 3 nodes, no partition** | Zero lost recorded stubs. A recording *is* a config write, so it is leader-serialized as a `PatchStubs` `ControlOp` and the log order is the publication order; op-id derived from `(port, signature)` (§7.5.3) collapses a replay and a retry into one operation |
 | C12 | **±5 s clock skew across nodes** | Journal clears exact (generation-based); HMAC window behavior per spec; no age-GC anomalies |
