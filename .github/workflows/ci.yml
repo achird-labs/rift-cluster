@@ -137,6 +137,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.changed.outputs.run == 'true'
 
+      # The tier publishes fixed host ports, and eleven of them fall inside
+      # Linux's ephemeral range (32768-60999). Any outbound connection on the
+      # runner — including the harness's own polling of these very endpoints —
+      # can be handed one as a source port, and `compose up` then fails to bind
+      # it: `failed to bind host port for 0.0.0.0:45262 ... address already in
+      # use`, which is issue #117 and which cost PR #113 a 22-minute re-run.
+      #
+      # Reserving them takes them out of the pool the kernel allocates *from*
+      # without making them any less bindable, so docker still publishes them
+      # normally. The list is pinned by a test
+      # (`ci_reserves_every_published_port_that_linux_could_hand_out`), so a new
+      # published port in this range fails the build rather than reintroducing
+      # the flake quietly.
+      - name: Reserve the tier's published ports from the ephemeral range
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=36300,39090,42525,45251-45253,45261-45263,48474,49901
+          # Assert the read-back, do not merely print it: `sysctl <key>` exits 0
+          # whatever the value is, so echoing it would prove nothing about a
+          # partially applied or silently truncated write.
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "36300,39090,42525,45251-45253,45261-45263,48474,49901"
+
       # Serial by necessity, not by preference: the compose file publishes fixed
       # host ports, so two stacks cannot coexist on one runner.
       #

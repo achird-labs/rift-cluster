@@ -87,8 +87,8 @@ pub const NODES: [Node; 3] = [
 /// Partitioning detaches a node from this one and leaves `mgmt` attached.
 const RIFT_NETWORK: &str = "rift-ee-cluster_rift";
 
-/// Toxiproxy's API, published by the chaos overlay.
-const TOXIPROXY_API: &str = "http://127.0.0.1:48474";
+/// Toxiproxy's API port, published by the chaos overlay.
+const TOXIPROXY_PORT: u16 = 48474;
 
 /// Envoy's front door and admin interface, published by the chaos overlay.
 pub const FRONT_PORT: u16 = 42525;
@@ -100,6 +100,12 @@ const UP_TIMEOUT: Duration = Duration::from_secs(240);
 /// How long a single convergence assertion waits before failing.
 pub const CONVERGE_TIMEOUT: Duration = Duration::from_secs(45);
 const POLL: Duration = Duration::from_millis(250);
+/// How long a published host port may stay bound after its stack is gone.
+///
+/// Generous against dockerd's own proxy teardown, short enough that a genuine
+/// squatter is reported rather than waited out: the alternative to failing here
+/// is `compose up` failing anyway, 30s later, without naming the port.
+const PORTS_FREE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The compose file publishes fixed host ports and a fixed subnet, so two
 /// stacks cannot coexist. Scenarios therefore run one at a time; this is the
@@ -179,6 +185,7 @@ impl Cluster {
         )
         .ok();
         wait_stack_gone();
+        wait_ports_free(PORTS_FREE_TIMEOUT)?;
         cluster
             .compose(&["up", "-d", "--build", "--no-deps", name])
             .context("compose up single node")?;
@@ -207,6 +214,7 @@ impl Cluster {
         )
         .ok();
         wait_stack_gone();
+        wait_ports_free(PORTS_FREE_TIMEOUT)?;
         cluster
             .compose(&["up", "-d", "--build"])
             .context("compose up")?;
@@ -405,6 +413,95 @@ impl Cluster {
             out.push('\n');
         }
         std::fs::write(&path, out).context("write log dump")
+    }
+}
+
+/// Every host port the compose files in this repo publish to the host.
+///
+/// Derived from the constants the scenarios already use rather than written out
+/// again: a port list that has to be maintained in two places is a port list
+/// that will disagree with itself, and the half that disagrees silently is the
+/// barrier.
+///
+/// These constants are the scenarios' view; the compose files are the truth.
+/// `the_barrier_covers_exactly_what_compose_publishes` asserts the two are the
+/// same set, because deriving from constants alone would only prove they agree
+/// with themselves.
+#[must_use]
+pub fn published_host_ports() -> Vec<u16> {
+    let mut ports = Vec::with_capacity(NODES.len() * 5 + 6);
+    for node in &NODES {
+        ports.extend([
+            node.admin,
+            node.probe,
+            node.metrics,
+            node.admin_via_mgmt,
+            node.metrics_via_mgmt,
+        ]);
+    }
+    ports.extend([FRONT_PORT, ENVOY_ADMIN_PORT, TOXIPROXY_PORT]);
+    ports.extend(PULL_ON_MISS_HOST_PORTS);
+    ports
+}
+
+/// Block until every published host port can be bound again.
+///
+/// [`wait_stack_gone`] waits for *containers*; this waits for the *sockets*, and
+/// they are not the same moment. Whatever still holds one — dockerd's per-port
+/// proxy finishing its own teardown, or an unrelated outbound connection that
+/// was handed the port out of the ephemeral pool — `compose up` fails on it with
+/// `failed to bind host port ... address already in use` and no indication of
+/// which port or who held it. That opaque failure is issue #117; this turns it
+/// into a named one, before the fleet is even asked to start.
+///
+/// Probing means binding: there is no way to ask "is this bindable" that is not
+/// itself a bind, and a bind that succeeds is dropped immediately. That leaves a
+/// window in which something else could take the port between the probe and
+/// docker's own bind — this narrows the race rather than closing it, which is
+/// why the CI-side reservation of the ephemeral range (issue #117's other half)
+/// is not redundant with it.
+///
+/// What it does **not** see is a port held only in `TIME_WAIT`, because both
+/// this probe and docker-proxy bind with `SO_REUSEADDR` and that option exists
+/// precisely to permit such a bind (measured on darwin: rebinding a
+/// `TIME_WAIT`-held port succeeds, while a live listener is refused). That is
+/// the right behaviour rather than a gap — a port docker *can* take is a port
+/// this must report free, or the barrier would stall 60s after every scenario.
+pub fn wait_ports_free(timeout: Duration) -> anyhow::Result<()> {
+    wait_ports_free_in(&published_host_ports(), timeout)
+}
+
+/// [`wait_ports_free`] over an explicit port list.
+///
+/// Exists so the barrier can be tested against a port the test itself owns: a
+/// test that waited on the whole published set would fail on any machine with
+/// the `deploy/compose` demo stack up, which is a false alarm about the
+/// developer's machine rather than a fact about the barrier.
+pub fn wait_ports_free_in(ports: &[u16], timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // `0.0.0.0`, matching what compose publishes on: BSD accepts a wildcard
+        // bind alongside a loopback one, so probing `127.0.0.1` would report a
+        // port free that docker cannot have.
+        let held: Vec<u16> = ports
+            .iter()
+            .copied()
+            .filter(|&port| std::net::TcpListener::bind(("0.0.0.0", port)).is_err())
+            .collect();
+
+        if held.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "published host ports still bound {timeout:?} after teardown: {held:?}. \
+                 `compose up` would fail on one of these with an unattributable \
+                 'address already in use'. Find the holder with: \
+                 lsof -nP -iTCP:{} -sTCP:LISTEN",
+                held[0]
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -681,7 +778,9 @@ pub fn exec_probe(container: &str, url: &str) -> bool {
 /// Add a toxic to one of the cluster listeners.
 pub async fn add_toxic(proxy: &str, toxic: serde_json::Value) -> anyhow::Result<()> {
     let response = reqwest::Client::new()
-        .post(format!("{TOXIPROXY_API}/proxies/{proxy}/toxics"))
+        .post(format!(
+            "http://127.0.0.1:{TOXIPROXY_PORT}/proxies/{proxy}/toxics"
+        ))
         .timeout(Duration::from_secs(10))
         .json(&toxic)
         .send()
@@ -704,7 +803,9 @@ pub async fn add_toxic(proxy: &str, toxic: serde_json::Value) -> anyhow::Result<
 /// while testing nothing.
 pub async fn toxic_count(proxy: &str) -> anyhow::Result<usize> {
     let toxics: serde_json::Value = reqwest::Client::new()
-        .get(format!("{TOXIPROXY_API}/proxies/{proxy}/toxics"))
+        .get(format!(
+            "http://127.0.0.1:{TOXIPROXY_PORT}/proxies/{proxy}/toxics"
+        ))
         .timeout(Duration::from_secs(10))
         .send()
         .await?
@@ -717,7 +818,9 @@ pub async fn toxic_count(proxy: &str) -> anyhow::Result<usize> {
 pub async fn clear_toxics(proxy: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let toxics: serde_json::Value = client
-        .get(format!("{TOXIPROXY_API}/proxies/{proxy}/toxics"))
+        .get(format!(
+            "http://127.0.0.1:{TOXIPROXY_PORT}/proxies/{proxy}/toxics"
+        ))
         .timeout(Duration::from_secs(10))
         .send()
         .await?
@@ -728,7 +831,9 @@ pub async fn clear_toxics(proxy: &str) -> anyhow::Result<()> {
             continue;
         };
         client
-            .delete(format!("{TOXIPROXY_API}/proxies/{proxy}/toxics/{name}"))
+            .delete(format!(
+                "http://127.0.0.1:{TOXIPROXY_PORT}/proxies/{proxy}/toxics/{name}"
+            ))
             .timeout(Duration::from_secs(10))
             .send()
             .await?;

@@ -43,6 +43,20 @@ Published host ports:
 | rift-2 | 22525 | 22526 | 29090 |
 | rift-3 | 32525 | 32526 | 39090 |
 
+**Adding a published port? Check where it lands.** Linux allocates ephemeral
+source ports from 32768–60999, so a published port inside that window can be
+handed to an unrelated outbound connection — including this harness polling
+these very endpoints — and `compose up` then fails to bind it with an
+unattributable `address already in use` (issue #117; it cost PR #113 a
+22-minute re-run). Ports in that range must be listed in the
+`net.ipv4.ip_local_reserved_ports` step that `ci.yml` and `nightly-chaos.yml`
+both run, which takes them out of the pool the kernel allocates *from* while
+leaving them bindable. `ci_reserves_every_published_port_that_linux_could_hand_out`
+fails the build if you forget, so this is a note about *why*, not a thing to
+remember.
+
+Below 32768 (the base tier's own ports, and 16300/26300) there is nothing to do.
+
 ### The chaos overlay
 
 Scenarios that need degraded links, a real partition, or a front door layer

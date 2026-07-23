@@ -25,9 +25,10 @@ use cluster_chaos::{
     CONVERGE_TIMEOUT, Cluster, FRONT_PORT, NODES, PULL_ON_MISS_HOST_PORTS,
     PULL_ON_MISS_IMPOSTER_PORT, add_toxic, append_stub, backend_failing_health_check, clear_toxics,
     config_revision, exec_probe, get_data_plane, get_json, imposter_ports, metric, probe,
-    put_imposter, put_imposter_with_key, put_stubs, toxic_count, wait_admin_reachable,
-    wait_backend_ejected, wait_converged, wait_converged_on, wait_revisions_agree,
-    wait_revisions_agree_on, wait_single_leader, wait_voters,
+    published_host_ports, put_imposter, put_imposter_with_key, put_stubs, toxic_count,
+    wait_admin_reachable, wait_backend_ejected, wait_converged, wait_converged_on,
+    wait_ports_free_in, wait_revisions_agree, wait_revisions_agree_on, wait_single_leader,
+    wait_voters,
 };
 
 /// The imposter port a scenario configures. Inside the container network
@@ -208,6 +209,199 @@ fn barrier_none_overlay_disables_the_barrier_fleet_wide() {
             node.name
         );
     }
+}
+
+/// The port barrier must fail *naming the port*, not time out anonymously.
+///
+/// This is issue #117's failure reproduced deterministically: a held host port
+/// is exactly what `compose up` hits, and docker's own message says only
+/// `address already in use` with no clue which stack held it. The barrier exists
+/// to answer that, so a silent timeout would be no improvement.
+///
+/// The squatter binds `0.0.0.0`, the same address docker publishes on, because
+/// BSD accepts `0.0.0.0:P` alongside `127.0.0.1:P` — a loopback squatter would
+/// make this pass on macOS while proving nothing.
+#[test]
+fn the_port_barrier_names_the_port_that_is_still_held() {
+    // A port this test owns, not one from the published set: waiting on the
+    // published set would fail on any machine with the `deploy/compose` demo
+    // stack up, which says nothing about the barrier.
+    let squatter = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("take a free port");
+    let port = squatter.local_addr().expect("addr").port();
+
+    let err = wait_ports_free_in(&[port], Duration::from_millis(300))
+        .expect_err("a held port must fail the barrier");
+    let message = err.to_string();
+    assert!(
+        message.contains(&port.to_string()),
+        "the barrier must name the port it is stuck on, got: {message}"
+    );
+
+    drop(squatter);
+    wait_ports_free_in(&[port], Duration::from_secs(5))
+        .expect("the barrier clears once the port is released");
+}
+
+/// The barrier must wait on exactly what compose publishes — read out of the
+/// compose files, not out of the constants it is checking.
+///
+/// Deriving both sides from `NODES` and friends would only prove the constants
+/// agree with themselves: a `ports:` entry added to an overlay with no matching
+/// constant would sail past, unwaited-on and unreserved, which is precisely the
+/// hole #117 came through. Set equality in both directions, so an unpublished
+/// constant is caught too.
+#[test]
+fn the_barrier_covers_exactly_what_compose_publishes() {
+    let mut published: Vec<u16> = COMPOSE_FILES
+        .iter()
+        .flat_map(|rel| host_ports_in(&read_compose(rel)))
+        .collect();
+    published.sort_unstable();
+    published.dedup();
+
+    let mut waited = published_host_ports();
+    waited.sort_unstable();
+    waited.dedup();
+
+    assert_eq!(
+        published, waited,
+        "the ports compose publishes and the ports the barrier waits on have \
+         diverged. Left-only: a published port nobody waits on or reserves -- the \
+         #117 hole. Right-only: a constant naming a port nothing publishes."
+    );
+
+    // If the scraper silently matched nothing, set equality could still hold
+    // against an empty list. Pin the shape so a broken scraper is loud.
+    assert!(
+        published.len() >= NODES.len() * 3,
+        "scraped only {} host ports from the compose files; the scraper is \
+         broken, not the topology",
+        published.len()
+    );
+}
+
+/// Every compose file in this repo that can publish a host port.
+const COMPOSE_FILES: [&str; 4] = [
+    "/../../deploy/compose/docker-compose.yml",
+    "/compose/chaos.overlay.yml",
+    "/compose/pull-on-miss.overlay.yml",
+    "/compose/barrier-none.overlay.yml",
+];
+
+fn read_compose(rel: &str) -> String {
+    let path = concat!(env!("CARGO_MANIFEST_DIR")).to_owned() + rel;
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+}
+
+/// Host ports from the `ports:` blocks of a compose file (`"12525:2525"` -> 12525).
+///
+/// Deliberately a literal scrape rather than a YAML parse: the value of this
+/// check is that it reads the shipped text the way a person would, with no
+/// dependency that could normalise away the thing being checked.
+fn host_ports_in(compose: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    let mut in_ports = false;
+    for line in compose.lines() {
+        let trimmed = line.trim();
+        if trimmed == "ports:" {
+            in_ports = true;
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !trimmed.starts_with('-') {
+            in_ports = false;
+            continue;
+        }
+        if !in_ports {
+            continue;
+        }
+        let spec = trimmed.trim_start_matches('-').trim();
+        let spec = spec.split('#').next().unwrap_or(spec).trim();
+        let spec = spec.trim_matches('"').trim_matches('\'');
+        if let Some((host, _container)) = spec.split_once(':')
+            && let Ok(port) = host.trim().parse::<u16>()
+        {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
+/// Linux hands out 32768-60999 as ephemeral source ports, so any published port
+/// in that window can be transiently held by an unrelated outbound connection —
+/// including the harness's own polling — and `compose up` then fails to bind it.
+/// CI reserves exactly those ports from the ephemeral pool.
+///
+/// This test is what keeps that list honest: publish a new port in the ephemeral
+/// range without reserving it and this fails, naming the port. Without it the
+/// sysctl is a comment that rots the first time the topology grows.
+#[test]
+fn ci_reserves_every_published_port_that_linux_could_hand_out() {
+    const EPHEMERAL: std::ops::RangeInclusive<u16> = 32768..=60999;
+
+    let vulnerable: Vec<u16> = published_host_ports()
+        .into_iter()
+        .filter(|p| EPHEMERAL.contains(p))
+        .collect();
+    assert!(
+        !vulnerable.is_empty(),
+        "if no published port is in the ephemeral range any more, delete the \
+         sysctl step and this test rather than leaving both to rot"
+    );
+
+    for workflow in ["ci.yml", "nightly-chaos.yml"] {
+        let path =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../.github/workflows/").to_owned() + workflow;
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let sets = reserved_port_sets(&text);
+        assert!(
+            !sets.is_empty(),
+            "{workflow} sets no net.ipv4.ip_local_reserved_ports, so the chaos \
+             tier's published ports stay in the pool Linux allocates ephemeral \
+             source ports from"
+        );
+
+        for reserved in &sets {
+            for port in &vulnerable {
+                assert!(
+                    reserved.contains(port),
+                    "{workflow} has a reservation that omits {port}, which is \
+                     published and inside Linux's ephemeral range — an outbound \
+                     connection can hold it and `compose up` will fail to bind it"
+                );
+            }
+        }
+    }
+}
+
+/// Every `a,b-c,d` value assigned to `net.ipv4.ip_local_reserved_ports` in a
+/// workflow, expanded. Empty when the workflow sets it nowhere.
+///
+/// *Every* occurrence, not the first: the reservation step is already duplicated
+/// across two workflows, so a second one in the same file is a matter of time,
+/// and pinning only the first would let the rest drift unwatched.
+fn reserved_port_sets(workflow: &str) -> Vec<Vec<u16>> {
+    workflow
+        .split("ip_local_reserved_ports=")
+        .skip(1)
+        .filter_map(|rest| {
+            let value = rest.split_whitespace().next()?;
+            let mut ports: Vec<u16> = Vec::new();
+            for part in value.split(',') {
+                match part.split_once('-') {
+                    Some((lo, hi)) => {
+                        let lo: u16 = lo.parse().ok()?;
+                        let hi: u16 = hi.parse().ok()?;
+                        ports.extend(lo..=hi);
+                    }
+                    None => ports.push(part.parse().ok()?),
+                }
+            }
+            Some(ports)
+        })
+        .collect()
 }
 
 /// An all-window leaderless fleet must not pass the transition bound vacuously.
