@@ -5,9 +5,10 @@ members = [
     "crates/rift-cluster",
     "crates/rift-ee-server",
     # Container-tier chaos scenarios (issue #11). A workspace member so it is
-    # type-checked and linted with everything else; its tests are `#[ignore]`d
-    # because they need a container runtime, so a plain `cargo test` on a
-    # machine without one still passes.
+    # type-checked and linted with everything else; the scenarios themselves are
+    # `#[ignore]`d because they need a container runtime, so a plain `cargo test`
+    # on a machine without one still passes. A few pure unit tests over the
+    # scenarios' own assertion arithmetic do run un-ignored.
     "tests/cluster-chaos",
 ]
 # The vendored open-source Rift is its own workspace; keep it out of ours and
