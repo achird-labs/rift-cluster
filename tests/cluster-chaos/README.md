@@ -253,6 +253,15 @@ when #72 was fixed.
   closed issue means the bug was fixed and the scenario was never turned back
   on.
 
+Because `list` decides what does *not* run, `scripts/chaos-quarantine.sh` is
+itself watched by the tier's path filter (`scripts/cluster-smoke-paths.sh`,
+issue #107): a bug in it shrinks the tier fleet-wide while the job still reports
+success, and `check` only validates tag syntax. The filter script is watched for
+the same reason — its self-test cannot catch a PR that edits pattern and case
+table together, but a real tier run can. `.github/workflows/` is deliberately
+*not* watched; the rationale, and what compensates for it, is written down in
+the filter script's header rather than left to memory.
+
 ## Nightly soak
 
 `.github/workflows/nightly-chaos.yml` runs one job per scenario (so the wall
