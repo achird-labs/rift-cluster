@@ -107,6 +107,36 @@ lazy_static! {
     )
     .expect("rift_cluster_dedup_hits_total registers once");
 
+    /// `rift_cluster_pull_on_miss_checks_total` — no-match requests the net
+    /// actually evaluated, i.e. those reaching a **non-leader** node with a
+    /// bound cluster handle. Leaders are excluded on purpose: a leader cannot
+    /// lag itself, so counting it would dilute the `lagging / checks` ratio
+    /// that makes this family worth reading.
+    static ref PULL_ON_MISS_CHECKS: IntCounter = register_int_counter!(
+        "rift_cluster_pull_on_miss_checks_total",
+        "No-match requests evaluated by the pull-on-miss net on a non-leader node"
+    )
+    .expect("rift_cluster_pull_on_miss_checks_total registers once");
+
+    /// `rift_cluster_pull_on_miss_lagging_total` — checks that found this node
+    /// behind the leader. Persistently non-zero means followers are serving
+    /// while behind, which is a readiness-gate question, not a matcher one.
+    static ref PULL_ON_MISS_LAGGING: IntCounter = register_int_counter!(
+        "rift_cluster_pull_on_miss_lagging_total",
+        "Pull-on-miss checks that found this node behind the leader"
+    )
+    .expect("rift_cluster_pull_on_miss_lagging_total registers once");
+
+    /// `rift_cluster_pull_on_miss_retries_total` — requests sent back through
+    /// the matcher once. There is deliberately no `rescues_total`: the hook
+    /// cannot observe the retry's outcome, so a rescue counter would be a guess.
+    /// Rescue evidence is the `rift-cluster-pull-on-miss` response header.
+    static ref PULL_ON_MISS_RETRIES: IntCounter = register_int_counter!(
+        "rift_cluster_pull_on_miss_retries_total",
+        "No-match requests re-matched after a pull-on-miss catch-up wait"
+    )
+    .expect("rift_cluster_pull_on_miss_retries_total registers once");
+
     /// `rift_cluster_config_revision{port}` — the log index that last wrote
     /// each applied config. Two nodes disagreeing here have not converged.
     static ref CONFIG_REVISION: GaugeVec = register_gauge_vec!(
@@ -163,6 +193,18 @@ pub fn intents_pending_sampled(depth: usize) {
 
 pub(crate) fn dedup_hit() {
     DEDUP_HITS.inc();
+}
+
+pub(crate) fn pull_on_miss_check() {
+    PULL_ON_MISS_CHECKS.inc();
+}
+
+pub(crate) fn pull_on_miss_lagging() {
+    PULL_ON_MISS_LAGGING.inc();
+}
+
+pub(crate) fn pull_on_miss_retry() {
+    PULL_ON_MISS_RETRIES.inc();
 }
 
 pub(crate) fn config_applied(port: u16, revision: u64) {
@@ -470,6 +512,9 @@ mod tests {
         intent_replayed();
         intents_pending_sampled(3);
         dedup_hit();
+        pull_on_miss_check();
+        pull_on_miss_lagging();
+        pull_on_miss_retry();
         config_applied(8080, 7);
         let mut failures = std::collections::BTreeMap::new();
         failures.insert(8080_u16, "bind".to_owned());
@@ -483,6 +528,9 @@ mod tests {
             "rift_cluster_write_forwards_total",
             "rift_cluster_barrier_waits_total",
             "rift_cluster_barrier_timeouts_total",
+            "rift_cluster_pull_on_miss_checks_total",
+            "rift_cluster_pull_on_miss_lagging_total",
+            "rift_cluster_pull_on_miss_retries_total",
             "rift_cluster_intents_parked_total",
             "rift_cluster_intents_replayed_total",
             "rift_cluster_intents_pending",

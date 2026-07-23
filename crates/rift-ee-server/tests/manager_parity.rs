@@ -51,6 +51,9 @@ use std::path::PathBuf;
 const ENTERPRISE_ADDITIONS: &[&str] = &[
     // Stamps `Rift-Cluster-*` headers onto every response (issue #9).
     "with_response_decorator",
+    // The pull-on-miss safety net: on a genuine no-match, wait briefly for a
+    // lagging follower to catch up and re-match once (issue #49).
+    "with_no_match_interceptor",
 ];
 
 /// Upstream builder calls the clustered path deliberately declines to mirror.

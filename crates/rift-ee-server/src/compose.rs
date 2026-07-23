@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use rift_cluster::rpc::Router;
 use rift_cluster::{
-    Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, RaftNode,
-    metrics,
+    Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity,
+    PullOnMissInterceptor, RaftNode, metrics,
 };
 use rift_ee::seams::{ImposterManager, RunningServer, ServerBuilder, TlsDefaults};
 
@@ -434,7 +434,12 @@ pub async fn start_with_runtimes(
     // The manager exists before the node so committed ops can drive it from
     // the very first apply; the data-plane server later composes around this
     // same instance rather than building its own.
-    let manager = match cluster_manager(&cli, accept_runtimes) {
+    // Built before the manager because the manager holds it, and bound to the
+    // node further down because the node does not exist yet -- the same
+    // ordering `NodeSlot` handles for the operator surface. Until `bind`, the
+    // hook proceeds on every miss, which is exactly today's behaviour.
+    let pull_on_miss = PullOnMissInterceptor::new();
+    let manager = match cluster_manager(&cli, accept_runtimes, Arc::clone(&pull_on_miss)) {
         Ok(manager) => Arc::new(manager),
         Err(e) => {
             probes.shutdown().await;
@@ -471,6 +476,7 @@ pub async fn start_with_runtimes(
         }
         return Err(anyhow::Error::new(e).context("binding the operator surface to the node"));
     }
+    pull_on_miss.bind(&node);
 
     let cluster_addr = node.advertise().clone();
     let leave_timeout = Duration::from_secs(cli.cluster.cluster_leave_timeout);
@@ -762,6 +768,7 @@ fn spawn_metrics_sampler(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
 fn cluster_manager(
     cli: &EeCli,
     accept_runtimes: Vec<tokio::runtime::Handle>,
+    pull_on_miss: Arc<PullOnMissInterceptor>,
 ) -> anyhow::Result<ImposterManager> {
     let default_cert = cli
         .oss
@@ -785,7 +792,8 @@ fn cluster_manager(
             allow_self_signed: !cli.oss.no_self_signed_tls,
         })
         .with_accept_runtimes(accept_runtimes)
-        .with_response_decorator(Arc::new(ClusterDecorator)))
+        .with_response_decorator(Arc::new(ClusterDecorator))
+        .with_no_match_interceptor(pull_on_miss))
 }
 
 /// Replay parked intents (issue #9 R4): drain whenever a leader (re)appears —
