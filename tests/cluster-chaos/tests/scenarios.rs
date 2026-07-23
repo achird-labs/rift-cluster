@@ -31,6 +31,81 @@ use cluster_chaos::{
 /// nothing else binds it, and each scenario gets a fresh stack.
 const IMPOSTER_PORT: u16 = 6001;
 
+/// Ceiling on observed leadership transitions in C6's 60s toxic window.
+///
+/// Derived, not tuned. C6 injects 100±100ms each direction against openraft's
+/// randomized election timeout (150ms to `ELECTION_TIMEOUT_MAX_MS` = 300ms,
+/// heartbeat 50ms, all in `rift-cluster`'s `raft/node.rs`), so heartbeat
+/// arrival gaps routinely exceed a timeout draw from the low half of that
+/// range: occasional elections are *in spec* for a correct fleet under these
+/// toxics, not evidence of a fault. What separates correct from flapping is the
+/// rate.
+///
+/// The leader gauge resamples on a ~5s timer, so the 60s window yields at most
+/// ~12 samples and therefore at most 11 observable transitions. A fleet
+/// re-electing continuously shows a different leader in nearly every sample --
+/// 8-11 -- while near-threshold elections under these toxics show 0-4. This
+/// bound is the top of the in-spec regime, which leaves it a wide margin below
+/// the flapping floor and none above: a 5th election in one window is treated
+/// as flapping, deliberately.
+///
+/// If `node.rs`'s timeouts or C6's toxics change, re-derive from the new
+/// arithmetic; do not nudge it upward to silence a failure.
+const C6_MAX_LEADER_TRANSITIONS: usize = 4;
+
+/// Observed leadership transitions in a sequence of distinct leader samples.
+///
+/// Shared by C6 and its bound test so the two cannot drift: a change to how a
+/// transition is counted is felt by the gate, not only by the container tier.
+fn leader_transitions(samples: &[usize]) -> usize {
+    samples.len().saturating_sub(1)
+}
+
+/// The C6 bound admits a correct fleet's near-threshold elections and still
+/// rejects a flapping one.
+///
+/// Runs in ordinary CI: C6 itself needs a container runtime, so without this
+/// the bound's arithmetic would only ever be exercised by the nightly tier.
+#[test]
+fn c6_bound_admits_near_threshold_but_rejects_flapping() {
+    // The sequence C6 actually failed on in PR #92 (run 29973215820, attempt 1),
+    // which attempt 2 passed on the same SHA -- a healthy fleet, not a fault.
+    let near_threshold = [0, 1, 2, 1];
+    assert_eq!(leader_transitions(&near_threshold), 3);
+    assert!(
+        leader_transitions(&near_threshold) <= C6_MAX_LEADER_TRANSITIONS,
+        "the observed same-SHA-passing sequence must not fail the bound"
+    );
+
+    // A fleet re-electing continuously: a different leader in every ~5s sample
+    // across the 60s window, which is the most the sampler can observe.
+    let flapping: Vec<usize> = (0..12).map(|i| i % 3).collect();
+    assert!(
+        leader_transitions(&flapping) > C6_MAX_LEADER_TRANSITIONS,
+        "a leader change in nearly every sample must still fail the bound"
+    );
+
+    // Pin the threshold itself, so an off-by-one edit to the constant or to the
+    // comparison is caught rather than absorbed by the gap between 3 and 11.
+    let at_bound: Vec<usize> = (0..=C6_MAX_LEADER_TRANSITIONS).collect();
+    assert_eq!(leader_transitions(&at_bound), C6_MAX_LEADER_TRANSITIONS);
+    assert!(leader_transitions(&at_bound) <= C6_MAX_LEADER_TRANSITIONS);
+
+    let one_over: Vec<usize> = (0..=C6_MAX_LEADER_TRANSITIONS + 1).collect();
+    assert!(leader_transitions(&one_over) > C6_MAX_LEADER_TRANSITIONS);
+}
+
+/// An all-window leaderless fleet must not pass the transition bound vacuously.
+#[test]
+fn c6_bound_is_vacuous_on_a_leaderless_fleet() {
+    assert_eq!(
+        leader_transitions(&[]),
+        0,
+        "zero samples yields zero transitions, which clears the bound -- C6 \
+         therefore has to assert the sequence is non-empty separately"
+    );
+}
+
 /// A write accepted by one node is servable by every node.
 ///
 /// This is R1, the whole point of config-sync: with the default write barrier a
@@ -633,11 +708,21 @@ async fn c6_loss_and_jitter_do_not_flap_or_lose_writes() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    let transitions = leader_samples.len().saturating_sub(1);
+    // Ordered before the rate bound: zero samples yields zero transitions, so a
+    // fleet that never had a leader at all would clear the bound vacuously.
     assert!(
-        transitions <= 1,
-        "leadership changed {transitions} times under load (sequence {leader_samples:?}); \
-         openraft may time out once, but repeated elections mean the fleet is flapping"
+        !leader_samples.is_empty(),
+        "no node ever reported leadership during the toxic window -- the \
+         transition bound would pass vacuously over a leaderless fleet"
+    );
+
+    let transitions = leader_transitions(&leader_samples);
+    assert!(
+        transitions <= C6_MAX_LEADER_TRANSITIONS,
+        "leadership changed {transitions} times in the toxic window (sequence \
+         {leader_samples:?}); occasional near-threshold elections are in spec \
+         under C6's jitter, but at ~5s sampling a continuously re-electing \
+         fleet shows 8+ -- this rate means the fleet is flapping"
     );
     assert!(
         !acked.is_empty(),

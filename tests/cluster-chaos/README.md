@@ -6,11 +6,12 @@ Real `rift-ee-server` processes, in containers, killed and restarted for real.
 cargo test -p cluster-chaos -- --ignored --test-threads=1
 ```
 
-`--ignored` because these need a container runtime — a workspace `cargo test` on
-a machine without Docker must still pass. `--test-threads=1` because the compose
-file publishes fixed host ports, so two stacks cannot coexist; the harness also
-holds a process-wide lock, so forgetting the flag costs time rather than
-correctness.
+`--ignored` because the scenarios need a container runtime — a workspace
+`cargo test` on a machine without Docker must still pass. (A few pure unit tests
+over the scenarios' own assertion arithmetic do run un-ignored; see "Why C6
+bounds a rate".) `--test-threads=1` because the compose file publishes fixed
+host ports, so two stacks cannot coexist; the harness also holds a process-wide
+lock, so forgetting the flag costs time rather than correctness.
 
 ## Why two tiers
 
@@ -97,6 +98,26 @@ Toxiproxy is used for C6 and *not* for C4, for two independent reasons:
   therefore modelled as `latency{latency:100, jitter:100}` on both streams plus
   `reset_peer` at toxicity 0.3 — 30% of connections reset, the TCP-level analogue
   of loss bursts.
+
+### Why C6 bounds a rate, not a count
+
+C6's injected jitter **overlaps the election timeout by design**: 100±100 ms each
+direction against a randomized 150–300 ms timeout means heartbeat arrival gaps
+routinely exceed a timeout draw from the low half of the range. So an occasional
+election during C6's window is a correct fleet behaving correctly, not a fault —
+and the scenario's original `transitions <= 1` was asserting a lucky draw rather
+than a property (#94). It failed intermittently for that reason, including a
+same-SHA fail-then-pass on PR #92.
+
+What actually separates a correct fleet from a flapping one is the **rate**, so
+C6 bounds transitions against `C6_MAX_LEADER_TRANSITIONS`, derived from the
+~5 s leader-gauge resolution rather than tuned. If C6 fails on that bound, the
+question is whether the fleet is genuinely re-electing continuously — **do not
+raise the constant to make it pass.** The derivation lives in the doc comment on
+the constant; changing `raft/node.rs`'s timeouts or C6's toxics means re-deriving
+it there. The bound's arithmetic is pinned by un-ignored unit tests
+(`c6_bound_admits_near_threshold_but_rejects_flapping`) so it stays honest even
+though C6 itself only runs in the container tier.
 
 ## House rules
 
