@@ -41,11 +41,19 @@ fn reserve_ports(n: usize) -> Vec<u16> {
 struct FlowMember {
     node: Arc<RaftNode>,
     net: Arc<FlowNet>,
+    /// A clone of the shard the net owns — same `Arc<Inner>`, so tests can
+    /// inspect (and sabotage) a member's local state directly.
+    shard: FlowShard,
     _dir: TempDir,
 }
 
-async fn spawn_member(id: NodeId, addr: SocketAddr, dir: &Path) -> (Arc<RaftNode>, Arc<FlowNet>) {
+async fn spawn_member(
+    id: NodeId,
+    addr: SocketAddr,
+    dir: &Path,
+) -> (Arc<RaftNode>, Arc<FlowNet>, FlowShard) {
     let shard = FlowShard::open(dir, ShardConfig::default()).expect("open flow shard");
+    let handle = shard.clone();
     let net = FlowNet::new(shard);
     let node = RaftNode::start(NodeConfig {
         node_id: id,
@@ -58,18 +66,26 @@ async fn spawn_member(id: NodeId, addr: SocketAddr, dir: &Path) -> (Arc<RaftNode
     })
     .await
     .unwrap_or_else(|e| panic!("start node {id}: {e}"));
-    (Arc::new(node), net)
+    (Arc::new(node), net, handle)
 }
 
-/// A converged 2-voter cluster with the flow subsystem bound on both nodes.
+/// A converged 2-voter cluster with the flow subsystem bound on both nodes,
+/// anti-entropy at test cadence.
 async fn flow_cluster() -> Vec<FlowMember> {
-    let ports = reserve_ports(2);
+    flow_cluster_of(2, Duration::from_millis(200)).await
+}
+
+/// `n` voters, with the repair cadence chosen per test: short where a test
+/// waits for the loop, effectively-off where the loop would mask what the test
+/// isolates (adoption).
+async fn flow_cluster_of(n: usize, anti_entropy: Duration) -> Vec<FlowMember> {
+    let ports = reserve_ports(n);
     let mut members = Vec::new();
 
     for (i, port) in ports.iter().enumerate() {
         let dir = TempDir::new().expect("tempdir");
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-        let (node, net) = spawn_member((i + 1) as NodeId, addr, dir.path()).await;
+        let (node, net, shard) = spawn_member((i + 1) as NodeId, addr, dir.path()).await;
         if i == 0 {
             node.cluster_init().await.expect("bootstrap");
         } else {
@@ -83,14 +99,15 @@ async fn flow_cluster() -> Vec<FlowMember> {
         members.push(FlowMember {
             node,
             net,
+            shard,
             _dir: dir,
         });
     }
 
-    // Wait for both to see a 2-voter membership, then bind the flow nets.
+    // Wait for everyone to see the full voter set, then bind the flow nets.
     let deadline = Instant::now() + CONVERGE;
     loop {
-        let converged = members.iter().all(|m| m.node.ring().members().len() == 2);
+        let converged = members.iter().all(|m| m.node.ring().members().len() == n);
         if converged {
             break;
         }
@@ -100,7 +117,13 @@ async fn flow_cluster() -> Vec<FlowMember> {
     for member in &members {
         member
             .net
-            .bind(&member.node, rift_cluster::BridgeConfig::for_workers(2))
+            .bind(
+                &member.node,
+                rift_cluster::stores::FlowBindConfig {
+                    bridge: rift_cluster::BridgeConfig::for_workers(2),
+                    anti_entropy_interval: anti_entropy,
+                },
+            )
             .expect("bind flow net");
     }
     members
@@ -392,6 +415,334 @@ async fn cas_reports_the_winning_value_and_increment_is_exact() {
         total,
         Some(serde_json::json!(10)),
         "10 owner-serialized increments must land exactly once each"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// #126, tombstones: a delayed replication `Put` arriving *after* a delete must
+/// not resurrect the key on a replica. The delete is pushed as a versioned
+/// tombstone, so the stale `Put` loses the ordinary version comparison — the
+/// resurrect is structurally impossible, not guarded.
+///
+/// Driven over the real wire with hand-built pushes, which also pins the wire
+/// shape a mixed-version peer would send.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delayed_put_cannot_resurrect_a_deleted_key() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    // Find the owner of this flow and the other node (the replica).
+    let ring = members[0].node.ring();
+    let owner_id = ring
+        .owner(rift_cluster::OwnedKey::new(
+            rift_cluster::KeyClass::FlowKv,
+            "flow-rz",
+        ))
+        .expect("two members");
+    let (owner, replica) = if members[0].node.id() == owner_id {
+        (&members[0], &members[1])
+    } else {
+        (&members[1], &members[0])
+    };
+
+    // Seed (v1 lands on the owner, push reaches the replica), then delete
+    // (tombstone v2, also pushed).
+    let store = store_on(owner, serde_json::json!({}));
+    {
+        let store = Arc::clone(&store);
+        blocking(move || store.set("flow-rz", "k", serde_json::json!("alive")))
+            .await
+            .expect("seed");
+    }
+    {
+        let store = Arc::clone(&store);
+        blocking(move || store.delete("flow-rz", "k"))
+            .await
+            .expect("delete");
+    }
+
+    // The delayed v1 push, replayed at the replica after the delete: exactly
+    // what a slow network delivers. It must lose to the tombstone.
+    let stale_put = serde_json::json!({
+        "flow_id": "flow-rz",
+        "op": { "Put": { "key": "k", "entry": {
+            "m_idx": ring.m_idx(),
+            "v": 1,
+            "origin": owner.node.id(),
+            "expires_at": 0,
+            "value": "alive",
+        }}},
+    });
+    members[0]
+        .node
+        .call_member(
+            replica.node.id(),
+            "POST",
+            "/_cluster/flow/replicate",
+            serde_json::to_vec(&stale_put).expect("encode"),
+        )
+        .await
+        .expect("replicate call");
+
+    assert_eq!(
+        replica.shard.get("flow-rz", "k"),
+        None,
+        "a delayed Put must lose to the tombstone, not resurrect the key"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// #126: a key that is deleted and then *re-set* must converge on the replicas.
+/// The re-set has to mint its version above the (hidden) tombstone — a mint
+/// that restarts at v1 loses the replica merge to the v-higher tombstone, and
+/// the acknowledged new value silently never replicates: divergent replicas
+/// now, a lost write on the next takeover. Common shape: flow state that
+/// clears a slot and reuses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_after_delete_replicates_over_the_tombstone() {
+    let _lock = TEST_LOCK.lock().await;
+    // Anti-entropy effectively off: replication push alone must get this right.
+    let members = flow_cluster_of(2, Duration::from_secs(60)).await;
+
+    let ring = members[0].node.ring();
+    let owner_id = ring
+        .owner(rift_cluster::OwnedKey::new(
+            rift_cluster::KeyClass::FlowKv,
+            "flow-reset",
+        ))
+        .expect("two members");
+    let (owner, replica) = if members[0].node.id() == owner_id {
+        (&members[0], &members[1])
+    } else {
+        (&members[1], &members[0])
+    };
+
+    let store = store_on(owner, serde_json::json!({}));
+    for step in [
+        ("set", Some(serde_json::json!("A"))),
+        ("delete", None),
+        ("set", Some(serde_json::json!("B"))),
+    ] {
+        let store = Arc::clone(&store);
+        match step {
+            ("set", Some(value)) => blocking(move || store.set("flow-reset", "slot", value))
+                .await
+                .expect("set"),
+            _ => blocking(move || store.delete("flow-reset", "slot"))
+                .await
+                .expect("delete"),
+        }
+    }
+
+    // The replica must converge to B via the ordinary push — the re-set must
+    // beat the tombstone it cannot see.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if replica.shard.get("flow-reset", "slot").map(|e| e.value) == Some(serde_json::json!("B"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the re-set never replicated: the replica still holds the tombstone \
+             (its copy: {:?})",
+            replica.shard.get_versioned("flow-reset", "slot")
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// #126, anti-entropy: a replica that missed a push converges within one
+/// repair tick. Sabotage stands in for the missed push — one key is removed
+/// from the replica's shard directly — and the loop must pull it back from the
+/// owner without any new write happening.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_that_missed_a_push_converges_within_one_tick() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await; // 200 ms anti-entropy
+
+    let ring = members[0].node.ring();
+    let owner_id = ring
+        .owner(rift_cluster::OwnedKey::new(
+            rift_cluster::KeyClass::FlowKv,
+            "flow-ae",
+        ))
+        .expect("two members");
+    let (owner, replica) = if members[0].node.id() == owner_id {
+        (&members[0], &members[1])
+    } else {
+        (&members[1], &members[0])
+    };
+
+    // Two keys: the flow must survive the sabotage in the replica's listing,
+    // or the loop would have nothing to pull (a replica cannot pull a flow it
+    // never heard of — the documented residual).
+    let store = store_on(owner, serde_json::json!({}));
+    for key in ["kept", "lost"] {
+        let store = Arc::clone(&store);
+        blocking(move || store.set("flow-ae", key, serde_json::json!("v")))
+            .await
+            .expect("write");
+    }
+
+    // Wait until the push has landed, then knock one key out of the replica —
+    // the moral equivalent of a push that never arrived.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while replica.shard.get("flow-ae", "lost").is_none() {
+        assert!(Instant::now() < deadline, "push never reached the replica");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    replica
+        .shard
+        .delete("flow-ae", "lost", rift_cluster::stores::Durability::None)
+        .await
+        .expect("sabotage");
+    assert_eq!(replica.shard.get("flow-ae", "lost"), None, "sabotage held");
+
+    // No new writes: only the loop can repair this.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if replica.shard.get("flow-ae", "lost").map(|e| e.value) == Some(serde_json::json!("v")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "anti-entropy never repaired the missing key"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// #126, adoption: after a membership change moves a flow's ownership, the new
+/// owner verifies its copy against the surviving holders before serving it. The
+/// new owner's replica is sabotaged with a stale value; without adoption it
+/// would serve that value — with it, the pull from the intact survivor wins the
+/// version merge and the read returns the truth.
+///
+/// Anti-entropy is effectively off (60 s) so the repair being observed is
+/// adoption's, not the loop's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_owner_adopts_from_the_surviving_replica_on_takeover() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster_of(3, Duration::from_secs(60)).await;
+
+    // A flow owned by a non-leader (node 1 bootstrapped and leads), so the
+    // membership change below does not also move leadership.
+    let full_ring = members[0].node.ring();
+    let leader_id = members[0].node.id();
+    let (flow_id, old_owner_id) = (0..64)
+        .map(|i| format!("flow-adopt-{i}"))
+        .find_map(|candidate| {
+            let owner = full_ring.owner(rift_cluster::OwnedKey::new(
+                rift_cluster::KeyClass::FlowKv,
+                &candidate,
+            ))?;
+            (owner != leader_id).then_some((candidate, owner))
+        })
+        .expect("some flow is owned by a non-leader");
+
+    // Predict the post-removal owner: HRW depends only on the member set and
+    // the key, so the test computes it the same way every node will.
+    let survivor_ids: Vec<rift_cluster::NodeId> = members
+        .iter()
+        .map(|m| m.node.id())
+        .filter(|&id| id != old_owner_id)
+        .collect();
+    let next_owner_id = rift_cluster::Ring::new(survivor_ids.iter().copied(), 0)
+        .owner(rift_cluster::OwnedKey::new(
+            rift_cluster::KeyClass::FlowKv,
+            &flow_id,
+        ))
+        .expect("two survivors");
+    let next_owner = members
+        .iter()
+        .find(|m| m.node.id() == next_owner_id)
+        .expect("member");
+    let reader = members
+        .iter()
+        .find(|m| m.node.id() != old_owner_id && m.node.id() != next_owner_id)
+        .expect("the third survivor");
+
+    // Write through the old owner; the push reaches every node (REPLICAS = 3).
+    let store = store_on(&members[0], serde_json::json!({}));
+    {
+        let store = Arc::clone(&store);
+        let flow = flow_id.clone();
+        blocking(move || store.set(&flow, "k", serde_json::json!("truth")))
+            .await
+            .expect("write");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while next_owner.shard.get(&flow_id, "k").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "push never reached the successor"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Sabotage the successor's copy with a STALE (lower-versioned) value — the
+    // stand-in for a push it missed.
+    let stale = rift_cluster::stores::Versioned {
+        m_idx: 0,
+        v: 0,
+        origin: 0,
+        expires_at: 0,
+        value: serde_json::json!("stale"),
+        deleted: false,
+    };
+    next_owner
+        .shard
+        .set(&flow_id, "k", stale, rift_cluster::stores::Durability::None)
+        .await
+        .expect("sabotage");
+
+    // Remove the old owner from the membership; ownership moves to the
+    // predicted successor.
+    let voters: std::collections::BTreeSet<rift_cluster::NodeId> =
+        survivor_ids.iter().copied().collect();
+    members[0]
+        .node
+        .change_membership(voters)
+        .await
+        .expect("membership change");
+    let old_m_idx = full_ring.m_idx();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let ring = reader.node.ring();
+        if ring.members().len() == 2 && ring.m_idx() > old_m_idx {
+            break;
+        }
+        assert!(Instant::now() < deadline, "membership change never applied");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A strong read via the third survivor forwards to the new owner, whose
+    // first serve must adopt from the intact replica — and answer the truth,
+    // not its sabotaged copy.
+    let reader_store = store_on(reader, serde_json::json!({}));
+    let flow = flow_id.clone();
+    let seen = blocking(move || reader_store.get(&flow, "k"))
+        .await
+        .expect("strong read after takeover");
+    assert_eq!(
+        seen,
+        Some(serde_json::json!("truth")),
+        "the new owner must verify against the surviving replica before serving"
     );
 
     for member in &members {

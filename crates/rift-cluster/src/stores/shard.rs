@@ -112,6 +112,17 @@ pub struct Versioned {
     /// Unix millis. `0` means no expiry.
     pub expires_at: u64,
     pub value: serde_json::Value,
+    /// A **tombstone** (#126): the versioned record that this key was deleted.
+    /// Readers ([`FlowShard::get`]) treat it as absence; replication and
+    /// adoption ([`FlowShard::flow`]) carry it, so a delayed `Put` push loses
+    /// to it by the ordinary version comparison instead of resurrecting the
+    /// key. Tombstones carry a finite `expires_at`, so the sweep reaps them.
+    ///
+    /// `serde(default)` is what keeps #119's disk rows readable: an absent
+    /// field is "not deleted", so a shard written before tombstones existed
+    /// recovers unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
 }
 
 impl Versioned {
@@ -302,8 +313,25 @@ impl FlowShard {
     }
 
     /// Read a key. Never blocks on the writer.
+    ///
+    /// A tombstone reads as absence: the deletion *record* is replication's
+    /// business ([`Self::flow`]), never the reader's.
     #[must_use]
     pub fn get(&self, flow_id: &str, key: &str) -> Option<Versioned> {
+        let now = now_millis();
+        let guard = self.inner.memory.read();
+        guard
+            .get(flow_id)?
+            .keys
+            .get(key)
+            .filter(|entry| is_live(entry, now) && !entry.deleted)
+            .cloned()
+    }
+
+    /// Read a key *including* a live tombstone — the version-comparison view
+    /// merges need, where "deleted at v5" must beat "set at v4".
+    #[must_use]
+    pub fn get_versioned(&self, flow_id: &str, key: &str) -> Option<Versioned> {
         let now = now_millis();
         let guard = self.inner.memory.read();
         guard
@@ -335,6 +363,13 @@ impl FlowShard {
     #[must_use]
     pub fn flow_count(&self) -> usize {
         self.inner.memory.read().len()
+    }
+
+    /// Every flow id this shard holds — the anti-entropy loop's worklist
+    /// (#126). A snapshot, not a view: the loop iterates it while writes land.
+    #[must_use]
+    pub fn flow_ids(&self) -> Vec<String> {
+        self.inner.memory.read().keys().cloned().collect()
     }
 
     /// Write a key at `durability`, returning once that level is satisfied.
