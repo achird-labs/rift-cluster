@@ -54,6 +54,11 @@ const ENTERPRISE_ADDITIONS: &[&str] = &[
     // The pull-on-miss safety net: on a genuine no-match, wait briefly for a
     // lagging follower to catch up and re-match once (issue #49).
     "with_no_match_interceptor",
+    // Every imposter's flow state served by the owner-authoritative clustered
+    // store, so scenarios behave correctly behind a round-robin LB (issue
+    // #120). Unconditional under --cluster by design: a process-local store is
+    // wrong for every imposter there, not just the configured ones.
+    "with_flow_store_provider",
 ];
 
 /// Upstream builder calls the clustered path deliberately declines to mirror.

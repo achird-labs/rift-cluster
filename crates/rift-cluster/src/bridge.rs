@@ -69,9 +69,26 @@ impl Default for BridgeConfig {
 
 /// Owns the cluster-io runtime and the permit pools.
 pub struct Bridge {
-    runtime: tokio::runtime::Runtime,
+    /// `Some` for the whole life of the bridge; taken only by `Drop`. An owned
+    /// `Runtime`'s default drop *blocks* waiting for its blocking pool, which
+    /// panics when the bridge is dropped from an async context — and the
+    /// bridge's holder is torn down by `compose`'s async shutdown, so that is
+    /// the normal path, not an edge. `Drop` below swaps in the non-blocking
+    /// shutdown instead.
+    runtime: Option<tokio::runtime::Runtime>,
     data_plane: Arc<Semaphore>,
     script_pool: Arc<Semaphore>,
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            // Tells the workers to stop and returns without waiting — safe from
+            // async and sync contexts alike. In-flight ops were already bounded
+            // by their own deadlines; nothing here needs to be joined.
+            runtime.shutdown_background();
+        }
+    }
 }
 
 impl Bridge {
@@ -83,16 +100,29 @@ impl Bridge {
             .enable_all()
             .build()?;
         Ok(Self {
-            runtime,
+            runtime: Some(runtime),
             data_plane: Arc::new(Semaphore::new(config.data_plane_permits)),
             script_pool: Arc::new(Semaphore::new(config.script_pool_permits)),
         })
     }
 
+    /// The runtime, which is present from construction until `Drop`.
+    fn runtime(&self) -> &tokio::runtime::Runtime {
+        // Invariant by construction: `runtime` is only `None` inside `Drop`,
+        // and nothing calls back into the bridge from there.
+        #[expect(
+            clippy::expect_used,
+            reason = "None only during Drop, which never re-enters"
+        )]
+        self.runtime
+            .as_ref()
+            .expect("bridge runtime lives until drop")
+    }
+
     /// Handle for spawning onto cluster-io directly (servers, background tasks).
     #[must_use]
     pub fn handle(&self) -> tokio::runtime::Handle {
-        self.runtime.handle().clone()
+        self.runtime().handle().clone()
     }
 
     fn permits(&self, class: CallerClass) -> &Arc<Semaphore> {
@@ -131,7 +161,7 @@ impl Bridge {
         // Capacity 1 and a matching receiver: the sender never blocks, so a
         // caller that has already timed out cannot wedge the cluster-io task.
         let (tx, rx) = sync_channel::<Result<T, RpcError>>(1);
-        self.runtime.spawn(async move {
+        self.runtime().spawn(async move {
             // The deadline bounds the *permit*, not just the caller. Releasing
             // it only when `op` finishes would let a slow peer hold data-plane
             // capacity far longer than anyone waited for it — an op that
