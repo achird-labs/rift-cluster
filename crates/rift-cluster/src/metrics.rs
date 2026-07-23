@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
 use prometheus::{
-    Gauge, GaugeVec, IntCounter, register_gauge, register_gauge_vec, register_int_counter,
+    Gauge, GaugeVec, Histogram, IntCounter, register_gauge, register_gauge_vec, register_histogram,
+    register_int_counter,
 };
 
 use crate::raft::{Ring, StatusReport};
@@ -137,6 +138,46 @@ lazy_static! {
     )
     .expect("rift_cluster_pull_on_miss_retries_total registers once");
 
+    /// `rift_cluster_flow_fsync_seconds` — how long a durable flow-state commit
+    /// took. Buckets start at 100µs (an SSD's floor) and reach 1s, because the
+    /// number worth seeing is the tail: `Sync` writes wait on this, so its p99
+    /// is the latency an imposter configured for zero loss actually pays.
+    static ref FLOW_FSYNC: Histogram = register_histogram!(
+        "rift_cluster_flow_fsync_seconds",
+        "Duration of a durable (fsynced) flow-state commit",
+        vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+    )
+    .expect("rift_cluster_flow_fsync_seconds registers once");
+
+    /// `rift_cluster_flow_wal_lag_ops` — writes acknowledged but not yet
+    /// fsynced. This is exactly the `async` mode's loss window, measured rather
+    /// than assumed: persistently high means the fsync ticker is not keeping up
+    /// and the interval is a fiction.
+    static ref FLOW_WAL_LAG: Gauge = register_gauge!(
+        "rift_cluster_flow_wal_lag_ops",
+        "Flow-state writes acknowledged but not yet fsynced"
+    )
+    .expect("rift_cluster_flow_wal_lag_ops registers once");
+
+    /// `rift_cluster_flow_replay_entries_total` — entries read back from disk at
+    /// startup. Zero after a restart that should have recovered state is the
+    /// signal that durability is not working, and it is visible without waiting
+    /// for a test to fail.
+    static ref FLOW_REPLAY_ENTRIES: IntCounter = register_int_counter!(
+        "rift_cluster_flow_replay_entries_total",
+        "Flow-state entries replayed from disk at startup"
+    )
+    .expect("rift_cluster_flow_replay_entries_total registers once");
+
+    /// `rift_cluster_kv_evicted_flows_total` — whole flows shed under the cap.
+    /// Counted in flows, never keys: eviction has no other granularity, because
+    /// a half-evicted scenario is worse than an absent one.
+    static ref FLOW_EVICTED: IntCounter = register_int_counter!(
+        "rift_cluster_kv_evicted_flows_total",
+        "Flows shed whole when the per-node flow cap was exceeded"
+    )
+    .expect("rift_cluster_kv_evicted_flows_total registers once");
+
     /// `rift_cluster_config_revision{port}` — the log index that last wrote
     /// each applied config. Two nodes disagreeing here have not converged.
     static ref CONFIG_REVISION: GaugeVec = register_gauge_vec!(
@@ -193,6 +234,26 @@ pub fn intents_pending_sampled(depth: usize) {
 
 pub(crate) fn dedup_hit() {
     DEDUP_HITS.inc();
+}
+
+pub(crate) fn flow_fsync_observed(elapsed: std::time::Duration) {
+    FLOW_FSYNC.observe(elapsed.as_secs_f64());
+}
+
+pub(crate) fn flow_wal_lag(depth: usize) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a gauge is f64; a lag deep enough to lose precision is already the alarm"
+    )]
+    FLOW_WAL_LAG.set(depth as f64);
+}
+
+pub(crate) fn flow_replayed(entries: usize) {
+    FLOW_REPLAY_ENTRIES.inc_by(entries as u64);
+}
+
+pub(crate) fn flow_flows_evicted(flows: usize) {
+    FLOW_EVICTED.inc_by(flows as u64);
 }
 
 pub(crate) fn pull_on_miss_check() {
@@ -515,6 +576,10 @@ mod tests {
         pull_on_miss_check();
         pull_on_miss_lagging();
         pull_on_miss_retry();
+        flow_fsync_observed(std::time::Duration::from_micros(200));
+        flow_wal_lag(4);
+        flow_replayed(10);
+        flow_flows_evicted(2);
         config_applied(8080, 7);
         let mut failures = std::collections::BTreeMap::new();
         failures.insert(8080_u16, "bind".to_owned());
@@ -535,6 +600,10 @@ mod tests {
             "rift_cluster_intents_replayed_total",
             "rift_cluster_intents_pending",
             "rift_cluster_dedup_hits_total",
+            "rift_cluster_flow_fsync_seconds",
+            "rift_cluster_flow_wal_lag_ops",
+            "rift_cluster_flow_replay_entries_total",
+            "rift_cluster_kv_evicted_flows_total",
             "rift_cluster_config_revision",
             "rift_cluster_bind_failures",
         ] {

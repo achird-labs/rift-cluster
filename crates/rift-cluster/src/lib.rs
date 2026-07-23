@@ -28,6 +28,7 @@ pub mod metrics;
 pub mod pull_on_miss;
 pub mod raft;
 pub mod rpc;
+pub mod stores;
 
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
