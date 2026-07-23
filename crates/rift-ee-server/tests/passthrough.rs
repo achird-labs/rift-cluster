@@ -6,6 +6,8 @@ use clap::Parser;
 use rift_ee_server::cli::EeCli;
 use rift_ee_server::compose;
 
+mod common;
+
 fn cli(args: &[&str]) -> EeCli {
     let mut full = vec!["rift-ee-server", "--port", "0", "--metrics-port", "0"];
     full.extend_from_slice(args);
@@ -98,10 +100,7 @@ async fn startup_guards_run_before_anything_binds() {
 #[tokio::test]
 async fn replay_loads_the_saved_imposters() {
     let dir = tempfile::TempDir::new().expect("tempdir");
-    let imposter_port = {
-        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
-        held.local_addr().expect("addr").port()
-    };
+    let imposter_port = common::ports::reserve_port();
 
     let saved = dir.path().join("saved.json");
     std::fs::write(

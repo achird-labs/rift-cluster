@@ -13,6 +13,10 @@ use rift_ee_server::cli::EeCli;
 use rift_ee_server::compose;
 use tempfile::TempDir;
 
+mod common;
+
+use common::ports::reserve_addr as reserve_port;
+
 const SECRET: &str = "clustered-test-secret";
 
 /// A clustered invocation. Every port is ephemeral unless `bind` or `probe_bind`
@@ -41,13 +45,6 @@ fn cluster_on(state: &TempDir, bind: &str, probe_bind: &str, extra: &[&str]) -> 
 /// The common case: every port ephemeral.
 fn cluster_cli(state: &TempDir, extra: &[&str]) -> EeCli {
     cluster_on(state, "127.0.0.1:0", "127.0.0.1:0", extra)
-}
-
-/// An address that was bound and released — free right now, and concrete enough
-/// to hand to a listener that has not started yet.
-fn reserve_port() -> String {
-    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
-    held.local_addr().expect("addr").to_string()
 }
 
 /// Poll `node`'s membership until it holds exactly `want` voters, bounded.

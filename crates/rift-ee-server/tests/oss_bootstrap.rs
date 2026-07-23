@@ -13,6 +13,10 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::ports::reserve_ports as free_ports;
+
 /// A spawned server that is killed when the test ends, however it ends.
 struct Server(Child);
 
@@ -21,22 +25,6 @@ impl Drop for Server {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-/// `N` *distinct* free ports, knowable before the server that binds them
-/// exists. Every listener is held until all the ports are read, so the kernel
-/// cannot hand the same one out twice — releasing each before taking the next
-/// is how a test ends up asking one server to serve its admin and its imposter
-/// on the same port.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let held: Vec<_> = (0..N)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port"))
-        .collect();
-    let mut ports = [0u16; N];
-    for (slot, listener) in ports.iter_mut().zip(&held) {
-        *slot = listener.local_addr().expect("addr").port();
-    }
-    ports
 }
 
 /// A config file with one templated imposter whose body references a function
