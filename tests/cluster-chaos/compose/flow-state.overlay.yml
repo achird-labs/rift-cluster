@@ -1,0 +1,57 @@
+# Overlay: publish the flow-state scenario's imposter data port on every node.
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/flow-state.overlay.yml up
+#
+# Why C15-flow needs it: the scenario's whole claim is that a scenario counter
+# survives a full-cluster restart *and* is correct however a load balancer
+# spread the steps. Both halves are data-plane facts — the counter is only
+# observable in a scripted response body — and `exec_probe` (the path every
+# other scenario uses to reach the data plane) runs the healthcheck subcommand
+# inside a container and answers success/failure only. So the port has to be
+# reachable from the host, where a real client can read the body.
+#
+# All three nodes, and that is the point rather than a convenience: the
+# scenario round-robins its requests across them by hand, which is a
+# deterministic stand-in for an LB and proves ownership routing works whichever
+# node a step lands on. Publishing one node would test the single-node path
+# only — the thing flow state's clustering exists to fix.
+#
+# Its own port and its own overlay, not a reuse of pull-on-miss's 6300: two
+# scenarios sharing a data port would couple them, and the sibling overlay's
+# header already warns against this quietly becoming "the chaos tier publishes
+# the data plane". One port, one scenario, enabled only where it is needed.
+#
+# 16400/26400/36400 follow the base file's convention (1xxxx/2xxxx/3xxxx for
+# rift-1/2/3). Note **36400 is inside** Linux's ephemeral source-port range
+# (32768-60999) and so is reserved by CI's `ip_local_reserved_ports` step, along
+# with its 36300 sibling — an outbound connection could otherwise be holding it
+# when compose tries to publish it (#117). The other two sit below the range and
+# need nothing. This comment first claimed all three were below it; #117's
+# coverage test rejected that, which is the whole reason that test exists.
+
+# `MB_ALLOW_INJECTION` is also scoped here, and that placement is the point.
+# Flow state is only reachable from a *script*, and upstream gates scripts
+# behind `--allowInjection` — which the shipped topology deliberately leaves
+# off, so a config that smuggles code in is refused (the enterprise write path
+# has its own test for that gate failing closed). Turning it on in the base file
+# to satisfy one scenario would switch it on for the whole chaos tier and for
+# anyone reading that file as the reference deployment. Here it is on for the
+# one scenario that needs it and nowhere else.
+
+services:
+  rift-1:
+    environment:
+      MB_ALLOW_INJECTION: "true"
+    ports:
+      - "16400:6400"
+  rift-2:
+    environment:
+      MB_ALLOW_INJECTION: "true"
+    ports:
+      - "26400:6400"
+  rift-3:
+    environment:
+      MB_ALLOW_INJECTION: "true"
+    ports:
+      - "36400:6400"

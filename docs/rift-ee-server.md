@@ -544,6 +544,13 @@ an unknown value is a `400` naming the key, never a silent default):
 | `readConsistency` | `"strong"` (default) \| `"local"` | `strong`: every read is owner-answered — correct under any LB, at most one LAN RPC. `local`: reads stay on this node's replica — fast, at most one replication push behind the owner |
 | `durability` | `"none"` \| `"async"` (default) \| `"sync"` | What a write survives: `sync` fsyncs before the ack (a full-fleet restart loses nothing), `async` is group-fsynced every `--cluster-flow-fsync-interval-ms` (bounded loss), `none` never touches disk |
 
+The mode is **fleet-wide, not node-local**: a replication push carries the
+durability the write chose, so a `none` flow is held in memory on every node
+that has a copy, and a `sync` flow is persisted by each of them. Background
+repair (adoption and anti-entropy) never writes to disk at all — disk copies
+come from writes, so a repair cannot quietly persist state an imposter asked to
+keep off disk.
+
 The existing `flowState` fields (`backend`, `ttlSeconds`, `flowIdSource`) keep
 their upstream meaning; `ttlSeconds` bounds each entry's life fleet-wide.
 

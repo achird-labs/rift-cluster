@@ -22,10 +22,11 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 
 use cluster_chaos::{
-    CONVERGE_TIMEOUT, Cluster, FRONT_PORT, NODES, PULL_ON_MISS_HOST_PORTS,
-    PULL_ON_MISS_IMPOSTER_PORT, add_toxic, append_stub, backend_failing_health_check, clear_toxics,
-    config_revision, exec_probe, get_data_plane, get_json, imposter_ports, metric, probe,
-    published_host_ports, put_imposter, put_imposter_with_key, put_stubs, toxic_count,
+    CONVERGE_TIMEOUT, Cluster, FLOW_STATE_HOST_PORTS, FLOW_STATE_IMPOSTER_PORT, FRONT_PORT, NODES,
+    PULL_ON_MISS_HOST_PORTS, PULL_ON_MISS_IMPOSTER_PORT, add_toxic, append_stub,
+    backend_failing_health_check, clear_toxics, config_revision, exec_probe, get_data_plane,
+    get_data_plane_with, get_json, imposter_ports, metric, probe, published_host_ports,
+    put_imposter, put_imposter_config, put_imposter_with_key, put_stubs, toxic_count,
     wait_admin_reachable, wait_backend_ejected, wait_converged, wait_converged_on,
     wait_ports_free_in, wait_revisions_agree, wait_revisions_agree_on, wait_single_leader,
     wait_voters,
@@ -252,9 +253,9 @@ fn the_port_barrier_names_the_port_that_is_still_held() {
 /// constant is caught too.
 #[test]
 fn the_barrier_covers_exactly_what_compose_publishes() {
-    let mut published: Vec<u16> = COMPOSE_FILES
+    let mut published: Vec<u16> = compose_files()
         .iter()
-        .flat_map(|rel| host_ports_in(&read_compose(rel)))
+        .flat_map(|path| host_ports_in(&read_compose(path)))
         .collect();
     published.sort_unstable();
     published.dedup();
@@ -280,17 +281,40 @@ fn the_barrier_covers_exactly_what_compose_publishes() {
     );
 }
 
-/// Every compose file in this repo that can publish a host port.
-const COMPOSE_FILES: [&str; 4] = [
-    "/../../deploy/compose/docker-compose.yml",
-    "/compose/chaos.overlay.yml",
-    "/compose/pull-on-miss.overlay.yml",
-    "/compose/barrier-none.overlay.yml",
-];
+/// Every compose file in this repo that can publish a host port: the shipped
+/// base file, plus **every** overlay in `compose/`.
+///
+/// Enumerated from the directory rather than listed, because a hardcoded list
+/// is a coverage check that silently stops covering the moment someone adds an
+/// overlay — which is exactly the fail-open shape the port check exists to
+/// prevent. Found while adding the flow-state overlay: the new file would have
+/// escaped the check entirely.
+fn compose_files() -> Vec<std::path::PathBuf> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("../../deploy/compose/docker-compose.yml")];
 
-fn read_compose(rel: &str) -> String {
-    let path = concat!(env!("CARGO_MANIFEST_DIR")).to_owned() + rel;
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    let overlays = root.join("compose");
+    let entries =
+        std::fs::read_dir(&overlays).unwrap_or_else(|e| panic!("read {}: {e}", overlays.display()));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_some_and(|ext| ext == "yml") {
+            files.push(path);
+        }
+    }
+    // Deterministic order so a failure message reads the same on every machine.
+    files.sort();
+    assert!(
+        files.len() > 2,
+        "found {} compose files; the overlay directory scan is broken, not the \
+         topology",
+        files.len()
+    );
+    files
+}
+
+fn read_compose(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
 /// Host ports from the `ports:` blocks of a compose file (`"12525:2525"` -> 12525).
@@ -1986,4 +2010,193 @@ async fn c16_pull_on_miss_rescues_lagging_follower() {
     wait_revisions_agree(u64::from(port), CONVERGE_TIMEOUT)
         .await
         .expect("the fleet reconverges once the link is healthy");
+}
+
+// ---------------------------------------------------------------------------
+// C15-flow: the durable flow-state tier, end to end (#121, the last child of
+// the #16 epic).
+// ---------------------------------------------------------------------------
+
+/// The imposter this scenario configures: one scripted stub that increments a
+/// per-flow counter and answers with it.
+///
+/// `durability: "sync"` is the whole point — the counter must be fsynced before
+/// the response is acknowledged, so a full-fleet stop cannot lose it.
+/// `flowIdSource: "header:X-Flow-Id"` splits one imposter into several
+/// independent flows, which is what makes "per-flow isolation survived" a
+/// thing this scenario can assert rather than assume.
+///
+/// `readConsistency` is left at its `strong` default deliberately: the whole
+/// claim is that a counter is correct *however* the requests were spread, and
+/// only owner-answered reads make that true without a staleness window to
+/// tolerate. A `local` variant would need slack in the assertions and would be
+/// asserting a weaker property.
+fn flow_counter_imposter(port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "port": port,
+        "protocol": "http",
+        "_rift": {
+            "flowState": {
+                "durability": "sync",
+                "flowIdSource": "header:X-Flow-Id",
+            }
+        },
+        "stubs": [{
+            "predicates": [{ "equals": { "path": "/step" } }],
+            "responses": [{
+                "_rift": {
+                    "script": {
+                        "engine": "javascript",
+                        "code": "function respond(ctx) { return http(200, String(ctx.state.incr('count'))); }",
+                    }
+                }
+            }],
+        }],
+    })
+}
+
+/// Take one step of `flow`, through the node at `node_idx`, and return the
+/// counter the fleet answered with.
+async fn flow_step(node_idx: usize, flow: &str) -> anyhow::Result<i64> {
+    let (status, _headers, body) = get_data_plane_with(
+        FLOW_STATE_HOST_PORTS[node_idx],
+        "/step",
+        &[("X-Flow-Id", flow)],
+    )
+    .await?;
+    anyhow::ensure!(
+        status == 200,
+        "flow {flow} step on {} answered {status}: {body}",
+        NODES[node_idx].name
+    );
+    body.trim()
+        .parse::<i64>()
+        .map_err(|e| anyhow::anyhow!("flow {flow} step answered {body:?}, not a counter: {e}"))
+}
+
+/// **C15 (flow state): a scenario mid-flight survives a full-cluster restart.**
+///
+/// This is #16's Gap E as a user sees it. Several flows advance through a
+/// scripted imposter, each request deliberately landing on a *different* node —
+/// a hand-rolled round robin, which is the honest stand-in for a load balancer
+/// and is what makes the result a statement about the cluster rather than about
+/// one process. Then the whole fleet stops and starts, and every flow must
+/// resume at exactly the next integer.
+///
+/// Why the assertions are exact rather than "nonzero": a counter that resets to
+/// 1 is the bug this exists to catch, and a counter that comes back at some
+/// *other* value is torn state — worse than a reset, because it looks plausible.
+/// `strong` reads are owner-answered, so there is no replication window to
+/// tolerate and no polling to do; anything but the exact successor is a failure.
+///
+/// SIGTERM (`compose stop`), not `kill -9`: the graceful path is what a rolling
+/// deploy and a `kubectl delete pod` both take, and `sync` durability means the
+/// counters were on disk before each response was acknowledged either way. The
+/// hard-kill variant of full-fleet restart is already covered for the *config*
+/// plane by `c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes`, and
+/// for flow state at process level by rift-cluster's SIGKILL suite (#119) —
+/// which is the layer where a kill can be timed precisely enough to mean
+/// something.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c15_flow_state_survives_a_full_cluster_restart() {
+    let cluster = Cluster::up_with_overlays(&["flow-state.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    let port = FLOW_STATE_IMPOSTER_PORT;
+
+    let (status, body) = put_imposter_config(NODES[0].admin, &flow_counter_imposter(port))
+        .await
+        .expect("admin write");
+    assert_eq!(
+        status, 201,
+        "the scripted flow-state imposter was refused: {body}"
+    );
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the imposter binds on every node before any flow starts");
+
+    // Four flows, five steps each, every step on a different node than the one
+    // before it. If ownership routing were broken, two nodes would keep
+    // independent counters and the sequence would repeat a value here — before
+    // the restart is even reached.
+    let flows = ["alpha", "beta", "gamma", "delta"];
+    let mut expected: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+    for step in 0..5 {
+        for (i, flow) in flows.iter().enumerate() {
+            // Stagger by flow as well as by step, so no flow sees the same node
+            // twice in a row and the flows do not move in lockstep.
+            let node_idx = (step + i) % NODES.len();
+            let seen = flow_step(node_idx, flow)
+                .await
+                .unwrap_or_else(|e| panic!("pre-restart step: {e}"));
+            let want = i64::try_from(step).expect("small") + 1;
+            assert_eq!(
+                seen, want,
+                "flow {flow} answered {seen} on step {want} via {} — the fleet is \
+                 not serializing this flow through one owner",
+                NODES[node_idx].name
+            );
+            expected.insert(flow, seen);
+        }
+    }
+
+    // The restart: every node down, then every node up.
+    for node in &NODES {
+        cluster.stop(node.name).expect("SIGTERM the node");
+    }
+    for node in &NODES {
+        cluster.start(node.name).expect("restart the node");
+    }
+    cluster
+        .wait_all_ready(Duration::from_secs(120))
+        .await
+        .expect("the fleet comes back");
+    cluster
+        .wait_cluster_formed(Duration::from_secs(120))
+        .await
+        .expect("the fleet re-forms a cluster");
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the imposter is rebound after the restart");
+
+    // Every flow resumes at exactly the next integer, read through a node that
+    // is (for most flows) not the one that took its last step.
+    for (i, flow) in flows.iter().enumerate() {
+        let node_idx = (i + 1) % NODES.len();
+        let resumed = flow_step(node_idx, flow)
+            .await
+            .unwrap_or_else(|e| panic!("post-restart step: {e}"));
+        let before = expected[flow];
+        assert_eq!(
+            resumed,
+            before + 1,
+            "flow {flow} stood at {before} before the restart and resumed at \
+             {resumed} via {}. A reset to 1 means the durable tier lost the \
+             flow; any other value means it came back torn. Per-flow state at \
+             the restart was {expected:?}",
+            NODES[node_idx].name
+        );
+    }
+
+    // Recovery is observable per node, not only through the counters: the
+    // replay counter is what an operator would look at to answer "did this node
+    // come back with its state or without it?".
+    let replayed: Vec<f64> = {
+        let mut seen = Vec::new();
+        for node in &NODES {
+            seen.push(
+                metric(node.metrics, "rift_cluster_flow_replay_entries_total")
+                    .await
+                    .unwrap_or(0.0),
+            );
+        }
+        seen
+    };
+    assert!(
+        replayed.iter().any(|&n| n > 0.0),
+        "no node reported replaying a single flow entry from disk after the \
+         restart ({replayed:?}) — the counters above would then be passing on \
+         something other than durability"
+    );
 }

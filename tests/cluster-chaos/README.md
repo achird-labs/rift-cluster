@@ -163,6 +163,7 @@ though C6 itself only runs in the container tier.
 Implemented and passing: `test_config_sync_converges`, `test_node_rejoin`,
 `test_graceful_leave`, `test_cold_start`, `c14_leader_kill_keeps_every_acknowledged_write`,
 `c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes`,
+`c15_flow_state_survives_a_full_cluster_restart`,
 `c5_rolling_restart_never_stops_accepting_writes`,
 `whole_fleet_sigterm_then_cold_start_converges`.
 
@@ -243,6 +244,28 @@ gauge is resampled on a ~5 s timer, so it cannot resolve a 3 s bound at all — 
 scenario polling it would be reading a quantity coarser than the thing it claims
 to measure, the same mistake #94 fixed in C6. A write returning 201 proves a
 leader exists, timestamped when it mattered, and is what a client experiences.
+
+`c15_flow_state_survives_a_full_cluster_restart` (#121) closes the #16 epic: a
+scripted imposter advances four independent flows, each step deliberately
+landing on a **different node**, and every counter resumes at exactly the next
+integer after the whole fleet stops and starts. Two properties in one scenario —
+ownership routing (a per-process store would repeat a value before the restart
+is even reached) and the durable tier (a reset to 1 afterwards is the bug it
+exists to catch).
+
+It needs its own overlay for two reasons, both scoped there rather than in the
+shipped topology: the imposter's data port must be reachable from the host,
+because the counter is only observable in a response body; and scripts are
+gated behind `--allowInjection`, which the base file deliberately leaves off.
+
+**This scenario earned its keep before it merged.** Run first against
+`durability: "none"` — the mutation that must fail — it *passed*, because
+replication pushes were hardcoded to persist at `Async` no matter what the
+imposter chose, so both replicas wrote to disk state the imposter had asked to
+keep in memory, and a restart adopted it back. The push now carries the write's
+own durability and repairs never persist at all, so the three modes mean the
+same thing fleet-wide; with the fix in place the mutation fails on
+`resumed at 1`, as it always should have.
 
 ## Quarantine convention
 

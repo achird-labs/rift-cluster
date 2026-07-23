@@ -441,6 +441,7 @@ pub fn published_host_ports() -> Vec<u16> {
     }
     ports.extend([FRONT_PORT, ENVOY_ADMIN_PORT, TOXIPROXY_PORT]);
     ports.extend(PULL_ON_MISS_HOST_PORTS);
+    ports.extend(FLOW_STATE_HOST_PORTS);
     ports
 }
 
@@ -650,13 +651,33 @@ pub async fn put_imposter(admin: u16, port: u16, body_text: &str) -> anyhow::Res
             "responses": [{ "is": { "statusCode": 200, "body": body_text } }]
         }]
     });
+    put_imposter_config(admin, &body)
+        .await
+        .map(|(status, _)| status)
+}
+
+/// `POST /imposters` with a config the caller built itself.
+///
+/// [`put_imposter`] covers the "one static stub" shape every config-plane
+/// scenario needs; this one exists for the scenarios whose *config* is the
+/// subject — a scripted stub, a `_rift.flowState` block — where the point is
+/// exactly the fields the convenience helper does not expose.
+/// Returns the status **and the body**: a config-shaped 400 carries the reason
+/// in its typed error envelope, and a status alone would make a refusal
+/// indistinguishable from any other refusal.
+pub async fn put_imposter_config(
+    admin: u16,
+    config: &serde_json::Value,
+) -> anyhow::Result<(u16, String)> {
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{admin}/imposters"))
         .timeout(Duration::from_secs(15))
-        .json(&body)
+        .json(config)
         .send()
         .await?;
-    Ok(response.status().as_u16())
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    Ok((status, body))
 }
 
 /// [`put_imposter`] carrying an `Idempotency-Key`, returning the status and the
@@ -704,6 +725,13 @@ pub async fn put_imposter_with_key(
 pub const PULL_ON_MISS_IMPOSTER_PORT: u16 = 6300;
 pub const PULL_ON_MISS_HOST_PORTS: [u16; 3] = [16300, 26300, 36300];
 
+/// The flow-state scenario's imposter port, and the host ports
+/// `flow-state.overlay.yml` publishes it on — one per node, in `NODES` order,
+/// so a scenario can round-robin its data-plane requests across the fleet the
+/// way a load balancer would.
+pub const FLOW_STATE_IMPOSTER_PORT: u16 = 6400;
+pub const FLOW_STATE_HOST_PORTS: [u16; 3] = [16400, 26400, 36400];
+
 /// Append a stub to an existing imposter — a `PatchStubs` `ControlOp`, i.e. a
 /// config write like any other, not a whole-imposter replacement.
 ///
@@ -743,17 +771,33 @@ pub async fn get_data_plane(
     host_port: u16,
     path: &str,
 ) -> anyhow::Result<(u16, reqwest::header::HeaderMap, String)> {
-    let response = reqwest::Client::new()
+    get_data_plane_with(host_port, path, &[]).await
+}
+
+/// [`get_data_plane`] carrying request headers.
+///
+/// Flow state needs it: an imposter with `flowIdSource: "header:<Name>"` keys
+/// its state off that header, so driving several *distinct* flows through one
+/// imposter — the only way to prove per-flow isolation survives a restart —
+/// means setting it per request.
+pub async fn get_data_plane_with(
+    host_port: u16,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> anyhow::Result<(u16, reqwest::header::HeaderMap, String)> {
+    let mut request = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{host_port}{path}"))
         // Comfortably past the hook's own 500 ms budget, so a scenario failure
         // reads as "not rescued" rather than as the client giving up first.
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?;
+        .timeout(Duration::from_secs(10));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.send().await?;
     let status = response.status().as_u16();
-    let headers = response.headers().clone();
+    let response_headers = response.headers().clone();
     let body = response.text().await.unwrap_or_default();
-    Ok((status, headers, body))
+    Ok((status, response_headers, body))
 }
 
 /// Probe a URL from *inside* a container, answering with success/failure.
