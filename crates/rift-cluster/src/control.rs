@@ -230,6 +230,10 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
                     return Err(format!("duplicate stub id {id:?}"));
                 }
             }
+            // The clustered store's knobs (#120). Refused here, pre-commit,
+            // because `FlowStoreProvider::provide` has no error channel — by the
+            // time the provider reads the config it must already be valid.
+            crate::stores::FlowConfig::validate(config)?;
             Ok(())
         }
         ControlOp::PatchStubs { tenant, .. } | ControlOp::DeleteImposter { tenant, .. } => {

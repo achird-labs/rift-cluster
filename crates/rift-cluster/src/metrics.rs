@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
 use prometheus::{
-    Gauge, GaugeVec, Histogram, IntCounter, register_gauge, register_gauge_vec, register_histogram,
-    register_int_counter,
+    Gauge, GaugeVec, Histogram, IntCounter, IntCounterVec, register_gauge, register_gauge_vec,
+    register_histogram, register_int_counter, register_int_counter_vec,
 };
 
 use crate::raft::{Ring, StatusReport};
@@ -178,6 +178,34 @@ lazy_static! {
     )
     .expect("rift_cluster_kv_evicted_flows_total registers once");
 
+    /// `rift_cluster_flow_reads_total{path}` — where each flow-state read was
+    /// answered. `owner` = this node owns the key and served from its shard;
+    /// `forward` = one RPC to the owner (the whole cost of `strong` on a
+    /// non-owner, so `forward / (owner+forward)` is the fraction of strong
+    /// reads that paid a network hop); `local` = a replica read an imposter
+    /// opted into with `readConsistency: "local"`.
+    static ref FLOW_READS: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_flow_reads_total",
+        "Flow-state reads by answering path",
+        &["path"]
+    )
+    .expect("rift_cluster_flow_reads_total registers once");
+
+    /// `rift_cluster_cas_conflicts_total{reason}` — owner-side refusals of
+    /// a flow write. `cas` = compare-and-set lost to the current value;
+    /// `fence` = the op carried a stale membership index (`m_idx`) and was
+    /// rejected per RFC-001 §7.6 rather than applied under an ownership the
+    /// sender no longer holds; `misroute` = the op reached a node that does
+    /// not own the flow at the shared `m_idx`, which only a buggy member does
+    /// — persistently non-zero means a peer's ring disagrees with its own
+    /// membership index, which is a bug to file, not noise.
+    static ref FLOW_CAS_CONFLICTS: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_cas_conflicts_total",
+        "Owner-side flow-write refusals, by reason",
+        &["reason"]
+    )
+    .expect("rift_cluster_cas_conflicts_total registers once");
+
     /// `rift_cluster_config_revision{port}` — the log index that last wrote
     /// each applied config. Two nodes disagreeing here have not converged.
     static ref CONFIG_REVISION: GaugeVec = register_gauge_vec!(
@@ -254,6 +282,16 @@ pub(crate) fn flow_replayed(entries: usize) {
 
 pub(crate) fn flow_flows_evicted(flows: usize) {
     FLOW_EVICTED.inc_by(flows as u64);
+}
+
+/// `path` is one of `owner` / `forward` / `local` — a closed set at the call
+/// sites, so an unexpected label cannot explode cardinality.
+pub(crate) fn flow_read(path: &str) {
+    FLOW_READS.with_label_values(&[path]).inc();
+}
+
+pub(crate) fn flow_conflict(reason: &str) {
+    FLOW_CAS_CONFLICTS.with_label_values(&[reason]).inc();
 }
 
 pub(crate) fn pull_on_miss_check() {

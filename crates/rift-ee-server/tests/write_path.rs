@@ -317,6 +317,50 @@ async fn a_config_without_a_port_is_refused_with_the_typed_envelope() {
     server.shutdown().await;
 }
 
+/// #120: an unknown `flowState` knob value is refused at admission with a 400
+/// that names the key — never committed and silently defaulted. The provider
+/// has no error channel (`provide` returns `Option`), so this gate, running in
+/// the admin front before the op commits, is the only place the refusal can
+/// happen.
+#[tokio::test]
+async fn an_unknown_flow_state_knob_is_refused_before_commit() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let mut config = minimal_imposter(port);
+    config["_rift"] = json!({ "flowState": { "readConsistency": "eventual" } });
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&config)
+        .send()
+        .await
+        .expect("post imposter");
+
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 400, "{seen}");
+    assert!(
+        seen.body.contains("readConsistency"),
+        "the refusal must name the offending key so the fix is obvious: {seen}"
+    );
+
+    // And nothing was committed: the imposter does not exist.
+    let read = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get");
+    assert_eq!(
+        read.status().as_u16(),
+        404,
+        "a refused config must not land"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_api_key_gates_terminated_routes_like_upstream() {
     let state = TempDir::new().expect("tempdir");

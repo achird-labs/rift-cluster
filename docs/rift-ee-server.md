@@ -148,6 +148,7 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-write-barrier <MODE>` | What a committed admin write waits for before its 2xx: `ready-nodes` (default — every Ready node has applied it, so any node serves it) or `none` (committed and applied locally) |
 | `--cluster-write-barrier-timeout <SECONDS>` | How long the barrier waits (default `2`) before answering anyway with a `Rift-Cluster-Warnings: unapplied=<node,…>` header |
 | `--cluster-admin-async` | Answer admin writes with an immediate `202` + op id after durably parking them; poll `GET /_cluster/ops/:id` for the outcome |
+| `--cluster-flow-fsync-interval-ms <MILLIS>` | Group-fsync cadence for `durability: "async"` flow-state writes (default `50`) — the bound on what a whole-fleet crash can lose for imposters that did not choose `"sync"` or `"none"` |
 
 Each flag also has an environment-variable spelling (`RIFT_CLUSTER_BIND`,
 `RIFT_CLUSTER_SECRET_FILE`, …), which is the intended vehicle for the secret.
@@ -525,19 +526,45 @@ A node is not Ready until its `cluster-reconciled` gate opens: its applied
 state has caught up to the leader's and its imposters are bound (or their
 failures reported on `GET /_cluster/imposters`).
 
+## Clustered flow state (#120)
+
+Under `--cluster`, **every** imposter's flow state (scenarios, `ctx.state`,
+flow-state templating) is served by the clustered store — configured or not,
+because scenario state on a process-local store behind a round-robin LB is
+wrong for every imposter, not just the ones that thought about it. Each flow
+has one owner (rendezvous-hashed over the applied membership); writes are
+serialized through it, and by default reads are answered by it, so a scenario
+behaves correctly however the LB spreads its steps.
+
+Two per-imposter knobs, under `_rift.flowState` (both validated at admission —
+an unknown value is a `400` naming the key, never a silent default):
+
+| Knob | Values | Meaning |
+|---|---|---|
+| `readConsistency` | `"strong"` (default) \| `"local"` | `strong`: every read is owner-answered — correct under any LB, at most one LAN RPC. `local`: reads stay on this node's replica — fast, at most one replication push behind the owner |
+| `durability` | `"none"` \| `"async"` (default) \| `"sync"` | What a write survives: `sync` fsyncs before the ack (a full-fleet restart loses nothing), `async` is group-fsynced every `--cluster-flow-fsync-interval-ms` (bounded loss), `none` never touches disk |
+
+The existing `flowState` fields (`backend`, `ttlSeconds`, `flowIdSource`) keep
+their upstream meaning; `ttlSeconds` bounds each entry's life fleet-wide.
+
+Observability: `rift_cluster_flow_reads_total{path=owner|forward|local}` says
+where reads are answered, and `rift_cluster_cas_conflicts_total{reason=cas|fence}`
+counts owner-side refusals.
+
 ## What lands later
 
-Two flags from the Phase-1 plan are deliberately **not** accepted yet, because
-nothing behind them exists and this codebase refuses flags that quietly do
+One flag from the Phase-1 plan is deliberately **not** accepted yet, because
+nothing behind it exists and this codebase refuses flags that quietly do
 nothing (that is the same principle the startup guards enforce):
 
-- `--cluster-degraded-mode` — the degradation table gives admin writes exactly
-  one behavior (`503`, durably parked, replayed), so this flag belongs to the
-  flow-state features (#16) that actually have a `local` mode to choose.
-- `--cluster-features` — the namespace gates nothing until a second clustered
-  feature (#16) exists.
+- `--cluster-features` — the namespace gates nothing while the clustered
+  feature set is not selectable; flow state (#120) ships on for every
+  `--cluster` node rather than behind a feature gate.
 
-Both arrive with the code that reads them.
+`--cluster-degraded-mode`, also once listed here, was superseded rather than
+built: the degradation choice the table reserved it for became the
+**per-imposter** `readConsistency` knob above — per-imposter because staleness
+tolerance is a property of the test using the imposter, not of the node.
 
 See [`docs/architecture/10-operations.md`](architecture/10-operations.md) for the
 operational model this implements.

@@ -70,9 +70,11 @@ issues — an implementer reading only the RFC would have built the wrong thing.
   durably parked, auto-replayed (#9) — and a **proxy recording is a config write**, so its
   row now says so instead of offering a merge. The **flow-KV read** row becomes
   owner-authoritative by default with `readConsistency: "local"` as a per-imposter opt-in
-  (#16 Gap C); §7.2.4's cross-text follows. `--cluster-degraded-mode` is scoped to
+  (#16 Gap C); §7.2.4's cross-text follows. The degradation choice is scoped to
   **data-plane features** (flow state, Phase-4 sequences, Phase-5 proxyOnce) — matching
-  #9's flag decisions, and explicitly not config writes.
+  #9's flag decisions, and explicitly not config writes. (#120 shipped it as the
+  per-imposter `readConsistency` knob rather than the global `--cluster-degraded-mode`
+  flag sketched here.)
 - **§7.5.1 gained the journal vector cursor and SSE design**, which v3 omitted entirely: a
   `(node_id → shard_seq)` map as the **opaque** `since` token (the admin layer round-trips
   it and never parses it), clear-generation staleness detection, eviction-overtakes-cursor
@@ -552,10 +554,15 @@ fallback dispatch, §7.4.6) stay enterprise.
   - `--cluster-allow-solo` — explicit opt-in to form/serve a cluster of one (see §7.1.3).
   - `--cluster-secret <string>` / `--cluster-secret-file <path>` — **required**; refuse to
     start clustered without it unless `--cluster-insecure` (§11.2).
-  - `--cluster-degraded-mode <reject|local>` — global partition-behavior override (§7.6).
+  - ~~`--cluster-degraded-mode <reject|local>`~~ — **superseded before it shipped
+    (#120)**: the degradation choice became the per-imposter
+    `flowState.readConsistency` knob, because staleness tolerance is a property of
+    the *test using the imposter*, not of the node. No global flag exists.
   - `--cluster-features <list>` — enable stateful features selectively
     (`config-sync,flow-state,sequencing,journal,proxy`; default: all shipped phases).
-    This is the per-phase rollback switch (§10).
+    This is the per-phase rollback switch (§10). **Not accepted yet**: flow state
+    (#120) ships on for every `--cluster` node, and the binary refuses flags that
+    gate nothing (see `rift-ee-server.md` §What lands later).
   - `--cluster-state-dir <path>` — persisted desired-state (default `<datadir>/_cluster`,
     or a mandatory explicit path when no datadir).
 - **Timing defaults:** gossip interval 1 s; phi-accrual failure detection target: node
@@ -691,8 +698,11 @@ do not gate matching (scripting `flow_store:get`) are **also owner-authoritative
 default** (#16 Gap C): scripts drive response content and fault decisions off flow state,
 so a stale read is a wrong answer just as a stale match is. A per-imposter
 `readConsistency: "local"` opts a given imposter back into the local replica (bounded
-staleness, flagged when the owner is unreachable) — same polarity as
-`--cluster-degraded-mode reject`: correct by default, fast by choice. The cost argument
+staleness) — correct by default, fast by choice. (Shipped by #120 exactly at this
+per-imposter granularity; the global `--cluster-degraded-mode` flag once planned as its
+vehicle was never built. A `strong` read that cannot reach the owner **errors** rather
+than silently serving the replica — the store is reached through `spawn_blocking`, where
+the response-annotation scope that would have flagged a degraded read does not exist.) The cost argument
 that once justified replica reads is void, because scripts run on the dedicated
 script-pool threads §7.7 already sizes with their own larger permit pool precisely so they
 can park on RPC. The split is per §7.6. Transitions
@@ -1037,12 +1047,12 @@ Unclaimed ──try_claim──► Pending(holder, deadline) ──complete─�
 > (which *is* a config write, so it no longer offers a merge), and **flow-KV read**
 > (owner-authoritative by default — #16 Gap C).
 
-Global default `--cluster-degraded-mode reject` — correctness-critical ops fail fast and
-honestly rather than silently diverging; per-feature defaults below chosen for a mock
-server's practical needs. `local` mode trades correctness for availability and stamps
-responses `Rift-Cluster-Degraded: <feature>` (emitted via U-8). `--cluster-degraded-mode`
-arrives with **#16** and governs **data-plane features only** — flow state (#16), Phase-4
-sequences, Phase-5 proxyOnce. It has **no effect on config writes** (including proxy
+The global default is **reject** — correctness-critical ops fail fast and honestly
+rather than silently diverging; per-feature defaults below chosen for a mock server's
+practical needs. `local` trades correctness for availability. The switch shipped with
+**#120 as the per-imposter `flowState.readConsistency` knob**, not the global
+`--cluster-degraded-mode` flag this section previously named, and it governs
+**data-plane features only** — flow state (#120), Phase-4 sequences, Phase-5 proxyOnce. It has **no effect on config writes** (including proxy
 recordings, which are config writes): those go through Raft, so their degraded behaviour is
 fixed rather than chosen — see the config-write row.
 
@@ -1255,7 +1265,7 @@ Phase 1 is not blocked by seams it doesn't need.
 | **0a — enabling seams** ✅ **DONE** | U-6 (#316), U-7 (#317), U-8 (#318) — **merged upstream v0.14.0** | — | OSS suite green; `matcher_bench` within 2 % of pre-seam baseline | Additive, default-off |
 | **0b — backend seams** ✅ **DONE** | U-1…U-5 (#311–#315) — **merged upstream v0.14.0** | — | Same bars per PR | Same |
 | **1 — Membership + config-sync** (v3: **Raft**, ADR-001) | `--cluster*` CLI; Raft membership incl. graceful leave; `ControlOp` config writes + read-after-write barrier + durable intent log + op-id dedup (replaces the v2 gossip mechanism); redb log/vote/snapshot + cold start; `/_cluster/{members,config,health,imposters,ops}`; `/readyz`. Transport substrate (#8) merged. | 0a ✅ | 3-node harness: `POST /imposters` on A visible & serving on B/C ≤ 5 s (`test_config_sync_converges`); kill B mid-run → A/C unaffected, B rejoin converges (`test_node_rejoin`); sibling-port config change preserves scenario state (`test_reconcile_preserves_state`); stub reorder converges order-correct (`test_reconcile_reorder`); unreachable seeds ⇒ never Ready (`test_no_seeds_not_ready`); full-cluster cold restart restores config incl. tombstones (`test_cold_start`); SIGTERM leave under load → zero data-plane errors on survivors AND zero lost acknowledged writes (`test_graceful_leave`). Chaos: C4, C5, C6, C7, **C14, C15**. SDK conformance suite (upstream epic achird-labs/rift#458) green against a clustered fleet — an SDK must not be able to tell a 3-node fleet from a single node, which is R1 as a client sees it; `--cluster`-off parity of the full OSS suite tracked as #37. | `--cluster` off → OSS single node. **Truth scope:** a de-clustered node serves the full fleet config only if it ran with `--datadir` (the OSS write-through) — with `--configfile`-only deployments, export a snapshot from `--cluster-state-dir` first. Rollback is per-fleet: mixed on/off nodes behind one LB diverge immediately |
-| **2 — Scenario/flow state** | `ClusteredFlowStore`: owner-serialized reads (match gate) + CAS, successor replication, adoption; `/_cluster/kv/{flow_id}`; stuck-scenario & split-brain runbooks | U-1, U-2 (+0a) | multi-step scenario round-robin across 3 nodes at 10 ms pacing: transitions linear per flow, zero illegal transitions, zero lost updates over 10 k iterations (`test_scenario_cluster_linear`); owner kill mid-scenario → adopt within 1 replication round or flagged reset, never an illegal transition (`test_scenario_handoff`). Chaos: C1, C8, C9, C12, C13 | `--cluster-features` without `flow-state` → local stores |
+| **2 — Scenario/flow state** | `ClusteredFlowStore`: owner-serialized reads (match gate) + CAS, successor replication, adoption; `/_cluster/kv/{flow_id}`; stuck-scenario & split-brain runbooks | U-1, U-2 (+0a) | multi-step scenario round-robin across 3 nodes at 10 ms pacing: transitions linear per flow, zero illegal transitions, zero lost updates over 10 k iterations (`test_scenario_cluster_linear`); owner kill mid-scenario → adopt within 1 replication round or flagged reset, never an illegal transition (`test_scenario_handoff`). Chaos: C1, C8, C9, C12, C13 | `--cluster` off → local stores. (#120 shipped the store always-on under `--cluster` — a `--cluster-features` opt-out would reintroduce the per-imposter split-brain it exists to remove) |
 | **3 — Recorded-request verification** | `ClusteredJournal`: sharded log, watermarks, pull-on-read, generation clears; count G-counter | U-4 (+0a); **U-13** for the vector-cursor/streaming form (§7.5.1) | spray N (< shard-cap) requests across 3 nodes → `GET .../requests` on each node returns exactly N (`test_journal_merge_exact`); `DELETE savedRequests` clears cluster-wide ≤ 5 s incl. concurrent appends, clock-skew-immune (`test_journal_clear`); `numberOfRequests` = N on every node (`test_count_merge`); incremental reads with the returned vector cursor concatenate, **within one clear generation**, to exactly a full read of that generation — no duplicate, no gap — with `Rift-Cluster-Cursor-Reset` exactly once across a clear and `Rift-Cluster-Partial` for a node unreachable mid-sequence (`test_journal_cursor_merge`, §7.5.1; needs seam U-13) | `--cluster-features` without `journal` → local Vec |
 | **4 — Response sequencing (strict = Redis first)** | `RedisSequencer` (strict, requires `--cluster-redis <url>`); `ClusteredSequencer` (gossip-native, experimental flag) | U-3 (+0a); **named customer request on file for gossip-native strict** | Redis mode: cyclic stub sprayed across nodes → global sequence no dup/skip incl. during single-node kill (`test_sequence_redis_strict`); gossip mode: no dup/skip while membership stable, documented reset on handoff (`test_sequence_no_dup_no_skip`, `test_sequence_handoff_reset`). Chaos: C2, C13 | feature flag off → per-node cursors (today's behavior) |
 | **5 — Proxy + proxyOnce (strict = Redis first)** | `RedisProxyStore` (strict claims); `ClusteredProxyStore` (Pending/Recorded, experimental); recordings as leader-serialized `PatchStubs` `ControlOp`s (ADR-001) | U-5 (+0a); same demand gate for gossip-native | Redis mode: 3 nodes, concurrent first-hits, 100-run soak incl. node kill → upstream called exactly once (`test_proxy_once_redis_strict`); gossip mode: exactly-once while membership stable, duplicates ≤ documented bound under owner kill, measured (`test_proxy_once_gossip_bound`); recorded stubs appear on all nodes (`test_recording_replicates`); concurrent recordings on 3 nodes, no partition → zero lost stubs (`test_recording_no_loss`). Chaos: C3, C10, C11 | feature flag off → local store (today) |
@@ -1302,6 +1312,12 @@ registered in `crates/rift-cluster/src/metrics.rs`:
 | `rift_cluster_pull_on_miss_checks_total`, `..._lagging_total`, `..._retries_total` | The lagging-follower safety net (#49): consulted, found behind, re-matched after catch-up |
 | `rift_cluster_config_revision{port}` | Applied config revision per port. **This is the convergence signal** — two nodes disagreeing here have not converged |
 | `rift_cluster_bind_failures{port}` | Ports that failed to bind |
+| `rift_cluster_flow_reads_total{path}` | Flow-state reads by answering path (#120): `owner` (this node owns the key), `forward` (one RPC to the owner — the whole cost of `strong` on a non-owner), `local` (a replica read the imposter opted into) |
+| `rift_cluster_cas_conflicts_total{reason}` | Owner-side flow-write refusals (#120): `cas` lost to the current value, `fence` carried a stale `m_idx` (§7.6) |
+| `rift_cluster_flow_fsync_seconds` | Durable flow-state commit latency (#119) — `sync` writes wait on its tail |
+| `rift_cluster_flow_wal_lag_ops` | `async` writes acknowledged but not yet fsynced — the loss window, measured (#119) |
+| `rift_cluster_flow_replay_entries_total` | Flow entries recovered from disk at startup (#119); zero after a restart that should have recovered is the durability alarm |
+| `rift_cluster_kv_evicted_flows_total` | Whole flows shed under the per-node cap (#119) — never single keys |
 
 Three more are counted **in process only and do not yet reach `/metrics`**:
 `rift_cluster_bridge_inflight`, `rift_cluster_bridge_rejected_total`, and
@@ -1311,10 +1327,11 @@ that would expose them has no caller yet, so nothing scrapes them. Named here be
 counters exist and the names are settled — not because a dashboard can use them today.
 
 **Planned, not yet built** — named here so later phases have a fixed target, but nothing
-exports them today: `rift_cluster_cas_conflicts_total` and
-`rift_cluster_kv_evicted_flows_total` (Phase 2, flow state),
-`rift_cluster_degraded_ops_total{feature}` (Phase 2+), `rift_cluster_partial_reads_total`
-(Phase 3, journal).
+exports them today: `rift_cluster_degraded_ops_total{feature}` (Phase 2+),
+`rift_cluster_partial_reads_total` (Phase 3, journal). (`rift_cluster_cas_conflicts_total`
+and `rift_cluster_kv_evicted_flows_total`, previously listed here, shipped with #120 and
+#119 and moved to the table above; the CAS counter gained a `{reason}` label so fencing
+rejections are distinguishable from lost races.)
 
 † **Retired by ADR-001.** A dashboard built on these should be told they will read zero
 forever. `rift_cluster_config_conflicts_total` counted a config-write merge conflict, which
@@ -1865,7 +1882,7 @@ follow-up)"* — then one PR per seam:
 | D-7 | Manager-scoped store via provider resolves the construction-time caveat | Per-imposter stores kept for OSS compat; a provider returning a shared store is strictly more flexible |
 | D-8 | Sequence cursors reset on ownership change | Replicating cursors puts a network write on the hottest stateful path; a documented reset matches test-run-scoped data |
 | D-9 | Sync traits + enterprise-side bridge runtime (std mpsc park, sized semaphore) | Async-ifying `FlowStore` ripples into Lua/JS engines and every call site — huge OSS churn benefiting only clustering |
-| D-10 | Default `--cluster-degraded-mode reject` (except sequencing = local) | Silent local fallback for CAS/proxyOnce converts partitions into wrong test results — the one thing a verification tool must never do; sequencing degrades by default because blocking all cyclic responses during a blip is worse than a possible duplicate index, and it's flagged |
+| D-10 | Degraded reads reject by default (except sequencing = local); shipped per-imposter as `readConsistency` (#120), not as the `--cluster-degraded-mode` flag first sketched | Silent local fallback for CAS/proxyOnce converts partitions into wrong test results — the one thing a verification tool must never do; sequencing degrades by default because blocking all cyclic responses during a blip is worse than a possible duplicate index, and it's flagged |
 | D-11 | Plain gateway listener upstreams with U-7 (promotion of #212); only cluster-aware dispatch (bind-failure fallback) stays enterprise | Keeping a generic single-node convenience enterprise-only has bad optics, zero moat (community can promote #212 trivially), and weakens U-7's story |
 | D-12 | Strict sequencing/proxyOnce ship **Redis-backed first**; gossip-native single-writer versions are demand-gated experimental follow-ons | Gossip-exact semantics are the hardest engineering in the RFC aimed at the least-demanded guarantee; the trait seams make the backend invisible to customers; target customers already operate Redis. The zero-dependency premise stays intact for Phases 1–3 (membership, config-sync, scenario state, verification) |
 | D-13 | LB header affinity treated as stickiness only; owner co-location is NOT assumed (one LAN RPC per stateful op is the budget) | v1/v2-draft claimed "receiving node is usually the owner" — false: LBs hash onto their own ring. A future sticky-owner lease (first-touch ownership) could align them but is a separate design with its own fencing story; recorded as future work, not assumed |

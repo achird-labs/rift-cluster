@@ -14,9 +14,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use rift_cluster::rpc::Router;
+use rift_cluster::stores::{
+    ClusteredFlowStoreProvider, FlowNet, FlowShard, ShardConfig, flow_routes,
+};
 use rift_cluster::{
-    Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity,
+    Authority, BridgeConfig, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity,
     PullOnMissInterceptor, RaftNode, metrics,
 };
 use rift_ee::seams::{ImposterManager, RunningServer, ServerBuilder, TlsDefaults};
@@ -439,7 +441,35 @@ pub async fn start_with_runtimes(
     // ordering `NodeSlot` handles for the operator surface. Until `bind`, the
     // hook proceeds on every miss, which is exactly today's behaviour.
     let pull_on_miss = PullOnMissInterceptor::new();
-    let manager = match cluster_manager(&cli, accept_runtimes, Arc::clone(&pull_on_miss)) {
+
+    // The flow-state subsystem (#120): the durable shard opens beside the
+    // control tables (a sibling file, never the same one -- their fsync
+    // policies differ), and the net is the shared late-bound core the
+    // per-imposter stores, the RPC routes below, and the post-start `bind` all
+    // hang off. Same before-the-node ordering as `pull_on_miss`; until `bind`,
+    // clustered flow ops refuse loudly rather than falling back to a
+    // process-local store.
+    let flow_shard = match FlowShard::open(
+        &state_dir,
+        ShardConfig {
+            fsync_interval: Duration::from_millis(cli.cluster.cluster_flow_fsync_interval_ms),
+            ..ShardConfig::default()
+        },
+    ) {
+        Ok(shard) => shard,
+        Err(e) => {
+            probes.shutdown().await;
+            return Err(anyhow::Error::new(e).context("opening the flow-state shard"));
+        }
+    };
+    let flow_net = FlowNet::new(flow_shard);
+
+    let manager = match cluster_manager(
+        &cli,
+        accept_runtimes,
+        Arc::clone(&pull_on_miss),
+        Arc::clone(&flow_net),
+    ) {
         Ok(manager) => Arc::new(manager),
         Err(e) => {
             probes.shutdown().await;
@@ -458,7 +488,14 @@ pub async fn start_with_runtimes(
         // directory: it is where a departure gets recorded on the way out.
         data_dir: state_dir.clone(),
         secret: cluster.secret,
-        routes: cluster_api::routes(Router::new(), slot.clone(), Arc::clone(&readiness)),
+        // Seeded with the flow routes: the registry ships empty and the state
+        // backends register their own endpoints (its design contract), and the
+        // operator surface layers its routes on top.
+        routes: cluster_api::routes(
+            flow_routes(Arc::clone(&flow_net)),
+            slot.clone(),
+            Arc::clone(&readiness),
+        ),
         engine: Some(Arc::clone(&manager)),
     })
     .await
@@ -477,6 +514,13 @@ pub async fn start_with_runtimes(
         return Err(anyhow::Error::new(e).context("binding the operator surface to the node"));
     }
     pull_on_miss.bind(&node);
+    if let Err(e) = flow_net.bind(&node, BridgeConfig::default()) {
+        probes.shutdown().await;
+        if let Err(e) = node.shutdown().await {
+            tracing::error!(error = %e, "cluster node shutdown reported an error");
+        }
+        return Err(anyhow::Error::new(e).context("starting the flow-state bridge"));
+    }
 
     let cluster_addr = node.advertise().clone();
     let leave_timeout = Duration::from_secs(cli.cluster.cluster_leave_timeout);
@@ -769,6 +813,7 @@ fn cluster_manager(
     cli: &EeCli,
     accept_runtimes: Vec<tokio::runtime::Handle>,
     pull_on_miss: Arc<PullOnMissInterceptor>,
+    flow_net: Arc<FlowNet>,
 ) -> anyhow::Result<ImposterManager> {
     let default_cert = cli
         .oss
@@ -793,7 +838,13 @@ fn cluster_manager(
         })
         .with_accept_runtimes(accept_runtimes)
         .with_response_decorator(Arc::new(ClusterDecorator))
-        .with_no_match_interceptor(pull_on_miss))
+        .with_no_match_interceptor(pull_on_miss)
+        // Every imposter on a cluster node gets the clustered flow store,
+        // configured or not: scenario state on a process-local store behind a
+        // round-robin LB is wrong for all of them, not just the ones that set
+        // `flowState` (#120). The `--cluster`-off path never reaches this
+        // function, which is the whole off-switch.
+        .with_flow_store_provider(Arc::new(ClusteredFlowStoreProvider::new(flow_net))))
 }
 
 /// Replay parked intents (issue #9 R4): drain whenever a leader (re)appears —

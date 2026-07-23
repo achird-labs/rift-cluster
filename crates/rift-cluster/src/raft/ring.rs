@@ -130,6 +130,27 @@ impl Ring {
             .max_by_key(|&node| (score(node, key), node))
     }
 
+    /// The top `n` members for `key` by HRW score, owner first.
+    ///
+    /// Positions past the owner are the **replica successors**: the nodes that
+    /// hold redundant copies of owned state, and — because HRW scores are
+    /// per-member and independent — the nodes that inherit ownership when the
+    /// owner leaves the membership, without any other key moving. Every node
+    /// computes the same list at the same `m_idx`, which is what lets an owner
+    /// push replicas without negotiating who holds them.
+    #[must_use]
+    pub fn owners(&self, key: OwnedKey<'_>, n: usize) -> Vec<NodeId> {
+        let mut scored: Vec<(u64, NodeId)> = self
+            .members
+            .iter()
+            .map(|&node| (score(node, key), node))
+            .collect();
+        // Same order as `owner()`: score, then node id for the (astronomically
+        // unlikely) tie — descending, so position 0 IS `owner()`'s answer.
+        scored.sort_unstable_by(|a, b| b.cmp(a));
+        scored.into_iter().take(n).map(|(_, node)| node).collect()
+    }
+
     /// Whether `me` owns `key`.
     #[must_use]
     pub fn i_own(&self, me: NodeId, key: OwnedKey<'_>) -> Option<OwnStatus> {
@@ -172,6 +193,33 @@ mod tests {
             let key = OwnedKey::config(&k);
             assert_eq!(forward.owner(key), reversed.owner(key), "key {k}");
         }
+    }
+
+    /// `owners()[0]` must be `owner()`'s answer for every key, or the replica
+    /// set and the ownership function have quietly diverged — the one bug that
+    /// would make every node disagree about where copies live.
+    #[test]
+    fn owners_head_is_the_owner_and_successors_are_distinct() {
+        let ring = Ring::new([1, 2, 3, 4, 5], 10);
+        for k in keys(200) {
+            let key = OwnedKey::new(KeyClass::FlowKv, &k);
+            let owners = ring.owners(key, 3);
+            assert_eq!(owners.len(), 3);
+            assert_eq!(owners[0], ring.owner(key).expect("non-empty"), "key {k}");
+            let mut dedup = owners.clone();
+            dedup.dedup();
+            assert_eq!(dedup, owners, "duplicate member in the replica set: {k}");
+        }
+    }
+
+    /// Asking for more replicas than there are members yields the whole ring —
+    /// a two-node cluster with replication factor three holds two copies, not a
+    /// phantom third.
+    #[test]
+    fn owners_is_clamped_to_the_membership() {
+        let ring = Ring::new([1, 2], 4);
+        let owners = ring.owners(OwnedKey::new(KeyClass::FlowKv, "flow-1"), 3);
+        assert_eq!(owners.len(), 2);
     }
 
     #[test]

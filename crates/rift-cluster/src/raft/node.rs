@@ -641,6 +641,45 @@ impl RaftNode {
             .collect()
     }
 
+    /// The advertise authority of a specific member, from the applied
+    /// membership. `None` when the id is not (or no longer) a member — which a
+    /// caller holding a [`Ring`] snapshot can see across a membership change,
+    /// and must treat as "re-resolve ownership", not as an error.
+    #[must_use]
+    pub fn member_authority(&self, id: NodeId) -> Option<String> {
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow();
+        metrics
+            .membership_config
+            .nodes()
+            .find(|(node_id, _)| **node_id == id)
+            .map(|(_, node)| node.addr.clone())
+    }
+
+    /// Call `method path` on member `id`, resolving its advertise authority and
+    /// trying every address it yields (#79's any-address contract).
+    ///
+    /// The flow-state subsystem's transport (#120): it works in [`Ring`] node
+    /// ids, and this is the bridge from an id to a wire call without exporting
+    /// the resolver/client plumbing.
+    ///
+    /// # Errors
+    ///
+    /// The member is unknown, its authority does not resolve, or every address
+    /// refused. The text is operator-facing, not client-facing.
+    pub async fn call_member(
+        &self,
+        id: NodeId,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        let authority = self
+            .member_authority(id)
+            .ok_or_else(|| format!("node {id} is not in the applied membership"))?;
+        self.call_any(&authority, method, path, body).await
+    }
+
     /// The current leader's advertise authority, if metrics know one right now.
     ///
     /// Deliberately returns the *unresolved* string: resolution blocks, and a

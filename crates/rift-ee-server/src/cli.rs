@@ -127,6 +127,18 @@ pub struct ClusterArgs {
     /// `GET /_cluster/ops/:id` for the outcome.
     #[arg(long, env = "RIFT_CLUSTER_ADMIN_ASYNC")]
     pub cluster_admin_async: bool,
+
+    /// Milliseconds between group fsyncs of acknowledged `durability: "async"`
+    /// flow-state writes — the bound on what a whole-fleet crash can lose for
+    /// imposters that did not opt into `"sync"` (which fsyncs before every ack)
+    /// or `"none"` (which never persists)
+    #[arg(
+        long,
+        value_name = "MILLIS",
+        default_value_t = 50,
+        env = "RIFT_CLUSTER_FLOW_FSYNC_INTERVAL_MS"
+    )]
+    pub cluster_flow_fsync_interval_ms: u64,
 }
 
 /// `--cluster-write-barrier` modes (issue #9 §4).
