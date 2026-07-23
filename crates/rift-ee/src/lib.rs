@@ -62,6 +62,14 @@ pub mod seams {
     /// error the engine reports when an apply side-effect fails.
     pub use rift_mock_core::imposter::{ImposterConfig, ImposterError, Stub};
 
+    /// The per-imposter flow-state block, and the passthrough map a
+    /// provider-supplied store reads its own options out of (upstream #845).
+    ///
+    /// `FlowStoreProvider::provide` is handed an [`ImposterConfig`], so this is
+    /// the path a clustered store takes to per-imposter settings that upstream
+    /// has no opinion about.
+    pub use rift_mock_core::imposter::RiftFlowStateConfig;
+
     /// Config-time `_rift.script` `file:`/`ref:` resolution (upstream #356):
     /// the clustered admin front resolves before replicating, so nothing
     /// unresolved is ever committed to the log.
@@ -164,6 +172,7 @@ mod tests {
         let _: &dyn FlowStore = &NoOpFlowStore;
 
         // Value types that cross the seam boundary.
+        let _: fn() -> RiftFlowStateConfig = RiftFlowStateConfig::default;
         let _: fn(&_, usize) -> String = stub_key;
         let _ = CasOutcome::Applied;
         let _ = ResponsePhase::DataPlane;
@@ -201,6 +210,39 @@ mod tests {
         let _ = (
             run_metrics_server,
             with_annotation_scope::<std::future::Ready<()>>,
+        );
+    }
+
+    /// A provider-supplied store can read its own options out of `flowState`.
+    ///
+    /// This is the whole point of the upstream `extra` passthrough (#845, this
+    /// repo's #118): without it there is nowhere to put a per-imposter setting
+    /// that upstream has no opinion about, and the clustered flow store (#120)
+    /// has two. Asserting the behaviour rather than merely naming the type,
+    /// because a rename would break the seam test above, but a *retraction* of
+    /// the flatten attribute would leave both compiling while silently dropping
+    /// every key.
+    #[test]
+    fn flow_state_config_carries_provider_options_through() {
+        use crate::seams::RiftFlowStateConfig;
+
+        let config: RiftFlowStateConfig = serde_json::from_value(serde_json::json!({
+            "backend": "inmemory",
+            "readConsistency": "strong",
+            "durability": "async",
+        }))
+        .expect("flowState with provider options parses");
+
+        assert_eq!(config.backend, "inmemory", "typed fields still bind");
+        assert_eq!(
+            config.extra.get("readConsistency").and_then(|v| v.as_str()),
+            Some("strong"),
+            "an unknown key must reach the provider, not be dropped: {:?}",
+            config.extra
+        );
+        assert_eq!(
+            config.extra.get("durability").and_then(|v| v.as_str()),
+            Some("async")
         );
     }
 

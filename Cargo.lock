@@ -2502,6 +2502,7 @@ dependencies = [
  "rift-http-proxy",
  "rift-mock-core",
  "rift-types",
+ "serde_json",
  "tokio",
  "tracing",
 ]
