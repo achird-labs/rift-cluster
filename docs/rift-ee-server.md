@@ -22,7 +22,7 @@ rift-ee-server --port 2525 --datadir ./data \
 
 ```
 $ rift-ee-server --version
-rift-ee-server 0.1.0 (enterprise, rift v0.15.0)
+rift-ee-server 0.1.0 (enterprise, rift v0.16.0)
 ```
 
 Three things, all of which matter on a bug report: this build's version, the
@@ -50,9 +50,9 @@ implementation** rather than reimplementing or declining it:
 | Subcommand / flag | Behaviour |
 |---|---|
 | `--rcfile` | Mountebank-compatible JSON defaults, applied only to fields left at their defaults. A missing or malformed rcfile warns and startup continues, exactly as upstream (the warning goes to stderr immediately and is repeated through `tracing` once the subscriber exists). |
-| `--pidfile` | written at startup, matching upstream's ordering — see the caveat below |
-| `stop` | SIGTERM the PID in the subcommand's `--pidfile`, then remove the file |
-| `restart` | `stop`, then start a new server in the same process |
+| `--pidfile` | one `global` flag, bindable on either side of the subcommand; written on the serving path only — see below |
+| `stop` | SIGTERM the PID in `--pidfile` (default `rift.pid`), then remove the file |
+| `restart` | `stop`, then start a new server in the same process. A missing PID file is "nothing to stop", not an error |
 | `save` | fetch `GET /imposters?replayable=true` from the configured `--host`/`--port` and write it to `--savefile` |
 | `replay` | start a server with `--configfile` set to the replayed file, overriding any top-level `--configfile`. Refused with `--cluster` — see below |
 
@@ -98,22 +98,25 @@ directory's `{port}.json` files are left untouched and nothing from them is
 bound or listed. A regression test pins that, because the suppression is a
 property of the clustered composition rather than of an explicit guard.
 
-### PID-file caveats (upstream behaviour, reproduced)
+### PID-file semantics (upstream behaviour, reproduced)
 
-The global `--pidfile` and the `stop`/`restart` subcommands' own `--pidfile` are
-**separate** flags. Upstream writes the global one *before* dispatching the
-subcommand, and this binary does the same, so:
+`--pidfile` is a single `global` flag: `--pidfile p restart` and
+`restart --pidfile p` name the same file. The PID file is written on the
+**serving** path only, after the subcommand dispatch — so:
 
-- `rift-ee-server restart --pidfile p` leaves the newly started server with **no**
-  PID file, because the global flag was never set.
-- `rift-ee-server --pidfile p restart --pidfile p` makes the process SIGTERM
-  **itself**: it writes its own PID to `p`, then `restart` reads `p` and signals
-  it. Use distinct paths, or run `stop` and `start` separately.
-- `rift-ee-server --pidfile p save` overwrites a running server's PID file with
-  the short-lived `save` process's PID.
+- `rift-ee-server --pidfile p restart` stops the server recorded in `p` and the
+  server it then starts writes its own PID back to `p`.
+- A transient `save` or `healthcheck` never touches a running server's PID file.
+- `stop`/`restart` fall back to `rift.pid` when `--pidfile` is absent. The
+  default is applied at dispatch rather than on the flag, so a plain start still
+  writes no PID file unless one was asked for.
+- `stop` with no PID file is an error; `restart` with no PID file starts fresh,
+  since "end up running" is already satisfiable.
 
-These are upstream's semantics; this binary reproduces rather than repairs them,
-because `--cluster`-off parity is the point.
+These are upstream's semantics (rift#827), reproduced rather than reinvented,
+because `--cluster`-off parity is the point. They replaced a set of caveats — a
+`restart` that SIGTERMed itself, a `save` that clobbered a live PID file — that
+this binary previously reproduced faithfully.
 
 One deliberate divergence, on the safe side: a PID file whose contents are not a
 positive integer is **refused** rather than passed to `kill(2)`, where `0` means

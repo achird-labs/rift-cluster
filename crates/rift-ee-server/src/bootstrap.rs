@@ -11,9 +11,11 @@
 //! It lives in the library rather than `main.rs` so it can be driven by tests
 //! without spawning a process, the same split the rest of this crate uses.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use rift_ee::rift_http_proxy::bootstrap::{apply_rcfile_defaults, save_imposters, stop_server};
+use rift_ee::rift_http_proxy::bootstrap::{
+    DEFAULT_PIDFILE, apply_rcfile_defaults, save_imposters, stop_server,
+};
 use rift_ee::seams::Commands;
 use tracing::{info, warn};
 
@@ -55,12 +57,12 @@ pub fn apply_rcfile(cli: &mut EeCli) -> Option<String> {
 
 /// Write this process's PID to `--pidfile`, if one was given.
 ///
-/// Placed here, before the subcommand dispatch, purely to match the open-source
-/// binary — the ordering is upstream's and is reproduced rather than improved.
-/// Note what that means: the global `--pidfile` and the `stop`/`restart`
-/// subcommand's own `--pidfile` are *separate* clap fields, so this does not
-/// give `restart` a PID file for the server it goes on to start. See the
-/// caveats in `docs/rift-ee-server.md`.
+/// Called on the **serving** path only — after [`dispatch`] has answered
+/// [`AfterBootstrap::Serve`] — matching the open-source binary since upstream
+/// #827. Writing it ahead of the dispatch is what made `restart` record its own
+/// PID and then signal it, and let a transient `save` clobber a running server's
+/// file. `restart` reaches this on its fall-through, so the server it starts now
+/// owns the PID file, as it should.
 pub fn write_pidfile(cli: &EeCli) -> anyhow::Result<()> {
     let Some(pidfile) = cli.oss.pidfile.as_ref() else {
         return Ok(());
@@ -73,10 +75,16 @@ pub fn write_pidfile(cli: &EeCli) -> anyhow::Result<()> {
 
 /// Reject a PID file body that names something other than a single process.
 ///
-/// Upstream parses straight into `libc::kill`, where `0` means "every process in
-/// my process group" and `-1` means "every process I am allowed to signal" — so
-/// a truncated or hand-edited PID file turns a stop into a broadcast. Tracked
-/// upstream as rift#822; this goes away when that lands.
+/// `libc::kill` reads `0` as "every process in my process group" and `-1` as
+/// "every process I am allowed to signal", so a truncated or hand-edited PID
+/// file would turn a stop into a broadcast.
+///
+/// Upstream now rejects a non-positive PID inside `stop_server` itself
+/// (rift#822, fixed by #824), which makes this **redundant defence in depth**
+/// rather than the gap-filler it was written as. Kept because it refuses before
+/// the call rather than inside it, and because the refusal message is asserted
+/// by this crate's own tests; it is a candidate for deletion, not a live
+/// divergence.
 ///
 /// Pure, and separate from [`stop_via_pidfile`], so the dangerous values can be
 /// tested without a `kill` anywhere on the path. A table-driven test that reached
@@ -97,19 +105,54 @@ fn validate_pid(raw: &str) -> anyhow::Result<i32> {
 
 /// Stop the server recorded in `pidfile`.
 ///
-/// The guard is **advisory**: upstream's `stop_server` re-reads and re-parses the
-/// file itself, so anything able to rewrite it between the two reads is still
-/// able to choose the PID. It defends a hand-edited or truncated file, which is
-/// the realistic case, not a hostile writer — closing that needs upstream to
-/// validate the PID it actually signals (rift#822).
+/// The [`validate_pid`] guard here is **advisory**: upstream's `stop_server`
+/// re-reads and re-parses the file itself, so anything able to rewrite it
+/// between the two reads is still able to choose the PID. Since rift#824 that
+/// second parse does its own non-positive check, so the race no longer has a
+/// dangerous outcome to reach.
 fn stop_via_pidfile(pidfile: &Path) -> anyhow::Result<()> {
     // Upstream's own not-found message, kept ahead of the read so `stop`'s
     // stderr stays identical to the open-source binary's.
     anyhow::ensure!(pidfile.exists(), "PID file not found: {pidfile:?}");
+    stop_present_pidfile(pidfile)
+}
+
+/// Stop for `restart`: a missing PID file is a satisfied precondition.
+///
+/// Mirrors upstream's `bootstrap::stop_for_restart` (#827) — `restart` means
+/// "end up running", so with nothing to stop the desired end state already holds
+/// and the caller goes on to start. Bare `stop` keeps its hard error, because a
+/// `stop` with nothing to stop is a user error.
+///
+/// Not delegated to upstream's function: that one calls `stop_server` directly
+/// and so skips the [`validate_pid`] guard below.
+fn stop_for_restart_via_pidfile(pidfile: &Path) -> anyhow::Result<()> {
+    if !pidfile.exists() {
+        info!("no PID file at {pidfile:?}; nothing to stop, starting fresh");
+        return Ok(());
+    }
+    stop_present_pidfile(pidfile)
+}
+
+/// The shared tail of both: guard the recorded PID, then signal it.
+fn stop_present_pidfile(pidfile: &Path) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(pidfile)
         .map_err(|e| anyhow::anyhow!("cannot read PID file {pidfile:?}: {e}"))?;
     validate_pid(&raw).map_err(|e| anyhow::anyhow!("{pidfile:?}: {e}"))?;
     stop_server(pidfile)
+}
+
+/// The PID file `stop`/`restart` act on.
+///
+/// The single global `--pidfile` binding, falling back to upstream's
+/// [`DEFAULT_PIDFILE`] (`rift.pid`). Resolved here rather than as a clap
+/// `default_value` for upstream's reason (#827): a default on the flag itself
+/// would make every plain start write a PID file it was never asked for.
+fn pidfile_or_default(cli: &EeCli) -> PathBuf {
+    cli.oss
+        .pidfile
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PIDFILE))
 }
 
 /// Run whichever non-server subcommand was asked for.
@@ -121,12 +164,12 @@ fn stop_via_pidfile(pidfile: &Path) -> anyhow::Result<()> {
 /// would stay green through exactly that.
 pub fn dispatch(cli: &mut EeCli) -> anyhow::Result<AfterBootstrap> {
     match &cli.oss.command {
-        Some(Commands::Stop { pidfile }) => {
-            stop_via_pidfile(pidfile)?;
+        Some(Commands::Stop) => {
+            stop_via_pidfile(&pidfile_or_default(cli))?;
             Ok(AfterBootstrap::Done)
         }
-        Some(Commands::Restart { pidfile }) => {
-            stop_via_pidfile(pidfile)?;
+        Some(Commands::Restart) => {
+            stop_for_restart_via_pidfile(&pidfile_or_default(cli))?;
             Ok(AfterBootstrap::Serve)
         }
         Some(Commands::Save {
@@ -183,8 +226,7 @@ pub fn dispatch(cli: &mut EeCli) -> anyhow::Result<AfterBootstrap> {
             cli.oss.configfile = Some(replayed);
             Ok(AfterBootstrap::Serve)
         }
-        // Both must run before any bootstrap — `script` wants only its own exit
-        // code and `healthcheck` would clobber a running server's --pidfile — so
+        // Both are self-contained programs that must run before any bootstrap, so
         // the caller dispatches them and they can never arrive here.
         Some(Commands::Script { .. } | Commands::Healthcheck { .. }) => Err(anyhow::anyhow!(
             "internal error: `script`/`healthcheck` must be dispatched before the bootstrap"
@@ -368,6 +410,62 @@ mod tests {
         assert!(
             !status.success(),
             "stop must terminate the recorded process"
+        );
+    }
+
+    /// Upstream #827: `restart` means "end up running", so nothing to stop is a
+    /// satisfied precondition rather than a failure. Bare `stop` keeps the hard
+    /// error — asserted by `missing_pidfile_reports_upstreams_message` below.
+    #[test]
+    fn restart_with_no_pidfile_starts_fresh() {
+        let dir = TempDir::new().expect("tempdir");
+        let absent = dir.path().join("absent.pid");
+        let mut c = cli(&["restart", "--pidfile", &absent.to_string_lossy()]);
+
+        assert_eq!(
+            dispatch(&mut c).expect("a missing PID file must not fail a restart"),
+            AfterBootstrap::Serve
+        );
+    }
+
+    /// Upstream #827 made `--pidfile` one `global` flag, so it binds the same
+    /// value whichever side of the subcommand it is typed on. Before that it was
+    /// two separate clap fields and the leading spelling was silently ignored by
+    /// `stop`/`restart`.
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_binds_ahead_of_the_subcommand() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut child = std::process::Command::new("sleep")
+            .arg("120")
+            .spawn()
+            .expect("spawn a child to stop");
+        let pidfile = write(&dir, "rift.pid", &child.id().to_string());
+        let mut c = cli(&["--pidfile", &pidfile.to_string_lossy(), "stop"]);
+
+        assert_eq!(
+            dispatch(&mut c).expect("stop dispatches"),
+            AfterBootstrap::Done
+        );
+
+        let status = child.wait().expect("reap the child");
+        assert!(
+            !status.success(),
+            "a leading --pidfile must be the file `stop` acts on, not ignored"
+        );
+    }
+
+    /// The `rift.pid` fallback is upstream's, and applies only to `stop`/`restart`
+    /// — a plain start must still write no PID file unless one was asked for.
+    #[test]
+    fn pidfile_default_applies_only_to_stop_and_restart() {
+        assert_eq!(
+            super::pidfile_or_default(&cli(&["stop"])),
+            PathBuf::from(super::DEFAULT_PIDFILE)
+        );
+        assert!(
+            cli(&[]).oss.pidfile.is_none(),
+            "a default on the flag itself would make every plain start write a PID file"
         );
     }
 
