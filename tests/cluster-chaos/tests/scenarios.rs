@@ -19,17 +19,91 @@
 
 use std::time::Duration;
 
+use tokio::task::JoinSet;
+
 use cluster_chaos::{
     CONVERGE_TIMEOUT, Cluster, FRONT_PORT, NODES, add_toxic, backend_failing_health_check,
     clear_toxics, config_revision, exec_probe, get_json, imposter_ports, metric, probe,
     put_imposter, put_imposter_with_key, put_stubs, toxic_count, wait_admin_reachable,
     wait_backend_ejected, wait_converged, wait_converged_on, wait_revisions_agree,
-    wait_single_leader, wait_voters,
+    wait_revisions_agree_on, wait_single_leader, wait_voters,
 };
 
 /// The imposter port a scenario configures. Inside the container network
 /// nothing else binds it, and each scenario gets a fresh stack.
 const IMPOSTER_PORT: u16 = 6001;
+
+/// How long the fleet may take to converge with the write barrier off.
+///
+/// From the issue's normative table. It is a *product* bound, not a harness
+/// tolerance: replication is a Raft append plus an apply, so 5s is generous by
+/// an order of magnitude on a healthy LAN. If this starts failing, the question
+/// is what got slow, not whether the number should go up.
+const UNBARRIERED_CONVERGE_BOUND: Duration = Duration::from_secs(5);
+
+/// Writes in C14's storm, per the issue's normative table.
+///
+/// Each one binds a distinct imposter port from `IMPOSTER_PORT` upward, so the
+/// range must stay clear of the ports other scenarios use.
+const C14_STORM_WRITES: u16 = 100;
+
+/// How long the fleet may take to accept writes again after its leader is
+/// killed — the operator-visible form of the issue's "new leader <= 3s".
+///
+/// **Why this and not the leader gauge or `/_cluster/members`.** The gauge
+/// (`rift_cluster_members{state="leader"}`) is resampled on a ~5s timer and so
+/// cannot resolve a three-second bound at all; reading a quantity coarser than
+/// the bound is the mistake #94 fixed in C6. `GET /_cluster/members` *does*
+/// serve openraft's live metrics, but it rides the **cluster port** behind the
+/// HMAC credential (docs/rift-ee-server.md, "These ride the cluster port"), so
+/// the harness cannot reach it. A write is what is left, and it is also what a
+/// client actually experiences.
+///
+/// **Derived, and deliberately larger than 3s.** A post-kill write pays the
+/// election *and* the write barrier: with the default `ready-nodes` barrier the
+/// new leader waits on the dead node's applied index until
+/// `--cluster-write-barrier-timeout` (2s) expires, then answers 201 with a
+/// warnings header. So the client-visible budget is election (<= 3s per the
+/// issue) + barrier timeout (2s) = 5s. Timing the write against a bare 3s would
+/// fail a perfectly healthy fleet for doing exactly what it is configured to
+/// do. The 3s the issue names is the election component, and it is the part
+/// that would have to change for this bound to change.
+const FAILOVER_WRITE_BOUND: Duration = Duration::from_secs(5);
+
+/// Poll until an admin write is accepted again, returning how long it took.
+///
+/// `503`/`504` are the documented answers while no leader is available, so they
+/// are retry signals here rather than failures. Any other non-201 is returned
+/// as an error rather than retried, so a permanently broken request fails fast
+/// and says what it saw instead of spinning out the whole budget.
+async fn time_until_writes_resume(admin: u16, port: u16, body: &str) -> Result<Duration, String> {
+    let started = std::time::Instant::now();
+    let deadline = started + FAILOVER_WRITE_BOUND * 3;
+    let mut last = String::from("no attempt completed");
+    while std::time::Instant::now() < deadline {
+        match put_imposter(admin, port, body).await {
+            Ok(201) => return Ok(started.elapsed()),
+            Ok(503 | 504) => last = "503/504 (no leader yet)".to_owned(),
+            Ok(other) => {
+                return Err(format!(
+                    "write answered {other}, which is not a failover state"
+                ));
+            }
+            Err(e) => last = format!("transport error: {e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!(
+        "no write accepted within {:?}; last: {last}",
+        deadline - started
+    ))
+}
+
+/// Rungs in `test_graceful_leave`'s write ladder, each on its own port.
+const LADDER_RUNGS: u16 = 20;
+
+/// First port of the ladder. Clear of `IMPOSTER_PORT` and of C14's storm range.
+const LADDER_BASE_PORT: u16 = 6200;
 
 /// Ceiling on observed leadership transitions in C6's 60s toxic window.
 ///
@@ -95,6 +169,46 @@ fn c6_bound_admits_near_threshold_but_rejects_flapping() {
     assert!(leader_transitions(&one_over) > C6_MAX_LEADER_TRANSITIONS);
 }
 
+/// The barrier-none overlay really does turn the barrier off, on every node.
+///
+/// `test_config_sync_converges_without_barrier` passes identically against a
+/// fleet still running the default `ready-nodes` barrier — that fleet converges
+/// well inside 5s too. So a typo'd key, a renamed env var, or a deleted service
+/// block would leave the scenario green while it silently stopped testing the
+/// thing it is named for. Checking the overlay's text is cheap and catches all
+/// three; it runs un-ignored because it needs no container.
+#[test]
+fn barrier_none_overlay_disables_the_barrier_fleet_wide() {
+    let overlay = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/compose/barrier-none.overlay.yml"
+    ))
+    .expect("read the barrier-none overlay");
+
+    for node in &NODES {
+        let block = overlay
+            .split(&format!("{}:", node.name))
+            .nth(1)
+            .unwrap_or_else(|| panic!("overlay has no block for {}", node.name));
+        let env = block
+            .split_once("RIFT_CLUSTER_WRITE_BARRIER")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| {
+                panic!(
+                    "overlay does not set RIFT_CLUSTER_WRITE_BARRIER for {} -- \
+                     the scenario that uses it would silently run with the \
+                     default barrier and still pass",
+                    node.name
+                )
+            });
+        assert!(
+            env.trim_start().starts_with(": \"none\""),
+            "{} sets RIFT_CLUSTER_WRITE_BARRIER to something other than \"none\"",
+            node.name
+        );
+    }
+}
+
 /// An all-window leaderless fleet must not pass the transition bound vacuously.
 #[test]
 fn c6_bound_is_vacuous_on_a_leaderless_fleet() {
@@ -115,14 +229,84 @@ fn c6_bound_is_vacuous_on_a_leaderless_fleet() {
 async fn test_config_sync_converges() {
     let _cluster = Cluster::up().await.expect("fleet comes up");
 
-    let status = put_imposter(NODES[0].admin, IMPOSTER_PORT, "converged")
+    let (status, headers, _) = put_imposter_with_key(
+        NODES[0].admin,
+        IMPOSTER_PORT,
+        "converged",
+        "converge-at-2xx",
+    )
+    .await
+    .expect("admin write");
+    assert_eq!(status, 201, "the write must be accepted by rift-1");
+
+    // A barrier that *timed out* also answers 201 -- with a Rift-Cluster-Warnings
+    // header naming the nodes that had not applied. Without this check a slow
+    // fleet would fail the no-retry assertion below as a bare "did not serve
+    // it", which reads as a lost write rather than as a slow barrier. Asserting
+    // the header's absence turns that into the precise failure it actually is.
+    assert!(
+        !headers.contains_key("rift-cluster-warnings"),
+        "the write barrier timed out (Rift-Cluster-Warnings: {:?}); the fleet is \
+         slow rather than broken, but a 201 no longer means every node applied",
+        headers.get("rift-cluster-warnings")
+    );
+
+    // At 2xx-return, not eventually. Polling with a timeout here would pass on
+    // a fleet whose barrier does nothing at all, because convergence would
+    // arrive on its own a moment later -- the scenario would then be asserting
+    // eventual consistency while claiming to prove read-your-write. So every
+    // node is asked exactly once, with no retry: the only thing between the
+    // 201 and the question is one HTTP round trip.
+    let want = u64::from(IMPOSTER_PORT);
+    for node in &NODES {
+        let ports = imposter_ports(node.admin)
+            .await
+            .unwrap_or_else(|e| panic!("read imposters from {}: {e}", node.name));
+        assert!(
+            ports.contains(&want),
+            "{} did not serve {want} at the moment the write returned 201 -- \
+             with --cluster-write-barrier=ready-nodes a 2xx means the fleet has \
+             it, not merely that the leader does (R1)",
+            node.name
+        );
+    }
+}
+
+/// R1's other half: with the barrier off, a 2xx promises less — so convergence
+/// has to be *fast* instead of immediate.
+///
+/// Separated from the scenario above rather than folded into it, because the
+/// two assert different contracts. With the barrier on, "eventually" is a bug;
+/// with it off, "eventually" is the contract and the only question is the
+/// bound. Running both is what stops the barrier from being a no-op that
+/// nothing would notice.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn test_config_sync_converges_without_barrier() {
+    let _cluster = Cluster::up_with_barrier_none()
+        .await
+        .expect("fleet comes up with the write barrier off");
+
+    let started = std::time::Instant::now();
+    let status = put_imposter(NODES[0].admin, IMPOSTER_PORT, "unbarriered")
         .await
         .expect("admin write");
     assert_eq!(status, 201, "the write must be accepted by rift-1");
 
-    wait_converged(u64::from(IMPOSTER_PORT), CONVERGE_TIMEOUT)
+    wait_converged(u64::from(IMPOSTER_PORT), UNBARRIERED_CONVERGE_BOUND)
         .await
-        .expect("every node serves the imposter the write created");
+        .unwrap_or_else(|e| {
+            panic!(
+                "with --cluster-write-barrier=none the fleet must still converge \
+                 within {UNBARRIERED_CONVERGE_BOUND:?}, measured from the write: {e}"
+            )
+        });
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= UNBARRIERED_CONVERGE_BOUND,
+        "converged, but in {elapsed:?} -- past the {UNBARRIERED_CONVERGE_BOUND:?} bound"
+    );
 }
 
 /// A node killed outright rejoins and catches up on what it missed.
@@ -164,7 +348,9 @@ async fn test_node_rejoin() {
 /// answered by a real signal handler in a real process, and the *survivors*
 /// have to observe the voter set shrink. In-process tests cannot show that the
 /// signal path is wired at all.
-#[tokio::test]
+// multi_thread because the write ladder below must be polled while the main
+// task is blocked inside a synchronous `docker compose stop`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a container runtime"]
 async fn test_graceful_leave() {
     let cluster = Cluster::up().await.expect("fleet comes up");
@@ -174,20 +360,83 @@ async fn test_graceful_leave() {
         .await
         .expect("three voters before the leave, or the assertion after proves nothing");
 
+    // Drive writes *across* the leave rather than after it: a leave drops an
+    // acknowledged write, if it drops one at all, in the window where
+    // membership is changing. A scenario that writes once the dust has settled
+    // cannot see the failure it exists to catch.
+    //
+    // Each rung takes its own port, so "was this acknowledged write kept?" is
+    // answered per write by asking whether the port is served. The config
+    // revision cannot answer it: `rift_cluster_config_revision` is the Raft log
+    // index that last wrote a config -- global and monotone, already past the
+    // ladder's length from bootstrap and bumped by the leave's own membership
+    // change -- so `revision >= acked` would hold even if most rungs vanished.
+    let writer = tokio::spawn(async move {
+        let mut acked = Vec::new();
+        let mut errors = Vec::new();
+        for rung in 0..LADDER_RUNGS {
+            let port = LADDER_BASE_PORT + rung;
+            match put_imposter_with_key(
+                NODES[0].admin,
+                port,
+                "rung",
+                &format!("leave-ladder-{rung}"),
+            )
+            .await
+            {
+                Ok((201, _, _)) => acked.push(u64::from(port)),
+                // 503/504 with an op-id is the documented degraded answer while
+                // membership changes: the write was never acknowledged, so it
+                // is not something the fleet promised to keep.
+                Ok((503 | 504, _, _)) => {}
+                Ok((other, _, _)) => errors.push(format!("rung {rung}: status {other}")),
+                Err(e) => errors.push(format!("rung {rung}: {e}")),
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        (acked, errors)
+    });
+
+    // Stop mid-ladder so the leave lands while writes are in flight.
+    //
+    // `stop` is synchronous -- it shells out to `docker compose` and does not
+    // return until the drain completes. On the default current-thread runtime
+    // that would block the whole runtime, so the ladder could not be polled
+    // during exactly the window this scenario exists to cover, and the writes
+    // would all land before or after the leave. The `multi_thread` flavour on
+    // this test is what keeps the writer on another worker; it is load-bearing,
+    // not decoration.
+    tokio::time::sleep(Duration::from_millis(600)).await;
     cluster.stop("rift-3").expect("SIGTERM rift-3");
 
     wait_voters(&NODES[0], 2.0, CONVERGE_TIMEOUT)
         .await
         .expect("a graceful leave must shrink the voter set the survivors see");
 
-    // And the survivors are still a working cluster, not merely a smaller one.
-    let status = put_imposter(NODES[0].admin, IMPOSTER_PORT, "after-leave")
+    let (acked, errors) = writer.await.expect("the write ladder task ran");
+    assert!(
+        errors.is_empty(),
+        "survivors returned data-plane errors across a graceful leave: {errors:?}"
+    );
+    assert!(
+        acked.len() >= LADDER_RUNGS as usize / 2,
+        "only {} of {LADDER_RUNGS} rungs were acknowledged; the ladder did not \
+         really run across the leave",
+        acked.len()
+    );
+
+    // Every acknowledged write is still served by both survivors. This is the
+    // "zero lost acknowledged writes" the table asks for, per write.
+    for port in &acked {
+        wait_converged_on(&survivors, *port, CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("write to port {port} was acknowledged and then lost across the leave: {e}")
+            });
+    }
+    wait_revisions_agree_on(&survivors, acked[0], CONVERGE_TIMEOUT)
         .await
-        .expect("admin write after a graceful leave");
-    assert_eq!(status, 201);
-    wait_converged_on(&survivors, u64::from(IMPOSTER_PORT), CONVERGE_TIMEOUT)
-        .await
-        .expect("the remaining two still converge");
+        .expect("survivors disagree on the config revision after the leave");
 }
 
 /// A full-fleet restart restores configuration from disk.
@@ -224,12 +473,61 @@ async fn test_cold_start() {
         .expect("configuration survives a full-cluster restart");
 }
 
+/// The other half of cold start: a fleet whose state directories are empty
+/// comes back **empty**, not with yesterday's config.
+///
+/// Without this, `test_cold_start` is nearly vacuous — it would pass just the
+/// same if the config were being restored from the image, from a stray
+/// `--datadir` write-through, or from anything else that outlives a container.
+/// Wiping the volumes is what makes the restore in that scenario attributable
+/// to redb: same restart, same fleet, only the durable state removed, and the
+/// config must then be gone.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn empty_state_dirs_cold_start_empty() {
+    let want = u64::from(IMPOSTER_PORT);
+
+    {
+        let cluster = Cluster::up().await.expect("fleet comes up");
+        let status = put_imposter(NODES[0].admin, IMPOSTER_PORT, "should-not-survive")
+            .await
+            .expect("admin write");
+        assert_eq!(status, 201);
+        wait_converged(want, CONVERGE_TIMEOUT)
+            .await
+            .expect("converges before the wipe, or the wipe proves nothing");
+        drop(cluster);
+    }
+
+    // What wipes the state is container *destruction*: the compose file
+    // declares no volumes, so each node's state dir lives in its container's
+    // writable layer and `down` takes it with the container. That is precisely
+    // the difference from `test_cold_start`, which kills and restarts the same
+    // containers and so keeps its state dirs.
+    let _cluster = Cluster::up().await.expect("fleet comes back up empty");
+
+    for node in &NODES {
+        let ports = imposter_ports(node.admin)
+            .await
+            .unwrap_or_else(|e| panic!("read imposters from {}: {e}", node.name));
+        assert!(
+            !ports.contains(&want),
+            "{} served {want} after its state directory was wiped -- the config \
+             came from somewhere other than redb, which means test_cold_start \
+             was not proving durability",
+            node.name
+        );
+    }
+}
+
 /// C14: killing the leader mid-write loses no acknowledged write.
 ///
 /// Every write that returned 2xx before the kill must still be present after a
 /// new leader settles — an acknowledgement the cluster later forgets is the
 /// worst failure this system can have.
-#[tokio::test]
+// multi_thread because the storm must keep being polled while the main task is
+// blocked inside a synchronous `docker kill`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a container runtime"]
 async fn c14_leader_kill_keeps_every_acknowledged_write() {
     let cluster = Cluster::up().await.expect("fleet comes up");
@@ -237,22 +535,36 @@ async fn c14_leader_kill_keeps_every_acknowledged_write() {
         .await
         .expect("exactly one leader");
 
-    // Acknowledged before the kill: whatever else happens, these must survive.
-    let mut acknowledged = Vec::new();
-    for offset in 0..5 {
-        let port = IMPOSTER_PORT + offset;
-        if put_imposter(NODES[leader].admin, port, "pre-kill")
-            .await
-            .is_ok_and(|s| s == 201)
-        {
-            acknowledged.push(u64::from(port));
+    // A 100-write storm that is genuinely *in flight* when the leader dies.
+    //
+    // Issuing the writes sequentially and awaiting each would settle every one
+    // through the barrier before the kill, so the storm would only ever
+    // exercise the quiet path -- 100 settled writes where there used to be 5,
+    // and still nothing in the window that matters. Driving them concurrently
+    // from a spawned task, and killing partway through, is what puts writes
+    // mid-commit when the leader goes away.
+    let leader_admin = NODES[leader].admin;
+    let storm = tokio::spawn(async move {
+        let mut inflight = JoinSet::new();
+        for offset in 0..C14_STORM_WRITES {
+            let port = IMPOSTER_PORT + offset;
+            inflight.spawn(async move { (port, put_imposter(leader_admin, port, "storm").await) });
+            // A trickle rather than a thundering herd: 100 simultaneous
+            // connections would mostly measure the admin listener's accept
+            // queue rather than the write path.
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-    assert!(
-        !acknowledged.is_empty(),
-        "the leader accepted nothing, so the scenario would prove nothing"
-    );
+        let mut acked = Vec::new();
+        while let Some(joined) = inflight.join_next().await {
+            if let Ok((port, Ok(201))) = joined {
+                acked.push(u64::from(port));
+            }
+        }
+        acked
+    });
 
+    // Kill partway through the storm, not after it.
+    tokio::time::sleep(Duration::from_millis(700)).await;
     cluster
         .kill(NODES[leader].name)
         .expect("kill the leader outright");
@@ -261,13 +573,35 @@ async fn c14_leader_kill_keeps_every_acknowledged_write() {
         .iter()
         .filter(|n| n.name != NODES[leader].name)
         .collect();
-    let new_leader_deadline = Duration::from_secs(30);
     let survivor_admin = survivors[0].admin;
 
-    // A new leader has to appear, and then every acknowledged write has to be
-    // there. Polling the survivor's admin API is the assertion; the leader
-    // gauge only tells us when to expect an answer.
-    tokio::time::timeout(new_leader_deadline, async {
+    // Failover speed, as a client experiences it. See FAILOVER_WRITE_BOUND for
+    // why this is a write rather than the leader gauge or /_cluster/members,
+    // and why the budget is larger than the issue's bare 3s.
+    let resumed = time_until_writes_resume(
+        survivor_admin,
+        IMPOSTER_PORT + C14_STORM_WRITES + 1,
+        "post-kill",
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!("the fleet never accepted a write after the leader was killed: {e}")
+    });
+    assert!(
+        resumed <= FAILOVER_WRITE_BOUND,
+        "writes resumed only after {resumed:?} following a leader kill, past the \
+         {FAILOVER_WRITE_BOUND:?} budget (election + barrier timeout) -- this is \
+         the window in which the front door sheds traffic"
+    );
+
+    let acknowledged = storm.await.expect("the storm task ran");
+    assert!(
+        !acknowledged.is_empty(),
+        "no write in the storm was acknowledged, so the scenario proves nothing"
+    );
+
+    // Every write acknowledged before or during the kill is still there.
+    tokio::time::timeout(CONVERGE_TIMEOUT, async {
         loop {
             if let Ok(ports) = imposter_ports(survivor_admin).await
                 && acknowledged.iter().all(|p| ports.contains(p))
@@ -279,8 +613,22 @@ async fn c14_leader_kill_keeps_every_acknowledged_write() {
     })
     .await
     .unwrap_or_else(|_| {
-        panic!("a write acknowledged before the leader died was lost: expected {acknowledged:?}")
+        panic!(
+            "a write acknowledged around the leader's death was lost: {} ports \
+             were acknowledged and the survivor never listed them all",
+            acknowledged.len()
+        )
     });
+
+    // The table's "zero duplicates" is discharged by construction rather than
+    // by an assertion here: the admin API renders imposters from a port-keyed
+    // map, so one port appearing twice is unrepresentable in the response and
+    // a count would always find exactly one -- it could never fail. What *can*
+    // show a double-apply is the revision: a replayed intent applied twice
+    // would leave the survivors disagreeing on a stormed port.
+    wait_revisions_agree_on(&survivors, acknowledged[0], CONVERGE_TIMEOUT)
+        .await
+        .expect("survivors disagree on a stormed port's revision after failover");
 
     for node in &survivors {
         assert_eq!(
@@ -352,19 +700,43 @@ async fn c5_rolling_restart_never_stops_accepting_writes() {
     let cluster = Cluster::up().await.expect("fleet comes up");
 
     for (i, rolled) in NODES.iter().enumerate() {
+        // Whether this roll takes the leader down decides what the timing
+        // below means, so establish it before the stop rather than inferring
+        // it after.
+        let leader_before = wait_single_leader(CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("no settled leader before rolling {}: {e}", rolled.name));
+        let rolling_the_leader = NODES[leader_before].name == rolled.name;
+
         cluster.stop(rolled.name).expect("SIGTERM the node");
 
         // Write through a node that is NOT the one being rolled, so this
         // measures the cluster's availability rather than one node's.
         let other = &NODES[(i + 1) % NODES.len()];
         let port = IMPOSTER_PORT + u16::try_from(i).expect("three nodes fit in a u16");
+        // Asserted as zero interruption rather than as a recovery bound. A
+        // graceful leave hands leadership over *during* the drain, and the
+        // drain happens inside the synchronous `stop` above -- so by the time
+        // any timer here could start, a leader already exists and a "recovered
+        // within N seconds" bound would be satisfied by one HTTP round trip no
+        // matter how bad the handover was. The stronger and actually
+        // measurable claim is that the very first write after the leave is
+        // accepted, with no retry at all.
         let status = put_imposter(other.admin, port, "mid-roll")
             .await
             .unwrap_or_else(|e| panic!("no write accepted while {} was down: {e}", rolled.name));
         assert_eq!(
-            status, 201,
-            "the fleet stopped accepting writes while {} was rolling",
-            rolled.name
+            status,
+            201,
+            "the first write after {} left was answered {status}; a graceful \
+             leave transfers leadership before the process exits, so the fleet \
+             should never have stopped accepting writes at all{}",
+            rolled.name,
+            if rolling_the_leader {
+                " (this roll took the leader)"
+            } else {
+                " (this roll took a follower, which should be invisible)"
+            }
         );
 
         cluster.start(rolled.name).expect("bring the node back");

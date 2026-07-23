@@ -172,7 +172,34 @@ Slice 2 (#73) added the scenarios that need the overlay:
 `test_reconcile_preserves_state`, `test_reconcile_reorder`,
 `test_no_seeds_not_ready`, `test_front_routes_around_an_unready_node`.
 
-The scenario table from #11 is now fully implemented.
+Slice 3 (#11) closed the gap between *having* every row and each row asserting
+what the table actually specifies — five scenarios were passing on materially
+weaker properties:
+
+- `test_config_sync_converges` now asserts convergence **at 2xx-return**, asking
+  each node exactly once with no retry. Polling with a timeout would have passed
+  against a fleet whose write barrier did nothing, since convergence arrives
+  moments later anyway — it would have been asserting eventual consistency while
+  claiming to prove read-your-write.
+- `test_config_sync_converges_without_barrier` is its counterpart on the
+  `barrier-none.overlay.yml` stack, where "eventually" *is* the contract and the
+  question is the ≤ 5 s bound. Running both is what keeps the barrier from being
+  a no-op nothing would notice.
+- `test_graceful_leave` drives a write ladder **across** the leave rather than
+  after it, and checks the surviving config revision against the number of
+  acknowledged writes. A leave loses writes in the window where membership is
+  changing, which a post-hoc write cannot see.
+- `empty_state_dirs_cold_start_empty` wipes the state volumes and asserts the
+  config is **gone**, which is what makes `test_cold_start`'s restore
+  attributable to redb rather than to anything else that outlives a container.
+- C5 and C14 gained the failover bound (`WRITES_RESUME_BOUND`), and C14 the
+  100-write storm and a zero-duplicates check.
+
+**Failover is measured as write availability, not off the leader gauge.** The
+gauge is resampled on a ~5 s timer, so it cannot resolve a 3 s bound at all — a
+scenario polling it would be reading a quantity coarser than the thing it claims
+to measure, the same mistake #94 fixed in C6. A write returning 201 proves a
+leader exists, timestamped when it mattered, and is what a client experiences.
 
 ## Quarantine convention
 
@@ -204,6 +231,25 @@ clock is the slowest scenario, not the sum), each iterating per a table sized to
 land under ~100 min of a 120 min cap. PR-time `cluster-smoke` runs each scenario
 once, which catches a broken scenario but not a *flaky* one; only iteration
 does, and iteration does not fit a PR's latency budget.
+
+### Two accepted deviations from #11's design bars
+
+Both are deliberate, and recorded here rather than left to be re-discovered as
+"the CI doesn't match the spec".
+
+- **`cluster-smoke` runs 1 iteration, not the specified 3.** Flake detection is
+  the nightly soak's job, and it does it far better: 60–100 iterations of each
+  scenario against 3 on a PR. Tripling the most expensive job on every
+  cluster-touching PR — roughly 25 min to 70+ — buys very little the soak does
+  not already catch, and it buys it by taxing every change. If a scenario is
+  suspected flaky, soak that one on demand via `workflow_dispatch` rather than
+  making every PR pay for the general case.
+- **The nightly iterates 60–100 per scenario, not a flat 100.** 100× everything
+  does not fit the 2 h cap: C6 alone carries an irreducible 60 s toxic window,
+  which puts it at ~3.6 h by itself. The table is sized to the cap, with the
+  cheapest scenarios at 100 and the longest at 60. The first nightly publishes
+  measured per-iteration wall clock as a step summary, so the table can be tuned
+  against real numbers rather than estimates.
 
 On failure the harness writes `docker compose ps` and `logs` to `$CHAOS_LOG_DIR`
 **before** teardown, and the job uploads them as an artifact — a 3am failure that
