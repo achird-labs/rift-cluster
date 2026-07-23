@@ -193,10 +193,21 @@ async fn a_failed_start_releases_the_cluster_port_and_the_state_dir() {
     server.shutdown().await;
 }
 
-/// The config-file spelling of intercept, which the CLI-level guard cannot see:
-/// it is only known once the open-source builder has loaded the config.
+/// The config-file spelling of intercept is refused under `--cluster`.
+///
+/// It used to be caught *after* the builder loaded the config, because that was
+/// the first moment an `intercept` block was knowable. Since #85 refuses
+/// `--configfile` outright under `--cluster` — the file's imposters would load
+/// outside the replicated log and then be deleted by the reconciler — the
+/// combination is now refused earlier, and names `--configfile` rather than
+/// intercept.
+///
+/// The safety property is unchanged and still asserted here: an intercept block
+/// cannot start a clustered node. Only the reason moved, and it moved *earlier*,
+/// which is the safer direction. The post-load intercept check stays as
+/// defence-in-depth for any future path that loads a config another way.
 #[tokio::test]
-async fn an_intercept_config_block_is_refused_after_the_config_loads() {
+async fn an_intercept_config_block_is_refused_under_cluster() {
     let state = TempDir::new().expect("tempdir");
     let configfile = state.path().join("imposters.json");
     std::fs::write(
@@ -221,7 +232,10 @@ async fn an_intercept_config_block_is_refused_after_the_config_loads() {
         Ok(_) => panic!("an intercept block must not start under --cluster"),
         Err(e) => format!("{e:#}"),
     };
-    assert!(err.to_lowercase().contains("intercept"), "{err}");
+    assert!(
+        err.contains("--configfile") && err.contains("--cluster"),
+        "the refusal must name the flags that produced it: {err}"
+    );
 }
 
 /// AC3's ordering guarantee: readiness fails *first*, so the balancer sheds this
