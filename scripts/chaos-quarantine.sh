@@ -11,13 +11,35 @@
 #
 #   list  -- emit `--skip <fn>` flags for every quarantined scenario, so CI and
 #            the nightly derive their skips from the source of truth rather than
-#            from a hardcoded list that silently rots.
+#            from a hardcoded list that silently rots. ONE TOKEN PER LINE, so a
+#            caller reads them into an array (see below).
 #   check -- fail if a quarantine tag names no issue, and (with GH_TOKEN) if the
 #            issue it names is already closed.
+#
+# Both modes take an optional path to the scenarios file, so the parser can be
+# exercised against a fixture rather than only against whatever the tree happens
+# to hold -- which today is nothing quarantined at all.
+#
+# Why one token per line: `list` used to emit everything on one space-separated
+# line, which forced its caller to write an unquoted `$skips` and lean on
+# word-splitting. That works, but it leaves SC2086 pointing at the call site, and
+# taking the lint's advice breaks the run:
+#
+#     $ cargo test ... -- --ignored "--skip a --skip b"
+#     error: Unrecognized option: 'skip a --skip b'      (exit 101)
+#
+# Measured, not assumed -- and it corrects issue #116, which claimed libtest
+# would read that argument as a *filter* and silently run nothing. It does not:
+# the argument starts with `--`, so libtest rejects it as an option and the job
+# goes red. Loud, but still broken, and still an edit the lint actively invites.
+#
+# One token per line makes the quoted array form the correct form, so the lint
+# has nothing to say and there is no suppression comment left for anyone to
+# delete.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-scenarios="$repo_root/tests/cluster-chaos/tests/scenarios.rs"
+scenarios="${2:-$repo_root/tests/cluster-chaos/tests/scenarios.rs}"
 
 # Pair each `quarantined:` ignore with the `fn` name that follows it. Emitted as
 # `<issue>\t<fn>` so both modes share one parse.
@@ -43,7 +65,7 @@ parse() {
 case "${1:-}" in
   list)
     while IFS=$'\t' read -r _issue fn; do
-      [ -n "$fn" ] && printf -- '--skip %s ' "$fn"
+      [ -n "$fn" ] && printf -- '--skip\n%s\n' "$fn"
     done < <(parse)
     ;;
 

@@ -404,6 +404,118 @@ fn reserved_port_sets(workflow: &str) -> Vec<Vec<u16>> {
         .collect()
 }
 
+/// `list` must emit one token per line, so its caller can read it into an array.
+///
+/// Driven from a fixture because nothing is quarantined today: run against the
+/// real scenarios file this would assert on empty output and pass whatever the
+/// format was. The shape only matters when there *is* a quarantine, which is
+/// exactly when nobody is looking at it.
+#[test]
+fn quarantine_list_emits_one_argument_per_line() {
+    // The tag word is assembled at runtime, never written literally, because
+    // `chaos-quarantine.sh` scans THIS file too: a literal tag here registers as
+    // a real quarantine, and `check` then demands that issues #101 and #102 be
+    // open. (It did, on the first draft — "2 quarantined" against a tree with
+    // none.) Nothing enforces this but the comment, so: do not inline it.
+    let tag = "quarantin";
+    let fixture_text = format!(
+        "#[tokio::test]\n\
+         #[ignore = \"{tag}ed: #101 -- flaky under load\"]\n\
+         async fn alpha_scenario() {{}}\n\
+         \n\
+         #[tokio::test]\n\
+         #[ignore = \"needs a container runtime\"]\n\
+         async fn not_quarantined() {{}}\n\
+         \n\
+         #[tokio::test]\n\
+         #[ignore = \"{tag}ed: #102 -- known failing\"]\n\
+         async fn beta_scenario() {{}}\n"
+    );
+
+    let dir = std::env::temp_dir().join("rift-116-quarantine-fixture");
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let fixture = dir.join("scenarios.rs");
+    std::fs::write(&fixture, &fixture_text).expect("write fixture");
+
+    let out = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/chaos-quarantine.sh"
+    ))
+    .args(["list", &fixture.to_string_lossy()])
+    .output()
+    .expect("run chaos-quarantine.sh list");
+    assert!(out.status.success(), "list failed: {out:?}");
+
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let tokens: Vec<&str> = stdout.lines().collect();
+
+    assert_eq!(
+        tokens,
+        ["--skip", "alpha_scenario", "--skip", "beta_scenario"],
+        "one token per line, quarantined scenarios only"
+    );
+    assert!(
+        !tokens.iter().any(|t| t.contains(' ')),
+        "a token containing a space collapses back into the single-string form \
+         that issue #116 is about: {tokens:?}"
+    );
+}
+
+/// The runner must pass the skips as an **array**, never as one string.
+///
+/// `cargo test -- ... "$skips"` hands libtest one argument beginning with `--`,
+/// which it rejects: `error: Unrecognized option: 'skip a --skip b'`, exit 101.
+/// The tier stops running until someone undoes it. Issue #116 predicted a
+/// *silent* skip instead; measured, it is loud — but SC2086 on the old unquoted
+/// form still invited the edit, and this pins the shape that removes the lint.
+#[test]
+fn the_chaos_runner_expands_skips_as_an_array() {
+    let ci = read_workflow("ci.yml");
+    let runner = ci
+        .split("Container chaos scenarios")
+        .nth(1)
+        .expect("ci.yml has no chaos runner step");
+
+    assert!(
+        runner.contains("\"${skips[@]}\""),
+        "the runner must expand the skips as a quoted array"
+    );
+    assert!(
+        !runner.contains("--test-threads=1 $skips"),
+        "the unquoted string form is back, and quoting it silently skips \
+         everything"
+    );
+    assert!(
+        runner.contains("mapfile") || runner.contains("readarray"),
+        "the skips have to be read into an array for the quoted expansion above \
+         to mean anything"
+    );
+}
+
+/// Both tiers must refuse a run in which no scenario actually ran.
+///
+/// libtest exits 0 when a filter matches nothing, so every way of losing the
+/// scenarios — bad skips, a renamed `--exact` target, a broken runner edit —
+/// otherwise lands on a green check. Since #104 made `cluster-smoke` required,
+/// that green is worse than a failure: the ruleset then certifies what did not
+/// run.
+#[test]
+fn both_tiers_refuse_a_run_that_tested_nothing() {
+    for workflow in ["ci.yml", "nightly-chaos.yml"] {
+        let text = read_workflow(workflow);
+        assert!(
+            text.contains("assert-scenarios-ran.sh"),
+            "{workflow} does not assert that any scenario ran, so a filter \
+             matching nothing would report success"
+        );
+    }
+}
+
+fn read_workflow(name: &str) -> String {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.github/workflows/").to_owned() + name;
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+}
+
 /// An all-window leaderless fleet must not pass the transition bound vacuously.
 #[test]
 fn c6_bound_is_vacuous_on_a_leaderless_fleet() {
