@@ -31,10 +31,18 @@ flowchart TB
 ```
 
 Ports remain globally unique (they are TCP ports); the tenant owns the port
-*binding*. Config ownership keys become `(tenant, port)`, so one tenant's
-write burst never serializes behind another's. The OSS config schema never
-learns the field — tenancy is stored on the control-plane record and
-injected/stripped at the API boundary, keeping the open-core line clean.
+*binding*. Config ownership keys become `(tenant, port)` — the tuple exists to
+make ownership explicit, **not** to give tenants independent write paths. Every
+tenancy and config write is still leader-serialized and still pays the write
+barrier, so one tenant's write burst *does* queue behind another's; ADR-001's
+single Raft log is the price of authorization data that is strongly consistent
+(RFC-002 §3.1). The OSS config schema never learns the field — tenancy is stored
+on the control-plane record and injected/stripped at the API boundary, keeping
+the open-core line clean.
+
+> **Design of record: [RFC-002](../rfc/RFC-002-multi-tenancy-and-rbac.md).** This
+> chapter is the architectural overview; the RFC carries the normative model,
+> role/action matrix, threat model and phasing.
 
 **Migration:** everything pre-tenancy lands in a reserved `default` tenant;
 the legacy `--api-key` maps to a synthetic principal with admin rights on it.
@@ -55,9 +63,11 @@ tenant, additive, deny-by-default:
 | `tenant-admin` | editor + manage the tenant's principals and bindings |
 | `fleet-admin` | everything, cross-tenant, plus `/_cluster/*` and delete-all (a binding on the reserved tenant `*`) |
 
-The `operator` role is why issue #15 (replicated `enabled`) is a tenancy
-prerequisite: pause/resume that silently applies to one node out of three is
-not a role anyone can be given.
+The `operator` role is why issue #15 (replicated `enabled`) mattered for
+tenancy: pause/resume that silently applies to one node out of three is not a
+role anyone can be given. It has since landed (upstream `EnabledChanged`,
+v0.16.0), so Phase T's only hard dependency is Phase 1's control plane
+(RFC-002 §10).
 
 All tenancy records — tenants, principals, bindings — are entries in the Raft
 state machine (Chapter 3). This is deliberate beyond convenience:
