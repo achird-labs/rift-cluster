@@ -138,6 +138,15 @@ impl Cluster {
         Self::start_stack(vec![base_file(), overlay_file()]).await
     }
 
+    /// [`Cluster::up`] with `--cluster-write-barrier=none` on every node.
+    ///
+    /// The whole fleet, not one node: the barrier is a property of whichever
+    /// node answers the write, so a mixed fleet would make a convergence
+    /// measurement depend on which node the scenario happened to write through.
+    pub async fn up_with_barrier_none() -> anyhow::Result<Self> {
+        Self::start_stack(vec![base_file(), barrier_none_file()]).await
+    }
+
     /// Bring up exactly one node, on the shipped topology, and do **not** wait
     /// for readiness.
     ///
@@ -435,6 +444,13 @@ fn base_file() -> String {
 /// The chaos-only additions, layered over it.
 fn overlay_file() -> String {
     format!("{}/compose/chaos.overlay.yml", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn barrier_none_file() -> String {
+    format!(
+        "{}/compose/barrier-none.overlay.yml",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 fn run(program: &str, args: &[&str]) -> anyhow::Result<Output> {
@@ -764,6 +780,36 @@ pub async fn config_revision(metrics: u16, port: u64) -> anyhow::Result<f64> {
         &format!(r#"rift_cluster_config_revision{{port="{port}"}}"#),
     )
     .await
+}
+
+/// [`wait_revisions_agree`] restricted to the nodes given.
+///
+/// The unrestricted form requires a reading from **every** node in [`NODES`],
+/// so it only works on a whole fleet. A scenario that stopped a node must use
+/// this instead, or it waits out the entire timeout polling a node that is gone
+/// and then reports its absence as a disagreement.
+pub async fn wait_revisions_agree_on(
+    nodes: &[&Node],
+    port: u64,
+    timeout: Duration,
+) -> anyhow::Result<f64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut revisions = Vec::new();
+        for node in nodes {
+            match config_revision(node.metrics, port).await {
+                Ok(v) => revisions.push(v),
+                Err(_) => break,
+            }
+        }
+        if revisions.len() == nodes.len() && revisions.iter().all(|v| *v == revisions[0]) {
+            return Ok(revisions[0]);
+        }
+        if Instant::now() >= deadline {
+            bail!("nodes disagree on the revision of port {port}: {revisions:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// Poll until every node reports the *same* applied revision for `port`.

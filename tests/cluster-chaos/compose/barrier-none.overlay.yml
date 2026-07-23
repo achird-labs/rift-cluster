@@ -1,0 +1,29 @@
+# Overlay: run the fleet with the write barrier off.
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/barrier-none.overlay.yml up
+#
+# The default `--cluster-write-barrier=ready-nodes` makes a 2xx mean "every
+# Ready node has applied this", which is the R1 guarantee `test_config_sync_
+# converges` asserts at 2xx-return. With `none`, a 2xx means only that the write
+# committed and applied locally, so the fleet converges *afterwards* — the
+# question then is how long that takes, which is what the ≤5s bound measures.
+#
+# An overlay rather than a flag on one node: the barrier is a property of the
+# node answering the write, so a mixed fleet would make the result depend on
+# which node the scenario happened to write through.
+#
+# Only the environment is overridden. Everything else — addresses, seeds, state
+# dirs, grace periods — comes from the base file, so this cannot drift into
+# being a second topology.
+
+services:
+  rift-1:
+    environment:
+      RIFT_CLUSTER_WRITE_BARRIER: "none"
+  rift-2:
+    environment:
+      RIFT_CLUSTER_WRITE_BARRIER: "none"
+  rift-3:
+    environment:
+      RIFT_CLUSTER_WRITE_BARRIER: "none"

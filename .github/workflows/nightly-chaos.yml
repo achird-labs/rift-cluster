@@ -46,6 +46,8 @@ jobs:
           # and C6 additionally carries an irreducible 60s toxic window.
           - scenario: test_config_sync_converges
             iterations: 100
+          - scenario: test_config_sync_converges_without_barrier
+            iterations: 100
           - scenario: test_reconcile_preserves_state
             iterations: 100
           - scenario: test_reconcile_reorder
@@ -70,6 +72,10 @@ jobs:
             iterations: 50
           - scenario: test_cold_start
             iterations: 50
+          # Pays a full down/up twice per iteration, so it is the most expensive
+          # scenario per run in the suite.
+          - scenario: empty_state_dirs_cold_start_empty
+            iterations: 40
           - scenario: c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes
             iterations: 50
           - scenario: c6_loss_and_jitter_do_not_flap_or_lose_writes
