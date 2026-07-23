@@ -14,6 +14,11 @@ use rift_ee_server::compose::{self, ComposedServer};
 use serde_json::json;
 use tempfile::TempDir;
 
+mod common;
+
+use common::ports::reserve_port;
+use common::seen::Seen;
+
 const SECRET: &str = "write-path-test-secret";
 
 fn cluster_cli(state: &TempDir, extra: &[&str]) -> EeCli {
@@ -35,12 +40,6 @@ fn cluster_cli(state: &TempDir, extra: &[&str]) -> EeCli {
     ];
     args.extend(extra.iter().map(|s| (*s).to_owned()));
     EeCli::try_parse_from(args).expect("parses")
-}
-
-/// An address that was bound and released — free right now.
-fn reserve_port() -> u16 {
-    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
-    held.local_addr().expect("addr").port()
 }
 
 /// Poll `/readyz` until the node reports Ready; the reconcile gate opens
@@ -113,26 +112,23 @@ async fn post_imposter_commits_binds_and_carries_cluster_headers() {
         .send()
         .await
         .expect("post imposter");
-    assert_eq!(response.status().as_u16(), 201);
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 201, "{seen}");
 
-    let revision = response
-        .headers()
-        .get("rift-cluster-revision")
-        .and_then(|v| v.to_str().ok())
+    let revision = seen
+        .header("rift-cluster-revision")
         .expect("revision header present")
         .to_owned();
     assert!(
         revision.starts_with(&format!("default:{port}@")),
         "revision names the tenant, port and log index: {revision}"
     );
-    let op_id = response
-        .headers()
-        .get("rift-cluster-op-id")
-        .and_then(|v| v.to_str().ok())
+    let op_id = seen
+        .header("rift-cluster-op-id")
         .expect("op-id header present");
     uuid::Uuid::parse_str(op_id).expect("op id is a uuid");
 
-    let body: serde_json::Value = response.json().await.expect("mutation body is json");
+    let body = seen.json();
     assert_eq!(body["port"], port, "upstream's own response shape: {body}");
 
     // The proxied read path sees it, and the engine actually serves it.
@@ -651,8 +647,14 @@ async fn barrier_none_answers_without_waiting_for_the_fleet() {
         .send()
         .await
         .expect("post imposter");
-    assert_eq!(response.status().as_u16(), 201);
-    assert!(response.headers().get("rift-cluster-revision").is_some());
+    // This is the assertion that produced issue #110's `left: 404, right: 201`
+    // and nothing else to go on. Whatever it answers next time, it says why.
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 201, "{seen}");
+    assert!(
+        seen.header("rift-cluster-revision").is_some(),
+        "a committed write must name its revision: {seen}"
+    );
 
     server.shutdown().await;
 }
@@ -708,14 +710,14 @@ async fn barrier_none_on_a_follower_renders_the_write_it_just_committed() {
             .await
             .expect("post on the follower");
 
-        let status = response.status().as_u16();
-        let body: serde_json::Value = response.json().await.expect("imposter body");
+        let seen = Seen::of(response).await;
         assert_eq!(
-            status, 201,
-            "the follower committed this write and then rendered {status} — \
-             a create that committed must not answer as though it had not \
-             (body {body})"
+            seen.status, 201,
+            "the follower committed this write and then rendered {}: a create \
+             that committed must not answer as though it had not — {seen}",
+            seen.status
         );
+        let body = seen.json();
         assert_eq!(
             body.get("port").and_then(serde_json::Value::as_u64),
             Some(u64::from(port)),
@@ -787,11 +789,11 @@ async fn barrier_none_does_not_wait_on_an_unreachable_peer() {
         .await
         .expect("post imposter");
     let elapsed = started.elapsed();
-    let status = response.status().as_u16();
+    let seen = Seen::of(response).await;
 
     assert_eq!(
-        status, 201,
-        "quorum survives one death of three, so the write must commit"
+        seen.status, 201,
+        "quorum survives one death of three, so the write must commit: {seen}"
     );
     assert!(
         elapsed < Duration::from_secs(5),
@@ -1020,10 +1022,7 @@ async fn an_idempotency_key_makes_retries_exactly_once() {
 /// returns, with no client retry.
 #[tokio::test]
 async fn a_parked_write_replays_when_quorum_returns() {
-    let leader_bind = {
-        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve");
-        held.local_addr().expect("addr").to_string()
-    };
+    let leader_bind = common::ports::reserve_addr();
     let leader_state = TempDir::new().expect("tempdir");
     let leader = compose::start(cluster_cli_at(
         &leader_state,
@@ -1236,11 +1235,8 @@ async fn a_keyed_replace_all_retries_exactly_once() {
 /// the write once quorum returns.
 #[tokio::test]
 async fn a_restarted_node_replays_its_own_parked_intents() {
-    let reserve_addr = || {
-        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve");
-        held.local_addr().expect("addr").to_string()
-    };
-    let (leader_bind, follower_bind) = (reserve_addr(), reserve_addr());
+    let (leader_bind, follower_bind) =
+        (common::ports::reserve_addr(), common::ports::reserve_addr());
     let leader_state = TempDir::new().expect("tempdir");
     let follower_state = TempDir::new().expect("tempdir");
 
@@ -1334,10 +1330,7 @@ async fn a_restarted_node_replays_its_own_parked_intents() {
 /// stubs intact (the toggle applies in place, never a replace).
 #[tokio::test]
 async fn disable_replicates_survives_restart_and_preserves_state() {
-    let bind = {
-        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve");
-        held.local_addr().expect("addr").to_string()
-    };
+    let bind = common::ports::reserve_addr();
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli_at(&state, &bind, &["--cluster-allow-solo"]))
         .await
