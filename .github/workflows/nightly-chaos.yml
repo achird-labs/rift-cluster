@@ -80,6 +80,12 @@ jobs:
             iterations: 50
           - scenario: c6_loss_and_jitter_do_not_flap_or_lose_writes
             iterations: 40
+          # Measured at ~2 min per iteration (stack up, converge, a 250 ms toxic
+          # window, teardown), so 40 lands near 80 min. Sized from a real run
+          # rather than copied from a neighbour: this one races a 500 ms budget,
+          # and the soak exists to find out whether that margin holds.
+          - scenario: c16_pull_on_miss_rescues_lagging_follower
+            iterations: 40
 
     steps:
       - uses: actions/checkout@v4

@@ -295,6 +295,22 @@ impl<V: ClusterView + 'static> NoMatchInterceptor for PullOnMissInterceptor<V> {
     }
 }
 
+/// What these cover, and what they deliberately do not.
+///
+/// Everything below drives the decision table through a scripted
+/// [`ClusterView`], which is the right shape for branch coverage and the wrong
+/// shape for proving the hook is *reached*: a fake view cannot tell you the
+/// interceptor was built, bound to the node, and consulted by the serve loop.
+/// That wiring is covered end to end by the container tier's
+/// `c16_pull_on_miss_rescues_lagging_follower` (#102), which slows a real
+/// follower's cluster link and asserts on the `rift-cluster-pull-on-miss`
+/// response header — the rescue's only evidence, which is also why there is no
+/// rescue counter (see `metrics.rs`).
+///
+/// The in-process two-node variant #49's acceptance criteria asked for stays
+/// unwritten on purpose: making a follower lag in that harness means racing the
+/// apply, and a timing-raced assertion is the exact shape the chaos tier's flake
+/// policy exists to keep out of the tree.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -147,6 +147,20 @@ impl Cluster {
         Self::start_stack(vec![base_file(), barrier_none_file()]).await
     }
 
+    /// [`Cluster::up`] with an explicit list of overlays layered over the
+    /// shipped base file, in order.
+    ///
+    /// The named helpers above cover the one- and two-file cases; C16 needs
+    /// three at once (chaos for the toxiproxy links, barrier-none so a write
+    /// returns before the fleet has applied it, and pull-on-miss to publish the
+    /// data port its assertion reads). Composing them by name beats adding a
+    /// third named constructor per combination.
+    pub async fn up_with_overlays(overlays: &[&str]) -> anyhow::Result<Self> {
+        let mut files = vec![base_file()];
+        files.extend(overlays.iter().map(|name| compose_file(name)));
+        Self::start_stack(files).await
+    }
+
     /// Bring up exactly one node, on the shipped topology, and do **not** wait
     /// for readiness.
     ///
@@ -453,6 +467,11 @@ fn barrier_none_file() -> String {
     )
 }
 
+/// An overlay in `compose/`, by file name.
+fn compose_file(name: &str) -> String {
+    format!("{}/compose/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
 fn run(program: &str, args: &[&str]) -> anyhow::Result<Output> {
     let output = Command::new(program)
         .args(args)
@@ -577,6 +596,67 @@ pub async fn put_imposter_with_key(
     // rather than as an error that would mask the status the caller came for.
     let envelope = response.json().await.unwrap_or(serde_json::Value::Null);
     Ok((status, headers, envelope))
+}
+
+/// The one imposter data port the `pull-on-miss` overlay publishes, and the
+/// host ports it appears on — indexed like [`NODES`]. C16 only.
+///
+/// Published on every node because C16 picks its lagging node at run time: the
+/// node that lags must be a follower, and leadership is not a scenario's to
+/// assume.
+pub const PULL_ON_MISS_IMPOSTER_PORT: u16 = 6300;
+pub const PULL_ON_MISS_HOST_PORTS: [u16; 3] = [16300, 26300, 36300];
+
+/// Append a stub to an existing imposter — a `PatchStubs` `ControlOp`, i.e. a
+/// config write like any other, not a whole-imposter replacement.
+///
+/// Returns the status. Distinct from [`put_imposter`] because the point of C16
+/// is that the imposter (and therefore the bound port) already exists fleet-wide
+/// while a *stub* is still in flight: a node that has not applied a missing
+/// imposter has no port bound at all, so a request there is refused at the
+/// socket and never reaches the no-match hook the safety net hangs on.
+pub async fn append_stub(
+    admin: u16,
+    port: u16,
+    path: &str,
+    body_text: &str,
+) -> anyhow::Result<u16> {
+    let body = serde_json::json!({
+        "stub": {
+            "predicates": [{ "equals": { "path": path } }],
+            "responses": [{ "is": { "statusCode": 200, "body": body_text } }]
+        }
+    });
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{admin}/imposters/{port}/stubs"))
+        .timeout(Duration::from_secs(15))
+        .json(&body)
+        .send()
+        .await?;
+    Ok(response.status().as_u16())
+}
+
+/// GET a published imposter data port from the host, keeping the response
+/// headers.
+///
+/// [`exec_probe`] cannot serve here: it shells out to the binary's `healthcheck`
+/// subcommand, which reports only success or failure and drops headers — and
+/// the `rift-cluster-pull-on-miss` header is the entire assertion in C16.
+pub async fn get_data_plane(
+    host_port: u16,
+    path: &str,
+) -> anyhow::Result<(u16, reqwest::header::HeaderMap, String)> {
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{host_port}{path}"))
+        // Comfortably past the hook's own 500 ms budget, so a scenario failure
+        // reads as "not rescued" rather than as the client giving up first.
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap_or_default();
+    Ok((status, headers, body))
 }
 
 /// Probe a URL from *inside* a container, answering with success/failure.

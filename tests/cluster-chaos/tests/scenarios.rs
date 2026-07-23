@@ -22,8 +22,9 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 
 use cluster_chaos::{
-    CONVERGE_TIMEOUT, Cluster, FRONT_PORT, NODES, add_toxic, backend_failing_health_check,
-    clear_toxics, config_revision, exec_probe, get_json, imposter_ports, metric, probe,
+    CONVERGE_TIMEOUT, Cluster, FRONT_PORT, NODES, PULL_ON_MISS_HOST_PORTS,
+    PULL_ON_MISS_IMPOSTER_PORT, add_toxic, append_stub, backend_failing_health_check, clear_toxics,
+    config_revision, exec_probe, get_data_plane, get_json, imposter_ports, metric, probe,
     put_imposter, put_imposter_with_key, put_stubs, toxic_count, wait_admin_reachable,
     wait_backend_ejected, wait_converged, wait_converged_on, wait_revisions_agree,
     wait_revisions_agree_on, wait_single_leader, wait_voters,
@@ -1516,4 +1517,167 @@ async fn test_front_routes_around_an_unready_node() {
     wait_converged(u64::from(port), CONVERGE_TIMEOUT)
         .await
         .expect("the fleet reconverges after the backend returns");
+}
+
+/// C16 — the pull-on-miss safety net rescues a lagging follower (#49, #102).
+///
+/// #49 shipped the safety net with an exhaustive unit-level decision table and
+/// no end-to-end proof: the *logic* was covered, the *wiring* — manager
+/// construction, `bind` on the node, the seam actually being consulted — was
+/// not. This is that proof.
+///
+/// Two things make it deterministic rather than raced:
+///
+/// **The lag is injected, not hoped for.** A 250 ms latency toxic on the
+/// follower's inbound cluster link puts a floor under how far behind it is,
+/// while the hook's own budget (500 ms, deliberately not configurable) puts a
+/// ceiling on how long it will wait. Floor below ceiling means the rescue
+/// happens by construction. Constant latency with **zero jitter** on purpose:
+/// jitter creates gaps between heartbeats and would risk the elections C6 exists
+/// to bound, whereas a constant shift preserves the heartbeat *rate* and so
+/// leaves leadership alone.
+///
+/// **The evidence is self-proving.** `rift-cluster-pull-on-miss: rescued-wait`
+/// is only ever set on the path where the node found itself behind the leader
+/// and then caught up — so the header *is* the assertion that it lagged. A
+/// separate "is it lagging yet?" precondition would be both redundant and racy
+/// (the node could apply between the check and the request), so there is not
+/// one.
+///
+/// The imposter is created and converged fleet-wide **first**, and only a
+/// *stub* is left in flight. A node that has not applied a missing imposter has
+/// no port bound at all: the request is refused at the socket and never reaches
+/// the no-match hook this net hangs on. That case is C7's, not this one.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c16_pull_on_miss_rescues_lagging_follower() {
+    let cluster = Cluster::up_with_overlays(&[
+        "chaos.overlay.yml",
+        "barrier-none.overlay.yml",
+        "pull-on-miss.overlay.yml",
+    ])
+    .await
+    .expect("fleet comes up");
+    cluster
+        .wait_all_ready(CONVERGE_TIMEOUT)
+        .await
+        .expect("all three ready");
+
+    // The node that lags must be a follower — a leader is never behind itself.
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("exactly one leader");
+    let lagging_idx = (leader + 1) % NODES.len();
+    let lagging = &NODES[lagging_idx];
+    let writer = &NODES[leader];
+    let port = PULL_ON_MISS_IMPOSTER_PORT;
+
+    // The imposter, fleet-wide, before anything is slowed down.
+    assert_eq!(
+        put_imposter(writer.admin, port, "base")
+            .await
+            .expect("admin write"),
+        201
+    );
+    // Scope the base stub to its own path. `put_imposter` creates a stub with no
+    // predicates, which matches *everything* — including the path this scenario
+    // needs to miss on. With a catch-all in place the request never reaches the
+    // no-match hook at all, and the scenario passes on the base body while
+    // proving nothing (it did exactly that on the first run).
+    assert_eq!(
+        put_stubs(
+            writer.admin,
+            port,
+            serde_json::json!([{
+                "predicates": [{ "equals": { "path": "/base" } }],
+                "responses": [{ "is": { "statusCode": 200, "body": "base" } }]
+            }]),
+        )
+        .await
+        .expect("scope the base stub"),
+        200
+    );
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the fleet converges before the lag is injected");
+
+    let retries_before = metric(
+        lagging.metrics_via_mgmt,
+        "rift_cluster_pull_on_miss_retries_total",
+    )
+    .await
+    .unwrap_or(0.0);
+
+    // Inbound cluster traffic to the follower now arrives 250 ms late, so its
+    // apply trails a commit the other two reach immediately.
+    add_toxic(
+        lagging.proxy,
+        serde_json::json!({
+            "type": "latency",
+            "stream": "upstream",
+            "toxicity": 1.0,
+            "attributes": { "latency": 250, "jitter": 0 }
+        }),
+    )
+    .await
+    .expect("latency toxic on the follower's cluster link");
+
+    // A stub append is a config write. Under barrier=none it answers as soon as
+    // it is committed and applied *here*, without waiting for the follower.
+    assert_eq!(
+        append_stub(writer.admin, port, "/rescued", "rescued-body")
+            .await
+            .expect("stub append"),
+        200
+    );
+
+    // The request that must be rescued: it lands on the follower inside the
+    // window where the stub is committed but not yet applied there.
+    let (status, headers, body) = get_data_plane(PULL_ON_MISS_HOST_PORTS[lagging_idx], "/rescued")
+        .await
+        .expect("data-plane request to the lagging follower");
+
+    let rescue = headers
+        .get("rift-cluster-pull-on-miss")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<absent>")
+        .to_string();
+
+    assert_eq!(
+        status, 200,
+        "the follower answered {status} for a stub that was committed before \
+         the request arrived; the safety net did not rescue it (header {rescue}, \
+         body {body})"
+    );
+    assert_eq!(
+        body, "rescued-body",
+        "rescued with the wrong stub: {body:?}"
+    );
+    assert_eq!(
+        rescue, "rescued-wait",
+        "expected the follower to report a catch-up rescue; got {rescue:?}. \
+         `retry-after-timeout` would mean a 250 ms lag outran the 500 ms budget, \
+         and an absent header would mean the hook never fired — the wiring, not \
+         the decision table, is what this scenario covers"
+    );
+
+    // Metrics corroborate the header rather than substitute for it: there is
+    // deliberately no rescue counter, so these say "went down the lagging path",
+    // not "rescued".
+    let retries_after = metric(
+        lagging.metrics_via_mgmt,
+        "rift_cluster_pull_on_miss_retries_total",
+    )
+    .await
+    .expect("retries metric on the lagging node");
+    assert!(
+        retries_after > retries_before,
+        "the follower served a rescue header but its retry counter did not \
+         move ({retries_before} -> {retries_after})"
+    );
+
+    clear_toxics(lagging.proxy).await.expect("clear the toxic");
+    wait_revisions_agree(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the fleet reconverges once the link is healthy");
 }

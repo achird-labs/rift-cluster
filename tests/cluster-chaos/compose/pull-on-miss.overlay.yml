@@ -1,0 +1,40 @@
+# Overlay: publish one imposter data port, on every node, to the host.
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/chaos.overlay.yml \
+#                    -f tests/cluster-chaos/compose/barrier-none.overlay.yml \
+#                    -f tests/cluster-chaos/compose/pull-on-miss.overlay.yml up
+#
+# Why this exists at all: the pull-on-miss safety net's only evidence that a
+# rescue happened is the `rift-cluster-pull-on-miss` **response header** on the
+# data plane (there is deliberately no rescue counter — see the note in
+# rift-cluster's metrics.rs). Every other chaos scenario reaches the data plane
+# through `exec_probe`, which runs the binary's `healthcheck` subcommand inside
+# the container and answers only success/failure — it discards headers. So the
+# one scenario whose assertion *is* a header needs the port reachable from the
+# host, where a real HTTP client can read it.
+#
+# All three nodes rather than just the one C16 slows down: the node that must
+# lag has to be a **follower**, and which node holds leadership is not something
+# a scenario should assume. C16 asks who the leader is and picks a follower at
+# run time, so the port has to be reachable whichever one it picks. Pinning it
+# to a single node instead would make the scenario pass or fail on an election
+# outcome that has nothing to do with what it tests.
+#
+# Still exactly one port, and only under this overlay — this cannot quietly
+# become "the chaos tier publishes the data plane", which would change what
+# every other scenario is testing.
+#
+# 16300/26300/36300 follow the base file's convention: 1xxxx/2xxxx/3xxxx for
+# rift-1/2/3.
+
+services:
+  rift-1:
+    ports:
+      - "16300:6300"
+  rift-2:
+    ports:
+      - "26300:6300"
+  rift-3:
+    ports:
+      - "36300:6300"
