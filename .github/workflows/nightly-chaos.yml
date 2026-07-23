@@ -117,6 +117,20 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Same reservation the PR-time tier makes, and the soak needs it more: it
+      # brings the fleet up once per iteration, so it rolls the dice on issue
+      # #117 up to 100 times per job instead of 18. See the long comment in
+      # ci.yml; the list is pinned by a test.
+      - name: Reserve the tier's published ports from the ephemeral range
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=36300,39090,42525,45251-45253,45261-45263,48474,49901
+          # Assert the read-back, do not merely print it: `sysctl <key>` exits 0
+          # whatever the value is, so echoing it would prove nothing about a
+          # partially applied or silently truncated write.
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "36300,39090,42525,45251-45253,45261-45263,48474,49901"
+
       # Once per job rather than once per iteration: the image is identical
       # across iterations, and rebuilding it 100 times would dominate the budget.
       - name: Build the image once
