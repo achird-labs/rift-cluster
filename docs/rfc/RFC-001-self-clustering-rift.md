@@ -1274,6 +1274,13 @@ dashboard built on the old names should be told they will read zero forever.
 - Admin API auth is unchanged (existing `--api-key`); `/_cluster/*` requires the cluster
   secret's derived bearer or the admin api-key. `/readyz`/`/healthz` are unauthenticated
   by design (probe targets, no state exposure).
+- **Principals, tenants and RBAC are
+  [RFC-002](RFC-002-multi-tenancy-and-rbac.md)** (#17), which replaces the single
+  global bearer above with a per-principal authorizer (upstream seam U-9) and adds
+  the audit stream. It lands as Phase T, parallel to Phases 2–3, and its records ride
+  this RFC's control plane — authorization data has to be strongly consistent, which
+  is one of the reasons ADR-001 matters beyond durability. Until then, `--api-key`
+  is the whole of client-facing authz and this section is accurate as written.
 
 ### 11.3 Performance guardrails
 
