@@ -50,7 +50,41 @@ WATCHED_PREFIXES='^(crates/rift-cluster/|crates/rift-ee/|crates/rift-ee-server/|
 # enterprise source file, which is this same blind spot in a different shape.
 # The workspace root lockfile is the only one that resolves the graph, so this
 # is deliberately root-only — a `Cargo.lock` deeper in the tree is not it.
-WATCHED_EXACT='vendor/rift|Cargo\.lock'
+#
+# The two scripts are the tier's own machinery (issue #107). Everything above
+# is watched because changing it can break the *cluster*; these two are watched
+# because changing them can break the *tier that would have caught that* —
+# which is worse, because it fails green:
+#
+#   * `chaos-quarantine.sh list` emits the `--skip` arguments the runner hands
+#     to `cargo test`, so its output IS the set of scenarios that will not run.
+#     The `check` subcommand in the `build` job validates tag *syntax*; it says
+#     nothing about whether `list` emits the right skips. A parser bug there
+#     shrinks the tier fleet-wide and the job still reports success.
+#   * this file's own `--self-test` pins the patterns against the case table —
+#     but a PR editing pattern and table together passes it by construction.
+#     Only a real tier run exercises such an edit end to end, and a PR that
+#     changes when the tier runs is exactly the PR that should carry that
+#     evidence.
+#
+# #104 raised the stakes: `cluster-smoke` is now a *required* status check, so
+# a silently-skipped tier is no longer merely a green tick — the ruleset
+# actively certifies the thing that did not run.
+#
+# Deliberately NOT watched, so the boundary is a decision rather than an
+# oversight:
+#
+#   * `.github/workflows/ci.yml` — every unrelated CI tweak touches it, and
+#     taxing all of them ~25 min is how a gate trains people to route around
+#     it. The compensating control is real: `--self-test` runs as the first
+#     step of `cluster-smoke` itself (a required check that fails closed).
+#   * `.github/workflows/nightly-chaos.yml` — the nightly soak exercises the
+#     full runner path daily. The accepted residual is that a broken runner-step
+#     edit is caught within a day rather than at review.
+#
+# `scripts/` as a whole stays out; only these two files are in. The
+# `check-public-api.sh` case in the table below pins that.
+WATCHED_EXACT='vendor/rift|Cargo\.lock|scripts/chaos-quarantine\.sh|scripts/cluster-smoke-paths\.sh'
 
 # Does any changed path match? Returns 0 on match, 1 on no match.
 #
@@ -160,6 +194,18 @@ true|crates/rift-ee/src/lib.rs
 false|
 # A lockfile-named file that is not THE lockfile.
 false|docs/Cargo.lock.md
+# The tier's own machinery (issue #107). `chaos-quarantine.sh list` produces
+# the `--skip` arguments the runner passes, so its output IS the set of
+# scenarios that do not run; a parser bug silently shrinks the tier while it
+# still reports green.
+true|scripts/chaos-quarantine.sh
+# This file. Its self-test pins the patterns against the table — but a change
+# that edits both cannot fail it by construction, and only a real tier run
+# exercises the edit end to end.
+true|scripts/cluster-smoke-paths.sh
+# Pins the boundary: `scripts/` as a whole stays unwatched. Only the two files
+# above are in, and this case fails if someone widens it to a prefix.
+false|scripts/check-public-api.sh
 CASES
 
   echo
