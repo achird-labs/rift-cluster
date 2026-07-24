@@ -795,17 +795,19 @@ impl FlowNet {
         entry: Versioned,
         durability: Durability,
     ) -> bool {
-        // `get_versioned`: the local record may be a tombstone, and it must win
-        // against an older Put — that comparison IS the no-resurrect guarantee.
-        let keep = self
-            .shard
-            .get_versioned(flow_id, key)
-            .is_none_or(|current| current.superseded_by(&entry));
-        if keep && let Err(e) = self.shard.set(flow_id, key, entry, durability).await {
-            tracing::error!(error = %e, "flow merge write failed");
-            return false;
+        // One atomic compare-and-install, not a read followed by a write: pushes
+        // arrive concurrently, and a check-then-act lets two of them both read the
+        // same `current`, both decide they win, and the *older* one land last.
+        // `FlowShard::merge` holds the comparison and the install under one lock —
+        // and the tombstone case rides the same rule, since a local tombstone
+        // simply fails to be superseded by an older Put.
+        match self.shard.merge(flow_id, key, entry, durability).await {
+            Ok(kept) => kept,
+            Err(e) => {
+                tracing::error!(error = %e, "flow merge write failed");
+                false
+            }
         }
-        keep
     }
 
     /// Verify this owner's copy of a flow before first serving it under a new
