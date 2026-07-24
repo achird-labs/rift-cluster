@@ -1,0 +1,40 @@
+{
+  "imposters": [
+    {
+      "port": 6001,
+      "protocol": "http",
+      "stubs": [
+        {
+          "responses": [
+            { "is": { "statusCode": 200, "body": "payments service\n" } }
+          ]
+        }
+      ]
+    },
+    {
+      "port": 6002,
+      "protocol": "http",
+      "stubs": [
+        {
+          "responses": [
+            { "is": { "statusCode": 200, "body": "search service\n" } }
+          ]
+        }
+      ]
+    }
+  ],
+  "routes": {
+    "routes": [
+      {
+        "id": "payments",
+        "match": { "host": "payments.test" },
+        "target": { "port": 6001 }
+      },
+      {
+        "id": "search",
+        "match": { "host": "search.test" },
+        "target": { "port": 6002 }
+      }
+    ]
+  }
+}

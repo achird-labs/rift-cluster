@@ -92,6 +92,24 @@ jobs:
           # count lands in the same place against the 100 min budget.
           - scenario: c15_flow_state_survives_a_full_cluster_restart
             iterations: 40
+          # A single write-then-dispatch check, no restart -- the cheapest
+          # per-iteration cost of the two front-door scenarios. Measured at
+          # ~18s/iteration (stack up, two imposter writes, two route writes,
+          # four real dispatches through the two non-writer nodes, teardown),
+          # so 100 lands at ~30 min against the 100 min budget. Capped at 100
+          # like this file's other single-write scenarios rather than filled
+          # to the budget -- more iterations of something this cheap buys
+          # little extra flake coverage.
+          - scenario: c17_routes_converge
+            iterations: 100
+          # One full-fleet stop/start (three imposters, one three-route write,
+          # six real dispatches before the restart and six after), measured at
+          # ~40s/iteration -- cheaper than C15-flow's restart because there is
+          # no scripted flow-state replay, only route-table reconciliation. 80
+          # iterations lands at ~53 min against the 100 min budget, leaving
+          # headroom for a CI runner slower than the one this was measured on.
+          - scenario: c18_routes_survive_a_full_cluster_restart
+            iterations: 80
 
     steps:
       - uses: actions/checkout@v4

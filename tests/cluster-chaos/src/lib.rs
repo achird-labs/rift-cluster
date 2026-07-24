@@ -442,6 +442,7 @@ pub fn published_host_ports() -> Vec<u16> {
     ports.extend([FRONT_PORT, ENVOY_ADMIN_PORT, TOXIPROXY_PORT]);
     ports.extend(PULL_ON_MISS_HOST_PORTS);
     ports.extend(FLOW_STATE_HOST_PORTS);
+    ports.extend(FRONT_DOOR_HOST_PORTS);
     ports
 }
 
@@ -680,6 +681,29 @@ pub async fn put_imposter_config(
     Ok((status, body))
 }
 
+/// `PUT /front-door/routes`: a whole-table replace of the front door's route
+/// table, returning the status **and the body** — the same forensic shape as
+/// [`put_imposter_config`], for the same reason: a config-shaped 400 carries
+/// the reason in its typed error envelope, and a bare status would make a
+/// refusal indistinguishable from any other refusal.
+///
+/// Takes a `serde_json::Value` rather than a `RouteTable`, matching every
+/// other write helper in this module: `Cargo.toml` pulls in no `rift_ee` /
+/// `rift_http_proxy` types on purpose — this crate drives real processes over
+/// plain HTTP, so a route table is built as JSON at the call site, the same
+/// as an imposter config via [`put_imposter_config`].
+pub async fn put_routes(admin: u16, table: &serde_json::Value) -> anyhow::Result<(u16, String)> {
+    let response = reqwest::Client::new()
+        .put(format!("http://127.0.0.1:{admin}/front-door/routes"))
+        .timeout(Duration::from_secs(15))
+        .json(table)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    Ok((status, body))
+}
+
 /// [`put_imposter`] carrying an `Idempotency-Key`, returning the status and the
 /// response headers.
 ///
@@ -731,6 +755,10 @@ pub const PULL_ON_MISS_HOST_PORTS: [u16; 3] = [16300, 26300, 36300];
 /// way a load balancer would.
 pub const FLOW_STATE_IMPOSTER_PORT: u16 = 6400;
 pub const FLOW_STATE_HOST_PORTS: [u16; 3] = [16400, 26400, 36400];
+
+/// The front door's host ports under `front-door.overlay.yml` — one per node,
+/// in `NODES` order. C17 and C18 only: no other scenario binds `--front-door`.
+pub const FRONT_DOOR_HOST_PORTS: [u16; 3] = [12527, 22527, 32527];
 
 /// Append a stub to an existing imposter — a `PatchStubs` `ControlOp`, i.e. a
 /// config write like any other, not a whole-imposter replacement.

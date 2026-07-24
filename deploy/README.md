@@ -1,11 +1,12 @@
 # Deploying Rift Enterprise
 
-Three artifacts, in increasing order of how much they promise:
+Four artifacts, in increasing order of how much they promise:
 
 | Path | What it is | Verified how |
 |---|---|---|
 | `Dockerfile` | The `rift-ee-server` image | Built and run by `compose/verify.sh` |
 | `compose/docker-compose.yml` | A real 3-node cluster for local work | Stood up and asserted by `compose/verify.sh` |
+| `compose/front-door-demo.yml` | The "no nginx" front-door demo (one node, two virtual services) | Stood up by hand — see below |
 | `k8s/statefulset.yaml` | A production-shaped StatefulSet | Schema only (`kubeconform -strict`) — see the caveat below |
 
 ## Quick start
@@ -37,6 +38,41 @@ reports its own identity, including the embedded upstream Rift.
 It is a script rather than a `cargo test` deliberately — it needs a container
 runtime, so it must not be able to fail the workspace's CI for a reason that has
 nothing to do with the code.
+
+## No-nginx front door demo
+
+Rift's front door (`--front-door`, issue #19 / U-11) resolves a request by
+`Host` header (or path) and dispatches it to the matching imposter, in
+process. `compose/front-door-demo.yml` is the smallest thing that shows this
+replacing a reverse-proxy sidecar: one `rift-ee-server`, one exposed port, two
+virtual services.
+
+```sh
+docker compose -f deploy/compose/front-door-demo.yml up --build
+```
+
+Then, from another terminal:
+
+```sh
+$ curl -s http://localhost:8080/ -H 'Host: payments.test'
+payments service
+
+$ curl -s http://localhost:8080/ -H 'Host: search.test'
+search service
+```
+
+Same port, same process — `Host` is the only thing that decided which
+imposter answered. The two virtual services and the route table binding them
+together are declared once, in `compose/front-door-demo.config.json`, and
+loaded at boot via `--configfile`: this demo is deliberately un-clustered, and
+route writes over the admin API (`PUT /front-door/routes`) are a `--cluster`
+feature (issue #131) — upstream never shipped one for the un-clustered path.
+
+Tear it down the same way as the cluster demo:
+
+```sh
+docker compose -f deploy/compose/front-door-demo.yml down -v
+```
 
 ## The rule these manifests exist to encode
 

@@ -1,0 +1,49 @@
+# The "no nginx" demo (issue #132 / #19's U-11): Rift's front door standing in
+# for a reverse-proxy sidecar whose only job was host-based routing to two
+# backends. One `rift-ee-server`, one exposed port, two virtual services --
+# `payments.test` and `search.test` -- distinguished purely by the `Host`
+# header a request arrives with. Nothing outside this container routes
+# between them.
+#
+#     docker compose -f deploy/compose/front-door-demo.yml up --build
+#
+# Then, from another terminal:
+#
+#     curl -s http://localhost:8080/ -H 'Host: payments.test'
+#     curl -s http://localhost:8080/ -H 'Host: search.test'
+#
+# See ../../README.md's "No-nginx front door demo" section for the full
+# walkthrough and expected output.
+#
+# Deliberately NOT clustered and NOT the 3-node topology in this directory's
+# `docker-compose.yml`: the front door works identically with `--cluster` off
+# (the `parity` CI job's whole bar), and the point of this file is the
+# feature on its own, not the cluster around it. That also means the route
+# table can't come from the admin API -- `PUT /front-door/routes` is a
+# `--cluster` feature (issue #131), because upstream never shipped a route
+# CRUD un-clustered -- so both virtual services and the table that binds them
+# are declared once, in front-door-demo.config.json, and loaded at boot via
+# `--configfile`. A static file is the right shape for a demo that starts and
+# stays put, not a limitation worth working around.
+
+name: rift-front-door-demo
+
+services:
+  rift:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    environment:
+      MB_CONFIGFILE: "/var/lib/rift/front-door-demo.config.json"
+      RIFT_FRONT_DOOR: "0.0.0.0:8080"
+    volumes:
+      - ./front-door-demo.config.json:/var/lib/rift/front-door-demo.config.json:ro
+    ports:
+      - "8080:8080"   # front door -- payments.test and search.test both live here
+      - "2525:2525"   # admin API
+    healthcheck:
+      test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
