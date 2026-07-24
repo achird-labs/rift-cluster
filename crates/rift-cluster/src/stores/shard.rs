@@ -409,6 +409,85 @@ impl FlowShard {
         .await
     }
 
+    /// Install `entry` only if it supersedes what is already here — comparing and
+    /// installing under **one** hold of the memory lock.
+    ///
+    /// This exists because the obvious spelling is wrong. Reading with
+    /// [`Self::get_versioned`], deciding, and then calling [`Self::set`] is a
+    /// check-then-act with an `.await` in the middle, and replication delivers
+    /// pushes concurrently: two merges both read the same `current`, both
+    /// conclude they supersede it, and whichever writes last wins. When the
+    /// loser is the newer write, an acknowledged value is silently replaced by
+    /// an older one on that replica — and a later takeover promotes exactly
+    /// that copy.
+    ///
+    /// The writer send happens under the same lock, so the durable order matches
+    /// the in-memory order. Sending outside it would fix what the replica serves
+    /// now and leave the same lost update on disk, to surface at the next
+    /// restart instead.
+    ///
+    /// Returns whether `entry` was installed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a storage failure.
+    pub async fn merge(
+        &self,
+        flow_id: &str,
+        key: &str,
+        entry: Versioned,
+        durability: Durability,
+    ) -> Result<bool, ShardError> {
+        let wait = {
+            let mut guard = self.inner.memory.write();
+            if let Some(current) = guard.get(flow_id).and_then(|flow| flow.keys.get(key))
+                && !current.superseded_by(&entry)
+            {
+                return Ok(false);
+            }
+            let flow = guard.entry(flow_id.to_owned()).or_default();
+            flow.keys.insert(key.to_owned(), entry.clone());
+            flow.last_touch = now_millis();
+
+            if durability == Durability::None {
+                None
+            } else {
+                let mutation = Mutation::Set {
+                    flow_id: flow_id.to_owned(),
+                    key: key.to_owned(),
+                    entry,
+                };
+                match durability {
+                    Durability::Sync => {
+                        let (ack, wait) = oneshot::channel();
+                        self.send(WriteRequest {
+                            mutation,
+                            durability,
+                            ack: Some(ack),
+                        })?;
+                        Some(wait)
+                    }
+                    Durability::Async | Durability::None => {
+                        self.send(WriteRequest {
+                            mutation,
+                            durability,
+                            ack: None,
+                        })?;
+                        None
+                    }
+                }
+            }
+        };
+        self.evict_if_needed();
+        if let Some(wait) = wait {
+            // Two `?`: the outer resolves the ack channel (the writer died), the
+            // inner is the write's own result. Dropping the inner one would make a
+            // failed durable write report success to the caller.
+            wait.await.map_err(|_| ShardError::WriterStopped)??;
+        }
+        Ok(true)
+    }
+
     /// Remove a key.
     ///
     /// # Errors

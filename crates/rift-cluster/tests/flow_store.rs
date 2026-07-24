@@ -516,6 +516,76 @@ async fn a_delayed_put_cannot_resurrect_a_deleted_key() {
 /// the acknowledged new value silently never replicates: divergent replicas
 /// now, a lost write on the next takeover. Common shape: flow state that
 /// clears a slot and reuses it.
+/// #131 follow-up: the single-round version of this below is ~17% flaky, and the
+/// failure it shows is not a slow push — it is a *lost update*.
+///
+/// A delete and the re-set that follows it are pushed to the replica as two
+/// independent fire-and-forget RPCs, so the replica handles them concurrently.
+/// Both read the same `current` before either writes, both conclude they
+/// supersede it, and whichever writes last wins. When that is the tombstone, an
+/// acknowledged write is silently reverted on the replica — and a later takeover
+/// promotes exactly that copy.
+///
+/// Hammering the sequence turns a 1-in-6 coin flip into a near-certain failure,
+/// which is what makes this a gate rather than a rumour.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_after_delete_never_loses_to_the_tombstone_under_repetition() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster_of(2, Duration::from_secs(60)).await;
+
+    let ring = members[0].node.ring();
+    let owner_id = ring
+        .owner(rift_cluster::OwnedKey::new(
+            rift_cluster::KeyClass::FlowKv,
+            "flow-hammer",
+        ))
+        .expect("two members");
+    let (owner, replica) = if members[0].node.id() == owner_id {
+        (&members[0], &members[1])
+    } else {
+        (&members[1], &members[0])
+    };
+    let store = store_on(owner, serde_json::json!({}));
+
+    for round in 0..25u32 {
+        let want = serde_json::json!(format!("round-{round}"));
+        for step in 0..3u8 {
+            let store = Arc::clone(&store);
+            let want = want.clone();
+            match step {
+                0 => blocking(move || store.set("flow-hammer", "slot", serde_json::json!("seed")))
+                    .await
+                    .expect("seed"),
+                1 => blocking(move || store.delete("flow-hammer", "slot"))
+                    .await
+                    .expect("delete"),
+                _ => blocking(move || store.set("flow-hammer", "slot", want))
+                    .await
+                    .expect("re-set"),
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if replica.shard.get("flow-hammer", "slot").map(|e| e.value) == Some(want.clone()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: the replica lost the re-set. Its copy is {:?} — an older push \
+                 (a tombstone, or an earlier value) overwrote a newer acknowledged write, which \
+                 means the merge compare-and-install is not atomic against a concurrent push.",
+                replica.shard.get_versioned("flow-hammer", "slot")
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reset_after_delete_replicates_over_the_tombstone() {
     let _lock = TEST_LOCK.lock().await;
