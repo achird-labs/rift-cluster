@@ -195,3 +195,141 @@ jobs:
       - name: Cluster logs on failure
         if: failure() && steps.changed.outputs.run == 'true'
         run: docker compose -f deploy/compose/docker-compose.yml logs --tail=100 || true
+
+  # Parity (issue #37): upstream's own behavioural suites, run against
+  # `rift-ee-server` with `--cluster` off. This is what turns "composition,
+  # not a fork: `--cluster` off is byte-identical to rift" from an assertion
+  # the composition makes by construction into something verified against the
+  # behaviour rift itself guarantees.
+  #
+  # Only four of upstream's `rift-http-proxy` integration suites can run
+  # against an external binary at all — the rest link `ImposterManager`/
+  # `AdminApiServer` directly and can never be pointed anywhere else, but they
+  # also don't need to be: `rift-ee-server` links that exact vendored library
+  # unmodified, so upstream's own CI already gates that code (see the issue's
+  # scoping finding). The four that spawn a server process use the shared
+  # `server_bin()` helper (`vendor/rift/crates/rift-http-proxy/tests/support/
+  # mod.rs`) to resolve which binary to spawn, honoring `RIFT_SERVER_BIN`.
+  #
+  # Structured identically to `cluster-smoke` — same filter script (own job
+  # selector, not a second untested filter, per issue #93), same `fetch-depth:
+  # 0` / `--self-test` / `set -euo pipefail` / `--no-renames` reasoning. See
+  # that job's comments for why each of those matters; it applies unchanged
+  # here.
+  parity:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # The path filter below diffs against the base commit, which a
+          # shallow clone does not have.
+          fetch-depth: 0
+
+      # Same reasoning as cluster-smoke's identical step: `build` and this job
+      # are independent, so a broken filter must be caught from inside the job
+      # whose greenness depends on it, not assumed from a sibling that ran a
+      # different job selector.
+      - name: Verify the path filter before trusting it
+        run: scripts/cluster-smoke-paths.sh --self-test
+
+      - name: Which paths changed
+        id: changed
+        run: |
+          # A filter that fails *open into skipping* is worse than no filter:
+          # it is a green check that verified nothing against upstream. `set
+          # -e` makes a broken diff fail the job instead of reading as "no
+          # parity-relevant change".
+          set -euo pipefail
+          base='${{ github.event.pull_request.base.sha }}'
+          # Same two fixes as cluster-smoke's identical line, both toward not
+          # skipping: `core.quotePath=false` so a non-ASCII path's leading
+          # quote can't defeat the filter, `--no-renames` so a file moved OUT
+          # of a watched path doesn't read as untouched.
+          changed="$(git -c core.quotePath=false diff --no-renames --name-only "$base"...HEAD)"
+          echo "$changed"
+          printf '%s\n' "$changed" | scripts/cluster-smoke-paths.sh --job parity | tee -a "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.changed.outputs.run == 'true'
+
+      # Two workspaces are in play here — this repo's own, and `vendor/rift`
+      # (excluded from it, see the root Cargo.toml) — so both are named
+      # explicitly; the default single-workspace cache would miss the second
+      # one entirely and rebuild it from scratch on every run.
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changed.outputs.run == 'true'
+        with:
+          workspaces: |
+            .
+            vendor/rift
+
+      - name: Build rift-ee-server (release)
+        if: steps.changed.outputs.run == 'true'
+        run: cargo build -p rift-ee-server --release
+
+      # `vendor/rift` is its own cargo workspace (excluded from ours), so the
+      # suites are run with that directory as the working dir rather than
+      # with `-p` flags from the root.
+      #
+      # No `--cluster` flags anywhere below — that is the point of "parity
+      # mode": these suites exercise exactly the composition an operator gets
+      # by running `rift-ee-server` as a drop-in `rift` replacement.
+      #
+      # `RIFT_SERVER_BIN` points the suites at our binary instead of their own
+      # debug build; `support::server_bin()` panics on a set-but-not-
+      # executable path rather than silently falling back, so a broken build
+      # step here fails loud, not quiet. `corpus_replay` also spawns
+      # `rift-verify`; that stays upstream's own build via
+      # `CARGO_BIN_EXE_rift-verify`, deliberately not overridden — it is
+      # harness, not the binary under test.
+      #
+      # `--include-ignored`, not `--ignored`: measured locally, all of
+      # `mountebank_compatibility` (45 tests) and `rift_extensions` (10) carry
+      # `#[ignore = "requires running server"]` — a plain `cargo test` runs
+      # neither suite at all, which is a green step having exercised 8 of the
+      # 63 tests these four files contain. `--ignored` alone is just as wrong
+      # the other way: it runs ONLY ignored tests, so `corpus_replay` and
+      # `issue_360_script_cli` (which carry no `#[ignore]`s) would report `0
+      # passed` while the step still goes green. `--include-ignored` is the
+      # only flag that runs all of it. (Upstream's own CI passes neither flag
+      # to this suite, so this parity job exercises more of it than upstream's
+      # own pipeline does.)
+      #
+      # `--test-threads=1`: `mountebank_compatibility` spawns one server
+      # process per test and picks its ports from a per-binary counter, not a
+      # global one; measured locally, the default thread-per-core parallelism
+      # spawns enough of those concurrently to occasionally hit a connection
+      # reset (44/45 passed, retried clean at `--test-threads=1`). Serial is
+      # slower but was the only setting that didn't flake across repeated
+      # runs — the same trade cluster-smoke already makes for its own
+      # fixed-port tier, for the same reason.
+      #
+      # `--skip test_response_cycling_with_rift_extensions`: this one issues
+      # six requests concurrently via `join_all` and asserts they land on the
+      # server's round-robin counter in dispatch order — an ordering the
+      # client-side concurrency doesn't actually guarantee. Confirmed locally
+      # against upstream's own `rift` binary, unmodified: identical failure
+      # shape (same three response bodies, twice each, scrambled order) with
+      # no `RIFT_SERVER_BIN` override at all. That makes it a pre-existing
+      # race in the test, not a `rift-ee-server` composition break — skipping
+      # it here is quarantine, not a parity exemption. Filed upstream as
+      # achird-labs/rift#849 rather than patched in `vendor/rift`, since this
+      # crate does not carry local patches to the pin.
+      - name: Upstream process-spawning suites against rift-ee-server
+        if: steps.changed.outputs.run == 'true'
+        working-directory: vendor/rift
+        env:
+          RIFT_SERVER_BIN: ${{ github.workspace }}/target/release/rift-ee-server
+          ASSERT_SCENARIOS_RAN: ${{ github.workspace }}/scripts/assert-scenarios-ran.sh
+        run: |
+          set -euo pipefail
+          cargo test -p rift-http-proxy \
+            --test mountebank_compatibility \
+            --test rift_extensions \
+            --test issue_360_script_cli \
+            --test corpus_replay \
+            -- --include-ignored --test-threads=1 \
+               --skip test_response_cycling_with_rift_extensions \
+            | "$ASSERT_SCENARIOS_RAN" --assert 50
