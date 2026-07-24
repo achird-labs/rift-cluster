@@ -7,6 +7,21 @@ embedding seams. With clustering off it is the open-source server, byte for
 byte — the same admin API, the same imposters, the same ports, and nothing
 extra bound.
 
+That claim is verified, not merely made by construction. The `parity` CI job
+(issue #37) builds `rift-ee-server` and runs upstream's own `rift-http-proxy`
+process-spawning suites — `mountebank_compatibility`, `rift_extensions`,
+`issue_360_script_cli`, `corpus_replay` — against it with `--cluster` off,
+using the `RIFT_SERVER_BIN` override (`vendor/rift`'s `tests/support/mod.rs`)
+to point them at this binary instead of their own debug build. `tests/
+passthrough.rs` in this crate covers the same claim at the admin-API level and
+runs on every PR regardless of what changed; `parity` is the path-gated
+counterpart that checks it against upstream's own, much larger behavioural
+suite whenever `vendor/rift`, `crates/rift-ee-server/`, `Cargo.lock`, or
+`.github/` change. (The rest of `rift-http-proxy`'s integration tests link
+`ImposterManager`/`AdminApiServer` directly and can never be pointed at an
+external binary — but they also don't need to be: this crate links that exact
+vendored library unmodified, so upstream's own CI already gates that code.)
+
 ```sh
 # Exactly the open-source behaviour.
 rift-ee-server --port 2525 --datadir ./data
