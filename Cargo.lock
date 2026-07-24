@@ -2538,6 +2538,7 @@ name = "rift-http-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "base64",
  "bytes",
  "chrono",
