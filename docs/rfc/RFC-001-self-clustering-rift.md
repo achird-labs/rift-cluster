@@ -793,10 +793,13 @@ Connection pooling per peer.
 > deterministically, and `revision` is the same Raft log index. What differs from the imposter
 > config plane is the post-apply projection: instead of driving `ImposterManager::apply_config`,
 > a committed route write recompiles a `CompiledRoutes` and hot-swaps it into the front door's
-> `ArcSwap` — the dispatch-side counterpart of §7.4.6's bind-divergence dividend, which the route
-> table gets for free (dispatch is in-process, so a node that failed to bind an imposter's own
-> port still reaches it through the front door). See `docs/rift-ee-server.md` ("The clustered
-> front door") for the operator-facing contract.
+> `ArcSwap`. **Correction (checked at #132's implementation time):** this paragraph previously
+> claimed the front door gets §7.4.6's bind-divergence dividend "for free" — that a node whose own
+> bind failed still reaches the imposter through the front door because dispatch is in-process.
+> It does not: a failed bind never inserts an entry into the imposter map (see §7.4.6's own
+> corrected note), so in-process dispatch finds nothing there either, and the front door 404s on
+> that node exactly like the gateway does. Tracked as #143. See `docs/rift-ee-server.md` ("The
+> clustered front door") for the operator-facing contract.
 
 **Design rules (v2, superseded mechanism): gossip carries pointers, not payloads; writes are
 serialized at a per-port owner** (v1's accept-anywhere LWW destroyed concurrent stub mutations —
@@ -891,6 +894,19 @@ unrelated process). Semantics:
 - Bind status is gossiped per `(port, node)`: `bind/<port>/<node> → Bound | Failed(reason)`.
 - The imposter **exists cluster-wide regardless**; nodes that failed to bind still serve it
   via the gateway listener (§6.3) if enabled, and still participate as owners for its keys.
+  > ⚠️ **The "still serve it" half is designed, not built (checked at #132's implementation
+  > time; tracked as #143).** `ImposterManager::create_imposter`
+  > (`vendor/rift/crates/rift-mock-core/src/imposter/manager.rs`) binds the listener *first*
+  > and returns `Err(ImposterError::BindError)` **before** the `Imposter` is constructed or
+  > inserted into the port table. A node whose bind fails therefore has no map entry for that
+  > port at all — `dispatch_to_port` (and, downstream of it, the front door's own in-process
+  > dispatch, per §7.4's front-door extension above) resolves through `manager.get_imposter(port)`
+  > and answers `404` on that node, gateway or front door alike. The *observability* half is
+  > real: `rift_cluster_bind_failures{port}`, the `cluster.bind_failures` annotation, and
+  > `record_report` (`crates/rift-cluster/src/raft/store.rs`) track a bind failure carefully,
+  > including the deleted-port case. It is only the serving half — a node routing around its
+  > own failed bind — that does not exist yet. Do not write a test asserting today's `404` as
+  > if it were the contract; #143 is where the serving half gets designed and built.
 - Admin `POST /imposters` returns `201` with a `Rift-Cluster-Warnings` **header** listing
   nodes that failed to bind (best-effort within a 2 s wait; late failures visible via
   `GET /_cluster/imposters`). A header — not a body field — because the U-8 decoration

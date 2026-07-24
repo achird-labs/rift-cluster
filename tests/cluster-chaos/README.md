@@ -96,6 +96,38 @@ Two things about it are easy to get wrong and are load-bearing:
   leg touches `rift`. No toxic is ever attached to those listeners — they are
   how the harness watches, not what it perturbs.
 
+### The front-door overlay
+
+C17 and C18 need every node's own `--front-door` listener bound and reachable
+from the host — real dispatch through it, not an admin-API lookup, is the
+whole point of both (issue #131's correction: there is no `/front-door/resolve`
+to read instead). `front-door.overlay.yml` adds that:
+
+```sh
+docker compose -f deploy/compose/docker-compose.yml \
+               -f tests/cluster-chaos/compose/front-door.overlay.yml up -d
+```
+
+`Cluster::up_with_overlays(&["front-door.overlay.yml"])` does this.
+
+| node | front door |
+|---|---|
+| rift-1 | 12527 |
+| rift-2 | 22527 |
+| rift-3 | 32527 |
+
+Not in the shipped base file, for the same reason `flow-state.overlay.yml`
+isn't: `--front-door` is a real operator choice that opens a listener, and the
+base file is read as the reference deployment. All three nodes are published,
+not one — C17 and C18 both assert dispatch through nodes that never received
+the admin write directly, which is what "converges" and "survives a restart"
+actually mean here.
+
+Imposter data ports are never published by this overlay: the front door
+dispatches to them in-process (`dispatch_to_port` against the local
+`ImposterManager`, never a socket), so every C17/C18 assertion goes through a
+front-door port and never touches an imposter port directly.
+
 ### Why partitions are not toxiproxy
 
 Toxiproxy is used for C6 and *not* for C4, for two independent reasons:
@@ -165,7 +197,8 @@ Implemented and passing: `test_config_sync_converges`, `test_node_rejoin`,
 `c15_hard_kill_of_the_whole_fleet_keeps_acknowledged_writes`,
 `c15_flow_state_survives_a_full_cluster_restart`,
 `c5_rolling_restart_never_stops_accepting_writes`,
-`whole_fleet_sigterm_then_cold_start_converges`.
+`whole_fleet_sigterm_then_cold_start_converges`, `c17_routes_converge`,
+`c18_routes_survive_a_full_cluster_restart`.
 
 `c5_rolling_restart_never_stops_accepting_writes` was committed **failing**, as
 the reproduction for a real defect this tier found (#72): a node that gracefully
@@ -266,6 +299,78 @@ keep in memory, and a restart adopted it back. The push now carries the write's
 own durability and repairs never persist at all, so the three modes mean the
 same thing fleet-wide; with the fix in place the mutation fails on
 `resumed at 1`, as it always should have.
+
+`c17_routes_converge` and `c18_routes_survive_a_full_cluster_restart` (#132)
+close #19's cluster-level acceptance list for the front door (#131): the
+route table is a replicated control-plane object exactly like the imposter
+config set, so it gets the same two container-tier proofs C15/C16 already
+gave imposter configs — a write's barrier contract, and survival of a real
+restart. A third planned scenario, `c19_front_door_routes_around_bind_divergence`
+(the §7.4.6 "bind-divergence dividend"), is **not** here: its premise does not
+hold against the code as written — see RFC-001 §7.4.6's corrected note and
+issue #143 — so it was descoped rather than written to assert an accidental
+404 as if it were a contract.
+
+Both need every node's own `--front-door` listener reachable from the host —
+see "The front-door overlay" above — because there is no `/front-door/resolve`
+to assert against instead (issue #131's correction): "the fleet has the
+write" has to be proven by a real request through the front door, not an
+admin-API lookup.
+
+`c17_routes_converge` is `test_config_sync_converges` reprised for the route
+table, with that stronger dispatch-based check. It writes twice — first an
+empty table becoming one route, then the same route id retargeted to a
+different imposter — and after each write, immediately (no polling: the
+barrier's return **is** the assertion) dispatches through the two nodes that
+did not receive the write. Verified red: commenting out the `ArcSwap` store in
+`RedbStateMachine::drive_engine`'s `EngineAction::SyncRoutes` arm
+(`crates/rift-cluster/src/raft/store.rs`) fails both nodes on the first write
+with
+
+```
+rift-2 did not route /svc the moment the write returned 200 -- with
+--cluster-write-barrier=ready-nodes a 2xx means the fleet has the
+new table, not merely that the leader does (R1)
+```
+
+`c18_routes_survive_a_full_cluster_restart` follows the C15 restart pattern
+exactly (`stop` then `start` every node, `wait_all_ready` + `wait_cluster_formed`,
+never `recreate`) against a table of three routes — an exact host, a wildcard
+host, and a path prefix, each naming a different imposter — and checks two
+things per node afterward: `GET /front-door/routes` (the *stored* table) and a
+real dispatch of all three shapes through that node's own front door (the
+*in-memory* compiled table a restarted process has to rebuild before it can
+serve anything). The two checks exist separately on purpose — a node can pass
+the first and still 404 every request if the rebuild is skipped, which is
+exactly what mutation-proving this scenario found:
+
+**Correction to the issue's premise.** The issue named `build_snapshot` /
+`install_snapshot` as C18's mutation target ("rides the snapshot"). Measured
+against this exact restart: it does not. `stop`/`start` keeps every node's own
+state directory intact and none of the three falls behind the log, so openraft
+never calls `install_snapshot` on any of them — that RPC exists to bring a
+*lagging* peer's state machine up to date over the wire, which nothing here
+is. Durability across this restart runs through `RaftNode::reconcile_engine`'s
+post-join re-derivation from `sm_routes` instead (`crates/rift-cluster/src/raft/store.rs`,
+called from the readiness reconciler `compose.rs` spawns to satisfy
+`GATE_RECONCILED`) — the real cold-start projection, and the same one
+`test_cold_start` exercises for imposter configs. That is the line this
+scenario is mutation-proven against: dropping the routes action from the vec
+`reconcile_engine` hands to `drive_engine` leaves `GET /front-door/routes`
+matching (the stored table on disk is untouched) while every post-restart
+dispatch 404s:
+
+```
+rift-1: exact-host route did not dispatch
+  left: 404
+ right: 200
+```
+
+(the `GET /front-door/routes` check immediately above it, for the same node,
+still passed — the stored table survived the restart; only the in-memory
+compiled table failed to come back.) The same mutant leaves `c17_routes_converge`
+green — it does not touch a restart, so this is confirmation the mutation is
+specific to the cold-start path, not a duplicate of C17's.
 
 ## Quarantine convention
 

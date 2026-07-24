@@ -22,14 +22,14 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 
 use cluster_chaos::{
-    CONVERGE_TIMEOUT, Cluster, FLOW_STATE_HOST_PORTS, FLOW_STATE_IMPOSTER_PORT, FRONT_PORT, NODES,
-    PULL_ON_MISS_HOST_PORTS, PULL_ON_MISS_IMPOSTER_PORT, add_toxic, append_stub,
-    backend_failing_health_check, clear_toxics, config_revision, exec_probe, get_data_plane,
-    get_data_plane_with, get_json, imposter_ports, metric, probe, published_host_ports,
-    put_imposter, put_imposter_config, put_imposter_with_key, put_stubs, toxic_count,
-    wait_admin_reachable, wait_backend_ejected, wait_converged, wait_converged_on,
-    wait_ports_free_in, wait_revisions_agree, wait_revisions_agree_on, wait_single_leader,
-    wait_voters,
+    CONVERGE_TIMEOUT, Cluster, FLOW_STATE_HOST_PORTS, FLOW_STATE_IMPOSTER_PORT,
+    FRONT_DOOR_HOST_PORTS, FRONT_PORT, NODES, PULL_ON_MISS_HOST_PORTS, PULL_ON_MISS_IMPOSTER_PORT,
+    add_toxic, append_stub, backend_failing_health_check, clear_toxics, config_revision,
+    exec_probe, get_data_plane, get_data_plane_with, get_json, imposter_ports, metric, probe,
+    published_host_ports, put_imposter, put_imposter_config, put_imposter_with_key, put_routes,
+    put_stubs, toxic_count, wait_admin_reachable, wait_backend_ejected, wait_converged,
+    wait_converged_on, wait_ports_free_in, wait_revisions_agree, wait_revisions_agree_on,
+    wait_single_leader, wait_voters,
 };
 
 /// The imposter port a scenario configures. Inside the container network
@@ -2199,4 +2199,391 @@ async fn c15_flow_state_survives_a_full_cluster_restart() {
          restart ({replayed:?}) — the counters above would then be passing on \
          something other than durability"
     );
+}
+
+// ---------------------------------------------------------------------------
+// C17/C18: the front door's route table, end to end (#132, closing #19's
+// cluster-level acceptance list). C19 (the §7.4.6 bind-divergence dividend)
+// is deliberately not here — its premise does not hold against the code as
+// written (see RFC-001 §7.4.6's corrected note); it is filed as #143 instead
+// of asserting today's accidental behaviour as if it were a contract.
+// ---------------------------------------------------------------------------
+
+/// C17's two imposters, each answering with a distinct body so a dispatched
+/// request's body says which one it reached.
+const C17_IMPOSTER_A: u16 = 6500;
+const C17_IMPOSTER_B: u16 = 6501;
+
+/// **C17: a route write converges the moment its 2xx returns — R1 for the
+/// front door.**
+///
+/// This is `test_config_sync_converges` reprised for the route table, with
+/// the stronger check issue #131's correction (and #132's, following it)
+/// calls for: there is no `/front-door/resolve` to read, so "the fleet has
+/// it" is proven by a REAL request through the OTHER two nodes' own front
+/// doors — never an admin-API lookup. `--cluster-write-barrier=ready-nodes`
+/// (the default, and what `front-door.overlay.yml` does not override) means
+/// the leader's write does not return 200 until every ready node has applied
+/// the entry, so if either dispatch below needed even one retry, the barrier
+/// would already be broken.
+///
+/// Two writes, not one: the second retargets the SAME route id to a
+/// different imposter, so this is a genuine test of "a *change* converges",
+/// not merely "the first write landed" — which a node that starts with an
+/// empty table would pass by accident even with no barrier at all.
+///
+/// No polling anywhere in this scenario, on purpose: polling with a timeout
+/// would pass against a front door that recompiles its table eventually,
+/// which is a materially weaker claim than the barrier's contract.
+///
+/// Mutation: commenting out the `ArcSwap` store in
+/// `RedbStateMachine::drive_engine`'s `EngineAction::SyncRoutes` arm
+/// (`crates/rift-cluster/src/raft/store.rs`) turns this red, because no node —
+/// leader included — ever applies a route again; both dispatches below then
+/// answer the front door's `no-route` 404 instead of the target imposter's
+/// body. Verified: see the chaos README's C17 entry for the actual failure
+/// message.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c17_routes_converge() {
+    let _cluster = Cluster::up_with_overlays(&["front-door.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+
+    for (port, body) in [(C17_IMPOSTER_A, "from-a"), (C17_IMPOSTER_B, "from-b")] {
+        let (status, resp_body) = put_imposter_config(
+            NODES[0].admin,
+            &serde_json::json!({
+                "port": port,
+                "protocol": "http",
+                "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": body } }] }],
+            }),
+        )
+        .await
+        .expect("admin write");
+        assert_eq!(
+            status, 201,
+            "imposter on port {port} was refused: {resp_body}"
+        );
+    }
+    for port in [C17_IMPOSTER_A, C17_IMPOSTER_B] {
+        wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("imposter {port} did not bind fleet-wide: {e}"));
+    }
+
+    // First write: an empty table becoming one route. Every node other than
+    // the writer starts with NO route at all, so this already exercises real
+    // convergence rather than a no-op re-apply.
+    let (status, body) = put_routes(
+        NODES[0].admin,
+        &serde_json::json!({
+            "routes": [{
+                "id": "svc",
+                "match": { "path_prefix": "/svc" },
+                "target": { "port": C17_IMPOSTER_A },
+            }],
+        }),
+    )
+    .await
+    .expect("put routes");
+    assert_eq!(status, 200, "route write was refused: {body}");
+
+    for (idx, node) in NODES.iter().enumerate().skip(1) {
+        let (dispatch_status, _headers, dispatch_body) =
+            get_data_plane_with(FRONT_DOOR_HOST_PORTS[idx], "/svc/anything", &[])
+                .await
+                .unwrap_or_else(|e| panic!("dispatch through {}: {e}", node.name));
+        assert_eq!(
+            dispatch_status, 200,
+            "{} did not route /svc the moment the write returned 200 -- with \
+             --cluster-write-barrier=ready-nodes a 2xx means the fleet has the \
+             new table, not merely that the leader does (R1)",
+            node.name
+        );
+        assert_eq!(
+            dispatch_body, "from-a",
+            "{} routed /svc to the wrong imposter",
+            node.name
+        );
+    }
+
+    // Second write: retarget the same route id. Proves a CHANGE converges,
+    // not just an initial write landing on an empty table.
+    let (status, body) = put_routes(
+        NODES[0].admin,
+        &serde_json::json!({
+            "routes": [{
+                "id": "svc",
+                "match": { "path_prefix": "/svc" },
+                "target": { "port": C17_IMPOSTER_B },
+            }],
+        }),
+    )
+    .await
+    .expect("put routes (retarget)");
+    assert_eq!(status, 200, "route retarget was refused: {body}");
+
+    for (idx, node) in NODES.iter().enumerate().skip(1) {
+        let (dispatch_status, _headers, dispatch_body) =
+            get_data_plane_with(FRONT_DOOR_HOST_PORTS[idx], "/svc/anything", &[])
+                .await
+                .unwrap_or_else(|e| panic!("dispatch through {}: {e}", node.name));
+        assert_eq!(
+            dispatch_status, 200,
+            "{} did not pick up the retarget the moment the write returned 200",
+            node.name
+        );
+        assert_eq!(
+            dispatch_body, "from-b",
+            "{} still routes /svc to the pre-retarget imposter after a \
+             converged write",
+            node.name
+        );
+    }
+}
+
+/// C18's three imposters, one per route shape, each answering with a distinct
+/// body so a dispatched request's body says which one it reached.
+const C18_IMPOSTER_EXACT: u16 = 6510;
+const C18_IMPOSTER_WILD: u16 = 6511;
+const C18_IMPOSTER_PREFIX: u16 = 6512;
+
+/// The table C18 writes before the restart: one route per shape the issue
+/// names — an exact host, a wildcard host, and a path prefix — each targeting
+/// a different imposter.
+fn c18_route_table() -> serde_json::Value {
+    serde_json::json!({
+        "routes": [
+            {
+                "id": "exact-host",
+                "match": { "host": "payments.c18.test" },
+                "target": { "port": C18_IMPOSTER_EXACT },
+            },
+            {
+                "id": "wild-host",
+                "match": { "host": "*.search.c18.test" },
+                "target": { "port": C18_IMPOSTER_WILD },
+            },
+            {
+                "id": "prefix",
+                "match": { "path_prefix": "/api" },
+                "target": { "port": C18_IMPOSTER_PREFIX },
+            },
+        ],
+    })
+}
+
+/// Route ids from a `GET /front-door/routes` body, sorted — so a comparison
+/// asserts the SET of routes came back, independent of whatever order the
+/// state machine's table iterator happens to yield them in.
+fn route_ids(routes_response: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = routes_response["routes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|route| route["id"].as_str().map(str::to_owned))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Dispatch all three of C18's route shapes through one node's own front
+/// door, asserting each answers 200 and returning the three bodies (exact,
+/// wildcard, prefix) for the caller to check against the right imposter.
+async fn c18_probe_all_shapes(front_door_port: u16, node_name: &str) -> (String, String, String) {
+    let (exact_status, _headers, exact_body) =
+        get_data_plane_with(front_door_port, "/", &[("Host", "payments.c18.test")])
+            .await
+            .unwrap_or_else(|e| panic!("{node_name}: exact-host dispatch: {e}"));
+    assert_eq!(
+        exact_status, 200,
+        "{node_name}: exact-host route did not dispatch"
+    );
+
+    let (wild_status, _headers, wild_body) =
+        get_data_plane_with(front_door_port, "/", &[("Host", "api.search.c18.test")])
+            .await
+            .unwrap_or_else(|e| panic!("{node_name}: wildcard-host dispatch: {e}"));
+    assert_eq!(
+        wild_status, 200,
+        "{node_name}: wildcard-host route did not dispatch"
+    );
+
+    let (prefix_status, _headers, prefix_body) =
+        get_data_plane_with(front_door_port, "/api/anything", &[])
+            .await
+            .unwrap_or_else(|e| panic!("{node_name}: path-prefix dispatch: {e}"));
+    assert_eq!(
+        prefix_status, 200,
+        "{node_name}: path-prefix route did not dispatch"
+    );
+
+    (exact_body, wild_body, prefix_body)
+}
+
+/// **C18: the front door's route table — and real dispatch through it —
+/// survives a full-cluster restart.**
+///
+/// Same discipline as C15 (`c15_flow_state_survives_a_full_cluster_restart`):
+/// a full-fleet SIGTERM/restart (`stop` then `start` every node, never
+/// `recreate` — the state directory persisting across it is exactly what is
+/// under test), `wait_all_ready` + `wait_cluster_formed` before asserting
+/// anything.
+///
+/// Two checks per node, not one, because they exercise different mechanisms:
+///
+/// - `GET /front-door/routes` reads `sm_routes` directly — durability of the
+///   *stored* table. There is no `resolve` endpoint upstream to assert
+///   against instead (issue #131's correction, inherited by #132).
+/// - Real dispatch through each node's own front door exercises the
+///   *in-memory* `ArcSwap` a restarted node has to rebuild from that stored
+///   table before it can serve anything again
+///   (`RedbStateMachine::reconcile_engine`, the same cold-start projection
+///   `test_cold_start` exercises for imposter configs — a fresh process's
+///   `ArcSwap<CompiledRoutes>` starts empty regardless of what is on disk).
+///   A node could pass the first check and still 404 every request if that
+///   rebuild were skipped, which is exactly the failure this second check
+///   exists to catch.
+///
+/// Three routes, three shapes, three imposters — an exact host, a wildcard
+/// host, and a path prefix, each targeting a different imposter — so a
+/// mismatched dispatch after the restart is visible in the response body,
+/// not just the status.
+///
+/// **Correction to the issue's premise:** the issue named `build_snapshot` /
+/// `install_snapshot` as the mutation target ("rides the snapshot"). Measured
+/// against this exact restart pattern, it does not: `Cluster::stop`/`start`
+/// keeps every node's own state directory intact and does not fall behind the
+/// log, so openraft never calls `install_snapshot` on any of the three nodes
+/// — that RPC exists to bring a LAGGING peer's state machine up to date over
+/// the wire, which nothing here is. Durability across *this* restart runs
+/// through `reconcile_engine`'s post-join re-derivation from `sm_routes`
+/// instead (see `crates/rift-cluster/src/raft/node.rs`'s `reconcile_engine`,
+/// called from the readiness reconciler `compose.rs` spawns to satisfy
+/// `GATE_RECONCILED`), so that is the line this scenario is mutation-proven
+/// against: dropping the `routes_action` from the vec `reconcile_engine`
+/// hands to `drive_engine` (`crates/rift-cluster/src/raft/store.rs`) turns
+/// this scenario red post-restart — `GET /front-door/routes` still matches
+/// (the stored table is untouched on disk), but every dispatch 404s with
+/// `x-rift-front-door: no-route`, because the front door of a freshly
+/// restarted process starts from `CompiledRoutes::default()` and nothing
+/// repopulates it. Verified: see the chaos README's C18 entry for the actual
+/// failure message.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c18_routes_survive_a_full_cluster_restart() {
+    let cluster = Cluster::up_with_overlays(&["front-door.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+
+    for (port, body) in [
+        (C18_IMPOSTER_EXACT, "exact-host-service"),
+        (C18_IMPOSTER_WILD, "wildcard-host-service"),
+        (C18_IMPOSTER_PREFIX, "path-prefix-service"),
+    ] {
+        let status = put_imposter(NODES[0].admin, port, body)
+            .await
+            .expect("admin write");
+        assert_eq!(status, 201, "imposter on port {port} was refused");
+    }
+    for port in [C18_IMPOSTER_EXACT, C18_IMPOSTER_WILD, C18_IMPOSTER_PREFIX] {
+        wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("imposter {port} did not bind fleet-wide: {e}"));
+    }
+
+    let (status, body) = put_routes(NODES[0].admin, &c18_route_table())
+        .await
+        .expect("put routes");
+    assert_eq!(status, 200, "route write was refused: {body}");
+
+    let expected_ids = ["exact-host", "prefix", "wild-host"];
+
+    // Pre-restart: every node's own front door already serves all three
+    // shapes (C17's write-barrier guarantee), and every node's stored table
+    // already matches.
+    for (idx, node) in NODES.iter().enumerate() {
+        let (_status, routes_before) = get_json(node.admin, "/front-door/routes")
+            .await
+            .unwrap_or_else(|e| panic!("{}: get routes: {e}", node.name));
+        assert_eq!(
+            route_ids(&routes_before),
+            expected_ids,
+            "{}: pre-restart route table",
+            node.name
+        );
+
+        let (exact, wild, prefix) =
+            c18_probe_all_shapes(FRONT_DOOR_HOST_PORTS[idx], node.name).await;
+        assert_eq!(
+            exact, "exact-host-service",
+            "{}: pre-restart exact-host body",
+            node.name
+        );
+        assert_eq!(
+            wild, "wildcard-host-service",
+            "{}: pre-restart wildcard-host body",
+            node.name
+        );
+        assert_eq!(
+            prefix, "path-prefix-service",
+            "{}: pre-restart path-prefix body",
+            node.name
+        );
+    }
+
+    // The restart: every node down, then every node up.
+    for node in &NODES {
+        cluster.stop(node.name).expect("SIGTERM the node");
+    }
+    for node in &NODES {
+        cluster.start(node.name).expect("restart the node");
+    }
+    cluster
+        .wait_all_ready(Duration::from_secs(120))
+        .await
+        .expect("the fleet comes back");
+    cluster
+        .wait_cluster_formed(Duration::from_secs(120))
+        .await
+        .expect("the fleet re-forms a cluster");
+    for port in [C18_IMPOSTER_EXACT, C18_IMPOSTER_WILD, C18_IMPOSTER_PREFIX] {
+        wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("imposter {port} did not rebind after the restart: {e}"));
+    }
+
+    // Post-restart: both checks, on EVERY node.
+    for (idx, node) in NODES.iter().enumerate() {
+        let (_status, routes_after) = get_json(node.admin, "/front-door/routes")
+            .await
+            .unwrap_or_else(|e| panic!("{}: get routes after restart: {e}", node.name));
+        assert_eq!(
+            route_ids(&routes_after),
+            expected_ids,
+            "{}: route table after restart does not match the pre-restart table",
+            node.name
+        );
+
+        let (exact, wild, prefix) =
+            c18_probe_all_shapes(FRONT_DOOR_HOST_PORTS[idx], node.name).await;
+        assert_eq!(
+            exact, "exact-host-service",
+            "{}: exact-host dispatch after restart -- the stored table survived \
+             (checked above) but the front door's in-memory compiled table was \
+             not rebuilt from it",
+            node.name
+        );
+        assert_eq!(
+            wild, "wildcard-host-service",
+            "{}: wildcard-host dispatch after restart",
+            node.name
+        );
+        assert_eq!(
+            prefix, "path-prefix-service",
+            "{}: path-prefix dispatch after restart",
+            node.name
+        );
+    }
 }
