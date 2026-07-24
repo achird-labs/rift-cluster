@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use rift_cluster::stores::{
     ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, FlowShard, ShardConfig, flow_routes,
 };
@@ -21,7 +22,10 @@ use rift_cluster::{
     Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity,
     PullOnMissInterceptor, RaftNode, metrics,
 };
-use rift_ee::seams::{ImposterManager, RunningServer, ServerBuilder, TlsDefaults};
+use rift_ee::seams::{
+    CompiledRoutes, ImposterManager, RunningFrontDoor, RunningServer, ServerBuilder, TlsDefaults,
+    bind_front_door,
+};
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
 use crate::cli::EeCli;
@@ -141,6 +145,13 @@ pub struct ComposedServer {
     /// The clustered admin front, when clustering is on: it owns the public
     /// admin address, and the OSS admin inside `server` is on loopback.
     front: Option<AdminFront>,
+    /// The front door listener (issue #131), when `--front-door` was given
+    /// under `--cluster`. Bound here rather than inside `server` — see
+    /// `attach_data_plane` for why — so it needs its own shutdown handle.
+    /// `None` both when clustering is off (upstream binds it, if at all,
+    /// inside `server`) and when clustering is on but `--front-door` was not
+    /// given.
+    front_door: Option<RunningFrontDoor>,
     /// Samples the fleet gauges. Aborted on shutdown so it cannot outlive the
     /// node it reads.
     metrics_sampler: Option<tokio::task::JoinHandle<()>>,
@@ -178,6 +189,19 @@ impl ComposedServer {
     #[must_use]
     pub fn probe_addr(&self) -> Option<SocketAddr> {
         self.probes.as_ref().map(ProbeListener::local_addr)
+    }
+
+    /// The bound front-door address, when `--front-door` was given. Either
+    /// this binary's own listener (clustered — issue #131, see
+    /// `attach_data_plane` for why it binds its own rather than upstream's)
+    /// or upstream's, transparently — a caller should not have to know which
+    /// path bound it, and `--cluster`-off parity depends on it not mattering.
+    #[must_use]
+    pub fn front_door_addr(&self) -> Option<SocketAddr> {
+        self.front_door
+            .as_ref()
+            .map(RunningFrontDoor::local_addr)
+            .or_else(|| self.server.front_door_addr())
     }
 
     /// The bound cluster port, when clustering is on.
@@ -223,6 +247,12 @@ impl ComposedServer {
         // request meets a closed port rather than a half-alive pipeline.
         if let Some(front) = self.front {
             front.shutdown().await;
+        }
+        // Independent of the admin plane (it dispatches into the manager
+        // directly, like the gateway port), so it closes on its own here
+        // rather than riding `server.shutdown()`.
+        if let Some(front_door) = self.front_door {
+            front_door.shutdown().await;
         }
         self.server.shutdown().await;
         if let Some(manager) = self.manager {
@@ -373,6 +403,7 @@ pub async fn start_with_runtimes(
             probes: None,
             node: None,
             front: None,
+            front_door: None,
             metrics_sampler: None,
             reconciler: None,
             intent_replayer: None,
@@ -477,27 +508,40 @@ pub async fn start_with_runtimes(
         }
     };
 
+    // The front door's compiled route table (issue #131): created before the
+    // node for the same reason `flow_net`/`pull_on_miss` are — the state
+    // machine takes this handle at construction so a committed `PutRoutes`/
+    // `DeleteRoute` swaps it directly, and so catch-up replay during a join
+    // drives it too, not just live commits after `start` returns. Populated
+    // fleet-wide regardless of whether *this* node binds a listener on it —
+    // routes are a replicated control-plane object like configs, and
+    // `GET /front-door/routes` must answer identically on every node.
+    let front_door_routes = Arc::new(ArcSwap::from_pointee(CompiledRoutes::default()));
+
     let slot = NodeSlot::default();
-    let node = match RaftNode::start(NodeConfig {
-        node_id: identity.node_id(),
-        bind,
-        // Cloned for the same reason as `data_dir` below: `cli` itself is
-        // still needed whole, by `attach_data_plane`.
-        advertise: cli.cluster.cluster_advertise.clone(),
-        // Cloned because the composed server keeps its own handle on the state
-        // directory: it is where a departure gets recorded on the way out.
-        data_dir: state_dir.clone(),
-        secret: cluster.secret,
-        // Seeded with the flow routes: the registry ships empty and the state
-        // backends register their own endpoints (its design contract), and the
-        // operator surface layers its routes on top.
-        routes: cluster_api::routes(
-            flow_routes(Arc::clone(&flow_net)),
-            slot.clone(),
-            Arc::clone(&readiness),
-        ),
-        engine: Some(Arc::clone(&manager)),
-    })
+    let node = match RaftNode::start_with_front_door_routes(
+        NodeConfig {
+            node_id: identity.node_id(),
+            bind,
+            // Cloned for the same reason as `data_dir` below: `cli` itself is
+            // still needed whole, by `attach_data_plane`.
+            advertise: cli.cluster.cluster_advertise.clone(),
+            // Cloned because the composed server keeps its own handle on the state
+            // directory: it is where a departure gets recorded on the way out.
+            data_dir: state_dir.clone(),
+            secret: cluster.secret,
+            // Seeded with the flow routes: the registry ships empty and the state
+            // backends register their own endpoints (its design contract), and the
+            // operator surface layers its routes on top.
+            routes: cluster_api::routes(
+                flow_routes(Arc::clone(&flow_net)),
+                slot.clone(),
+                Arc::clone(&readiness),
+            ),
+            engine: Some(Arc::clone(&manager)),
+        },
+        Arc::clone(&front_door_routes),
+    )
     .await
     {
         Ok(node) => Arc::new(node),
@@ -529,11 +573,20 @@ pub async fn start_with_runtimes(
     // `start` is an embedding seam that callers retry, so a failure must not
     // leave the cluster port bound or the redb state dir locked — it would fail
     // the retry too, with an error that hides the real cause.
-    match attach_data_plane(cli, &node, &readiness, Arc::clone(&manager)).await {
-        Ok((server, front, reconciler)) => Ok(ComposedServer {
+    match attach_data_plane(
+        cli,
+        &node,
+        &readiness,
+        Arc::clone(&manager),
+        front_door_routes,
+    )
+    .await
+    {
+        Ok((server, front, front_door, reconciler)) => Ok(ComposedServer {
             server,
             probes: Some(probes),
             front: Some(front),
+            front_door,
             metrics_sampler: Some(spawn_metrics_sampler(Arc::clone(&node))),
             reconciler: Some(reconciler),
             intent_replayer: Some(spawn_intent_replayer(Arc::clone(&node))),
@@ -562,7 +615,13 @@ async fn attach_data_plane(
     node: &Arc<RaftNode>,
     readiness: &Arc<Readiness>,
     manager: Arc<ImposterManager>,
-) -> anyhow::Result<(RunningServer, AdminFront, tokio::task::JoinHandle<()>)> {
+    front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
+) -> anyhow::Result<(
+    RunningServer,
+    AdminFront,
+    Option<RunningFrontDoor>,
+    tokio::task::JoinHandle<()>,
+)> {
     join_or_bootstrap(node, &cli).await?;
     readiness.satisfy(GATE_JOINED);
 
@@ -577,13 +636,32 @@ async fn attach_data_plane(
     cli.oss.host = "127.0.0.1".to_owned();
     cli.oss.port = 0;
 
+    // Taken, not read: when clustered, this node binds the front door itself
+    // (below), against the table the state machine maintains rather than the
+    // config file `ServerBuilder::start` would otherwise read once at
+    // startup. Left in place, upstream would *also* bind it inside `start()`
+    // a few lines down — the same port, twice. `--cluster` off never reaches
+    // this function, so upstream's own binding is untouched there, which is
+    // what the `parity` job checks.
+    let front_door_addr = match cli
+        .oss
+        .front_door
+        .take()
+        .as_deref()
+        .map(parse_front_door_addr)
+    {
+        Some(Ok(addr)) => Some(addr),
+        Some(Err(e)) => return Err(e.context("--front-door")),
+        None => None,
+    };
+
     let barrier = cli.cluster.cluster_write_barrier;
     let barrier_timeout = Duration::from_secs(cli.cluster.cluster_write_barrier_timeout);
     let admin_async = cli.cluster.cluster_admin_async;
     let seeds = cli.cluster.cluster_seeds.clone();
 
     let server = ServerBuilder::from_cli(cli.oss)
-        .manager(manager)
+        .manager(Arc::clone(&manager))
         .start()
         .await?;
 
@@ -603,6 +681,26 @@ async fn attach_data_plane(
         ));
     }
 
+    // Bound after the node (issue #131): the same "engine constructed before
+    // the node" ordering problem `PullOnMissInterceptor` and `FlowNet::bind`
+    // both solve by binding late. `front_door_routes` is the exact `ArcSwap`
+    // the state machine writes into, so a route committed after this returns
+    // takes effect with no listener restart — and one committed *before* this
+    // node finished joining is already reflected in it, because the handle
+    // was attached before `Raft::new` and catch-up replay drives it like any
+    // other commit.
+    let front_door = if let Some(addr) = front_door_addr {
+        match bind_front_door(addr, Arc::clone(&manager), front_door_routes).await {
+            Ok(running) => Some(running),
+            Err(e) => {
+                server.shutdown().await;
+                return Err(e.context("front door"));
+            }
+        }
+    } else {
+        None
+    };
+
     let front = match admin_front::bind(
         FrontConfig {
             public_addr: public_admin.clone(),
@@ -620,6 +718,9 @@ async fn attach_data_plane(
     {
         Ok(front) => front,
         Err(e) => {
+            if let Some(front_door) = front_door {
+                front_door.shutdown().await;
+            }
             server.shutdown().await;
             return Err(anyhow::Error::new(e).context(format!(
                 "binding the clustered admin front on {public_admin}"
@@ -627,7 +728,30 @@ async fn attach_data_plane(
         }
     };
 
-    Ok((server, front, spawn_reconciler(node, readiness, seeds)))
+    Ok((
+        server,
+        front,
+        front_door,
+        spawn_reconciler(node, readiness, seeds),
+    ))
+}
+
+/// Parse `--front-door`'s value the same way upstream's own (private)
+/// `parse_front_door_addr` does: `HOST:PORT`, or a bare port meaning every
+/// interface. Duplicated rather than reached for, because upstream keeps it
+/// `fn`-private to `rift_http_proxy::server` — there is no seam to call
+/// through, and it is five lines.
+fn parse_front_door_addr(value: &str) -> anyhow::Result<SocketAddr> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(port) = value.parse::<u16>() {
+        return Ok(SocketAddr::from(([0, 0, 0, 0], port)));
+    }
+    anyhow::bail!(
+        "--front-door '{value}' is not a valid bind address; use HOST:PORT (e.g. 0.0.0.0:8080) \
+         or a bare port number"
+    )
 }
 
 /// Everywhere this node may offer itself when it needs to (re)join: the

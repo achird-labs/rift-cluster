@@ -2471,6 +2471,7 @@ name = "rift-cluster"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "futures-lite",
  "hmac",
  "http-body-util",
@@ -2512,6 +2513,7 @@ name = "rift-ee-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "clap",
  "http-body-util",
  "hyper",

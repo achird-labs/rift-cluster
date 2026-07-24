@@ -109,6 +109,17 @@ pub mod seams {
     pub use rift_http_proxy::server::{
         Cli, Commands, RunningServer, ServerBuilder, run_metrics_server,
     };
+
+    /// The front door's route table (issue #19 / U-11): content-based routing
+    /// from one listener to many imposters. Upstream ships the listener, the
+    /// matcher and the config-file surface; its admin CRUD was deferred, which
+    /// is why the clustered admin front provides it as a replicated
+    /// control-plane object (issue #131) rather than proxying to an upstream
+    /// endpoint that does not exist.
+    pub use rift_http_proxy::front_door::{
+        CompiledRoutes, HeaderMatch, Route, RouteMatch, RouteTable, RouteTableError, RouteTarget,
+        RunningFrontDoor, bind_front_door,
+    };
 }
 
 /// Build edition marker, surfaced in banners and `--version` output.
@@ -211,6 +222,17 @@ mod tests {
             run_metrics_server,
             with_annotation_scope::<std::future::Ready<()>>,
         );
+
+        // Front-door route table (issue #131).
+        _named::<RouteTable>();
+        _named::<Route>();
+        _named::<RouteMatch>();
+        _named::<RouteTarget>();
+        _named::<HeaderMatch>();
+        _named::<RouteTableError>();
+        _named::<CompiledRoutes>();
+        _named::<RunningFrontDoor>();
+        let _ = bind_front_door;
     }
 
     /// A provider-supplied store can read its own options out of `flowState`.

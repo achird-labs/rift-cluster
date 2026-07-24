@@ -51,6 +51,11 @@ serde_json = "1.0"
 # Control-op identity (ADR-001 §4.1): `op_id` for idempotency/dedup across the
 # Raft log. v4 minted by the accepting node when the client sends none.
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
+# Hot-swappable front-door route table (issue #131): the same version
+# rift-http-proxy already pins, so the workspace resolves one copy and the
+# `Arc<ArcSwap<CompiledRoutes>>` the state machine writes is the exact type
+# `bind_front_door` reads.
+arc-swap = "1.7"
 
 # Cluster transport. hyper/hyper-util/http-body-util track the versions the
 # vendored engine already builds against, so the workspace resolves one copy.

@@ -8,7 +8,7 @@
 //! that can differ per node (port binds, listener state) lives in the engine
 //! drive *after* apply, never here.
 
-use rift_ee::seams::{ImposterConfig, Stub};
+use rift_ee::seams::{ImposterConfig, RouteTable, Stub};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -111,6 +111,20 @@ pub enum ControlOp {
         tenant: TenantId,
         port: u16,
         enabled: bool,
+    },
+    /// Whole-table replace of the front door's route table (issue #19 / U-11,
+    /// enterprise #131). Never a partial merge: [`RouteTable::validate`]
+    /// checks the table as a unit (ambiguity is a property of the whole set),
+    /// so admission must see — and apply must store — the whole thing.
+    PutRoutes {
+        tenant: TenantId,
+        table: RouteTable,
+    },
+    /// Remove one route by id. Idempotent at the state-machine level, like
+    /// [`ControlOp::DeleteImposter`] — see `mutate_tables`'s comment for why.
+    DeleteRoute {
+        tenant: TenantId,
+        id: String,
     },
     TenantPut {
         body: serde_json::Value,
@@ -241,6 +255,20 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
         }
         ControlOp::DeleteAll { tenant } => require_default_tenant(tenant),
         ControlOp::SetEnabled { tenant, .. } => require_default_tenant(tenant),
+        ControlOp::PutRoutes { tenant, table } => {
+            require_default_tenant(tenant)?;
+            // The U-11 rules (unique ids, ambiguous enabled matches,
+            // strip_prefix without path_prefix, malformed wildcard/method/
+            // prefix) plus the whole-table atomicity the issue calls for: a
+            // table is accepted or refused as a unit, never partially.
+            table.validate().map_err(|e| e.to_string())
+        }
+        // A delete removes one route from an already-validated table.
+        // Ambiguity is pairwise, so removing an element can only shrink the
+        // set of matching pairs, never create one — the remaining table is
+        // structurally guaranteed valid, so there is nothing to check here
+        // beyond the tenant gate.
+        ControlOp::DeleteRoute { tenant, .. } => require_default_tenant(tenant),
         ControlOp::TenantPut { .. }
         | ControlOp::TenantDelete { .. }
         | ControlOp::PrincipalPut { .. }
@@ -277,6 +305,12 @@ pub(crate) fn precondition_target(op: &ControlOp) -> Option<(&TenantId, u16)> {
         | ControlOp::DeleteImposter { tenant, port }
         | ControlOp::SetEnabled { tenant, port, .. } => Some((tenant, *port)),
         ControlOp::DeleteAll { .. }
+        // No `expected_revision` support for routes (yet): `PutRoutes` is a
+        // whole-table replace with no single stored record to condition on,
+        // and a per-route precondition is future work if a single-route
+        // upsert op ever lands.
+        | ControlOp::PutRoutes { .. }
+        | ControlOp::DeleteRoute { .. }
         | ControlOp::TenantPut { .. }
         | ControlOp::TenantDelete { .. }
         | ControlOp::PrincipalPut { .. }
@@ -461,6 +495,20 @@ mod tests {
                 },
                 "SetEnabled",
             ),
+            (
+                ControlOp::PutRoutes {
+                    tenant: TenantId::default(),
+                    table: RouteTable::default(),
+                },
+                "PutRoutes",
+            ),
+            (
+                ControlOp::DeleteRoute {
+                    tenant: TenantId::default(),
+                    id: "r".to_owned(),
+                },
+                "DeleteRoute",
+            ),
             (ControlOp::TenantPut { body: json!({}) }, "TenantPut"),
             (ControlOp::TenantDelete { body: json!({}) }, "TenantDelete"),
             (ControlOp::PrincipalPut { body: json!({}) }, "PrincipalPut"),
@@ -609,6 +657,111 @@ mod tests {
             let err = validate(&op).expect_err("reserved until RFC-002");
             assert!(err.contains("#17"), "{err}");
         }
+    }
+
+    // -- validate: PutRoutes / DeleteRoute -------------------------------------
+
+    use rift_ee::seams::{Route, RouteMatch, RouteTarget};
+
+    fn route(id: &str, port: u16) -> Route {
+        Route {
+            id: id.to_owned(),
+            priority: 0,
+            matches: RouteMatch::default(),
+            target: RouteTarget {
+                port,
+                strip_prefix: false,
+                set_host: None,
+            },
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_route_table() {
+        let op = ControlOp::PutRoutes {
+            tenant: TenantId::default(),
+            table: RouteTable {
+                routes: vec![route("a", 1)],
+            },
+        };
+        assert_eq!(validate(&op), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_put_routes_on_a_non_default_tenant() {
+        let op = ControlOp::PutRoutes {
+            tenant: TenantId::new("acme"),
+            table: RouteTable::default(),
+        };
+        let err = validate(&op).expect_err("non-default tenant must be rejected");
+        assert!(err.contains("tenant"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_a_route_table_with_duplicate_ids() {
+        let op = ControlOp::PutRoutes {
+            tenant: TenantId::default(),
+            table: RouteTable {
+                routes: vec![route("same", 1), route("same", 2)],
+            },
+        };
+        let err = validate(&op).expect_err("duplicate route ids must be rejected");
+        assert!(err.contains("same"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_a_route_table_with_ambiguous_enabled_matches() {
+        let a = route("a", 1);
+        let b = route("b", 2);
+        let op = ControlOp::PutRoutes {
+            tenant: TenantId::default(),
+            // Both catch-all (default `RouteMatch`), both enabled, same
+            // priority: the exact ambiguity `RouteTable::validate` exists to
+            // catch.
+            table: RouteTable { routes: vec![a, b] },
+        };
+        let err = validate(&op).expect_err("ambiguous enabled matches must be rejected");
+        assert!(err.contains("match"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_strip_prefix_without_a_path_prefix() {
+        let mut bad = route("bad", 1);
+        bad.target.strip_prefix = true;
+        let op = ControlOp::PutRoutes {
+            tenant: TenantId::default(),
+            table: RouteTable { routes: vec![bad] },
+        };
+        let err = validate(&op).expect_err("strip_prefix without path_prefix must be rejected");
+        assert!(err.contains("strip_prefix"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_wildcard_host() {
+        let mut bad = route("bad", 1);
+        bad.matches.host = Some("pay*.test".to_owned());
+        let op = ControlOp::PutRoutes {
+            tenant: TenantId::default(),
+            table: RouteTable { routes: vec![bad] },
+        };
+        let err = validate(&op).expect_err("a malformed wildcard host must be rejected");
+        assert!(err.contains("wildcard"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_delete_route_on_the_default_tenant_only() {
+        let op = ControlOp::DeleteRoute {
+            tenant: TenantId::default(),
+            id: "any".to_owned(),
+        };
+        assert_eq!(validate(&op), Ok(()));
+
+        let op = ControlOp::DeleteRoute {
+            tenant: TenantId::new("acme"),
+            id: "any".to_owned(),
+        };
+        validate(&op).expect_err("non-default tenant is still refused");
     }
 
     // -- apply_edit -----------------------------------------------------------
