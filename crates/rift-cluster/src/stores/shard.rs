@@ -439,8 +439,20 @@ impl FlowShard {
         durability: Durability,
     ) -> Result<bool, ShardError> {
         let wait = {
+            let now = now_millis();
             let mut guard = self.inner.memory.write();
-            if let Some(current) = guard.get(flow_id).and_then(|flow| flow.keys.get(key))
+            // `is_live`, matching `get_versioned`: an expired record is not a
+            // record. Without this filter the comparison here was stricter than
+            // the read it replaced — a delayed write could be refused by a
+            // tombstone that had already aged out, which is a different policy
+            // than the one #126 chose (tombstones expire so deleted keys do not
+            // accumulate) smuggled in as a side effect of making the merge
+            // atomic. Atomicity was the only thing that change was entitled to
+            // alter.
+            if let Some(current) = guard
+                .get(flow_id)
+                .and_then(|flow| flow.keys.get(key))
+                .filter(|current| is_live(current, now))
                 && !current.superseded_by(&entry)
             {
                 return Ok(false);
