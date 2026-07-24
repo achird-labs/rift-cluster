@@ -188,6 +188,51 @@ fn an_async_write_inside_the_window_is_lost_or_intact_never_torn() {
     }
 }
 
+/// `merge` must treat an expired record exactly as `get_versioned` does — as
+/// absent. The two are the read and the compare-and-write of the same rule, and
+/// when #140 made the merge atomic it compared against the raw map instead,
+/// which silently made an aged-out tombstone keep refusing writes. That is a
+/// different expiry policy than the one chosen (tombstones expire so deleted
+/// keys do not accumulate), arrived at as a side effect rather than a decision.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_treats_an_expired_record_as_absent_just_like_get_versioned() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard = FlowShard::open(dir.path(), ShardConfig::default()).expect("open");
+
+    // A high-version record that is already expired: `get_versioned` hides it,
+    // so `merge` must not let it win either.
+    let mut stale = entry("stale");
+    stale.v = 99;
+    stale.expires_at = 1; // 1970.
+    shard
+        .set("flow-1", "slot", stale, Durability::Sync)
+        .await
+        .expect("seed expired");
+    assert_eq!(
+        shard.get_versioned("flow-1", "slot"),
+        None,
+        "precondition: get_versioned hides an expired record"
+    );
+
+    // A *lower* version than the expired one. Against the raw map it loses;
+    // against the live view there is nothing to lose to, so it must install.
+    let mut fresh = entry("fresh");
+    fresh.v = 1;
+    let installed = shard
+        .merge("flow-1", "slot", fresh, Durability::Sync)
+        .await
+        .expect("merge");
+    assert!(
+        installed,
+        "an expired record must not block a merge — get_versioned would have \
+         reported the slot empty, and merge has to agree with it"
+    );
+    assert_eq!(
+        shard.get_versioned("flow-1", "slot").map(|e| e.value),
+        Some(serde_json::json!("fresh"))
+    );
+}
+
 #[tokio::test]
 async fn recovery_drops_what_had_already_expired() {
     let dir = tempfile::TempDir::new().expect("tempdir");
