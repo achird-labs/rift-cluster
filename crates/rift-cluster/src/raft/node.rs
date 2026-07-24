@@ -16,10 +16,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use openraft::error::{ClientWriteError, InitializeError, RaftError};
 use openraft::metrics::WaitError;
 use openraft::{BasicNode, Config, Raft, ServerState};
-use rift_ee::seams::{ImposterConfig, ImposterManager};
+use rift_ee::seams::{CompiledRoutes, ImposterConfig, ImposterManager, RouteTable};
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -259,11 +260,37 @@ impl RaftNode {
     /// does not form or join a cluster; call [`RaftNode::cluster_init`] to
     /// bootstrap a new one or [`RaftNode::join_via`] to attach to an existing one.
     pub async fn start(config: NodeConfig) -> Result<Self, NodeError> {
+        Self::start_inner(config, None).await
+    }
+
+    /// Like [`Self::start`], with the front door's compiled-route handle
+    /// attached to the state machine before `Raft::new` (issue #131) — a
+    /// separate constructor rather than a `NodeConfig` field so every
+    /// existing caller (most of which never touch the front door) keeps
+    /// compiling untouched. Same before-construction contract as
+    /// `NodeConfig::engine`: attaching here, rather than after this call
+    /// returns, means catch-up replay during a join drives the `ArcSwap`
+    /// too, not just live commits afterward.
+    pub async fn start_with_front_door_routes(
+        config: NodeConfig,
+        front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
+    ) -> Result<Self, NodeError> {
+        Self::start_inner(config, Some(front_door_routes)).await
+    }
+
+    async fn start_inner(
+        config: NodeConfig,
+        front_door_routes: Option<Arc<ArcSwap<CompiledRoutes>>>,
+    ) -> Result<Self, NodeError> {
         let (log_store, state_machine) = store::new(config.data_dir.join(RAFT_DB_FILE))
             .await
             .map_err(|e| NodeError::Storage(e.to_string()))?;
         let state_machine = match &config.engine {
             Some(engine) => state_machine.with_engine(engine.clone()),
+            None => state_machine,
+        };
+        let state_machine = match front_door_routes {
+            Some(routes) => state_machine.with_routes_handle(routes),
             None => state_machine,
         };
         let sm_reader = state_machine.clone();
@@ -1091,6 +1118,17 @@ impl RaftNode {
     pub fn configured_ports(&self) -> Result<Vec<u16>, NodeError> {
         self.sm_reader
             .configured_ports()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The default tenant's front-door route table, as currently applied.
+    /// Like [`Self::configured_ports`], this answers from local durable state
+    /// — it does not require leadership. Issue #131: upstream has no `GET
+    /// /front-door/routes` for the clustered admin front to proxy to, so this
+    /// is the only read path.
+    pub fn route_table(&self) -> Result<RouteTable, NodeError> {
+        self.sm_reader
+            .route_table()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 

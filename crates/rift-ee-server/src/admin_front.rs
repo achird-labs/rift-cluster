@@ -64,8 +64,9 @@ use rift_cluster::control::{self, ControlOp, ControlRequest, StubEdit, StubEditS
 use rift_cluster::decorate::{HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS};
 use rift_cluster::{ControlOutcome, ControlResponse, NodeError, RaftNode, TenantId};
 use rift_ee::seams::{
-    ErrorKind, ImposterConfig, RiftScriptConfig, ScriptBaseDir, Stub, config_uses_script_surface,
-    error_response_typed, resolve_scripts, resolve_stub_scripts, validate_stub, validate_stubs,
+    ErrorKind, ImposterConfig, RiftScriptConfig, RouteTable, ScriptBaseDir, Stub,
+    config_uses_script_surface, error_response_typed, resolve_scripts, resolve_stub_scripts,
+    validate_stub, validate_stubs,
 };
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -337,9 +338,28 @@ enum Terminated {
     ReplaceStubById(u16, String),
     DeleteStubById(u16, String),
     SetEnabled(u16, bool),
+    /// Whole-table replace of the front door's route table (issue #131).
+    /// There is no upstream `/front-door/routes` to proxy to (U-11's admin
+    /// CRUD was deferred), so this is provided here, not there.
+    PutRoutes,
+    DeleteRoute(String),
 }
 
 fn classify(method: &Method, path: &str) -> Option<Terminated> {
+    if path == "/front-door/routes" {
+        // `GET` is a read, not a mutation — it terminates in `handle` directly
+        // rather than through this (write-only) classifier.
+        return match *method {
+            Method::PUT => Some(Terminated::PutRoutes),
+            _ => None,
+        };
+    }
+    if let Some(id) = path.strip_prefix("/front-door/routes/") {
+        return match *method {
+            Method::DELETE if !id.is_empty() => Some(Terminated::DeleteRoute(id.to_owned())),
+            _ => None,
+        };
+    }
     if path == "/imposters" {
         return match *method {
             Method::POST => Some(Terminated::Create),
@@ -379,9 +399,68 @@ fn classify(method: &Method, path: &str) -> Option<Terminated> {
 
 async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<FrontBody> {
     let path = req.uri().path().to_owned();
+    // A state-machine read, not a mutation: it never reaches `classify`
+    // (write-only) or `proxy` (there is no upstream `/front-door/routes` to
+    // proxy to — U-11's admin CRUD was deferred).
+    if req.method() == Method::GET && path == "/front-door/routes" {
+        return read_routes(&state, &req).await;
+    }
     match classify(req.method(), &path) {
         Some(kind) => terminate(state, req, kind).await,
         None => proxy(state, req).await,
+    }
+}
+
+/// `GET /front-door/routes`: the current default-tenant route table, read
+/// straight from the state machine. This is the front door's *only* read
+/// path (issue #131) — upstream never shipped a `GET` to proxy to, so unlike
+/// every other read in this module, there is no loopback re-read to fall
+/// back on.
+async fn read_routes(state: &Arc<FrontState>, req: &Request<Incoming>) -> Response<FrontBody> {
+    if let Some(response) = authorize(state, req) {
+        return response;
+    }
+    let Some(node) = state.node.upgrade() else {
+        return typed_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Unavailable,
+            "cluster node is shutting down",
+        );
+    };
+    match node.route_table() {
+        Ok(table) => match serde_json::to_vec(&table) {
+            Ok(body) => buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
+                .unwrap_or_else(|response| response),
+            Err(e) => internal(&e.to_string()),
+        },
+        Err(e) => internal(&e.to_string()),
+    }
+}
+
+/// The same whole-header constant-time comparison the OSS admin performs,
+/// factored out so the one read path that never reaches `proxy` or
+/// `terminate` (`GET /front-door/routes`) still enforces it.
+///
+/// `Some(refusal)` means the request is denied and that response must be
+/// returned; `None` means it may proceed. An `Option` rather than a
+/// `Result<(), Response<..>>` because neither caller uses `?` — the error was
+/// pure payload, and a `Response` is large enough that carrying it in an `Err`
+/// trips `clippy::result_large_err` for no benefit.
+///
+/// `#[must_use]`: dropping the verdict would let an unauthorized request
+/// through silently, which is the one failure mode an auth guard must not have.
+#[must_use]
+fn authorize(state: &FrontState, req: &Request<Incoming>) -> Option<Response<FrontBody>> {
+    let expected = state.api_key.as_ref()?;
+    let presented = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) {
+        None
+    } else {
+        Some(unauthorized())
     }
 }
 
@@ -455,19 +534,16 @@ async fn terminate(
         );
     };
 
-    // The same whole-header constant-time comparison the OSS admin performs;
-    // terminated requests never reach it, so its gate is enforced here.
+    // Terminated requests never reach the OSS admin's own gate, so it is
+    // enforced here.
+    if let Some(response) = authorize(&state, &req) {
+        return response;
+    }
     let auth = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    if let Some(expected) = &state.api_key {
-        let presented = auth.as_deref().unwrap_or("");
-        if !bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) {
-            return unauthorized();
-        }
-    }
 
     let host = req.headers().get("host").cloned();
     let idempotency = req
@@ -1056,6 +1132,62 @@ async fn build_mutation(
                 status: StatusCode::OK,
             },
         }),
+        Terminated::PutRoutes => {
+            let table: RouteTable = parse(body)?;
+            // No loopback re-read: there is no upstream `/front-door/routes`
+            // to fetch from (U-11's admin CRUD was deferred). A whole-table
+            // replace is deterministic and pre-validated (`build_and_run`
+            // runs `control::validate` before this ever commits), so the
+            // table just parsed IS what gets stored — captured now rather
+            // than re-read, the same shortcut `SetEnabled` takes for its
+            // canned message.
+            let body = serde_json::to_vec(&table).map_err(|e| internal(&e.to_string()))?;
+            Ok(Mutation {
+                ops: vec![ControlOp::PutRoutes {
+                    tenant: TenantId::default(),
+                    table,
+                }],
+                // No single stored record: a whole-table replace has no port
+                // to label the revision header with, and (as a consequence)
+                // no `If-Match` precondition either — see `precondition_target`.
+                port: None,
+                render: Render::Captured {
+                    body: Bytes::from(body),
+                    content_type: json_content_type(),
+                    status: StatusCode::OK,
+                },
+            })
+        }
+        Terminated::DeleteRoute(id) => {
+            // Mirrors `DeleteImposter`: idempotent at the state-machine level
+            // (`mutate_tables`'s `DeleteRoute` arm never fails), but the admin
+            // surface still answers 404 for a route that was never there —
+            // captured *before* the delete commits, the same as
+            // `DeleteImposter`'s pre-delete fetch, just read from the state
+            // machine directly since there is no loopback endpoint to fetch
+            // from.
+            let table = node.route_table().map_err(|e| internal(&e.to_string()))?;
+            let Some(route) = table.routes.iter().find(|r| r.id == id) else {
+                return Err(typed_error(
+                    StatusCode::NOT_FOUND,
+                    ErrorKind::NoSuchResource,
+                    &format!("no route with id {id:?}"),
+                ));
+            };
+            let body = serde_json::to_vec(route).map_err(|e| internal(&e.to_string()))?;
+            Ok(Mutation {
+                ops: vec![ControlOp::DeleteRoute {
+                    tenant: TenantId::default(),
+                    id,
+                }],
+                port: None,
+                render: Render::Captured {
+                    body: Bytes::from(body),
+                    content_type: json_content_type(),
+                    status: StatusCode::OK,
+                },
+            })
+        }
     }
 }
 
@@ -1581,6 +1713,34 @@ mod tests {
 
         // An unparseable port is not this surface's route at all.
         assert!(classify(&Method::DELETE, "/imposters/not-a-port").is_none());
+    }
+
+    /// The front-door route surface (issue #131): `PUT`/`DELETE` terminate,
+    /// `GET` does not (it never reaches `classify` at all — `handle` answers
+    /// it directly, since there is no upstream endpoint to proxy it to).
+    #[test]
+    fn classify_terminates_exactly_the_route_write_surface() {
+        assert!(matches!(
+            classify(&Method::PUT, "/front-door/routes"),
+            Some(Terminated::PutRoutes)
+        ));
+        assert!(matches!(
+            classify(&Method::DELETE, "/front-door/routes/svc"),
+            Some(Terminated::DeleteRoute(id)) if id == "svc"
+        ));
+
+        for (method, path) in [
+            (Method::GET, "/front-door/routes"),
+            (Method::POST, "/front-door/routes"),
+            (Method::DELETE, "/front-door/routes"),
+            (Method::PUT, "/front-door/routes/svc"),
+            (Method::DELETE, "/front-door/routes/"),
+        ] {
+            assert!(
+                classify(&method, path).is_none(),
+                "{method} {path} must not terminate as a route write"
+            );
+        }
     }
 
     #[test]

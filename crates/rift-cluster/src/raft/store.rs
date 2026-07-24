@@ -11,6 +11,9 @@
 //! * `raft_snapshot` — `() -> StoredSnapshot` (JSON): the last installed/built snapshot.
 //! * `sm_configs`    — `(tenant, port) -> StoredImposter` (JSON): the applied
 //!   config, its enabled flag, and the revision (log index) that last wrote it.
+//! * `sm_routes`     — `(tenant, route id) -> Route` (JSON): the front door's
+//!   replicated route table (issue #131). Read as a whole per tenant to
+//!   recompile a [`CompiledRoutes`] after every mutating op.
 //! * `sm_op_dedup`   — `op_id -> DedupEntry` (JSON): the response recorded for an
 //!   applied op, kept for [`DEDUP_TTL_SECS`] so a replayed intent (crash-replay,
 //!   client retry with the same `Idempotency-Key`) is exactly-once-in-effect.
@@ -50,6 +53,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
     BasicNode, Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
@@ -57,7 +61,9 @@ use openraft::{
 };
 use parking_lot::Mutex;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDefinition};
-use rift_ee::seams::{ApplyReport, ImposterConfig, ImposterError, ImposterManager};
+use rift_ee::seams::{
+    ApplyReport, CompiledRoutes, ImposterConfig, ImposterError, ImposterManager, Route, RouteTable,
+};
 use serde::{Deserialize, Serialize};
 
 use super::TypeConfig;
@@ -72,6 +78,11 @@ const LOG_META_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_lo
 const VOTE_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_vote");
 const SNAPSHOT_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("raft_snapshot");
 const SM_CONFIGS_TABLE: TableDefinition<(&str, u16), &str> = TableDefinition::new("sm_configs");
+/// `(tenant, route id) -> Route` (JSON): the front door's replicated route
+/// table (issue #131). One row per route rather than one row per table, so a
+/// `DeleteRoute` is a single-key removal instead of a read-modify-write of
+/// the whole tenant's set.
+const SM_ROUTES_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_routes");
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
 /// Node-local durable intents (issue #9 R4): ops this node accepted but has
@@ -130,6 +141,12 @@ struct DedupEntry {
 struct SnapshotPayload {
     /// `(tenant, port, stored-imposter JSON)` rows of `sm_configs`.
     configs: Vec<(String, u16, String)>,
+    /// `(tenant, route id, route JSON)` rows of `sm_routes`. Defaulted so a
+    /// snapshot built before issue #131 still installs cleanly on an upgraded
+    /// node — it just carries no routes, the same as a fleet that never wrote
+    /// any.
+    #[serde(default)]
+    routes: Vec<(String, String, String)>,
     /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
     dedup: Vec<(String, String)>,
     last_applied_log: Option<LogId<u64>>,
@@ -172,6 +189,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(VOTE_TABLE).map_err(io)?;
         write_txn.open_table(SNAPSHOT_TABLE).map_err(io)?;
         write_txn.open_table(SM_CONFIGS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_ROUTES_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
         write_txn.open_table(PENDING_INTENTS_TABLE).map_err(io)?;
@@ -444,6 +462,20 @@ enum EngineAction {
         port: u16,
         error: String,
     },
+    /// Recompile and hot-swap the front door's route table (issue #131),
+    /// carrying the desired table computed *as of that op* — the same
+    /// intra-transaction snapshot discipline as `Sync` above, and for the same
+    /// reason: a batch that both writes and deletes routes must replay against
+    /// the ArcSwap through the same intermediate states the table went
+    /// through.
+    SyncRoutes(RouteTable),
+    /// A route sync that must NOT run: a stored record failed to parse. The
+    /// front door keeps its last-known-good compiled table rather than
+    /// swapping in a partial one.
+    RefuseRoutesSync {
+        id: String,
+        error: String,
+    },
 }
 
 #[derive(Clone)]
@@ -454,6 +486,13 @@ pub struct RedbStateMachine {
     /// tests and while the embedder has not wired one — the state machine is
     /// then tables-only, which is exactly what the conformance suite exercises.
     engine: Option<Arc<ImposterManager>>,
+    /// The front door's hot-swappable compiled table (issue #131). `None` in
+    /// storage tests and on a node that never binds a front door — routes are
+    /// still replicated and readable from `sm_routes` either way, this is only
+    /// the dispatch-side handle. Attach before `Raft::new` for the same reason
+    /// as `engine`: replay during join must drive it too, not just live
+    /// commits.
+    routes: Option<Arc<ArcSwap<CompiledRoutes>>>,
     /// Last engine side-effect failure per port, cleared when a later drive
     /// succeeds for that port. Key 0 is the set-level slot (an `apply_config`
     /// refusal that names no single port). This is node status, not replicated
@@ -465,6 +504,7 @@ impl std::fmt::Debug for RedbStateMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedbStateMachine")
             .field("engine", &self.engine.is_some())
+            .field("routes", &self.routes.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -475,6 +515,7 @@ impl RedbStateMachine {
             db,
             snapshot_idx: Arc::new(AtomicU64::new(0)),
             engine: None,
+            routes: None,
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -485,6 +526,14 @@ impl RedbStateMachine {
     #[must_use]
     pub fn with_engine(mut self, engine: Arc<ImposterManager>) -> Self {
         self.engine = Some(engine);
+        self
+    }
+
+    /// Attach the front door's compiled-route handle. Same before-`Raft::new`
+    /// contract as [`Self::with_engine`].
+    #[must_use]
+    pub fn with_routes_handle(mut self, routes: Arc<ArcSwap<CompiledRoutes>>) -> Self {
+        self.routes = Some(routes);
         self
     }
 
@@ -574,6 +623,35 @@ impl RedbStateMachine {
             }
         }
         Ok(ports)
+    }
+
+    /// The default tenant's route table, as currently applied. Like
+    /// [`Self::read_config`], this is the node's own read path — it answers
+    /// from local durable state without a Raft round trip. It is also the
+    /// *only* read path for routes: upstream has no `GET /front-door/routes`
+    /// to proxy to (U-11's admin CRUD was deferred), so `GET
+    /// /front-door/routes` in the clustered admin front calls straight
+    /// through to this.
+    #[allow(clippy::result_large_err)]
+    pub fn route_table(&self) -> StorageResult<RouteTable> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_ROUTES_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        match Self::desired_routes(&table)
+            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+        {
+            Ok(table) => Ok(table),
+            Err((id, error)) => {
+                tracing::error!(route_id = %id, error = %error, "corrupt stored route");
+                Err(StorageError::from(StorageIOError::read_state_machine(
+                    &std::io::Error::other(format!("corrupt stored route {id}: {error}")),
+                )))
+            }
+        }
     }
 
     /// Last engine side-effect failure per port (0 = set-level), as recorded by
@@ -736,22 +814,37 @@ impl RedbStateMachine {
     /// engine-side failures land in [`Self::apply_failures`] as usual.
     #[allow(clippy::result_large_err)]
     pub async fn reconcile_engine(&self) -> StorageResult<()> {
-        let action = {
+        // Both tables read fresh, in one call: a restart's local `ImposterManager`
+        // and `ArcSwap<CompiledRoutes>` both start empty (they are process-local,
+        // rebuilt from persisted `sm_configs`/`sm_routes`), and a live commit only
+        // drives the table it touched — nothing else re-seeds the other on a
+        // cold start.
+        let (config_action, routes_action) = {
             let read_txn = self
                 .db
                 .begin_read()
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let table = read_txn
+            let configs = read_txn
                 .open_table(SM_CONFIGS_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            match Self::desired_configs(&table)
+            let config_action = match Self::desired_configs(&configs)
                 .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
             {
                 Ok(desired) => EngineAction::Sync(desired),
                 Err((port, error)) => EngineAction::RefuseSync { port, error },
-            }
+            };
+            let routes = read_txn
+                .open_table(SM_ROUTES_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let routes_action = match Self::desired_routes(&routes)
+                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+            {
+                Ok(table) => EngineAction::SyncRoutes(table),
+                Err((id, error)) => EngineAction::RefuseRoutesSync { id, error },
+            };
+            (config_action, routes_action)
         };
-        self.drive_engine(vec![action]).await;
+        self.drive_engine(vec![config_action, routes_action]).await;
         Ok(())
     }
 
@@ -840,6 +933,50 @@ impl RedbStateMachine {
         })
     }
 
+    /// The desired route table as of now, read from an open (possibly
+    /// mid-transaction) view of `sm_routes`: every default-tenant route.
+    ///
+    /// `Ok(Err((id, reason)))` means a stored record failed to parse — this
+    /// crate is the only writer of `sm_routes`, so it should never happen in
+    /// practice, but the read path stays defensive rather than trusting that
+    /// (mirrors [`Self::desired_configs`]).
+    fn desired_routes(
+        table: &impl ReadableTable<(&'static str, &'static str), &'static str>,
+    ) -> Result<Result<RouteTable, (String, String)>, redb::StorageError> {
+        let mut routes = Vec::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            let (tenant, id) = key.value();
+            if tenant != DEFAULT_TENANT {
+                continue;
+            }
+            match serde_json::from_str::<Route>(value.value()) {
+                Ok(route) => routes.push(route),
+                Err(e) => {
+                    return Ok(Err((
+                        id.to_owned(),
+                        format!("stored route will not parse: {e}"),
+                    )));
+                }
+            }
+        }
+        Ok(Ok(RouteTable { routes }))
+    }
+
+    /// Build the engine action for a route op: a full sync when every stored
+    /// record parses, a recorded refusal when one does not.
+    #[allow(clippy::result_large_err)]
+    fn sync_routes_action(
+        routes: &Table<'_, (&'static str, &'static str), &'static str>,
+    ) -> StorageResult<EngineAction> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        Ok(match Self::desired_routes(routes).map_err(io)? {
+            Ok(table) => EngineAction::SyncRoutes(table),
+            Err((id, error)) => EngineAction::RefuseRoutesSync { id, error },
+        })
+    }
+
     /// Check op's `expected_revision` (#46) against the stored revision of the
     /// record it addresses. `Ok(Err(reason))` is a deterministic domain refusal
     /// — recorded as the same committed `Failed` outcome `validate` and
@@ -897,6 +1034,7 @@ impl RedbStateMachine {
     #[allow(clippy::result_large_err)]
     fn mutate_tables(
         configs: &mut Table<'_, (&'static str, u16), &'static str>,
+        routes: &mut Table<'_, (&'static str, &'static str), &'static str>,
         op: &ControlOp,
         index: u64,
     ) -> StorageResult<Result<Vec<EngineAction>, String>> {
@@ -1039,6 +1177,29 @@ impl RedbStateMachine {
                     enabled: *enabled,
                 }]))
             }
+            ControlOp::PutRoutes { tenant, table } => {
+                // Whole-table replace: clear this tenant's rows, then insert
+                // the validated set. `validate` already confirmed the table
+                // as a unit, so there is nothing left to check here — only to
+                // store, deterministically, on every replica.
+                let tenant_str = tenant.as_str();
+                routes.retain(|(t, _), _| t != tenant_str).map_err(io)?;
+                for route in &table.routes {
+                    let value = serde_json::to_string(route)
+                        .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                    routes
+                        .insert((tenant_str, route.id.as_str()), value.as_str())
+                        .map_err(io)?;
+                }
+                Ok(Ok(vec![Self::sync_routes_action(routes)?]))
+            }
+            ControlOp::DeleteRoute { tenant, id } => {
+                // Idempotent no-op if absent, like `DeleteImposter` — the
+                // admin-surface 404 for a missing route (if the operator
+                // wants one) is the write path's concern, not apply's.
+                routes.remove((tenant.as_str(), id.as_str())).map_err(io)?;
+                Ok(Ok(vec![Self::sync_routes_action(routes)?]))
+            }
             ControlOp::TenantPut { .. }
             | ControlOp::TenantDelete { .. }
             | ControlOp::PrincipalPut { .. }
@@ -1048,15 +1209,22 @@ impl RedbStateMachine {
         }
     }
 
-    /// Project the applied state onto the local engine, in log order. Failures
-    /// are recorded per port and never propagate — see the module doc.
+    /// Project the applied state onto the local engine and the front door's
+    /// compiled route table, in log order. Failures are recorded (per port for
+    /// the engine; logged only for routes, which has no per-node bind state to
+    /// track) and never propagate — see the module doc.
+    ///
+    /// The two projections are independent: a `SyncRoutes` action still swaps
+    /// the `ArcSwap` on a node with no attached `engine` (a state machine
+    /// wired for a routes-only test, or an embedder that has not attached an
+    /// `ImposterManager`), and vice versa. Neither handle's absence gates the
+    /// other's actions — unlike the pre-#131 shape, which could return early
+    /// only because every action was engine-bound.
     async fn drive_engine(&self, actions: Vec<EngineAction>) {
-        let Some(engine) = &self.engine else {
-            return;
-        };
         for action in actions {
             match action {
                 EngineAction::Sync(desired) => {
+                    let Some(engine) = &self.engine else { continue };
                     let desired_ports: std::collections::BTreeSet<u16> =
                         desired.iter().filter_map(|c| c.port).collect();
                     match engine.apply_config(desired).await {
@@ -1068,6 +1236,9 @@ impl RedbStateMachine {
                     }
                 }
                 EngineAction::RefuseSync { port, error } => {
+                    if self.engine.is_none() {
+                        continue;
+                    }
                     tracing::error!(
                         port,
                         error = %error,
@@ -1077,6 +1248,7 @@ impl RedbStateMachine {
                     self.apply_failures.lock().insert(port, error);
                 }
                 EngineAction::SetEnabled { port, enabled } => {
+                    let Some(engine) = &self.engine else { continue };
                     match engine.set_imposter_enabled(port, enabled).await {
                         Ok(()) => {
                             self.apply_failures.lock().remove(&port);
@@ -1088,6 +1260,7 @@ impl RedbStateMachine {
                     }
                 }
                 EngineAction::Patch { port, edit } => {
+                    let Some(engine) = &self.engine else { continue };
                     match Self::drive_patch(engine, port, &edit).await {
                         Ok(()) => {
                             self.apply_failures.lock().remove(&port);
@@ -1102,9 +1275,24 @@ impl RedbStateMachine {
                         }
                     }
                 }
+                EngineAction::SyncRoutes(table) => {
+                    if let Some(routes) = &self.routes {
+                        routes.store(Arc::new(CompiledRoutes::new(&table)));
+                    }
+                }
+                EngineAction::RefuseRoutesSync { id, error } => {
+                    tracing::error!(
+                        route_id = %id,
+                        error = %error,
+                        "refusing route-table sync: a stored record will not parse \
+                         (the front door keeps its last-known-good table)"
+                    );
+                }
             }
         }
-        crate::metrics::observe_apply_failures(&self.apply_failures.lock());
+        if self.engine.is_some() {
+            crate::metrics::observe_apply_failures(&self.apply_failures.lock());
+        }
     }
 
     async fn drive_patch(
@@ -1159,7 +1347,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
     async fn build_snapshot(&mut self) -> StorageResult<Snapshot<TypeConfig>> {
         let applied = self.read_applied()?;
 
-        let (configs, dedup) = {
+        let (configs, routes, dedup) = {
             let read_txn = self
                 .db
                 .begin_read()
@@ -1176,6 +1364,18 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 let (tenant, port) = key.value();
                 configs.push((tenant.to_owned(), port, value.value().to_owned()));
             }
+            let routes_table = read_txn
+                .open_table(SM_ROUTES_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut routes = Vec::new();
+            for item in routes_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (tenant, id) = key.value();
+                routes.push((tenant.to_owned(), id.to_owned(), value.value().to_owned()));
+            }
             let dedup_table = read_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -1187,11 +1387,12 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
                 dedup.push((key.value().to_owned(), value.value().to_owned()));
             }
-            (configs, dedup)
+            (configs, routes, dedup)
         };
 
         let payload = SnapshotPayload {
             configs,
+            routes,
             dedup,
             last_applied_log: applied.last_applied_log,
             last_membership: applied.last_membership.clone(),
@@ -1271,6 +1472,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut configs = write_txn
                 .open_table(SM_CONFIGS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut routes = write_txn
+                .open_table(SM_ROUTES_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut dedup = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -1321,13 +1525,17 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     Err(reason) => Err(reason),
                                     Ok(()) => Self::mutate_tables(
                                         &mut configs,
+                                        &mut routes,
                                         &request.op,
                                         log_id.index,
                                     )?,
                                 },
-                                None => {
-                                    Self::mutate_tables(&mut configs, &request.op, log_id.index)?
-                                }
+                                None => Self::mutate_tables(
+                                    &mut configs,
+                                    &mut routes,
+                                    &request.op,
+                                    log_id.index,
+                                )?,
                             },
                         };
                         let response = match outcome {
@@ -1410,7 +1618,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         write_txn
             .set_durability(Durability::Immediate)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        let action = {
+        let (config_action, routes_action) = {
             let mut snap_table = write_txn
                 .open_table(SNAPSHOT_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
@@ -1429,11 +1637,29 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     .insert((tenant.as_str(), *port), value.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
-            let action = match Self::desired_configs(&configs_table)
+            let config_action = match Self::desired_configs(&configs_table)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?
             {
                 Ok(desired) => EngineAction::Sync(desired),
                 Err((port, error)) => EngineAction::RefuseSync { port, error },
+            };
+
+            let mut routes_table = write_txn
+                .open_table(SM_ROUTES_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            routes_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (tenant, id, value) in &payload.routes {
+                routes_table
+                    .insert((tenant.as_str(), id.as_str()), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+            let routes_action = match Self::desired_routes(&routes_table)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?
+            {
+                Ok(table) => EngineAction::SyncRoutes(table),
+                Err((id, error)) => EngineAction::RefuseRoutesSync { id, error },
             };
 
             let mut dedup_table = write_txn
@@ -1461,15 +1687,16 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             applied_table
                 .insert((), applied_bytes.as_slice())
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            action
+            (config_action, routes_action)
         };
         write_txn
             .commit()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
-        // A snapshot replaces the whole applied state, so the engine converges
-        // on it the same way apply does — after the durable write, best-effort.
-        self.drive_engine(vec![action]).await;
+        // A snapshot replaces the whole applied state, so the engine and the
+        // front door's compiled table both converge on it the same way apply
+        // does — after the durable write, best-effort.
+        self.drive_engine(vec![config_action, routes_action]).await;
 
         Ok(())
     }
@@ -1502,13 +1729,16 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 mod tests {
     use std::sync::Arc;
 
+    use arc_swap::ArcSwap;
     use openraft::storage::{RaftStateMachine, Snapshot};
     use openraft::testing::{StoreBuilder, Suite};
     use openraft::{
         CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder, StorageError,
     };
     use redb::ReadableTable;
-    use rift_ee::seams::{ImposterConfig, ImposterManager};
+    use rift_ee::seams::{
+        CompiledRoutes, ImposterConfig, ImposterManager, Route, RouteMatch, RouteTable, RouteTarget,
+    };
     use serde_json::json;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1557,6 +1787,47 @@ mod tests {
             None => sm,
         };
         (td, sm)
+    }
+
+    /// Like [`fresh_sm`], with a routes handle attached instead of an engine —
+    /// the routes-only tests never need an `ImposterManager`.
+    async fn fresh_sm_with_routes() -> (TempDir, RedbStateMachine, Arc<ArcSwap<CompiledRoutes>>) {
+        let td = TempDir::new().expect("tempdir");
+        let (_, sm) = new(td.path().join("raft.redb")).await.expect("open store");
+        let routes = Arc::new(ArcSwap::from_pointee(CompiledRoutes::default()));
+        let sm = sm.with_routes_handle(Arc::clone(&routes));
+        (td, sm, routes)
+    }
+
+    /// A route matching `/<id>`, never the default catch-all: two of these
+    /// with different ids never collide with `RouteTable::validate`'s
+    /// ambiguity check, so tests can freely build multi-route tables without
+    /// every `PutRoutes` needing its own bespoke `RouteMatch`.
+    fn test_route(id: &str, port: u16) -> Route {
+        Route {
+            id: id.to_owned(),
+            priority: 0,
+            matches: RouteMatch {
+                path_prefix: Some(format!("/{id}")),
+                ..RouteMatch::default()
+            },
+            target: RouteTarget {
+                port,
+                strip_prefix: false,
+                set_host: None,
+            },
+            enabled: true,
+        }
+    }
+
+    fn put_routes(op_id: u128, routes: Vec<Route>) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::PutRoutes {
+                tenant: TenantId::default(),
+                table: RouteTable { routes },
+            },
+        )
     }
 
     fn entry(index: u64, request: ControlRequest) -> Entry<TypeConfig> {
@@ -2361,6 +2632,188 @@ mod tests {
         assert_eq!(
             replay, first,
             "the replay must return the ORIGINAL refusal, not re-evaluate"
+        );
+    }
+
+    // -- issue #131: replicated route table ------------------------------------
+
+    #[tokio::test]
+    async fn apply_put_routes_records_the_table() {
+        let (_td, mut sm, _routes) = fresh_sm_with_routes().await;
+        let responses = sm
+            .apply(vec![entry(1, put_routes(1, vec![test_route("a", 8080)]))])
+            .await
+            .expect("apply");
+        assert_eq!(responses, vec![ControlResponse::applied(1)]);
+        let table = sm.route_table().expect("read route table");
+        assert_eq!(table.routes.len(), 1);
+        assert_eq!(table.routes[0].id, "a");
+    }
+
+    /// A whole-table replace really replaces: a second `PutRoutes` drops
+    /// whatever the first one wrote that is not in the new table.
+    #[tokio::test]
+    async fn put_routes_replaces_the_whole_table() {
+        let (_td, mut sm, _routes) = fresh_sm_with_routes().await;
+        sm.apply(vec![entry(
+            1,
+            put_routes(1, vec![test_route("a", 1), test_route("b", 2)]),
+        )])
+        .await
+        .expect("apply first table");
+        sm.apply(vec![entry(2, put_routes(2, vec![test_route("c", 3)]))])
+            .await
+            .expect("apply replacement table");
+        let table = sm.route_table().expect("read route table");
+        assert_eq!(
+            table
+                .routes
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"],
+            "the second PutRoutes must replace, not merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_delete_route_removes_it_and_is_idempotent_when_absent() {
+        let (_td, mut sm, _routes) = fresh_sm_with_routes().await;
+        sm.apply(vec![entry(1, put_routes(1, vec![test_route("a", 1)]))])
+            .await
+            .expect("apply put");
+
+        let delete = |op_id: u128| {
+            request(
+                op_id,
+                ControlOp::DeleteRoute {
+                    tenant: TenantId::default(),
+                    id: "a".to_owned(),
+                },
+            )
+        };
+        let responses = sm.apply(vec![entry(2, delete(2))]).await.expect("delete");
+        assert_eq!(responses, vec![ControlResponse::applied(2)]);
+        assert!(sm.route_table().expect("read").routes.is_empty());
+
+        // Deleting again (an absent route) is idempotent, like DeleteImposter.
+        let responses = sm
+            .apply(vec![entry(3, delete(3))])
+            .await
+            .expect("delete absent");
+        assert_eq!(
+            responses,
+            vec![ControlResponse::applied(3)],
+            "deleting an absent route must not be a Failed outcome"
+        );
+    }
+
+    /// A committed `PutRoutes` must swap the front door's compiled table, not
+    /// just the `sm_routes` rows — this is the mechanism `bind_front_door`
+    /// actually reads from.
+    #[tokio::test]
+    async fn put_routes_swaps_the_attached_compiled_table() {
+        let (_td, mut sm, routes) = fresh_sm_with_routes().await;
+        assert!(routes.load().is_empty(), "starts empty");
+        sm.apply(vec![entry(1, put_routes(1, vec![test_route("a", 8080)]))])
+            .await
+            .expect("apply");
+        assert!(
+            !routes.load().is_empty(),
+            "a committed PutRoutes must swap the ArcSwap"
+        );
+        let loaded = routes.load();
+        let resolved = loaded
+            .resolve(None, &hyper::Method::GET, "/a", &hyper::HeaderMap::new())
+            .expect("the route matches its own path prefix");
+        assert_eq!(resolved.target.port, 8080);
+    }
+
+    /// Same `op_id` twice: the dedup contract applies to route ops exactly as
+    /// it does to imposter ops (existing dedup-test pattern, issue #9).
+    #[tokio::test]
+    async fn dedup_collapses_a_replayed_put_routes() {
+        let (_td, mut sm, _routes) = fresh_sm_with_routes().await;
+        let first = sm
+            .apply(vec![entry(1, put_routes(7, vec![test_route("a", 1)]))])
+            .await
+            .expect("apply");
+        assert_eq!(first, vec![ControlResponse::applied(1)]);
+
+        let replay = sm
+            .apply(vec![entry(2, put_routes(7, vec![test_route("b", 2)]))])
+            .await
+            .expect("replay");
+        assert_eq!(
+            replay,
+            vec![ControlResponse::applied(1)],
+            "the replay must return the ORIGINAL revision, not its own index"
+        );
+        assert_eq!(
+            sm.route_table().expect("read").routes[0].id,
+            "a",
+            "the replayed op_id must not have applied a second time"
+        );
+    }
+
+    /// Snapshot + restore on a fresh node round-trips `sm_routes` (existing
+    /// store-conformance pattern, mirrors `snapshot_carries_configs_and_dedup_state`).
+    #[tokio::test]
+    async fn snapshot_round_trips_the_route_table() {
+        let (_td, mut sm, _routes) = fresh_sm_with_routes().await;
+        sm.apply(vec![entry(
+            1,
+            put_routes(9, vec![test_route("a", 1), test_route("b", 2)]),
+        )])
+        .await
+        .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower, follower_routes) = fresh_sm_with_routes().await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+
+        let mut ids: Vec<String> = follower
+            .route_table()
+            .expect("read")
+            .routes
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(
+            !follower_routes.load().is_empty(),
+            "install_snapshot must also drive the attached routes handle"
+        );
+    }
+
+    /// A restart, unlike a join: the routes `ArcSwap` is process-local and
+    /// starts empty every time, even though `sm_routes` already has committed
+    /// rows on disk from the previous run. `reconcile_engine` is what
+    /// re-seeds it — the same cold-start hook the engine has always used,
+    /// extended to routes.
+    #[tokio::test]
+    async fn reconcile_engine_reseeds_the_routes_handle_after_a_cold_start() {
+        let (_td, mut sm, routes) = fresh_sm_with_routes().await;
+        sm.apply(vec![entry(1, put_routes(1, vec![test_route("a", 8080)]))])
+            .await
+            .expect("apply");
+        // Simulate the restart: a brand new `ArcSwap`, as a fresh process
+        // would construct, while `sm`'s underlying `sm_routes` table (unlike
+        // the ArcSwap) is exactly what a restart finds already on disk.
+        routes.store(Arc::new(CompiledRoutes::default()));
+        assert!(routes.load().is_empty(), "simulated cold start");
+
+        sm.reconcile_engine().await.expect("reconcile");
+
+        assert!(
+            !routes.load().is_empty(),
+            "reconcile_engine must re-seed the routes handle from sm_routes, \
+             not only the engine"
         );
     }
 }

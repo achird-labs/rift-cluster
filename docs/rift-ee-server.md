@@ -541,6 +541,56 @@ A node is not Ready until its `cluster-reconciled` gate opens: its applied
 state has caught up to the leader's and its imposters are bound (or their
 failures reported on `GET /_cluster/imposters`).
 
+## The clustered front door (#131)
+
+Upstream's front door (`--front-door <ADDR>`, env `RIFT_FRONT_DOOR`; a
+`HOST:PORT` or a bare port meaning every interface) resolves a request against
+a content-based route table and dispatches it to an imposter port — U-11's
+listener and matcher. Its admin CRUD was deliberately deferred upstream, so
+under `--cluster` this binary provides it: the route table is a **replicated
+control-plane object**, exactly like the imposter config set.
+
+`--front-door` is not a `--cluster*` flag — `EeCli` flattens the open-source
+`Cli`, so it is accepted as-is — but what it *does* changes under `--cluster`:
+
+- **Who binds it.** Un-clustered, upstream's own `ServerBuilder::start` binds
+  it from the config file's `routes` block, with a private `ArcSwap` it never
+  shares. Clustered, this binary clears the flag before handing the CLI to
+  `ServerBuilder` (so upstream never binds it — the same port bound twice
+  would otherwise fail the second bind) and binds it itself, after the node
+  has joined, against the table the state machine maintains — never the
+  config file. This is the same "engine constructed before the node" ordering
+  problem `PullOnMissInterceptor` and `FlowNet::bind` solve by binding late.
+- **What the table is.** `PUT /front-door/routes` (body: a whole U-11
+  `RouteTable`, `vendor/rift/crates/rift-http-proxy/src/front_door/route_table.rs`)
+  and `DELETE /front-door/routes/:id` are terminated by the clustered admin
+  front into `ControlOp::PutRoutes`/`ControlOp::DeleteRoute`, committed
+  through the Raft leader exactly like an imposter config write: `control::validate`
+  runs U-11's rules (unique ids, no two enabled routes with an identical match
+  at the same priority, `strip_prefix` requires `path_prefix`, wildcard/method/
+  prefix well-formedness) before anything commits, apply is deterministic, and
+  a committed write recompiles the table and hot-swaps it into every node's
+  front door — no restart, no re-read of a config file. `GET
+  /front-door/routes` answers from the local state machine directly (there is
+  no upstream endpoint to proxy to). `PutRoutes` is a whole-table replace, not
+  a merge — the same all-or-nothing shape U-11's own `RouteTable::validate`
+  uses, because ambiguity is a property of the whole set, not one route.
+  `DeleteRoute` on an absent id is idempotent at the state machine (like
+  `DeleteImposter`), but the admin surface still answers `404` for one that
+  was never there.
+- **The response headers are the imposter write path's, unchanged.** A
+  successful route write carries `Rift-Cluster-Revision` (`default@<log-index>`
+  — routes have no per-record port to qualify it with, so there is no
+  `If-Match` support for them either) and `Rift-Cluster-Op-Id`, and follows
+  the same `--cluster-write-barrier` semantics as every other mutating route.
+- **Bind-divergence dividend (§7.4.6), unchanged.** The front door dispatches
+  into the manager in-process, so a node that failed to bind an imposter's own
+  port still serves it through the front door — no new code for this, it falls
+  out of `dispatch_to_port`.
+
+With `--cluster` off, none of this exists: `--front-door` behaves exactly as
+it does in the open-source binary, which is what the `parity` CI job checks.
+
 ## Clustered flow state (#120)
 
 Under `--cluster`, **every** imposter's flow state (scenarios, `ctx.state`,

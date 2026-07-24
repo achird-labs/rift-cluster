@@ -785,6 +785,18 @@ Connection pooling per peer.
 > assertion aimed at *that* door must either wait for #800 or assert the headers only.
 > Everything else already carries the stable `type`. See ADR-001 §Write path and issue #9.
 > Text retained for context and the surviving contract.
+>
+> **Extended by issue #131.** The front door's route table (U-11) is a second document under
+> this same mechanism, not a new one: `ControlOp::PutRoutes` (whole-table replace)/`DeleteRoute`
+> validate on admission (unique ids, no two enabled routes matching identically, `strip_prefix`
+> requires `path_prefix`, wildcard/method/prefix well-formedness — U-11's own rules), apply
+> deterministically, and `revision` is the same Raft log index. What differs from the imposter
+> config plane is the post-apply projection: instead of driving `ImposterManager::apply_config`,
+> a committed route write recompiles a `CompiledRoutes` and hot-swaps it into the front door's
+> `ArcSwap` — the dispatch-side counterpart of §7.4.6's bind-divergence dividend, which the route
+> table gets for free (dispatch is in-process, so a node that failed to bind an imposter's own
+> port still reaches it through the front door). See `docs/rift-ee-server.md` ("The clustered
+> front door") for the operator-facing contract.
 
 **Design rules (v2, superseded mechanism): gossip carries pointers, not payloads; writes are
 serialized at a per-port owner** (v1's accept-anywhere LWW destroyed concurrent stub mutations —
