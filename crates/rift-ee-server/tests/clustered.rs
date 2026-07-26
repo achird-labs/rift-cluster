@@ -826,3 +826,118 @@ async fn a_departed_founder_rejoins_through_the_peers_its_log_remembers() {
     extra.shutdown().await;
     keeper.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #134: `--imposters` becomes source declarations under `--cluster`
+// ---------------------------------------------------------------------------
+
+/// Under `--cluster`, `--imposters` is sugar for declaring pinned sources and
+/// pulling them — so the imposters land through the replicated log rather than
+/// in this node's manager alone (where the reconciler would then delete them,
+/// the failure `--configfile` is refused for).
+///
+/// Drives `compose::start` because that is where the desugaring lives: the flag
+/// has to be taken off the CLI *before* `ServerBuilder` sees it, or upstream
+/// creates the imposters itself and the log never hears about them.
+#[tokio::test]
+async fn imposters_flag_becomes_a_replicated_source_under_cluster() {
+    let state = TempDir::new().expect("tempdir");
+    let doc = state.path().join("mocks.json");
+    let port = common::ports::reserve_port();
+    std::fs::write(
+        &doc,
+        serde_json::json!({
+            "imposters": [
+                { "port": port, "protocol": "http", "name": "from-file-source" }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write the source document");
+
+    let uri = format!("file:{}", doc.to_string_lossy());
+    let server = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--imposters", &uri],
+    ))
+    .await
+    .expect("a node with --imposters must start");
+
+    let node = server.node().expect("clustered");
+    let sources = node.sources().expect("read sources");
+    assert_eq!(
+        sources.len(),
+        1,
+        "--imposters must declare exactly one source per uri: {sources:?}"
+    );
+    let source = &sources[0];
+    assert_eq!(source.uri, uri);
+    assert_eq!(source.ports, vec![port], "the source owns what it declared");
+    assert!(!source.drifted);
+    assert_eq!(
+        node.configured_ports().expect("ports"),
+        vec![port],
+        "the imposter must be in the replicated log, not just this node's manager"
+    );
+    assert_eq!(
+        node.config_provenance().expect("provenance")[0].1.id,
+        source.id,
+        "the config carries the provenance of the source that produced it"
+    );
+    let id = source.id.clone();
+    server.shutdown().await;
+
+    // Idempotent by id: a restart on the same state directory with the same
+    // flag upserts the same source rather than accumulating one per boot, and
+    // the digest short circuit makes the repeat pull a no-op. Asserted in this
+    // test rather than its own so the suite does not hold a second composed
+    // server open concurrently — seventeen of them exhaust the process's file
+    // descriptors on a developer machine.
+    let restarted = compose::start(cluster_cli(
+        &state,
+        &["--cluster-allow-solo", "--imposters", &uri],
+    ))
+    .await
+    .expect("a restart with the same flag must start");
+    let sources = restarted
+        .node()
+        .expect("clustered")
+        .sources()
+        .expect("read sources");
+    assert_eq!(
+        sources.len(),
+        1,
+        "a restart must not add a source: {sources:?}"
+    );
+    assert_eq!(
+        sources[0].id, id,
+        "the id is derived from the uri, so it is stable across boots"
+    );
+    restarted.shutdown().await;
+}
+
+/// A source that cannot be fetched fails the start. An operator who passed
+/// `--imposters` asked for those imposters to be serving; coming up healthy
+/// without them is the silently half-configured node this path exists to avoid.
+#[tokio::test]
+async fn an_unfetchable_imposters_source_fails_the_start() {
+    let state = TempDir::new().expect("tempdir");
+    let missing = state.path().join("does-not-exist.json");
+    let err = match compose::start(cluster_cli(
+        &state,
+        &[
+            "--cluster-allow-solo",
+            "--imposters",
+            &format!("file:{}", missing.to_string_lossy()),
+        ],
+    ))
+    .await
+    {
+        Ok(_) => panic!("an unfetchable source must not start silently"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("does-not-exist.json"),
+        "the failure must name the source that could not be loaded: {err}"
+    );
+}

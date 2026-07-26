@@ -15,16 +15,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use rift_cluster::sources;
 use rift_cluster::stores::{
     ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, FlowShard, ShardConfig, flow_routes,
 };
 use rift_cluster::{
-    Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity,
-    PullOnMissInterceptor, RaftNode, metrics,
+    Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, OnDrift,
+    PullOnMissInterceptor, RaftNode, SourcePuller, metrics,
 };
 use rift_ee::seams::{
-    CompiledRoutes, ImposterManager, RunningFrontDoor, RunningServer, ServerBuilder, TlsDefaults,
-    bind_front_door,
+    CompiledRoutes, FileSource, HttpSource, ImposterManager, RunningFrontDoor, RunningServer,
+    ServerBuilder, SourceRef, SourceRegistry, TlsDefaults, bind_front_door, parse_uri_list,
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -518,6 +519,20 @@ pub async fn start_with_runtimes(
     // `GET /front-door/routes` must answer identically on every node.
     let front_door_routes = Arc::new(ArcSwap::from_pointee(CompiledRoutes::default()));
 
+    // Imposter sources (issue #134). Built before the node for the same reason
+    // the flow net and the pull-on-miss hook are: its routes go into the
+    // `NodeConfig.routes` seam that binds the cluster port, whose address the
+    // node then advertises — so the node can only arrive afterwards, through
+    // `bind` below. The registry is this node's own view of which schemes it
+    // can fetch; deterministic op validation deliberately does not consult it.
+    let puller = match build_source_registry(cli.oss.no_parse) {
+        Ok(registry) => Arc::new(SourcePuller::new(registry)),
+        Err(e) => {
+            probes.shutdown().await;
+            return Err(e.context("registering the built-in imposter sources"));
+        }
+    };
+
     let slot = NodeSlot::default();
     let node = match RaftNode::start_with_front_door_routes(
         NodeConfig {
@@ -533,10 +548,13 @@ pub async fn start_with_runtimes(
             // Seeded with the flow routes: the registry ships empty and the state
             // backends register their own endpoints (its design contract), and the
             // operator surface layers its routes on top.
-            routes: cluster_api::routes(
-                flow_routes(Arc::clone(&flow_net)),
-                slot.clone(),
-                Arc::clone(&readiness),
+            routes: sources::routes(
+                cluster_api::routes(
+                    flow_routes(Arc::clone(&flow_net)),
+                    slot.clone(),
+                    Arc::clone(&readiness),
+                ),
+                Arc::clone(&puller),
             ),
             engine: Some(Arc::clone(&manager)),
         },
@@ -558,6 +576,13 @@ pub async fn start_with_runtimes(
         return Err(anyhow::Error::new(e).context("binding the operator surface to the node"));
     }
     pull_on_miss.bind(&node);
+    if let Err(e) = puller.bind(&node) {
+        probes.shutdown().await;
+        if let Err(e) = node.shutdown().await {
+            tracing::error!(error = %e, "cluster node shutdown reported an error");
+        }
+        return Err(anyhow::Error::new(e).context("binding the source puller to the node"));
+    }
     if let Err(e) = flow_net.bind(&node, FlowBindConfig::default()) {
         probes.shutdown().await;
         if let Err(e) = node.shutdown().await {
@@ -579,6 +604,7 @@ pub async fn start_with_runtimes(
         &readiness,
         Arc::clone(&manager),
         front_door_routes,
+        Arc::clone(&puller),
     )
     .await
     {
@@ -616,6 +642,7 @@ async fn attach_data_plane(
     readiness: &Arc<Readiness>,
     manager: Arc<ImposterManager>,
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
+    puller: Arc<SourcePuller>,
 ) -> anyhow::Result<(
     RunningServer,
     AdminFront,
@@ -655,6 +682,18 @@ async fn attach_data_plane(
         None => None,
     };
 
+    // Taken, not read (issue #134), for exactly the reason `--configfile` is
+    // refused outright a few frames up: left in place, upstream's `start()`
+    // would fetch these URIs and create the imposters *in this node's manager*,
+    // outside the replicated log — and the reconciler, which treats the
+    // replicated set as authoritative, would then delete them again. Under
+    // `--cluster` the flag becomes sugar for declaring pinned sources, so the
+    // same URIs land through the log and reach every node.
+    //
+    // `--configfile` is refused rather than desugared because it names a local
+    // path: the other nodes have no such file, and a source only replicates
+    // usefully when every node can fetch it.
+    let bootstrap_sources = cli.oss.imposters.take().as_deref().map(parse_uri_list);
     let barrier = cli.cluster.cluster_write_barrier;
     let barrier_timeout = Duration::from_secs(cli.cluster.cluster_write_barrier_timeout);
     let admin_async = cli.cluster.cluster_admin_async;
@@ -728,12 +767,78 @@ async fn attach_data_plane(
         }
     };
 
+    if let Some(refs) = bootstrap_sources
+        && let Err(e) = bootstrap_imposter_sources(&puller, &refs).await
+    {
+        // Same teardown discipline as every other failure past a live node:
+        // `start` is an embedding seam callers retry, so a half-composed server
+        // must not keep the admin address or the front door bound.
+        front.shutdown().await;
+        if let Some(front_door) = front_door {
+            front_door.shutdown().await;
+        }
+        server.shutdown().await;
+        return Err(e);
+    }
+
     Ok((
         server,
         front,
         front_door,
         spawn_reconciler(node, readiness, seeds),
     ))
+}
+
+/// The built-in schemes a clustered node can fetch a source from: `file:` and
+/// `http(s):`, the same two upstream registers. The enterprise `git:`/`s3:`/
+/// `registry:` providers register here too when they land (#136).
+fn build_source_registry(no_parse: bool) -> anyhow::Result<SourceRegistry> {
+    let mut registry = SourceRegistry::new();
+    registry.register(Arc::new(FileSource::new(no_parse)))?;
+    registry.register(Arc::new(HttpSource::new()?))?;
+    Ok(registry)
+}
+
+/// Turn `--imposters` into declared sources and pull each once.
+///
+/// Failing the start is deliberate: an operator who passed `--imposters` asked
+/// for those imposters to be serving, and a node that comes up healthy without
+/// them is the silent half-configured fleet this whole path exists to avoid.
+/// The one exception is a source that is already declared and unchanged — the
+/// digest short circuit makes that a no-op, which is what makes a restart or a
+/// second node's boot idempotent rather than a re-apply.
+async fn bootstrap_imposter_sources(
+    puller: &SourcePuller,
+    refs: &[SourceRef],
+) -> anyhow::Result<()> {
+    for source_ref in refs {
+        let id = sources::bootstrap_id(&source_ref.uri);
+        let report = puller
+            .declare_and_pull(&id, &source_ref.uri, OnDrift::Overwrite)
+            .await
+            .with_context(|| {
+                format!(
+                    "bootstrapping imposter source {} as source {id:?}",
+                    source_ref.uri
+                )
+            })?;
+        for warning in &report.warnings {
+            tracing::warn!(source_id = %id, "{warning}");
+        }
+        if report.unchanged {
+            tracing::info!(
+                source_id = %id, uri = %source_ref.uri,
+                "imposter source already applied at this content; nothing to do"
+            );
+        } else {
+            tracing::info!(
+                source_id = %id, uri = %source_ref.uri,
+                revision = report.revision, ports = ?report.changed,
+                "imposter source applied"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Parse `--front-door`'s value the same way upstream's own (private)

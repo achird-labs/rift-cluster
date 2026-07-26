@@ -60,6 +60,26 @@ pub enum RpcError {
     #[error("shed: no bridge capacity")]
     Shed,
 
+    /// The request was well-formed transport-wise but the handler refused its
+    /// content: a malformed body, or a domain rule the caller violated.
+    ///
+    /// Distinct from [`Self::Handler`] because the difference is the caller's to
+    /// act on — a `BadRequest` fails identically on every retry and names
+    /// something the operator can fix, while a `Handler` error is this node
+    /// failing at something it should have been able to do.
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
+    /// The cluster could not commit the write: no quorum, or no reachable
+    /// leader. `op_id` is present when the op was durably accepted before the
+    /// failure, so a client can poll `GET /_cluster/ops/:id` for its eventual
+    /// outcome rather than guessing whether to retry (Ch. 4 write path).
+    #[error("unavailable: {detail}")]
+    Unavailable {
+        detail: String,
+        op_id: Option<String>,
+    },
+
     /// The registered handler failed.
     #[error("handler error: {0}")]
     Handler(String),
@@ -77,6 +97,8 @@ impl RpcError {
             Self::Timeout => "timeout",
             Self::Transport(_) => "transport",
             Self::Shed => "shed",
+            Self::BadRequest(_) => "bad_request",
+            Self::Unavailable { .. } => "unavailable",
             Self::Handler(_) => "handler",
         }
     }
@@ -93,6 +115,8 @@ impl RpcError {
             Self::Timeout => 504,
             Self::Transport(_) => 502,
             Self::Shed => 503,
+            Self::BadRequest(_) => 400,
+            Self::Unavailable { .. } => 503,
             Self::Handler(_) => 500,
         }
     }
@@ -185,6 +209,15 @@ mod tests {
             },
             RpcError::BodyTooLarge { limit: 32 },
             RpcError::Shed,
+            // A refused request fails the same way every time.
+            RpcError::BadRequest("bad".into()),
+            // Not retryable *by the transport*: the op may already be parked
+            // and on its way, so the client polls `GET /_cluster/ops/:id`
+            // rather than re-submitting and racing its own write.
+            RpcError::Unavailable {
+                detail: "no quorum".into(),
+                op_id: None,
+            },
         ] {
             assert!(!err.is_retryable(), "{err:?}");
         }

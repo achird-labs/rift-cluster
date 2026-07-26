@@ -22,6 +22,7 @@ pub(crate) mod store;
 pub use identity::NodeIdentity;
 pub use node::{LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport};
 pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
+pub use store::{PullOutcome, SourceRecord};
 
 use std::io::Cursor;
 

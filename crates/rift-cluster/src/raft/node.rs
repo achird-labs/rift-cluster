@@ -30,9 +30,9 @@ use super::network::{
     JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
 };
 use super::ring::Ring;
-use super::store::{self, RedbStateMachine};
+use super::store::{self, RedbStateMachine, SourceRecord};
 use super::{NodeId, TypeConfig};
-use crate::control::{ControlOp, ControlRequest, ControlResponse, TenantId};
+use crate::control::{ControlOp, ControlRequest, ControlResponse, SourceProvenance, TenantId};
 use crate::rpc::{
     Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer,
     RpcServerConfig, Signer, TrackedPeerHealth, Verifier,
@@ -1129,6 +1129,30 @@ impl RaftNode {
     pub fn route_table(&self) -> Result<RouteTable, NodeError> {
         self.sm_reader
             .route_table()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Every imposter source the default tenant has declared, id-ascending
+    /// (issue #134). Like [`Self::configured_ports`], this answers from local
+    /// applied state and needs no leadership — which is what lets any node
+    /// serve `GET /admin/sources`.
+    pub fn sources(&self) -> Result<Vec<SourceRecord>, NodeError> {
+        self.sm_reader
+            .sources()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// One source by id, or `None` when the default tenant has no such source.
+    pub fn source(&self, id: &str) -> Result<Option<SourceRecord>, NodeError> {
+        self.sm_reader
+            .source(id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// `(port, provenance)` for every source-owned config, ascending by port.
+    pub fn config_provenance(&self) -> Result<Vec<(u16, SourceProvenance)>, NodeError> {
+        self.sm_reader
+            .config_provenance()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 

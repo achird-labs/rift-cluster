@@ -126,6 +126,43 @@ pub enum ControlOp {
         tenant: TenantId,
         id: String,
     },
+    /// Create or replace an imposter source (issue #134 / #20 B). A source is a
+    /// durable control-plane object: the fleet agrees on which URI backs which
+    /// imposters, and every node can answer for it without asking a peer.
+    SourcePut {
+        tenant: TenantId,
+        id: String,
+        uri: String,
+        mode: SourceMode,
+        /// The *name* of a credential, never a credential. Resolution ships with
+        /// the providers that need it (#136); a URI carrying embedded
+        /// credentials is refused by [`validate`] so a secret can never enter
+        /// the replicated log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_ref: Option<String>,
+        on_drift: OnDrift,
+    },
+    /// Forget a source. Its imposters stay bound and lose their provenance —
+    /// see `mutate_tables`' arm for why deleting them would be the wrong
+    /// default.
+    SourceDelete {
+        tenant: TenantId,
+        id: String,
+    },
+    /// The outcome of one fetch, submitted by whichever node performed it
+    /// (issue #134). This is the whole reason fetching is not in the apply path:
+    /// apply must be deterministic and infallible, and two nodes fetching the
+    /// same URI can get different bytes. The fetcher canonicalizes and hashes
+    /// what it got, and *this* op — an ordinary validated write — is what every
+    /// replica applies identically.
+    SourcePullResult {
+        tenant: TenantId,
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        digest: Digest,
+        configs: Vec<ImposterConfig>,
+    },
     TenantPut {
         body: serde_json::Value,
     },
@@ -145,6 +182,96 @@ pub enum ControlOp {
         body: serde_json::Value,
     },
 }
+
+/// How a source is kept current.
+///
+/// `Tracking` is in the log format now so #135 does not need a wire break, but
+/// [`validate`] refuses it until the leader-only poll scheduler exists — a
+/// source that claims to track and does not would be worse than one that never
+/// promised to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMode {
+    /// Explicit pulls only.
+    #[default]
+    Pinned,
+    /// Scheduled polls (#135).
+    Tracking,
+}
+
+/// What a pull does when the source's imposters have been edited by hand since
+/// it last applied.
+///
+/// The default is `Overwrite` — the source is the declared truth, which is
+/// Solo's semantics — but it is *declared* rather than assumed, and readable
+/// from `GET /admin/sources/:id`, so an operator can see which way their fleet
+/// will go before it goes there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDrift {
+    #[default]
+    Overwrite,
+    Skip,
+    Fail,
+}
+
+impl std::fmt::Display for OnDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Overwrite => "overwrite",
+            Self::Skip => "skip",
+            Self::Fail => "fail",
+        })
+    }
+}
+
+/// A content digest of a fetched config set: lowercase hex SHA-256 over the
+/// canonical encoding in [`crate::sources::digest_of`].
+///
+/// Opaque on purpose. The only questions anyone asks of it are "is this the
+/// same content as last time" and "what do I show an operator", so exposing it
+/// as a bare `String` would invite comparing it against something that is not a
+/// digest of the same canonical form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Digest(String);
+
+impl Digest {
+    #[must_use]
+    pub fn new(hex: impl Into<String>) -> Self {
+        Self(hex.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Digest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Which source a stored config came from, stamped per config when a pull
+/// applies. This is what makes drift detection deterministic: provenance lives
+/// in the replicated state machine, so every replica reaches the same verdict
+/// about whether a manual edit touched source-owned state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceProvenance {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// Largest config payload a [`ControlOp::SourcePullResult`] may carry, matching
+/// the 10 MB body cap upstream's providers enforce at fetch time
+/// (`rift_http_proxy::sources::MAX_BODY_BYTES`). Checked again here as defence
+/// in depth: the provider cap bounds what a *fetch* buffers, while this bounds
+/// what a *log entry* carries, and only the second one is a fleet-wide
+/// liability. Both sit under the cluster transport's own cap.
+pub const MAX_SOURCE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 /// An ordered sequence of stub edits, applied atomically to one imposter's stub
 /// list — the order-aware #316 semantics, mirroring
@@ -226,29 +353,7 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
     match op {
         ControlOp::PutImposter { tenant, config } => {
             require_default_tenant(tenant)?;
-            if config.port.is_none() {
-                return Err(
-                    "config must carry an explicit port: an auto-assigned port cannot replicate"
-                        .to_owned(),
-                );
-            }
-            match config.protocol.as_str() {
-                "http" | "https" => {}
-                other => return Err(format!("unsupported protocol {other:?}")),
-            }
-            let mut ids = std::collections::HashSet::new();
-            for stub in &config.stubs {
-                if let Some(id) = stub.id.as_deref()
-                    && !ids.insert(id)
-                {
-                    return Err(format!("duplicate stub id {id:?}"));
-                }
-            }
-            // The clustered store's knobs (#120). Refused here, pre-commit,
-            // because `FlowStoreProvider::provide` has no error channel — by the
-            // time the provider reads the config it must already be valid.
-            crate::stores::FlowConfig::validate(config)?;
-            Ok(())
+            validate_replicable_config(config)
         }
         ControlOp::PatchStubs { tenant, .. } | ControlOp::DeleteImposter { tenant, .. } => {
             require_default_tenant(tenant)
@@ -269,6 +374,85 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
         // structurally guaranteed valid, so there is nothing to check here
         // beyond the tenant gate.
         ControlOp::DeleteRoute { tenant, .. } => require_default_tenant(tenant),
+        ControlOp::SourcePut {
+            tenant,
+            id,
+            uri,
+            mode,
+            auth_ref,
+            ..
+        } => {
+            require_default_tenant(tenant)?;
+            require_source_id(id)?;
+            require_credential_free_uri(uri)?;
+            if *mode == SourceMode::Tracking {
+                return Err(
+                    "mode \"tracking\" needs the leader-only poll scheduler, which arrives with \
+                     #135; use \"pinned\" and pull explicitly"
+                        .to_owned(),
+                );
+            }
+            // Validated as a *name* only. Resolving it to a credential ships
+            // with the providers that need one (#136) — see the module doc.
+            if let Some(auth_ref) = auth_ref
+                && !is_source_name(auth_ref)
+            {
+                return Err(
+                    "auth_ref must be a non-empty name of at most 128 characters drawn from \
+                     [A-Za-z0-9._-]"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
+        ControlOp::SourceDelete { tenant, id } => {
+            require_default_tenant(tenant)?;
+            require_source_id(id)
+        }
+        ControlOp::SourcePullResult {
+            tenant,
+            id,
+            digest,
+            configs,
+            ..
+        } => {
+            require_default_tenant(tenant)?;
+            require_source_id(id)?;
+            if digest.as_str().is_empty() {
+                return Err(
+                    "a pull result must carry a digest: it is what the no-change short circuit \
+                     compares"
+                        .to_owned(),
+                );
+            }
+            // The bound on what a *log entry* carries. The provider's own 10 MB
+            // fetch cap bounds a single fetch; this bounds what every replica
+            // then stores and every snapshot copies, which is the fleet-wide
+            // liability, so it is checked here rather than trusted upstream.
+            let encoded = serde_json::to_vec(configs)
+                .map_err(|e| format!("pull result configs do not serialize: {e}"))?;
+            if encoded.len() > MAX_SOURCE_PAYLOAD_BYTES {
+                return Err(format!(
+                    "pull result carries {} bytes of configs, over the {MAX_SOURCE_PAYLOAD_BYTES} \
+                     byte limit",
+                    encoded.len()
+                ));
+            }
+            // Held to exactly the `PutImposter` rules: a source must not be a
+            // way to land a config that admission would otherwise refuse.
+            let mut ports = std::collections::HashSet::new();
+            for config in configs {
+                validate_replicable_config(config)?;
+                if let Some(port) = config.port
+                    && !ports.insert(port)
+                {
+                    return Err(format!(
+                        "source document declares port {port} twice; each port may be declared once"
+                    ));
+                }
+            }
+            Ok(())
+        }
         ControlOp::TenantPut { .. }
         | ControlOp::TenantDelete { .. }
         | ControlOp::PrincipalPut { .. }
@@ -278,6 +462,119 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             Err("reserved op: multi-tenancy and RBAC arrive with RFC-002 (#17)".to_owned())
         }
     }
+}
+
+/// The rules every config carried by the log must satisfy, whether an operator
+/// wrote it directly ([`ControlOp::PutImposter`]) or a source produced it
+/// ([`ControlOp::SourcePullResult`]). Shared so the two paths cannot drift into
+/// admitting different things.
+fn validate_replicable_config(config: &ImposterConfig) -> Result<(), String> {
+    if config.port.is_none() {
+        return Err(
+            "config must carry an explicit port: an auto-assigned port cannot replicate".to_owned(),
+        );
+    }
+    match config.protocol.as_str() {
+        "http" | "https" => {}
+        other => return Err(format!("unsupported protocol {other:?}")),
+    }
+    let mut ids = std::collections::HashSet::new();
+    for stub in &config.stubs {
+        if let Some(id) = stub.id.as_deref()
+            && !ids.insert(id)
+        {
+            return Err(format!("duplicate stub id {id:?}"));
+        }
+    }
+    // The clustered store's knobs (#120). Refused here, pre-commit, because
+    // `FlowStoreProvider::provide` has no error channel — by the time the
+    // provider reads the config it must already be valid.
+    crate::stores::FlowConfig::validate(config)
+}
+
+/// Whether `name` is usable as a source id or an `auth_ref`: a bounded,
+/// path-safe, redb-key-safe token.
+fn is_source_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn require_source_id(id: &str) -> Result<(), String> {
+    if is_source_name(id) {
+        Ok(())
+    } else {
+        Err(
+            "source id must be a non-empty name of at most 128 characters drawn from \
+             [A-Za-z0-9._-]: it addresses the record and appears in the request path"
+                .to_owned(),
+        )
+    }
+}
+
+/// Refuse a source URI that carries credentials in its authority.
+///
+/// This is the secret-hygiene rule, and it lives in `validate` rather than only
+/// in the admin handler because `validate` is what runs before the state
+/// machine mutates anything on *every* replica: a URI that gets past admission
+/// by some other route still never becomes stored state. `auth_ref` is the only
+/// credential path.
+///
+/// The scheme is deliberately not checked against a registry here. Which
+/// schemes a node serves is per-node configuration (an embedder registers its
+/// own providers), so a registry check inside deterministic validation would
+/// let two replicas disagree about the same committed op. The admin handler
+/// makes that check node-locally, before the op is ever submitted.
+///
+/// A URI has an authority — and therefore somewhere to hide a credential — only
+/// when the scheme is followed immediately by `//` (RFC 3986 §3). Anything else
+/// is a path: upstream's `SourceRef::scheme` routes a `file:` prefix and a bare
+/// path to the local file provider, so an `@` there is a filename character.
+///
+/// The scheme is parsed properly rather than by searching for `://` anywhere in
+/// the string, because "anywhere" finds the wrong one:
+/// `s3:key@bucket/p?endpoint=https://minio.local` would have its *query* read
+/// as the authority, see no `@`, and admit a credential into the log. Parsing
+/// from the front means the delimiter has to be where a scheme delimiter
+/// actually is.
+fn require_credential_free_uri(uri: &str) -> Result<(), String> {
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return Err("source uri must not be empty".to_owned());
+    }
+    let scheme_len = uri
+        .find(':')
+        .filter(|end| {
+            // RFC 3986: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+            let scheme = &uri[..*end];
+            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        })
+        .map_or(0, |end| end + 1);
+    // Everything before the first `/` (or query/fragment) of the hier-part,
+    // and only when the hier-part actually opens with `//`.
+    let Some(hier) = uri[scheme_len..].strip_prefix("//") else {
+        // No authority to carry a credential: `file:…`, `s3:key@bucket/p`, and
+        // bare paths all address something local or opaque, never a host this
+        // node would authenticate to.
+        return Ok(());
+    };
+    let authority = hier.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return Err(
+            "source uri carries credentials in its authority; pass a credential name as auth_ref \
+             instead so no secret enters the replicated log"
+                .to_owned(),
+        );
+    }
+    if authority.is_empty() {
+        return Err(format!("source uri {uri:?} names no host"));
+    }
+    Ok(())
 }
 
 fn require_default_tenant(tenant: &TenantId) -> Result<(), String> {
@@ -311,6 +608,12 @@ pub(crate) fn precondition_target(op: &ControlOp) -> Option<(&TenantId, u16)> {
         // upsert op ever lands.
         | ControlOp::PutRoutes { .. }
         | ControlOp::DeleteRoute { .. }
+        // A source op addresses a source, not an imposter: `expected_revision`
+        // is defined against `sm_configs` rows, so there is no record here for
+        // a precondition to hold against.
+        | ControlOp::SourcePut { .. }
+        | ControlOp::SourceDelete { .. }
+        | ControlOp::SourcePullResult { .. }
         | ControlOp::TenantPut { .. }
         | ControlOp::TenantDelete { .. }
         | ControlOp::PrincipalPut { .. }
@@ -509,6 +812,34 @@ mod tests {
                 },
                 "DeleteRoute",
             ),
+            (
+                ControlOp::SourcePut {
+                    tenant: TenantId::default(),
+                    id: "mocks".to_owned(),
+                    uri: "https://h/i.json".to_owned(),
+                    mode: SourceMode::Pinned,
+                    auth_ref: None,
+                    on_drift: OnDrift::Overwrite,
+                },
+                "SourcePut",
+            ),
+            (
+                ControlOp::SourceDelete {
+                    tenant: TenantId::default(),
+                    id: "mocks".to_owned(),
+                },
+                "SourceDelete",
+            ),
+            (
+                ControlOp::SourcePullResult {
+                    tenant: TenantId::default(),
+                    id: "mocks".to_owned(),
+                    version: None,
+                    digest: Digest::new("a".repeat(64)),
+                    configs: vec![],
+                },
+                "SourcePullResult",
+            ),
             (ControlOp::TenantPut { body: json!({}) }, "TenantPut"),
             (ControlOp::TenantDelete { body: json!({}) }, "TenantDelete"),
             (ControlOp::PrincipalPut { body: json!({}) }, "PrincipalPut"),
@@ -532,6 +863,35 @@ mod tests {
             );
             let _: ControlOp = serde_json::from_value(value).expect("round-trips");
         }
+    }
+
+    /// The source enums are log format too: a replica decoding `"overwrite"` as
+    /// something else would apply a committed pull differently from its peers.
+    #[test]
+    fn source_enum_spellings_are_stable() {
+        for (mode, spelling) in [
+            (SourceMode::Pinned, "pinned"),
+            (SourceMode::Tracking, "tracking"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(mode).expect("serialize"),
+                json!(spelling)
+            );
+        }
+        for (on_drift, spelling) in [
+            (OnDrift::Overwrite, "overwrite"),
+            (OnDrift::Skip, "skip"),
+            (OnDrift::Fail, "fail"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(on_drift).expect("serialize"),
+                json!(spelling)
+            );
+            assert_eq!(on_drift.to_string(), spelling);
+        }
+        // The defaults a source takes when the operator declares neither.
+        assert_eq!(SourceMode::default(), SourceMode::Pinned);
+        assert_eq!(OnDrift::default(), OnDrift::Overwrite);
     }
 
     #[test]
@@ -762,6 +1122,275 @@ mod tests {
             id: "any".to_owned(),
         };
         validate(&op).expect_err("non-default tenant is still refused");
+    }
+
+    // -- validate: source ops (issue #134) --------------------------------------
+
+    fn source_put(id: &str, uri: &str) -> ControlOp {
+        ControlOp::SourcePut {
+            tenant: TenantId::default(),
+            id: id.to_owned(),
+            uri: uri.to_owned(),
+            mode: SourceMode::Pinned,
+            auth_ref: None,
+            on_drift: OnDrift::Overwrite,
+        }
+    }
+
+    fn pull_result(id: &str, configs: Vec<ImposterConfig>) -> ControlOp {
+        ControlOp::SourcePullResult {
+            tenant: TenantId::default(),
+            id: id.to_owned(),
+            version: Some("v1".to_owned()),
+            digest: Digest::new("a".repeat(64)),
+            configs,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_pinned_source() {
+        assert_eq!(
+            validate(&source_put("mocks", "https://h/imposters.json")),
+            Ok(())
+        );
+        assert_eq!(
+            validate(&source_put("mocks", "file:/srv/mocks.json")),
+            Ok(())
+        );
+        assert_eq!(
+            validate(&ControlOp::SourceDelete {
+                tenant: TenantId::default(),
+                id: "mocks".to_owned(),
+            }),
+            Ok(())
+        );
+    }
+
+    /// The secret-hygiene rule: `auth_ref` is the only credential path, so a URI
+    /// that carries one is refused at admission — before it can be written to a
+    /// log that every replica keeps and every snapshot copies.
+    #[test]
+    fn validate_rejects_embedded_credentials_in_a_source_uri() {
+        for uri in [
+            "https://user:pass@host/x.json",
+            "https://token@host/x.json",
+            "git+https://oauth2:ghp_secret@github.com/o/r#main:p",
+        ] {
+            let err = validate(&source_put("mocks", uri))
+                .expect_err("a URI carrying credentials must be refused");
+            assert!(
+                err.contains("auth_ref") && err.contains("credential"),
+                "the refusal must point at the supported path: {err}"
+            );
+            assert!(
+                !err.contains(uri) && !err.contains('@'),
+                "the refusal must not echo the credential-bearing uri back: {err}"
+            );
+        }
+    }
+
+    /// Userinfo is only userinfo before the first `/`. A password-looking
+    /// substring in a *path* or *query* is not a credential, and refusing it
+    /// would make ordinary URIs unusable.
+    #[test]
+    fn validate_allows_an_at_sign_outside_the_authority() {
+        for uri in [
+            "https://host/teams/a@b/mocks.json",
+            "https://host/x.json?owner=a@b",
+            "file:/srv/a@b/mocks.json",
+        ] {
+            assert_eq!(validate(&source_put("mocks", uri)), Ok(()), "uri {uri}");
+        }
+    }
+
+    /// The authority is located by parsing the scheme from the front, not by
+    /// searching for `://` anywhere in the string. A `://` in a *query* is not
+    /// a scheme delimiter, and reading it as one would look past the real
+    /// userinfo and admit a credential into the log.
+    #[test]
+    fn a_later_double_slash_cannot_be_mistaken_for_the_authority() {
+        let err = validate(&source_put(
+            "mocks",
+            "https://user:pw@cfg.test/i.json?endpoint=https://minio.local",
+        ))
+        .expect_err("the credential is in the real authority");
+        assert!(err.contains("auth_ref"), "{err}");
+
+        // The same shape without a credential still parses to the real host.
+        assert_eq!(
+            validate(&source_put(
+                "mocks",
+                "https://cfg.test/i.json?endpoint=https://minio.local"
+            )),
+            Ok(())
+        );
+    }
+
+    /// A path is a path however it is spelled. `file:` and bare forms both
+    /// dispatch to the file provider upstream and have no authority, so an `@`
+    /// in them is a filename character — refusing it would make ordinary paths
+    /// unusable while protecting nothing, since no network provider is
+    /// reachable without `://`.
+    #[test]
+    fn an_at_sign_in_a_path_only_uri_is_not_a_credential() {
+        for uri in ["a@b/mocks.json", "file:a@b/mocks.json", "./a@b.json"] {
+            assert_eq!(validate(&source_put("mocks", uri)), Ok(()), "uri {uri}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_source_without_a_usable_uri() {
+        for uri in ["", "   ", "https://"] {
+            let err = validate(&source_put("mocks", uri))
+                .expect_err("a source must name something fetchable");
+            assert!(err.contains("uri"), "{err}");
+        }
+    }
+
+    /// The id is a path segment in `/admin/sources/:id` and a redb key. A blank
+    /// or slash-bearing id would address a different route than it names.
+    #[test]
+    fn validate_rejects_an_unusable_source_id() {
+        for id in ["", " ", "a/b", "a?b", "a b", &"x".repeat(129)] {
+            let err = validate(&source_put(id, "https://h/x.json"))
+                .expect_err("id must be a usable path segment");
+            assert!(err.contains("id"), "id {id:?}: {err}");
+        }
+        for id in ["mocks", "team-a.payments_v2", "A1"] {
+            assert_eq!(
+                validate(&source_put(id, "https://h/x.json")),
+                Ok(()),
+                "id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_tracking_mode_until_the_poll_scheduler_lands() {
+        let op = ControlOp::SourcePut {
+            tenant: TenantId::default(),
+            id: "mocks".to_owned(),
+            uri: "https://h/x.json".to_owned(),
+            mode: SourceMode::Tracking,
+            auth_ref: None,
+            on_drift: OnDrift::Overwrite,
+        };
+        let err = validate(&op).expect_err("tracking arrives with #135");
+        assert!(err.contains("#135"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_an_unusable_auth_ref() {
+        let bad = ControlOp::SourcePut {
+            tenant: TenantId::default(),
+            id: "mocks".to_owned(),
+            uri: "https://h/x.json".to_owned(),
+            mode: SourceMode::Pinned,
+            auth_ref: Some(String::new()),
+            on_drift: OnDrift::Overwrite,
+        };
+        let err = validate(&bad).expect_err("an empty credential name names nothing");
+        assert!(err.contains("auth_ref"), "{err}");
+    }
+
+    /// A pull result carries configs into the log, so it is held to exactly the
+    /// same config rules as a hand-written `PutImposter` — a source must not be
+    /// a way to smuggle an unreplicable config past admission.
+    #[test]
+    fn validate_holds_pull_results_to_the_put_imposter_config_rules() {
+        assert_eq!(validate(&pull_result("mocks", vec![*config(8080)])), Ok(()));
+
+        let portless: ImposterConfig =
+            serde_json::from_value(json!({ "protocol": "http" })).expect("parses");
+        let err = validate(&pull_result("mocks", vec![portless]))
+            .expect_err("auto-assign cannot replicate");
+        assert!(err.contains("port"), "{err}");
+
+        let bad_protocol: ImposterConfig =
+            serde_json::from_value(json!({ "port": 1, "protocol": "smtp" })).expect("parses");
+        let err = validate(&pull_result("mocks", vec![bad_protocol]))
+            .expect_err("protocol outside http/https");
+        assert!(err.contains("protocol"), "{err}");
+
+        let dup_stubs: ImposterConfig = serde_json::from_value(json!({
+            "port": 1,
+            "protocol": "http",
+            "stubs": [ { "id": "a" }, { "id": "a" } ],
+        }))
+        .expect("parses");
+        let err = validate(&pull_result("mocks", vec![dup_stubs]))
+            .expect_err("duplicate ids corrupt the stub-key diff");
+        assert!(err.contains('a'), "{err}");
+    }
+
+    /// A document declaring the same port twice would apply as "last one wins"
+    /// and leave the operator with one of the two imposters they wrote.
+    #[test]
+    fn validate_rejects_a_pull_result_that_declares_a_port_twice() {
+        let err = validate(&pull_result("mocks", vec![*config(8080), *config(8080)]))
+            .expect_err("a port may be declared once per document");
+        assert!(err.contains("8080"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_a_pull_result_without_a_digest() {
+        let op = ControlOp::SourcePullResult {
+            tenant: TenantId::default(),
+            id: "mocks".to_owned(),
+            version: None,
+            digest: Digest::new(""),
+            configs: vec![],
+        };
+        let err = validate(&op).expect_err("the digest is what the short-circuit compares");
+        assert!(err.contains("digest"), "{err}");
+    }
+
+    /// The log-entry size bound. A fetch is capped at the provider; this caps
+    /// what reaches the log, which is the fleet-wide liability.
+    #[test]
+    fn an_oversize_pull_result_is_refused() {
+        // One config whose serialized form comfortably exceeds the cap.
+        let huge: ImposterConfig = serde_json::from_value(json!({
+            "port": 8080,
+            "protocol": "http",
+            "name": "x".repeat(MAX_SOURCE_PAYLOAD_BYTES + 1),
+        }))
+        .expect("parses");
+        let err = validate(&pull_result("mocks", vec![huge]))
+            .expect_err("an oversize payload must never reach the log");
+        assert!(
+            err.contains(&MAX_SOURCE_PAYLOAD_BYTES.to_string()),
+            "the refusal must name the bound: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_source_ops_on_a_non_default_tenant() {
+        let ops = [
+            ControlOp::SourcePut {
+                tenant: TenantId::new("acme"),
+                id: "mocks".to_owned(),
+                uri: "https://h/x.json".to_owned(),
+                mode: SourceMode::Pinned,
+                auth_ref: None,
+                on_drift: OnDrift::Overwrite,
+            },
+            ControlOp::SourceDelete {
+                tenant: TenantId::new("acme"),
+                id: "mocks".to_owned(),
+            },
+            ControlOp::SourcePullResult {
+                tenant: TenantId::new("acme"),
+                id: "mocks".to_owned(),
+                version: None,
+                digest: Digest::new("a".repeat(64)),
+                configs: vec![],
+            },
+        ];
+        for op in ops {
+            let err = validate(&op).expect_err("non-default tenant must be rejected");
+            assert!(err.contains("tenant"), "{err}");
+        }
     }
 
     // -- apply_edit -----------------------------------------------------------

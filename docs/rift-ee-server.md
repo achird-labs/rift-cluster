@@ -596,6 +596,161 @@ control-plane object**, exactly like the imposter config set.
 With `--cluster` off, none of this exists: `--front-door` behaves exactly as
 it does in the open-source binary, which is what the `parity` CI job checks.
 
+## Imposter sources (#134)
+
+An **imposter source** is a URI the fleet agrees backs some of its imposters —
+a config document in S3, in a git repo, on a config server. Under `--cluster`
+a source is a replicated control-plane object, like the imposter set and the
+route table: declared once, visible on every node, and pulled on demand.
+
+The rule that makes this cluster-correct: **fetching never happens in the apply
+path.** A fetch is I/O against a system this cluster does not control, and two
+nodes fetching the same URI a second apart can legitimately get different
+bytes — so the node that received the request fetches *once*, hashes what it
+got, and submits the result as an ordinary control op. The fetched bytes enter
+the log exactly once and every node applies those same bytes. Followers never
+fetch.
+
+### The endpoints
+
+These ride the **cluster port**, beside `/_cluster/*` — they are an operator
+surface authenticated with the cluster credential (`--cluster-secret`), not
+with the admin API key:
+
+| Endpoint | What it does |
+|---|---|
+| `POST /admin/sources` | Declare a source: `{ id, uri, mode?, authRef?, onDrift? }` |
+| `GET /admin/sources` | Every source, with its drift flag and last pull outcome |
+| `GET /admin/sources/:id` | One source |
+| `DELETE /admin/sources/:id` | Stop tracking the URI |
+| `POST /admin/sources/:id/pull` | Fetch it now and apply what it produced |
+
+A pull answers `{ revision, version, digest, unchanged, skipped, changed: [ports] }`.
+The two negative flags mean different things: `unchanged` is "nothing to do, no
+log entry written", while `skipped` is "the log recorded a decision *not* to
+apply" (a drifted source under `onDrift: skip`) — in which case the fleet does
+not hold this content and `changed` is empty.
+
+Refusals carry the usual split: `400` for something the operator can fix (a
+malformed body, an unservable scheme, a drifted source under `onDrift: fail`),
+`404` for an unknown source, and `503` + `Rift-Cluster-Op-Id` when the write
+could not be committed — the same Chapter 4 write-path contract the admin
+front uses, so a client polls `GET /_cluster/ops/:id` rather than blind-
+retrying.
+
+| Field | Values | Meaning |
+|---|---|---|
+| `mode` | `"pinned"` (default) | Explicit pulls only. `"tracking"` (scheduled polls) is in the log format but refused until #135 |
+| `onDrift` | `"overwrite"` (default) \| `"skip"` \| `"fail"` | What a pull does when the source's imposters have been hand-edited since it last applied |
+| `authRef` | a credential *name* | Stored and validated as a name. Resolving it into a request header ships with the providers that need it (#136) — upstream's `HttpSource` has no header-injection seam, so a credentialed fetch needs a new provider, not a hook here |
+
+**Secret hygiene.** A URI carrying credentials in its authority
+(`https://user:pass@host/x.json`) is refused before anything is written, so the
+secret never reaches the log — not even as a committed refusal, which would
+keep it on every replica's disk and in every snapshot. `authRef` is the only
+credential path.
+
+### No-change pulls cost nothing
+
+A pull whose content matches what the source last applied produces **no log
+entry at all** — it answers `unchanged: true` and the applied index does not
+move. Without that, a fleet re-pulling a stable document would grow its log
+forever and re-churn imposter state every round. The comparison is a SHA-256
+over a canonical (recursively key-sorted) encoding of the fetched configs, so
+a document that only reordered itself still counts as unchanged.
+
+Two things deliberately do **not** count as unchanged, because in both the
+fleet does not hold the content:
+
+- a **drifted** source — an operator who hand-edited an imposter and then pulls
+  to restore declared truth is the ordinary repair path, and answering
+  "unchanged" there would make drift unfixable except by editing the document
+  upstream;
+- content a previous pull **skipped** — a skip records the digest it *saw*, not
+  one that was applied.
+
+### Provenance and drift
+
+A pull stamps each config it applies with its source id and version. That
+provenance is replicated state, which is what makes drift detection
+deterministic: when an operator edits a source-owned imposter by hand — a
+`PUT`/`POST` on its stubs, an enable/disable, a delete — every replica flips
+that source's `drifted` flag at the same log index, for the same reason.
+
+`GET /_cluster/config` reports the provenance alongside the ports, so the
+question an operator actually asks of a source-driven fleet — "has every node
+converged on the same configs, from the same source version?" — is answered by
+comparing two nodes' responses.
+
+The next pull then follows the source's declared `onDrift`:
+
+- `overwrite` (the default, and Solo's behaviour) applies the document and
+  clears the flag — but *declared*, and visible in `GET /admin/sources/:id`
+  beforehand, rather than a silent clobber;
+- `skip` leaves the operator's edit alone and records the attempt, so a source
+  being held back is visible rather than looking idle;
+- `fail` refuses the pull.
+
+Two deliberate non-destructive choices:
+
+- **A pull only touches what its own source owns.** Ports the document dropped
+  are removed; a config it declares unchanged is not rewritten at all (the
+  rewrite is what would reset that imposter's runtime state); an imposter no
+  source owns is never in the blast radius. If two sources declare the same
+  port — nothing forbids it, since they are fetched independently — the one
+  that loses the port is marked `drifted` rather than left believing it still
+  owns it.
+- **Deleting a source does not delete its imposters.** "Stop tracking this URI"
+  is not "tear down live traffic". The imposters keep serving and simply lose
+  their provenance, so nothing is left pointing at a source that no longer
+  exists.
+
+### `--imposters` under `--cluster`
+
+Upstream's `--imposters <uri,...>` loads imposters from source URIs at startup.
+With `--cluster` **off** it behaves exactly as it does in the open-source
+binary. With `--cluster` **on** it becomes sugar for declaring pinned sources:
+this binary takes the flag before handing the CLI to `ServerBuilder` and
+declares one source per URI, then pulls each once — so the imposters land
+through the replicated log and reach every node.
+
+Left in place, upstream's own startup would create those imposters in *this
+node's* manager, outside the log, and the reconciler — which treats the
+replicated set as authoritative — would then delete them again. That is the
+same failure `--configfile` is refused for (see the startup guards);
+`--imposters` can be desugared instead of refused because a URI is fetchable
+from every node, while a local path is not.
+
+Source ids are derived from the URI (a readable slug plus a short hash), so
+they are stable: a restart, or a second node booting with the same flags,
+upserts the same source rather than accumulating one per boot — and the digest
+short circuit then makes the repeat pull a no-op.
+
+A source that cannot be declared or pulled **fails the start**. An operator who
+passed `--imposters` asked for those imposters to be serving; a node that comes
+up healthy without them is the silently half-configured fleet this path exists
+to avoid.
+
+### What a pull does not apply
+
+A source document may declare blocks that belong to other subsystems:
+
+- an `intercept` block **refuses the pull** — the cluster refuses the TLS-MITM
+  intercept listener fleet-wide, because its state is per-node and is not
+  replicated;
+- a `routes` block is **ignored, with a warning in the pull response** — the
+  front door's table is its own replicated object with its own op (`PUT
+  /front-door/routes`, above).
+
+### Audit
+
+Every applied pull writes a structured `audit`-target log event naming the
+principal, the source id, the version and the applying revision — so "who moved
+the payment mocks to which commit, and when" is a log query.
+
+Scheduled `tracking` polls are #135; the `git:`/`s3:`/`registry:` providers are
+#136; container-tier chaos coverage is #137.
+
 ## Clustered flow state (#120)
 
 Under `--cluster`, **every** imposter's flow state (scenarios, `ctx.state`,
