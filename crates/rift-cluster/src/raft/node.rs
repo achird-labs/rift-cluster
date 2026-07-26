@@ -1132,6 +1132,53 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// Block until this node's leadership differs from `was_leader`, or until
+    /// `timeout` elapses; return its leadership as of the moment this returns.
+    ///
+    /// Event-driven off the same `RaftMetrics` watch the forward-to-leader path
+    /// reads (issue #135) — deliberately *not* a second leadership source. Two
+    /// independent notions of "am I the leader" is how a fleet ends up with two
+    /// pollers, which is the exact failure the tracking scheduler exists to
+    /// prevent.
+    ///
+    /// The bounded wait is the safety net, not the mechanism: the watch also
+    /// fires on ordinary metrics movement (a committed entry), so the caller
+    /// re-reconciles promptly on a `SourcePut` without needing its own signal.
+    /// A closed watch (the Raft core is gone) reports the current value and
+    /// lets the caller notice on its next upgrade.
+    ///
+    /// Returns a plain `bool` rather than the metrics themselves: openraft is
+    /// an implementation detail of this crate and must not reach its public API.
+    pub async fn await_leadership_change(&self, was_leader: bool, timeout: Duration) -> bool {
+        let mut receiver = self.raft.metrics();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Read and drop the watch guard in one statement: holding a
+            // `borrow()` across the await below would block the sender.
+            let now = receiver.borrow().state == ServerState::Leader;
+            if now != was_leader {
+                return now;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return now;
+            }
+            match tokio::time::timeout(remaining, receiver.changed()).await {
+                // Timed out, or the Raft core dropped the sender: report what
+                // is true now and let the caller decide what to do about it.
+                Err(_) | Ok(Err(_)) => return receiver.borrow().state == ServerState::Leader,
+                // Metrics moved — re-read and check again.
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+
+    /// Whether this node is currently the Raft leader.
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
+        self.raft.metrics().borrow().state == ServerState::Leader
+    }
+
     /// Every imposter source the default tenant has declared, id-ascending
     /// (issue #134). Like [`Self::configured_ports`], this answers from local
     /// applied state and needs no leadership — which is what lets any node

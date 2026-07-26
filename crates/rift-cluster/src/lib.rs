@@ -45,6 +45,7 @@ pub use raft::{
     PullOutcome, RaftNode, Ring, SourceRecord, StatusReport,
 };
 pub use rpc::{Authority, AuthorityError, Router, RpcClient, RpcError, RpcServer};
+pub use sources::scheduler::{PollStatus, SourceScheduler};
 pub use sources::{PullError, PullReport, SourcePuller};
 
 use serde::{Deserialize, Serialize};

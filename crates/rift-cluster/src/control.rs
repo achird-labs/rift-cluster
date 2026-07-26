@@ -141,6 +141,16 @@ pub enum ControlOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_ref: Option<String>,
         on_drift: OnDrift,
+        /// How often the leader re-fetches a [`SourceMode::Tracking`] source,
+        /// in seconds (issue #135). Required for `tracking`, refused for
+        /// `pinned` — a poll interval on a source nobody polls is a setting
+        /// that silently does nothing.
+        ///
+        /// Defaulted so a `SourcePut` written before #135 still decodes; such
+        /// an entry is necessarily `pinned`, which is exactly what `None`
+        /// means.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll_secs: Option<u64>,
     },
     /// Forget a source. Its imposters stay bound and lose their provenance —
     /// see `mutate_tables`' arm for why deleting them would be the wrong
@@ -265,6 +275,17 @@ pub struct SourceProvenance {
     pub version: Option<String>,
 }
 
+/// The shortest poll interval a [`SourceMode::Tracking`] source may declare.
+///
+/// A floor, not a suggestion: `poll_secs: 0` (or a typo'd `1`) turns the fleet
+/// into a request flood against someone else's host, and the operator who wrote
+/// it would see only that their mocks update promptly. Five seconds is far
+/// below any realistic config-change cadence while keeping a mistyped value
+/// from being a denial of service — and the digest short circuit means a poll
+/// that finds nothing new costs no log growth, so there is no reason to want
+/// less.
+pub const MIN_POLL_SECS: u64 = 5;
+
 /// Largest config payload a [`ControlOp::SourcePullResult`] may carry, matching
 /// the 10 MB body cap upstream's providers enforce at fetch time
 /// (`rift_http_proxy::sources::MAX_BODY_BYTES`). Checked again here as defence
@@ -380,17 +401,38 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             uri,
             mode,
             auth_ref,
+            poll_secs,
             ..
         } => {
             require_default_tenant(tenant)?;
             require_source_id(id)?;
             require_credential_free_uri(uri)?;
-            if *mode == SourceMode::Tracking {
-                return Err(
-                    "mode \"tracking\" needs the leader-only poll scheduler, which arrives with \
-                     #135; use \"pinned\" and pull explicitly"
-                        .to_owned(),
-                );
+            match (mode, poll_secs) {
+                (SourceMode::Tracking, None) => {
+                    return Err(
+                        "mode \"tracking\" requires pollSecs: a source the fleet polls has to say \
+                         how often"
+                            .to_owned(),
+                    );
+                }
+                (SourceMode::Tracking, Some(secs)) if *secs < MIN_POLL_SECS => {
+                    return Err(format!(
+                        "pollSecs {secs} is below the {MIN_POLL_SECS}s floor: a shorter interval \
+                         floods the source host, and an unchanged document costs nothing to \
+                         re-poll at the floor"
+                    ));
+                }
+                // Refused rather than ignored: a poll interval on a source
+                // nobody polls is a setting that silently does nothing, which
+                // is how an operator ends up believing their mocks track.
+                (SourceMode::Pinned, Some(_)) => {
+                    return Err(
+                        "pollSecs applies to mode \"tracking\" only; a pinned source is pulled \
+                         explicitly"
+                            .to_owned(),
+                    );
+                }
+                (SourceMode::Tracking, Some(_)) | (SourceMode::Pinned, None) => {}
             }
             // Validated as a *name* only. Resolving it to a credential ships
             // with the providers that need one (#136) — see the module doc.
@@ -820,6 +862,7 @@ mod tests {
                     mode: SourceMode::Pinned,
                     auth_ref: None,
                     on_drift: OnDrift::Overwrite,
+                    poll_secs: None,
                 },
                 "SourcePut",
             ),
@@ -1134,6 +1177,7 @@ mod tests {
             mode: SourceMode::Pinned,
             auth_ref: None,
             on_drift: OnDrift::Overwrite,
+            poll_secs: None,
         }
     }
 
@@ -1265,18 +1309,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn validate_rejects_tracking_mode_until_the_poll_scheduler_lands() {
-        let op = ControlOp::SourcePut {
+    fn tracking_put(poll_secs: Option<u64>) -> ControlOp {
+        ControlOp::SourcePut {
             tenant: TenantId::default(),
             id: "mocks".to_owned(),
             uri: "https://h/x.json".to_owned(),
             mode: SourceMode::Tracking,
             auth_ref: None,
             on_drift: OnDrift::Overwrite,
+            poll_secs,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_tracking_source_at_or_above_the_poll_floor() {
+        assert_eq!(validate(&tracking_put(Some(MIN_POLL_SECS))), Ok(()));
+        assert_eq!(validate(&tracking_put(Some(300))), Ok(()));
+    }
+
+    /// The floor is a denial-of-service guard, not a style preference: the
+    /// operator who typos `1` sees only that their mocks update promptly, while
+    /// the fleet hammers someone else's host.
+    #[test]
+    fn validate_rejects_a_poll_interval_below_the_floor() {
+        for secs in [0, 1, MIN_POLL_SECS - 1] {
+            let err = validate(&tracking_put(Some(secs)))
+                .expect_err("a sub-floor interval must be refused");
+            assert!(
+                err.contains(&MIN_POLL_SECS.to_string()),
+                "the refusal must name the floor so it is actionable: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_tracking_source_with_no_interval() {
+        let err = validate(&tracking_put(None))
+            .expect_err("a polled source must say how often it is polled");
+        assert!(err.contains("pollSecs"), "{err}");
+    }
+
+    /// Refused rather than ignored: silently accepting a poll interval on a
+    /// pinned source is how an operator ends up believing their mocks track
+    /// when nothing polls them.
+    #[test]
+    fn validate_rejects_a_poll_interval_on_a_pinned_source() {
+        let op = ControlOp::SourcePut {
+            tenant: TenantId::default(),
+            id: "mocks".to_owned(),
+            uri: "https://h/x.json".to_owned(),
+            mode: SourceMode::Pinned,
+            auth_ref: None,
+            on_drift: OnDrift::Overwrite,
+            poll_secs: Some(60),
         };
-        let err = validate(&op).expect_err("tracking arrives with #135");
-        assert!(err.contains("#135"), "{err}");
+        let err = validate(&op).expect_err("a pinned source is never polled");
+        assert!(err.contains("tracking"), "{err}");
+    }
+
+    /// The op is log format: a `SourcePut` written before #135 has no
+    /// `poll_secs` and must still decode — as a pinned source, which is what it
+    /// necessarily was.
+    #[test]
+    fn a_pre_poll_source_put_still_decodes() {
+        let legacy = json!({
+            "SourcePut": {
+                "tenant": "default",
+                "id": "mocks",
+                "uri": "https://h/x.json",
+                "mode": "pinned",
+                "on_drift": "overwrite",
+            }
+        });
+        let op: ControlOp = serde_json::from_value(legacy).expect("a pre-#135 op decodes");
+        match op {
+            ControlOp::SourcePut {
+                poll_secs, mode, ..
+            } => {
+                assert_eq!(poll_secs, None);
+                assert_eq!(mode, SourceMode::Pinned);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
@@ -1288,6 +1402,7 @@ mod tests {
             mode: SourceMode::Pinned,
             auth_ref: Some(String::new()),
             on_drift: OnDrift::Overwrite,
+            poll_secs: None,
         };
         let err = validate(&bad).expect_err("an empty credential name names nothing");
         assert!(err.contains("auth_ref"), "{err}");
@@ -1374,6 +1489,7 @@ mod tests {
                 mode: SourceMode::Pinned,
                 auth_ref: None,
                 on_drift: OnDrift::Overwrite,
+                poll_secs: None,
             },
             ControlOp::SourceDelete {
                 tenant: TenantId::new("acme"),

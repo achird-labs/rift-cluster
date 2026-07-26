@@ -127,6 +127,11 @@ pub enum PullError {
 pub struct SourcePuller {
     registry: SourceRegistry,
     node: OnceLock<Weak<RaftNode>>,
+    /// Leader-local poll status from the tracking scheduler (#135), when one is
+    /// running. Absent on a node with no scheduler (a test fixture, or an
+    /// embedder that wired only explicit pulls) — and, by construction, empty
+    /// on a follower, since only the leader polls.
+    poll_status: OnceLock<Weak<scheduler::PollStatus>>,
 }
 
 impl std::fmt::Debug for SourcePuller {
@@ -147,6 +152,7 @@ impl SourcePuller {
         Self {
             registry,
             node: OnceLock::new(),
+            poll_status: OnceLock::new(),
         }
     }
 
@@ -161,6 +167,22 @@ impl SourcePuller {
         self.node
             .set(Arc::downgrade(node))
             .map_err(|_| AlreadyBound)
+    }
+
+    /// Publish the scheduler's poll status so `GET /admin/sources/:id` can
+    /// report why a tracking source is not advancing.
+    ///
+    /// `Weak`, like the node handle: the scheduler's lifetime is the node's,
+    /// and the puller must not extend it. A second attach is ignored — the
+    /// composition wires exactly one scheduler.
+    pub fn attach_poll_status(&self, status: &Arc<scheduler::PollStatus>) {
+        let _ = self.poll_status.set(Arc::downgrade(status));
+    }
+
+    /// The last poll error this node recorded for `id`, if any.
+    #[must_use]
+    pub fn last_poll_error(&self, id: &str) -> Option<String> {
+        self.poll_status.get()?.upgrade()?.last_error(id)
     }
 
     /// Whether this build can serve the scheme `uri` names. Node-local
@@ -386,6 +408,7 @@ impl SourcePuller {
                 mode: SourceMode::Pinned,
                 auth_ref: None,
                 on_drift,
+                poll_secs: None,
             },
         );
         if let Err(reason) = crate::control::validate(&request.op) {
@@ -553,6 +576,11 @@ struct SourceBody {
     auth_ref: Option<String>,
     #[serde(default)]
     on_drift: OnDrift,
+    /// Poll cadence for a `tracking` source (#135). `validate` enforces the
+    /// mode/interval pairing, so this is carried through verbatim rather than
+    /// second-guessed here.
+    #[serde(default)]
+    poll_secs: Option<u64>,
 }
 
 /// Register the source endpoints onto `base` (see the module doc for why they
@@ -647,6 +675,7 @@ async fn create_source(puller: &SourcePuller, body: &[u8]) -> Result<Vec<u8>, Rp
             mode: parsed.mode,
             auth_ref: parsed.auth_ref,
             on_drift: parsed.on_drift,
+            poll_secs: parsed.poll_secs,
         },
     );
     // Refused before the submit, so a credential-bearing URI never reaches the
@@ -694,7 +723,18 @@ async fn read_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, Rpc
         .source(id)
         .map_err(handler_error)?
         .ok_or_else(|| unknown_route("GET", id))?;
-    serde_json::to_vec(&record).map_err(handler_error)
+    // The durable record says what the fleet holds; the poll status says why a
+    // tracking source might not be advancing. An operator looking at a stale
+    // `lastVersion` needs the second to interpret the first — and a poll
+    // failure is deliberately never written to the log (#135), so this is the
+    // only place it surfaces.
+    let mut rendered = serde_json::to_value(&record).map_err(handler_error)?;
+    if let Some(error) = puller.last_poll_error(id)
+        && let Some(object) = rendered.as_object_mut()
+    {
+        object.insert("lastPollError".to_owned(), serde_json::Value::String(error));
+    }
+    serde_json::to_vec(&rendered).map_err(handler_error)
 }
 
 async fn delete_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, RpcError> {
@@ -782,6 +822,8 @@ fn pull_error(e: PullError) -> RpcError {
         PullError::Internal(detail) => RpcError::Handler(detail),
     }
 }
+
+pub mod scheduler;
 
 #[cfg(test)]
 mod tests;

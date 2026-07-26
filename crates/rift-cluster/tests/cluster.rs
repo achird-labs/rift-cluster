@@ -1226,3 +1226,225 @@ async fn a_credential_bearing_source_uri_never_reaches_the_log() {
 
     cluster.shutdown_all().await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #135: the leader-only tracking poll scheduler
+// ---------------------------------------------------------------------------
+
+/// Declare a tracking source and start a scheduler bound to `node`.
+async fn start_scheduler(
+    node: &Arc<RaftNode>,
+    source: &Arc<CountingSource>,
+) -> (
+    Arc<rift_cluster::SourcePuller>,
+    Arc<rift_cluster::PollStatus>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut registry = rift_ee::seams::SourceRegistry::new();
+    registry
+        .register(Arc::clone(source) as Arc<dyn rift_ee::seams::ImposterSource>)
+        .expect("register the counting source");
+    let puller = Arc::new(rift_cluster::SourcePuller::new(registry));
+    puller.bind(node).expect("bind the puller");
+    // The task handle is returned, not dropped: the supervisor holds an
+    // `Arc<RaftNode>` while waiting on the leadership watch, so a test that
+    // forgot to abort it would keep the node alive past `shutdown_all` and the
+    // next test's bind would fail.
+    let (status, task) =
+        rift_cluster::SourceScheduler::spawn(&tokio::runtime::Handle::current(), node, &puller);
+    (puller, status, task)
+}
+
+fn tracking_put(id: &str, uri: &str, poll_secs: u64) -> rift_cluster::ControlRequest {
+    rift_cluster::ControlRequest {
+        op_id: uuid::Uuid::new_v4(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: rift_cluster::ControlOp::SourcePut {
+            tenant: rift_cluster::TenantId::default(),
+            id: id.to_owned(),
+            uri: uri.to_owned(),
+            mode: rift_cluster::SourceMode::Tracking,
+            auth_ref: None,
+            on_drift: rift_cluster::OnDrift::Overwrite,
+            poll_secs: Some(poll_secs),
+        },
+    }
+}
+
+/// The property the whole design rests on: **one poller fleet-wide**, not one
+/// per node.
+///
+/// Every node runs a scheduler — the real deployment shape — but each is given
+/// its **own** counting source with its **own** counter. That turns the claim
+/// into an exact assertion (`followers fetched 0 times`) rather than a timing
+/// bound, which matters: an earlier version of this test asserted a ceiling on
+/// the *total* fetch count and a mutant that ignored leadership slipped under
+/// it, because two pollers at a 5s cadence over 12s land right at the bound.
+/// Per-node counters cannot be fudged by cadence, jitter, or a slow runner.
+#[tokio::test]
+async fn tracking_polls_run_on_the_leader_only() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(2).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("a leader");
+
+    // One scheduler per node, each with its own counter.
+    let mut counters: Vec<(NodeId, Arc<std::sync::atomic::AtomicUsize>)> = Vec::new();
+    let mut schedulers = Vec::new();
+    for member in &cluster.members {
+        let node = member.node.as_ref().expect("running");
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = Arc::new(CountingSource {
+            fetches: Arc::clone(&fetches),
+            body: std::sync::Mutex::new(vec![source_config(9501, "tracked-v1")]),
+            version: std::sync::Mutex::new("v1".to_owned()),
+        });
+        schedulers.push(start_scheduler(node, &source).await);
+        counters.push((member.id, fetches));
+    }
+
+    let leader = cluster.leader_handle().expect("a leader").clone();
+    leader
+        .submit(tracking_put("tracked", "counting://cfg/i.json", 5))
+        .await
+        .expect("declaring a tracking source commits");
+
+    // Long enough that a follower running its own timer would certainly have
+    // fired at a 5s cadence.
+    tokio::time::sleep(Duration::from_secs(14)).await;
+
+    for (id, fetches) in &counters {
+        let observed = fetches.load(std::sync::atomic::Ordering::SeqCst);
+        if *id == leader_id {
+            assert!(
+                observed >= 1,
+                "node {id} is the leader and must poll; saw {observed} fetches"
+            );
+        } else {
+            assert_eq!(
+                observed, 0,
+                "node {id} is a follower and must never fetch — a follower that polls is the \
+                 duplicate-fetch bug the whole fetch-then-submit design exists to prevent"
+            );
+        }
+    }
+
+    // And the polled content really did converge through the log.
+    assert!(
+        cluster
+            .wait_converged(9501, "tracked-v1", CONVERGE_DEADLINE)
+            .await,
+        "a scheduled poll must apply through the log like any other pull"
+    );
+
+    // Abort before shutdown: dropping a `JoinHandle` does not cancel the task,
+    // and a live supervisor holds the node alive past `shutdown_all`.
+    for (_, _, task) in &schedulers {
+        task.abort();
+    }
+    cluster.shutdown_all().await;
+}
+
+/// Unchanged content costs **zero log growth**, however long the fleet polls.
+/// This is what makes tracking mode affordable, and it is the first thing a
+/// careless refactor of the digest short circuit would break.
+#[tokio::test]
+async fn polling_unchanged_content_never_grows_the_log() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(1).await;
+    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
+
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source = Arc::new(CountingSource {
+        fetches: Arc::clone(&fetches),
+        body: std::sync::Mutex::new(vec![source_config(9502, "static")]),
+        version: std::sync::Mutex::new("v1".to_owned()),
+    });
+    let node = cluster.leader_handle().expect("a leader").clone();
+    let (_puller, _status, task) = start_scheduler(&node, &source).await;
+
+    node.submit(tracking_put("static", "counting://cfg/i.json", 5))
+        .await
+        .expect("declaring commits");
+    // Let the first poll apply the content, then pin the index.
+    assert!(
+        cluster
+            .wait_converged(9502, "static", CONVERGE_DEADLINE)
+            .await
+    );
+    let settled = node.status().last_applied.expect("an applied index");
+    let fetches_at_settle = fetches.load(std::sync::atomic::Ordering::SeqCst);
+
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    assert!(
+        fetches.load(std::sync::atomic::Ordering::SeqCst) > fetches_at_settle,
+        "the scheduler must still be polling — otherwise this proves nothing"
+    );
+    assert_eq!(
+        node.status().last_applied.expect("an applied index"),
+        settled,
+        "polling unchanged content must not write a single log entry"
+    );
+
+    task.abort();
+    cluster.shutdown_all().await;
+}
+
+/// The task set follows the source table without a restart: deleting a tracking
+/// source stops its poller.
+#[tokio::test]
+async fn deleting_a_tracking_source_stops_its_poller() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(1).await;
+    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
+
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source = Arc::new(CountingSource {
+        fetches: Arc::clone(&fetches),
+        body: std::sync::Mutex::new(vec![source_config(9503, "temp")]),
+        version: std::sync::Mutex::new("v1".to_owned()),
+    });
+    let node = cluster.leader_handle().expect("a leader").clone();
+    let (_puller, _status, task) = start_scheduler(&node, &source).await;
+
+    node.submit(tracking_put("temp", "counting://cfg/i.json", 5))
+        .await
+        .expect("declaring commits");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let polled = fetches.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        polled >= 1,
+        "the source must have been polled at least once"
+    );
+
+    node.submit(rift_cluster::ControlRequest {
+        op_id: uuid::Uuid::new_v4(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: rift_cluster::ControlOp::SourceDelete {
+            tenant: rift_cluster::TenantId::default(),
+            id: "temp".to_owned(),
+        },
+    })
+    .await
+    .expect("delete commits");
+
+    // Give the supervisor a reconcile window, then confirm the rate stopped.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after_delete = fetches.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        fetches.load(std::sync::atomic::Ordering::SeqCst),
+        after_delete,
+        "a deleted source must stop being polled without restarting the node"
+    );
+
+    task.abort();
+    cluster.shutdown_all().await;
+}

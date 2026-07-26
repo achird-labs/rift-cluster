@@ -147,6 +147,11 @@ struct StoredSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth_ref: Option<String>,
     on_drift: OnDrift,
+    /// Poll interval for a tracking source (issue #135). Defaulted so a source
+    /// stored before #135 still parses — it is necessarily pinned, which is
+    /// what `None` means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    poll_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last: Option<LastPull>,
     #[serde(default)]
@@ -207,6 +212,9 @@ pub struct SourceRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_ref: Option<String>,
     pub on_drift: OnDrift,
+    /// How often the leader re-fetches this source, when it tracks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_secs: Option<u64>,
     /// Whether an operator has edited this source's imposters by hand since it
     /// last applied.
     pub drifted: bool,
@@ -917,6 +925,7 @@ impl RedbStateMachine {
             mode: stored.mode,
             auth_ref: stored.auth_ref.clone(),
             on_drift: stored.on_drift,
+            poll_secs: stored.poll_secs,
             drifted: stored.drifted,
             last_version: stored.last.as_ref().and_then(|last| last.version.clone()),
             last_digest: stored
@@ -1640,6 +1649,7 @@ impl RedbStateMachine {
                 mode,
                 auth_ref,
                 on_drift,
+                poll_secs,
             } => {
                 let existing = Self::stored_source(sources, tenant.as_str(), id)?;
                 // Keep the pull history only while the record still describes
@@ -1655,6 +1665,7 @@ impl RedbStateMachine {
                     mode: *mode,
                     auth_ref: auth_ref.clone(),
                     on_drift: *on_drift,
+                    poll_secs: *poll_secs,
                     last,
                     drifted,
                     revision: index,
@@ -2567,6 +2578,7 @@ mod tests {
                 mode: SourceMode::Pinned,
                 auth_ref: None,
                 on_drift,
+                poll_secs: None,
             },
         )
     }

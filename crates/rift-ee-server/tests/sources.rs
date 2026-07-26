@@ -564,7 +564,8 @@ async fn operator_errors_are_refusals_not_internal_failures() {
     assert_eq!(err.status(), 400, "{err}");
     assert!(err.to_string().contains("scripted"), "{err}");
 
-    // `tracking` mode until #135.
+    // A tracking source with no interval: the fleet cannot poll what does not
+    // say how often.
     let err = call_err(
         &client,
         fixture.addr,
@@ -574,7 +575,43 @@ async fn operator_errors_are_refusals_not_internal_failures() {
     )
     .await;
     assert_eq!(err.status(), 400, "{err}");
-    assert!(err.to_string().contains("#135"), "{err}");
+    assert!(err.to_string().contains("pollSecs"), "{err}");
+
+    // Below the poll floor: refused, and the refusal names the floor so the
+    // operator can act on it rather than guessing.
+    let err = call_err(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources",
+        serde_json::json!({
+            "id": "flooder",
+            "uri": "scripted://cfg/i.json",
+            "mode": "tracking",
+            "pollSecs": 1,
+        }),
+    )
+    .await;
+    assert_eq!(err.status(), 400, "{err}");
+    assert!(err.to_string().contains('5'), "{err}");
+
+    // A poll interval on a pinned source: refused rather than silently ignored,
+    // which is how an operator ends up believing their mocks track.
+    let err = call_err(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources",
+        serde_json::json!({
+            "id": "confused",
+            "uri": "scripted://cfg/i.json",
+            "mode": "pinned",
+            "pollSecs": 60,
+        }),
+    )
+    .await;
+    assert_eq!(err.status(), 400, "{err}");
+    assert!(err.to_string().contains("tracking"), "{err}");
 
     // An unknown source, read and pulled.
     for (method, path) in [
@@ -756,6 +793,44 @@ async fn the_collection_route_resolves_with_a_query_string() {
         listed["sources"].as_array().expect("array").len(),
         1,
         "a query string must not turn the collection into a 404, nor into a member lookup"
+    );
+}
+
+/// A well-formed tracking source is accepted and reports its cadence back, so
+/// an operator can confirm what the fleet will actually do.
+#[tokio::test]
+async fn a_tracking_source_round_trips_with_its_poll_interval() {
+    let fixture = start().await;
+    let client = client();
+
+    let created = call(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources",
+        serde_json::json!({
+            "id": "tracked",
+            "uri": "scripted://cfg/i.json",
+            "mode": "tracking",
+            "pollSecs": 30,
+        }),
+    )
+    .await;
+    assert_eq!(created["mode"], "tracking");
+    assert_eq!(created["pollSecs"], 30);
+
+    let fetched = call(
+        &client,
+        fixture.addr,
+        "GET",
+        "/admin/sources/tracked",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(fetched["mode"], "tracking");
+    assert_eq!(
+        fetched["pollSecs"], 30,
+        "the cadence must survive the round trip: it is what the scheduler reads"
     );
 }
 
