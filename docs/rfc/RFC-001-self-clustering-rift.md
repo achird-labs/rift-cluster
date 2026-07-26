@@ -1877,13 +1877,15 @@ Redis impls of U-3/U-4/U-5, the `ResponseDecorator` impl, `/_cluster/*` endpoint
 > U-1→#311 (`compare_and_set`), U-2→#312 (`FlowStoreProvider`), U-3→#313 (`ResponseSequencer`),
 > U-4→#314 (`RequestJournal`), U-5→#315 (`ProxyRecordingStore`), U-6→#316 (`apply_config` +
 > events + `stub_key`), U-7→#317 (embeddable `ServerBuilder`/gateway/metrics), U-8→#318
-> (`ResponseDecorator` + `BackendUnavailable`). Three further seams are queued for later
-> phases: **U-11** the front-door route table (#19), **U-12** the `ImposterSource` provider
-> trait (#20), and **U-13** `RequestJournal::read_since` — the incremental-read method the
-> §7.5.1 vector cursor needs, which U-4 (#314, already merged) does not carry, so Phase 3's
-> fleet-wide streaming form is gated on it landing upstream. RFC-002 adds **U-9** (admin
-> authorizer) + **U-10** (principal on events). The original drafts are retained below for
-> provenance.
+> (`ResponseDecorator` + `BackendUnavailable`). Of the three later-phase seams, **U-11** (the
+> front-door route table, #19) and **U-12** (the `ImposterSource` provider trait, #20) have
+> since landed upstream — U-12 as `achird-labs/rift#852`, vendored by this repo's #133 — and
+> the enterprise halves are built on them: the replicated route table (#131) and sources as
+> control-plane objects (#134). **U-13** `RequestJournal::read_since` — the incremental-read
+> method the §7.5.1 vector cursor needs, which U-4 (#314, already merged) does not carry — is
+> still outstanding, so Phase 3's fleet-wide streaming form remains gated on it landing
+> upstream. RFC-002 adds **U-9** (admin authorizer) + **U-10** (principal on events). The
+> original drafts are retained below for provenance.
 
 Filed on `achird-labs/rift` (generic wording; no enterprise references). One
 umbrella issue — *"Pluggable runtime-state backends & embeddable server (#203

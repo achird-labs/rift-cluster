@@ -46,7 +46,7 @@
 //! fatal to the node, and that is the correct severity for a log that can no
 //! longer be applied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
@@ -68,7 +68,8 @@ use serde::{Deserialize, Serialize};
 
 use super::TypeConfig;
 use crate::control::{
-    self, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, StubEdit, StubEditScript,
+    self, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest, OnDrift, SourceMode,
+    SourceProvenance, StubEdit, StubEditScript,
 };
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
@@ -83,6 +84,10 @@ const SM_CONFIGS_TABLE: TableDefinition<(&str, u16), &str> = TableDefinition::ne
 /// `DeleteRoute` is a single-key removal instead of a read-modify-write of
 /// the whole tenant's set.
 const SM_ROUTES_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_routes");
+/// `(tenant, source id) -> StoredSource` (JSON): imposter sources as durable
+/// control-plane objects (issue #134). One row per source, like `sm_routes` —
+/// a delete is a single-key removal rather than a read-modify-write of a set.
+const SM_SOURCES_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_sources");
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
 /// Node-local durable intents (issue #9 R4): ops this node accepted but has
@@ -123,6 +128,121 @@ struct StoredImposter {
     config_json: String,
     enabled: bool,
     revision: u64,
+    /// Which source produced this config, when one did (issue #134). Defaulted
+    /// so a record written before sources existed still parses — it is simply a
+    /// hand-written imposter, which is exactly what `None` means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<SourceProvenance>,
+}
+
+/// What `sm_sources` stores per `(tenant, id)`.
+///
+/// `drifted` is replicated state, not a node's opinion: the provenance it is
+/// computed from lives in the state machine, so every replica flips the flag at
+/// the same log index for the same reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredSource {
+    uri: String,
+    mode: SourceMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_ref: Option<String>,
+    on_drift: OnDrift,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last: Option<LastPull>,
+    #[serde(default)]
+    drifted: bool,
+    revision: u64,
+}
+
+/// What the last pull against a source produced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LastPull {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    digest: Digest,
+    /// The applying op's `issued_at_secs` — the replicated logical clock, never
+    /// a replica's local wall clock, for the same reason the dedup TTL uses it:
+    /// two replicas must record the same value for the same committed op.
+    at_secs: u64,
+    outcome: PullOutcome,
+}
+
+/// How a committed pull was applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullOutcome {
+    /// The configs were applied and the source's drift flag cleared.
+    Applied,
+    /// The source had drifted and its `on_drift` said `skip`: nothing was
+    /// applied, and it is still drifted.
+    Skipped,
+}
+
+impl PullOutcome {
+    /// Whether the fleet actually holds the content this pull carried.
+    ///
+    /// Load-bearing for the no-change short circuit: a `Skipped` pull records
+    /// the digest it *saw*, not one it applied, so treating the two alike would
+    /// let a later pull of that same content decide there was nothing to do —
+    /// exactly when an operator has just switched the source to `overwrite` to
+    /// make it win.
+    #[must_use]
+    pub fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+/// One source as reported by the read paths — the shape `GET /admin/sources`
+/// and `GET /admin/sources/:id` render.
+///
+/// A crate-owned type rather than the stored record itself: the stored shape is
+/// free to gain fields the operator surface should not have to render, and this
+/// crosses the public API boundary where `openraft` types may not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceRecord {
+    pub id: String,
+    pub uri: String,
+    pub mode: SourceMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_ref: Option<String>,
+    pub on_drift: OnDrift,
+    /// Whether an operator has edited this source's imposters by hand since it
+    /// last applied.
+    pub drifted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pulled_at_secs: Option<u64>,
+    /// How the last pull ended, or absent when the source has never pulled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<PullOutcome>,
+    /// The ports this source currently owns, ascending.
+    pub ports: Vec<u16>,
+    /// The log index that last wrote this source record.
+    pub revision: u64,
+}
+
+impl SourceRecord {
+    /// The digest of the content the fleet actually holds from this source, or
+    /// `None` if it holds none.
+    ///
+    /// This — not `last_digest` — is what a pull compares against to decide
+    /// there is nothing to do. A *skipped* pull (a drifted source under
+    /// `on_drift: skip`) also records the digest it saw, and treating that as
+    /// applied would strand the fleet: an operator switches the source to
+    /// `overwrite` precisely so the next pull wins, and it would instead answer
+    /// "unchanged" and apply nothing.
+    #[must_use]
+    pub fn applied_digest(&self) -> Option<&str> {
+        if self.last_outcome.is_some_and(PullOutcome::is_applied) {
+            self.last_digest.as_deref()
+        } else {
+            None
+        }
+    }
 }
 
 /// What `sm_op_dedup` stores per `op_id`. The applying log index lives inside
@@ -147,6 +267,12 @@ struct SnapshotPayload {
     /// any.
     #[serde(default)]
     routes: Vec<(String, String, String)>,
+    /// `(tenant, source id, stored-source JSON)` rows of `sm_sources`. Defaulted
+    /// for the same reason `routes` is: a snapshot built before issue #134 still
+    /// installs cleanly, carrying no sources — the same as a fleet that declared
+    /// none.
+    #[serde(default)]
+    sources: Vec<(String, String, String)>,
     /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
     dedup: Vec<(String, String)>,
     last_applied_log: Option<LogId<u64>>,
@@ -190,6 +316,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SNAPSHOT_TABLE).map_err(io)?;
         write_txn.open_table(SM_CONFIGS_TABLE).map_err(io)?;
         write_txn.open_table(SM_ROUTES_TABLE).map_err(io)?;
+        write_txn.open_table(SM_SOURCES_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
         write_txn.open_table(PENDING_INTENTS_TABLE).map_err(io)?;
@@ -654,6 +781,155 @@ impl RedbStateMachine {
         }
     }
 
+    /// Every declared source for the default tenant, id-ascending (issue #134).
+    ///
+    /// Like [`Self::read_config`], this answers from local applied state with no
+    /// Raft round trip, so comparing two nodes' answers is what tells an
+    /// operator whether a `SourcePut` has converged.
+    #[allow(clippy::result_large_err)]
+    pub fn sources(&self) -> StorageResult<Vec<SourceRecord>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let sources = read_txn
+            .open_table(SM_SOURCES_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let configs = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let owned = Self::ports_by_source(&configs)
+            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+
+        let mut records = Vec::new();
+        for item in sources
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (tenant, id) = key.value();
+            if tenant != DEFAULT_TENANT {
+                continue;
+            }
+            // A source row that will not parse is committed-state corruption.
+            // Reported as an error rather than skipped: silently shrinking the
+            // list would tell an operator their source is gone when it is not.
+            let stored: StoredSource = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(source_id = %id, error = %e, "corrupt stored source");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            records.push(Self::render_source(id, &stored, owned.get(id)));
+        }
+        Ok(records)
+    }
+
+    /// One source by id, or `None` if the default tenant has no such source.
+    #[allow(clippy::result_large_err)]
+    pub fn source(&self, id: &str) -> StorageResult<Option<SourceRecord>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let sources = read_txn
+            .open_table(SM_SOURCES_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let Some(guard) = sources
+            .get((DEFAULT_TENANT, id))
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        else {
+            return Ok(None);
+        };
+        let stored: StoredSource = serde_json::from_str(guard.value()).map_err(|e| {
+            tracing::error!(source_id = %id, error = %e, "corrupt stored source");
+            StorageError::from(StorageIOError::read_state_machine(&e))
+        })?;
+        let configs = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let owned = Self::ports_by_source(&configs)
+            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+        Ok(Some(Self::render_source(id, &stored, owned.get(id))))
+    }
+
+    /// `(port, provenance)` for every source-owned config, ascending by port —
+    /// what `GET /_cluster/config` reports so an operator can see which
+    /// imposters a source owns and at which version.
+    #[allow(clippy::result_large_err)]
+    pub fn config_provenance(&self) -> StorageResult<Vec<(u16, SourceProvenance)>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let configs = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut owned = Vec::new();
+        for item in configs
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (tenant, port) = key.value();
+            if tenant != DEFAULT_TENANT {
+                continue;
+            }
+            let stored: StoredImposter = serde_json::from_str(value.value())
+                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+            if let Some(provenance) = stored.source {
+                owned.push((port, provenance));
+            }
+        }
+        Ok(owned)
+    }
+
+    /// Source id -> the ports it owns, from `sm_configs` provenance. Read from
+    /// an open (possibly mid-transaction) view so both the read paths and apply
+    /// can use it.
+    fn ports_by_source(
+        table: &impl ReadableTable<(&'static str, u16), &'static str>,
+    ) -> Result<BTreeMap<String, Vec<u16>>, redb::StorageError> {
+        let mut owned: BTreeMap<String, Vec<u16>> = BTreeMap::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            let (tenant, port) = key.value();
+            if tenant != DEFAULT_TENANT {
+                continue;
+            }
+            // A record that will not parse owns no port *as far as provenance
+            // goes*; the config read paths report the corruption. Ignoring it
+            // here can only under-report ownership, never delete anything.
+            if let Ok(stored) = serde_json::from_str::<StoredImposter>(value.value())
+                && let Some(provenance) = stored.source
+            {
+                owned.entry(provenance.id).or_default().push(port);
+            }
+        }
+        for ports in owned.values_mut() {
+            ports.sort_unstable();
+        }
+        Ok(owned)
+    }
+
+    fn render_source(id: &str, stored: &StoredSource, ports: Option<&Vec<u16>>) -> SourceRecord {
+        SourceRecord {
+            id: id.to_owned(),
+            uri: stored.uri.clone(),
+            mode: stored.mode,
+            auth_ref: stored.auth_ref.clone(),
+            on_drift: stored.on_drift,
+            drifted: stored.drifted,
+            last_version: stored.last.as_ref().and_then(|last| last.version.clone()),
+            last_digest: stored
+                .last
+                .as_ref()
+                .map(|last| last.digest.as_str().to_owned()),
+            last_pulled_at_secs: stored.last.as_ref().map(|last| last.at_secs),
+            last_outcome: stored.last.as_ref().map(|last| last.outcome),
+            ports: ports.cloned().unwrap_or_default(),
+            revision: stored.revision,
+        }
+    }
+
     /// Last engine side-effect failure per port (0 = set-level), as recorded by
     /// the most recent drives. Empty when the local engine matches the applied
     /// state.
@@ -1023,6 +1299,130 @@ impl RedbStateMachine {
         }
     }
 
+    /// The stored imposter at `(tenant, port)`, or `None` when there is none.
+    /// A record that will not parse is `None` *for provenance purposes only* —
+    /// the callers here use it to decide what to preserve and what to flag, and
+    /// the config read paths already report the corruption loudly.
+    #[allow(clippy::result_large_err)]
+    fn stored_imposter(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+        tenant: &str,
+        port: u16,
+    ) -> StorageResult<Option<StoredImposter>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let Some(guard) = configs.get((tenant, port)).map_err(io)? else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<StoredImposter>(guard.value()) {
+            Ok(stored) => Ok(Some(stored)),
+            Err(e) => {
+                // Corruption of committed state, and the callers' next act is
+                // usually to overwrite these bytes — which loses the port's
+                // provenance link for good. `None` keeps the op deterministic
+                // (every replica holds the same bad bytes and decides the same
+                // way), but it must not also be silent.
+                tracing::error!(
+                    tenant, port, error = %e,
+                    "corrupt stored imposter; its source provenance is lost"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn provenance_of(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+        tenant: &str,
+        port: u16,
+    ) -> StorageResult<Option<SourceProvenance>> {
+        Ok(Self::stored_imposter(configs, tenant, port)?.and_then(|stored| stored.source))
+    }
+
+    /// Every port the named source currently owns, ascending.
+    #[allow(clippy::result_large_err)]
+    fn ports_of_source(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+        tenant: &str,
+        id: &str,
+    ) -> StorageResult<Vec<u16>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let mut ports = Vec::new();
+        for item in configs.iter().map_err(io)? {
+            let (key, value) = item.map_err(io)?;
+            let (t, port) = key.value();
+            if t != tenant {
+                continue;
+            }
+            if let Ok(stored) = serde_json::from_str::<StoredImposter>(value.value())
+                && stored.source.as_ref().is_some_and(|s| s.id == id)
+            {
+                ports.push(port);
+            }
+        }
+        ports.sort_unstable();
+        Ok(ports)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn stored_source(
+        sources: &Table<'_, (&'static str, &'static str), &'static str>,
+        tenant: &str,
+        id: &str,
+    ) -> StorageResult<Option<StoredSource>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let Some(guard) = sources.get((tenant, id)).map_err(io)? else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<StoredSource>(guard.value()) {
+            Ok(stored) => Ok(Some(stored)),
+            Err(e) => {
+                // Corruption of committed state. Reported as `None` so the op
+                // takes its "unknown source" path — a deterministic refusal on
+                // every replica, since they all hold the same bad bytes —
+                // rather than failing apply, which would wedge the node.
+                tracing::error!(source_id = %id, error = %e, "corrupt stored source");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Record that a source's imposters no longer match what it declares.
+    ///
+    /// A no-op when the edited port had no provenance (nothing to drift from)
+    /// or when the source itself is gone (its provenance outlived it, which
+    /// `SourceDelete` clears — this is the belt to that braces).
+    #[allow(clippy::result_large_err)]
+    fn mark_drifted(
+        sources: &mut Table<'_, (&'static str, &'static str), &'static str>,
+        tenant: &str,
+        provenance: Option<&SourceProvenance>,
+        index: u64,
+    ) -> StorageResult<()> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let Some(provenance) = provenance else {
+            return Ok(());
+        };
+        let Some(mut stored) = Self::stored_source(sources, tenant, &provenance.id)? else {
+            return Ok(());
+        };
+        if stored.drifted {
+            return Ok(());
+        }
+        stored.drifted = true;
+        stored.revision = index;
+        let value =
+            serde_json::to_string(&stored).map_err(|e| StorageIOError::write_state_machine(&e))?;
+        sources
+            .insert((tenant, provenance.id.as_str()), value.as_str())
+            .map_err(io)?;
+        Ok(())
+    }
+
     /// Mutate `sm_configs` for one validated op and return the engine actions it
     /// implies. `Ok(Err(reason))` is a deterministic domain refusal (recorded as
     /// a `Failed` outcome); `Err(_)` is real storage I/O and fails apply.
@@ -1035,8 +1435,10 @@ impl RedbStateMachine {
     fn mutate_tables(
         configs: &mut Table<'_, (&'static str, u16), &'static str>,
         routes: &mut Table<'_, (&'static str, &'static str), &'static str>,
+        sources: &mut Table<'_, (&'static str, &'static str), &'static str>,
         op: &ControlOp,
         index: u64,
+        issued_at_secs: u64,
     ) -> StorageResult<Result<Vec<EngineAction>, String>> {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
@@ -1048,18 +1450,25 @@ impl RedbStateMachine {
                 let Some(port) = config.port else {
                     return Ok(Err("config must carry an explicit port".to_owned()));
                 };
+                // Provenance survives a manual replace: the source still owns
+                // this port, it just no longer holds what the source declares.
+                // Clearing it instead would orphan the port, and the next
+                // `overwrite` pull would recreate it as a second imposter.
+                let provenance = Self::provenance_of(configs, tenant.as_str(), port)?;
                 let config_json = serde_json::to_string(config)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 let stored = StoredImposter {
                     config_json,
                     enabled: config.enabled,
                     revision: index,
+                    source: provenance.clone(),
                 };
                 let value = serde_json::to_string(&stored)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 configs
                     .insert((tenant.as_str(), port), value.as_str())
                     .map_err(io)?;
+                Self::mark_drifted(sources, tenant.as_str(), provenance.as_ref(), index)?;
                 crate::metrics::config_applied(port, index);
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
@@ -1098,6 +1507,7 @@ impl RedbStateMachine {
                 configs
                     .insert((tenant.as_str(), *port), value.as_str())
                     .map_err(io)?;
+                Self::mark_drifted(sources, tenant.as_str(), record.source.as_ref(), index)?;
                 crate::metrics::config_applied(*port, index);
                 Ok(Ok(vec![EngineAction::Patch {
                     port: *port,
@@ -1108,24 +1518,46 @@ impl RedbStateMachine {
                 // Removing an absent port is a no-op, not a failure: deletes are
                 // idempotent at the state-machine level (the admin-surface 404
                 // for a missing imposter is the write path's concern).
+                let provenance = Self::provenance_of(configs, tenant.as_str(), *port)?;
                 configs.remove((tenant.as_str(), *port)).map_err(io)?;
+                Self::mark_drifted(sources, tenant.as_str(), provenance.as_ref(), index)?;
                 crate::metrics::config_removed(*port);
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
             ControlOp::DeleteAll { tenant } => {
                 let tenant = tenant.as_str();
-                let removed: Vec<u16> = {
+                let (removed, drifted): (Vec<u16>, BTreeSet<String>) = {
                     let mut removed = Vec::new();
+                    let mut drifted = BTreeSet::new();
                     for item in configs.iter().map_err(io)? {
-                        let (key, _) = item.map_err(io)?;
+                        let (key, value) = item.map_err(io)?;
                         let (t, port) = key.value();
-                        if t == tenant {
-                            removed.push(port);
+                        if t != tenant {
+                            continue;
+                        }
+                        removed.push(port);
+                        // A record that will not parse names no source here.
+                        // Same reasoning as `ports_by_source`: this can only
+                        // under-report which sources to flag, never delete
+                        // anything, and `stored_imposter` logs the corruption
+                        // where it is actionable.
+                        if let Ok(stored) = serde_json::from_str::<StoredImposter>(value.value())
+                            && let Some(provenance) = stored.source
+                        {
+                            drifted.insert(provenance.id);
                         }
                     }
-                    removed
+                    (removed, drifted)
                 };
                 configs.retain(|(t, _), _| t != tenant).map_err(io)?;
+                for id in drifted {
+                    Self::mark_drifted(
+                        sources,
+                        tenant,
+                        Some(&SourceProvenance { id, version: None }),
+                        index,
+                    )?;
+                }
                 for port in removed {
                     crate::metrics::config_removed(port);
                 }
@@ -1171,6 +1603,7 @@ impl RedbStateMachine {
                 configs
                     .insert((tenant.as_str(), *port), value.as_str())
                     .map_err(io)?;
+                Self::mark_drifted(sources, tenant.as_str(), record.source.as_ref(), index)?;
                 crate::metrics::config_applied(*port, index);
                 Ok(Ok(vec![EngineAction::SetEnabled {
                     port: *port,
@@ -1199,6 +1632,198 @@ impl RedbStateMachine {
                 // wants one) is the write path's concern, not apply's.
                 routes.remove((tenant.as_str(), id.as_str())).map_err(io)?;
                 Ok(Ok(vec![Self::sync_routes_action(routes)?]))
+            }
+            ControlOp::SourcePut {
+                tenant,
+                id,
+                uri,
+                mode,
+                auth_ref,
+                on_drift,
+            } => {
+                let existing = Self::stored_source(sources, tenant.as_str(), id)?;
+                // Keep the pull history only while the record still describes
+                // the same content: a digest identifies bytes at a URI, so
+                // carrying it across a repoint would let the no-change short
+                // circuit skip the very fetch the repoint asked for.
+                let (last, drifted) = match existing {
+                    Some(previous) if previous.uri == *uri => (previous.last, previous.drifted),
+                    _ => (None, false),
+                };
+                let stored = StoredSource {
+                    uri: uri.clone(),
+                    mode: *mode,
+                    auth_ref: auth_ref.clone(),
+                    on_drift: *on_drift,
+                    last,
+                    drifted,
+                    revision: index,
+                };
+                let value = serde_json::to_string(&stored)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                sources
+                    .insert((tenant.as_str(), id.as_str()), value.as_str())
+                    .map_err(io)?;
+                // No engine action: declaring a source binds nothing. Only a
+                // pull produces configs.
+                Ok(Ok(Vec::new()))
+            }
+            ControlOp::SourceDelete { tenant, id } => {
+                // Idempotent when absent, like `DeleteImposter`.
+                sources.remove((tenant.as_str(), id.as_str())).map_err(io)?;
+                // The imposters stay bound — "stop tracking this URI" is not
+                // "tear down live traffic" — but nothing may still point at a
+                // source that no longer exists, so their provenance is cleared.
+                let orphaned = Self::ports_of_source(configs, tenant.as_str(), id)?;
+                for port in orphaned {
+                    let Some(mut record) = Self::stored_imposter(configs, tenant.as_str(), port)?
+                    else {
+                        continue;
+                    };
+                    record.source = None;
+                    record.revision = index;
+                    let value = serde_json::to_string(&record)
+                        .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                    configs
+                        .insert((tenant.as_str(), port), value.as_str())
+                        .map_err(io)?;
+                }
+                // Provenance is metadata: the desired config *set* is
+                // unchanged, so there is nothing for the engine to do.
+                Ok(Ok(Vec::new()))
+            }
+            ControlOp::SourcePullResult {
+                tenant,
+                id,
+                version,
+                digest,
+                configs: fetched,
+            } => {
+                let tenant_str = tenant.as_str();
+                let Some(mut source) = Self::stored_source(sources, tenant_str, id)? else {
+                    // The source was deleted between the fetch and this write.
+                    // Applying anyway would resurrect imposters the operator
+                    // just asked to stop tracking.
+                    return Ok(Err(format!(
+                        "unknown source {id:?}: it was deleted before this pull was committed"
+                    )));
+                };
+
+                if source.drifted {
+                    match source.on_drift {
+                        OnDrift::Fail => {
+                            return Ok(Err(format!(
+                                "source {id:?} has drifted (its imposters were edited by hand) and \
+                                 its on_drift policy is \"fail\""
+                            )));
+                        }
+                        OnDrift::Skip => {
+                            // A committed decision, not a failure: the attempt
+                            // is recorded so an operator can see the source is
+                            // being held back rather than silently idle.
+                            source.last = Some(LastPull {
+                                version: version.clone(),
+                                digest: digest.clone(),
+                                at_secs: issued_at_secs,
+                                outcome: PullOutcome::Skipped,
+                            });
+                            source.revision = index;
+                            let value = serde_json::to_string(&source)
+                                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                            sources
+                                .insert((tenant_str, id.as_str()), value.as_str())
+                                .map_err(io)?;
+                            return Ok(Ok(Vec::new()));
+                        }
+                        OnDrift::Overwrite => {}
+                    }
+                }
+
+                let provenance = SourceProvenance {
+                    id: id.clone(),
+                    version: version.clone(),
+                };
+                let previously_owned = Self::ports_of_source(configs, tenant_str, id)?;
+                let declared: BTreeSet<u16> = fetched.iter().filter_map(|c| c.port).collect();
+
+                for port in previously_owned.iter().filter(|p| !declared.contains(p)) {
+                    configs.remove((tenant_str, *port)).map_err(io)?;
+                    crate::metrics::config_removed(*port);
+                }
+
+                for config in fetched {
+                    // `validate` guaranteed the port; a missing one here would
+                    // mean a caller skipped validation, and silently dropping
+                    // the config would apply a document the operator cannot see
+                    // the effect of.
+                    let Some(port) = config.port else {
+                        return Ok(Err(
+                            "pull result carries a config without an explicit port".to_owned()
+                        ));
+                    };
+                    let config_json = serde_json::to_string(config)
+                        .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                    let existing = Self::stored_imposter(configs, tenant_str, port)?;
+                    // Rewriting a byte-identical record would bump its revision
+                    // for no reason and — because the engine sync diffs on
+                    // content — is the difference between "leave this imposter
+                    // alone" and "replace it", which resets its runtime state.
+                    if let Some(existing) = &existing
+                        && existing.config_json == config_json
+                        && existing.enabled == config.enabled
+                        && existing.source.as_ref() == Some(&provenance)
+                    {
+                        continue;
+                    }
+                    // Taking a port from another source. Nothing forbids two
+                    // documents declaring the same port — they are fetched
+                    // independently — so the loser is marked drifted rather
+                    // than left silently believing it still owns a port whose
+                    // provenance now names someone else. Without this the two
+                    // sources flip-flop the port on every pull, each reporting
+                    // success.
+                    if let Some(other) = existing.as_ref().and_then(|e| e.source.as_ref())
+                        && other.id != *id
+                    {
+                        tracing::warn!(
+                            port,
+                            from = %other.id,
+                            to = %id,
+                            "a source took over a port another source owns"
+                        );
+                        Self::mark_drifted(sources, tenant_str, Some(other), index)?;
+                    }
+                    let stored = StoredImposter {
+                        config_json,
+                        enabled: config.enabled,
+                        revision: index,
+                        source: Some(provenance.clone()),
+                    };
+                    let value = serde_json::to_string(&stored)
+                        .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                    configs
+                        .insert((tenant_str, port), value.as_str())
+                        .map_err(io)?;
+                    crate::metrics::config_applied(port, index);
+                }
+
+                source.last = Some(LastPull {
+                    version: version.clone(),
+                    digest: digest.clone(),
+                    at_secs: issued_at_secs,
+                    outcome: PullOutcome::Applied,
+                });
+                // The fleet now holds exactly what the source declares, so
+                // whatever it had drifted from is resolved.
+                source.drifted = false;
+                source.revision = index;
+                let value = serde_json::to_string(&source)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                sources
+                    .insert((tenant_str, id.as_str()), value.as_str())
+                    .map_err(io)?;
+
+                Ok(Ok(vec![Self::sync_action(configs)?]))
             }
             ControlOp::TenantPut { .. }
             | ControlOp::TenantDelete { .. }
@@ -1347,7 +1972,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
     async fn build_snapshot(&mut self) -> StorageResult<Snapshot<TypeConfig>> {
         let applied = self.read_applied()?;
 
-        let (configs, routes, dedup) = {
+        let (configs, routes, sources, dedup) = {
             let read_txn = self
                 .db
                 .begin_read()
@@ -1376,6 +2001,18 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 let (tenant, id) = key.value();
                 routes.push((tenant.to_owned(), id.to_owned(), value.value().to_owned()));
             }
+            let sources_table = read_txn
+                .open_table(SM_SOURCES_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut sources = Vec::new();
+            for item in sources_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (tenant, id) = key.value();
+                sources.push((tenant.to_owned(), id.to_owned(), value.value().to_owned()));
+            }
             let dedup_table = read_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -1387,12 +2024,13 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
                 dedup.push((key.value().to_owned(), value.value().to_owned()));
             }
-            (configs, routes, dedup)
+            (configs, routes, sources, dedup)
         };
 
         let payload = SnapshotPayload {
             configs,
             routes,
+            sources,
             dedup,
             last_applied_log: applied.last_applied_log,
             last_membership: applied.last_membership.clone(),
@@ -1475,6 +2113,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut routes = write_txn
                 .open_table(SM_ROUTES_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut sources = write_txn
+                .open_table(SM_SOURCES_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut dedup = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -1526,15 +2167,19 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     Ok(()) => Self::mutate_tables(
                                         &mut configs,
                                         &mut routes,
+                                        &mut sources,
                                         &request.op,
                                         log_id.index,
+                                        applied.logical_clock_secs,
                                     )?,
                                 },
                                 None => Self::mutate_tables(
                                     &mut configs,
                                     &mut routes,
+                                    &mut sources,
                                     &request.op,
                                     log_id.index,
+                                    applied.logical_clock_secs,
                                 )?,
                             },
                         };
@@ -1662,6 +2307,18 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                 Err((id, error)) => EngineAction::RefuseRoutesSync { id, error },
             };
 
+            let mut sources_table = write_txn
+                .open_table(SM_SOURCES_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            sources_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (tenant, id, value) in &payload.sources {
+                sources_table
+                    .insert((tenant.as_str(), id.as_str()), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
             let mut dedup_table = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
@@ -1743,10 +2400,13 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use super::{DEDUP_TTL_SECS, DedupEntry, RedbLogStore, RedbStateMachine, SM_DEDUP_TABLE, new};
+    use super::{
+        DEDUP_TTL_SECS, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine, SM_DEDUP_TABLE,
+        SourceRecord, new,
+    };
     use crate::control::{
-        ControlOp, ControlOutcome, ControlRequest, ControlResponse, StubEdit, StubEditScript,
-        TenantId,
+        ControlOp, ControlOutcome, ControlRequest, ControlResponse, Digest, OnDrift, SourceMode,
+        StubEdit, StubEditScript, TenantId,
     };
     use crate::raft::TypeConfig;
 
@@ -1893,6 +2553,687 @@ mod tests {
             .iter()
             .map(|s| s.id.clone().expect("test stubs carry ids"))
             .collect()
+    }
+
+    // -- issue #134: sources as control-plane objects ---------------------------
+
+    fn source_put(op_id: u128, id: &str, uri: &str, on_drift: OnDrift) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::SourcePut {
+                tenant: TenantId::default(),
+                id: id.to_owned(),
+                uri: uri.to_owned(),
+                mode: SourceMode::Pinned,
+                auth_ref: None,
+                on_drift,
+            },
+        )
+    }
+
+    fn pull(op_id: u128, id: &str, version: &str, ports: &[u16]) -> ControlRequest {
+        pull_at(op_id, 0, id, version, ports)
+    }
+
+    fn pull_at(
+        op_id: u128,
+        issued_at_secs: u64,
+        id: &str,
+        version: &str,
+        ports: &[u16],
+    ) -> ControlRequest {
+        let configs: Vec<ImposterConfig> = ports
+            .iter()
+            .map(|port| config(*port, json!([{ "id": format!("s{port}") }])))
+            .collect();
+        request_at(
+            op_id,
+            issued_at_secs,
+            ControlOp::SourcePullResult {
+                tenant: TenantId::default(),
+                id: id.to_owned(),
+                version: Some(version.to_owned()),
+                // The real digest comes from `sources::digest_of`; these tests
+                // exercise apply, which only ever compares digests for equality.
+                digest: Digest::new(format!("digest-{version}")),
+                configs,
+            },
+        )
+    }
+
+    async fn apply_one(
+        sm: &mut RedbStateMachine,
+        index: u64,
+        request: ControlRequest,
+    ) -> ControlResponse {
+        sm.apply([entry(index, request)])
+            .await
+            .expect("apply")
+            .pop()
+            .expect("one response")
+    }
+
+    fn one_source(sm: &RedbStateMachine, id: &str) -> SourceRecord {
+        sm.source(id).expect("read source").expect("source present")
+    }
+
+    #[tokio::test]
+    async fn a_source_is_stored_read_back_and_deleted() {
+        let (_td, mut sm) = fresh_sm(None).await;
+
+        let response = apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+
+        let record = one_source(&sm, "mocks");
+        assert_eq!(record.uri, "https://h/i.json");
+        assert_eq!(record.mode, SourceMode::Pinned);
+        assert_eq!(record.on_drift, OnDrift::Overwrite);
+        assert!(!record.drifted);
+        assert_eq!(record.last_digest, None, "a fresh source has never pulled");
+        assert_eq!(record.revision, 1);
+        assert_eq!(sm.sources().expect("list").len(), 1);
+
+        let response = apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::SourceDelete {
+                    tenant: TenantId::default(),
+                    id: "mocks".to_owned(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert!(sm.source("mocks").expect("read").is_none());
+        assert!(sm.sources().expect("list").is_empty());
+    }
+
+    /// Re-declaring the same source is an upsert, not a duplicate — this is
+    /// what makes `--imposters` bootstrap idempotent across restarts. A `PUT`
+    /// that leaves the URI alone must keep the pull history, or every restart
+    /// would re-apply an identical document.
+    #[tokio::test]
+    async fn re_putting_the_same_uri_keeps_the_pull_history() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+        assert_eq!(
+            one_source(&sm, "mocks").last_digest.as_deref(),
+            Some("digest-v1")
+        );
+
+        apply_one(
+            &mut sm,
+            3,
+            source_put(3, "mocks", "https://h/i.json", OnDrift::Skip),
+        )
+        .await;
+        let record = one_source(&sm, "mocks");
+        assert_eq!(
+            record.last_digest.as_deref(),
+            Some("digest-v1"),
+            "an unchanged uri keeps what it last applied"
+        );
+        assert_eq!(
+            record.on_drift,
+            OnDrift::Skip,
+            "the new policy takes effect"
+        );
+        assert_eq!(record.ports, vec![8080], "its imposters are untouched");
+    }
+
+    /// Repointing a source at a different URI makes its last digest meaningless
+    /// — comparing the new URI's content against the old one's digest would
+    /// short-circuit a pull that must actually happen.
+    #[tokio::test]
+    async fn repointing_a_source_forgets_the_old_digest() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/a.json", OnDrift::Overwrite),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+
+        apply_one(
+            &mut sm,
+            3,
+            source_put(3, "mocks", "https://h/b.json", OnDrift::Overwrite),
+        )
+        .await;
+        let record = one_source(&sm, "mocks");
+        assert_eq!(record.uri, "https://h/b.json");
+        assert_eq!(
+            record.last_digest, None,
+            "a digest describes content at a uri, not a source id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pull_stamps_provenance_and_reports_its_ports() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        let response = apply_one(&mut sm, 2, pull_at(2, 4242, "mocks", "v1", &[8080, 8081])).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+
+        let record = one_source(&sm, "mocks");
+        assert_eq!(record.ports, vec![8080, 8081]);
+        assert_eq!(record.last_version.as_deref(), Some("v1"));
+        assert_eq!(record.last_outcome, Some(PullOutcome::Applied));
+        assert_eq!(
+            record.last_pulled_at_secs,
+            Some(4242),
+            "the timestamp is the replicated logical clock, not a local one"
+        );
+
+        let provenance = sm.config_provenance().expect("provenance");
+        assert_eq!(provenance.len(), 2);
+        for (port, source) in provenance {
+            assert!(port == 8080 || port == 8081);
+            assert_eq!(source.id, "mocks");
+            assert_eq!(source.version.as_deref(), Some("v1"));
+        }
+    }
+
+    /// A pull whose source was deleted in the window between fetch and submit
+    /// must not resurrect it — the operator asked for it to be gone.
+    #[tokio::test]
+    async fn a_pull_for_an_unknown_source_is_refused() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let response = apply_one(&mut sm, 1, pull(1, "ghost", "v1", &[8080])).await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => assert!(reason.contains("ghost"), "{reason}"),
+            other => panic!("a raced delete must refuse, got {other:?}"),
+        }
+        assert!(sm.read_config(8080).expect("read").is_none());
+    }
+
+    /// The incremental-apply criterion: a pull that changes one imposter leaves
+    /// the sibling's stored record — and so its runtime state — untouched, and
+    /// an imposter nobody's source owns is never in the blast radius.
+    #[tokio::test]
+    async fn pull_applies_incrementally_and_spares_siblings() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        // A hand-written imposter that no source owns.
+        apply_one(&mut sm, 1, put(1, 9000, json!([{ "id": "manual" }]))).await;
+        apply_one(
+            &mut sm,
+            2,
+            source_put(2, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        apply_one(&mut sm, 3, pull(3, "mocks", "v1", &[8080, 8081])).await;
+        let sibling_before = sm.read_config(8081).expect("read").expect("present");
+
+        // v2 drops 8081 and keeps 8080.
+        let changed = request(
+            4,
+            ControlOp::SourcePullResult {
+                tenant: TenantId::default(),
+                id: "mocks".to_owned(),
+                version: Some("v2".to_owned()),
+                digest: Digest::new("digest-v2"),
+                configs: vec![config(8080, json!([{ "id": "changed" }]))],
+            },
+        );
+        apply_one(&mut sm, 4, changed).await;
+
+        assert_eq!(
+            stored_stub_ids(&sm, 8080),
+            vec!["changed".to_owned()],
+            "the changed imposter is replaced"
+        );
+        assert!(
+            sm.read_config(8081).expect("read").is_none(),
+            "a port the document dropped is removed from the source's set"
+        );
+        assert!(
+            sm.read_config(9000).expect("read").is_some(),
+            "an imposter no source owns is never touched by a pull"
+        );
+        assert_eq!(one_source(&sm, "mocks").ports, vec![8080]);
+        assert_ne!(sibling_before, String::new());
+    }
+
+    /// A sibling *this* source still declares must survive a pull byte-for-byte
+    /// when the document did not change it — the state machine may not rewrite
+    /// a record it has no new content for, because rewriting it is what would
+    /// reset the engine's per-imposter runtime state.
+    #[tokio::test]
+    async fn an_unchanged_sibling_is_not_rewritten_by_a_pull() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080, 8081])).await;
+        let untouched_before = sm.read_config(8081).expect("read").expect("present");
+
+        let changed = request(
+            3,
+            ControlOp::SourcePullResult {
+                tenant: TenantId::default(),
+                id: "mocks".to_owned(),
+                version: Some("v2".to_owned()),
+                digest: Digest::new("digest-v2"),
+                configs: vec![
+                    config(8080, json!([{ "id": "changed" }])),
+                    config(8081, json!([{ "id": "s8081" }])),
+                ],
+            },
+        );
+        apply_one(&mut sm, 3, changed).await;
+
+        assert_eq!(
+            sm.read_config(8081).expect("read").expect("present"),
+            untouched_before,
+            "an identical config must not be rewritten: the rewrite is what resets runtime state"
+        );
+        assert_eq!(stored_stub_ids(&sm, 8080), vec!["changed".to_owned()]);
+    }
+
+    /// `test_source_pull_dedup`: a replayed pull collapses to the original
+    /// response and applies nothing a second time.
+    #[tokio::test]
+    async fn test_source_pull_dedup() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        let first = apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+
+        // A manual edit between the two, so a re-apply would be visible.
+        apply_one(&mut sm, 3, put(3, 8080, json!([{ "id": "edited" }]))).await;
+
+        let replay = apply_one(&mut sm, 4, pull(2, "mocks", "v1", &[8080])).await;
+        assert_eq!(replay, first, "a replay returns the original response");
+        assert_eq!(
+            stored_stub_ids(&sm, 8080),
+            vec!["edited".to_owned()],
+            "a replayed pull must change nothing"
+        );
+    }
+
+    /// Drift: a manual edit of a source-owned port flips the flag, and the
+    /// provenance stays — the source still owns the port, it is just no longer
+    /// what the source says it is.
+    #[tokio::test]
+    async fn a_manual_edit_flips_the_source_drift_flag() {
+        for (label, edit) in [
+            ("PutImposter", put(10, 8080, json!([{ "id": "edited" }]))),
+            (
+                "PatchStubs",
+                request(
+                    10,
+                    ControlOp::PatchStubs {
+                        tenant: TenantId::default(),
+                        port: 8080,
+                        edit: StubEditScript(vec![StubEdit::Add {
+                            stub: serde_json::from_value(json!({ "id": "added" })).expect("stub"),
+                            index: None,
+                        }]),
+                    },
+                ),
+            ),
+            (
+                "SetEnabled",
+                request(
+                    10,
+                    ControlOp::SetEnabled {
+                        tenant: TenantId::default(),
+                        port: 8080,
+                        enabled: false,
+                    },
+                ),
+            ),
+            (
+                "DeleteImposter",
+                request(
+                    10,
+                    ControlOp::DeleteImposter {
+                        tenant: TenantId::default(),
+                        port: 8080,
+                    },
+                ),
+            ),
+            (
+                "DeleteAll",
+                request(
+                    10,
+                    ControlOp::DeleteAll {
+                        tenant: TenantId::default(),
+                    },
+                ),
+            ),
+        ] {
+            let (_td, mut sm) = fresh_sm(None).await;
+            apply_one(
+                &mut sm,
+                1,
+                source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+            )
+            .await;
+            apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+            assert!(
+                !one_source(&sm, "mocks").drifted,
+                "{label}: clean after a pull"
+            );
+
+            apply_one(&mut sm, 3, edit).await;
+            assert!(
+                one_source(&sm, "mocks").drifted,
+                "{label}: a manual edit of a source-owned port must flip drift"
+            );
+        }
+    }
+
+    /// Editing an imposter no source owns is not drift — there is nothing for
+    /// it to have drifted from.
+    #[tokio::test]
+    async fn editing_an_unowned_imposter_is_not_drift() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+        apply_one(&mut sm, 3, put(3, 9000, json!([{ "id": "manual" }]))).await;
+        assert!(!one_source(&sm, "mocks").drifted);
+    }
+
+    /// A pull's own writes are not drift — otherwise every source would be
+    /// permanently drifted from the moment it first applied.
+    #[tokio::test]
+    async fn a_pull_does_not_flag_itself_as_drift() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+        apply_one(&mut sm, 3, pull(3, "mocks", "v2", &[8080])).await;
+        assert!(!one_source(&sm, "mocks").drifted);
+    }
+
+    #[tokio::test]
+    async fn drifted_source_overwrites_by_default() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+        apply_one(&mut sm, 3, put(3, 8080, json!([{ "id": "edited" }]))).await;
+
+        let response = apply_one(&mut sm, 4, pull(4, "mocks", "v2", &[8080])).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert_eq!(
+            stored_stub_ids(&sm, 8080),
+            vec!["s8080".to_owned()],
+            "overwrite restores what the source declares"
+        );
+        let record = one_source(&sm, "mocks");
+        assert!(!record.drifted, "a successful overwrite clears the flag");
+        assert_eq!(record.last_outcome, Some(PullOutcome::Applied));
+    }
+
+    #[tokio::test]
+    async fn drifted_source_skips_when_asked() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Skip),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+        apply_one(&mut sm, 3, put(3, 8080, json!([{ "id": "edited" }]))).await;
+
+        let response = apply_one(&mut sm, 4, pull(4, "mocks", "v2", &[8080])).await;
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Applied,
+            "a skip is a committed decision, not a failure"
+        );
+        assert_eq!(
+            stored_stub_ids(&sm, 8080),
+            vec!["edited".to_owned()],
+            "skip leaves the operator's edit in place"
+        );
+        let record = one_source(&sm, "mocks");
+        assert!(record.drifted, "skipping does not resolve the drift");
+        assert_eq!(record.last_outcome, Some(PullOutcome::Skipped));
+        assert_eq!(
+            record.last_version.as_deref(),
+            Some("v2"),
+            "the attempt is still recorded, so an operator can see it happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn drifted_source_fails_when_asked() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Fail),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+        apply_one(&mut sm, 3, put(3, 8080, json!([{ "id": "edited" }]))).await;
+
+        let response = apply_one(&mut sm, 4, pull(4, "mocks", "v2", &[8080])).await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(reason.contains("drift"), "{reason}");
+            }
+            other => panic!("on_drift=fail must refuse, got {other:?}"),
+        }
+        assert_eq!(
+            stored_stub_ids(&sm, 8080),
+            vec!["edited".to_owned()],
+            "a refused pull changes nothing"
+        );
+        let record = one_source(&sm, "mocks");
+        assert!(record.drifted);
+        assert_eq!(
+            record.last_version.as_deref(),
+            Some("v1"),
+            "a refusal is not a pull: the last applied version is unchanged"
+        );
+    }
+
+    /// Deleting a source leaves its imposters serving — tearing down live
+    /// traffic is not what "stop tracking this URI" means — but clears their
+    /// provenance, so nothing is left pointing at a source that no longer
+    /// exists.
+    #[tokio::test]
+    async fn deleting_a_source_orphans_its_imposters_rather_than_deleting_them() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080])).await;
+
+        apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::SourceDelete {
+                    tenant: TenantId::default(),
+                    id: "mocks".to_owned(),
+                },
+            ),
+        )
+        .await;
+
+        assert!(
+            sm.read_config(8080).expect("read").is_some(),
+            "the imposter keeps serving"
+        );
+        assert!(
+            sm.config_provenance().expect("provenance").is_empty(),
+            "nothing may still claim a deleted source"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_absent_source_is_applied_not_failed() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let response = apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::SourceDelete {
+                    tenant: TenantId::default(),
+                    id: "ghost".to_owned(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Applied,
+            "deletes are idempotent at the state-machine level, like DeleteImposter"
+        );
+    }
+
+    /// Provenance and the source table both survive a snapshot install — a
+    /// follower that catches up by snapshot must know which imposters a source
+    /// owns, or its next drift verdict would differ from its peers'.
+    #[tokio::test]
+    async fn provenance_is_reported_and_survives_snapshot_restore() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Skip),
+        )
+        .await;
+        apply_one(&mut sm, 2, pull(2, "mocks", "v7", &[8080])).await;
+        apply_one(&mut sm, 3, put(3, 8080, json!([{ "id": "edited" }]))).await;
+        assert!(one_source(&sm, "mocks").drifted);
+
+        let snapshot: Snapshot<TypeConfig> = sm.build_snapshot().await.expect("build snapshot");
+        let (_td2, mut restored) = fresh_sm(None).await;
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install snapshot");
+
+        let record = restored
+            .source("mocks")
+            .expect("read source")
+            .expect("source survived the snapshot");
+        assert_eq!(record.uri, "https://h/i.json");
+        assert_eq!(record.on_drift, OnDrift::Skip);
+        assert_eq!(record.last_version.as_deref(), Some("v7"));
+        assert!(record.drifted, "the drift verdict must survive too");
+        assert_eq!(record.ports, vec![8080]);
+
+        let provenance = restored.config_provenance().expect("provenance");
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0].0, 8080);
+        assert_eq!(provenance[0].1.id, "mocks");
+        assert_eq!(provenance[0].1.version.as_deref(), Some("v7"));
+    }
+
+    /// A snapshot written before sources existed still installs — the field
+    /// defaults to empty, which is what "this fleet declared no sources" is.
+    #[tokio::test]
+    async fn a_pre_sources_snapshot_still_installs() {
+        let (_td, sm) = fresh_sm(None).await;
+        let legacy = json!({
+            "configs": [],
+            "dedup": [],
+            "last_applied_log": null,
+            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
+        });
+        let payload: super::SnapshotPayload =
+            serde_json::from_value(legacy).expect("a pre-#134 snapshot payload still decodes");
+        assert!(payload.sources.is_empty());
+        assert!(sm.sources().expect("list").is_empty());
+    }
+
+    /// A pull drives the engine: the imposters a source declares are actually
+    /// bound, and one the document drops is torn down.
+    #[tokio::test]
+    async fn a_pull_drives_the_engine() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(Arc::clone(&engine))).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put(1, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        let ports = [ephemeral_port(), ephemeral_port()];
+        apply_one(&mut sm, 2, pull(2, "mocks", "v1", &ports)).await;
+        for port in ports {
+            assert!(
+                engine.get_imposter(port).is_ok(),
+                "port {port} must be bound after a pull"
+            );
+        }
+
+        let dropped = request(
+            3,
+            ControlOp::SourcePullResult {
+                tenant: TenantId::default(),
+                id: "mocks".to_owned(),
+                version: Some("v2".to_owned()),
+                digest: Digest::new("digest-v2"),
+                configs: vec![config(ports[0], json!([]))],
+            },
+        );
+        apply_one(&mut sm, 3, dropped).await;
+        assert!(engine.get_imposter(ports[0]).is_ok());
+        assert!(
+            engine.get_imposter(ports[1]).is_err(),
+            "a port the document dropped is torn down"
+        );
+    }
+
+    fn ephemeral_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve a port")
+            .local_addr()
+            .expect("addr")
+            .port()
     }
 
     #[tokio::test]

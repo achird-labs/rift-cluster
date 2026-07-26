@@ -152,15 +152,28 @@ async fn handle(config: Arc<RpcServerConfig>, req: Request<Incoming>) -> Respons
 }
 
 fn error_response(err: &RpcError) -> Response<Full<Bytes>> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "error": err.reason(),
         "message": err.to_string(),
-    })
-    .to_string();
-    Response::builder()
+    });
+    // A write that was durably accepted before the cluster failed to commit it
+    // is not lost — the replay loop owns it. Naming the op is what lets the
+    // client poll `GET /_cluster/ops/:id` instead of blind-retrying a write
+    // that may already be on its way (Ch. 4 write path).
+    let mut builder = Response::builder()
         .status(StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .header("content-type", "application/json");
+    if let RpcError::Unavailable {
+        op_id: Some(op_id), ..
+    } = err
+    {
+        body["opId"] = serde_json::Value::String(op_id.clone());
+        builder = builder
+            .header(crate::decorate::HEADER_OP_ID, op_id.as_str())
+            .header("retry-after", "1");
+    }
+    builder
+        .body(Full::new(Bytes::from(body.to_string())))
         // Infallible in practice: the status is validated above and the body is
         // owned. Falling back to a bare 500 keeps the signature total.
         .unwrap_or_else(|_| {

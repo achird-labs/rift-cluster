@@ -441,6 +441,12 @@ fn status_to_error(status: u16, body: &[u8], method: &str, path: &str) -> RpcErr
         // overflow as a forged MAC, sending an operator hunting a secret
         // mismatch that isn't there.
         401 => RpcError::Unauthorized(auth_error_from_reason(field("error").as_deref())),
+        // Preserved as its own class rather than folded into `Handler`: the
+        // caller's next move differs entirely. A `BadRequest` will fail
+        // identically on every retry and names something the operator can fix;
+        // a `Handler` error is the peer failing at something it should have
+        // managed, and is worth escalating rather than rewriting the request.
+        400 => RpcError::BadRequest(detail),
         404 => RpcError::UnknownRoute {
             method: method.to_owned(),
             path: path.to_owned(),
@@ -450,7 +456,18 @@ fn status_to_error(status: u16, body: &[u8], method: &str, path: &str) -> RpcErr
             peer: None,
             ours: PROTO_VERSION,
         },
-        503 => RpcError::Shed,
+        // Two different 503s share this status: local shedding (no bridge
+        // capacity) and a write the cluster could not commit. They are told
+        // apart by the envelope's reason label, the same way the 401 arm
+        // recovers which credential check failed — collapsing them would lose
+        // the op id a client needs to poll for the write's real outcome.
+        503 => match field("error").as_deref() {
+            Some("unavailable") => RpcError::Unavailable {
+                detail,
+                op_id: field("opId"),
+            },
+            _ => RpcError::Shed,
+        },
         504 => RpcError::Timeout,
         _ => RpcError::Handler(detail),
     }
@@ -645,6 +662,36 @@ mod tests {
         assert!(
             matches!(mapped(500, br#"{"message":"boom"}"#), RpcError::Handler(m) if m == "boom")
         );
+        assert!(
+            matches!(mapped(400, br#"{"message":"nope"}"#), RpcError::BadRequest(m) if m == "nope"),
+            "a peer's refusal of the request must not read as the peer failing"
+        );
+    }
+
+    /// Both 503 classes share a status, so the reason label is what tells them
+    /// apart — and an `Unavailable` must carry its op id across the wire, or a
+    /// client cannot poll for the write's real outcome.
+    #[test]
+    fn the_two_503_classes_are_told_apart_by_their_reason() {
+        assert!(matches!(
+            mapped(503, br#"{"error":"shed"}"#),
+            RpcError::Shed
+        ));
+        assert!(
+            matches!(mapped(503, b"{}"), RpcError::Shed),
+            "an unlabelled 503 keeps the pre-existing meaning"
+        );
+        let mapped = mapped(
+            503,
+            br#"{"error":"unavailable","message":"no quorum","opId":"1a2b"}"#,
+        );
+        match mapped {
+            RpcError::Unavailable { detail, op_id } => {
+                assert_eq!(detail, "no quorum");
+                assert_eq!(op_id.as_deref(), Some("1a2b"));
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
     }
 
     #[test]

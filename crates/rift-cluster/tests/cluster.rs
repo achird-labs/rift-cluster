@@ -13,6 +13,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rift_cluster::{Authority, NodeConfig, NodeId, RaftNode, Router};
@@ -49,10 +50,13 @@ struct Member {
     id: NodeId,
     addr: SocketAddr,
     dir: TempDir,
-    node: Option<RaftNode>,
+    /// `Arc` because the node-bound subsystems (`SourcePuller`, and the flow
+    /// and pull-on-miss bridges in the composed server) take a `&Arc<RaftNode>`
+    /// so they can hold a `Weak` back to it without keeping it alive.
+    node: Option<Arc<RaftNode>>,
 }
 
-async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> RaftNode {
+async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> Arc<RaftNode> {
     let config = NodeConfig {
         node_id: id,
         bind: addr,
@@ -65,9 +69,11 @@ async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> RaftNode {
     // No retry-on-lock-contention: `RaftNode::shutdown` now waits for the Raft
     // core to release its storage handles before returning (#41), so a restart on
     // a directory whose previous node was shut down cannot race the redb lock.
-    RaftNode::start(config)
-        .await
-        .unwrap_or_else(|e| panic!("start node {id}: {e}"))
+    Arc::new(
+        RaftNode::start(config)
+            .await
+            .unwrap_or_else(|e| panic!("start node {id}: {e}")),
+    )
 }
 
 /// A running in-process cluster.
@@ -129,7 +135,16 @@ impl TestCluster {
     }
 
     fn live(&self) -> impl Iterator<Item = &RaftNode> {
-        self.members.iter().filter_map(|m| m.node.as_ref())
+        self.members.iter().filter_map(|m| m.node.as_deref())
+    }
+
+    /// The current leader as a shared handle, for the subsystems that bind to
+    /// one.
+    fn leader_handle(&self) -> Option<&Arc<RaftNode>> {
+        self.members
+            .iter()
+            .filter_map(|m| m.node.as_ref())
+            .find(|n| n.status().is_leader)
     }
 
     /// The node currently reporting itself leader, if any.
@@ -981,6 +996,232 @@ async fn test_rejoin_after_leave_with_retained_state_dir() {
             .wait_converged(9092, "after-rejoin", CONVERGE_DEADLINE)
             .await,
         "the cluster stopped committing after the retained-state rejoin"
+    );
+
+    cluster.shutdown_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #134: sources as control-plane objects
+// ---------------------------------------------------------------------------
+
+/// A source that counts how many times it was fetched, so the fetch-once
+/// criterion is an assertion rather than an argument.
+struct CountingSource {
+    fetches: Arc<std::sync::atomic::AtomicUsize>,
+    body: std::sync::Mutex<Vec<rift_ee::seams::ImposterConfig>>,
+    version: std::sync::Mutex<String>,
+}
+
+impl rift_ee::seams::ImposterSource for CountingSource {
+    fn schemes(&self) -> &'static [&'static str] {
+        &["counting"]
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _r: &'a rift_ee::seams::SourceRef,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<rift_ee::seams::FetchedImposters>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(rift_ee::seams::FetchedImposters {
+                configs: self.body.lock().expect("body lock").clone(),
+                intercept: None,
+                routes: None,
+                meta: rift_ee::seams::SourceMeta {
+                    version: Some(self.version.lock().expect("version lock").clone()),
+                    fetched_at: std::time::SystemTime::now(),
+                },
+                unchanged: false,
+            })
+        })
+    }
+}
+
+fn source_config(port: u16, name: &str) -> rift_ee::seams::ImposterConfig {
+    serde_json::from_value(serde_json::json!({
+        "port": port,
+        "protocol": "http",
+        "name": name,
+    }))
+    .expect("test config parses")
+}
+
+/// C-#134: one pull fetches exactly once no matter how many nodes are in the
+/// fleet, and every node converges on what that single fetch produced.
+///
+/// This is the property that justifies fetch-then-submit over "each node
+/// fetches for itself": the fetched bytes enter the log once, so replicas
+/// cannot disagree about what the source said.
+#[tokio::test]
+async fn source_pull_fetches_exactly_once_and_converges_the_fleet() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
+
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source = Arc::new(CountingSource {
+        fetches: Arc::clone(&fetches),
+        body: std::sync::Mutex::new(vec![source_config(9401, "from-source-v1")]),
+        version: std::sync::Mutex::new("v1".to_owned()),
+    });
+    let mut registry = rift_ee::seams::SourceRegistry::new();
+    registry
+        .register(Arc::clone(&source) as Arc<dyn rift_ee::seams::ImposterSource>)
+        .expect("register the counting source");
+    let puller = rift_cluster::SourcePuller::new(registry);
+    // Bound to the leader here; the write path forwards from any node, so which
+    // node holds the puller is not what makes the fetch single.
+    puller
+        .bind(cluster.leader_handle().expect("a leader"))
+        .expect("bind the puller");
+
+    let report = puller
+        .declare_and_pull(
+            "mocks",
+            "counting://host/i.json",
+            rift_cluster::OnDrift::Overwrite,
+        )
+        .await
+        .expect("declare and pull");
+    assert!(!report.unchanged);
+    assert_eq!(report.changed, vec![9401]);
+    assert_eq!(
+        fetches.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a 3-node fleet must fetch the source exactly once: followers apply, they do not fetch"
+    );
+
+    assert!(
+        cluster
+            .wait_converged(9401, "from-source-v1", CONVERGE_DEADLINE)
+            .await,
+        "every node must converge on the config the single fetch produced"
+    );
+    // And every node can answer for the source itself, not just its imposters.
+    for node in cluster.live() {
+        let record = node
+            .source("mocks")
+            .expect("read source")
+            .expect("the source is replicated, not node-local");
+        assert_eq!(record.last_version.as_deref(), Some("v1"));
+        assert_eq!(record.ports, vec![9401]);
+        assert!(!record.drifted);
+    }
+
+    // Re-pulling unchanged content fetches again (the provider is the only one
+    // who can tell) but writes nothing: the applied index must not move.
+    let before = cluster
+        .leader()
+        .expect("a leader")
+        .status()
+        .last_applied
+        .expect("an applied index");
+    let report = puller.pull("mocks", None).await.expect("re-pull");
+    assert!(report.unchanged, "identical content is not a change");
+    assert!(report.changed.is_empty());
+    assert_eq!(
+        fetches.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the re-pull did fetch"
+    );
+    assert_eq!(
+        cluster
+            .leader()
+            .expect("a leader")
+            .status()
+            .last_applied
+            .expect("an applied index"),
+        before,
+        "unchanged content must produce no log entry at all"
+    );
+
+    // A real change does move the fleet.
+    *source.body.lock().expect("body lock") = vec![source_config(9401, "from-source-v2")];
+    *source.version.lock().expect("version lock") = "v2".to_owned();
+    let report = puller.pull("mocks", None).await.expect("pull v2");
+    assert!(!report.unchanged);
+    assert!(
+        cluster
+            .wait_converged(9401, "from-source-v2", CONVERGE_DEADLINE)
+            .await,
+        "a changed document must reach every node"
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// The secret-hygiene criterion, asserted where it matters: a credential-bearing
+/// URI is refused *before* anything is written, so it never reaches the log —
+/// not even as a committed refusal, which would keep the secret on every
+/// replica's disk and in every snapshot.
+#[tokio::test]
+async fn a_credential_bearing_source_uri_never_reaches_the_log() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(1).await;
+    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
+
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = rift_ee::seams::SourceRegistry::new();
+    registry
+        .register(Arc::new(CountingSource {
+            fetches: Arc::clone(&fetches),
+            body: std::sync::Mutex::new(vec![]),
+            version: std::sync::Mutex::new("v1".to_owned()),
+        }))
+        .expect("register");
+    let puller = rift_cluster::SourcePuller::new(registry);
+    puller
+        .bind(cluster.leader_handle().expect("a leader"))
+        .expect("bind");
+
+    let before = cluster
+        .leader()
+        .expect("a leader")
+        .status()
+        .last_applied
+        .expect("an applied index");
+    let err = puller
+        .declare_and_pull(
+            "leaky",
+            "counting://user:hunter2@host/i.json",
+            rift_cluster::OnDrift::Overwrite,
+        )
+        .await
+        .expect_err("a credential-bearing uri must be refused");
+    assert!(
+        matches!(&err, rift_cluster::PullError::BadRequest(detail) if detail.contains("auth_ref")),
+        "{err}"
+    );
+    assert_eq!(
+        cluster
+            .leader()
+            .expect("a leader")
+            .status()
+            .last_applied
+            .expect("an applied index"),
+        before,
+        "the refused uri must not have produced a log entry"
+    );
+    assert!(
+        cluster
+            .leader()
+            .expect("a leader")
+            .sources()
+            .expect("read sources")
+            .is_empty()
+    );
+    assert_eq!(
+        fetches.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused source is never fetched"
     );
 
     cluster.shutdown_all().await;

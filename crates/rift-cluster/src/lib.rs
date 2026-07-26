@@ -28,21 +28,24 @@ pub mod metrics;
 pub mod pull_on_miss;
 pub mod raft;
 pub mod rpc;
+pub mod sources;
 pub mod stores;
 
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use control::{
-    ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT, StubEdit,
-    StubEditScript, TenantId,
+    ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
+    MAX_SOURCE_PAYLOAD_BYTES, OnDrift, SourceMode, SourceProvenance, StubEdit, StubEditScript,
+    TenantId,
 };
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;
 pub use raft::{
     KeyClass, LeaveOutcome, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey,
-    RaftNode, Ring, StatusReport,
+    PullOutcome, RaftNode, Ring, SourceRecord, StatusReport,
 };
 pub use rpc::{Authority, AuthorityError, Router, RpcClient, RpcError, RpcServer};
+pub use sources::{PullError, PullReport, SourcePuller};
 
 use serde::{Deserialize, Serialize};
 

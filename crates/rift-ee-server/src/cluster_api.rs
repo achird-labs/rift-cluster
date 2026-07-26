@@ -132,8 +132,27 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
         json_handler(move || {
             let node = config.node()?;
             let ports = node.configured_ports().map_err(handler_error)?;
+            // Provenance (issue #134): which imposters a source owns, and at
+            // which version. Reported here rather than only under
+            // `/admin/sources` because this is the endpoint an operator
+            // compares across nodes to see whether the fleet has converged —
+            // and "converged on the same configs from the same source version"
+            // is the question a source-driven fleet actually asks.
+            let provenance: Vec<serde_json::Value> = node
+                .config_provenance()
+                .map_err(handler_error)?
+                .into_iter()
+                .map(|(port, source)| {
+                    serde_json::json!({
+                        "port": port,
+                        "sourceId": source.id,
+                        "version": source.version,
+                    })
+                })
+                .collect();
             Ok(serde_json::json!({
                 "ports": ports,
+                "provenance": provenance,
                 "last_applied": node.status().last_applied,
             }))
         }),

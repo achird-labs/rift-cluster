@@ -110,6 +110,20 @@ pub mod seams {
         Cli, Commands, RunningServer, ServerBuilder, run_metrics_server,
     };
 
+    /// Imposter sources (U-12): the scheme-dispatched provider SPI upstream
+    /// ships `file:` and `https:` implementations of, plus the registry an
+    /// embedder registers its own providers into.
+    ///
+    /// The clustered control plane (issue #134) fetches *through* this and then
+    /// submits the result as a control op, rather than letting each node fetch
+    /// independently — two nodes fetching the same URI can get different bytes,
+    /// and the Raft apply path must be deterministic. `MAX_BODY_BYTES` is the
+    /// provider-side fetch cap the log-entry bound is matched to.
+    pub use rift_http_proxy::sources::{
+        FetchedImposters, FileSource, HttpSource, ImposterSource, MAX_BODY_BYTES, SourceMeta,
+        SourceRef, SourceRegistry, parse_uri_list,
+    };
+
     /// The front door's route table (issue #19 / U-11): content-based routing
     /// from one listener to many imposters. Upstream ships the listener, the
     /// matcher and the config-file surface; its admin CRUD was deferred, which
@@ -222,6 +236,16 @@ mod tests {
             run_metrics_server,
             with_annotation_scope::<std::future::Ready<()>>,
         );
+
+        // Imposter sources (U-12 / issue #134).
+        assert_object_safe::<dyn ImposterSource>();
+        _named::<SourceRef>();
+        _named::<SourceRegistry>();
+        _named::<SourceMeta>();
+        _named::<FetchedImposters>();
+        _named::<FileSource>();
+        _named::<HttpSource>();
+        let _ = (MAX_BODY_BYTES, parse_uri_list);
 
         // Front-door route table (issue #131).
         _named::<RouteTable>();
