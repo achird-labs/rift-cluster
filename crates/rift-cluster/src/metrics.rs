@@ -228,6 +228,35 @@ lazy_static! {
     )
     .expect("rift_cluster_flow_repairs_total registers once");
 
+    /// `rift_cluster_source_polls_total{outcome}` — scheduled tracking-source
+    /// polls the leader performed (#135), by what they did.
+    ///
+    /// `unchanged` should dominate a healthy fleet: it is the digest short
+    /// circuit firing, which is what makes polling cost no log growth. A rising
+    /// `error` rate is the signal an upstream source host is unreachable —
+    /// deliberately visible here rather than as a log entry per failure, which
+    /// would turn someone else's outage into fleet-wide write traffic.
+    ///
+    /// Only the leader increments this, so summing across the fleet counts each
+    /// poll once — which is also how you catch a fleet that has grown a second
+    /// poller.
+    static ref SOURCE_POLLS: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_source_polls_total",
+        "Scheduled tracking-source polls, by outcome",
+        &["outcome"]
+    )
+    .expect("rift_cluster_source_polls_total registers once");
+
+    /// `rift_cluster_source_poll_seconds` — wall-clock of a scheduled poll,
+    /// fetch included. Buckets reach far past any healthy fetch because the
+    /// interesting tail is an upstream host that has started hanging.
+    static ref SOURCE_POLL_SECONDS: Histogram = register_histogram!(
+        "rift_cluster_source_poll_seconds",
+        "Duration of a scheduled tracking-source poll, fetch included",
+        vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0]
+    )
+    .expect("rift_cluster_source_poll_seconds registers once");
+
     /// `rift_cluster_config_revision{port}` — the log index that last wrote
     /// each applied config. Two nodes disagreeing here have not converged.
     static ref CONFIG_REVISION: GaugeVec = register_gauge_vec!(
@@ -319,6 +348,13 @@ pub(crate) fn flow_adoption(outcome: &str) {
 
 pub(crate) fn flow_repair() {
     FLOW_REPAIRS.inc();
+}
+
+/// Record one scheduled tracking-source poll (#135). `outcome` is
+/// `applied` | `unchanged` | `skipped` | `error`.
+pub(crate) fn source_poll(outcome: &str, elapsed: std::time::Duration) {
+    SOURCE_POLLS.with_label_values(&[outcome]).inc();
+    SOURCE_POLL_SECONDS.observe(elapsed.as_secs_f64());
 }
 
 pub(crate) fn flow_conflict(reason: &str) {

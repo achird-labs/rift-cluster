@@ -640,7 +640,8 @@ retrying.
 
 | Field | Values | Meaning |
 |---|---|---|
-| `mode` | `"pinned"` (default) | Explicit pulls only. `"tracking"` (scheduled polls) is in the log format but refused until #135 |
+| `mode` | `"pinned"` (default) \| `"tracking"` | `pinned`: explicit pulls only. `tracking`: the fleet re-fetches on `pollSecs` — see below |
+| `pollSecs` | ≥ 5 | How often a `tracking` source is re-fetched. Required for `tracking`, refused for `pinned` |
 | `onDrift` | `"overwrite"` (default) \| `"skip"` \| `"fail"` | What a pull does when the source's imposters have been hand-edited since it last applied |
 | `authRef` | a credential *name* | Stored and validated as a name. Resolving it into a request header ships with the providers that need it (#136) — upstream's `HttpSource` has no header-injection seam, so a credentialed fetch needs a new provider, not a hook here |
 
@@ -668,6 +669,48 @@ fleet does not hold the content:
   upstream;
 - content a previous pull **skipped** — a skip records the digest it *saw*, not
   one that was applied.
+
+### Tracking sources: one poller, fleet-wide (#135)
+
+A `tracking` source is re-fetched on an interval without anyone asking. The
+whole difficulty is the word *fleet*: N nodes each running a timer would fetch N
+times per interval, undoing the fetch-once property above with the very thing
+meant to drive it. So the scheduler is **leader-only**.
+
+- The poller is grounded on the same Raft leadership signal the forward-to-leader
+  write path reads — deliberately not a second notion of leadership, because two
+  independent answers to "am I the leader" is exactly how a fleet grows a second
+  poller during an election.
+- On losing leadership a node stops every poll task; on gaining it, it starts
+  them. `SourcePut` and `SourceDelete` reconcile the running set without a
+  restart.
+- Intervals are jittered ±10%, so sources declared together do not arrive at the
+  upstream host as a burst every interval.
+- **`pollSecs` has a 5-second floor**, enforced at admission with a typed `400`.
+  A mistyped `1` would turn the fleet into a request flood against someone
+  else's host, and the operator would see only that their mocks update promptly.
+
+**A poll costs no log growth when nothing changed.** Polling runs the same pull
+flow as an explicit `POST .../pull`, so the digest short circuit applies: an
+unchanged document writes no log entry, forever. That is what makes tracking
+mode affordable at a 30-second cadence.
+
+**A failing poll is visible without being written down.** Errors are recorded
+*leader-locally* — surfaced as `lastPollError` on `GET /admin/sources/:id`, and
+counted by `rift_cluster_source_polls_total{outcome="error"}`. They are
+deliberately never committed: a log entry per failure would reintroduce the log
+growth the short circuit exists to prevent, at the worst possible moment (an
+upstream outage is exactly when you do not want fleet-wide write traffic). The
+durable `last…` fields still move only when a pull actually applies or is
+skipped, so a stale `lastVersion` next to a `lastPollError` reads correctly:
+the fleet is holding the last good content and the source is currently
+unreachable.
+
+Observability: `rift_cluster_source_polls_total{outcome}` (`applied` /
+`unchanged` / `skipped` / `error`) and `rift_cluster_source_poll_seconds`. Only
+the leader increments them, so summing across the fleet counts each poll once —
+which is also how you would catch a fleet that has somehow grown a second
+poller.
 
 ### Provenance and drift
 
@@ -748,8 +791,8 @@ Every applied pull writes a structured `audit`-target log event naming the
 principal, the source id, the version and the applying revision — so "who moved
 the payment mocks to which commit, and when" is a log query.
 
-Scheduled `tracking` polls are #135; the `git:`/`s3:`/`registry:` providers are
-#136; container-tier chaos coverage is #137.
+The `git:`/`s3:`/`registry:` providers are #136; container-tier chaos coverage
+is #137.
 
 ## Clustered flow state (#120)
 

@@ -21,7 +21,7 @@ use rift_cluster::stores::{
 };
 use rift_cluster::{
     Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, OnDrift,
-    PullOnMissInterceptor, RaftNode, SourcePuller, metrics,
+    PullOnMissInterceptor, RaftNode, SourcePuller, SourceScheduler, metrics,
 };
 use rift_ee::seams::{
     CompiledRoutes, FileSource, HttpSource, ImposterManager, RunningFrontDoor, RunningServer,
@@ -159,6 +159,12 @@ pub struct ComposedServer {
     /// Reconciles the engine and satisfies [`GATE_RECONCILED`]; aborted on
     /// shutdown for the same reason as the sampler.
     reconciler: Option<tokio::task::JoinHandle<()>>,
+    /// The tracking-source poll scheduler (#135). Aborted on shutdown for the
+    /// same reason as the sampler — and more urgently: it holds an
+    /// `Arc<RaftNode>` while waiting on the leadership watch, so a task left
+    /// running delays the node's `Drop`, which is what releases the cluster
+    /// port and the redb lock.
+    source_scheduler: Option<tokio::task::JoinHandle<()>>,
     /// Replays parked intents on leader changes (issue #9 R4); same lifecycle
     /// rules as the reconciler.
     intent_replayer: Option<tokio::task::JoinHandle<()>>,
@@ -240,6 +246,9 @@ impl ComposedServer {
         }
         if let Some(replayer) = self.intent_replayer {
             replayer.abort();
+        }
+        if let Some(scheduler) = self.source_scheduler {
+            scheduler.abort();
         }
         if let Some(probes) = self.probes {
             probes.shutdown().await;
@@ -407,6 +416,7 @@ pub async fn start_with_runtimes(
             front_door: None,
             metrics_sampler: None,
             reconciler: None,
+            source_scheduler: None,
             intent_replayer: None,
             cluster_addr: None,
             manager: None,
@@ -583,7 +593,23 @@ pub async fn start_with_runtimes(
         }
         return Err(anyhow::Error::new(e).context("binding the source puller to the node"));
     }
+    // The tracking-source poll scheduler (#135). Started on the ambient
+    // runtime, like the metrics sampler and the intent replayer — never a bare
+    // `Runtime` of its own (#120: one dropped from inside async context panics
+    // the process on shutdown). It polls only while this node is the Raft
+    // leader.
+    //
+    // Its handle is aborted on every path that shuts the node down, here and in
+    // `ComposedServer::shutdown`. `Weak` handles are not sufficient on their
+    // own: the supervisor upgrades to an `Arc<RaftNode>` for the duration of
+    // each leadership wait, so a task left running holds the node past its
+    // shutdown — and the node's `Drop` is what frees the cluster port and the
+    // redb lock, which a retried `start` immediately needs.
+    let (poll_status, source_scheduler) =
+        SourceScheduler::spawn(&tokio::runtime::Handle::current(), &node, &puller);
+    puller.attach_poll_status(&poll_status);
     if let Err(e) = flow_net.bind(&node, FlowBindConfig::default()) {
+        source_scheduler.abort();
         probes.shutdown().await;
         if let Err(e) = node.shutdown().await {
             tracing::error!(error = %e, "cluster node shutdown reported an error");
@@ -615,6 +641,7 @@ pub async fn start_with_runtimes(
             front_door,
             metrics_sampler: Some(spawn_metrics_sampler(Arc::clone(&node))),
             reconciler: Some(reconciler),
+            source_scheduler: Some(source_scheduler),
             intent_replayer: Some(spawn_intent_replayer(Arc::clone(&node))),
             node: Some(node),
             cluster_addr: Some(cluster_addr),
@@ -624,6 +651,7 @@ pub async fn start_with_runtimes(
             state_dir: Some(state_dir),
         }),
         Err(e) => {
+            source_scheduler.abort();
             probes.shutdown().await;
             if let Err(e) = node.shutdown().await {
                 tracing::error!(error = %e, "cluster node shutdown reported an error");

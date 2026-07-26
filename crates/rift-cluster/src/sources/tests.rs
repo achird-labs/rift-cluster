@@ -207,6 +207,7 @@ fn a_bootstrap_id_is_always_a_valid_source_id() {
             mode: crate::control::SourceMode::Pinned,
             auth_ref: None,
             on_drift: crate::control::OnDrift::Overwrite,
+            poll_secs: None,
         };
         assert_eq!(
             crate::control::validate(&op),
