@@ -728,6 +728,37 @@ async fn a_pull_repairs_drift_even_when_the_document_is_unchanged() {
     assert_eq!(record["drifted"], false);
 }
 
+/// Issue #156, in the shape it was found: the collection route carries a query
+/// string and must still resolve — and must resolve to the *collection*, not
+/// fall through to the `/admin/sources/` member prefix.
+#[tokio::test]
+async fn the_collection_route_resolves_with_a_query_string() {
+    let fixture = start().await;
+    let client = client();
+    call(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources",
+        serde_json::json!({ "id": "mocks", "uri": "scripted://cfg/i.json" }),
+    )
+    .await;
+
+    let listed = call(
+        &client,
+        fixture.addr,
+        "GET",
+        "/admin/sources?verbose=1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        listed["sources"].as_array().expect("array").len(),
+        1,
+        "a query string must not turn the collection into a 404, nor into a member lookup"
+    );
+}
+
 /// The source surface rides the authenticated cluster port, so it is subject to
 /// the same credential as everything else there.
 #[tokio::test]

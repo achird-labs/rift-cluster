@@ -91,6 +91,56 @@ fn rpc_loopback_round_trip() {
     assert_eq!(response, b"{\"hello\":\"peer\"}");
 }
 
+/// Issue #156: a query string must reach a registered route, over the real
+/// signed transport.
+///
+/// This is the test that proves the two consumers of the request target
+/// diverged *correctly*: the signature is still computed and verified over the
+/// full `path_and_query` (so a handler reading a query has an authenticated
+/// input), while routing matches on the path component alone. A fix that
+/// stopped signing the query would still pass a router unit test — it would
+/// fail here, because client and server would then disagree about what was
+/// signed.
+#[test]
+fn a_query_string_reaches_an_exact_route_over_a_signed_connection() {
+    let bridge = bridge();
+    let addr = start_server(&bridge, Some(Arc::new(Verifier::new(SECRET))));
+    let client = client(Some(Signer::new(SECRET)));
+
+    let response = bridge
+        .call(CallerClass::DataPlane, Duration::from_secs(5), async move {
+            client
+                .call(
+                    addr,
+                    "POST",
+                    "/internal/v1/echo?since=42&probe=1",
+                    b"{\"hello\":\"peer\"}".to_vec(),
+                )
+                .await
+        })
+        .expect("a query string must not turn a registered route into a 404");
+
+    assert_eq!(response, b"{\"hello\":\"peer\"}");
+}
+
+/// Ignoring the query must not degrade into ignoring the path: an unregistered
+/// path is still a 404 however many query parameters it carries.
+#[test]
+fn a_query_string_does_not_rescue_an_unknown_route() {
+    let bridge = bridge();
+    let addr = start_server(&bridge, Some(Arc::new(Verifier::new(SECRET))));
+    let client = client(Some(Signer::new(SECRET)));
+
+    let err = bridge
+        .call(CallerClass::DataPlane, Duration::from_secs(5), async move {
+            client
+                .call(addr, "POST", "/internal/v1/nope?x=1", Vec::new())
+                .await
+        })
+        .expect_err("an unregistered path is still unknown");
+    assert!(matches!(err, RpcError::UnknownRoute { .. }), "{err:?}");
+}
+
 #[test]
 fn rpc_rejects_a_peer_with_the_wrong_secret() {
     let bridge = bridge();
