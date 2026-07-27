@@ -2564,6 +2564,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rift-mock-core",
+ "rift-store-redis",
  "rift-types",
  "rustls",
  "rustls-pemfile",
@@ -2601,7 +2602,6 @@ dependencies = [
  "chrono",
  "crossbeam",
  "foldhash 0.2.0",
- "futures",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -2616,10 +2616,8 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "quamina",
- "r2d2",
  "rand 0.8.6",
  "rcgen",
- "redis",
  "regex",
  "regex-automata",
  "reqwest",
@@ -2645,6 +2643,18 @@ dependencies = [
  "urlencoding",
  "uuid",
  "yasna",
+]
+
+[[package]]
+name = "rift-store-redis"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "r2d2",
+ "redis",
+ "rift-mock-core",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

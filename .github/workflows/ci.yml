@@ -306,17 +306,14 @@ jobs:
       # runs — the same trade cluster-smoke already makes for its own
       # fixed-port tier, for the same reason.
       #
-      # `--skip test_response_cycling_with_rift_extensions`: this one issues
-      # six requests concurrently via `join_all` and asserts they land on the
-      # server's round-robin counter in dispatch order — an ordering the
-      # client-side concurrency doesn't actually guarantee. Confirmed locally
-      # against upstream's own `rift` binary, unmodified: identical failure
-      # shape (same three response bodies, twice each, scrambled order) with
-      # no `RIFT_SERVER_BIN` override at all. That makes it a pre-existing
-      # race in the test, not a `rift-ee-server` composition break — skipping
-      # it here is quarantine, not a parity exemption. Filed upstream as
-      # achird-labs/rift#849 rather than patched in `vendor/rift`, since this
-      # crate does not carry local patches to the pin.
+      # The `test_response_cycling_with_rift_extensions` quarantine is gone
+      # (issue #145): it skipped a test that issued six requests concurrently
+      # and asserted they reached the round-robin counter in dispatch order,
+      # which client-side concurrency never guaranteed. Filed upstream as
+      # achird-labs/rift#849 rather than patched here — this crate carries no
+      # local patches to the pin — and fixed upstream by rift#850, which
+      # dispatches those requests sequentially. That fix is in the pin, so the
+      # skip now suppresses a test that passes: dropped rather than left to rot.
       - name: Upstream process-spawning suites against rift-ee-server
         if: steps.changed.outputs.run == 'true'
         working-directory: vendor/rift
@@ -331,5 +328,4 @@ jobs:
             --test issue_360_script_cli \
             --test corpus_replay \
             -- --include-ignored --test-threads=1 \
-               --skip test_response_cycling_with_rift_extensions \
-            | "$ASSERT_SCENARIOS_RAN" --assert 50
+            | "$ASSERT_SCENARIOS_RAN" --assert 51
