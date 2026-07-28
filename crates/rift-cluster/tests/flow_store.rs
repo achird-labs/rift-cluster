@@ -129,19 +129,58 @@ async fn flow_cluster_of(n: usize, anti_entropy: Duration) -> Vec<FlowMember> {
     members
 }
 
-fn imposter(flow_state: serde_json::Value) -> ImposterConfig {
+/// The port is a parameter because it *is* the imposter scope (#152): two
+/// configs differing only in port are two imposters, and that is the boundary
+/// the scope tests below assert.
+fn imposter_on(port: u16, flow_state: serde_json::Value) -> ImposterConfig {
     serde_json::from_value(serde_json::json!({
-        "port": 4545,
+        "port": port,
         "protocol": "http",
         "_rift": { "flowState": flow_state },
     }))
     .expect("imposter parses")
 }
 
-fn store_on(member: &FlowMember, flow_state: serde_json::Value) -> Arc<dyn FlowStore> {
+/// The port `store_on` and `stored` agree on. Shared so the two cannot drift —
+/// a mismatch would show up as a confusing runtime absence, not a compile error.
+const TEST_PORT: u16 = 4545;
+
+fn imposter(flow_state: serde_json::Value) -> ImposterConfig {
+    imposter_on(TEST_PORT, flow_state)
+}
+
+fn store_on_port(
+    member: &FlowMember,
+    port: u16,
+    flow_state: serde_json::Value,
+) -> Arc<dyn FlowStore> {
     ClusteredFlowStoreProvider::new(Arc::clone(&member.net))
-        .provide(&imposter(flow_state))
+        .provide(&imposter_on(port, flow_state))
         .expect("the clustered provider always provides")
+}
+
+fn store_on(member: &FlowMember, flow_state: serde_json::Value) -> Arc<dyn FlowStore> {
+    store_on_port(member, TEST_PORT, flow_state)
+}
+
+/// The id a flow written through [`store_on`] is actually **stored** under.
+///
+/// The store scopes at its face (#152), so everything below it — shards, the
+/// ownership ring, replication — sees the prefixed id. Tests that reach past
+/// the store to a `FlowShard`, or that predict an owner from the ring, are
+/// asking questions about that layer and must use its vocabulary. Rendered by
+/// the production function rather than a hand-written literal, so a test can
+/// never disagree with the store about what the prefix is.
+///
+/// This applies to **hand-built wire bodies** as much as to `FlowShard` calls:
+/// a `/_cluster/flow/write` or `/_cluster/flow/replicate` body carries the id
+/// verbatim, so a bare id there addresses a namespace no store ever writes to,
+/// and any assertion made through the store face against it is vacuously true.
+fn stored(flow_id: &str) -> String {
+    format!(
+        "{}{flow_id}",
+        rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(TEST_PORT))
+    )
 }
 
 /// The store face is synchronous and parks its thread on the bridge; calling it
@@ -271,6 +310,239 @@ async fn a_local_read_stays_on_the_replica_and_sees_replicated_state() {
     }
 }
 
+/// The G5 parity proof (#152, RFC-005 §3.5): two imposters that happen to
+/// resolve the same flow id — the ordinary outcome of both using
+/// `flowIdSource: "header:X-Session"` — must not share state. OSS isolates them
+/// because each imposter builds its own `InMemoryFlowStore`; the clustered
+/// store has to reproduce that boundary itself, since one `FlowNet` backs every
+/// imposter on the node.
+///
+/// Both read paths are asserted, because the prefix has to sit above the read
+/// consistency choice, not inside one branch of it. The `local` half is written
+/// so its absence assertion means something: it first waits until the *same*
+/// imposter's local read observes the write, which proves replication landed —
+/// only then is the other imposter's empty read attributable to scoping rather
+/// than to a push still in flight.
+#[tokio::test(flavor = "multi_thread")]
+async fn imposter_scope_isolates_two_imposters_sharing_one_flow_id() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    const SHARED: &str = "x-session-abc";
+
+    let writer = store_on_port(&members[0], 6400, serde_json::json!({}));
+    let same_imposter_strong = store_on_port(&members[1], 6400, serde_json::json!({}));
+    let other_imposter_strong = store_on_port(&members[1], 6401, serde_json::json!({}));
+    let same_imposter_local = store_on_port(
+        &members[1],
+        6400,
+        serde_json::json!({ "readConsistency": "local" }),
+    );
+    let other_imposter_local = store_on_port(
+        &members[1],
+        6401,
+        serde_json::json!({ "readConsistency": "local" }),
+    );
+
+    blocking(move || writer.set(SHARED, "step", serde_json::json!("checkout")))
+        .await
+        .expect("write through imposter 6400 on node A");
+
+    // Control: the same imposter, through the other node, does see it. Without
+    // this the isolation assertion below could pass on a store that lost the
+    // write entirely.
+    let seen = blocking(move || same_imposter_strong.get(SHARED, "step"))
+        .await
+        .expect("strong read");
+    assert_eq!(
+        seen,
+        Some(serde_json::json!("checkout")),
+        "the writing imposter must still observe its own flow across nodes"
+    );
+
+    let seen = blocking(move || other_imposter_strong.get(SHARED, "step"))
+        .await
+        .expect("strong read");
+    assert_eq!(
+        seen, None,
+        "a different imposter sharing the flow-id value must not observe the write (strong path)"
+    );
+
+    // Replication is async; poll the same imposter's local read until the push
+    // lands, so the cross-imposter local read that follows is a scoping result.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let probe = Arc::clone(&same_imposter_local);
+        let seen = blocking(move || probe.get(SHARED, "step"))
+            .await
+            .expect("local read");
+        if seen == Some(serde_json::json!("checkout")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replication push never reached the replica; local read still sees {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let seen = blocking(move || other_imposter_local.get(SHARED, "step"))
+        .await
+        .expect("local read");
+    assert_eq!(
+        seen, None,
+        "a different imposter must not observe the write on the local path either"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// `contextScope: "fleet"` is the opt-back-in to pre-#152 sharing: two
+/// imposters deliberately share one context. Asserted alongside the disjointness
+/// of the two namespaces — a `fleet` store must not pick up an `imposter`-scoped
+/// write either, which is why `fleet` carries its own `f:` prefix instead of
+/// passing the flow id through bare.
+#[tokio::test(flavor = "multi_thread")]
+async fn fleet_scope_shares_across_imposters_and_stays_disjoint_from_imposter_scope() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    const SHARED: &str = "x-session-def";
+    let fleet = || serde_json::json!({ "contextScope": "fleet" });
+
+    let fleet_writer = store_on_port(&members[0], 6500, fleet());
+    let fleet_reader = store_on_port(&members[1], 6501, fleet());
+
+    blocking(move || fleet_writer.set(SHARED, "step", serde_json::json!("shared")))
+        .await
+        .expect("fleet-scoped write");
+
+    let seen = blocking(move || fleet_reader.get(SHARED, "step"))
+        .await
+        .expect("strong read");
+    assert_eq!(
+        seen,
+        Some(serde_json::json!("shared")),
+        "two fleet-scoped imposters must share one context"
+    );
+
+    // Disjointness, both directions.
+    let imposter_reader = store_on_port(&members[1], 6501, serde_json::json!({}));
+    let seen = blocking(move || imposter_reader.get(SHARED, "step"))
+        .await
+        .expect("strong read");
+    assert_eq!(
+        seen, None,
+        "an imposter-scoped read must not observe a fleet-scoped write"
+    );
+
+    let imposter_writer = store_on_port(&members[0], 6502, serde_json::json!({}));
+    blocking(move || imposter_writer.set(SHARED, "own", serde_json::json!("mine")))
+        .await
+        .expect("imposter-scoped write");
+    let fleet_probe = store_on_port(&members[1], 6502, fleet());
+    let seen = blocking(move || fleet_probe.get(SHARED, "own"))
+        .await
+        .expect("strong read");
+    assert_eq!(
+        seen, None,
+        "a fleet-scoped read must not observe an imposter-scoped write"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// The boundary holds for every write op, not just `set` — and for flow ids
+/// deliberately shaped like another imposter's prefix.
+///
+/// Today all eleven `FlowStore` methods funnel through `write`/`get`, so the
+/// scoping is structural rather than per-method. This test is what keeps that
+/// true: a future bespoke fast path for `clear_flow` or `increment_by` that
+/// forgot to scope would fail here instead of silently reopening #152.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_write_op_is_scoped_including_prefix_shaped_flow_ids() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    let a = store_on_port(&members[0], 6400, serde_json::json!({}));
+    let b = store_on_port(&members[1], 6401, serde_json::json!({}));
+
+    // `increment_by`: two imposters counting under one id keep separate counts.
+    let first = {
+        let a = Arc::clone(&a);
+        blocking(move || a.increment_by("ctr", "n", 5))
+            .await
+            .expect("increment through imposter 6400")
+    };
+    assert_eq!(first, 5);
+    let second = {
+        let b = Arc::clone(&b);
+        blocking(move || b.increment_by("ctr", "n", 1))
+            .await
+            .expect("increment through imposter 6401")
+    };
+    assert_eq!(
+        second, 1,
+        "a second imposter's counter must start at zero, not inherit the first's"
+    );
+
+    // `clear_flow`: wiping one imposter's flow must not reach the other's.
+    for (store, mark) in [(&a, "a"), (&b, "b")] {
+        let store = Arc::clone(store);
+        let mark = serde_json::json!(mark);
+        blocking(move || store.set("wipe", "k", mark))
+            .await
+            .expect("seed");
+    }
+    {
+        let a = Arc::clone(&a);
+        blocking(move || a.clear_flow("wipe"))
+            .await
+            .expect("clear through imposter 6400");
+    }
+    let cleared = {
+        let a = Arc::clone(&a);
+        blocking(move || a.get("wipe", "k")).await.expect("read")
+    };
+    assert_eq!(cleared, None, "the clear must take effect in its own scope");
+    let survivor = {
+        let b = Arc::clone(&b);
+        blocking(move || b.get("wipe", "k")).await.expect("read")
+    };
+    assert_eq!(
+        survivor,
+        Some(serde_json::json!("b")),
+        "clear_flow must not reach across the scope boundary"
+    );
+
+    // A flow id shaped like imposter 6401's prefix cannot address imposter
+    // 6401: `6401:evil` on port 6400 keys `i6400:6401:evil`, which is not
+    // `i6401:evil`. The decimal port always terminates in a `:`, so the scheme
+    // stays uniquely decodable.
+    {
+        let a = Arc::clone(&a);
+        blocking(move || a.set("6401:evil", "k", serde_json::json!("spoofed")))
+            .await
+            .expect("write a prefix-shaped id");
+    }
+    let spoofed = {
+        let b = Arc::clone(&b);
+        blocking(move || b.get("evil", "k")).await.expect("read")
+    };
+    assert_eq!(
+        spoofed, None,
+        "a caller-chosen flow id must not be able to impersonate another imposter's prefix"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
 /// RFC-001 §7.6: an op minted under a stale membership view is rejected and
 /// counted, never applied under an ownership the sender no longer holds. Driven
 /// over the real wire with a hand-built body, which pins the wire contract too.
@@ -283,7 +555,7 @@ async fn a_stale_fencing_token_is_rejected_and_counted() {
 
     let target = members[1].node.id();
     let stale = serde_json::json!({
-        "flow_id": "flow-z",
+        "flow_id": stored("flow-z"),
         "key": "step",
         "op": { "Set": { "value": "stolen" } },
         "ttl_seconds": null,
@@ -337,7 +609,7 @@ async fn a_misrouted_write_with_a_valid_token_is_refused() {
     let m_idx = members[0].node.ring().m_idx();
     let body = |val: &str| {
         serde_json::to_vec(&serde_json::json!({
-            "flow_id": "flow-misroute",
+            "flow_id": stored("flow-misroute"),
             "key": "k",
             "op": { "Set": { "value": val } },
             "ttl_seconds": null,
@@ -451,7 +723,7 @@ async fn a_delayed_put_cannot_resurrect_a_deleted_key() {
     let owner_id = ring
         .owner(rift_cluster::OwnedKey::new(
             rift_cluster::KeyClass::FlowKv,
-            "flow-rz",
+            &stored("flow-rz"),
         ))
         .expect("two members");
     let (owner, replica) = if members[0].node.id() == owner_id {
@@ -479,7 +751,7 @@ async fn a_delayed_put_cannot_resurrect_a_deleted_key() {
     // The delayed v1 push, replayed at the replica after the delete: exactly
     // what a slow network delivers. It must lose to the tombstone.
     let stale_put = serde_json::json!({
-        "flow_id": "flow-rz",
+        "flow_id": stored("flow-rz"),
         "op": { "Put": { "key": "k", "entry": {
             "m_idx": ring.m_idx(),
             "v": 1,
@@ -500,7 +772,7 @@ async fn a_delayed_put_cannot_resurrect_a_deleted_key() {
         .expect("replicate call");
 
     assert_eq!(
-        replica.shard.get("flow-rz", "k"),
+        replica.shard.get(&stored("flow-rz"), "k"),
         None,
         "a delayed Put must lose to the tombstone, not resurrect the key"
     );
@@ -537,7 +809,7 @@ async fn a_reset_after_delete_never_loses_to_the_tombstone_under_repetition() {
     let owner_id = ring
         .owner(rift_cluster::OwnedKey::new(
             rift_cluster::KeyClass::FlowKv,
-            "flow-hammer",
+            &stored("flow-hammer"),
         ))
         .expect("two members");
     let (owner, replica) = if members[0].node.id() == owner_id {
@@ -567,7 +839,12 @@ async fn a_reset_after_delete_never_loses_to_the_tombstone_under_repetition() {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if replica.shard.get("flow-hammer", "slot").map(|e| e.value) == Some(want.clone()) {
+            if replica
+                .shard
+                .get(&stored("flow-hammer"), "slot")
+                .map(|e| e.value)
+                == Some(want.clone())
+            {
                 break;
             }
             assert!(
@@ -575,7 +852,7 @@ async fn a_reset_after_delete_never_loses_to_the_tombstone_under_repetition() {
                 "round {round}: the replica lost the re-set. Its copy is {:?} — an older push \
                  (a tombstone, or an earlier value) overwrote a newer acknowledged write, which \
                  means the merge compare-and-install is not atomic against a concurrent push.",
-                replica.shard.get_versioned("flow-hammer", "slot")
+                replica.shard.get_versioned(&stored("flow-hammer"), "slot")
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -596,7 +873,7 @@ async fn a_reset_after_delete_replicates_over_the_tombstone() {
     let owner_id = ring
         .owner(rift_cluster::OwnedKey::new(
             rift_cluster::KeyClass::FlowKv,
-            "flow-reset",
+            &stored("flow-reset"),
         ))
         .expect("two members");
     let (owner, replica) = if members[0].node.id() == owner_id {
@@ -626,7 +903,11 @@ async fn a_reset_after_delete_replicates_over_the_tombstone() {
     // beat the tombstone it cannot see.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if replica.shard.get("flow-reset", "slot").map(|e| e.value) == Some(serde_json::json!("B"))
+        if replica
+            .shard
+            .get(&stored("flow-reset"), "slot")
+            .map(|e| e.value)
+            == Some(serde_json::json!("B"))
         {
             break;
         }
@@ -634,7 +915,7 @@ async fn a_reset_after_delete_replicates_over_the_tombstone() {
             Instant::now() < deadline,
             "the re-set never replicated: the replica still holds the tombstone \
              (its copy: {:?})",
-            replica.shard.get_versioned("flow-reset", "slot")
+            replica.shard.get_versioned(&stored("flow-reset"), "slot")
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -657,7 +938,7 @@ async fn a_replica_that_missed_a_push_converges_within_one_tick() {
     let owner_id = ring
         .owner(rift_cluster::OwnedKey::new(
             rift_cluster::KeyClass::FlowKv,
-            "flow-ae",
+            &stored("flow-ae"),
         ))
         .expect("two members");
     let (owner, replica) = if members[0].node.id() == owner_id {
@@ -680,21 +961,34 @@ async fn a_replica_that_missed_a_push_converges_within_one_tick() {
     // Wait until the push has landed, then knock one key out of the replica —
     // the moral equivalent of a push that never arrived.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while replica.shard.get("flow-ae", "lost").is_none() {
+    while replica.shard.get(&stored("flow-ae"), "lost").is_none() {
         assert!(Instant::now() < deadline, "push never reached the replica");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     replica
         .shard
-        .delete("flow-ae", "lost", rift_cluster::stores::Durability::None)
+        .delete(
+            &stored("flow-ae"),
+            "lost",
+            rift_cluster::stores::Durability::None,
+        )
         .await
         .expect("sabotage");
-    assert_eq!(replica.shard.get("flow-ae", "lost"), None, "sabotage held");
+    assert_eq!(
+        replica.shard.get(&stored("flow-ae"), "lost"),
+        None,
+        "sabotage held"
+    );
 
     // No new writes: only the loop can repair this.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if replica.shard.get("flow-ae", "lost").map(|e| e.value) == Some(serde_json::json!("v")) {
+        if replica
+            .shard
+            .get(&stored("flow-ae"), "lost")
+            .map(|e| e.value)
+            == Some(serde_json::json!("v"))
+        {
             break;
         }
         assert!(
@@ -726,16 +1020,20 @@ async fn a_new_owner_adopts_from_the_surviving_replica_on_takeover() {
     // membership change below does not also move leadership.
     let full_ring = members[0].node.ring();
     let leader_id = members[0].node.id();
+    // Ownership is computed over the *stored* id, because that is the string
+    // the ring sees once the store has scoped it (#152) — predicting from the
+    // bare id would name a node that never owns this flow.
     let (flow_id, old_owner_id) = (0..64)
         .map(|i| format!("flow-adopt-{i}"))
         .find_map(|candidate| {
             let owner = full_ring.owner(rift_cluster::OwnedKey::new(
                 rift_cluster::KeyClass::FlowKv,
-                &candidate,
+                &stored(&candidate),
             ))?;
             (owner != leader_id).then_some((candidate, owner))
         })
         .expect("some flow is owned by a non-leader");
+    let stored_id = stored(&flow_id);
 
     // Predict the post-removal owner: HRW depends only on the member set and
     // the key, so the test computes it the same way every node will.
@@ -747,7 +1045,7 @@ async fn a_new_owner_adopts_from_the_surviving_replica_on_takeover() {
     let next_owner_id = rift_cluster::Ring::new(survivor_ids.iter().copied(), 0)
         .owner(rift_cluster::OwnedKey::new(
             rift_cluster::KeyClass::FlowKv,
-            &flow_id,
+            &stored_id,
         ))
         .expect("two survivors");
     let next_owner = members
@@ -769,7 +1067,7 @@ async fn a_new_owner_adopts_from_the_surviving_replica_on_takeover() {
             .expect("write");
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    while next_owner.shard.get(&flow_id, "k").is_none() {
+    while next_owner.shard.get(&stored_id, "k").is_none() {
         assert!(
             Instant::now() < deadline,
             "push never reached the successor"
@@ -789,7 +1087,12 @@ async fn a_new_owner_adopts_from_the_surviving_replica_on_takeover() {
     };
     next_owner
         .shard
-        .set(&flow_id, "k", stale, rift_cluster::stores::Durability::None)
+        .set(
+            &stored_id,
+            "k",
+            stale,
+            rift_cluster::stores::Durability::None,
+        )
         .await
         .expect("sabotage");
 
@@ -853,7 +1156,7 @@ async fn a_none_durability_write_is_not_persisted_by_the_replica_either() {
     let owner_id = ring
         .owner(rift_cluster::OwnedKey::new(
             rift_cluster::KeyClass::FlowKv,
-            "flow-none",
+            &stored("flow-none"),
         ))
         .expect("two members");
     let (owner, replica) = if members[0].node.id() == owner_id {
@@ -875,7 +1178,7 @@ async fn a_none_durability_write_is_not_persisted_by_the_replica_either() {
     // The push still happens — a `local` reader on the replica must see it —
     // so wait for the value to arrive before judging what it cost.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while replica.shard.get("flow-none", "k").is_none() {
+    while replica.shard.get(&stored("flow-none"), "k").is_none() {
         assert!(
             Instant::now() < deadline,
             "the push never reached the replica"
