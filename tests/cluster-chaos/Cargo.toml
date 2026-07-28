@@ -15,5 +15,19 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde_json.workspace = true
 tokio.workspace = true
 
+# The ONE first-party dependency, and only for its cluster-port client (#137).
+#
+# Everything else this harness drives is plain HTTP, which is why no `rift_ee` /
+# `rift_http_proxy` types appear anywhere in it: an imposter config, a route
+# table and a source declaration are all built as JSON at the call site, the way
+# an operator's `curl` would. The cluster port is the exception — it is
+# HMAC-authenticated per request over a length-prefixed canonical form and
+# negotiates a protocol version (RFC-001 §11.2) — and `/admin/sources*` rides
+# it. Re-implementing that framing here would put a second copy of a
+# security-critical wire format in a test harness; using the shipped
+# `rpc::RpcClient` is what an operator's own tooling would do, and it cannot
+# drift from the server it is talking to.
+rift-cluster = { path = "../../crates/rift-cluster" }
+
 [dev-dependencies]
 tokio.workspace = true

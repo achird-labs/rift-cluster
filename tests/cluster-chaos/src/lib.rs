@@ -443,6 +443,7 @@ pub fn published_host_ports() -> Vec<u16> {
     ports.extend(PULL_ON_MISS_HOST_PORTS);
     ports.extend(FLOW_STATE_HOST_PORTS);
     ports.extend(FRONT_DOOR_HOST_PORTS);
+    ports.extend(SOURCES_HOST_PORTS);
     ports
 }
 
@@ -759,6 +760,76 @@ pub const FLOW_STATE_HOST_PORTS: [u16; 3] = [16400, 26400, 36400];
 /// The front door's host ports under `front-door.overlay.yml` — one per node,
 /// in `NODES` order. C17 and C18 only: no other scenario binds `--front-door`.
 pub const FRONT_DOOR_HOST_PORTS: [u16; 3] = [12527, 22527, 32527];
+
+/// Each node's **cluster port** as `sources.overlay.yml` publishes it, in
+/// [`NODES`] order. C20-C23 only.
+///
+/// Published because `/admin/sources*` rides the cluster port, not the admin
+/// API: sources are a control-plane object authenticated with the cluster
+/// credential (see `crates/rift-cluster/src/sources/mod.rs`'s module doc). The
+/// shipped topology deliberately does not publish 4790 — peers reach it over
+/// the container network and an operator reaches it from inside the perimeter —
+/// so this is scoped to the one overlay whose scenarios need it and is not a
+/// change to the reference deployment.
+///
+/// All three nodes, not one, and that is the point rather than a convenience:
+/// C20's barrier and C22's post-restart checks both assert on **every** node's
+/// own applied state, which is the only way "the fleet converged" differs from
+/// "the node we wrote through converged".
+pub const SOURCES_CLUSTER_HOST_PORTS: [u16; 3] = [14790, 24790, 34790];
+
+/// The counting origin's admin API, as `sources.overlay.yml` publishes it.
+///
+/// The origin is a fourth `rift-ee-server`, run **un-clustered**, whose imposter
+/// serves the very config documents the fleet fetches. Its Mountebank-compatible
+/// admin API therefore hands the harness an exact fetch counter for free:
+/// `GET /imposters/:port` reports `numberOfRequests`. That is what turns
+/// "fetched once fleet-wide" into an equality against a first-class API value
+/// instead of a log scrape — and it is why the origin is another rift container
+/// rather than a new image: the chaos tier pins images by digest, and inventing
+/// one for a static-file server would be a new supply-chain surface to serve a
+/// counter this build already publishes.
+pub const SOURCES_ORIGIN_ADMIN_PORT: u16 = 46525;
+
+/// Every host port `sources.overlay.yml` publishes, as one list — what
+/// [`published_host_ports`] extends itself with.
+///
+/// Derived from the two constants above rather than written out again, for the
+/// reason `published_host_ports` gives: a port list maintained in two places is
+/// a port list that will disagree with itself.
+///
+/// **34790 and 46525 are inside** Linux's ephemeral source-port range
+/// (32768-60999), so both are reserved by the `ip_local_reserved_ports` step
+/// `ci.yml` and `nightly-chaos.yml` run;
+/// `ci_reserves_every_published_port_that_linux_could_hand_out` fails the build
+/// if that is ever forgotten. 14790 and 24790 sit below the range and need
+/// nothing.
+pub const SOURCES_HOST_PORTS: [u16; 4] = [
+    SOURCES_CLUSTER_HOST_PORTS[0],
+    SOURCES_CLUSTER_HOST_PORTS[1],
+    SOURCES_CLUSTER_HOST_PORTS[2],
+    SOURCES_ORIGIN_ADMIN_PORT,
+];
+
+/// The imposter port the counting origin serves its config documents on.
+///
+/// Clear of every other scenario's range (C17/C18 own 6500-6512), because a
+/// shared data port would couple two scenarios through the one thing this
+/// scenario counts.
+pub const SOURCES_ORIGIN_IMPOSTER_PORT: u16 = 6600;
+
+/// The origin as the *fleet* reaches it — a container-network name, resolved by
+/// Docker's embedded DNS, never a host address. A source URI is replicated
+/// state: every node has to be able to fetch it, so it cannot name anything
+/// that is only meaningful from the harness's side of the network.
+pub const SOURCES_ORIGIN_BASE_URL: &str = "http://source-origin:6600";
+
+/// The cluster secret `deploy/compose/docker-compose.yml` sets on every node.
+///
+/// Inline here for the same reason it is inline there: this is the local
+/// development topology, and the harness has to present the same credential the
+/// nodes verify against. A real deployment injects it from a secret store.
+const CLUSTER_SECRET: &str = "local-development-cluster-secret";
 
 /// Append a stub to an existing imposter — a `PatchStubs` `ControlOp`, i.e. a
 /// config write like any other, not a whole-imposter replacement.
@@ -1139,6 +1210,316 @@ pub async fn backend_failing_health_check(ip: &str) -> anyhow::Result<bool> {
         }
     }
     Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// The cluster port, as an operator reaches it (C20-C23)
+// ---------------------------------------------------------------------------
+
+/// A client for the **cluster port**, signed with the cluster credential.
+///
+/// Every other helper in this module talks plain HTTP, because every other
+/// surface it drives is plain HTTP. The cluster port is not: it is
+/// HMAC-authenticated per request (`x-rift-cluster-auth`, RFC-001 §11.2) with a
+/// length-prefixed canonical form over method, path and body, and it negotiates
+/// a protocol version. So this one helper reaches for `rift_cluster`'s own
+/// `RpcClient` rather than hand-rolling that framing here — a second
+/// implementation of a security-critical wire format is not a thing to keep in
+/// a test harness, and the shipped client is exactly what an operator's tooling
+/// would use.
+///
+/// **`max_retries: 0` is load-bearing, not tidiness.** The default client
+/// retries transient failures three times, and a retried `POST
+/// /admin/sources/:id/pull` fetches the source again — which would quietly turn
+/// C20's `== 1` counter equality into whatever the transport happened to do.
+/// A pull that times out must surface as a failure the scenario reports, never
+/// as a second fetch nobody asked for.
+///
+/// The timeout is likewise raised well above the 2s default: a pull does a real
+/// network fetch and then a Raft round trip, and 2s would make a healthy fleet
+/// look broken.
+fn cluster_client() -> rift_cluster::rpc::RpcClient {
+    rift_cluster::rpc::RpcClient::new(
+        Some(rift_cluster::rpc::Signer::new(CLUSTER_SECRET)),
+        std::sync::Arc::new(rift_cluster::rpc::AlwaysHealthy),
+        rift_cluster::rpc::RpcClientConfig {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            max_retries: 0,
+        },
+    )
+}
+
+/// Call a cluster-port endpoint on one node, returning `(status, body)`.
+///
+/// Forensic by construction, like [`put_imposter_config`]: a refusal on this
+/// surface carries its reason in a typed error envelope, and a bare status
+/// would make "this source declares an intercept block" indistinguishable from
+/// "unknown source". A failure is rendered as its HTTP status plus the message,
+/// so an assertion that trips prints what the node actually said.
+///
+/// # Errors
+/// Only if the host port cannot be parsed as an address — every transport and
+/// handler failure is reported through the returned status instead, so a
+/// scenario asserts on it rather than unwrapping past it.
+pub async fn cluster_api(
+    host_port: u16,
+    method: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<(u16, serde_json::Value)> {
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{host_port}")
+        .parse()
+        .context("cluster-port address")?;
+    let payload = if body.is_null() {
+        Vec::new()
+    } else {
+        serde_json::to_vec(body).context("encode cluster-port request body")?
+    };
+    match cluster_client().call(addr, method, path, payload).await {
+        Ok(raw) => {
+            // A 2xx whose body is not JSON is itself a finding, so it surfaces
+            // as null rather than as an error that would mask the status.
+            let parsed = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+            Ok((200, parsed))
+        }
+        Err(e) => Ok((
+            e.status(),
+            serde_json::json!({ "error": e.reason(), "message": e.to_string() }),
+        )),
+    }
+}
+
+/// Poll until a node's cluster port answers `GET /admin/sources`.
+///
+/// Readiness on the probe port says the *node* is up; it says nothing about
+/// whether the source puller has been bound to it yet, and an unbound puller
+/// answers "cluster node is not available yet". Polling here means a scenario's
+/// first source call is not racing composition order.
+pub async fn wait_sources_reachable(host_port: u16, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let attempt =
+            match cluster_api(host_port, "GET", "/admin/sources", &serde_json::Value::Null).await {
+                Ok((200, _)) => return Ok(()),
+                Ok((status, body)) => format!("status {status}: {body}"),
+                Err(e) => e.to_string(),
+            };
+        if Instant::now() >= deadline {
+            bail!("cluster port :{host_port} never served /admin/sources ({attempt})");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Declare a source on one node, returning `(status, body)`.
+pub async fn declare_source(
+    host_port: u16,
+    source: &serde_json::Value,
+) -> anyhow::Result<(u16, serde_json::Value)> {
+    cluster_api(host_port, "POST", "/admin/sources", source).await
+}
+
+/// `POST /admin/sources/:id/pull` on one node, returning `(status, body)`.
+pub async fn pull_source(host_port: u16, id: &str) -> anyhow::Result<(u16, serde_json::Value)> {
+    cluster_api(
+        host_port,
+        "POST",
+        &format!("/admin/sources/{id}/pull"),
+        &serde_json::Value::Null,
+    )
+    .await
+}
+
+/// `GET /admin/sources/:id` on one node, returning `(status, body)`.
+pub async fn read_source(host_port: u16, id: &str) -> anyhow::Result<(u16, serde_json::Value)> {
+    cluster_api(
+        host_port,
+        "GET",
+        &format!("/admin/sources/{id}"),
+        &serde_json::Value::Null,
+    )
+    .await
+}
+
+/// `GET /_cluster/config` on one node — the ports it has a committed config
+/// for, and the source provenance stamped on each. Returns `(status, body)`.
+pub async fn cluster_config(host_port: u16) -> anyhow::Result<(u16, serde_json::Value)> {
+    cluster_api(
+        host_port,
+        "GET",
+        "/_cluster/config",
+        &serde_json::Value::Null,
+    )
+    .await
+}
+
+/// `GET /_cluster/imposters` on one node — every port it has a committed config
+/// for, with the config body. Returns `(status, body)`.
+///
+/// The only way to read what the fleet actually *holds* for a port when the
+/// overlay publishes no imposter data port. C23 needs it: "the pull overwrote
+/// the hand edit" is a claim about committed content, and the admin API's
+/// `/imposters` listing answers with what this node's engine has bound, which
+/// is a different question.
+pub async fn cluster_imposters(host_port: u16) -> anyhow::Result<(u16, serde_json::Value)> {
+    cluster_api(
+        host_port,
+        "GET",
+        "/_cluster/imposters",
+        &serde_json::Value::Null,
+    )
+    .await
+}
+
+/// The committed config body for `port`, from a `/_cluster/imposters` body.
+#[must_use]
+pub fn committed_config(imposters: &serde_json::Value, port: u16) -> Option<serde_json::Value> {
+    imposters["imposters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["port"].as_u64() == Some(u64::from(port)))
+        .map(|entry| entry["config"].clone())
+}
+
+/// The source id and version stamped on `port`, from a `/_cluster/config` body.
+///
+/// `None` when that node holds no config for the port at all, which a caller
+/// must be able to tell apart from "holds it, unstamped" — a hand-written
+/// imposter has no provenance and that is not the same finding.
+#[must_use]
+pub fn provenance_of(config: &serde_json::Value, port: u16) -> Option<(String, Option<String>)> {
+    config["provenance"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["port"].as_u64() == Some(u64::from(port)))
+        .map(|entry| {
+            (
+                entry["sourceId"].as_str().unwrap_or_default().to_owned(),
+                entry["version"].as_str().map(str::to_owned),
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
+// The counting origin (C20-C23)
+// ---------------------------------------------------------------------------
+
+/// Publish a set of `(path, document)` pairs on the origin, creating its
+/// imposter. Returns `(status, body)`.
+///
+/// One imposter with a stub per path rather than one imposter per document: the
+/// request counter is per imposter, and C20's whole assertion is a count, so
+/// keeping every document behind one counter is what makes "the fleet fetched
+/// exactly once" a single number rather than a sum a scenario could get wrong.
+///
+/// The document is serialised into the response body as a **string**. A JSON
+/// object would be re-encoded by the origin on its way out, and this body is
+/// then hashed by the fetching node into the digest the no-change short circuit
+/// compares — so it has to be exactly the bytes the scenario intended.
+pub async fn origin_publish(
+    documents: &[(&str, serde_json::Value)],
+) -> anyhow::Result<(u16, String)> {
+    let config = serde_json::json!({
+        "port": SOURCES_ORIGIN_IMPOSTER_PORT,
+        "protocol": "http",
+        "name": "source-origin",
+        "stubs": origin_stubs(documents)?,
+    });
+    put_imposter_config(SOURCES_ORIGIN_ADMIN_PORT, &config).await
+}
+
+/// Replace what the origin serves, **without** replacing the imposter.
+///
+/// `PUT /imposters/:port/stubs` rather than a delete-and-recreate, deliberately:
+/// recreating the imposter would reset `numberOfRequests`, and a scenario that
+/// changes the document mid-run (C21's content change, C23's second pull) still
+/// needs the counter to be continuous across that change.
+pub async fn origin_republish(
+    documents: &[(&str, serde_json::Value)],
+) -> anyhow::Result<(u16, String)> {
+    let stubs = origin_stubs(documents)?;
+    let response = reqwest::Client::new()
+        .put(format!(
+            "http://127.0.0.1:{SOURCES_ORIGIN_ADMIN_PORT}/imposters/{SOURCES_ORIGIN_IMPOSTER_PORT}/stubs"
+        ))
+        .timeout(Duration::from_secs(15))
+        .json(&serde_json::json!({ "stubs": stubs }))
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    Ok((status, body))
+}
+
+/// One path-predicated stub per document.
+fn origin_stubs(documents: &[(&str, serde_json::Value)]) -> anyhow::Result<serde_json::Value> {
+    let mut stubs = Vec::with_capacity(documents.len());
+    for (path, document) in documents {
+        let encoded = serde_json::to_string(document).context("encode a source document")?;
+        stubs.push(serde_json::json!({
+            "predicates": [{ "equals": { "path": path } }],
+            "responses": [{ "is": {
+                "statusCode": 200,
+                // No `ETag`, and that is the point: upstream's `HttpSource`
+                // sends `If-None-Match` whenever it has one cached, and a 304
+                // would let a node answer from its own cache instead of
+                // reaching the origin — which is precisely the request C20
+                // counts.
+                "headers": { "Content-Type": "application/json" },
+                "body": encoded,
+            } }]
+        }));
+    }
+    Ok(serde_json::Value::Array(stubs))
+}
+
+/// How many requests the origin's document imposter has served, ever.
+///
+/// The count is maintained whether or not request *recording* is on (upstream's
+/// `note_request_counts_even_when_recording_off`), so nothing here depends on a
+/// journal being configured. Scenarios assert on the **delta** across an action
+/// rather than on the absolute value: that is immune both to whatever a stack
+/// did before the measurement and to whether
+/// `DELETE /imposters/:port/savedRequests` (which does reset it) was reached.
+pub async fn origin_request_count() -> anyhow::Result<u64> {
+    let (status, body) = get_json(
+        SOURCES_ORIGIN_ADMIN_PORT,
+        &format!("/imposters/{SOURCES_ORIGIN_IMPOSTER_PORT}"),
+    )
+    .await?;
+    if status != 200 {
+        bail!("origin admin answered {status} for its document imposter: {body}");
+    }
+    body["numberOfRequests"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("origin reported no numberOfRequests: {body}"))
+}
+
+/// Poll until the origin's admin API answers, so a scenario's first publish is
+/// not racing a container that is still starting.
+pub async fn wait_origin_ready(timeout: Duration) -> anyhow::Result<()> {
+    wait_admin_reachable(SOURCES_ORIGIN_ADMIN_PORT, timeout).await
+}
+
+/// A source document declaring one imposter that answers every request with
+/// `body` — the smallest thing whose content is visible fleet-wide.
+#[must_use]
+pub fn source_document(ports_and_bodies: &[(u16, &str)]) -> serde_json::Value {
+    let imposters: Vec<serde_json::Value> = ports_and_bodies
+        .iter()
+        .map(|(port, body)| {
+            serde_json::json!({
+                "port": port,
+                "protocol": "http",
+                "name": body,
+                "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": body } }] }],
+            })
+        })
+        .collect();
+    serde_json::json!({ "imposters": imposters })
 }
 
 /// Wait until `node` reports the effective voter set has reached `expected`.

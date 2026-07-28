@@ -1,0 +1,24 @@
+{
+  "//": "The config server the sources demo fetches from. One un-clustered rift node whose imposter serves a config DOCUMENT as its response body -- so 'the mocks live somewhere else' needs no second image, and changing what the fleet should be serving is one admin-API call away (see deploy/README.md, 'Imposter sources demo').",
+  "imposters": [
+    {
+      "port": 6600,
+      "protocol": "http",
+      "name": "config-server",
+      "stubs": [
+        {
+          "predicates": [{ "equals": { "path": "/imposters.json" } }],
+          "responses": [
+            {
+              "is": {
+                "statusCode": 200,
+                "headers": { "Content-Type": "application/json" },
+                "body": "{\"imposters\":[{\"port\":7001,\"protocol\":\"http\",\"name\":\"payments\",\"stubs\":[{\"responses\":[{\"is\":{\"statusCode\":200,\"body\":\"payments v1\\n\"}}]}]}]}"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

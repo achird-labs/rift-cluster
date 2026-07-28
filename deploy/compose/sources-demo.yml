@@ -1,0 +1,184 @@
+# The imposter-sources demo (issue #137 / #20): mocks that live somewhere else.
+#
+#     docker compose -f deploy/compose/sources-demo.yml up --build
+#
+# See ../README.md's "Imposter sources demo" section for the walkthrough and
+# expected output.
+#
+# The shape it exists to show is the one a Mimeo-style deployment already has:
+# **one environment variable** names where the mocks come from, every node in
+# the fleet ends up serving them, and rolling the fleet onto new content later
+# is **one call**, not a redeploy.
+#
+#     RIFT_IMPOSTERS=http://source-origin:6600/imposters.json,file:/seed/local.json
+#
+# Two schemes in one list, deliberately: some mocks come from a config server
+# the whole organisation shares, some are baked in beside the app. Under
+# `--cluster` the flag is sugar for declaring pinned sources, so both go through
+# the replicated log and reach every node — rather than being created in the
+# receiving node's own manager, outside the log, where the reconciler would
+# delete them again.
+#
+# ## Why there are four containers
+#
+# `source-origin` is the config server: a fourth `rift-ee-server`, run
+# **un-clustered**, whose imposter's response body *is* the config document the
+# fleet fetches (`sources-demo.origin.json`). Using rift for it means the demo
+# needs no second image, and — the part that makes the demo work — changing what
+# the fleet *should* be serving is one ordinary admin-API call against that
+# container, with no restart and no volume edit.
+#
+# Un-clustered is not incidental: it must be a plain HTTP host the fleet fetches
+# *from*, entirely outside the replicated log. A fourth voter would change the
+# quorum arithmetic and make it a four-node cluster demo instead.
+#
+# Its healthcheck targets the admin API rather than `/readyz`: the probe
+# listener is bound by the clustered composition only, so an un-clustered node
+# has no 2526 to answer.
+#
+# ## Why the nodes wait for it
+#
+# `--imposters` fails the start when a source cannot be fetched — an operator
+# who passed it asked for those imposters to be serving, and a node that comes
+# up healthy without them is the silent half-configured fleet the flag exists to
+# avoid. So the nodes depend on the origin being *healthy*, not merely started.
+#
+# ## Ports
+#
+# Its own project name, subnet and host ports, so it can run beside the 3-node
+# development cluster in this directory without either stack fighting the other
+# for a port. Everything here is below 32768 and so cannot collide with Linux's
+# ephemeral source-port range (see the chaos tier's note on issue #117).
+#
+# 15790 is rift-1's **cluster port**: `/admin/sources*` rides it rather than the
+# admin API, because a source is a control-plane object authenticated with the
+# cluster credential. It is published here so the demo's one pull can be made
+# from the host; the reference deployment in `docker-compose.yml` deliberately
+# does not publish it.
+
+name: rift-sources-demo
+
+networks:
+  rift:
+    ipam:
+      config:
+        - subnet: 172.28.9.0/24
+
+x-node: &node
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+    args:
+      RIFT_UPSTREAM_VERSION: "${RIFT_UPSTREAM_VERSION:-}"
+  environment: &node-env
+    RIFT_CLUSTER: "true"
+    RIFT_CLUSTER_SECRET: "local-development-cluster-secret"
+    RIFT_CLUSTER_PROBE_BIND: "0.0.0.0:2526"
+    RIFT_CLUSTER_LEAVE_TIMEOUT: "5"
+    RIFT_CLUSTER_STATE_DIR: "/var/lib/rift/_cluster"
+    MB_DATADIR: "/var/lib/rift/data"
+    RIFT_CLUSTER_BIND: "0.0.0.0:4790"
+    RIFT_CLUSTER_BIND_PUBLIC_OK: "true"
+    # The whole demo, in one variable.
+    RIFT_IMPOSTERS: "http://source-origin:6600/imposters.json,file:/seed/local.json"
+  volumes:
+    - ./sources-demo.seed.json:/seed/local.json:ro
+  stop_grace_period: 15s
+  restart: unless-stopped
+  healthcheck: &probe
+    test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 10s
+
+services:
+  source-origin:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      args:
+        RIFT_UPSTREAM_VERSION: "${RIFT_UPSTREAM_VERSION:-}"
+    container_name: sources-demo-origin
+    hostname: source-origin
+    environment:
+      MB_CONFIGFILE: "/var/lib/rift/origin.json"
+    volumes:
+      - ./sources-demo.origin.json:/var/lib/rift/origin.json:ro
+    networks:
+      rift:
+        ipv4_address: 172.28.9.20
+    ports:
+      - "16525:2525"   # admin API -- where the served document is changed
+    healthcheck:
+      test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2525/imposters"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  rift-1:
+    <<: *node
+    container_name: sources-demo-1
+    hostname: rift-1
+    networks:
+      rift:
+        ipv4_address: 172.28.9.11
+    environment:
+      <<: *node-env
+      RIFT_CLUSTER_ADVERTISE: "172.28.9.11:4790"
+      RIFT_CLUSTER_NODE_NAME: "rift-1"
+      RIFT_CLUSTER_ALLOW_SOLO: "true"
+    ports:
+      - "15525:2525"   # admin API
+      - "15526:2526"   # probes
+      - "15790:4790"   # cluster port -- /admin/sources* lives here
+      - "17001:7001"   # the config server's imposter
+      - "17002:7002"   # the file-seeded imposter
+    depends_on:
+      source-origin:
+        condition: service_healthy
+
+  rift-2:
+    <<: *node
+    container_name: sources-demo-2
+    hostname: rift-2
+    networks:
+      rift:
+        ipv4_address: 172.28.9.12
+    environment:
+      <<: *node-env
+      RIFT_CLUSTER_ADVERTISE: "172.28.9.12:4790"
+      RIFT_CLUSTER_NODE_NAME: "rift-2"
+      RIFT_CLUSTER_SEEDS: "172.28.9.11:4790"
+    ports:
+      - "25525:2525"
+      - "27001:7001"
+      - "27002:7002"
+    depends_on:
+      source-origin:
+        condition: service_healthy
+      rift-1:
+        condition: service_started
+
+  rift-3:
+    <<: *node
+    container_name: sources-demo-3
+    hostname: rift-3
+    networks:
+      rift:
+        ipv4_address: 172.28.9.13
+    environment:
+      <<: *node-env
+      RIFT_CLUSTER_ADVERTISE: "172.28.9.13:4790"
+      RIFT_CLUSTER_NODE_NAME: "rift-3"
+      RIFT_CLUSTER_SEEDS: "172.28.9.11:4790"
+    ports:
+      - "35525:2525"
+      - "37001:7001"
+      - "37002:7002"
+    depends_on:
+      source-origin:
+        condition: service_healthy
+      rift-1:
+        condition: service_started

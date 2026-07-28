@@ -1,12 +1,13 @@
 # Deploying Rift Enterprise
 
-Four artifacts, in increasing order of how much they promise:
+Five artifacts, in increasing order of how much they promise:
 
 | Path | What it is | Verified how |
 |---|---|---|
 | `Dockerfile` | The `rift-ee-server` image | Built and run by `compose/verify.sh` |
 | `compose/docker-compose.yml` | A real 3-node cluster for local work | Stood up and asserted by `compose/verify.sh` |
 | `compose/front-door-demo.yml` | The "no nginx" front-door demo (one node, two virtual services) | Stood up by hand — see below |
+| `compose/sources-demo.yml` | The imposter-sources demo (three nodes + a config server) | Stood up by hand — see below; the properties it shows are asserted by chaos scenarios C20–C23 |
 | `k8s/statefulset.yaml` | A production-shaped StatefulSet | Schema only (`kubeconform -strict`) — see the caveat below |
 
 ## Quick start
@@ -72,6 +73,119 @@ Tear it down the same way as the cluster demo:
 
 ```sh
 docker compose -f deploy/compose/front-door-demo.yml down -v
+```
+
+## Imposter sources demo
+
+Mocks that live somewhere else. `compose/sources-demo.yml` is the smallest thing
+that shows the shape a Mimeo-style deployment already has: **one environment
+variable** says where the mocks come from, every node in the fleet serves them,
+and rolling the fleet onto new content later is **one call** rather than a
+redeploy.
+
+```yaml
+RIFT_IMPOSTERS: "http://source-origin:6600/imposters.json,file:/seed/local.json"
+```
+
+Two schemes in one list on purpose — some mocks come from a config server the
+whole organisation shares, some are baked in beside the app. Under `--cluster`
+the flag is sugar for declaring **pinned sources**, so both go through the
+replicated log and reach every node.
+
+`source-origin` is the config server: a fourth `rift-ee-server`, run
+un-clustered, whose imposter's response body *is* the config document. That is
+why the demo needs no second image — and it is what makes the second half work,
+since changing what the fleet should be serving becomes an ordinary admin-API
+call rather than a volume edit and a restart.
+
+```sh
+docker compose -f deploy/compose/sources-demo.yml up --build
+```
+
+Once all three report ready, every node serves both sources' imposters:
+
+```sh
+$ curl -s localhost:17001/ ; curl -s localhost:27001/ ; curl -s localhost:37001/
+payments v1
+payments v1
+payments v1
+
+$ curl -s localhost:27002/
+local seed
+```
+
+### Rolling the fleet with one call
+
+The `/admin/sources*` endpoints ride the **cluster port**, not the admin API: a
+source is a control-plane object authenticated with the cluster credential
+(`--cluster-secret`), so plain `curl` cannot reach them — every request carries
+an HMAC over its method, path and body. `cluster-curl` is the one-file client
+for exactly that, and it lives in the crate that defines the format so the two
+cannot drift:
+
+```sh
+$ cargo run -q -p rift-cluster --example cluster-curl -- \
+    --secret local-development-cluster-secret \
+    GET http://127.0.0.1:15790/admin/sources
+```
+
+Each source is named by an id derived from its URI, so it is stable across
+restarts and identical on every node. For the HTTP source above that is
+`http-source-origin-6600-imposters-json-7d18d4d6`.
+
+Now change what the config server serves — an ordinary admin write against the
+origin, no restart:
+
+```sh
+$ curl -s -X PUT localhost:16525/imposters/6600/stubs \
+    -H 'Content-Type: application/json' \
+    -d '{"stubs":[{"predicates":[{"equals":{"path":"/imposters.json"}}],
+         "responses":[{"is":{"statusCode":200,
+           "body":"{\"imposters\":[{\"port\":7001,\"protocol\":\"http\",\"name\":\"payments\",\"stubs\":[{\"responses\":[{\"is\":{\"statusCode\":200,\"body\":\"payments v2\\n\"}}]}]}]}"
+         }}]}]}' > /dev/null
+```
+
+Nothing has changed in the fleet yet — a `pinned` source is pulled when you ask,
+never on a timer. One call does it:
+
+```sh
+$ cargo run -q -p rift-cluster --example cluster-curl -- \
+    --secret local-development-cluster-secret \
+    POST http://127.0.0.1:15790/admin/sources/http-source-origin-6600-imposters-json-7d18d4d6/pull
+{"revision":16,"digest":"61079cc5…","unchanged":false,"skipped":false,"changed":[7001]}
+```
+
+And every node has it — including the two that never received the call:
+
+```sh
+$ curl -s localhost:17001/ ; curl -s localhost:27001/ ; curl -s localhost:37001/
+payments v2
+payments v2
+payments v2
+```
+
+The fleet fetched the document **once**, on the node that took the call; the
+other two applied the bytes it submitted, because a fetch never happens in the
+apply path. That is the property container scenario
+`c20_source_pull_converges_and_fetches_once` asserts as an equality against the
+config server's own request counter, rather than leaving it as a claim in prose.
+
+(Boot is the one place three fetches are expected and correct: `--imposters` is
+per node, so each one independently declares the same sources — by an id derived
+from the URI, hence identical — and pulls them. The second and third pulls hit
+the digest short circuit and write nothing. Fetch-once is a property of *a
+pull*, not of a fleet's lifetime.)
+
+A second pull with nothing changed writes no log entry at all and answers
+`"unchanged": true` — which is what makes a `tracking` source (re-fetched on
+`pollSecs`, by the **leader only**) affordable at a 30-second cadence. See
+`docs/rift-ee-server.md`'s "Imposter sources" section for the full surface:
+tracking mode, drift, `onDrift`, provenance, and the credentialed providers.
+
+Tear it down the same way as the other demos:
+
+```sh
+docker compose -f deploy/compose/sources-demo.yml down -v
 ```
 
 ## The rule these manifests exist to encode
