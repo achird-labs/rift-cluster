@@ -14,6 +14,14 @@
 //! * `sm_routes`     — `(tenant, route id) -> Route` (JSON): the front door's
 //!   replicated route table (issue #131). Read as a whole per tenant to
 //!   recompile a [`CompiledRoutes`] after every mutating op.
+//! * `sm_tenants`    — `tenant id -> Tenant` (JSON): tenant records, including
+//!   deleted tombstones (issue #159, RFC-002 §10 slice T1).
+//! * `sm_principals` — `principal id -> Principal` (JSON): fleet-wide identities,
+//!   not tenant-scoped — a principal exists once and is bound to tenants via
+//!   `sm_bindings` (issue #159).
+//! * `sm_bindings`   — `(principal id, tenant) -> Role` (JSON): principal-major,
+//!   deliberately not tenant-major — see its `TableDefinition`'s doc comment
+//!   for why the key order is load-bearing (issue #159).
 //! * `sm_op_dedup`   — `op_id -> DedupEntry` (JSON): the response recorded for an
 //!   applied op, kept for [`DEDUP_TTL_SECS`] so a replayed intent (crash-replay,
 //!   client retry with the same `Idempotency-Key`) is exactly-once-in-effect.
@@ -68,9 +76,15 @@ use serde::{Deserialize, Serialize};
 
 use super::TypeConfig;
 use crate::control::{
-    self, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest, OnDrift, SourceMode,
-    SourceProvenance, StubEdit, StubEditScript,
+    self, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest, FLEET_SCOPE, OnDrift,
+    SourceMode, SourceProvenance, StubEdit, StubEditScript, Tenant,
 };
+// Only the test-only row readers below (`test_principal_row`, `test_binding`)
+// name these types outside `mod tests`; production `mutate_tables` never
+// spells them (it only destructures `ControlOp` variant fields), so they are
+// unused in a non-test build without this gate.
+#[cfg(test)]
+use crate::control::{Principal, Role};
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
 
@@ -88,6 +102,26 @@ const SM_ROUTES_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::ne
 /// control-plane objects (issue #134). One row per source, like `sm_routes` —
 /// a delete is a single-key removal rather than a read-modify-write of a set.
 const SM_SOURCES_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_sources");
+/// `tenant id -> Tenant` (JSON): tenant records, including deleted tombstones
+/// (issue #159, RFC-002 §10 slice T1). See [`Tenant::deleted`]'s doc for why a
+/// delete leaves the row behind instead of removing it.
+const SM_TENANTS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_tenants");
+/// `principal id -> Principal` (JSON). Fleet-wide, not tenant-scoped: a
+/// principal is one identity that may be bound to many tenants, so unlike
+/// `sm_configs`/`sm_routes`/`sm_sources` this key carries no tenant component
+/// at all.
+const SM_PRINCIPALS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_principals");
+/// `(principal id, tenant) -> Role` (JSON): a principal's binding to one
+/// tenant (issue #159).
+///
+/// Principal-major, **not** tenant-major, and that ordering is load-bearing.
+/// The hot path is per-request: authenticate a principal, then resolve *that
+/// principal's* bindings — a redb prefix range under `(principal_id, ..)`, one
+/// seek. "Which principals are bound to tenant X" is an admin listing, not a
+/// per-request check, and it pays a full-table scan under this key order —
+/// that trade is deliberate. Keying tenant-major would flip the cost onto
+/// every authorized request instead of onto an occasional admin query.
+const SM_BINDINGS_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_bindings");
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
 /// Node-local durable intents (issue #9 R4): ops this node accepted but has
@@ -281,6 +315,19 @@ struct SnapshotPayload {
     /// none.
     #[serde(default)]
     sources: Vec<(String, String, String)>,
+    /// `(tenant id, Tenant JSON)` rows of `sm_tenants` (issue #159). Defaulted
+    /// for the same reason `routes`/`sources` are: a pre-#159 snapshot still
+    /// installs, carrying no tenants — a table omitted here is a table that
+    /// vanishes on the next follower catch-up (#134/#137 already taught this
+    /// crate that lesson once).
+    #[serde(default)]
+    tenants: Vec<(String, String)>,
+    /// `(principal id, Principal JSON)` rows of `sm_principals` (issue #159).
+    #[serde(default)]
+    principals: Vec<(String, String)>,
+    /// `(principal id, tenant, Role JSON)` rows of `sm_bindings` (issue #159).
+    #[serde(default)]
+    bindings: Vec<(String, String, String)>,
     /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
     dedup: Vec<(String, String)>,
     last_applied_log: Option<LogId<u64>>,
@@ -325,6 +372,9 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_CONFIGS_TABLE).map_err(io)?;
         write_txn.open_table(SM_ROUTES_TABLE).map_err(io)?;
         write_txn.open_table(SM_SOURCES_TABLE).map_err(io)?;
+        write_txn.open_table(SM_TENANTS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_PRINCIPALS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_BINDINGS_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
         write_txn.open_table(PENDING_INTENTS_TABLE).map_err(io)?;
@@ -1145,6 +1195,74 @@ impl RedbStateMachine {
         txn.commit().expect("test commit");
     }
 
+    /// Test-only: the raw `sm_configs` row for an arbitrary `(tenant, port)` —
+    /// unlike [`Self::read_config`], which only ever answers for
+    /// [`DEFAULT_TENANT`], this is what issue #159's cross-tenant tests need.
+    #[cfg(test)]
+    fn raw_config_row(&self, tenant: &str, port: u16) -> Option<String> {
+        let txn = self.db.begin_read().expect("test txn");
+        let table = txn.open_table(SM_CONFIGS_TABLE).expect("test table");
+        table
+            .get((tenant, port))
+            .expect("test get")
+            .map(|g| g.value().to_owned())
+    }
+
+    /// Test-only: the raw `sm_routes` row for an arbitrary `(tenant, id)`.
+    #[cfg(test)]
+    fn raw_route_row(&self, tenant: &str, id: &str) -> Option<String> {
+        let txn = self.db.begin_read().expect("test txn");
+        let table = txn.open_table(SM_ROUTES_TABLE).expect("test table");
+        table
+            .get((tenant, id))
+            .expect("test get")
+            .map(|g| g.value().to_owned())
+    }
+
+    /// Test-only: the raw `sm_sources` row for an arbitrary `(tenant, id)`.
+    #[cfg(test)]
+    fn raw_source_row(&self, tenant: &str, id: &str) -> Option<String> {
+        let txn = self.db.begin_read().expect("test txn");
+        let table = txn.open_table(SM_SOURCES_TABLE).expect("test table");
+        table
+            .get((tenant, id))
+            .expect("test get")
+            .map(|g| g.value().to_owned())
+    }
+
+    /// Test-only: the parsed `sm_tenants` row for `id`.
+    #[cfg(test)]
+    fn test_tenant(&self, id: &str) -> Option<Tenant> {
+        let txn = self.db.begin_read().expect("test txn");
+        let table = txn.open_table(SM_TENANTS_TABLE).expect("test table");
+        table
+            .get(id)
+            .expect("test get")
+            .map(|g| serde_json::from_str(g.value()).expect("tenant row parses"))
+    }
+
+    /// Test-only: the parsed `sm_principals` row for `id`.
+    #[cfg(test)]
+    fn test_principal_row(&self, id: &str) -> Option<Principal> {
+        let txn = self.db.begin_read().expect("test txn");
+        let table = txn.open_table(SM_PRINCIPALS_TABLE).expect("test table");
+        table
+            .get(id)
+            .expect("test get")
+            .map(|g| serde_json::from_str(g.value()).expect("principal row parses"))
+    }
+
+    /// Test-only: the parsed `sm_bindings` row for `(principal_id, tenant)`.
+    #[cfg(test)]
+    fn test_binding(&self, principal_id: &str, tenant: &str) -> Option<Role> {
+        let txn = self.db.begin_read().expect("test txn");
+        let table = txn.open_table(SM_BINDINGS_TABLE).expect("test table");
+        table
+            .get((principal_id, tenant))
+            .expect("test get")
+            .map(|g| serde_json::from_str(g.value()).expect("role row parses"))
+    }
+
     /// Remove dedup entries whose TTL has passed relative to `now_secs` — the
     /// replicated logical clock in production, an injected value in tests.
     fn gc_dedup(
@@ -1432,6 +1550,102 @@ impl RedbStateMachine {
         Ok(())
     }
 
+    /// The stored [`Tenant`] record at `id`, or `None` when there is none.
+    ///
+    /// A record that will not parse is treated as `None`, like
+    /// [`Self::stored_source`]: the callers here use it to decide whether a
+    /// tenant exists, and every replica holds the same bad bytes, so refusing
+    /// deterministically (as "unknown tenant") is safe — it can never diverge
+    /// two replicas' apply of the same committed op.
+    #[allow(clippy::result_large_err)]
+    /// `Ok(Ok(None))` is "no such tenant"; `Ok(Err(reason))` is a corrupt row.
+    ///
+    /// The two must not collapse into one answer. A corrupt row is not an
+    /// absent one: the tenant's configs, routes, sources and bindings are all
+    /// still live, so treating it as missing makes `TenantDelete` skip the
+    /// entire cascade and report `Applied` — the operator is told the tenant is
+    /// gone while its imposters keep serving. Surfacing it as a committed
+    /// refusal matches how `check_expected_revision` already treats a record it
+    /// cannot parse, and is deterministic: every replica holds the same bytes.
+    #[allow(clippy::result_large_err)]
+    fn stored_tenant(
+        tenants: &Table<'_, &'static str, &'static str>,
+        id: &str,
+    ) -> StorageResult<Result<Option<Tenant>, String>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let Some(guard) = tenants.get(id).map_err(io)? else {
+            return Ok(Ok(None));
+        };
+        match serde_json::from_str::<Tenant>(guard.value()) {
+            Ok(stored) => Ok(Ok(Some(stored))),
+            Err(e) => {
+                tracing::error!(tenant = id, error = %e, "corrupt stored tenant");
+                Ok(Err(format!(
+                    "stored tenant {id:?} cannot be read: its record is corrupt"
+                )))
+            }
+        }
+    }
+
+    /// `Err` when `tenant` names no live tenant record — used by every op that
+    /// addresses an *existing* tenant rather than creating one
+    /// (`PrincipalPut`, `BindingPut` against an ordinary tenant). A deleted
+    /// tenant reads the same as a missing one: its tombstone (`deleted:
+    /// true`) exists so the id's history survives, not so new state can still
+    /// be attached to it.
+    #[allow(clippy::result_large_err)]
+    fn require_live_tenant(
+        tenants: &Table<'_, &'static str, &'static str>,
+        tenant: &str,
+    ) -> StorageResult<Result<(), String>> {
+        // `default` is live by definition, with or without a stored row.
+        // Nothing ever writes one on a fresh cluster (there is no bootstrap
+        // `TenantPut`), and `validate` refuses to delete it — so requiring a
+        // row here would make `PrincipalPut { tenant: "default" }` fail on
+        // every new cluster until someone thought to create the tenant that
+        // the rest of the code already treats as always-present.
+        if tenant == DEFAULT_TENANT {
+            return Ok(Ok(()));
+        }
+        Ok(match Self::stored_tenant(tenants, tenant)? {
+            // A corrupt row keeps its own reason: "unknown" would send an
+            // operator looking for a tenant that is present but unreadable.
+            Err(reason) => Err(reason),
+            Ok(Some(t)) if !t.deleted => Ok(()),
+            Ok(_) => Err(format!("unknown tenant {tenant:?}")),
+        })
+    }
+
+    /// Whether `port` is already claimed by a tenant other than `tenant`.
+    ///
+    /// Ports are fleet-unique across tenants (RFC-002 §3.2): `sm_configs` is
+    /// keyed `(tenant, port)`, so nothing at the table level stops two
+    /// tenants from claiming the same port, and this full scan is the check
+    /// that stands in for it. Called by `PutImposter` and by
+    /// `SourcePullResult`'s pre-pass — the operator-write and source-pull
+    /// paths must admit exactly the same things, which is the rule
+    /// `validate_replicable_config` exists to keep. A re-write from the
+    /// *same* tenant that already owns the port is an upsert, not a
+    /// collision, and this returns `false` for it.
+    #[allow(clippy::result_large_err)]
+    fn port_claimed_by_another_tenant(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+        tenant: &str,
+        port: u16,
+    ) -> StorageResult<bool> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        for item in configs.iter().map_err(io)? {
+            let (key, _) = item.map_err(io)?;
+            let (owner, p) = key.value();
+            if p == port && owner != tenant {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Mutate `sm_configs` for one validated op and return the engine actions it
     /// implies. `Ok(Err(reason))` is a deterministic domain refusal (recorded as
     /// a `Failed` outcome); `Err(_)` is real storage I/O and fails apply.
@@ -1441,10 +1655,14 @@ impl RedbStateMachine {
     /// after them is fatal to the node — the process-local registry dies with
     /// the process that briefly over-reported.
     #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_arguments)]
     fn mutate_tables(
         configs: &mut Table<'_, (&'static str, u16), &'static str>,
         routes: &mut Table<'_, (&'static str, &'static str), &'static str>,
         sources: &mut Table<'_, (&'static str, &'static str), &'static str>,
+        tenants: &mut Table<'_, &'static str, &'static str>,
+        principals: &mut Table<'_, &'static str, &'static str>,
+        bindings: &mut Table<'_, (&'static str, &'static str), &'static str>,
         op: &ControlOp,
         index: u64,
         issued_at_secs: u64,
@@ -1459,6 +1677,15 @@ impl RedbStateMachine {
                 let Some(port) = config.port else {
                     return Ok(Err("config must carry an explicit port".to_owned()));
                 };
+                // Ports are fleet-unique across tenants (RFC-002 §3.2). The
+                // reason is named as the port only, never the other tenant:
+                // naming it would turn this refusal into a cross-tenant
+                // enumeration oracle (RFC-002 §8.4) — an operator could probe
+                // ports to learn which tenants exist and what they run. Do not
+                // "improve" this message; it is deliberately incomplete.
+                if Self::port_claimed_by_another_tenant(configs, tenant.as_str(), port)? {
+                    return Ok(Err(format!("port {port} is already bound in this fleet")));
+                }
                 // Provenance survives a manual replace: the source still owns
                 // this port, it just no longer holds what the source declares.
                 // Clearing it instead would orphan the port, and the next
@@ -1750,6 +1977,39 @@ impl RedbStateMachine {
                     }
                 }
 
+                // Ports are fleet-unique across tenants (RFC-002 §3.2), and a
+                // pull is no exception: a document fetched into tenant B must
+                // not take a port tenant A already binds. `PutImposter` refuses
+                // this, and `validate_replicable_config` exists precisely so the
+                // operator-write and source-pull paths "cannot drift into
+                // admitting different things" — an unguarded pull would be that
+                // drift, and the quieter half of it, since nobody typed the
+                // port.
+                //
+                // Checked as a **pre-pass over the whole fetched set, before any
+                // mutation**, and that placement is load-bearing: a refusal
+                // returned from inside the apply loop below would still commit
+                // the transaction (`Ok(Err(_))` is a committed `Failed`, not a
+                // rollback), so a late refusal would leave the de-declared-port
+                // removals applied — a half-pull reported as a clean failure.
+                //
+                // Named as the port only, never the owning tenant (RFC-002
+                // §8.4): naming it would make this refusal a cross-tenant
+                // enumeration oracle. Do not "improve" the message.
+                for config in fetched {
+                    // Both refusals live in this pre-pass so the arm below is
+                    // structurally free of late failures, rather than free of
+                    // them only because `validate` happens to run first.
+                    let Some(port) = config.port else {
+                        return Ok(Err(
+                            "pull result carries a config without an explicit port".to_owned()
+                        ));
+                    };
+                    if Self::port_claimed_by_another_tenant(configs, tenant_str, port)? {
+                        return Ok(Err(format!("port {port} is already bound in this fleet")));
+                    }
+                }
+
                 let provenance = SourceProvenance {
                     id: id.clone(),
                     version: version.clone(),
@@ -1763,15 +2023,10 @@ impl RedbStateMachine {
                 }
 
                 for config in fetched {
-                    // `validate` guaranteed the port; a missing one here would
-                    // mean a caller skipped validation, and silently dropping
-                    // the config would apply a document the operator cannot see
-                    // the effect of.
-                    let Some(port) = config.port else {
-                        return Ok(Err(
-                            "pull result carries a config without an explicit port".to_owned()
-                        ));
-                    };
+                    // Both port checks already ran in the pre-pass above, which
+                    // is why this cannot refuse: refusing here, after the
+                    // de-declared-port removals, would commit a half-pull.
+                    let Some(port) = config.port else { continue };
                     let config_json = serde_json::to_string(config)
                         .map_err(|e| StorageIOError::write_state_machine(&e))?;
                     let existing = Self::stored_imposter(configs, tenant_str, port)?;
@@ -1836,12 +2091,142 @@ impl RedbStateMachine {
 
                 Ok(Ok(vec![Self::sync_action(configs)?]))
             }
-            ControlOp::TenantPut { .. }
-            | ControlOp::TenantDelete { .. }
-            | ControlOp::PrincipalPut { .. }
-            | ControlOp::PrincipalDelete { .. }
-            | ControlOp::BindingPut { .. }
-            | ControlOp::BindingDelete { .. } => Ok(Err("reserved op: RFC-002 (#17)".to_owned())),
+            ControlOp::TenantPut {
+                tenant,
+                display_name,
+                quotas,
+            } => {
+                let tenant_str = tenant.as_str();
+                // An upsert preserves `created_at_secs` and clears any
+                // tombstone: recreating a previously-deleted tenant id is
+                // allowed (ids are not permanently burned — only `"default"`
+                // is protected, and `validate` refuses to delete it at all).
+                let created_at_secs = match Self::stored_tenant(tenants, tenant_str)? {
+                    // Refuse rather than silently re-stamp: overwriting an
+                    // unreadable row would destroy the only copy of whatever
+                    // it held and reset the tenant's age to now.
+                    Err(reason) => return Ok(Err(reason)),
+                    Ok(Some(existing)) => existing.created_at_secs,
+                    Ok(None) => issued_at_secs,
+                };
+                let record = Tenant {
+                    id: tenant.clone(),
+                    display_name: display_name.clone(),
+                    quotas: quotas.clone(),
+                    created_at_secs,
+                    deleted: false,
+                };
+                let value = serde_json::to_string(&record)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                tenants.insert(tenant_str, value.as_str()).map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
+            ControlOp::TenantDelete { tenant } => {
+                let tenant_str = tenant.as_str();
+                let mut record = match Self::stored_tenant(tenants, tenant_str)? {
+                    // Corrupt is NOT absent. The tenant's configs, routes,
+                    // sources and bindings are all still live, so answering
+                    // `Applied` here would report a deletion that never
+                    // happened and leave its imposters serving traffic.
+                    Err(reason) => return Ok(Err(reason)),
+                    // Deleting a tenant that was never created is idempotent,
+                    // like every other delete in this match.
+                    Ok(None) => return Ok(Ok(Vec::new())),
+                    Ok(Some(record)) => record,
+                };
+                if record.deleted {
+                    return Ok(Ok(Vec::new()));
+                }
+                // The cascade runs *before* the tombstone write, inside the
+                // same write transaction as everything else here: a tenant
+                // deleted but still holding configs/routes/sources would be
+                // resources no principal can administer (nothing can bind to
+                // a deleted tenant) — a single committed op is what keeps
+                // "tombstoned" and "cleaned up" from ever being observed
+                // apart, on any replica.
+                configs.retain(|(t, _), _| t != tenant_str).map_err(io)?;
+                routes.retain(|(t, _), _| t != tenant_str).map_err(io)?;
+                sources.retain(|(t, _), _| t != tenant_str).map_err(io)?;
+                // Bindings cascade too, and this one is a security property
+                // rather than tidiness. A tombstoned id may be recreated (the
+                // tombstone records that it existed, it does not reserve it),
+                // plausibly by a different operator for a different customer.
+                // Bindings left behind would make every one of the old
+                // tenant's principals live again the moment the name is
+                // reused — privilege resurrection across an ownership change,
+                // and unfixable afterwards because the rows are already
+                // committed to the log.
+                bindings.retain(|(_, t), _| t != tenant_str).map_err(io)?;
+                record.deleted = true;
+                let value = serde_json::to_string(&record)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                tenants.insert(tenant_str, value.as_str()).map_err(io)?;
+                Ok(Ok(vec![
+                    Self::sync_action(configs)?,
+                    Self::sync_routes_action(routes)?,
+                ]))
+            }
+            ControlOp::PrincipalPut { tenant, principal } => {
+                if let Err(reason) = Self::require_live_tenant(tenants, tenant.as_str())? {
+                    return Ok(Err(reason));
+                }
+                let value = serde_json::to_string(principal)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                principals
+                    .insert(principal.id.as_str(), value.as_str())
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
+            // `tenant` addresses no stored record here — `sm_principals` is
+            // fleet-wide, keyed by principal id alone (see its
+            // `TableDefinition`'s doc) — so, like every other delete in this
+            // match, removing an absent principal is idempotent.
+            ControlOp::PrincipalDelete {
+                tenant: _,
+                principal_id,
+            } => {
+                principals.remove(principal_id.as_str()).map_err(io)?;
+                // The principal's bindings go with it. A principal id can be
+                // an external value — an OIDC `subject`, an mTLS SAN — and
+                // identity providers do recycle those, so orphaned bindings
+                // would hand a *different* human every role the previous
+                // holder of the name had, the moment the id is re-created.
+                // This is the read the principal-major key order exists for:
+                // a prefix range under `(principal_id, ..)` rather than a scan.
+                bindings
+                    .retain(|(p, _), _| p != principal_id.as_str())
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
+            ControlOp::BindingPut {
+                tenant,
+                principal_id,
+                role,
+            } => {
+                // The fleet scope is never a stored tenant row (`validate`
+                // already limited it to `Role::FleetAdmin` bindings only), so
+                // there is nothing to look up for it.
+                if tenant.as_str() != FLEET_SCOPE
+                    && let Err(reason) = Self::require_live_tenant(tenants, tenant.as_str())?
+                {
+                    return Ok(Err(reason));
+                }
+                let value = serde_json::to_string(role)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                bindings
+                    .insert((principal_id.as_str(), tenant.as_str()), value.as_str())
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
+            ControlOp::BindingDelete {
+                tenant,
+                principal_id,
+            } => {
+                bindings
+                    .remove((principal_id.as_str(), tenant.as_str()))
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
         }
     }
 
@@ -1983,7 +2368,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
     async fn build_snapshot(&mut self) -> StorageResult<Snapshot<TypeConfig>> {
         let applied = self.read_applied()?;
 
-        let (configs, routes, sources, dedup) = {
+        let (configs, routes, sources, tenants, principals, bindings, dedup) = {
             let read_txn = self
                 .db
                 .begin_read()
@@ -2024,6 +2409,44 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 let (tenant, id) = key.value();
                 sources.push((tenant.to_owned(), id.to_owned(), value.value().to_owned()));
             }
+            let tenants_table = read_txn
+                .open_table(SM_TENANTS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut tenants = Vec::new();
+            for item in tenants_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                tenants.push((key.value().to_owned(), value.value().to_owned()));
+            }
+            let principals_table = read_txn
+                .open_table(SM_PRINCIPALS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut principals = Vec::new();
+            for item in principals_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                principals.push((key.value().to_owned(), value.value().to_owned()));
+            }
+            let bindings_table = read_txn
+                .open_table(SM_BINDINGS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut bindings = Vec::new();
+            for item in bindings_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (principal_id, tenant) = key.value();
+                bindings.push((
+                    principal_id.to_owned(),
+                    tenant.to_owned(),
+                    value.value().to_owned(),
+                ));
+            }
             let dedup_table = read_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -2035,13 +2458,18 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
                 dedup.push((key.value().to_owned(), value.value().to_owned()));
             }
-            (configs, routes, sources, dedup)
+            (
+                configs, routes, sources, tenants, principals, bindings, dedup,
+            )
         };
 
         let payload = SnapshotPayload {
             configs,
             routes,
             sources,
+            tenants,
+            principals,
+            bindings,
             dedup,
             last_applied_log: applied.last_applied_log,
             last_membership: applied.last_membership.clone(),
@@ -2127,6 +2555,15 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut sources = write_txn
                 .open_table(SM_SOURCES_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut tenants = write_txn
+                .open_table(SM_TENANTS_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut principals = write_txn
+                .open_table(SM_PRINCIPALS_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut bindings = write_txn
+                .open_table(SM_BINDINGS_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut dedup = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -2179,6 +2616,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut configs,
                                         &mut routes,
                                         &mut sources,
+                                        &mut tenants,
+                                        &mut principals,
+                                        &mut bindings,
                                         &request.op,
                                         log_id.index,
                                         applied.logical_clock_secs,
@@ -2188,6 +2628,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut configs,
                                     &mut routes,
                                     &mut sources,
+                                    &mut tenants,
+                                    &mut principals,
+                                    &mut bindings,
                                     &request.op,
                                     log_id.index,
                                     applied.logical_clock_secs,
@@ -2330,6 +2773,42 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
+            let mut tenants_table = write_txn
+                .open_table(SM_TENANTS_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            tenants_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (id, value) in &payload.tenants {
+                tenants_table
+                    .insert(id.as_str(), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
+            let mut principals_table = write_txn
+                .open_table(SM_PRINCIPALS_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            principals_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (id, value) in &payload.principals {
+                principals_table
+                    .insert(id.as_str(), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
+            let mut bindings_table = write_txn
+                .open_table(SM_BINDINGS_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            bindings_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (principal_id, tenant, value) in &payload.bindings {
+                bindings_table
+                    .insert((principal_id.as_str(), tenant.as_str()), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
             let mut dedup_table = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
@@ -2413,11 +2892,12 @@ mod tests {
 
     use super::{
         DEDUP_TTL_SECS, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine, SM_DEDUP_TABLE,
-        SourceRecord, new,
+        SM_TENANTS_TABLE, SourceRecord, new,
     };
     use crate::control::{
-        ControlOp, ControlOutcome, ControlRequest, ControlResponse, Digest, OnDrift, SourceMode,
-        StubEdit, StubEditScript, TenantId,
+        AuthSource, ControlOp, ControlOutcome, ControlRequest, ControlResponse, Digest,
+        FLEET_SCOPE, OnDrift, Principal, PrincipalId, Quotas, Role, SourceMode, StubEdit,
+        StubEditScript, TenantId,
     };
     use crate::raft::TypeConfig;
 
@@ -3985,6 +4465,618 @@ mod tests {
         assert_eq!(
             replay, first,
             "the replay must return the ORIGINAL refusal, not re-evaluate"
+        );
+    }
+
+    // -- issue #159: tenancy and RBAC records (RFC-002 §10 slice T1) -----------
+
+    fn tenant_put_req(op_id: u128, tenant: &str, display_name: &str) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::TenantPut {
+                tenant: TenantId::new(tenant),
+                display_name: display_name.to_owned(),
+                quotas: Quotas::default(),
+            },
+        )
+    }
+
+    /// A well-formed argon2id hash shape. Not a real hash of anything — apply
+    /// only ever stores it, it never verifies a password against it — so a
+    /// fixed placeholder stands in wherever a valid one is needed.
+    const VALID_ARGON2_HASH: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
+
+    fn test_principal(id: &str) -> Principal {
+        Principal {
+            id: PrincipalId::new(id),
+            display_name: id.to_owned(),
+            auth: AuthSource::ApiKey {
+                hash: VALID_ARGON2_HASH.to_owned(),
+            },
+            disabled: false,
+        }
+    }
+
+    fn principal_put_req(op_id: u128, tenant: &str, principal: Principal) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::PrincipalPut {
+                tenant: TenantId::new(tenant),
+                principal,
+            },
+        )
+    }
+
+    fn binding_put_req(
+        op_id: u128,
+        tenant: &str,
+        principal_id: &str,
+        role: Role,
+    ) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::BindingPut {
+                tenant: TenantId::new(tenant),
+                principal_id: PrincipalId::new(principal_id),
+                role,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn tenant_put_then_principal_put_then_binding_put_all_commit_and_read_back() {
+        let (_td, mut sm) = fresh_sm(None).await;
+
+        let response = apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme Corp")).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        let tenant = sm.test_tenant("acme").expect("tenant stored");
+        assert_eq!(tenant.display_name, "Acme Corp");
+        assert!(!tenant.deleted);
+
+        let response = apply_one(
+            &mut sm,
+            2,
+            principal_put_req(2, "acme", test_principal("alice")),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        let principal = sm.test_principal_row("alice").expect("principal stored");
+        assert_eq!(principal.display_name, "alice");
+
+        let response = apply_one(
+            &mut sm,
+            3,
+            binding_put_req(3, "acme", "alice", Role::Editor),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert_eq!(sm.test_binding("alice", "acme"), Some(Role::Editor));
+    }
+
+    /// `validate` cannot see whether "acme" exists — that is state, checked in
+    /// `mutate_tables` once the op is known to be well-formed.
+    #[tokio::test]
+    async fn principal_put_against_a_nonexistent_tenant_is_a_committed_failure() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let response = apply_one(
+            &mut sm,
+            1,
+            principal_put_req(1, "ghost", test_principal("alice")),
+        )
+        .await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => assert!(reason.contains("ghost"), "{reason}"),
+            other => panic!("a principal in an unknown tenant must be refused, got {other:?}"),
+        }
+        assert!(sm.test_principal_row("alice").is_none());
+    }
+
+    #[tokio::test]
+    async fn binding_put_against_a_nonexistent_tenant_is_a_committed_failure() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let response = apply_one(
+            &mut sm,
+            1,
+            binding_put_req(1, "ghost", "alice", Role::Viewer),
+        )
+        .await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => assert!(reason.contains("ghost"), "{reason}"),
+            other => panic!("a binding against an unknown tenant must be refused, got {other:?}"),
+        }
+        assert!(sm.test_binding("alice", "ghost").is_none());
+    }
+
+    #[tokio::test]
+    async fn binding_put_fleet_admin_on_an_ordinary_tenant_is_a_committed_failure() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "payments", "Payments")).await;
+        let response = apply_one(
+            &mut sm,
+            2,
+            binding_put_req(2, "payments", "alice", Role::FleetAdmin),
+        )
+        .await;
+        assert!(
+            matches!(response.outcome, ControlOutcome::Failed { .. }),
+            "{response:?}"
+        );
+        assert!(sm.test_binding("alice", "payments").is_none());
+    }
+
+    #[tokio::test]
+    async fn binding_put_editor_on_the_fleet_scope_is_a_committed_failure() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let response = apply_one(
+            &mut sm,
+            1,
+            binding_put_req(1, FLEET_SCOPE, "alice", Role::Editor),
+        )
+        .await;
+        assert!(
+            matches!(response.outcome, ControlOutcome::Failed { .. }),
+            "{response:?}"
+        );
+        assert!(sm.test_binding("alice", FLEET_SCOPE).is_none());
+    }
+
+    /// Ports are fleet-unique across tenants (RFC-002 §3.2): a second tenant
+    /// claiming a port another tenant already holds must be refused, and the
+    /// refusal must never name the tenant that holds it — naming it would be a
+    /// cross-tenant enumeration oracle (RFC-002 §8.4).
+    #[tokio::test]
+    async fn a_cross_tenant_port_collision_is_refused_without_naming_the_owner() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(&mut sm, 2, tenant_put_req(2, "globex", "Globex")).await;
+
+        let first = request(
+            3,
+            ControlOp::PutImposter {
+                tenant: TenantId::new("acme"),
+                config: Box::new(config(9100, json!([]))),
+            },
+        );
+        assert_eq!(
+            apply_one(&mut sm, 3, first).await.outcome,
+            ControlOutcome::Applied
+        );
+
+        let second = request(
+            4,
+            ControlOp::PutImposter {
+                tenant: TenantId::new("globex"),
+                config: Box::new(config(9100, json!([]))),
+            },
+        );
+        match apply_one(&mut sm, 4, second).await.outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(reason.contains("9100"), "{reason}");
+                assert!(
+                    !reason.contains("acme"),
+                    "the refusal must not name the owner: {reason}"
+                );
+            }
+            other => panic!("a cross-tenant port collision must be refused, got {other:?}"),
+        }
+    }
+
+    /// A re-`PutImposter` from the tenant that already owns the port is an
+    /// upsert, not a collision — the fleet-uniqueness check must not refuse a
+    /// tenant overwriting its own imposter.
+    #[tokio::test]
+    async fn a_same_tenant_re_put_is_not_a_port_collision() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        for index in [2u64, 3] {
+            let op = request(
+                u128::from(index),
+                ControlOp::PutImposter {
+                    tenant: TenantId::new("acme"),
+                    config: Box::new(config(9101, json!([]))),
+                },
+            );
+            assert_eq!(
+                apply_one(&mut sm, index, op).await.outcome,
+                ControlOutcome::Applied
+            );
+        }
+    }
+
+    /// A source pull is held to the same fleet-uniqueness rule as an operator
+    /// write, and refuses **atomically**.
+    ///
+    /// Two halves, both load-bearing. `validate_replicable_config` exists so the
+    /// operator-write and source-pull paths "cannot drift into admitting
+    /// different things" — an unguarded pull would be exactly that drift, and
+    /// the quieter half of it, because nobody typed the port. And the check has
+    /// to run *before* any mutation: `mutate_tables` returning a refusal still
+    /// commits its transaction (`Ok(Err(_))` is a committed `Failed`, not a
+    /// rollback), so a check inside the apply loop would leave the de-declared
+    /// port already removed and report a clean failure for a half-applied pull.
+    /// The final assertion is that atomicity, not the refusal.
+    #[tokio::test]
+    async fn a_pull_that_would_take_another_tenants_port_is_refused_atomically() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+
+        // acme binds 9200 by hand.
+        let acme = request(
+            2,
+            ControlOp::PutImposter {
+                tenant: TenantId::new("acme"),
+                config: Box::new(config(9200, json!([]))),
+            },
+        );
+        assert_eq!(
+            apply_one(&mut sm, 2, acme).await.outcome,
+            ControlOutcome::Applied
+        );
+
+        // The default tenant runs a source that currently owns 8080.
+        apply_one(
+            &mut sm,
+            3,
+            source_put(3, "mocks", "https://h/i.json", OnDrift::Overwrite),
+        )
+        .await;
+        apply_one(&mut sm, 4, pull(4, "mocks", "v1", &[8080])).await;
+        assert!(
+            sm.read_config(8080).expect("read").is_some(),
+            "precondition: the source owns 8080"
+        );
+
+        // v2 drops 8080 and declares acme's 9200. Dropping 8080 is precisely
+        // the write a late refusal would have committed.
+        let greedy = request(
+            5,
+            ControlOp::SourcePullResult {
+                tenant: TenantId::default(),
+                id: "mocks".to_owned(),
+                version: Some("v2".to_owned()),
+                digest: Digest::new("digest-v2"),
+                configs: vec![config(9200, json!([]))],
+            },
+        );
+        match apply_one(&mut sm, 5, greedy).await.outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(reason.contains("9200"), "{reason}");
+                assert!(
+                    !reason.contains("acme"),
+                    "the refusal must not name the owner: {reason}"
+                );
+            }
+            other => panic!("a pull must not take another tenant's port, got {other:?}"),
+        }
+        assert!(
+            sm.read_config(8080).expect("read").is_some(),
+            "the refusal must be atomic: the port this pull would have dropped is still here"
+        );
+    }
+
+    /// Deleting a tenant takes its bindings with it.
+    ///
+    /// A tombstone records that an id existed; it does not reserve it, and the
+    /// upsert path deliberately allows recreating one. So a binding left behind
+    /// is a role that comes back to life the moment the name is reused —
+    /// plausibly by a different operator for a different customer. That is
+    /// privilege resurrection across an ownership change, and it cannot be
+    /// repaired after the fact because the rows are already in the log.
+    #[tokio::test]
+    async fn tenant_delete_takes_its_bindings_with_it_so_a_reused_id_grants_nothing() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(
+            &mut sm,
+            2,
+            principal_put_req(2, "acme", test_principal("alice")),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            3,
+            binding_put_req(3, "acme", "alice", Role::TenantAdmin),
+        )
+        .await;
+        assert_eq!(sm.test_binding("alice", "acme"), Some(Role::TenantAdmin));
+
+        apply_one(
+            &mut sm,
+            4,
+            request(
+                4,
+                ControlOp::TenantDelete {
+                    tenant: TenantId::new("acme"),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            sm.test_binding("alice", "acme"),
+            None,
+            "a deleted tenant's bindings must not survive it"
+        );
+
+        // The id is recreated — a different customer, the same name.
+        apply_one(&mut sm, 5, tenant_put_req(5, "acme", "Acme Reborn")).await;
+        assert_eq!(
+            sm.test_binding("alice", "acme"),
+            None,
+            "recreating the id must not resurrect the old tenant's roles"
+        );
+    }
+
+    /// Deleting a principal takes its bindings with it, for the same reason —
+    /// and this one is likelier, because a principal id can be an external
+    /// value (an OIDC `subject`, an mTLS SAN) and identity providers recycle
+    /// those. Orphaned bindings would hand a different human every role the
+    /// previous holder of the name had.
+    #[tokio::test]
+    async fn principal_delete_takes_its_bindings_with_it_across_every_tenant() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(&mut sm, 2, tenant_put_req(2, "globex", "Globex")).await;
+        apply_one(
+            &mut sm,
+            3,
+            principal_put_req(3, "acme", test_principal("alice")),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            4,
+            binding_put_req(4, "acme", "alice", Role::Editor),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            5,
+            binding_put_req(5, "globex", "alice", Role::Viewer),
+        )
+        .await;
+        // A second principal's binding is the control: the cascade must be
+        // scoped to the principal being deleted, not a table wipe.
+        apply_one(
+            &mut sm,
+            6,
+            principal_put_req(6, "acme", test_principal("bob")),
+        )
+        .await;
+        apply_one(&mut sm, 7, binding_put_req(7, "acme", "bob", Role::Viewer)).await;
+
+        apply_one(
+            &mut sm,
+            8,
+            request(
+                8,
+                ControlOp::PrincipalDelete {
+                    tenant: TenantId::new("acme"),
+                    principal_id: PrincipalId::new("alice"),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(sm.test_principal_row("alice"), None);
+        assert_eq!(
+            sm.test_binding("alice", "acme"),
+            None,
+            "the deleted principal's bindings must go with it"
+        );
+        assert_eq!(
+            sm.test_binding("alice", "globex"),
+            None,
+            "including bindings in tenants the delete did not name"
+        );
+        assert_eq!(
+            sm.test_binding("bob", "acme"),
+            Some(Role::Viewer),
+            "another principal's binding must be untouched"
+        );
+    }
+
+    /// A tenant row that will not parse is refused, not treated as absent.
+    ///
+    /// The two states look identical to a naive read and could not be more
+    /// different: the tenant's configs, routes and sources are all still live.
+    /// Answering `Applied` would tell the operator the tenant is gone while its
+    /// imposters keep serving traffic — the "wrong but quiet" failure this
+    /// repo's error rules exist to prevent.
+    #[tokio::test]
+    async fn tenant_delete_refuses_a_corrupt_row_instead_of_reporting_success() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::PutImposter {
+                    tenant: TenantId::default(),
+                    config: Box::new(config(9300, json!([]))),
+                },
+            ),
+        )
+        .await;
+
+        // Corrupt acme's row behind the state machine's back.
+        {
+            let txn = sm.db.begin_write().expect("test txn");
+            {
+                let mut table = txn.open_table(SM_TENANTS_TABLE).expect("test table");
+                table.insert("acme", "{not json").expect("test insert");
+            }
+            txn.commit().expect("test commit");
+        }
+
+        match apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::TenantDelete {
+                    tenant: TenantId::new("acme"),
+                },
+            ),
+        )
+        .await
+        .outcome
+        {
+            ControlOutcome::Failed { reason } => {
+                assert!(reason.contains("corrupt"), "{reason}");
+                assert!(reason.contains("acme"), "{reason}");
+            }
+            other => panic!("a corrupt tenant row must refuse, not report success: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_delete_cascades_configs_routes_and_sources_in_one_revision_and_tombstones() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::PutImposter {
+                    tenant: TenantId::new("acme"),
+                    config: Box::new(config(9200, json!([]))),
+                },
+            ),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::PutRoutes {
+                    tenant: TenantId::new("acme"),
+                    table: RouteTable {
+                        routes: vec![test_route("r1", 9200)],
+                    },
+                },
+            ),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            4,
+            request(
+                4,
+                ControlOp::SourcePut {
+                    tenant: TenantId::new("acme"),
+                    id: "mocks".to_owned(),
+                    uri: "https://h/i.json".to_owned(),
+                    mode: SourceMode::Pinned,
+                    auth_ref: None,
+                    on_drift: OnDrift::Overwrite,
+                    poll_secs: None,
+                },
+            ),
+        )
+        .await;
+
+        let response = apply_one(
+            &mut sm,
+            5,
+            request(
+                5,
+                ControlOp::TenantDelete {
+                    tenant: TenantId::new("acme"),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+
+        // The cascade landed in the same revision as the tombstone: nothing
+        // half-deleted survives it.
+        assert!(sm.raw_config_row("acme", 9200).is_none());
+        assert!(sm.raw_route_row("acme", "r1").is_none());
+        assert!(sm.raw_source_row("acme", "mocks").is_none());
+
+        let tenant = sm.test_tenant("acme").expect("the tombstone survives");
+        assert!(tenant.deleted);
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trips_tenants_principals_and_bindings() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(
+            &mut sm,
+            2,
+            principal_put_req(2, "acme", test_principal("alice")),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            3,
+            binding_put_req(3, "acme", "alice", Role::Editor),
+        )
+        .await;
+
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install snapshot");
+
+        let tenant = follower.test_tenant("acme").expect("tenant survived");
+        assert_eq!(tenant.display_name, "Acme");
+        let principal = follower
+            .test_principal_row("alice")
+            .expect("principal survived");
+        assert_eq!(principal.display_name, "alice");
+        assert_eq!(follower.test_binding("alice", "acme"), Some(Role::Editor));
+    }
+
+    /// A snapshot written before issue #159 still installs — the three new
+    /// fields default to empty, which is what "this fleet declared no tenancy
+    /// records" is. Mirrors `a_pre_sources_snapshot_still_installs`: this crate
+    /// has been bitten by a table omitted from the snapshot before (#134/#137),
+    /// and the fix both times is the same defaulted-field discipline.
+    #[tokio::test]
+    async fn a_pre_tenancy_snapshot_still_installs() {
+        let (_td, sm) = fresh_sm(None).await;
+        let legacy = json!({
+            "configs": [],
+            "dedup": [],
+            "last_applied_log": null,
+            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
+        });
+        let payload: super::SnapshotPayload =
+            serde_json::from_value(legacy).expect("a pre-#159 snapshot payload still decodes");
+        assert!(payload.tenants.is_empty());
+        assert!(payload.principals.is_empty());
+        assert!(payload.bindings.is_empty());
+        assert!(sm.test_tenant("default").is_none());
+    }
+
+    /// This slice adds tenancy *records*; it must not change any answer the
+    /// existing single-tenant API gives. A default-tenant `PutImposter` works
+    /// exactly as it did before #159 — including with no `TenantPut` for
+    /// `"default"` ever having been applied: a resource op does not require
+    /// its tenant to have a stored `Tenant` row (only `PrincipalPut` and
+    /// `BindingPut` do).
+    #[tokio::test]
+    async fn a_pre_tenancy_imposter_reads_back_under_default_with_no_tenant_record() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let response = apply_one(&mut sm, 1, put(1, 9300, json!([{ "id": "a" }]))).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert!(
+            sm.read_config(9300).expect("read").is_some(),
+            "the default-tenant read path is unaffected by #159"
+        );
+        assert!(
+            sm.test_tenant("default").is_none(),
+            "a default-tenant resource op does not require a TenantPut for \"default\""
         );
     }
 
