@@ -82,15 +82,111 @@ Enforcement lives at every admin entry point — route handlers, SSE subscribe,
 `/_cluster/*` (fleet-admin only) — via a generic upstream hook, because the
 open-source admin API must stay tenancy-ignorant:
 
+Both seams have **landed upstream** and are in the current pin — U-9 as
+`rift-mock-core::extensions::authz`, U-10 as `EventContext` on the listener
+signature. Both are re-exported through `rift_ee::seams` (issue #160).
+
 - **U-9, `AdminAuthorizer`**: a trait consulted after route parsing with
-  `(credential, action, port/space)`, returning allow-with-principal or deny.
-  The default implementation reproduces today's single-api-key check
-  byte-for-byte; the enterprise implementation resolves principal → bindings →
-  role → action. Generic OSS justification: embedders fronting Rift with their
-  own identity currently have to reverse-proxy and re-parse routes to get any
-  authorization at all.
-- **U-10, principal on change events**: `ImposterEvent` carries the
-  authenticated principal, so audit sinks can attribute changes.
+  `(credential, action, port, space, scope, params)`, returning
+  allow-with-principal or deny. Installing nothing changes nothing: with no
+  authorizer registered the api-key comparison decides alone, exactly as before.
+  The enterprise implementation resolves principal → bindings → role → action.
+  Generic OSS justification: embedders fronting Rift with their own identity
+  currently have to reverse-proxy and re-parse routes to get any authorization
+  at all.
+
+  Three parts of the contract enforcement (#161) is built on, stated with their
+  limits rather than as slogans:
+
+  **Ordering.** The api-key check runs *before* the route is parsed, and only
+  then is the hook consulted, so `Deny` renders `403` and a bad key renders
+  `401`. But the gate is `if let Some(key) = api_key` — **keyless is upstream's
+  default**, and a loopback admin plane with no `--api-key` is a supported
+  configuration. So "authenticated" is a precondition, not a guarantee: an EE
+  deployment that installs the authorizer and drops `--api-key` on the grounds
+  that RBAC now handles identity gets every request arriving with
+  `credential: None`. #161 must decide explicitly whether the EE authorizer
+  refuses an absent credential or whether the binary requires a key when
+  clustered.
+
+  Note also that an EE authorizer **cannot produce a `401`**: `AuthzDecision` is
+  `Allow`/`Deny` only, and `Deny` maps unconditionally to `403`. Under EE RBAC a
+  missing credential is therefore a `403`, not a `401` — the `401`/`403` split
+  described above belongs to the built-in api-key gate, not to us.
+
+  **What the hook does *not* bound.** When route classification returns `None`
+  — an unmatched path, or the `/__rift/` gateway — the authorizer is never
+  consulted and the request falls through to the ordinary `404`. Upstream states
+  the consequence plainly: *"an authenticated caller can still distinguish a
+  `404` from a `403`, so the hook bounds what a principal can do, not what it
+  can learn about which routes exist."* Route-existence is not concealed; do not
+  claim otherwise in tenancy-isolation copy. What the ordering *does* buy is
+  that an **unauthenticated** caller cannot use it as an oracle when a key is
+  set.
+
+  **`scope` is caller-asserted.** It arrives in the `x-rift-scope` request
+  header, so any caller can set it to any value. It names which target a create
+  is *claimed* for (`POST /imposters` has no port yet); it must be cross-checked
+  against what the credential entitles, never used as the authorization subject.
+
+  Upstream also ships an `actions` module of stable action-string constants
+  (`system.read`, `system.write`, `imposter.read`, `imposter.write`,
+  `imposter.delete`, `imposter.verify`, `events.read`, `intercept.read`,
+  `intercept.write`). `seams_resolve` names all nine, so an upstream rename is a
+  compile error here rather than a silently never-matching match arm.
+
+- **U-10, attribution on change events**: a separate `EventContext` parameter on
+  `ImposterEventListener::on_event`, **not** a field on `ImposterEvent`. That
+  enum is not `#[non_exhaustive]`, so adding a field to every variant would
+  break every downstream `match` — the wrong trade for a seam whose premise is
+  that installing nothing changes nothing. `EventContext` is itself
+  `#[non_exhaustive]` so the next attribution field (scope, request id, remote
+  address) is not a second breaking change; embedders build one from `Default`
+  and assign.
+
+  The principal reaches the emit site through a **task-local** scope
+  (`with_principal_scope` / `current_principal`) rather than a parameter
+  threaded through `create_imposter`, `delete_imposter`, `apply_config`,
+  `add_stub` and every other mutating method. A task-local follows the task
+  across `.await` but **not** across `tokio::spawn`. Upstream is careful about
+  this: all sixteen emit sites in `ImposterManager` are direct calls inside the
+  mutating method, none is inside a spawned task, so single-node attribution is
+  complete.
+
+### The task-local does not reach a clustered write — attribution rides the log
+
+**This is the fact #163 has to be built on, so it is stated here rather than
+discovered later.** In a clustered deployment the admin request does not call
+the manager. It appends a `ControlOp` and returns; the mutation happens when
+openraft applies the entry:
+
+```
+admin request task            openraft state-machine task
+  with_principal_scope(...)     RedbStateMachine::apply
+  append ControlOp        ──▶     drive_engine
+  await commit                     engine.apply_config(...)
+                                     ImposterManager::emit
+                                       current_principal()  ──▶  None
+```
+
+`apply` is driven by openraft's own task, not by the task that opened the scope,
+so the task-local is out of scope by the time `emit` runs. **Every replicated
+write attributes `None`** — and replicated writes are the whole of the clustered
+write path, which is exactly what an audit trail is for. Followers are further
+still from any request: they apply entries no client ever spoke to them about.
+
+This is not a defect in U-10. A task-local is the right mechanism for the
+in-process path it was designed for, and no upstream seam could have carried a
+principal across a Raft log it knows nothing about. The clustered answer is the
+one the log format already anticipates: `ControlRequest.principal`
+(`crates/rift-cluster/src/control.rs:61`) is in the envelope today and `None` at
+every construction site. #161 populates it from `AuthzDecision::Allow`, and #163
+reads it at apply time. `EventContext` remains the attribution path for the
+embedded/single-node case.
+
+  One gap neither mechanism closes: `AllDeleted` carries no port, therefore no
+  tenant. Its audit record gets `tenant: null, resource: "*"` — correct, and
+  stated here so the null is not later read as a bug.
 
 Quotas (max imposters, stubs per imposter, flow-KV entries, journal retention)
 enforce at the one place that sees a tenant's entire write stream — the Raft

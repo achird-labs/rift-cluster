@@ -51,10 +51,58 @@ pub mod seams {
     };
 
     /// Incremental config reconciliation: the per-port / per-stub apply path
-    /// that replaces reset-the-world reload, plus the change-event hook and the
-    /// stable stub identity both sides key on.
+    /// that replaces reset-the-world reload, plus the change-event hook, the
+    /// attribution that rides with it, and the stable stub identity both sides
+    /// key on.
+    ///
+    /// [`EventContext`] is U-10 (upstream #855): it answers *who* caused a
+    /// change, which is what turns an event stream into an audit trail. It is
+    /// `#[non_exhaustive]`, so an embedder builds one from [`Default`] and
+    /// assigns — a struct literal will not compile outside upstream.
     pub use rift_mock_core::imposter::{
-        ApplyReport, ImposterEvent, ImposterEventListener, ImposterManager, TlsDefaults, stub_key,
+        ApplyReport, EventContext, ImposterEvent, ImposterEventListener, ImposterManager,
+        TlsDefaults, stub_key,
+    };
+
+    /// Pluggable admin-API authorization (U-9, upstream #854) and the
+    /// attribution channel that carries its verdict to the event hook (U-10).
+    ///
+    /// The built-in gate is one global api key, so success yields *access*, not
+    /// an identity — every caller is equivalent. [`AdminAuthorizer`] is
+    /// consulted **after** the route is parsed, so a decision can see the
+    /// action, the port, the space and the parsed path params. Two parts of the
+    /// upstream contract the enterprise RBAC layer (#161) is built on:
+    ///
+    /// - **Ordering.** The api-key check runs before the route is parsed, so
+    ///   `Deny` renders `403` and a bad key renders `401`. Two limits worth
+    ///   knowing before relying on that: keyless is upstream's *default* (the
+    ///   gate is `if let Some(key) = api_key`), so `credential` may legitimately
+    ///   be `None`; and an authorizer can only `Allow`/`Deny`, with `Deny`
+    ///   mapping unconditionally to `403` — an EE authorizer cannot answer
+    ///   `401`. When route classification returns `None` the hook is not
+    ///   consulted at all and the request 404s, so the hook bounds what a
+    ///   principal can *do*, not what it can learn about which routes exist.
+    /// - **[`AuthzRequest::scope`] is caller-asserted.** It arrives in the
+    ///   `x-rift-scope` request header, so any caller can set it to anything. It
+    ///   says which target a create is *claimed* for; it is never the
+    ///   authorization subject.
+    ///
+    /// [`with_principal_scope`] is how an allowed principal reaches
+    /// [`EventContext`]: upstream sets a task-local around the request rather
+    /// than threading a principal parameter through every mutating manager
+    /// method.
+    ///
+    /// **It does not survive the clustered write path.** A task-local follows
+    /// the task across `.await` but not across a task boundary, and a clustered
+    /// mutation is applied by openraft's state-machine task, not by the admin
+    /// request task that opened the scope — so `current_principal()` is `None`
+    /// at every replicated emit. Clustered attribution rides
+    /// `ControlRequest.principal` in the log instead (#161 populates it, #163
+    /// reads it); this seam is the single-node/embedded path. See
+    /// `docs/architecture/08-tenancy-security.md`.
+    pub use rift_mock_core::extensions::authz::{
+        AdminAuthorizer, AllowAll, AuthzDecision, AuthzRequest, SharedAdminAuthorizer, actions,
+        current_principal, with_principal_scope,
     };
 
     /// The config types a replicated control op carries (ADR-001 §4.1): the
@@ -200,6 +248,7 @@ mod tests {
         assert_object_safe::<dyn RequestJournal>();
         assert_object_safe::<dyn ProxyRecordingStore>();
         assert_object_safe::<dyn ImposterEventListener>();
+        assert_object_safe::<dyn AdminAuthorizer>();
         assert_object_safe::<dyn ResponseDecorator>();
         assert_object_safe::<dyn NoMatchInterceptor>();
 
@@ -260,6 +309,36 @@ mod tests {
         _named::<HttpSource>();
         let _ = (MAX_BODY_BYTES, parse_uri_list);
 
+        // Admin authorization + event attribution (U-9 / U-10, issue #160).
+        _named::<AuthzRequest<'_>>();
+        _named::<AuthzDecision>();
+        _named::<EventContext>();
+        _named::<AllowAll>();
+        _named::<SharedAdminAuthorizer>();
+        let _ = AuthzDecision::allow();
+        // All nine, not just the two the EE code happens to name today: the
+        // point of the constants is that an upstream rename is a compile error
+        // here rather than a match arm that silently stops matching, and that
+        // only holds for the ones something actually names.
+        let _ = [
+            actions::SYSTEM_READ,
+            actions::SYSTEM_WRITE,
+            actions::IMPOSTER_READ,
+            actions::IMPOSTER_WRITE,
+            actions::IMPOSTER_DELETE,
+            actions::IMPOSTER_VERIFY,
+            actions::EVENTS_READ,
+            actions::INTERCEPT_READ,
+            actions::INTERCEPT_WRITE,
+        ];
+        let _ = (
+            current_principal,
+            with_principal_scope::<std::future::Ready<()>>,
+        );
+        // The registration point: a seam that cannot be installed is not a seam.
+        let _: fn(ServerBuilder, std::sync::Arc<dyn AdminAuthorizer>) -> ServerBuilder =
+            ServerBuilder::admin_authorizer;
+
         // Front-door route table (issue #131).
         _named::<RouteTable>();
         _named::<Route>();
@@ -302,6 +381,130 @@ mod tests {
         assert_eq!(
             config.extra.get("durability").and_then(|v| v.as_str()),
             Some("async")
+        );
+    }
+
+    /// An embedder can actually *build* an [`EventContext`].
+    ///
+    /// This guards the `Default` derive specifically. `EventContext` is
+    /// `#[non_exhaustive]`, so a struct literal will not compile outside
+    /// upstream and `Default` + assignment is the only construction path an
+    /// enterprise crate has. Drop that derive upstream and the seam test above
+    /// still passes while every #163 audit test loses its ability to build a
+    /// context at all.
+    #[test]
+    fn an_embedder_can_construct_an_event_context_and_carry_a_principal() {
+        use crate::seams::{AuthzDecision, EventContext};
+
+        let unattributed = EventContext::default();
+        assert_eq!(
+            unattributed.principal, None,
+            "absent attribution must be reported as absent, never guessed"
+        );
+
+        let mut ctx = EventContext::default();
+        ctx.principal = Some("tenant-a/alice".to_owned());
+        assert_eq!(ctx.principal.as_deref(), Some("tenant-a/alice"));
+
+        // The handoff, as a compile check rather than a behavioural claim:
+        // `Allow` must stay a distinct variant carrying an owned principal, so
+        // #161 can move it into an `EventContext` (single-node) or into
+        // `ControlRequest.principal` (clustered). Collapsing `Allow` to a unit
+        // variant, or narrowing `principal` to a borrow, breaks this line.
+        let AuthzDecision::Allow { principal } = (AuthzDecision::Allow {
+            principal: Some("tenant-a/alice".to_owned()),
+        }) else {
+            panic!("Allow must stay a distinct variant carrying its principal");
+        };
+        assert_eq!(principal, ctx.principal);
+    }
+
+    /// [`AuthzRequest`]'s `Debug` must redact the credential.
+    ///
+    /// Upstream hand-writes this rather than deriving it, and the enterprise
+    /// RBAC layer (#161) logs authz decisions — so a derived `Debug` upstream
+    /// would put the verbatim admin token into enterprise logs, and nothing on
+    /// this side would notice. Asserted at the boundary we depend on it at.
+    #[test]
+    fn the_authz_request_debug_never_leaks_the_credential() {
+        use crate::seams::{AuthzRequest, actions};
+
+        let req = AuthzRequest {
+            credential: Some("super-secret-admin-token"),
+            action: actions::IMPOSTER_WRITE,
+            port: Some(4545),
+            space: None,
+            scope: Some("tenant-a"),
+            params: &[("port", "4545")],
+        };
+        let rendered = format!("{req:?}");
+        assert!(
+            !rendered.contains("super-secret-admin-token"),
+            "the admin credential leaked into Debug: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+        // A caller-asserted scope is not a secret and must stay visible — it is
+        // exactly what an audit record needs to show was *claimed*.
+        assert!(rendered.contains("tenant-a"), "got: {rendered}");
+    }
+
+    /// The enterprise side can implement the trait and refuse.
+    ///
+    /// Honest about what this buys: the *assertion* is trivial — upstream
+    /// already pins `Deny.is_allowed() == false`. The value is the **compile**,
+    /// which is what proves `AdminAuthorizer` is implementable from outside
+    /// upstream (object-safe, no sealed supertrait, `AuthzRequest` constructible
+    /// with a caller-owned `params` slice). That is the shape #161's
+    /// deny-by-default RBAC is built on, and an upstream change that broke it
+    /// would surface here rather than inside `rift-cluster`.
+    #[test]
+    fn an_enterprise_authorizer_can_deny() {
+        use crate::seams::{AdminAuthorizer, AuthzDecision, AuthzRequest, actions};
+
+        struct DenyEverything;
+        impl AdminAuthorizer for DenyEverything {
+            fn authorize(&self, _req: AuthzRequest<'_>) -> AuthzDecision {
+                AuthzDecision::Deny {
+                    reason: "no binding grants this action",
+                }
+            }
+        }
+
+        let authorizer: std::sync::Arc<dyn AdminAuthorizer> = std::sync::Arc::new(DenyEverything);
+        let decision = authorizer.authorize(AuthzRequest {
+            credential: Some("token"),
+            action: actions::IMPOSTER_DELETE,
+            port: None,
+            space: None,
+            scope: None,
+            params: &[],
+        });
+        assert!(!decision.is_allowed());
+    }
+
+    /// `with_principal_scope` actually makes `current_principal` observable —
+    /// the mechanism upstream chose instead of threading a principal parameter
+    /// through every mutating manager method.
+    #[tokio::test]
+    async fn the_principal_scope_is_observable_inside_it_and_absent_outside() {
+        use crate::seams::{current_principal, with_principal_scope};
+
+        assert_eq!(
+            current_principal(),
+            None,
+            "outside any request scope there is nobody to name"
+        );
+
+        let seen = with_principal_scope(Some("tenant-a/alice".to_owned()), async {
+            current_principal()
+        })
+        .await;
+        assert_eq!(seen.as_deref(), Some("tenant-a/alice"));
+
+        assert_eq!(
+            current_principal(),
+            None,
+            "the scope must not leak past the request it was opened for"
         );
     }
 
