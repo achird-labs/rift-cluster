@@ -1154,11 +1154,27 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
 pub struct ClusteredFlowStore {
     net: Arc<FlowNet>,
     config: FlowConfig,
+    /// This imposter's flow-id namespace, rendered once at `provide` time from
+    /// [`FlowConfig::scope`] and the port (#152).
+    ///
+    /// It is deliberately applied *at the store face* and nowhere below it:
+    /// shard tables, HRW ownership, replication, anti-entropy, adoption markers
+    /// and the admin `flow_get`/`flow_set` routes all consume whatever id the
+    /// store hands them, so scoping here covers every one of those paths
+    /// uniformly and none of them has to learn the concept. It also settles the
+    /// admission recorded at `REPAIR_DURABILITY` above — a repair path could
+    /// not previously tell which imposter a `flow_id` belonged to; now the id
+    /// itself says.
+    prefix: String,
 }
 
 impl ClusteredFlowStore {
+    fn scoped(&self, flow_id: &str) -> String {
+        format!("{}{flow_id}", self.prefix)
+    }
+
     fn write(&self, flow_id: &str, key: &str, op: WriteOp) -> anyhow::Result<WriteReply> {
-        let (flow_id, key) = (flow_id.to_owned(), key.to_owned());
+        let (flow_id, key) = (self.scoped(flow_id), key.to_owned());
         let config = self.config;
         self.net.blocking_write(move |m_idx| WriteReq {
             flow_id,
@@ -1189,16 +1205,19 @@ impl ClusteredFlowStore {
 
 impl rift_ee::seams::FlowStore for ClusteredFlowStore {
     fn get(&self, flow_id: &str, key: &str) -> anyhow::Result<Option<Value>> {
+        // Scoped above the consistency branch, not inside one: the namespace is
+        // a property of the imposter, not of which copy answers the read.
+        let flow_id = self.scoped(flow_id);
         match self.config.read_consistency {
             ReadConsistency::Local => {
                 // The replica read the imposter opted into. Pure memory — no
                 // bridge, no permit, no deadline.
                 metrics::flow_read("local");
-                Ok(self.net.shard_value(flow_id, key))
+                Ok(self.net.shard_value(&flow_id, key))
             }
             ReadConsistency::Strong => Ok(self
                 .net
-                .blocking_read(flow_id, key)?
+                .blocking_read(&flow_id, key)?
                 .map(|entry| entry.value)),
         }
     }
@@ -1316,6 +1335,7 @@ impl rift_ee::seams::FlowStoreProvider for ClusteredFlowStoreProvider {
         Some(Arc::new(ClusteredFlowStore {
             net: Arc::clone(&self.net),
             config: flow_config,
+            prefix: flow_config.scope.prefix_for(config.port),
         }))
     }
 }

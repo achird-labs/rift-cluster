@@ -361,6 +361,80 @@ async fn an_unknown_flow_state_knob_is_refused_before_commit() {
     server.shutdown().await;
 }
 
+/// #152: `contextScope: "tenant"` is a *reserved* value, not an unknown one —
+/// it is the scope RFC-002 will activate, and there is no tenant to scope by
+/// today. Refusing it at admission with wording that names the successor issue
+/// is deterministic feature detection: a config written for a later build fails
+/// loudly here instead of silently landing in the wrong namespace.
+#[tokio::test]
+async fn the_reserved_tenant_context_scope_is_refused_before_commit() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let mut config = minimal_imposter(port);
+    config["_rift"] = json!({ "flowState": { "contextScope": "tenant" } });
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&config)
+        .send()
+        .await
+        .expect("post imposter");
+
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 400, "{seen}");
+    assert!(
+        seen.body.contains("contextScope"),
+        "the refusal must name the offending key: {seen}"
+    );
+    assert!(
+        seen.body.contains("#17"),
+        "a reserved value must say which work activates it, like the reserved tenancy ops do: {seen}"
+    );
+
+    let read = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get");
+    assert_eq!(
+        read.status().as_u16(),
+        404,
+        "a refused config must not land"
+    );
+
+    server.shutdown().await;
+}
+
+/// The accepted values do land — the companion to the refusal above, so a
+/// future tightening of the parser cannot quietly reject `fleet` too.
+#[tokio::test]
+async fn an_explicit_fleet_context_scope_is_admitted() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let mut config = minimal_imposter(port);
+    config["_rift"] = json!({ "flowState": { "contextScope": "fleet" } });
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&config)
+        .send()
+        .await
+        .expect("post imposter");
+
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 201, "{seen}");
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_api_key_gates_terminated_routes_like_upstream() {
     let state = TempDir::new().expect("tempdir");

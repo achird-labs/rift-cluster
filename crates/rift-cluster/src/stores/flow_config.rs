@@ -1,10 +1,11 @@
 //! The per-imposter flow-state knobs a provider-supplied store reads out of
 //! `_rift.flowState` (upstream #845's `extra` passthrough, this repo's #118).
 //!
-//! Two knobs, both with correct-by-default polarity (the same shape as
+//! Three knobs, all with correct-by-default polarity (the same shape as
 //! `--cluster-degraded-mode reject`): reads are owner-authoritative unless an
-//! imposter opts into replica staleness, and writes are group-fsynced unless it
-//! opts into losing them.
+//! imposter opts into replica staleness, writes are group-fsynced unless it
+//! opts into losing them, and flow ids are per-imposter unless it opts into
+//! sharing them fleet-wide.
 //!
 //! Parsing is strict on the values and silent on unrelated keys: `extra` is a
 //! generic passthrough, so a key this module does not own is not an error — but
@@ -30,6 +31,59 @@ pub enum ReadConsistency {
     Local,
 }
 
+/// Which imposters share one flow-id namespace (#152, RFC-005 §3.5).
+///
+/// Flow ids are caller-chosen — `flowIdSource: "header:X-Session"` turns a
+/// header value into one — so two unrelated imposters reading the same header
+/// produce the same id as a matter of course. Whether that means "the same
+/// context" is a deployment's choice, and this is where it makes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextScope {
+    /// Each imposter gets its own namespace. The default, and the behaviour
+    /// single-node Rift has always had for free: one `FlowStore` instance per
+    /// imposter isolates them without anyone asking.
+    #[default]
+    Imposter,
+    /// One namespace for the whole fleet: imposters deliberately share
+    /// contexts, so a suite spanning two mocks can carry one session across
+    /// both.
+    Fleet,
+}
+
+impl ContextScope {
+    /// The namespace prefix every flow id carries under this scope.
+    ///
+    /// `Fleet` renders `f:` rather than passing the id through bare so the
+    /// namespaces are disjoint *by construction*: a caller-chosen flow id that
+    /// happens to read like `i6400:cart` cannot otherwise be made to collide
+    /// with imposter 6400's `cart`.
+    #[must_use]
+    pub fn prefix_for(self, port: Option<u16>) -> String {
+        match (self, port) {
+            (Self::Fleet, _) => "f:".to_owned(),
+            (Self::Imposter, Some(port)) => format!("i{port}:"),
+            // Admission refuses a portless config (`validate_replicable_config`),
+            // and upstream's manager assigns the port back into the config
+            // before the provider ever sees it, so this is doubly unreachable.
+            // It still has to answer something, and the answer must not be the
+            // fleet namespace: collapsing an imposter that cannot be identified
+            // into the shared one is precisely the bleed this scope exists to
+            // prevent. Logged because if a future admission path *does* reach
+            // here, every portless imposter would quietly share this one
+            // namespace — a silent regression of #152, and this is the only
+            // thing that would make it greppable.
+            (Self::Imposter, None) => {
+                tracing::error!(
+                    "imposter-scoped flow store built without a port; falling back to an isolated \
+                     placeholder namespace. Every portless imposter shares it — this should be \
+                     unreachable, so it means an admission path stopped requiring a port."
+                );
+                "i?:".to_owned()
+            }
+        }
+    }
+}
+
 /// The parsed `flowState` block, with everything the clustered store needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowConfig {
@@ -39,6 +93,7 @@ pub struct FlowConfig {
     /// `None` when non-positive: upstream treats `<= 0` as "expire now" per
     /// key-op, but as a *default* TTL a non-positive value means "no expiry".
     pub ttl_seconds: Option<i64>,
+    pub scope: ContextScope,
 }
 
 impl Default for FlowConfig {
@@ -47,6 +102,7 @@ impl Default for FlowConfig {
             read_consistency: ReadConsistency::Strong,
             durability: Durability::Async,
             ttl_seconds: Some(300),
+            scope: ContextScope::Imposter,
         }
     }
 }
@@ -54,6 +110,7 @@ impl Default for FlowConfig {
 /// The keys this module owns inside `flowState`'s `extra` map.
 const KEY_READ_CONSISTENCY: &str = "readConsistency";
 const KEY_DURABILITY: &str = "durability";
+const KEY_CONTEXT_SCOPE: &str = "contextScope";
 
 impl FlowConfig {
     /// Parse an imposter's `flowState` block. Absent block ⇒ all defaults —
@@ -98,10 +155,32 @@ impl FlowConfig {
             },
         };
 
+        let scope = match flow_state.extra.get(KEY_CONTEXT_SCOPE) {
+            None => ContextScope::Imposter,
+            Some(value) => match value.as_str() {
+                Some("imposter") => ContextScope::Imposter,
+                Some("fleet") => ContextScope::Fleet,
+                // Reserved, not unknown: the message names the work that
+                // activates it, so a config written for a later build reads as
+                // "not yet" rather than as a typo.
+                Some("tenant") => {
+                    return Err(format!(
+                        "flowState.{KEY_CONTEXT_SCOPE} reserved value \"tenant\": tenant scope arrives with RFC-002 (#17); accepted: \"imposter\", \"fleet\""
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "flowState.{KEY_CONTEXT_SCOPE} must be \"imposter\" or \"fleet\", got {value}"
+                    ));
+                }
+            },
+        };
+
         Ok(Self {
             read_consistency,
             durability,
             ttl_seconds: (flow_state.ttl_seconds > 0).then_some(flow_state.ttl_seconds),
+            scope,
         })
     }
 
@@ -197,6 +276,95 @@ mod tests {
             "someFutureKnob": { "nested": true },
         })))
         .expect("unowned keys are not this module's business");
+    }
+
+    #[test]
+    fn context_scope_defaults_to_imposter() {
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+        }))
+        .expect("parses");
+        assert_eq!(
+            FlowConfig::from_imposter(&config).expect("valid").scope,
+            ContextScope::Imposter,
+            "the default must be the OSS-parity scope, not the pre-#152 fleet namespace"
+        );
+
+        // Present-but-empty `flowState` takes the same default as an absent one.
+        assert_eq!(
+            FlowConfig::from_imposter(&imposter(serde_json::json!({})))
+                .expect("valid")
+                .scope,
+            ContextScope::Imposter
+        );
+    }
+
+    #[test]
+    fn both_context_scopes_parse() {
+        assert_eq!(
+            FlowConfig::from_imposter(&imposter(serde_json::json!({ "contextScope": "imposter" })))
+                .expect("valid")
+                .scope,
+            ContextScope::Imposter
+        );
+        assert_eq!(
+            FlowConfig::from_imposter(&imposter(serde_json::json!({ "contextScope": "fleet" })))
+                .expect("valid")
+                .scope,
+            ContextScope::Fleet
+        );
+    }
+
+    #[test]
+    fn an_unknown_context_scope_is_refused_naming_the_key_and_the_accepted_set() {
+        let err = FlowConfig::validate(&imposter(serde_json::json!({ "contextScope": "galaxy" })))
+            .expect_err("unknown scope must refuse");
+        assert!(err.contains("contextScope"), "{err}");
+        assert!(err.contains("galaxy"), "{err}");
+        assert!(err.contains("imposter"), "{err}");
+        assert!(err.contains("fleet"), "{err}");
+    }
+
+    /// `tenant` is reserved, not unknown: it is the scope RFC-002 activates, so
+    /// the refusal points at that work rather than reading as a typo.
+    #[test]
+    fn the_reserved_tenant_scope_is_refused_naming_its_successor() {
+        let err = FlowConfig::validate(&imposter(serde_json::json!({ "contextScope": "tenant" })))
+            .expect_err("tenant scope must refuse");
+        assert!(err.contains("contextScope"), "{err}");
+        assert!(err.contains("tenant"), "{err}");
+        assert!(
+            err.contains("#17"),
+            "the reserved-op wording names the issue that lifts the reservation: {err}"
+        );
+    }
+
+    /// The prefixes must be mutually unambiguous, including the defensive
+    /// portless arm — its whole justification is that it is *not* the shared
+    /// namespace, and nothing else pins that.
+    #[test]
+    fn scope_prefixes_are_distinct_and_the_portless_arm_never_shares() {
+        let fleet = ContextScope::Fleet.prefix_for(Some(6400));
+        let portless = ContextScope::Imposter.prefix_for(None);
+
+        assert_eq!(ContextScope::Imposter.prefix_for(Some(6400)), "i6400:");
+        assert_eq!(fleet, "f:");
+        assert_ne!(
+            portless, fleet,
+            "an imposter that cannot be identified must not fall into the fleet namespace"
+        );
+        assert_ne!(portless, ContextScope::Imposter.prefix_for(Some(6400)));
+
+        // The port is rendered in decimal and terminated by a `:`, which is not
+        // a digit — that is what makes the scheme uniquely decodable, so a flow
+        // id can never be chosen to impersonate another imposter's prefix.
+        assert!(ContextScope::Fleet.prefix_for(None).starts_with('f'));
+        for port in [1u16, 640, 6400, 65535] {
+            let prefix = ContextScope::Imposter.prefix_for(Some(port));
+            assert!(prefix.ends_with(':'), "{prefix}");
+            assert_eq!(prefix.matches(':').count(), 1, "{prefix}");
+        }
     }
 
     #[test]

@@ -339,9 +339,36 @@ fn scoped(&self, flow_id: &str) -> String {
 - **`fleet`** — the pre-RFC behavior, kept for migration, `FleetAdmin`-gated
   at admission because it deliberately crosses the tenant boundary.
 
+> **As shipped (#152) — two deviations from the sketch above.** S1 landed the
+> scope prefix ahead of the M5 milestone, against a tree where RFC-002 has not
+> yet landed. Both deviations exist because there is nothing to implement
+> against yet, not because the design changed:
+>
+> - **`tenant` is parsed and refused, not implemented.** There is no source of
+>   truth for a tenant at `provide` time: `ImposterConfig` carries no tenant
+>   (RFC-002 §3.2 adds it), and `TenantId` is pinned to `"default"` with the
+>   tenancy ops still reserved. `contextScope: "tenant"` is therefore a `400` at
+>   admission naming RFC-002 (#17) — deterministic feature detection, the same
+>   contract style as the reserved `ControlOp` variants, rather than a value
+>   that silently means something else. `ContextScope` ships with two variants;
+>   the third arrives with the tenant field it needs.
+> - **`fleet` ships ungated.** The `FleetAdmin` gate is meaningful only once
+>   there is a tenant boundary for `fleet` to cross; in a single-tenant fleet it
+>   would refuse nothing. The gate lands in RFC-002 alongside `tenant`
+>   activation, at the same admission point.
+>
+> Also as shipped: `fleet` renders an explicit `f:` prefix rather than passing
+> ids through bare, so the namespaces are disjoint by construction — a
+> caller-chosen id shaped like `i6400:x` cannot be made to read across the
+> boundary.
+
 Validation follows the `flow_config.rs` pattern: unknown value ⇒ 400 naming
-the key. The prefix is invisible to configs, scripts, and templates — it is
-applied and stripped inside the EE store. Migration note: on upgrade, existing
+the key. The prefix is invisible to configs, scripts, and templates — they name
+flow ids unprefixed and the EE store applies the prefix beneath them. (*As
+shipped:* nothing **strips**, because nothing hands a flow id back — no
+`FlowStore` method returns one, and the admin API echoes the id from the request
+path. Stripping first becomes real in §3.6's inspector, which lists stored ids.)
+Migration note: on upgrade, existing
 in-flight flows keyed without a prefix are orphaned; with the 300 s default
 TTL this is a bounded, one-deploy blip, called out in release notes rather
 than papered over with a compatibility read path.

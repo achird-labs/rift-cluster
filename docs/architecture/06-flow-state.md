@@ -9,6 +9,46 @@ subsystem that is both correctness-critical **and** on the request path, which
 is why it gets its own machinery instead of riding the Raft log: a quorum
 round per scenario transition at 20–40k RPS is not a design, it's an outage.
 
+## What a flow id names: the context scope
+
+Before ownership is computed, the id has to mean something unambiguous — and a
+raw flow id does not. `flowIdSource: "header:X-Session"` makes the *client*
+choose the id, so two imposters reading the same header hand this subsystem the
+same string while meaning two different contexts. Single-node Rift never has to
+answer that question: each imposter owns a separate store instance, so the
+boundary is a consequence of the object graph. One `FlowNet` backs every
+imposter on a clustered node, so here the boundary has to be drawn explicitly.
+
+It is drawn at the **store face**, in `ClusteredFlowStore`: every id crossing it
+is prefixed with the imposter's namespace, rendered once when the provider builds
+the store from `ContextScope` (`_rift.flowState.contextScope`) and the port.
+
+| Scope | Prefix | Meaning |
+|---|---|---|
+| `imposter` (default) | `i<port>:` | Per-imposter namespace — the single-node semantics, restored |
+| `fleet` | `f:` | One namespace fleet-wide — imposters deliberately share contexts |
+
+Two properties make this the right seam:
+
+- **Everything below it is unchanged.** Shard tables, the ownership ring,
+  replication, anti-entropy, adoption markers and the admin `flow_get`/`flow_set`
+  routes all consume whatever id the store hands them. Scoping once, above them,
+  covers every path uniformly and leaves none of them needing to know the
+  concept exists. A prefix that had to be understood at shard level would be a
+  sign it was applied too deep.
+- **The namespaces are disjoint by construction.** `fleet` carries `f:` rather
+  than passing ids through bare, so a caller-chosen id that happens to look like
+  `i6400:cart` still cannot address imposter 6400's `cart`.
+
+It also settles a limitation the durable tier records below: a repair path could
+not previously tell which imposter a `flow_id` belonged to. Now the id says.
+
+Scope is per-imposter and not a cluster-wide setting, because it is a property
+of what an imposter's contexts *mean* — the same reason `readConsistency` is
+per-imposter. See `docs/rift-ee-server.md` for the knob, the behaviour change it
+represents, and the upgrade note (old ids are orphaned, TTL-bounded, with no
+dual-read path).
+
 ## Single-writer by placement: the ownership ring
 
 Every flow key has **exactly one authoritative owner node** at any moment,

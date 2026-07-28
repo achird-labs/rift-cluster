@@ -955,13 +955,55 @@ has one owner (rendezvous-hashed over the applied membership); writes are
 serialized through it, and by default reads are answered by it, so a scenario
 behaves correctly however the LB spreads its steps.
 
-Two per-imposter knobs, under `_rift.flowState` (both validated at admission —
+Three per-imposter knobs, under `_rift.flowState` (all validated at admission —
 an unknown value is a `400` naming the key, never a silent default):
 
 | Knob | Values | Meaning |
 |---|---|---|
 | `readConsistency` | `"strong"` (default) \| `"local"` | `strong`: every read is owner-answered — correct under any LB, at most one LAN RPC. `local`: reads stay on this node's replica — fast, at most one replication push behind the owner |
 | `durability` | `"none"` \| `"async"` (default) \| `"sync"` | What a write survives: `sync` fsyncs before the ack (a full-fleet restart loses nothing), `async` is group-fsynced every `--cluster-flow-fsync-interval-ms` (bounded loss), `none` never touches disk |
+| `contextScope` | `"imposter"` (default) \| `"fleet"` | Which imposters share a flow-id namespace. `imposter`: this imposter's flow ids are its own — two imposters resolving the same id (the ordinary result of both using `flowIdSource: "header:X-Session"`) stay isolated, matching single-node behaviour. `fleet`: one namespace across every imposter, so a suite spanning two mocks carries one context through both |
+
+### `contextScope` and the isolation it restores (#152)
+
+Flow ids are caller-chosen: `flowIdSource: "header:X-Session"` turns a request
+header into one. Two unrelated imposters reading the same header therefore
+produce the *same* flow id as a matter of course. Single-node Rift isolates them
+without anyone asking, because each imposter builds its own flow store; before
+this knob existed the clustered store passed those ids into one fleet-wide
+namespace, so the two imposters silently shared state — no error, just wrong
+reads.
+
+`imposter` is the default because it is the parity-restoring answer. This is a
+**behaviour change** for a fleet that was relying on the old sharing: set
+`contextScope: "fleet"` on those imposters to keep it, explicitly.
+
+The two namespaces are disjoint by construction — `fleet` carries its own
+prefix rather than using bare ids — so no caller-chosen flow id can be crafted
+to read across the boundary.
+
+**One residual difference from single-node.** The namespace is keyed by the
+imposter's *port*, not by the store instance, so deleting an imposter and
+recreating it on the same port inherits whatever flow state the old one left,
+up to `ttlSeconds`. Single-node gives the replacement a fresh store and
+therefore an empty one. This is strictly better than the pre-`contextScope`
+behaviour (where the state was shared with every *other* imposter as well), but
+a suite that recreates an imposter between runs and expects clean state should
+set a short `ttlSeconds` or use distinct flow ids per run.
+
+**Upgrading.** The scope is a key prefix, so flows written by an older build are
+keyed differently and are **orphaned** on upgrade, not corrupted: they are
+simply never looked up again, and the per-flow TTL (`ttlSeconds`, default 300 s)
+reaps them. Two consequences worth planning for:
+
+- Flows in flight at the moment of upgrade are lost; `ttlSeconds` bounds the
+  window in which that matters.
+- During a **rolling** upgrade, old and new nodes address disjoint namespaces
+  for the duration, and nothing will flag it — the prefix also changes each flow
+  id's owner in the ring. Upgrade the fleet together, or accept a bounded blip
+  for in-flight flows. There is deliberately no dual-read compatibility path:
+  one would have to guess which namespace a bare id belonged to, and guessing
+  wrong is the bug this change exists to remove.
 
 The mode is **fleet-wide, not node-local**: a replication push carries the
 durability the write chose, so a `none` flow is held in memory on every node
