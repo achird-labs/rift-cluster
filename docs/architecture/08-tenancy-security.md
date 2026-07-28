@@ -49,6 +49,45 @@ the legacy `--api-key` maps to a synthetic principal with admin rights on it.
 Tenancy becomes real the day a second tenant is created, with zero day-one
 breakage.
 
+### What T1 ships, and the one thing it deliberately does not
+
+Slice T1 (RFC-002 §10, issue #159) has landed: `Tenant`, `Principal`,
+`RoleBinding`, `Role` and `Quotas` are real records; the six reserved
+`ControlOp` variants carry typed payloads; `sm_tenants`, `sm_principals` and
+`sm_bindings` are state-machine tables, in snapshots in both directions; and
+the single-tenant gate is lifted, so every op accepts any well-formed tenant
+slug.
+
+**Storing is not serving.** T1 delivers the records and their storage, not
+tenant-aware serving. A resource op naming a non-`default` tenant is validated,
+committed and stored against `(tenant, …)`, and `TenantDelete` cascades over
+it — but the read and sync paths (`desired_configs`, `desired_routes`,
+`read_config`, `configured_ports`, `sources`) still filter to `default`, so
+nothing binds it and no operator surface reports it. T1's exit criterion —
+*no observable change* — holds because the admin HTTP front constructs
+`TenantId::default()` at every call site, so nothing reachable over the API can
+create such a row; only a direct `RiftNode::submit` can, which is how the tests
+exercise the cascade and the fleet-wide port rule.
+
+One consequence to carry into the slice that makes serving tenant-aware:
+because ports are fleet-unique across tenants, a config stored for tenant A
+*does* claim its port against tenant B. That is RFC-002 §3.2's rule, not a bug,
+but it means the read paths must land in the same PR as tenant-aware serving —
+otherwise an operator can be refused a port that nothing is listening on and no
+read path reports as taken.
+
+Two deletion rules are security properties rather than tidiness, and both are
+enforced in the cascade: **`TenantDelete` removes the tenant's bindings**, and
+**`PrincipalDelete` removes that principal's bindings across every tenant.** A
+tombstone records that an id existed; it does not reserve it. Bindings left
+behind would come back to life the moment the name is reused — and principal
+ids in particular can be external values (an OIDC `subject`, an mTLS SAN) that
+identity providers recycle. Rows already committed to the log cannot be
+repaired afterwards, which is why this is settled here rather than in #161.
+
+**Quotas are stored, not enforced.** `Quotas` rides the `Tenant` record so the
+shape is in the log format now; enforcement is #163.
+
 ## Principals and roles
 
 Principals are API keys in v1 (argon2id hashes stored, key shown once at

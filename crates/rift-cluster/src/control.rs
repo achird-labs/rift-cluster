@@ -12,15 +12,23 @@ use rift_ee::seams::{ImposterConfig, RouteTable, Stub};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Tenant scope of a control op. Fixed to `"default"` until RFC-002 (#17) —
-/// [`validate`] rejects anything else, but the field is in the log format now so
-/// multi-tenancy does not need a wire break.
+/// Tenant scope of a control op. Every op carries one; which tenant ids
+/// [`validate`] accepts for a given op depends on the op — see its doc.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TenantId(String);
 
-/// The only tenant that exists until RFC-002 (#17).
+/// The tenant every op ran against before RFC-002 (#17) multi-tenancy, and
+/// still the tenant a request implicitly targets when nothing else says
+/// otherwise. The one tenant id [`validate`] never lets [`ControlOp::TenantDelete`]
+/// remove — the fleet must always have somewhere for an unscoped request to land.
 pub const DEFAULT_TENANT: &str = "default";
+
+/// The reserved fleet-wide scope (RFC-002 §3.3, §8.4): not a real tenant —
+/// there is no [`ControlOp::TenantPut`] record for it, [`validate`] refuses one
+/// — and the only scope [`Role::FleetAdmin`] may bind against. Every other
+/// role is meaningless there and [`validate`] refuses that pairing too.
+pub const FLEET_SCOPE: &str = "*";
 
 impl TenantId {
     #[must_use]
@@ -49,6 +57,126 @@ impl std::fmt::Display for TenantId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// A principal's identity (RFC-002 §3.2): the RBAC subject a request
+/// authenticates as. Newtype over `String` for the same reason [`TenantId`]
+/// is one — it is a redb key component and an admin-surface path segment, not
+/// a bare string to be confused with a display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PrincipalId(String);
+
+impl PrincipalId {
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PrincipalId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Per-tenant resource ceilings (RFC-002 §3.4).
+///
+/// This slice (#159 T1) stores quotas; it does not enforce them — enforcement
+/// is #163. `Default` picks generous ceilings rather than zero, so a tenant
+/// created without an explicit quota is immediately usable instead of
+/// silently capacity-locked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Quotas {
+    pub max_imposters: u32,
+    pub max_stubs_per_imposter: u32,
+    pub max_flow_entries: u64,
+    /// `0` = unlimited.
+    pub journal_retention_secs: u64,
+}
+
+impl Default for Quotas {
+    fn default() -> Self {
+        Self {
+            max_imposters: 1_000,
+            max_stubs_per_imposter: 1_000,
+            max_flow_entries: 100_000,
+            journal_retention_secs: 0,
+        }
+    }
+}
+
+/// A tenant record (RFC-002 §3.1): the scope every resource op is keyed
+/// under.
+///
+/// `deleted` is a tombstone rather than a removed row: [`ControlOp::TenantDelete`]
+/// leaves this record behind (see its `mutate_tables` arm) so the id's
+/// history — and the fact that it once existed — survives the delete, the
+/// same reason `sm_op_dedup` keeps entries instead of forgetting them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tenant {
+    pub id: TenantId,
+    pub display_name: String,
+    pub quotas: Quotas,
+    /// The replicated logical clock at creation (the applying entry's
+    /// `issued_at_secs`) — never a local `SystemTime::now()`. Every replica
+    /// applies the same committed [`ControlOp::TenantPut`] and must compute the
+    /// identical record; a local clock read here would let them diverge, the
+    /// same reasoning [`ControlRequest::issued_at_secs`]'s doc gives for dedup.
+    pub created_at_secs: u64,
+    pub deleted: bool,
+}
+
+/// How a principal authenticates (RFC-002 §3.2).
+///
+/// `ApiKey` carries an argon2id *hash*, never a raw key — [`validate`]'s
+/// `PrincipalPut` arm refuses anything else. Admitting a raw key into the log
+/// would put a live credential into every replica's redb file and every
+/// snapshot, forever (there is no way to redact a committed log entry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AuthSource {
+    ApiKey { hash: String },
+    Oidc { issuer: String, subject: String },
+    MtlsSan { san: String },
+}
+
+/// A principal record (RFC-002 §3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Principal {
+    pub id: PrincipalId,
+    pub display_name: String,
+    pub auth: AuthSource,
+    pub disabled: bool,
+}
+
+/// A principal's binding to one tenant (RFC-002 §3.3): what [`ControlOp::BindingPut`]
+/// stores.
+///
+/// `FleetAdmin` is meaningful only on the reserved [`FLEET_SCOPE`] — [`validate`]'s
+/// `BindingPut` arm enforces the pairing in both directions, so a binding
+/// naming `FleetAdmin` on an ordinary tenant, or naming any other role on
+/// `"*"`, can never be committed.
+///
+/// Serializes lower-kebab (`tenant-admin`, `fleet-admin`, ...): this is a
+/// wire enum an operator writes directly in an admin request body, unlike
+/// `ControlOp`'s own snake_case fields, which are never hand-authored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
+    Viewer,
+    Operator,
+    Editor,
+    TenantAdmin,
+    FleetAdmin,
 }
 
 /// The envelope every log entry carries: the op plus the identity needed for
@@ -82,9 +210,14 @@ pub struct ControlRequest {
 
 /// Application-level operation carried by the Raft log (ADR-001 §4.1).
 ///
-/// The reserved variants exist so the log format is stable before RFC-002
-/// (#17) defines their payloads: their tag is fixed now, their body is opaque
-/// JSON, and [`validate`] rejects them until the features land.
+/// The `Tenant*`/`Principal*`/`Binding*` variants are RFC-002's multi-tenancy
+/// and RBAC *records* (issue #159, RFC-002 §10 slice T1): they store tenants,
+/// principals and role bindings, deterministically, like every other op here.
+/// They do not enforce anything — no request is authorized against a
+/// principal or a role anywhere in this crate yet. That is #161. Landing the
+/// records first (this slice) and enforcement second means the wire format
+/// and the replicated tables are stable before anything depends on them for
+/// access control.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlOp {
     PutImposter {
@@ -173,23 +306,55 @@ pub enum ControlOp {
         digest: Digest,
         configs: Vec<ImposterConfig>,
     },
+    /// Create or update a tenant record (RFC-002 §3.1). `display_name` and
+    /// `quotas` are always replaced wholesale — a tenant has few enough
+    /// fields that a partial-update op would be pure complexity for no real
+    /// saving in payload size.
     TenantPut {
-        body: serde_json::Value,
+        tenant: TenantId,
+        display_name: String,
+        quotas: Quotas,
     },
+    /// Tombstone a tenant and cascade-remove its `sm_configs`/`sm_routes`/
+    /// `sm_sources` rows, in the same committed op — see `mutate_tables`'s
+    /// arm for why the cascade cannot be a separate op.
     TenantDelete {
-        body: serde_json::Value,
+        tenant: TenantId,
     },
+    /// Create or update a principal's identity (RFC-002 §3).
+    ///
+    /// **Principals are a fleet-global namespace, and `tenant` does not scope
+    /// them.** [`Principal`] rows are keyed by [`PrincipalId`] alone (see
+    /// `SM_PRINCIPALS_TABLE`'s doc in `raft::store`); `tenant` is recorded for
+    /// audit and checked for liveness, nothing more. Two different tenants
+    /// naming the same [`PrincipalId`] address the *same* record, so the
+    /// second write replaces the first — including its credential.
+    ///
+    /// That is RFC-002 §3's model, not an oversight: only a `RoleBinding` is
+    /// tenant-scoped. It is also exactly why the RFC makes `PrincipalPut` and
+    /// `PrincipalDelete` **`FleetAdmin`-only**, while a `TenantAdmin` gets
+    /// `BindingPut`/`BindingDelete` within its own tenant. Until #161 lands
+    /// that rule there is no enforcement here — so do not read the `tenant`
+    /// field as an isolation guarantee, because it is not one.
     PrincipalPut {
-        body: serde_json::Value,
+        tenant: TenantId,
+        principal: Principal,
     },
     PrincipalDelete {
-        body: serde_json::Value,
+        tenant: TenantId,
+        principal_id: PrincipalId,
     },
+    /// Bind a principal to a role in a tenant (RFC-002 §3.3). `tenant` is
+    /// [`FLEET_SCOPE`] only for a [`Role::FleetAdmin`] binding — [`validate`]
+    /// enforces the pairing both ways.
     BindingPut {
-        body: serde_json::Value,
+        tenant: TenantId,
+        principal_id: PrincipalId,
+        role: Role,
     },
     BindingDelete {
-        body: serde_json::Value,
+        tenant: TenantId,
+        principal_id: PrincipalId,
     },
 }
 
@@ -366,23 +531,51 @@ impl ControlResponse {
 /// `ImposterManager::validate_config_set` for the ops it covers (protocol,
 /// duplicate explicit stub ids), plus the cluster-only rules: an explicit port
 /// (auto-assign cannot replicate — every node would pick a different port),
-/// the single-tenant gate, and the not-yet-implemented variants.
+/// tenant-id shape, and the RFC-002 tenancy/RBAC rules below.
+///
+/// # What T1 does and does not make tenant-aware
+///
+/// The single-tenant gate is lifted here — every op now accepts any
+/// well-formed tenant slug — but T1 (RFC-002 §10) delivers the tenancy
+/// *records and their storage*, not tenant-aware serving. Concretely, a
+/// resource op naming a non-`default` tenant is validated, committed and
+/// stored against `(tenant, …)`, and its `TenantDelete` cascades over it — but
+/// the read and sync paths (`desired_configs`, `desired_routes`,
+/// `read_config`, `configured_ports`, `sources`, `config_provenance`) still
+/// filter to `default`, so nothing binds it and no operator surface reports
+/// it. **Storing is not serving in this slice.**
+///
+/// That is deliberate rather than an oversight, and it is why T1's exit
+/// criterion — *no observable change* — still holds: the admin HTTP front
+/// constructs `TenantId::default()` at every call site, so nothing reachable
+/// over the API can create such a row. Only a direct `RiftNode::submit` can,
+/// which is how the tenancy tests exercise the cascade and the fleet-wide port
+/// rule that RFC-002 §3.2 requires.
+///
+/// One consequence to know before widening anything: because ports are
+/// fleet-unique across tenants, a config stored for tenant A *does* claim its
+/// port against tenant B — see `mutate_tables`' collision check. That is the
+/// rule, not a bug, but it means the slice that makes serving tenant-aware
+/// must land the read paths in the same PR, or an operator can be refused a
+/// port that nothing is listening on and no read path reports as taken.
 ///
 /// `Err` carries the reason recorded in the `Failed` outcome. It must depend
-/// only on the op itself, never on per-node state.
+/// only on the op itself, never on per-node state — a tenant's *existence* is
+/// state, so that check lives in `raft::store::mutate_tables` instead (see
+/// its `PrincipalPut`/`BindingPut` arms), not here.
 pub fn validate(op: &ControlOp) -> Result<(), String> {
     match op {
         ControlOp::PutImposter { tenant, config } => {
-            require_default_tenant(tenant)?;
+            require_real_tenant(tenant)?;
             validate_replicable_config(config)
         }
         ControlOp::PatchStubs { tenant, .. } | ControlOp::DeleteImposter { tenant, .. } => {
-            require_default_tenant(tenant)
+            require_real_tenant(tenant)
         }
-        ControlOp::DeleteAll { tenant } => require_default_tenant(tenant),
-        ControlOp::SetEnabled { tenant, .. } => require_default_tenant(tenant),
+        ControlOp::DeleteAll { tenant } => require_real_tenant(tenant),
+        ControlOp::SetEnabled { tenant, .. } => require_real_tenant(tenant),
         ControlOp::PutRoutes { tenant, table } => {
-            require_default_tenant(tenant)?;
+            require_real_tenant(tenant)?;
             // The U-11 rules (unique ids, ambiguous enabled matches,
             // strip_prefix without path_prefix, malformed wildcard/method/
             // prefix) plus the whole-table atomicity the issue calls for: a
@@ -393,8 +586,8 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
         // Ambiguity is pairwise, so removing an element can only shrink the
         // set of matching pairs, never create one — the remaining table is
         // structurally guaranteed valid, so there is nothing to check here
-        // beyond the tenant gate.
-        ControlOp::DeleteRoute { tenant, .. } => require_default_tenant(tenant),
+        // beyond the tenant shape.
+        ControlOp::DeleteRoute { tenant, .. } => require_real_tenant(tenant),
         ControlOp::SourcePut {
             tenant,
             id,
@@ -404,7 +597,7 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             poll_secs,
             ..
         } => {
-            require_default_tenant(tenant)?;
+            require_real_tenant(tenant)?;
             require_source_id(id)?;
             // Hygiene strictly before shape, and the order is load-bearing.
             // Both must hold, but a URI that fails *both* — say
@@ -456,7 +649,7 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             Ok(())
         }
         ControlOp::SourceDelete { tenant, id } => {
-            require_default_tenant(tenant)?;
+            require_real_tenant(tenant)?;
             require_source_id(id)
         }
         ControlOp::SourcePullResult {
@@ -466,7 +659,7 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             configs,
             ..
         } => {
-            require_default_tenant(tenant)?;
+            require_real_tenant(tenant)?;
             require_source_id(id)?;
             if digest.as_str().is_empty() {
                 return Err(
@@ -503,13 +696,76 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             }
             Ok(())
         }
-        ControlOp::TenantPut { .. }
-        | ControlOp::TenantDelete { .. }
-        | ControlOp::PrincipalPut { .. }
-        | ControlOp::PrincipalDelete { .. }
-        | ControlOp::BindingPut { .. }
-        | ControlOp::BindingDelete { .. } => {
-            Err("reserved op: multi-tenancy and RBAC arrive with RFC-002 (#17)".to_owned())
+        ControlOp::TenantPut {
+            tenant,
+            display_name,
+            quotas: _,
+        } => {
+            require_real_tenant(tenant)?;
+            if display_name.trim().is_empty() {
+                return Err("tenant display_name must not be empty".to_owned());
+            }
+            // No bounds on `quotas`' values: this slice stores them, it does
+            // not enforce them (#163), so there is nothing here to reject a
+            // number against yet — see `Quotas`' doc comment.
+            Ok(())
+        }
+        ControlOp::TenantDelete { tenant } => {
+            require_real_tenant(tenant)?;
+            if tenant.is_default() {
+                return Err(
+                    "the default tenant cannot be deleted: it is the fleet's always-present \
+                     scope for an unscoped request"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
+        ControlOp::PrincipalPut { tenant, principal } => {
+            require_real_tenant(tenant)?;
+            require_principal_id(&principal.id)?;
+            if principal.display_name.trim().is_empty() {
+                return Err("principal display_name must not be empty".to_owned());
+            }
+            validate_auth_source(&principal.auth)
+        }
+        ControlOp::PrincipalDelete {
+            tenant,
+            principal_id,
+        } => {
+            require_real_tenant(tenant)?;
+            require_principal_id(principal_id)
+        }
+        ControlOp::BindingPut {
+            tenant,
+            principal_id,
+            role,
+        } => {
+            require_tenant_or_fleet_scope(tenant)?;
+            require_principal_id(principal_id)?;
+            let is_fleet_scope = tenant.as_str() == FLEET_SCOPE;
+            let is_fleet_admin = matches!(role, Role::FleetAdmin);
+            if is_fleet_scope && !is_fleet_admin {
+                Err(format!(
+                    "role {role:?} is not valid on the reserved fleet scope {FLEET_SCOPE:?}: \
+                     only fleet-admin binds there"
+                ))
+            } else if !is_fleet_scope && is_fleet_admin {
+                Err(format!(
+                    "fleet-admin may only be bound on the reserved fleet scope {FLEET_SCOPE:?}, \
+                     not tenant {:?}",
+                    tenant.as_str()
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        ControlOp::BindingDelete {
+            tenant,
+            principal_id,
+        } => {
+            require_tenant_or_fleet_scope(tenant)?;
+            require_principal_id(principal_id)
         }
     }
 }
@@ -732,14 +988,115 @@ fn require_well_formed_uri(uri: &str) -> Result<(), String> {
     }
 }
 
-fn require_default_tenant(tenant: &TenantId) -> Result<(), String> {
-    if tenant.is_default() {
+/// A tenant id's wire shape (RFC-002 §3.1): `[a-z0-9][a-z0-9-]{0,63}`.
+///
+/// Deliberately narrower than an arbitrary UTF-8 string: a tenant id is a
+/// redb key component today and an admin-surface path segment as soon as
+/// #161 exposes one, so it is restricted to the safe subset once, here,
+/// rather than escaped at every future use site.
+fn is_tenant_slug(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && id.len() <= 64
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn require_tenant_slug(tenant: &TenantId) -> Result<(), String> {
+    if is_tenant_slug(tenant.as_str()) {
         Ok(())
     } else {
         Err(format!(
-            "unknown tenant {:?}: multi-tenancy arrives with RFC-002 (#17)",
+            "tenant id {:?} must match [a-z0-9][a-z0-9-]{{0,63}}",
             tenant.as_str()
         ))
+    }
+}
+
+/// A well-formed tenant id that is also a *real* tenant scope: every op
+/// except a binding may target [`FLEET_SCOPE`] (`"*"`) — there is no tenant
+/// record there, ever, so an op that would create or address one must refuse
+/// it up front rather than let it silently succeed against nothing.
+fn require_real_tenant(tenant: &TenantId) -> Result<(), String> {
+    require_tenant_slug(tenant)?;
+    if tenant.as_str() == FLEET_SCOPE {
+        Err(format!(
+            "{FLEET_SCOPE:?} is the reserved fleet-wide scope, not a tenant: it names no \
+             TenantPut record and never will"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Accepts a well-formed tenant slug OR [`FLEET_SCOPE`] — the two valid
+/// binding targets (RFC-002 §3.3): an ordinary tenant, or the fleet-wide
+/// scope [`Role::FleetAdmin`] binds against. Which roles are valid for which
+/// of the two is a separate, op-specific check — see `validate`'s
+/// `BindingPut` arm.
+fn require_tenant_or_fleet_scope(tenant: &TenantId) -> Result<(), String> {
+    if tenant.as_str() == FLEET_SCOPE {
+        Ok(())
+    } else {
+        require_tenant_slug(tenant)
+    }
+}
+
+/// Whether `id` is usable as a [`PrincipalId`]: a bounded, control-character-free
+/// token. Wider than [`is_source_name`]'s charset — a principal id may come
+/// from an external identity provider (an OIDC `subject`, say) rather than be
+/// operator-chosen — but still bounded, because it is a redb key component.
+fn require_principal_id(id: &PrincipalId) -> Result<(), String> {
+    let s = id.as_str();
+    if !s.is_empty() && s.len() <= 256 && s.chars().all(|c| !c.is_control()) {
+        Ok(())
+    } else {
+        Err(
+            "principal id must be a non-empty string of at most 256 bytes with no control \
+             characters"
+                .to_owned(),
+        )
+    }
+}
+
+/// The credential-hygiene rule for principals, mirroring
+/// [`require_credential_free_uri`]'s role for sources: a raw API key must
+/// never enter the replicated log, so only an already-hashed argon2id
+/// credential is accepted — recognizable by the `$argon2id$` prefix argon2's
+/// own PHC-string encoder produces. There is no way to tell a raw key from an
+/// unknown hash format by inspection alone, so anything without that prefix
+/// is refused rather than guessed at.
+fn validate_auth_source(auth: &AuthSource) -> Result<(), String> {
+    match auth {
+        AuthSource::ApiKey { hash } => {
+            const PREFIX: &str = "$argon2id$";
+            if hash.is_empty() {
+                Err("principal auth hash must not be empty".to_owned())
+            } else if !hash.starts_with(PREFIX) {
+                Err(format!(
+                    "principal auth hash must be an argon2id encoded hash (starting with \
+                     {PREFIX:?}), never a raw key"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        AuthSource::Oidc { issuer, subject } => {
+            if issuer.trim().is_empty() || subject.trim().is_empty() {
+                Err("oidc auth must carry a non-empty issuer and subject".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+        AuthSource::MtlsSan { san } => {
+            if san.trim().is_empty() {
+                Err("mtls_san auth must carry a non-empty san".to_owned())
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -863,6 +1220,24 @@ mod tests {
 
     fn stub_ids(stubs: &[Stub]) -> Vec<Option<String>> {
         stubs.iter().map(|s| s.id.clone()).collect()
+    }
+
+    /// A well-formed argon2id hash shape (RFC-002 §3.2). Not a real hash of
+    /// anything — `validate` only ever checks the PHC-string prefix, never
+    /// verifies a password against it — so a fixed placeholder is enough to
+    /// stand in wherever a valid one is needed.
+    const VALID_ARGON2_HASH: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
+
+    fn test_principal(id: &str) -> Principal {
+        Principal {
+            id: PrincipalId::new(id),
+            display_name: id.to_owned(),
+            auth: AuthSource::ApiKey {
+                hash: VALID_ARGON2_HASH.to_owned(),
+            },
+            disabled: false,
+        }
     }
 
     // -- log-format stability -------------------------------------------------
@@ -996,16 +1371,47 @@ mod tests {
                 },
                 "SourcePullResult",
             ),
-            (ControlOp::TenantPut { body: json!({}) }, "TenantPut"),
-            (ControlOp::TenantDelete { body: json!({}) }, "TenantDelete"),
-            (ControlOp::PrincipalPut { body: json!({}) }, "PrincipalPut"),
             (
-                ControlOp::PrincipalDelete { body: json!({}) },
+                ControlOp::TenantPut {
+                    tenant: TenantId::new("acme"),
+                    display_name: "Acme Corp".to_owned(),
+                    quotas: Quotas::default(),
+                },
+                "TenantPut",
+            ),
+            (
+                ControlOp::TenantDelete {
+                    tenant: TenantId::new("acme"),
+                },
+                "TenantDelete",
+            ),
+            (
+                ControlOp::PrincipalPut {
+                    tenant: TenantId::new("acme"),
+                    principal: test_principal("alice"),
+                },
+                "PrincipalPut",
+            ),
+            (
+                ControlOp::PrincipalDelete {
+                    tenant: TenantId::new("acme"),
+                    principal_id: PrincipalId::new("alice"),
+                },
                 "PrincipalDelete",
             ),
-            (ControlOp::BindingPut { body: json!({}) }, "BindingPut"),
             (
-                ControlOp::BindingDelete { body: json!({}) },
+                ControlOp::BindingPut {
+                    tenant: TenantId::new("acme"),
+                    principal_id: PrincipalId::new("alice"),
+                    role: Role::Editor,
+                },
+                "BindingPut",
+            ),
+            (
+                ControlOp::BindingDelete {
+                    tenant: TenantId::new("acme"),
+                    principal_id: PrincipalId::new("alice"),
+                },
                 "BindingDelete",
             ),
         ];
@@ -1097,13 +1503,43 @@ mod tests {
         }
     }
 
+    /// RFC-002 §10 T1 lifts the single-tenant gate: a resource op now accepts
+    /// any well-formed tenant slug, not just `"default"`.
     #[test]
-    fn validate_rejects_a_non_default_tenant() {
+    fn validate_accepts_a_well_formed_non_default_tenant() {
         let op = ControlOp::DeleteAll {
             tenant: TenantId::new("acme"),
         };
-        let err = validate(&op).expect_err("non-default tenant must be rejected");
-        assert!(err.contains("tenant"), "{err}");
+        assert_eq!(validate(&op), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_tenant_id() {
+        for id in [
+            "",
+            "Acme",
+            "-acme",
+            "acme_corp",
+            "acme.corp",
+            &"a".repeat(65),
+        ] {
+            let op = ControlOp::DeleteAll {
+                tenant: TenantId::new(id),
+            };
+            let err = validate(&op).expect_err("malformed tenant id must be rejected");
+            assert!(err.contains("tenant"), "id {id:?}: {err}");
+        }
+    }
+
+    /// [`FLEET_SCOPE`] is the reserved fleet-wide scope, never a real tenant:
+    /// no op that addresses a tenant record may target it.
+    #[test]
+    fn validate_rejects_the_fleet_scope_as_a_real_tenant() {
+        let op = ControlOp::DeleteAll {
+            tenant: TenantId::new(FLEET_SCOPE),
+        };
+        let err = validate(&op).expect_err("the fleet scope is not a tenant");
+        assert!(err.contains(FLEET_SCOPE), "{err}");
     }
 
     #[test]
@@ -1143,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_set_enabled_on_the_default_tenant_only() {
+    fn validate_accepts_set_enabled_on_any_well_formed_tenant() {
         let op = ControlOp::SetEnabled {
             tenant: TenantId::default(),
             port: 1,
@@ -1156,23 +1592,7 @@ mod tests {
             port: 1,
             enabled: false,
         };
-        validate(&op).expect_err("non-default tenant is still refused");
-    }
-
-    #[test]
-    fn validate_rejects_every_reserved_variant() {
-        let reserved = [
-            ControlOp::TenantPut { body: json!({}) },
-            ControlOp::TenantDelete { body: json!({}) },
-            ControlOp::PrincipalPut { body: json!({}) },
-            ControlOp::PrincipalDelete { body: json!({}) },
-            ControlOp::BindingPut { body: json!({}) },
-            ControlOp::BindingDelete { body: json!({}) },
-        ];
-        for op in reserved {
-            let err = validate(&op).expect_err("reserved until RFC-002");
-            assert!(err.contains("#17"), "{err}");
-        }
+        assert_eq!(validate(&op), Ok(()));
     }
 
     // -- validate: PutRoutes / DeleteRoute -------------------------------------
@@ -1205,12 +1625,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_put_routes_on_a_non_default_tenant() {
+    fn validate_accepts_put_routes_on_any_well_formed_tenant() {
         let op = ControlOp::PutRoutes {
             tenant: TenantId::new("acme"),
             table: RouteTable::default(),
         };
-        let err = validate(&op).expect_err("non-default tenant must be rejected");
+        assert_eq!(validate(&op), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_put_routes_on_a_malformed_tenant() {
+        let op = ControlOp::PutRoutes {
+            tenant: TenantId::new("Not Valid"),
+            table: RouteTable::default(),
+        };
+        let err = validate(&op).expect_err("malformed tenant id must be rejected");
         assert!(err.contains("tenant"), "{err}");
     }
 
@@ -1266,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_delete_route_on_the_default_tenant_only() {
+    fn validate_accepts_delete_route_on_any_well_formed_tenant() {
         let op = ControlOp::DeleteRoute {
             tenant: TenantId::default(),
             id: "any".to_owned(),
@@ -1277,7 +1706,7 @@ mod tests {
             tenant: TenantId::new("acme"),
             id: "any".to_owned(),
         };
-        validate(&op).expect_err("non-default tenant is still refused");
+        assert_eq!(validate(&op), Ok(()));
     }
 
     // -- validate: source ops (issue #134) --------------------------------------
@@ -1778,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_source_ops_on_a_non_default_tenant() {
+    fn validate_accepts_source_ops_on_any_well_formed_tenant() {
         let ops = [
             ControlOp::SourcePut {
                 tenant: TenantId::new("acme"),
@@ -1802,8 +2231,179 @@ mod tests {
             },
         ];
         for op in ops {
-            let err = validate(&op).expect_err("non-default tenant must be rejected");
-            assert!(err.contains("tenant"), "{err}");
+            assert_eq!(validate(&op), Ok(()), "{op:?}");
+        }
+    }
+
+    // -- validate: tenancy and RBAC records (issue #159, RFC-002 §10 T1) -------
+
+    fn tenant_put(id: &str) -> ControlOp {
+        ControlOp::TenantPut {
+            tenant: TenantId::new(id),
+            display_name: "Acme Corp".to_owned(),
+            quotas: Quotas::default(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_tenant_put() {
+        assert_eq!(validate(&tenant_put("acme")), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_a_tenant_put_with_an_empty_display_name() {
+        let op = ControlOp::TenantPut {
+            tenant: TenantId::new("acme"),
+            display_name: "   ".to_owned(),
+            quotas: Quotas::default(),
+        };
+        let err = validate(&op).expect_err("an empty display name names nothing");
+        assert!(err.contains("display_name"), "{err}");
+    }
+
+    /// The fleet's always-present, unscoped-request tenant must never become
+    /// deletable — there would be nowhere left for a pre-#159 request to land.
+    #[test]
+    fn validate_rejects_deleting_the_default_tenant() {
+        let op = ControlOp::TenantDelete {
+            tenant: TenantId::default(),
+        };
+        let err = validate(&op).expect_err("the default tenant must never be deletable");
+        assert!(err.contains("default"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_deleting_a_non_default_tenant() {
+        let op = ControlOp::TenantDelete {
+            tenant: TenantId::new("acme"),
+        };
+        assert_eq!(validate(&op), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_principal_put() {
+        let op = ControlOp::PrincipalPut {
+            tenant: TenantId::new("acme"),
+            principal: test_principal("alice"),
+        };
+        assert_eq!(validate(&op), Ok(()));
+    }
+
+    /// The secret-hygiene rule for principals, mirroring the source-uri rule
+    /// above: a raw API key must never be admitted into the replicated log.
+    #[test]
+    fn validate_rejects_a_principal_put_carrying_a_raw_key_instead_of_a_hash() {
+        let op = ControlOp::PrincipalPut {
+            tenant: TenantId::new("acme"),
+            principal: Principal {
+                auth: AuthSource::ApiKey {
+                    hash: "rift_live_sk_notahash".to_owned(),
+                },
+                ..test_principal("alice")
+            },
+        };
+        let err = validate(&op).expect_err("a raw key is not an argon2id hash");
+        assert!(err.contains("argon2id"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_a_principal_put_with_an_empty_hash() {
+        let op = ControlOp::PrincipalPut {
+            tenant: TenantId::new("acme"),
+            principal: Principal {
+                auth: AuthSource::ApiKey {
+                    hash: String::new(),
+                },
+                ..test_principal("alice")
+            },
+        };
+        let err = validate(&op).expect_err("an empty hash names no credential");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_an_unusable_principal_id() {
+        let op = ControlOp::PrincipalPut {
+            tenant: TenantId::new("acme"),
+            principal: Principal {
+                id: PrincipalId::new(""),
+                ..test_principal("alice")
+            },
+        };
+        let err = validate(&op).expect_err("an empty principal id addresses nothing");
+        assert!(err.contains("principal id"), "{err}");
+    }
+
+    fn binding_put(tenant: &str, role: Role) -> ControlOp {
+        ControlOp::BindingPut {
+            tenant: TenantId::new(tenant),
+            principal_id: PrincipalId::new("alice"),
+            role,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_fleet_admin_only_on_the_fleet_scope() {
+        assert_eq!(
+            validate(&binding_put(FLEET_SCOPE, Role::FleetAdmin)),
+            Ok(())
+        );
+    }
+
+    /// `Role::FleetAdmin` bound on an ordinary tenant would let a tenant-scoped
+    /// principal act with fleet-wide power — the exact escalation RFC-002 §3.3
+    /// exists to prevent.
+    #[test]
+    fn validate_rejects_fleet_admin_on_an_ordinary_tenant() {
+        let err = validate(&binding_put("payments", Role::FleetAdmin))
+            .expect_err("fleet-admin must never bind on an ordinary tenant");
+        assert!(err.contains("fleet-admin"), "{err}");
+    }
+
+    /// The converse: every non-fleet-admin role is meaningless on the
+    /// fleet-wide scope, so it is refused rather than silently accepted.
+    #[test]
+    fn validate_rejects_a_non_fleet_admin_role_on_the_fleet_scope() {
+        for role in [
+            Role::Viewer,
+            Role::Operator,
+            Role::Editor,
+            Role::TenantAdmin,
+        ] {
+            let err = validate(&binding_put(FLEET_SCOPE, role))
+                .expect_err("only fleet-admin binds on the fleet scope");
+            assert!(err.contains(FLEET_SCOPE), "{role:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_an_ordinary_role_on_an_ordinary_tenant() {
+        for role in [
+            Role::Viewer,
+            Role::Operator,
+            Role::Editor,
+            Role::TenantAdmin,
+        ] {
+            assert_eq!(validate(&binding_put("payments", role)), Ok(()), "{role:?}");
+        }
+    }
+
+    /// Every wire role value, locked to lower-kebab: this is what an operator
+    /// writes in an admin request body, so a spelling drift here is a wire
+    /// break for every existing client.
+    #[test]
+    fn every_role_spelling_is_stable_lower_kebab() {
+        for (role, spelling) in [
+            (Role::Viewer, "viewer"),
+            (Role::Operator, "operator"),
+            (Role::Editor, "editor"),
+            (Role::TenantAdmin, "tenant-admin"),
+            (Role::FleetAdmin, "fleet-admin"),
+        ] {
+            let value = serde_json::to_value(role).expect("serialize");
+            assert_eq!(value, json!(spelling));
+            let back: Role = serde_json::from_value(value).expect("round-trips");
+            assert_eq!(back, role);
         }
     }
 

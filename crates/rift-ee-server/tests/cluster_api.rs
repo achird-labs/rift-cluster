@@ -202,7 +202,12 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
     assert_eq!(reported["state"], "applied");
     assert_eq!(reported["revision"], response.revision);
 
-    // Failed ops are terminal and queryable too.
+    // Failed ops are terminal and queryable too. The op just has to fail
+    // deterministically — what this test is about is the `/_cluster/ops` state
+    // machine, not the reason. It used to name a non-default tenant, which
+    // stopped failing when #159 lifted the single-tenant gate; a *malformed*
+    // tenant slug is refused by `validate` for as long as tenant ids have a
+    // shape, so it keeps the `detail` assertion below meaningful.
     let failed_id = uuid::Uuid::from_u128(0xFA11);
     fixture
         .node
@@ -212,7 +217,7 @@ async fn ops_endpoint_reports_applied_pending_and_unknown() {
             issued_at_secs: 0,
             expected_revision: None,
             op: ControlOp::DeleteAll {
-                tenant: TenantId::new("acme"),
+                tenant: TenantId::new("Not A Slug"),
             },
         })
         .await
