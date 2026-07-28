@@ -110,6 +110,32 @@ jobs:
           # headroom for a CI runner slower than the one this was measured on.
           - scenario: c18_routes_survive_a_full_cluster_restart
             iterations: 80
+          # Imposter sources (#137). Every one of these brings up a fourth
+          # container (the counting origin) alongside the fleet. Sized from
+          # per-iteration wall clock measured against a pre-built image, the
+          # same way this job runs them.
+          #
+          # C20 is a stack-up, one declare, two pulls and a convergence check —
+          # measured at ~18s/iteration, the same shape and cost as C17, so it
+          # gets the same 100 and lands near 30 min against the 100 min budget.
+          - scenario: c20_source_pull_converges_and_fetches_once
+            iterations: 100
+          # C21 carries two irreducible 40s measurement windows on top of an
+          # election and a poll-driven convergence — measured at ~108s, the most
+          # expensive per iteration in the suite. 50 lands near 90 min. Do not
+          # raise it without re-measuring, and never buy headroom by shortening
+          # the windows: the rate bound is derived from their length.
+          - scenario: c21_tracking_poll_is_leader_only_and_survives_failover
+            iterations: 50
+          # One full-fleet stop/start on top of two sources and a hand edit,
+          # measured at ~40s/iteration — the same cost as C18's restart, so the
+          # same 80, landing near 53 min.
+          - scenario: c22_sources_survive_a_full_cluster_restart
+            iterations: 80
+          # Stack up, one declare, one hand edit, two pulls, no restart —
+          # measured at ~18s/iteration, so 100 lands near 30 min.
+          - scenario: c23_drift_flags_and_pull_overwrites
+            iterations: 100
 
     steps:
       - uses: actions/checkout@v4
@@ -149,11 +175,11 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: |
           set -euo pipefail
-          sudo sysctl -w net.ipv4.ip_local_reserved_ports=36300,36400,39090,42525,45251-45253,45261-45263,48474,49901
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,39090,42525,45251-45253,45261-45263,46525,48474,49901
           # Assert the read-back, do not merely print it: `sysctl <key>` exits 0
           # whatever the value is, so echoing it would prove nothing about a
           # partially applied or silently truncated write.
-          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "36300,36400,39090,42525,45251-45253,45261-45263,48474,49901"
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,39090,42525,45251-45253,45261-45263,46525,48474,49901"
 
       # Once per job rather than once per iteration: the image is identical
       # across iterations, and rebuilding it 100 times would dominate the budget.

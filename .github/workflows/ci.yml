@@ -143,7 +143,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.changed.outputs.run == 'true'
 
-      # The tier publishes fixed host ports, and eleven of them fall inside
+      # The tier publishes fixed host ports, and thirteen of them fall inside
       # Linux's ephemeral range (32768-60999). Any outbound connection on the
       # runner — including the harness's own polling of these very endpoints —
       # can be handed one as a source port, and `compose up` then fails to bind
@@ -160,11 +160,11 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         run: |
           set -euo pipefail
-          sudo sysctl -w net.ipv4.ip_local_reserved_ports=36300,36400,39090,42525,45251-45253,45261-45263,48474,49901
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,39090,42525,45251-45253,45261-45263,46525,48474,49901
           # Assert the read-back, do not merely print it: `sysctl <key>` exits 0
           # whatever the value is, so echoing it would prove nothing about a
           # partially applied or silently truncated write.
-          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "36300,36400,39090,42525,45251-45253,45261-45263,48474,49901"
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,39090,42525,45251-45253,45261-45263,46525,48474,49901"
 
       # Serial by necessity, not by preference: the compose file publishes fixed
       # host ports, so two stacks cannot coexist on one runner.

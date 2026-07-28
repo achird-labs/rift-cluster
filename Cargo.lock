@@ -560,6 +560,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "reqwest",
+ "rift-cluster",
  "serde_json",
  "tokio",
 ]

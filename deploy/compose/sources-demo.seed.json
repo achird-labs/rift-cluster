@@ -1,0 +1,15 @@
+{
+  "//": "The `file:` half of the demo's --imposters list, mounted read-only into every node at /seed/local.json. It shows that a source list mixes schemes freely: some mocks come from a config server the whole organisation shares, some are baked into the image beside the app. Both arrive through the replicated log, so all three nodes serve both.",
+  "imposters": [
+    {
+      "port": 7002,
+      "protocol": "http",
+      "name": "local-seed",
+      "stubs": [
+        {
+          "responses": [{ "is": { "statusCode": 200, "body": "local seed\n" } }]
+        }
+      ]
+    }
+  ]
+}

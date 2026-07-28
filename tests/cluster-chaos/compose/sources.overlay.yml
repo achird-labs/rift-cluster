@@ -1,0 +1,99 @@
+# Overlay: the imposter-source scenarios (C20-C23, issue #137).
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/sources.overlay.yml up
+#
+# Two additions, for two different reasons.
+#
+# ## 1. Each node's cluster port, published
+#
+# `/admin/sources*` rides the **cluster port**, not the admin API: a source is a
+# control-plane object an operator manages, it is authenticated with the cluster
+# credential rather than the admin API key, and the cluster port is the single
+# authenticated listener that already carries exactly that audience (see the
+# module doc in `crates/rift-cluster/src/sources/mod.rs`). The shipped base file
+# deliberately does not publish 4790 — peers reach it over the container network
+# and an operator reaches it from inside the perimeter — so publishing it is
+# scoped here, to the four scenarios that need it, and is not a change to what
+# the reference deployment exposes.
+#
+# All three nodes, and that is the assertion rather than a convenience: C20's
+# barrier and C22's post-restart checks both read **every** node's own applied
+# state. "The fleet converged" and "the node we wrote through converged" are
+# only different claims if you can ask all three.
+#
+# 14790/24790/34790 follow the base file's 1xxxx/2xxxx/3xxxx-per-node
+# convention. **34790 is inside** Linux's ephemeral source-port range
+# (32768-60999) and so must be listed in the `ip_local_reserved_ports` step both
+# workflows run, alongside 36300/36400 and the origin's 46525 below;
+# `ci_reserves_every_published_port_that_linux_could_hand_out` fails the build
+# if it is not. 14790 and 24790 sit below the range and need nothing.
+#
+# ## 2. `source-origin`: the counting server
+#
+# C20's central claim is that a pull fetches the source **exactly once
+# fleet-wide** — the node that received the request fetches, hashes, and submits
+# an ordinary control op; followers apply and never fetch. Asserting that needs
+# something that counts requests, and counts them exactly.
+#
+# So the origin is a fourth `rift-ee-server`, run **un-clustered**, whose
+# imposter's response body *is* the config document the fleet fetches. Its
+# Mountebank-compatible admin API then hands the harness the counter for free:
+# `GET /imposters/6600` reports `numberOfRequests`, maintained whether or not
+# request recording is on. "Fetched once" becomes `== 1` against a first-class
+# API value instead of a log scrape.
+#
+# A rift container rather than a tiny static-file image, deliberately: this tier
+# pins its images (`toxiproxy`, `envoy`) by digest, and adding a public image
+# means adding a digest to pin, review and rotate — a new supply-chain surface
+# to serve a counter the binary already in this repo publishes. The origin also
+# gains, for nothing, the ability to *change* what it serves mid-scenario
+# (`PUT /imposters/6600/stubs`), which C21's content change and C23's repair
+# pull both need and which a static file could not do without a container
+# restart.
+#
+# Un-clustered is not incidental either. The origin must be a plain HTTP host
+# that the fleet fetches *from*, entirely outside the replicated log — a fourth
+# voter would change the quorum arithmetic every one of these scenarios depends
+# on, and C21 kills a leader.
+#
+# Its healthcheck targets the admin API rather than `/readyz`: the probe
+# listener is bound by the clustered composition only, so an un-clustered node
+# has no 2526 to answer and the image's default healthcheck would report it
+# permanently unhealthy.
+#
+# 172.28.7.20 keeps it clear of the nodes' .11/.12/.13 on the same fixed subnet;
+# the fleet reaches it by service name (`http://source-origin:6600/...`) through
+# Docker's embedded DNS, because a source URI is replicated state and must be
+# fetchable from every node rather than only from the harness's side.
+
+services:
+  rift-1:
+    ports:
+      - "14790:4790"
+  rift-2:
+    ports:
+      - "24790:4790"
+  rift-3:
+    ports:
+      - "34790:4790"
+
+  source-origin:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      args:
+        RIFT_UPSTREAM_VERSION: "${RIFT_UPSTREAM_VERSION:-}"
+    container_name: source-origin
+    hostname: source-origin
+    networks:
+      rift:
+        ipv4_address: 172.28.7.20
+    ports:
+      - "46525:2525"   # admin API -- where the fetch counter is read
+    healthcheck:
+      test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2525/imposters"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s

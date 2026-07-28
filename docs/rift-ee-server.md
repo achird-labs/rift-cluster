@@ -357,6 +357,17 @@ the fleet has converged.
 
 `/_cluster/ring` and `/_cluster/kv` arrive with later phases.
 
+**Calling them.** Every request on this port carries an HMAC over its
+timestamp, nonce, method, path and body (RFC-001 §11.2), so plain `curl` cannot
+reach it. `cargo run -q -p rift-cluster --example cluster-curl` is a one-file
+client that signs one request and prints the answer — deliberately minimal, and
+living in the crate that defines the format so the two cannot drift:
+
+```sh
+cargo run -q -p rift-cluster --example cluster-curl -- \
+    --secret "$RIFT_CLUSTER_SECRET" GET http://127.0.0.1:4790/_cluster/members
+```
+
 ## Metrics
 
 Under `--cluster` the node publishes fleet gauges on the existing metrics port
@@ -637,6 +648,21 @@ malformed body, an unservable scheme, a drifted source under `onDrift: fail`),
 could not be committed — the same Chapter 4 write-path contract the admin
 front uses, so a client polls `GET /_cluster/ops/:id` rather than blind-
 retrying.
+
+**What a pull's 2xx does and does not promise.** It means the op was committed
+and *the node you asked* has applied it — the puller awaits its own local apply
+before answering, no more (#99). `--cluster-write-barrier` is a property of the
+**admin front**, and these endpoints are not on it, so a 2xx here is not the
+fleet-wide read-after-write a `POST /imposters` 201 is. The rest of the fleet
+follows within a replication round; compare `GET /_cluster/config` across nodes
+if a script needs to know it has. Container scenario
+`c20_source_pull_converges_and_fetches_once` is where that convergence is
+asserted, alongside the exactly-one-fetch equality.
+
+These endpoints are on the cluster port, so reach them with `cluster-curl` (see
+"The `/_cluster/*` operator surface" above), and see `deploy/README.md`'s
+"Imposter sources demo" for a three-node walkthrough that rolls the whole fleet
+with one pull.
 
 | Field | Values | Meaning |
 |---|---|---|

@@ -89,12 +89,32 @@ The one rule that makes this cluster-correct: **fetching never happens in the
 apply path.** Two nodes fetching the same URL can receive different bytes; so
 exactly one fetch happens, its result enters the log as data, and every node
 applies identical bytes. Everything else follows from machinery already built:
-pulls are ops (op-id dedup makes retries safe, Chapter 4), the barrier makes a
-pull fleet-visible at its 2xx, provenance (`source id + version`) lands on
-each config record, and a manual edit to a source-owned imposter flips a
-visible `drifted` flag whose fate on the next pull is a per-source policy
-(`overwrite | skip | fail`) — Solo's silent re-pull clobber, made declared and
-observable.
+pulls are ops (op-id dedup makes retries safe, Chapter 4), provenance
+(`source id + version`) lands on each config record, and a manual edit to a
+source-owned imposter flips a visible `drifted` flag whose fate on the next
+pull is a per-source policy (`overwrite | skip | fail`) — Solo's silent
+re-pull clobber, made declared and observable.
+
+**Correction (#137).** An earlier draft of this section also claimed "the
+barrier makes a pull fleet-visible at its 2xx". It does not, and the
+distinction matters to anyone scripting against this path.
+`--cluster-write-barrier` is a property of the **admin front**
+(`crates/rift-ee-server/src/admin_front.rs`), while `POST /admin/sources/:id/pull`
+rides the **cluster port**: `SourcePuller::pull` submits the op and then awaits
+only *this* node's local apply (#99), so its 2xx means "committed, and the node
+you asked has it". The fleet follows within a replication round, which is what
+`c20_source_pull_converges_and_fetches_once` polls for rather than asserting at
+2xx-return. Read-your-write across the fleet on this path would be a barrier the
+source handler has to take, not one it already has.
+
+**Verified, not asserted.** Container scenarios C20–C23
+(`tests/cluster-chaos/tests/scenarios.rs`) hold this section to its claims: a
+pull converges fleet-wide and the config server counts **exactly one** request
+for it (`== 1`, never `>= 1`); a tracking source is polled by the leader alone,
+and still is after that leader is killed; sources, provenance and drift flags
+survive a full-fleet restart; and a hand edit shows as drift on every node
+before the next pull overwrites it. Each was also shown red under a named
+mutant — see the chaos README's "C20–C23" section.
 
 Sources are tenant-owned, quota-counted, and audited like every other write:
 "who moved the payment mocks to which commit, when" is a log query, not a

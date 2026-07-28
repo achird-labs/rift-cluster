@@ -24,12 +24,15 @@ use tokio::task::JoinSet;
 use cluster_chaos::{
     CONVERGE_TIMEOUT, Cluster, FLOW_STATE_HOST_PORTS, FLOW_STATE_IMPOSTER_PORT,
     FRONT_DOOR_HOST_PORTS, FRONT_PORT, NODES, PULL_ON_MISS_HOST_PORTS, PULL_ON_MISS_IMPOSTER_PORT,
-    add_toxic, append_stub, backend_failing_health_check, clear_toxics, config_revision,
-    exec_probe, get_data_plane, get_data_plane_with, get_json, imposter_ports, metric, probe,
-    published_host_ports, put_imposter, put_imposter_config, put_imposter_with_key, put_routes,
-    put_stubs, toxic_count, wait_admin_reachable, wait_backend_ejected, wait_converged,
-    wait_converged_on, wait_ports_free_in, wait_revisions_agree, wait_revisions_agree_on,
-    wait_single_leader, wait_voters,
+    SOURCES_CLUSTER_HOST_PORTS, SOURCES_ORIGIN_BASE_URL, add_toxic, append_stub,
+    backend_failing_health_check, clear_toxics, cluster_config, cluster_imposters,
+    committed_config, config_revision, declare_source, exec_probe, get_data_plane,
+    get_data_plane_with, get_json, imposter_ports, metric, origin_publish, origin_republish,
+    origin_request_count, probe, provenance_of, published_host_ports, pull_source, put_imposter,
+    put_imposter_config, put_imposter_with_key, put_routes, put_stubs, read_source,
+    source_document, toxic_count, wait_admin_reachable, wait_backend_ejected, wait_converged,
+    wait_converged_on, wait_origin_ready, wait_ports_free_in, wait_revisions_agree,
+    wait_revisions_agree_on, wait_single_leader, wait_sources_reachable, wait_voters,
 };
 
 /// The imposter port a scenario configures. Inside the container network
@@ -2584,6 +2587,920 @@ async fn c18_routes_survive_a_full_cluster_restart() {
             prefix, "path-prefix-service",
             "{}: path-prefix dispatch after restart",
             node.name
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C20-C23: imposter sources, end to end (#134/#135, closing #20's cluster
+// acceptance list). Every one of these rides `sources.overlay.yml`, which
+// publishes each node's cluster port (where `/admin/sources*` lives) and adds
+// the counting origin the fleet fetches from.
+//
+// The origin is a fourth `rift-ee-server`, un-clustered, whose imposter's
+// response body *is* the config document. That is what makes "fetched once
+// fleet-wide" an equality against `numberOfRequests` — a first-class admin-API
+// value — rather than a log scrape. See the overlay's header for why it is a
+// rift container and not a static-file image.
+// ---------------------------------------------------------------------------
+
+/// The path C20's document is served on, and the two imposters it declares.
+const C20_DOC_PATH: &str = "/gh-mocks.json";
+const C20_PORT_A: u16 = 6610;
+const C20_PORT_B: u16 = 6611;
+
+/// How long a source's control-plane surface gets to start answering.
+///
+/// Longer than [`CONVERGE_TIMEOUT`] because it covers a different thing:
+/// `/readyz` going 200 says the node is up, not that the source puller has been
+/// bound to it, and an unbound puller answers "cluster node is not available
+/// yet". This is composition order, not convergence.
+const SOURCES_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// **C20: a source pull converges fleet-wide and fetches the source exactly
+/// once.**
+///
+/// Two claims, and the second is the one the whole design turns on.
+///
+/// *Converges.* A pull is an ordinary control op: the receiving node fetches,
+/// canonicalizes, hashes, and submits `SourcePullResult` through the leader like
+/// any other write. So every node must end up serving the imposters the document
+/// declared, at the same applied revision — asserted with `wait_converged` plus
+/// `wait_revisions_agree`, which is strictly stronger (two nodes can both serve
+/// a port while one is on an older config for it).
+///
+/// Polled rather than asserted at 2xx-return, and deliberately so: the write
+/// barrier (`--cluster-write-barrier`) is a property of the **admin front**, and
+/// `/admin/sources/:id/pull` rides the **cluster port**, which has no such
+/// barrier — `SourcePuller::pull` awaits only *this* node's local apply (#99).
+/// Claiming read-your-write across the fleet here would be asserting a contract
+/// the code does not offer. C17 is where the barrier's own contract is pinned.
+///
+/// *Fetches once.* The counter equality is `== 1`, never `>= 1`. "Followers
+/// never fetch, they apply" is the reason the fetch can be non-deterministic
+/// I/O at all (two nodes fetching the same URI a second apart can legitimately
+/// get different bytes; a fleet that applied *different* configs from the same
+/// op would have diverged with nothing to point at). An inequality would pass
+/// against a fleet that had quietly gone back to per-node fetching, which is
+/// exactly the regression worth catching.
+///
+/// The second pull is not decoration. It pins the other half of the contract:
+/// a pull **always** fetches — it has to, to find out whether anything changed —
+/// and it is the *write* the digest short circuit removes. So the counter moves
+/// by exactly one again while `unchanged: true` and nothing is applied.
+///
+/// Mutation: making `SourcePuller::pull` fetch once per voter instead of once
+/// (`crates/rift-cluster/src/sources/mod.rs`) — a stand-in for the fetch-in-apply
+/// design #134 rejected — turns this red on the counter, and only on the
+/// counter: every convergence assertion still passes, which is the point. See
+/// the chaos README's C20 entry for the actual failure message.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c20_source_pull_converges_and_fetches_once() {
+    let _cluster = Cluster::up_with_overlays(&["sources.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    wait_origin_ready(SOURCES_READY_TIMEOUT)
+        .await
+        .expect("the counting origin's admin API answers");
+
+    let (status, body) = origin_publish(&[(
+        C20_DOC_PATH,
+        source_document(&[(C20_PORT_A, "gh-v1-a"), (C20_PORT_B, "gh-v1-b")]),
+    )])
+    .await
+    .expect("publish the source document");
+    assert_eq!(status, 201, "the origin refused the document: {body}");
+
+    for host in SOURCES_CLUSTER_HOST_PORTS {
+        wait_sources_reachable(host, SOURCES_READY_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("cluster port :{host}: {e}"));
+    }
+
+    let (status, body) = declare_source(
+        SOURCES_CLUSTER_HOST_PORTS[0],
+        &serde_json::json!({
+            "id": "gh-mocks",
+            "uri": format!("{SOURCES_ORIGIN_BASE_URL}{C20_DOC_PATH}"),
+            "onDrift": "overwrite",
+        }),
+    )
+    .await
+    .expect("declare the source");
+    assert_eq!(status, 200, "declaring the source was refused: {body}");
+
+    // Declaring is not fetching: in pinned mode a pull is an explicit act. This
+    // also makes the counter reading below unambiguous — the one request it
+    // sees can only be the pull's.
+    let before = origin_request_count().await.expect("origin request count");
+    assert_eq!(
+        before, 0,
+        "declaring a source fetched it; the counter below could then not \
+         attribute its request to the pull"
+    );
+
+    let (status, report) = pull_source(SOURCES_CLUSTER_HOST_PORTS[0], "gh-mocks")
+        .await
+        .expect("pull the source");
+    assert_eq!(status, 200, "the pull was refused: {report}");
+    assert_eq!(report["unchanged"], false, "first pull: {report}");
+    assert_eq!(report["skipped"], false, "first pull: {report}");
+    assert_eq!(
+        report["changed"],
+        serde_json::json!([C20_PORT_A, C20_PORT_B]),
+        "the pull must name the ports it created: {report}"
+    );
+
+    for port in [C20_PORT_A, C20_PORT_B] {
+        wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("source imposter {port} did not reach every node: {e}"));
+        wait_revisions_agree(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("nodes serve {port} but do not agree on its revision: {e}"));
+    }
+
+    // Every node stamps the same provenance on the ports the pull created —
+    // read from each node's OWN applied state, which is what makes comparing
+    // them a convergence check rather than three reads of one answer.
+    for (idx, host) in SOURCES_CLUSTER_HOST_PORTS.iter().enumerate() {
+        let (status, config) = cluster_config(*host)
+            .await
+            .unwrap_or_else(|e| panic!("{}: /_cluster/config: {e}", NODES[idx].name));
+        assert_eq!(status, 200, "{}: {config}", NODES[idx].name);
+        for port in [C20_PORT_A, C20_PORT_B] {
+            let stamped = provenance_of(&config, port);
+            assert_eq!(
+                stamped.as_ref().map(|(id, _)| id.as_str()),
+                Some("gh-mocks"),
+                "{}: port {port} is not stamped with the source that created it: {config}",
+                NODES[idx].name
+            );
+        }
+    }
+
+    let after = origin_request_count().await.expect("origin request count");
+    assert_eq!(
+        after - before,
+        1,
+        "the fleet fetched the source {} times for one pull. Exactly one is the \
+         contract: the receiving node fetches and submits the bytes, and every \
+         other node applies them. Anything more means a node fetched on the \
+         apply path, where two fetches a second apart can legitimately disagree \
+         and the fleet diverges with nothing to point at.",
+        after - before
+    );
+
+    // A pull always fetches — that is how it finds out whether anything changed.
+    // What the digest short circuit removes is the *write*.
+    let (status, report) = pull_source(SOURCES_CLUSTER_HOST_PORTS[0], "gh-mocks")
+        .await
+        .expect("re-pull the source");
+    assert_eq!(status, 200, "the second pull was refused: {report}");
+    assert_eq!(
+        report["unchanged"], true,
+        "identical content must short-circuit: {report}"
+    );
+    assert_eq!(report["changed"], serde_json::json!([]));
+    let after_second = origin_request_count().await.expect("origin request count");
+    assert_eq!(
+        after_second - after,
+        1,
+        "an unchanged pull must still fetch exactly once — it cannot know the \
+         content is unchanged without asking"
+    );
+}
+
+/// C21's document path, the imposter it starts with, and the one a content
+/// change adds.
+const C21_DOC_PATH: &str = "/tracked.json";
+const C21_PORT: u16 = 6620;
+const C21_PORT_ADDED: u16 = 6621;
+
+/// C21's poll cadence: the enforced floor (`MIN_POLL_SECS`), because the
+/// scenario's cost is dominated by how long it must watch and a slower cadence
+/// buys nothing.
+const C21_POLL_SECS: u64 = 5;
+
+/// How long each rate measurement watches the origin's counter.
+const C21_WINDOW: Duration = Duration::from_secs(40);
+
+/// Bounds on fetches observed in one [`C21_WINDOW`], for a fleet with **one**
+/// poller.
+///
+/// Derived, not tuned. The poll loop sleeps `C21_POLL_SECS` ±10% (the scheduler
+/// jitters so sources declared together do not burst), so one poller completes
+/// between `40/5.5 ≈ 7.3` and `40/4.5 ≈ 8.9` sleeps in the window, and the
+/// window's edges can clip one at either end: 6-10 on an idle box.
+///
+/// The bounds are widened from that, in one direction each and for one reason
+/// each:
+///
+/// * **down to 3**, because a CI runner under load can stretch sleeps and,
+///   after a failover, the second window starts with no poller at all until the
+///   election resolves. Three still fails a fleet that is not polling: zero,
+///   one or two in forty seconds is not a five-second cadence.
+/// * **up to 12**, which is ~50% of headroom above the ideal ceiling and still
+///   nowhere near what a second poller costs. Three pollers at this cadence
+///   produce `3 × 7 = 21` at an absolute minimum — so the bound separates
+///   "one poller, on a slow box" from "more than one poller" with room to
+///   spare, which is the only distinction it is asked to make.
+///
+/// If this fails, the question is how many nodes are polling, not whether the
+/// numbers should move.
+const C21_MIN_FETCHES: u64 = 3;
+const C21_MAX_FETCHES: u64 = 12;
+
+/// **C21: only the leader polls a tracking source, and that survives losing the
+/// leader.**
+///
+/// A `tracking` source is re-fetched on an interval with nobody asking. The
+/// whole difficulty is the word *fleet*: three nodes each running a timer would
+/// fetch three times per interval and undo C20's fetch-once property with the
+/// very thing meant to drive it. So the scheduler is leader-only, grounded on
+/// the same Raft leadership watch the forward-to-leader write path reads.
+///
+/// Measured as a **rate over a window**, not as a single count, because a
+/// single count cannot tell a slow box from a second poller. The bound is
+/// derived on `C21_MIN_FETCHES`/`C21_MAX_FETCHES` and is deliberately loose
+/// enough to survive a stretched sleep while staying far below what a second
+/// poller would cost — and the floor keeps it from passing vacuously against a
+/// fleet that has stopped polling altogether.
+///
+/// The failover half is the part that makes this more than a startup check:
+/// leadership is the *only* thing gating the poller, so a fleet that lost its
+/// leader must resume polling at one node's cadence — not zero (the survivors
+/// never took it up) and not two (the dead node's tasks were inherited as well
+/// as started). A content change afterwards proves the resumed poller is doing
+/// real work and not merely burning requests.
+///
+/// `rift_cluster_source_polls_total` is asserted alongside the origin's counter
+/// on purpose: only the leader increments it, so the fleet-wide sum is an
+/// independent second opinion on the same claim, read from the product's own
+/// observability rather than from the thing being polled.
+///
+/// Mutation: deleting the `if !is_leader { … }` arm from
+/// `SourceScheduler::supervise` (`crates/rift-cluster/src/sources/scheduler.rs`),
+/// so every node reconciles and polls, turns this red on the first rate
+/// assertion. See the chaos README's C21 entry for the actual failure message.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c21_tracking_poll_is_leader_only_and_survives_failover() {
+    let cluster = Cluster::up_with_overlays(&["sources.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    wait_origin_ready(SOURCES_READY_TIMEOUT)
+        .await
+        .expect("the counting origin's admin API answers");
+
+    let (status, body) =
+        origin_publish(&[(C21_DOC_PATH, source_document(&[(C21_PORT, "tracked-v1")]))])
+            .await
+            .expect("publish the source document");
+    assert_eq!(status, 201, "the origin refused the document: {body}");
+
+    for host in SOURCES_CLUSTER_HOST_PORTS {
+        wait_sources_reachable(host, SOURCES_READY_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("cluster port :{host}: {e}"));
+    }
+
+    let (status, body) = declare_source(
+        SOURCES_CLUSTER_HOST_PORTS[0],
+        &serde_json::json!({
+            "id": "tracked",
+            "uri": format!("{SOURCES_ORIGIN_BASE_URL}{C21_DOC_PATH}"),
+            "mode": "tracking",
+            "pollSecs": C21_POLL_SECS,
+            "onDrift": "overwrite",
+        }),
+    )
+    .await
+    .expect("declare the tracking source");
+    assert_eq!(status, 200, "declaring the source was refused: {body}");
+
+    // The first poll applies the document, which is also the proof the
+    // scheduler picked the source up at all — without it the rate below could
+    // be measuring a fleet that never started.
+    wait_converged(u64::from(C21_PORT), Duration::from_secs(60))
+        .await
+        .expect("the tracking source's first poll reaches every node");
+
+    let first_leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("exactly one leader before the kill");
+
+    let (fetched, counted) = c21_measure_window().await;
+    assert!(
+        (C21_MIN_FETCHES..=C21_MAX_FETCHES).contains(&fetched),
+        "the origin saw {fetched} fetches in {C21_WINDOW:?} at a \
+         {C21_POLL_SECS}s cadence. One poller is {C21_MIN_FETCHES}-\
+         {C21_MAX_FETCHES}; three would be 21 or more. Fleet-wide \
+         rift_cluster_source_polls_total moved by {counted} over the same \
+         window."
+    );
+    assert_eq!(
+        counted, fetched,
+        "the fleet counted {counted} polls while the origin served {fetched} \
+         fetches. Only the leader increments the counter, so a disagreement \
+         means either a follower fetched without counting or a poll fetched \
+         more than once"
+    );
+
+    // Kill the leader outright: no drain, no leave, no chance to hand the
+    // scheduler over. Two of three is still a quorum, so the fleet must elect
+    // and resume on its own.
+    let dead = &NODES[first_leader];
+    cluster.kill(dead.name).expect("kill the leader");
+    let survivors: Vec<&cluster_chaos::Node> = NODES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != first_leader)
+        .map(|(_, node)| node)
+        .collect();
+    let survivor_hosts: Vec<u16> = NODES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != first_leader)
+        .map(|(i, _)| SOURCES_CLUSTER_HOST_PORTS[i])
+        .collect();
+
+    // Wait for the election before measuring: the window would otherwise start
+    // in the leaderless gap and measure how fast the fleet re-elects, which is
+    // C14's question, not this one.
+    let new_leader = c21_wait_surviving_leader(first_leader).await;
+    assert_ne!(
+        new_leader, first_leader,
+        "the killed node is still reporting itself leader"
+    );
+
+    let (fetched, counted) = c21_measure_window().await;
+    assert!(
+        (C21_MIN_FETCHES..=C21_MAX_FETCHES).contains(&fetched),
+        "after failover the origin saw {fetched} fetches in {C21_WINDOW:?}. \
+         Below {C21_MIN_FETCHES} means the survivors never took the schedule \
+         up; above {C21_MAX_FETCHES} means more than one of them did. \
+         Fleet-wide rift_cluster_source_polls_total moved by {counted}."
+    );
+
+    // The resumed poller does real work, not just requests: a content change
+    // has to reach the whole surviving fleet without anyone asking for it.
+    let (status, body) = origin_republish(&[(
+        C21_DOC_PATH,
+        source_document(&[(C21_PORT, "tracked-v2"), (C21_PORT_ADDED, "tracked-added")]),
+    )])
+    .await
+    .expect("republish the source document");
+    assert_eq!(status, 200, "the origin refused the new document: {body}");
+
+    wait_converged_on(
+        &survivors,
+        u64::from(C21_PORT_ADDED),
+        // Generous against the cadence: the change can land just after a poll,
+        // so the fleet may legitimately wait a full interval before noticing.
+        Duration::from_secs(90),
+    )
+    .await
+    .expect("the tracking poll carries a content change to every surviving node");
+
+    for host in survivor_hosts {
+        let (status, record) = read_source(host, "tracked")
+            .await
+            .unwrap_or_else(|e| panic!("read the source on :{host}: {e}"));
+        assert_eq!(status, 200, ":{host}: {record}");
+        assert_eq!(
+            record["lastOutcome"], "applied",
+            ":{host}: the poll that carried the change is not recorded as \
+             applied: {record}"
+        );
+    }
+}
+
+/// Watch the origin's counter and the fleet's own poll counter across one
+/// window, returning `(fetches the origin served, polls the fleet counted)`.
+///
+/// Both numbers, not one: the origin's counter is the external truth and the
+/// metric is the product's own account of it, so a scenario that reports them
+/// together can say *which* of the two is wrong when they disagree.
+async fn c21_measure_window() -> (u64, u64) {
+    let fetches_before = origin_request_count().await.expect("origin request count");
+    let polls_before = c21_fleet_poll_count().await;
+    tokio::time::sleep(C21_WINDOW).await;
+    let fetches_after = origin_request_count().await.expect("origin request count");
+    let polls_after = c21_fleet_poll_count().await;
+    (
+        fetches_after.saturating_sub(fetches_before),
+        polls_after.saturating_sub(polls_before),
+    )
+}
+
+/// `rift_cluster_source_polls_total` summed over every outcome and every node
+/// that is still answering.
+///
+/// Summed fleet-wide because only the leader increments it, so the sum counts
+/// each poll exactly once — and a fleet that grew a second poller shows up here
+/// as double counting. A node that is down (C21 kills one) or has never polled
+/// contributes zero rather than failing the read: its absence is expected, and
+/// treating it as an error would turn the kill into a harness failure.
+async fn c21_fleet_poll_count() -> u64 {
+    let mut total = 0.0;
+    for node in &NODES {
+        for outcome in ["applied", "unchanged", "skipped", "error"] {
+            let family = format!(r#"rift_cluster_source_polls_total{{outcome="{outcome}"}}"#);
+            total += metric(node.metrics, &family).await.unwrap_or(0.0);
+        }
+    }
+    total as u64
+}
+
+/// Poll until exactly one of the *surviving* nodes reports itself leader.
+///
+/// [`wait_single_leader`] cannot serve here: it reads all three nodes, and the
+/// killed one stops answering rather than reporting zero, so the scenario would
+/// be waiting on a metrics endpoint that is gone.
+async fn c21_wait_surviving_leader(dead: usize) -> usize {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut leaders = Vec::new();
+        for (i, node) in NODES.iter().enumerate() {
+            if i == dead {
+                continue;
+            }
+            if metric(node.metrics, r#"rift_cluster_members{state="leader"}"#)
+                .await
+                .is_ok_and(|v| v == 1.0)
+            {
+                leaders.push(i);
+            }
+        }
+        if leaders.len() == 1 {
+            return leaders[0];
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the surviving nodes reported {leaders:?} as leader; expected \
+             exactly one within 60s of the kill"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// C22's two documents and the ports each declares. Two sources, not one,
+/// because the scenario has to assert two things a single source cannot hold at
+/// once: a drift flag that survives, and a digest that still short-circuits
+/// (drift deliberately defeats the short circuit, so the same source cannot
+/// carry both claims).
+const C22_CLEAN_PATH: &str = "/c22-clean.json";
+const C22_DRIFTED_PATH: &str = "/c22-drifted.json";
+const C22_CLEAN_PORT: u16 = 6630;
+const C22_DRIFTED_PORT: u16 = 6631;
+
+/// **C22: sources, their provenance and their drift flags survive a full
+/// cluster restart.**
+///
+/// The C15/C18 harness pattern exactly: `stop` then `start` every node (never
+/// `recreate` — each node keeping its own state directory across the restart is
+/// precisely what is under test), then `wait_all_ready` + `wait_cluster_formed`
+/// before asserting anything.
+///
+/// Three properties, checked on **every** node from that node's own applied
+/// state:
+///
+/// - the source records themselves — uri, mode, `onDrift`, and the whole `last…`
+///   block a pull wrote;
+/// - the provenance stamped on each config, which is what `/_cluster/config`
+///   reports and what an operator compares across nodes;
+/// - the replicated `drifted` flag, which is not a node's opinion: it is
+///   computed from provenance that lives in the state machine, so every replica
+///   flips it at the same log index for the same reason. A fleet that came back
+///   having forgotten a hand edit would silently re-apply a source over an
+///   operator's deliberate change under `onDrift: skip`.
+///
+/// Then the sharper check the issue asks for: a post-restart pull of the
+/// **clean** source must still short-circuit on the unchanged digest. That is
+/// the only assertion here that distinguishes "the source row came back" from
+/// "the source's *last applied digest* came back" — a record restored without
+/// its `last` block would re-apply identical content on every pull forever, and
+/// every other check above would still pass.
+///
+/// A separate clean source is needed for it because drift deliberately defeats
+/// the short circuit (`!record.drifted && applied_digest() == digest`): an
+/// operator who hand-edited an imposter and then pulls is doing the ordinary
+/// repair, and answering "unchanged" there would make drift unfixable except by
+/// editing the document upstream.
+///
+/// **Correction to the issue's named mutation.** The issue names "`sm_sources`
+/// omitted from the snapshot". Measured, that mutant cannot be killed at this
+/// tier and it is not this scenario's fault: openraft's snapshot policy here is
+/// the default `LogEntries(5000)` (`crates/rift-cluster/src/raft/node.rs` builds
+/// `Config { .. ..Default::default() }`), and a chaos stack commits a few dozen
+/// entries — so no snapshot is ever built, and `stop`/`start` restores from each
+/// node's own redb rather than over the wire. This is the same correction C18
+/// carries. The snapshot round trip is gated in-process instead, by
+/// `provenance_is_reported_and_survives_snapshot_restore` in
+/// `crates/rift-cluster/src/raft/store.rs`, which drives `build_snapshot` /
+/// `install_snapshot` directly. What *does* kill this scenario is the restart
+/// path it actually exercises: see the chaos README's C22 entry.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c22_sources_survive_a_full_cluster_restart() {
+    let cluster = Cluster::up_with_overlays(&["sources.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    wait_origin_ready(SOURCES_READY_TIMEOUT)
+        .await
+        .expect("the counting origin's admin API answers");
+
+    let (status, body) = origin_publish(&[
+        (
+            C22_CLEAN_PATH,
+            source_document(&[(C22_CLEAN_PORT, "clean-v1")]),
+        ),
+        (
+            C22_DRIFTED_PATH,
+            source_document(&[(C22_DRIFTED_PORT, "drifted-v1")]),
+        ),
+    ])
+    .await
+    .expect("publish the source documents");
+    assert_eq!(status, 201, "the origin refused the documents: {body}");
+
+    for host in SOURCES_CLUSTER_HOST_PORTS {
+        wait_sources_reachable(host, SOURCES_READY_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("cluster port :{host}: {e}"));
+    }
+
+    for (id, path) in [("clean", C22_CLEAN_PATH), ("drifted", C22_DRIFTED_PATH)] {
+        let (status, body) = declare_source(
+            SOURCES_CLUSTER_HOST_PORTS[0],
+            &serde_json::json!({
+                "id": id,
+                "uri": format!("{SOURCES_ORIGIN_BASE_URL}{path}"),
+                // `skip` on the drifted source, so a stray pull cannot quietly
+                // repair the drift this scenario needs to survive the restart.
+                "onDrift": if id == "drifted" { "skip" } else { "overwrite" },
+            }),
+        )
+        .await
+        .expect("declare a source");
+        assert_eq!(status, 200, "declaring {id} was refused: {body}");
+
+        let (status, report) = pull_source(SOURCES_CLUSTER_HOST_PORTS[0], id)
+            .await
+            .expect("pull a source");
+        assert_eq!(status, 200, "pulling {id} was refused: {report}");
+        assert_eq!(report["unchanged"], false, "{id}: {report}");
+    }
+    for port in [C22_CLEAN_PORT, C22_DRIFTED_PORT] {
+        wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("source imposter {port} did not reach every node: {e}"));
+    }
+
+    // The hand edit that drifts one source: an ordinary admin write against a
+    // port the source owns, exactly as an operator debugging in production
+    // would make it.
+    let status = put_stubs(NODES[0].admin, C22_DRIFTED_PORT, hand_edited_stubs())
+        .await
+        .expect("hand-edit a source-owned imposter");
+    assert_eq!(status, 200, "the hand edit was refused");
+    wait_drift(
+        &SOURCES_CLUSTER_HOST_PORTS,
+        "drifted",
+        true,
+        CONVERGE_TIMEOUT,
+    )
+    .await
+    .expect("the hand edit is visible as drift on every node before the restart");
+
+    // The record as it stood before the restart, read from the node that made
+    // every write. Compared field for field afterwards, on every node.
+    let (status, before) = read_source(SOURCES_CLUSTER_HOST_PORTS[0], "clean")
+        .await
+        .expect("read the clean source");
+    assert_eq!(status, 200, "{before}");
+    assert_eq!(before["lastOutcome"], "applied", "{before}");
+    assert!(
+        before["lastDigest"].is_string(),
+        "a pull that applied must have recorded a digest: {before}"
+    );
+
+    // The restart: every node down, then every node up. The origin container is
+    // untouched, so the document is still there to be re-fetched — which is
+    // what makes the short-circuit check below a statement about the fleet's
+    // memory rather than about the origin's availability.
+    for node in &NODES {
+        cluster.stop(node.name).expect("SIGTERM the node");
+    }
+    for node in &NODES {
+        cluster.start(node.name).expect("restart the node");
+    }
+    cluster
+        .wait_all_ready(Duration::from_secs(120))
+        .await
+        .expect("the fleet comes back");
+    cluster
+        .wait_cluster_formed(Duration::from_secs(120))
+        .await
+        .expect("the fleet re-forms a cluster");
+    for port in [C22_CLEAN_PORT, C22_DRIFTED_PORT] {
+        wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("source imposter {port} did not rebind after the restart: {e}")
+            });
+    }
+    for host in SOURCES_CLUSTER_HOST_PORTS {
+        wait_sources_reachable(host, SOURCES_READY_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("cluster port :{host} after the restart: {e}"));
+    }
+
+    for (idx, host) in SOURCES_CLUSTER_HOST_PORTS.iter().enumerate() {
+        let name = NODES[idx].name;
+
+        let (status, after) = read_source(*host, "clean")
+            .await
+            .unwrap_or_else(|e| panic!("{name}: read the clean source: {e}"));
+        assert_eq!(status, 200, "{name}: {after}");
+        for field in [
+            "uri",
+            "mode",
+            "onDrift",
+            "lastDigest",
+            "lastOutcome",
+            "ports",
+            "drifted",
+        ] {
+            assert_eq!(
+                after[field], before[field],
+                "{name}: the clean source's {field} did not survive the restart. \
+                 Before: {before}. After: {after}"
+            );
+        }
+
+        let (status, drifted) = read_source(*host, "drifted")
+            .await
+            .unwrap_or_else(|e| panic!("{name}: read the drifted source: {e}"));
+        assert_eq!(status, 200, "{name}: {drifted}");
+        assert_eq!(
+            drifted["drifted"], true,
+            "{name}: the fleet came back having forgotten a hand edit. Under \
+             onDrift: skip that means the next pull silently overwrites an \
+             operator's deliberate change: {drifted}"
+        );
+
+        let (status, config) = cluster_config(*host)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: /_cluster/config: {e}",));
+        assert_eq!(status, 200, "{name}: {config}");
+        for (port, source_id) in [(C22_CLEAN_PORT, "clean"), (C22_DRIFTED_PORT, "drifted")] {
+            assert_eq!(
+                provenance_of(&config, port)
+                    .as_ref()
+                    .map(|(id, _)| id.as_str()),
+                Some(source_id),
+                "{name}: port {port} lost the provenance that says which source \
+                 owns it — which is what the drift flag is computed from: {config}"
+            );
+        }
+    }
+
+    // The digest survived, not merely the row: an identical pull writes nothing
+    // at all. `last_applied` standing still is what makes that exact — a
+    // re-apply would move it on every node.
+    let (status, config_before) = cluster_config(SOURCES_CLUSTER_HOST_PORTS[0])
+        .await
+        .expect("/_cluster/config before the post-restart pull");
+    assert_eq!(status, 200, "{config_before}");
+    let applied_before = config_before["last_applied"].clone();
+
+    let (status, report) = pull_source(SOURCES_CLUSTER_HOST_PORTS[0], "clean")
+        .await
+        .expect("re-pull the clean source after the restart");
+    assert_eq!(status, 200, "the post-restart pull was refused: {report}");
+    assert_eq!(
+        report["unchanged"], true,
+        "the fleet re-applied content it already held. The source row came back \
+         from disk but its last applied digest did not, so every pull from here \
+         on writes a log entry for nothing: {report}"
+    );
+    assert_eq!(report["changed"], serde_json::json!([]), "{report}");
+
+    let (status, config_after) = cluster_config(SOURCES_CLUSTER_HOST_PORTS[0])
+        .await
+        .expect("/_cluster/config after the post-restart pull");
+    assert_eq!(status, 200, "{config_after}");
+    assert_eq!(
+        config_after["last_applied"], applied_before,
+        "an unchanged pull moved the applied index, so it wrote a log entry \
+         after all"
+    );
+}
+
+/// The stub list a hand edit leaves behind: one catch-all answering
+/// `hand-edited`, so the edit is visible in committed content and not only in a
+/// flag.
+///
+/// A stub replacement (`PUT /imposters/:port/stubs`) rather than a whole-imposter
+/// `POST`, because it is what an operator debugging in production actually
+/// reaches for — and because the two travel different paths into the state
+/// machine (`PatchStubs` vs `PutImposter`), only one of which can be exercised
+/// per scenario. Both mark drift; this is the one an operator uses.
+fn hand_edited_stubs() -> serde_json::Value {
+    serde_json::json!([
+        { "responses": [{ "is": { "statusCode": 200, "body": "hand-edited" } }] }
+    ])
+}
+
+/// Poll every node's source surface until `id` reports the drift flag `want`.
+///
+/// Polled rather than read once: `drifted` is set by an ordinary committed op
+/// (the hand edit), so a node that has not applied it yet is behind, not wrong.
+/// Returns the last reading on failure, so an assertion says what it saw.
+async fn wait_drift(hosts: &[u16], id: &str, want: bool, timeout: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut seen = Vec::with_capacity(hosts.len());
+        for host in hosts {
+            match read_source(*host, id).await {
+                Ok((200, record)) => seen.push(record["drifted"].clone()),
+                Ok((status, body)) => {
+                    seen.push(serde_json::json!({ "status": status, "body": body }))
+                }
+                Err(e) => seen.push(serde_json::json!({ "error": e.to_string() })),
+            }
+        }
+        if seen.iter().all(|v| *v == serde_json::Value::Bool(want)) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "source {id:?} did not report drifted={want} on every node \
+                 within {timeout:?}; last reading: {seen:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// C23's document path and the imposter the source owns.
+const C23_DOC_PATH: &str = "/c23.json";
+const C23_PORT: u16 = 6640;
+
+/// **C23: a hand edit shows as drift fleet-wide, and the next pull overwrites
+/// it.**
+///
+/// Drift is what makes a source-backed fleet honest about the difference
+/// between what an operator declared and what the fleet is actually serving.
+/// The flag is *replicated* state, not a node's opinion — it is computed from
+/// provenance that lives in the state machine — so it is asserted on every
+/// node, not on the one that took the edit.
+///
+/// **Only the `overwrite` arm runs here, deliberately.** `on_drift` has three
+/// arms and all three are already covered in-process, over real HTTP, by #134's
+/// suite in `crates/rift-ee-server/tests/sources.rs`
+/// (`a_skipped_pull_does_not_short_circuit_the_pull_that_resolves_it` for
+/// `skip`, and the state machine's own `drifted_source_fails_when_asked` for
+/// `fail`). What containers add is process death and the operator-facing
+/// surface, neither of which differs between the arms — so triplicating a
+/// multi-minute scenario would buy a third copy of the same evidence and spend
+/// the tier's budget on it. `overwrite` is the arm run here because it is the
+/// default, and because it is the only one whose effect is visible in committed
+/// content rather than only in a report field.
+///
+/// The repair is asserted on the committed config, not on the pull's report: a
+/// report saying `applied` while the fleet still holds the hand edit is exactly
+/// the failure worth catching, and `/_cluster/imposters` is where each node's
+/// own committed body can be read.
+///
+/// Mutation: making `RedbStateMachine::mark_drifted` a no-op
+/// (`crates/rift-cluster/src/raft/store.rs`) — the drift flag never raised —
+/// turns this red on the post-edit check, with all three nodes reporting
+/// `false`. Note what still passes under it: the repair pull, and the committed
+/// content afterwards. Drift is what the operator *sees*, and a fleet that
+/// silently loses it keeps working right up until someone sets `onDrift: skip`
+/// and finds their deliberate edit overwritten anyway. See the chaos README's
+/// C23 entry for the actual failure message.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c23_drift_flags_and_pull_overwrites() {
+    let _cluster = Cluster::up_with_overlays(&["sources.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    wait_origin_ready(SOURCES_READY_TIMEOUT)
+        .await
+        .expect("the counting origin's admin API answers");
+
+    let (status, body) =
+        origin_publish(&[(C23_DOC_PATH, source_document(&[(C23_PORT, "declared-v1")]))])
+            .await
+            .expect("publish the source document");
+    assert_eq!(status, 201, "the origin refused the document: {body}");
+
+    for host in SOURCES_CLUSTER_HOST_PORTS {
+        wait_sources_reachable(host, SOURCES_READY_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("cluster port :{host}: {e}"));
+    }
+
+    let (status, body) = declare_source(
+        SOURCES_CLUSTER_HOST_PORTS[0],
+        &serde_json::json!({
+            "id": "c23-mocks",
+            "uri": format!("{SOURCES_ORIGIN_BASE_URL}{C23_DOC_PATH}"),
+            "onDrift": "overwrite",
+        }),
+    )
+    .await
+    .expect("declare the source");
+    assert_eq!(status, 200, "declaring the source was refused: {body}");
+
+    let (status, report) = pull_source(SOURCES_CLUSTER_HOST_PORTS[0], "c23-mocks")
+        .await
+        .expect("pull the source");
+    assert_eq!(status, 200, "the pull was refused: {report}");
+    wait_converged(u64::from(C23_PORT), CONVERGE_TIMEOUT)
+        .await
+        .expect("the source's imposter reaches every node");
+    wait_drift(
+        &SOURCES_CLUSTER_HOST_PORTS,
+        "c23-mocks",
+        false,
+        CONVERGE_TIMEOUT,
+    )
+    .await
+    .expect("a freshly pulled source is not drifted");
+
+    // The hand edit: an ordinary admin write against a port the source owns.
+    let status = put_stubs(NODES[0].admin, C23_PORT, hand_edited_stubs())
+        .await
+        .expect("hand-edit a source-owned imposter");
+    assert_eq!(status, 200, "the hand edit was refused");
+    wait_drift(
+        &SOURCES_CLUSTER_HOST_PORTS,
+        "c23-mocks",
+        true,
+        CONVERGE_TIMEOUT,
+    )
+    .await
+    .expect("the hand edit is visible as drift on EVERY node, not only the one that took it");
+    c23_assert_committed_body(C23_PORT, "hand-edited").await;
+
+    // The repair. The document has not changed at all — only the fleet moved —
+    // so a pull that answered "unchanged" here would make drift unrepairable
+    // except by editing the document upstream.
+    let (status, report) = pull_source(SOURCES_CLUSTER_HOST_PORTS[0], "c23-mocks")
+        .await
+        .expect("pull to repair the drift");
+    assert_eq!(status, 200, "the repair pull was refused: {report}");
+    assert_eq!(
+        report["unchanged"], false,
+        "the fleet no longer matches the source, so there IS something to do: {report}"
+    );
+    assert_eq!(
+        report["skipped"], false,
+        "onDrift: overwrite must apply, not record a decision to hold off: {report}"
+    );
+    assert_eq!(
+        report["changed"],
+        serde_json::json!([C23_PORT]),
+        "the repair must name the port it rewrote: {report}"
+    );
+
+    wait_drift(
+        &SOURCES_CLUSTER_HOST_PORTS,
+        "c23-mocks",
+        false,
+        CONVERGE_TIMEOUT,
+    )
+    .await
+    .expect("overwrite resolves the drift on every node");
+    c23_assert_committed_body(C23_PORT, "declared-v1").await;
+}
+
+/// Assert every node's *committed* config for `port` carries `marker`.
+///
+/// Read from `/_cluster/imposters` rather than the admin API's own `/imposters`
+/// listing: the latter answers with what this node's engine has bound, which is
+/// a different question from what the fleet agreed to hold — and "applied" that
+/// never reached the log is precisely the failure C23 exists to catch.
+async fn c23_assert_committed_body(port: u16, marker: &str) {
+    for (idx, host) in SOURCES_CLUSTER_HOST_PORTS.iter().enumerate() {
+        let name = NODES[idx].name;
+        let (status, imposters) = cluster_imposters(*host)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: /_cluster/imposters: {e}"));
+        assert_eq!(status, 200, "{name}: {imposters}");
+        let config = committed_config(&imposters, port)
+            .unwrap_or_else(|| panic!("{name}: no committed config for port {port}: {imposters}"));
+        let rendered = config.to_string();
+        assert!(
+            rendered.contains(marker),
+            "{name}: the committed config for port {port} does not carry \
+             {marker:?}: {rendered}"
         );
     }
 }
