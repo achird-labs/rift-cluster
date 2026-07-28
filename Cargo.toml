@@ -69,6 +69,26 @@ http-body-util = "0.1"
 tokio-util = "0.7"
 
 # Cluster RPC authentication (RFC-001 §11.2): keyed MAC over each request.
+# Pinned to the same line the vendored upstream uses (`vendor/rift/Cargo.toml`),
+# features included: a second `reqwest` configuration would pull a second TLS
+# backend into the binary. The enterprise source providers (#136) need their own
+# client because upstream's `HttpSource` has no header-injection seam.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Basic/Bearer credential encoding for the git and registry providers. Already
+# in the tree transitively; naming it here just makes the use site legal.
+base64 = "0.22"
+
+# Group-kill for the timed-out `git` subprocess (#136). Killing only the direct
+# child leaves `git-remote-https` alive holding the inherited pipes open, so the
+# timeout buys nothing; `kill(-pgid)` is the only way to reach it, and there is
+# no std API for it. Unix-only, and already in the tree via tokio.
+libc = "0.2"
+
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"

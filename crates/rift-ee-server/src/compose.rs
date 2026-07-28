@@ -817,14 +817,67 @@ async fn attach_data_plane(
     ))
 }
 
-/// The built-in schemes a clustered node can fetch a source from: `file:` and
-/// `http(s):`, the same two upstream registers. The enterprise `git:`/`s3:`/
-/// `registry:` providers register here too when they land (#136).
-fn build_source_registry(no_parse: bool) -> anyhow::Result<SourceRegistry> {
-    let mut registry = SourceRegistry::new();
-    registry.register(Arc::new(FileSource::new(no_parse)))?;
-    registry.register(Arc::new(HttpSource::new()?))?;
-    Ok(registry)
+/// Every scheme a clustered node can fetch a source from: upstream's `file:`
+/// and `http(s):`, plus the enterprise `git+https:`/`git+file:`, `s3:` and
+/// `registry:` providers (#136).
+///
+/// The three enterprise providers share one [`sources::auth::StandardResolver`]
+/// (environment, then a mounted secrets directory — see that module's doc),
+/// configured from environment variables rather than new CLI flags. This is
+/// deliberately the minimum plumbing this build needs, not a config
+/// subsystem:
+///
+/// - `RIFT_SOURCE_SECRETS_DIR` — a directory of `<auth_ref>`-named files, the
+///   shape a Kubernetes secret mounts as. Unset means a credential can only
+///   come from a `RIFT_SOURCE_AUTH_<REF>` environment variable.
+/// - `RIFT_S3_ENDPOINT` — overrides the S3 endpoint (MinIO, an in-VPC
+///   gateway, a test stub); unset means the real
+///   `https://s3.{region}.amazonaws.com`.
+/// - `RIFT_S3_REGION` — the SigV4 region; defaults to `us-east-1` when unset.
+/// - `RIFT_SOURCE_REGISTRY_ENDPOINT` / `RIFT_SOURCE_REGISTRY_POINTER` — the
+///   `registry:` provider's base URL and the RFC 6901 pointer into each
+///   response that names the imposters array. The provider is registered
+///   only when an endpoint is configured: a `registry:` scheme with nothing
+///   to reach is not a provider worth having, it is a pull failure waiting to
+///   happen on the first source that names it.
+fn build_source_registry(no_parse: bool) -> anyhow::Result<sources::SourceProviders> {
+    let mut upstream = SourceRegistry::new();
+    upstream.register(Arc::new(FileSource::new(no_parse)))?;
+    upstream.register(Arc::new(HttpSource::new()?))?;
+    let mut providers = sources::SourceProviders::new(upstream);
+
+    let secrets_dir = std::env::var("RIFT_SOURCE_SECRETS_DIR")
+        .ok()
+        .map(PathBuf::from);
+    let resolver: Arc<dyn sources::auth::CredentialResolver> =
+        Arc::new(sources::auth::StandardResolver::new(secrets_dir));
+
+    providers.register_credentialed(Arc::new(sources::git::GitSource::new(Arc::clone(
+        &resolver,
+    ))?))?;
+
+    let s3_config = sources::s3::S3Config {
+        endpoint: std::env::var("RIFT_S3_ENDPOINT").ok(),
+        region: std::env::var("RIFT_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
+    };
+    providers.register_credentialed(Arc::new(sources::s3::S3Source::new(
+        Arc::clone(&resolver),
+        s3_config,
+    )?))?;
+
+    if let Ok(endpoint) = std::env::var("RIFT_SOURCE_REGISTRY_ENDPOINT") {
+        let imposters_pointer = std::env::var("RIFT_SOURCE_REGISTRY_POINTER")
+            .unwrap_or_else(|_| "/imposters".to_owned());
+        providers.register_credentialed(Arc::new(sources::registry::RegistrySource::new(
+            resolver,
+            sources::registry::RegistryConfig {
+                endpoint,
+                imposters_pointer,
+            },
+        )?))?;
+    }
+
+    Ok(providers)
 }
 
 /// Turn `--imposters` into declared sources and pull each once.

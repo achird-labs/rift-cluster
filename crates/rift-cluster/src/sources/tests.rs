@@ -12,7 +12,7 @@ use rift_ee::seams::{
     FetchedImposters, ImposterConfig, ImposterSource, SourceMeta, SourceRef, SourceRegistry,
 };
 
-use super::{PullError, SourcePuller, bootstrap_id, canonical, digest_of};
+use super::{PullError, SourcePuller, bootstrap_id, canonical, check_credential_use, digest_of};
 
 /// `digest_of` is fallible; every config these tests build encodes, so a
 /// failure here is a broken test, not a case under test.
@@ -185,6 +185,110 @@ fn bootstrap_ids_distinguish_uris_that_slugify_alike() {
     let a = bootstrap_id("https://cfg.test/a/mocks.json");
     let b = bootstrap_id("https://cfg.test/b/mocks.json");
     assert_ne!(a, b);
+}
+
+// -- issue #136 review, B4: authRef refused for a scheme that consumes none -
+
+/// A [`SourceProviders`] wired the way production is: one upstream,
+/// non-credentialed scheme (`counting`, standing in for `file:`/a bespoke
+/// embedder provider), and the two real HTTP-based enterprise providers this
+/// crate ships (`s3:`, `registry:`) registered as credentialed. Real
+/// `S3Source`/`RegistrySource` rather than a hand-rolled `CredentialedSource`
+/// stub, so `check_credential_use`'s refusal is proven against the actual
+/// production providers `authRef` is meant to reach — not just against
+/// whatever a test fixture happens to claim. (`git+https:`/`git+file:` is not
+/// included here: `GitSource::new` probes a `git` binary at construction,
+/// which is an environment dependency this otherwise pure-logic test does not
+/// need — the same `SourceProviders`-level check applies to it identically,
+/// since `check_credential_use` never looks past the credentialed map.)
+fn providers_with_the_real_credentialed_schemes() -> super::SourceProviders {
+    let mut upstream = SourceRegistry::new();
+    upstream
+        .register(Arc::new(CountingSource {
+            fetches: Arc::new(AtomicUsize::new(0)),
+            configs: vec![],
+            version: None,
+        }))
+        .expect("register the non-credentialed upstream scheme");
+    let mut providers = super::SourceProviders::new(upstream);
+
+    let resolver: Arc<dyn super::auth::CredentialResolver> =
+        Arc::new(super::auth::StandardResolver::new(None));
+    providers
+        .register_credentialed(Arc::new(
+            super::s3::S3Source::new(
+                Arc::clone(&resolver),
+                super::s3::S3Config {
+                    endpoint: None,
+                    region: "us-east-1".to_owned(),
+                },
+            )
+            .expect("build s3 source"),
+        ))
+        .expect("register s3 as credentialed");
+    providers
+        .register_credentialed(Arc::new(
+            super::registry::RegistrySource::new(
+                resolver,
+                super::registry::RegistryConfig {
+                    endpoint: "http://registry.invalid".to_owned(),
+                    imposters_pointer: "/data/imposters".to_owned(),
+                },
+            )
+            .expect("build registry source"),
+        ))
+        .expect("register registry as credentialed");
+    providers
+}
+
+/// The refusal this check exists for: before it, `POST /admin/sources` with
+/// `{ uri: "counting://…", authRef: "tok" }` would be accepted and then
+/// fetched anonymously forever, silently, because the upstream
+/// `ImposterSource` path has no seam to receive `auth_ref` at all.
+#[test]
+fn check_credential_use_refuses_an_auth_ref_on_a_scheme_that_consumes_none() {
+    let puller = SourcePuller::new(providers_with_the_real_credentialed_schemes());
+    let err = check_credential_use(&puller, Some("tok"), "counting://host/x.json")
+        .expect_err("`counting` never consumes a credential");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("counting"),
+        "the refusal must name the offending scheme: {rendered}"
+    );
+    assert!(
+        rendered.contains("s3") && rendered.contains("registry"),
+        "the refusal must say which schemes do take a credential: {rendered}"
+    );
+}
+
+/// The other half: `authRef` on a scheme that genuinely consumes one — the
+/// two real HTTP providers this build ships — must still be accepted.
+#[test]
+fn check_credential_use_accepts_an_auth_ref_on_the_real_credentialed_schemes() {
+    let puller = SourcePuller::new(providers_with_the_real_credentialed_schemes());
+    for uri in ["s3://bucket/key", "registry://svc-a"] {
+        assert!(
+            check_credential_use(&puller, Some("tok"), uri).is_ok(),
+            "uri {uri} takes a credential and must accept one"
+        );
+    }
+}
+
+/// No `authRef` at all is always fine, on any scheme — the ordinary anonymous
+/// path this check must never disturb.
+#[test]
+fn check_credential_use_accepts_no_auth_ref_on_any_scheme() {
+    let puller = SourcePuller::new(providers_with_the_real_credentialed_schemes());
+    for uri in [
+        "counting://host/x.json",
+        "s3://bucket/key",
+        "registry://svc-a",
+    ] {
+        assert!(
+            check_credential_use(&puller, None, uri).is_ok(),
+            "uri {uri}: no authRef is always fine"
+        );
+    }
 }
 
 /// The id is a redb key and a path segment, so it must satisfy the same rule

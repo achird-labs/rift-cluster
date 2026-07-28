@@ -791,8 +791,133 @@ Every applied pull writes a structured `audit`-target log event naming the
 principal, the source id, the version and the applying revision — so "who moved
 the payment mocks to which commit, and when" is a log query.
 
-The `git:`/`s3:`/`registry:` providers are #136; container-tier chaos coverage
-is #137.
+Container-tier chaos coverage for sources is #137.
+
+## Source providers (#136)
+
+Which schemes a node can fetch is **per-node** configuration — deliberately not
+part of the replicated op validation, so two nodes can never disagree about a
+committed source. `POST /admin/sources` refuses a scheme *this* node cannot
+serve, listing the ones it can.
+
+| Scheme | URI shape | `version` is | Credential (`authRef`) |
+|---|---|---|---|
+| `file:` | `file:/srv/mocks.json` | *(none — always re-applied)* | n/a |
+| `http:` / `https:` | `https://host/imposters.json` | the `ETag` | n/a — use `registry:` for a token-authenticated endpoint |
+| `git+https:` | `git+https://host/org/repo#<ref>:<path>` | the **commit sha** | a token, sent as an `Authorization: Basic` git `http.extraHeader` |
+| `git+file:` | `git+file:/srv/repo.git#<ref>:<path>` | the **commit sha** | as above (rarely needed for a local mirror) |
+| `s3:` | `s3://bucket/key` | the `ETag`, unquoted | `<access-key-id>:<secret-access-key>`, signed with SigV4 |
+| `registry:` | `registry://<service-id>[,…]` | a SHA-256 of the responses | a token, sent as `Authorization: Bearer` |
+
+Notes that matter in practice:
+
+- **`git+…` needs a `git` binary.** These providers shell out rather than
+  linking libgit2 or `gitoxide`, and the binary is probed at **startup**, so an
+  image without `git` refuses to boot instead of failing on the first pull. The
+  shipped `deploy/Dockerfile` installs it.
+- **`<path>` may be a file or a directory.** A directory parses every file under
+  it and merges them; a port declared by two documents is an error naming both,
+  never a silent last-one-wins.
+- **`s3:` is path-style** (`{endpoint}/{bucket}/{key}`), which is what makes a
+  MinIO or in-VPC endpoint reachable. Ambient credentials (IRSA, an EC2/ECS task
+  role) are **not** implemented: `authRef` static keys are the credentialed
+  path, and a source with no `authRef` fetches anonymously.
+- **`registry:` is only registered when its endpoint is configured** — a scheme
+  with nothing to reach is a pull failure waiting to happen.
+- **Interop caveat:** the SigV4 signer is covered by structural and regression
+  tests against a local stub, not by a test against a real S3 or MinIO — the
+  chaos tier has no S3-compatible container plumbing. Treat first use against a
+  new S3-compatible endpoint as worth verifying by hand.
+
+### What a source URI is not allowed to be
+
+A source URI is operator-supplied data that reaches every node through the
+replicated log, so the `git+` schemes are constrained tightly — at **admission**,
+so a URI no node should ever fetch never reaches the log at all, and again in the
+provider:
+
+- A remote or ref beginning with `-` is **refused**. `git`'s option parser
+  permutes, so `git+file:--upload-pack=/tmp/x.sh#main:y` would otherwise be
+  parsed as an *option* and run `/tmp/x.sh` as the rift process on every node
+  that pulls it. This is the reason the two checks exist at all.
+- A remote containing `::` is **refused** — that is the `<helper>::<target>`
+  transport syntax, whose purpose is running a command as the transport.
+  `protocol.ext.allow=never` is also set on every invocation, so it is two
+  independent gates rather than one.
+- A `git+file:` remote must be an **absolute path**; a `git+https:` remote must
+  parse as an `https` URL with a host.
+- A ref must look like a ref: `[A-Za-z0-9._/+-]`, no `..`, no leading `/`.
+
+Three more properties of the git subprocess worth knowing operationally:
+
+- **Every invocation has a 30s budget** and is killed — as a process *group*, so
+  the `git-remote-https` helper goes with it — when the budget passes. Without
+  the group kill the helper survives holding the pipes open, and a stalled
+  remote would leak one blocking-pool thread per poll until nothing on the node
+  could do blocking work at all.
+- **Redirects are refused** (`http.followRedirects=false`). `git` does not strip
+  `http.extraHeader` when it follows one, so a remote that 302s elsewhere would
+  otherwise hand that host your token.
+- **Host git config is ignored** (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are
+  `/dev/null`), so an `insteadOf` rewrite, a `credential.helper` or an
+  `http.proxy` outside this process cannot redirect or re-credential a fetch the
+  replicated URI is supposed to define completely.
+
+### Credentials
+
+A source **names** a credential and never carries one: a URI with credentials in
+its authority is refused at admission, before it can reach a log that every
+replica keeps and every snapshot copies. Resolution happens on the fetching
+node, at fetch time, in this order — first hit wins:
+
+1. environment variable `RIFT_SOURCE_AUTH_<REF>`, where `<REF>` is `authRef`
+   upper-cased with every non-alphanumeric character replaced by `_` (so
+   `gh-mocks` reads `RIFT_SOURCE_AUTH_GH_MOCKS`);
+2. a file named exactly `<authRef>` under `RIFT_SOURCE_SECRETS_DIR` — the shape
+   a Kubernetes secret mounts as (a trailing newline is stripped);
+3. a cloud secret manager, when one is configured. None is wired in this build.
+
+**Resolution fails closed.** An `authRef` that cannot be resolved is a *pull
+error* surfaced in `last.outcome` — never a retry without the credential, never
+a silent skip. A source configured for a private repo does not quietly start
+serving whatever a public one holds because a secret mount went missing.
+
+**An `authRef` a provider would ignore is refused, not accepted.** Only
+`git+https:`, `git+file:`, `s3:` and `registry:` consume a credential; `file:`
+and `http(s):` do not. Setting `authRef` on one of those is a `400` at
+`POST /admin/sources`, naming the schemes that do take one. Accepting it would
+mean fetching anonymously forever while the operator believed the request was
+authenticated — and against an endpoint that serves public content to anonymous
+callers, that is not an error the operator ever sees, it is the fleet quietly
+serving the wrong corpus. (This is a node-local check, like the unknown-scheme
+refusal: which schemes take a credential is per-node configuration, so it
+cannot live in the replicated op validation.)
+
+Secret material never reaches a log line, an audit row, or an error string: the
+credential type has no `Display` and renders as `<redacted>` under `Debug`, the
+git token travels in the subprocess environment rather than in the remote URL
+(`git` echoes URLs on failure), the S3 secret key never leaves the signing
+function, and no provider folds a response body into an error — an echoing
+server must not be able to reflect an `Authorization` header back into a
+message an operator reads.
+
+### Provider configuration
+
+Environment variables, not flags — this is deliberately the minimum plumbing,
+not a config subsystem:
+
+| Variable | Effect |
+|---|---|
+| `RIFT_SOURCE_SECRETS_DIR` | Directory of `<authRef>`-named secret files |
+| `RIFT_S3_ENDPOINT` | Override the S3 endpoint (MinIO, in-VPC gateway) |
+| `RIFT_S3_REGION` | SigV4 region; defaults to `us-east-1` |
+| `RIFT_SOURCE_REGISTRY_ENDPOINT` | Registry base URL; **registers the `registry:` scheme** |
+| `RIFT_SOURCE_REGISTRY_POINTER` | RFC 6901 pointer to the imposters array in a registry response; defaults to `/imposters` |
+
+A `registry:` fetch issues one `GET {endpoint}/{service-id}` per id in the URI,
+in order, and pulls the imposters array out of each response through the
+pointer. A pointer that matches nothing is an **error**, not an empty list —
+an empty list would silently delete every imposter the source owns.
 
 ## Clustered flow state (#120)
 

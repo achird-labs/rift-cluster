@@ -28,6 +28,10 @@ hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 
+reqwest.workspace = true
+futures-util.workspace = true
+base64.workspace = true
+
 hmac.workspace = true
 sha2.workspace = true
 subtle.workspace = true
@@ -41,12 +45,20 @@ xxhash-rust.workspace = true
 prometheus.workspace = true
 lazy_static.workspace = true
 
+# The `git+https:`/`git+file:` source (#136) fetches into a scratch working
+# directory per pull — a production dependency, not just a test fixture, since
+# the fetch itself (not only `provider_tests.rs`) needs one.
+tempfile = "3"
+
+# Group-kill for a timed-out `git` subprocess — see `sources::git::kill_group`.
+# Unix-only: elsewhere the direct child is killed and its transport helper, if
+# any, is left to exit on its own.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 # Streaming request bodies, to prove the body cap holds without a declared length.
 futures-lite = "2"
-# Each openraft storage-suite store and each membership test gets its own temp
-# `redb` database file, cleaned up when the guard drops.
-tempfile = "3"
 # The 3-node integration harness (tests/cluster.rs) drives real nodes directly,
 # so it needs tokio in its own right — integration tests do not inherit the
 # library's normal dependencies.
