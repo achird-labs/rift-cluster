@@ -88,6 +88,18 @@ async fn probe(base: &str, path: &str) -> (u16, serde_json::Value) {
     (status, response.json().await.expect("probe body is json"))
 }
 
+/// [`probe`], but `None` when the listener is not reachable at all.
+///
+/// For the one caller that has to tell "the node answered something I did not
+/// expect" apart from "the socket is gone" — a distinction `probe` collapses
+/// into one `.expect("probe request")` panic, which is how a closed-listener
+/// failure spent this test's history looking like an unrelated readiness bug.
+async fn try_probe(base: &str, path: &str) -> Option<(u16, serde_json::Value)> {
+    let response = reqwest::get(format!("http://{base}{path}")).await.ok()?;
+    let status = response.status().as_u16();
+    Some((status, response.json().await.ok()?))
+}
+
 /// Poll `path` until the listener is accepting, bounded. The probe port comes up
 /// concurrently with the caller, so a single early request would race it.
 async fn poll_until_bound(base: &str, path: &str) -> (u16, serde_json::Value) {
@@ -243,7 +255,10 @@ async fn sigterm_fails_readiness_before_closing_any_listener() {
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(
         &state,
-        &["--cluster-allow-solo", "--cluster-leave-timeout", "2"],
+        // 5s, not 2s: the assertions below have to land *inside* the drain
+        // window, and the window has to be comfortably longer than the time it
+        // takes this machine to notice the leave — see the polling loop.
+        &["--cluster-allow-solo", "--cluster-leave-timeout", "5"],
     ))
     .await
     .expect("solo cluster starts");
@@ -260,9 +275,41 @@ async fn sigterm_fails_readiness_before_closing_any_listener() {
     leave_tx.send(()).expect("trigger the leave");
 
     // Within the drain window: not-ready, but everything still serving.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let (status, body) = probe(&probes, "/readyz").await;
-    assert_eq!(status, 503);
+    //
+    // Polled, not slept, and against a 5s window rather than 2s. This was
+    // `sleep(300ms)` then a single `probe(...)`, which made it the flakiest
+    // test in this file — 4 failures in 10 full-suite runs, measured.
+    //
+    // The failure was *not* "readiness had not flipped yet", which is what the
+    // shape of the code suggests. It panicked inside `probe` on
+    // `.expect("probe request")` — a connection error. Under the load of the
+    // rest of the suite this task can be descheduled for longer than the whole
+    // 2s drain window, so by the time its "300ms into the drain" sample
+    // actually went out, the drain had finished and the probe listener was
+    // already closed. A fixed sleep cannot express "during the window" on a
+    // machine that may not run you for seconds at a time.
+    //
+    // So: wait for the transition (tolerating the listener being momentarily
+    // unreachable is *not* wanted here — if it is gone we have already lost the
+    // window, and that is worth saying out loud), inside a window long enough
+    // that the wait is not itself the problem.
+    let started = std::time::Instant::now();
+    let body = loop {
+        match try_probe(&probes, "/readyz").await {
+            Some((503, body)) => break body,
+            Some((status, _)) => assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "readiness never went down after the leave was triggered (last status {status})"
+            ),
+            None => panic!(
+                "the probe listener closed {:?} after the leave was triggered, before this test \
+                 ever observed the draining state — the drain window elapsed while this task was \
+                 descheduled. Readiness must go down before any listener closes.",
+                started.elapsed()
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(body["status"], "draining");
     assert_eq!(
         probe(&probes, "/healthz").await.0,
