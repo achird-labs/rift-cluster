@@ -48,11 +48,14 @@ RUN cargo build --locked --release -p rift-ee-server
 FROM debian:bookworm-slim AS runtime
 
 # ca-certificates is needed for outbound TLS (proxied imposters, HTTPS config
-# sources). Nothing else is installed on purpose — in particular no curl: the
-# health check below execs the binary's own `healthcheck` subcommand, which is
-# exactly why upstream put it in the binary.
+# sources). `git` is needed by the `git+https:`/`git+file:` imposter source
+# (#136), which shells out to it rather than linking libgit2 — and which probes
+# `git --version` at startup, so a runtime image without it would refuse to
+# boot rather than fail later. Nothing else is installed on purpose — in
+# particular no curl: the health check below execs the binary's own
+# `healthcheck` subcommand, which is exactly why upstream put it in the binary.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 rift
 

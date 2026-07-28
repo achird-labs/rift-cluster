@@ -41,11 +41,21 @@
 //! providers that need it (#136): upstream's `HttpSource` has no
 //! header-injection seam, so a credentialed HTTPS fetch needs a new provider
 //! rather than a hook here.
+//!
+//! Upstream's [`rift_ee::seams::ImposterSource::fetch`] is handed a [`SourceRef`], which carries
+//! a URI and nothing else — while `auth_ref` lives *beside* the URI on the
+//! record. [`CredentialedSource`] is the enterprise-side seam that closes that
+//! gap: a provider that needs a credential is handed the ref's *name*, and
+//! resolves it through [`auth::CredentialResolver`] at fetch time. The
+//! alternatives were all worse in the same way — smuggling the name into the URI
+//! collides with `git+https:`'s own `#ref:path` fragment, and a side table keyed
+//! by URI races two sources that legitimately share one.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use rift_ee::seams::{ImposterConfig, SourceRef, SourceRegistry};
+use rift_ee::seams::{FetchedImposters, ImposterConfig, SourceRef, SourceRegistry};
 use uuid::Uuid;
 
 use crate::control::{
@@ -117,6 +127,141 @@ pub enum PullError {
     Internal(String),
 }
 
+/// A provider that authenticates with a named credential.
+///
+/// Deliberately *not* an extension of [`ImposterSource`]: a credentialed
+/// provider must never be reachable through the plain `fetch` path, because
+/// that path has no `auth_ref` to give it and would therefore fetch
+/// anonymously. Keeping the two traits disjoint makes "fetched without the
+/// credential it was configured with" unrepresentable rather than merely
+/// unlikely.
+pub trait CredentialedSource: Send + Sync {
+    /// The schemes this provider claims, same contract as
+    /// [`rift_ee::seams::ImposterSource::schemes`].
+    fn schemes(&self) -> &'static [&'static str];
+
+    /// Fetch `r`, authenticating with the credential `auth_ref` names.
+    ///
+    /// `None` means the source declared no `auth_ref` — an anonymous fetch,
+    /// which is legitimate for a public repo or a bucket reached by an ambient
+    /// role. A *named* ref that cannot be resolved is an error, never a
+    /// fallback to anonymous: see [`auth`].
+    fn fetch_with_auth<'a>(
+        &'a self,
+        r: &'a SourceRef,
+        auth_ref: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<FetchedImposters>> + Send + 'a>,
+    >;
+}
+
+/// Every provider a node can fetch through: upstream's scheme registry plus the
+/// enterprise providers that take a credential.
+///
+/// Two maps rather than one because the two traits are disjoint by design (see
+/// [`CredentialedSource`]). A scheme claimed by both is refused at build time,
+/// for the same reason upstream refuses a doubly-claimed scheme: resolving it
+/// by declaration order would let an enterprise provider silently shadow a
+/// built-in, or vice versa, and the operator would find out from behaviour.
+#[derive(Default)]
+pub struct SourceProviders {
+    upstream: SourceRegistry,
+    credentialed: HashMap<String, Arc<dyn CredentialedSource>>,
+}
+
+impl SourceProviders {
+    #[must_use]
+    pub fn new(upstream: SourceRegistry) -> Self {
+        Self {
+            upstream,
+            credentialed: HashMap::new(),
+        }
+    }
+
+    /// Register a credentialed provider for every scheme it claims.
+    ///
+    /// # Errors
+    /// If any of its schemes is already claimed, by either map.
+    pub fn register_credentialed(
+        &mut self,
+        provider: Arc<dyn CredentialedSource>,
+    ) -> anyhow::Result<()> {
+        for scheme in provider.schemes() {
+            if self.upstream.get(scheme).is_some() || self.credentialed.contains_key(*scheme) {
+                anyhow::bail!(
+                    "two imposter sources both claim the `{scheme}:` scheme; each scheme may have \
+                     exactly one source"
+                );
+            }
+            self.credentialed
+                .insert((*scheme).to_string(), provider.clone());
+        }
+        Ok(())
+    }
+
+    /// Every scheme this build can fetch, sorted.
+    #[must_use]
+    pub fn schemes(&self) -> Vec<String> {
+        let mut schemes: Vec<String> = self
+            .upstream
+            .schemes()
+            .into_iter()
+            .map(str::to_owned)
+            .chain(self.credentialed.keys().cloned())
+            .collect();
+        schemes.sort();
+        schemes
+    }
+
+    #[must_use]
+    fn serves(&self, scheme: &str) -> bool {
+        self.upstream.get(scheme).is_some() || self.credentialed.contains_key(scheme)
+    }
+
+    /// Whether `scheme`'s provider consumes a credential at all.
+    ///
+    /// Only the credentialed map can ever answer yes: an upstream
+    /// [`rift_ee::seams::ImposterSource`] has no `auth_ref` parameter to give
+    /// it, so a scheme served only there is anonymous by construction. This is
+    /// what lets [`SourcePuller::uses_credential`] refuse an `auth_ref` that a
+    /// scheme could never use, instead of silently dropping it.
+    #[must_use]
+    fn supports_credential(&self, scheme: &str) -> bool {
+        self.credentialed.contains_key(scheme)
+    }
+
+    /// Every scheme that *does* consume a credential, sorted — what a refusal
+    /// lists so the operator can see which schemes their `authRef` would have
+    /// worked on.
+    #[must_use]
+    fn credentialed_schemes(&self) -> Vec<String> {
+        let mut schemes: Vec<String> = self.credentialed.keys().cloned().collect();
+        schemes.sort();
+        schemes
+    }
+
+    /// Fetch `r` through whichever provider claims its scheme, handing the
+    /// credential name only to a provider that takes one.
+    async fn fetch(
+        &self,
+        r: &SourceRef,
+        auth_ref: Option<&str>,
+    ) -> Option<anyhow::Result<FetchedImposters>> {
+        let scheme = r.scheme();
+        if let Some(provider) = self.credentialed.get(scheme) {
+            return Some(provider.fetch_with_auth(r, auth_ref).await);
+        }
+        let provider = self.upstream.get(scheme)?;
+        Some(provider.fetch(r).await)
+    }
+}
+
+impl From<SourceRegistry> for SourceProviders {
+    fn from(upstream: SourceRegistry) -> Self {
+        Self::new(upstream)
+    }
+}
+
 /// Performs pulls for a node, against the schemes this build registers.
 ///
 /// Bound late for the same reason [`crate::PullOnMissInterceptor`] is: the
@@ -125,7 +270,7 @@ pub enum PullError {
 /// the node arrives afterwards through [`Self::bind`]. Until then a pull answers
 /// "not available yet" rather than silently doing nothing.
 pub struct SourcePuller {
-    registry: SourceRegistry,
+    registry: SourceProviders,
     node: OnceLock<Weak<RaftNode>>,
     /// Leader-local poll status from the tracking scheduler (#135), when one is
     /// running. Absent on a node with no scheduler (a test fixture, or an
@@ -148,9 +293,9 @@ impl SourcePuller {
     /// which schemes it can serve — deliberately *not* consulted by the
     /// deterministic op validation, which must not depend on per-node config.
     #[must_use]
-    pub fn new(registry: SourceRegistry) -> Self {
+    pub fn new(registry: impl Into<SourceProviders>) -> Self {
         Self {
-            registry,
+            registry: registry.into(),
             node: OnceLock::new(),
             poll_status: OnceLock::new(),
         }
@@ -191,18 +336,32 @@ impl SourcePuller {
     /// fetch.
     #[must_use]
     pub fn serves(&self, uri: &str) -> bool {
-        self.registry.get(SourceRef::new(uri).scheme()).is_some()
+        self.registry.serves(SourceRef::new(uri).scheme())
+    }
+
+    /// Whether `uri`'s scheme is served by a provider that consumes a
+    /// credential. Node-local knowledge, like [`Self::serves`] — checked
+    /// before an op is submitted so an `authRef` that a scheme could never use
+    /// is refused with a named reason instead of silently fetched anonymously
+    /// forever.
+    #[must_use]
+    pub fn uses_credential(&self, uri: &str) -> bool {
+        self.registry
+            .supports_credential(SourceRef::new(uri).scheme())
+    }
+
+    /// Every scheme this build can authenticate to, sorted — what an
+    /// `authRef`-on-an-anonymous-scheme refusal lists.
+    #[must_use]
+    pub fn credentialed_schemes(&self) -> Vec<String> {
+        self.registry.credentialed_schemes()
     }
 
     /// The schemes this build registers, sorted — what an unknown-scheme
     /// refusal lists so the operator can see what they *could* have written.
     #[must_use]
     pub fn schemes(&self) -> Vec<String> {
-        self.registry
-            .schemes()
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        self.registry.schemes()
     }
 
     fn node(&self) -> Result<Arc<RaftNode>, PullError> {
@@ -226,16 +385,21 @@ impl SourcePuller {
 
         let source_ref = SourceRef::new(record.uri.clone());
         let scheme = source_ref.scheme().to_owned();
-        let provider = self.registry.get(&scheme).cloned().ok_or_else(|| {
-            PullError::BadRequest(format!(
-                "no imposter source is registered for the `{scheme}:` scheme; this build serves: {}",
-                self.schemes().join(", ")
-            ))
-        })?;
 
-        let fetched = provider
-            .fetch(&source_ref)
+        // The credential *name* travels with the fetch; the secret is resolved
+        // inside the provider and never returns here, so it cannot reach the
+        // op, the audit row below, or a `PullError` rendered to the caller.
+        let fetched = self
+            .registry
+            .fetch(&source_ref, record.auth_ref.as_deref())
             .await
+            .ok_or_else(|| {
+                PullError::BadRequest(format!(
+                    "no imposter source is registered for the `{scheme}:` scheme; this build \
+                     serves: {}",
+                    self.schemes().join(", ")
+                ))
+            })?
             .map_err(|e| PullError::Fetch {
                 id: id.to_owned(),
                 detail: e.to_string(),
@@ -650,6 +814,41 @@ pub fn routes(base: Router, puller: Arc<SourcePuller>) -> Router {
     )
 }
 
+/// Refuse an `auth_ref` that names a credential no provider for `uri`'s scheme
+/// would ever consume (issue #136 review, B4).
+///
+/// `SourceProviders::fetch` only ever hands `auth_ref` to a scheme in the
+/// credentialed map; a scheme served only through the upstream
+/// [`rift_ee::seams::ImposterSource`] path has no seam to receive it at all.
+/// Before this check, `POST /admin/sources` with `{ uri: "https://…",
+/// authRef: "tok" }` was accepted and then fetched **anonymously forever** —
+/// silently, since nothing about the write or a subsequent pull ever fails.
+/// Refused rather than ignored: that silent drop is exactly how an operator
+/// ends up believing a source is authenticated when it never was, right up
+/// until whatever it serves anonymously stops matching what the credentialed
+/// path would have returned.
+///
+/// Node-local, like [`SourcePuller::serves`] right beside it: which schemes
+/// take a credential is per-node provider configuration, so this must not
+/// move into [`crate::control::validate`], which has to give the same answer
+/// on every replica regardless of which providers that replica happens to
+/// have registered.
+fn check_credential_use(
+    puller: &SourcePuller,
+    auth_ref: Option<&str>,
+    uri: &str,
+) -> Result<(), RpcError> {
+    if auth_ref.is_some() && !puller.uses_credential(uri) {
+        return Err(RpcError::BadRequest(format!(
+            "authRef is set, but the `{}:` scheme does not consume a credential; only these \
+             schemes take one: {}",
+            SourceRef::new(uri).scheme(),
+            puller.credentialed_schemes().join(", ")
+        )));
+    }
+    Ok(())
+}
+
 async fn create_source(puller: &SourcePuller, body: &[u8]) -> Result<Vec<u8>, RpcError> {
     let parsed: SourceBody = serde_json::from_slice(body)
         .map_err(|e| RpcError::BadRequest(format!("source body: {e}")))?;
@@ -665,6 +864,7 @@ async fn create_source(puller: &SourcePuller, body: &[u8]) -> Result<Vec<u8>, Rp
             puller.schemes().join(", ")
         )));
     }
+    check_credential_use(puller, parsed.auth_ref.as_deref(), &parsed.uri)?;
 
     let request = mint(
         None,
@@ -823,7 +1023,21 @@ fn pull_error(e: PullError) -> RpcError {
     }
 }
 
+pub mod auth;
+mod common;
+pub mod git;
+pub mod registry;
+pub mod s3;
 pub mod scheduler;
+
+// `provider_tests.rs` is the immutable gate for issue #136 (see its own module
+// doc) and is not edited to satisfy lints — its stub HTTP server's callback
+// type is exactly as complex as a hand-rolled fixture needs to be, so the lint
+// is silenced at this declaration rather than by reshaping test-only code that
+// must stay byte-for-byte the gate it was reviewed as.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+mod provider_tests;
 
 #[cfg(test)]
 mod tests;

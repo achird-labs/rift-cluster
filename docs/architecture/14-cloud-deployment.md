@@ -50,10 +50,17 @@ AWS-specific decisions and why:
   assumption (Chapter 1's non-goal); run one cluster per region instead, each
   pulling the same sources (#20) — same mocks everywhere without stretching
   consensus.
-- **Secrets**: cluster HMAC secret and source `auth_ref`s (Git tokens,
-  registry creds) via Secrets Manager → External Secrets Operator → mounted
-  file (`--cluster-secret-file`). IRSA grants the pod role read access to
-  exactly those secrets and any `s3://` sources.
+- **Secrets**: Secrets Manager → External Secrets Operator → mounted file, but
+  by two different routes. The **cluster HMAC secret** is a single file named by
+  `--cluster-secret-file`. **Source `auth_ref`s** (Git tokens, registry creds,
+  S3 static keys) are a *directory* of `<auth_ref>`-named files pointed at by
+  `RIFT_SOURCE_SECRETS_DIR`, or individual `RIFT_SOURCE_AUTH_<REF>` environment
+  variables, which take precedence (#136).
+  IRSA grants the pod role read access to those secrets. It does **not** yet
+  reach `s3://` sources: the S3 provider signs with static keys resolved from an
+  `auth_ref`, and ambient role credentials are not implemented — a bucket
+  policy that only admits the pod role will not be readable by this build. An
+  `s3://` source with no `auth_ref` fetches anonymously.
 - **Cluster port stays ClusterIP-internal** — never on the NLB. Security
   group: cluster port open node-to-node only; front-door/admin from the NLB;
   metrics from the scrape infrastructure.

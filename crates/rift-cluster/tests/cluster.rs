@@ -1395,6 +1395,125 @@ async fn polling_unchanged_content_never_grows_the_log() {
     cluster.shutdown_all().await;
 }
 
+/// A credentialed provider that counts fetches — the same shape as
+/// `CountingSource` above, but registered through
+/// `SourceProviders::register_credentialed` / `CredentialedSource`, the
+/// enterprise seam issue #136 adds. `ImposterSource::fetch` has no `auth_ref`
+/// to give it, so exercising the digest short circuit through *this* trait is
+/// what proves it fires on the path the real `git+https:`/`s3:`/`registry:`
+/// providers actually use, not merely on the upstream-only path
+/// `source_pull_fetches_exactly_once_and_converges_the_fleet` above already
+/// covers.
+struct CountingCredentialedSource {
+    fetches: Arc<std::sync::atomic::AtomicUsize>,
+    body: std::sync::Mutex<Vec<rift_ee::seams::ImposterConfig>>,
+    version: std::sync::Mutex<String>,
+}
+
+impl rift_cluster::sources::CredentialedSource for CountingCredentialedSource {
+    fn schemes(&self) -> &'static [&'static str] {
+        &["counting-cred"]
+    }
+
+    fn fetch_with_auth<'a>(
+        &'a self,
+        _r: &'a rift_ee::seams::SourceRef,
+        _auth_ref: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<rift_ee::seams::FetchedImposters>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(rift_ee::seams::FetchedImposters {
+                configs: self.body.lock().expect("body lock").clone(),
+                intercept: None,
+                routes: None,
+                meta: rift_ee::seams::SourceMeta {
+                    version: Some(self.version.lock().expect("version lock").clone()),
+                    fetched_at: std::time::SystemTime::now(),
+                },
+                unchanged: false,
+            })
+        })
+    }
+}
+
+/// Issue #136 review, B6.1: the digest short circuit (#134) exercised through
+/// the *actual shipped path* — a credentialed provider, pulled twice through
+/// a real `SourcePuller` bound to a real `RaftNode` — rather than the
+/// tautological version this replaces (two `digest_of(...)` calls compared
+/// directly, in `sources/provider_tests.rs`, which would still pass even if
+/// the short circuit in `SourcePuller::pull` were deleted outright, since it
+/// never drove a pull through that code at all).
+#[tokio::test]
+async fn a_credentialed_source_short_circuits_on_unchanged_content() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(1).await;
+    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
+
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source = Arc::new(CountingCredentialedSource {
+        fetches: Arc::clone(&fetches),
+        body: std::sync::Mutex::new(vec![source_config(9504, "cred-static")]),
+        version: std::sync::Mutex::new("v1".to_owned()),
+    });
+    let mut providers =
+        rift_cluster::sources::SourceProviders::new(rift_ee::seams::SourceRegistry::new());
+    providers
+        .register_credentialed(source as Arc<dyn rift_cluster::sources::CredentialedSource>)
+        .expect("register the credentialed counting source");
+    let puller = rift_cluster::SourcePuller::new(providers);
+    puller
+        .bind(cluster.leader_handle().expect("a leader"))
+        .expect("bind the puller");
+
+    let first = puller
+        .declare_and_pull(
+            "cred-mocks",
+            "counting-cred://host/i.json",
+            rift_cluster::OnDrift::Overwrite,
+        )
+        .await
+        .expect("first pull");
+    assert!(!first.unchanged, "the first pull is a real change");
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let before = cluster
+        .leader()
+        .expect("a leader")
+        .status()
+        .last_applied
+        .expect("an applied index");
+
+    let second = puller.pull("cred-mocks", None).await.expect("second pull");
+    assert!(
+        second.unchanged,
+        "identical content through a credentialed provider must short circuit"
+    );
+    assert_eq!(
+        fetches.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the re-pull did fetch — the provider is the only one who can tell content is unchanged"
+    );
+    assert_eq!(
+        cluster
+            .leader()
+            .expect("a leader")
+            .status()
+            .last_applied
+            .expect("an applied index"),
+        before,
+        "unchanged content through a credentialed provider must produce no log entry at all"
+    );
+
+    cluster.shutdown_all().await;
+}
+
 /// The task set follows the source table without a restart: deleting a tracking
 /// source stops its poller.
 #[tokio::test]

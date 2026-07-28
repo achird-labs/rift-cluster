@@ -124,6 +124,19 @@ pub mod seams {
         SourceRef, SourceRegistry, parse_uri_list,
     };
 
+    /// The shared parse path every provider must route its bytes through, so a
+    /// document behaves identically whichever source delivered it.
+    ///
+    /// The enterprise `git:`/`s3:`/`registry:` providers (#136) are exactly the
+    /// third-party sources [`parse_remote_document`]'s own doc anticipates:
+    /// they hand back bytes, and format sniffing, the Mountebank document
+    /// shapes and the `intercept`/`routes` block rules all run here. Its two
+    /// fail-closed differences from the `--configfile` path — EJS
+    /// `include`/`stringify` refused, `_rift.script` `file:` references refused
+    /// — are the reason a provider must not parse for itself: a document
+    /// fetched from a git host has no author who already holds local access.
+    pub use rift_http_proxy::config_loader::{LoadedConfig, parse_remote_document};
+
     /// The front door's route table (issue #19 / U-11): content-based routing
     /// from one listener to many imposters. Upstream ships the listener, the
     /// matcher and the config-file surface; its admin CRUD was deferred, which

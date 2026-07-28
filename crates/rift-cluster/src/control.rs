@@ -406,7 +406,15 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
         } => {
             require_default_tenant(tenant)?;
             require_source_id(id)?;
+            // Hygiene strictly before shape, and the order is load-bearing.
+            // Both must hold, but a URI that fails *both* — say
+            // `git+https://oauth2:ghp_secret@host/o/r` with no `#ref:path` —
+            // must be refused by the credential check, whose message is
+            // deliberately free of the URI. Shape errors are more specific and
+            // so more tempting to run first; doing that puts a secret-bearing
+            // URI into an operator-facing error string.
             require_credential_free_uri(uri)?;
+            require_well_formed_uri(uri)?;
             match (mode, poll_secs) {
                 (SourceMode::Tracking, None) => {
                     return Err(
@@ -617,6 +625,111 @@ fn require_credential_free_uri(uri: &str) -> Result<(), String> {
         return Err(format!("source uri {uri:?} names no host"));
     }
     Ok(())
+}
+
+/// Per-scheme URI *shape* checks for the enterprise providers (#136), so a URI
+/// that no provider could ever fetch is refused at admission with a 400 instead
+/// of being committed and then failing every pull forever.
+///
+/// This is deterministic and stays deterministic: it is a pure function of the
+/// URI string. That is precisely what separates it from the check
+/// [`require_credential_free_uri`]'s doc rules out — asking *which schemes this
+/// node serves* is per-node configuration and would let two replicas disagree
+/// about one committed op, while asking *whether a `git+https:` URI has a
+/// `#ref:path` fragment* has the same answer on every node forever.
+///
+/// A scheme this build knows nothing about is not an error here. Embedders
+/// register their own providers, so an unknown scheme is the node-local check
+/// the admin handler already makes before submitting.
+///
+/// **No message here echoes the URI.** [`require_credential_free_uri`] runs
+/// first and guarantees the *authority* holds no credential, but it
+/// deliberately permits an `@` — and therefore a token — in a query string, and
+/// these refusals are rendered straight back to the caller and into the
+/// admission log. Naming the scheme and the shape that was expected is just as
+/// actionable to the operator who wrote the URI, and cannot leak.
+fn require_well_formed_uri(uri: &str) -> Result<(), String> {
+    let uri = uri.trim();
+    let scheme = match uri.split_once("://") {
+        Some((scheme, _)) => scheme,
+        None => uri.split_once(':').map_or("", |(scheme, _)| scheme),
+    };
+
+    match scheme {
+        "git+https" | "git+file" => {
+            let git_shape = format!("write `{scheme}://host/org/repo#<ref>:<path>`");
+            let (before_fragment, fragment) = uri
+                .split_once('#')
+                .ok_or_else(|| format!("source uri names no ref and path: {git_shape}"))?;
+            let (git_ref, path) = fragment
+                .split_once(':')
+                .ok_or_else(|| format!("source uri names a ref but no path: {git_shape}"))?;
+            if git_ref.trim().is_empty() {
+                return Err(format!("source uri names an empty git ref: {git_shape}"));
+            }
+            if path.trim().is_empty() {
+                return Err(format!(
+                    "source uri names an empty path in the repo: {git_shape}"
+                ));
+            }
+            // The same argument-injection refusal `sources::git` applies at
+            // fetch time (issue #136 review, B1), mirrored here so a remote
+            // or ref that `git` would read as an option — or an `ext::`
+            // transport helper — is refused at *admission*, before the op
+            // ever reaches the replicated log, rather than only discovered
+            // when the leader (or whichever node performs the pull) tries to
+            // fetch it. `before_fragment` is split exactly the way
+            // `sources::git::parse_git_uri` splits it, so this checks the
+            // same remote the fetch would actually use. Neither
+            // `check_remote` nor `check_ref` ever echoes its input, so this
+            // cannot violate the "no message here echoes the URI" rule above.
+            let is_file = scheme == "git+file";
+            let remote = if is_file {
+                before_fragment.strip_prefix("git+file:")
+            } else {
+                before_fragment.strip_prefix("git+")
+            }
+            .unwrap_or(before_fragment);
+            crate::sources::git::check_remote(remote, is_file).map_err(|e| e.to_string())?;
+            crate::sources::git::check_ref(git_ref).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "s3" => {
+            let rest = uri
+                .strip_prefix("s3://")
+                .ok_or_else(|| "source uri is not written `s3://<bucket>/<key>`".to_owned())?;
+            let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+                "source uri names a bucket but no key: write `s3://<bucket>/<key>`".to_owned()
+            })?;
+            if bucket.is_empty() {
+                return Err("source uri names no bucket: write `s3://<bucket>/<key>`".to_owned());
+            }
+            if key.trim_matches('/').is_empty() {
+                return Err("source uri names no key: write `s3://<bucket>/<key>`".to_owned());
+            }
+            Ok(())
+        }
+        "registry" => {
+            let rest = uri.strip_prefix("registry://").ok_or_else(|| {
+                "source uri is not written `registry://<service-id>[,…]`".to_owned()
+            })?;
+            if rest.is_empty() {
+                return Err("source uri names no service: write \
+                            `registry://<service-id>[,<service-id>…]`"
+                    .to_owned());
+            }
+            // A trailing or doubled comma yields an empty id, which would
+            // otherwise become a request to the registry's collection endpoint
+            // — a very different query than the operator wrote.
+            if rest.split(',').any(|id| id.trim().is_empty()) {
+                return Err("source uri has an empty service id; write \
+                            `registry://<service-id>[,<service-id>…]`"
+                    .to_owned());
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn require_default_tenant(tenant: &TenantId) -> Result<(), String> {
@@ -1230,6 +1343,191 @@ mod tests {
                 !err.contains(uri) && !err.contains('@'),
                 "the refusal must not echo the credential-bearing uri back: {err}"
             );
+        }
+    }
+
+    // -- per-provider URI shape (#136) --------------------------------------
+
+    /// A `git+https:` URI whose fragment is missing or malformed can never be
+    /// fetched, so it is refused at admission rather than committed and then
+    /// failing every pull for the life of the source.
+    #[test]
+    fn validate_rejects_a_malformed_git_uri() {
+        for (uri, expected) in [
+            ("git+https://host/o/r", "names no ref and path"),
+            ("git+https://host/o/r#main", "names a ref but no path"),
+            ("git+https://host/o/r#:mocks.json", "empty git ref"),
+            ("git+https://host/o/r#main:", "empty path"),
+        ] {
+            let err = validate(&source_put("mocks", uri)).expect_err("must be refused");
+            assert!(
+                err.contains(expected),
+                "refusing {uri}: expected {expected:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_git_uri() {
+        for uri in [
+            "git+https://github.com/org/repo#main:imposters.json",
+            "git+https://github.com/org/repo#v1.2.3:mocks/",
+            "git+file:/srv/repos/mocks.git#main:imposters.json",
+        ] {
+            assert_eq!(validate(&source_put("mocks", uri)), Ok(()), "uri {uri}");
+        }
+    }
+
+    // -- issue #136 review, B1: the git argument-injection refusal is
+    // mirrored at admission, not only at fetch time ---------------------------
+
+    /// A remote that `git fetch` would read as an option (`--upload-pack=…`
+    /// runs its argument as a command) must never even reach the log, let
+    /// alone get as far as a node actually shelling out to `git`.
+    #[test]
+    fn validate_refuses_a_git_remote_that_would_be_read_as_an_option() {
+        let err = validate(&source_put(
+            "mocks",
+            "git+file:--upload-pack=/tmp/pwn.sh#main:x",
+        ))
+        .expect_err("an option-shaped remote must be refused at admission");
+        assert!(err.contains("option"), "{err}");
+    }
+
+    /// Same class of bug in the ref position: `git fetch <remote>
+    /// --upload-pack=<cmd>` is just as effective as putting it in the remote.
+    #[test]
+    fn validate_refuses_a_git_ref_that_would_be_read_as_an_option() {
+        let err = validate(&source_put(
+            "mocks",
+            "git+https://github.com/org/repo#--upload-pack=/tmp/pwn.sh:x",
+        ))
+        .expect_err("an option-shaped ref must be refused at admission");
+        assert!(err.contains("option"), "{err}");
+    }
+
+    /// `ext::` is a transport helper: git runs its argument as a shell
+    /// command. This must be refused before the op is committed, not only
+    /// when a node's `git.rs` fetch happens to notice it.
+    #[test]
+    fn validate_refuses_a_git_transport_helper_remote() {
+        let err = validate(&source_put("mocks", "git+file:ext::sh -c whoami#main:x"))
+            .expect_err("a transport helper remote must be refused at admission");
+        assert!(err.contains("transport"), "{err}");
+    }
+
+    /// A `git+file:` remote must be an absolute path — the same positive
+    /// shape rule `sources::git::check_remote` enforces at fetch time,
+    /// mirrored here so a relative one never reaches the log either.
+    #[test]
+    fn validate_refuses_a_relative_git_file_remote() {
+        for uri in ["git+file:relative/path#main:x", "git+file:relative#main:x"] {
+            let err = validate(&source_put("mocks", uri))
+                .expect_err("a relative git+file: remote must be refused");
+            assert!(err.contains("absolute"), "{uri}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_s3_uri() {
+        for (uri, expected) in [("s3://bucket", "no key"), ("s3://bucket/", "no key")] {
+            let err = validate(&source_put("mocks", uri)).expect_err("must be refused");
+            assert!(
+                err.contains(expected),
+                "refusing {uri}: expected {expected:?}, got {err:?}"
+            );
+        }
+        // `s3:///key` has an empty authority, so the *hygiene* check refuses it
+        // first with "names no host". That is a correct refusal and the order
+        // that produces it is deliberate — see `validate`'s comment and
+        // `a_malformed_credential_bearing_uri_is_refused_without_echoing_it`.
+        assert!(validate(&source_put("mocks", "s3:///key")).is_err());
+        assert_eq!(
+            validate(&source_put("mocks", "s3://bucket/mocks/imposters.json")),
+            Ok(())
+        );
+    }
+
+    /// An empty service id would become a request to the registry's
+    /// *collection* endpoint — a very different query from the one written.
+    #[test]
+    fn validate_rejects_a_malformed_registry_uri() {
+        for uri in [
+            "registry://",
+            "registry://a,",
+            "registry://,b",
+            "registry://a,,b",
+        ] {
+            assert!(
+                validate(&source_put("mocks", uri)).is_err(),
+                "{uri} must be refused"
+            );
+        }
+        assert_eq!(validate(&source_put("mocks", "registry://svc-a")), Ok(()));
+        assert_eq!(
+            validate(&source_put("mocks", "registry://svc-a,svc-b")),
+            Ok(())
+        );
+    }
+
+    /// The regression this pins: a URI that is **both** credential-bearing and
+    /// malformed must be refused by the hygiene check, not the shape check.
+    ///
+    /// Shape errors are the more specific ones, which makes running them first
+    /// tempting — and every existing credential test uses a *well-formed* URI,
+    /// so nothing else here would notice. Running them first puts the operator's
+    /// token into a 400 body and into the admission log.
+    #[test]
+    fn a_malformed_credential_bearing_uri_is_refused_without_echoing_it() {
+        for uri in [
+            // credentialed and missing its `#ref:path` entirely
+            "git+https://oauth2:ghp_supersecret@github.com/o/r",
+            // credentialed and its fragment names no path
+            "git+https://oauth2:ghp_supersecret@github.com/o/r#main",
+            // credentialed and names no key
+            "s3://key-id:ghp_supersecret@bucket-only",
+        ] {
+            let err = validate(&source_put("mocks", uri)).expect_err("must be refused");
+            assert!(
+                !err.contains("ghp_supersecret"),
+                "the refusal leaked the credential: {err}"
+            );
+            assert!(
+                !err.contains(uri),
+                "the refusal echoed the credential-bearing uri: {err}"
+            );
+        }
+    }
+
+    /// Belt and braces on the rule above: no shape refusal echoes the URI at
+    /// all, so a token hidden somewhere the hygiene check permits (a query
+    /// string) cannot leak either.
+    #[test]
+    fn no_shape_refusal_echoes_the_uri() {
+        for uri in [
+            "git+https://host/o/r?token=ghp_supersecret",
+            "s3://bucket?token=ghp_supersecret",
+            "registry://a,,b?token=ghp_supersecret",
+        ] {
+            let err = validate(&source_put("mocks", uri)).expect_err("must be refused");
+            assert!(
+                !err.contains("ghp_supersecret"),
+                "a shape refusal echoed a query-string token: {err}"
+            );
+        }
+    }
+
+    /// The shape check must not become a scheme allow-list: an embedder's own
+    /// provider registers a scheme this crate has never heard of, and
+    /// deterministic validation cannot know which those are.
+    #[test]
+    fn validate_leaves_an_unknown_scheme_alone() {
+        for uri in [
+            "custom://host/thing",
+            "scripted:whatever",
+            "file:/tmp/x.json",
+        ] {
+            assert_eq!(validate(&source_put("mocks", uri)), Ok(()), "uri {uri}");
         }
     }
 
