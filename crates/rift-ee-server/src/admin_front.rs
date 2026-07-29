@@ -60,6 +60,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rift_cluster::audit_export::ExportStatus;
 use rift_cluster::control::Role;
 use rift_cluster::control::{self, ControlOp, ControlRequest, StubEdit, StubEditScript};
 use rift_cluster::decorate::{HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS};
@@ -118,6 +119,12 @@ pub struct FrontConfig {
     /// `--cluster-admin-async`: answer 202 + op id right after parking, and
     /// let the submit run in the background.
     pub admin_async: bool,
+    /// This node's audit-exporter status (issue #164), for
+    /// `GET /admin/audit/sink`. `None` when the composition root never spawned
+    /// an `AuditExporter` — the route still answers, just without a status
+    /// attached, the same way it does for a follower (see
+    /// `tenancy::AuditSinkView`'s doc).
+    pub export_status: Option<Arc<ExportStatus>>,
 }
 
 /// A bound, serving admin front.
@@ -232,6 +239,7 @@ struct FrontState {
     barrier: WriteBarrier,
     barrier_timeout: Duration,
     admin_async: bool,
+    export_status: Option<Arc<ExportStatus>>,
     /// Streams proxied requests through unchanged (SSE included).
     proxy: Client<hyper_util::client::legacy::connect::HttpConnector, Incoming>,
     /// Issues the internal re-reads mutation responses are rendered from.
@@ -258,6 +266,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         barrier: config.barrier,
         barrier_timeout: config.barrier_timeout,
         admin_async: config.admin_async,
+        export_status: config.export_status,
         proxy: Client::builder(TokioExecutor::new()).build_http(),
         fetch: Client::builder(TokioExecutor::new()).build_http(),
     });
@@ -1422,7 +1431,14 @@ async fn terminate_tenancy(
         }
     };
 
-    let outcome = match tenancy::dispatch(node, route, &body, authorized_tenant, bindings) {
+    let outcome = match tenancy::dispatch(
+        node,
+        route,
+        &body,
+        authorized_tenant,
+        bindings,
+        state.export_status.as_deref(),
+    ) {
         Ok(outcome) => outcome,
         Err(tenancy::TenancyError::BadRequest(reason)) => {
             return typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &reason);
@@ -2566,6 +2582,7 @@ mod tests {
                 barrier: crate::cli::WriteBarrier::None,
                 barrier_timeout: Duration::from_secs(1),
                 admin_async: false,
+                export_status: None,
             },
             &node,
         )

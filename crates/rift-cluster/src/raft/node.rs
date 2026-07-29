@@ -33,8 +33,8 @@ use super::ring::Ring;
 use super::store::{self, RedbStateMachine, SourceRecord};
 use super::{NodeId, TypeConfig};
 use crate::control::{
-    AuditRow, ControlOp, ControlRequest, ControlResponse, Principal, Role, SourceProvenance,
-    Tenant, TenantId,
+    AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, Principal, Role,
+    SourceProvenance, Tenant, TenantId,
 };
 use crate::rpc::{
     Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer,
@@ -1273,6 +1273,39 @@ impl RaftNode {
     ) -> Result<Vec<AuditRow>, NodeError> {
         self.sm_reader
             .audit_since(since, tenant, limit)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The fleet's declared audit export sink, or `None` (issue #164).
+    ///
+    /// # Errors
+    /// Storage I/O, or a stored sink record that will not parse.
+    pub fn audit_sink(&self) -> Result<Option<AuditSink>, NodeError> {
+        self.sm_reader
+            .audit_sink()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The last revision shipped to the audit export sink; `0` when nothing has
+    /// shipped (issue #164).
+    ///
+    /// # Errors
+    /// Storage I/O.
+    pub fn audit_checkpoint(&self) -> Result<u64, NodeError> {
+        self.sm_reader
+            .audit_checkpoint()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The highest revision retention GC has removed from the audit table; `0`
+    /// if it has never removed anything (issue #164). The exporter's only
+    /// evidence that rows were *lost* rather than never written.
+    ///
+    /// # Errors
+    /// Storage I/O.
+    pub fn audit_gc_watermark(&self) -> Result<u64, NodeError> {
+        self.sm_reader
+            .audit_gc_watermark()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 

@@ -1152,3 +1152,238 @@ async fn an_idempotency_key_is_refused_when_minting_a_credential() {
 
     server.shutdown().await;
 }
+
+// -- audit export sink admin surface (issue #164 review: gap 1) -------------
+//
+// `tenancy.rs`'s unit tests cover `Route::scope()` and `Route::action()` for
+// the three `/admin/audit/sink` routes, but nothing before this called
+// `dispatch()` for them, so the lines that build the `ControlOp` were
+// untested. One of those lines already shipped wrong once — `TenantId::
+// default()` instead of `TenantId::new(FLEET_SCOPE)` — which would file a
+// fleet-wide config change under one tenant's name in the audit stream. These
+// tests drive the surface over real HTTP, exactly as the rest of this file
+// does, so a regression there fails at the wire.
+
+/// The round trip a fleet admin can do end to end: declare the sink, read it
+/// back, see the change attributed to the fleet scope in the audit stream —
+/// **the point of this test** — get refused a malformed body, then delete the
+/// sink and confirm it is genuinely gone.
+#[tokio::test]
+async fn the_audit_sink_surface_round_trips_for_a_fleet_admin_and_is_audited_under_the_fleet_scope()
+{
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "tenancy-fleet-audit-sink";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+
+    // PUT succeeds for a fleet admin.
+    let response = client
+        .put(format!("http://{admin}/admin/audit/sink"))
+        .header("authorization", fleet_key)
+        .json(&json!({
+            "uri": "https://collector.example/audit",
+            "batchMaxRows": 100,
+        }))
+        .send()
+        .await
+        .expect("declare sink");
+    let put_revision = revision_of(&response);
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 200, "declaring the sink: {seen}");
+
+    // GET returns the full record: uri, batchMaxRows, revision — and no
+    // authRef, since none was given (the field is `skip_serializing_if
+    // Option::is_none`, not serialized as `null`).
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/audit/sink"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read sink"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "{seen}");
+    let body = seen.json();
+    assert_eq!(body["uri"], "https://collector.example/audit", "{seen}");
+    assert_eq!(body["batchMaxRows"], 100, "{seen}");
+    assert_eq!(body["revision"], put_revision, "{seen}");
+    assert!(
+        body.get("authRef").is_none(),
+        "no authRef was given, so the field must be omitted rather than null: {seen}"
+    );
+
+    // THE POINT OF THIS TEST: the resulting audit row is attributed to the
+    // fleet scope, under the sink's own `cluster.admin` action — not to
+    // whatever `TenantId::default()` would have named. This is exactly the
+    // regression that already shipped once (see this file's doc above).
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/audit"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read audit"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "{seen}");
+    let rows: Vec<Value> = serde_json::from_str(&seen.body).expect("audit body is JSON");
+    let sink_rows: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["action"] == "cluster.admin")
+        .collect();
+    assert!(
+        !sink_rows.is_empty(),
+        "no audit row named the sink change at all: {rows:?}"
+    );
+    assert!(
+        sink_rows.iter().all(|r| r["tenant"] == FLEET_SCOPE),
+        "the sink change must be attributed to the fleet scope (\"{FLEET_SCOPE}\"): a \
+         regression to TenantId::default() would file it under an ordinary tenant's name \
+         instead: {rows:?}"
+    );
+
+    // A malformed PUT body is a real refusal, never a silently-defaulted 200.
+    let seen = Seen::of(
+        client
+            .put(format!("http://{admin}/admin/audit/sink"))
+            .header("authorization", fleet_key)
+            .json(&json!({ "uri": 12345 }))
+            .send()
+            .await
+            .expect("malformed put"),
+    )
+    .await;
+    assert_eq!(
+        seen.status / 100,
+        4,
+        "a malformed body must be refused, not defaulted: {seen}"
+    );
+
+    // DELETE succeeds, and a subsequent GET is a genuine 404 — not the sink
+    // still answering because the delete silently no-opped.
+    let seen = Seen::of(
+        client
+            .delete(format!("http://{admin}/admin/audit/sink"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("delete sink"),
+    )
+    .await;
+    assert_eq!(seen.status, 204, "{seen}");
+
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/audit/sink"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read sink after delete"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 404,
+        "the sink must read as gone after delete: {seen}"
+    );
+
+    server.shutdown().await;
+}
+
+/// A tenant admin — genuinely privileged inside its own tenant — must not
+/// reach the fleet's audit sink at all. `Route::scope()` pins every
+/// `/admin/audit/sink` method to `FLEET_SCOPE`, so a principal bound only
+/// inside `acme` holds no binding on `"*"` and is refused with the same `404`
+/// (not `403`) that RFC-002 §8.4 gives any other caller with no standing on a
+/// scope — the indistinguishable not-found, since a tenant admin must not be
+/// able to tell "this route does not exist" from "you have no binding here".
+#[tokio::test]
+async fn a_tenant_admin_is_refused_on_every_audit_sink_method() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "tenancy-fleet-audit-sink-tenant";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+    let (_, tenant_admin_key) =
+        mint_principal(&client, &admin, fleet_key, "acme", Role::TenantAdmin).await;
+
+    // The fleet admin declares a sink first, so a wrongly-permissive GET or
+    // DELETE below would have something real to (wrongly) show or remove.
+    let seen = Seen::of(
+        client
+            .put(format!("http://{admin}/admin/audit/sink"))
+            .header("authorization", fleet_key)
+            .json(&json!({ "uri": "https://collector.example/audit" }))
+            .send()
+            .await
+            .expect("fleet admin declares the sink"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "{seen}");
+
+    for (method, body) in [
+        (reqwest::Method::GET, None),
+        (
+            reqwest::Method::PUT,
+            Some(json!({ "uri": "https://evil.example/audit" })),
+        ),
+        (reqwest::Method::DELETE, None),
+    ] {
+        let mut request = client
+            .request(method.clone(), format!("http://{admin}/admin/audit/sink"))
+            .header("authorization", &tenant_admin_key);
+        if let Some(body) = &body {
+            request = request.json(body);
+        }
+        let seen = Seen::of(
+            request
+                .send()
+                .await
+                .expect("tenant admin on the sink route"),
+        )
+        .await;
+        assert_eq!(
+            seen.status, 404,
+            "a tenant admin holds no binding on the fleet scope, so this route must read as \
+             not-found, the same as any other unbound cross-scope probe: {method} {seen}"
+        );
+    }
+
+    // And the sink the tenant admin could not touch is still there, untouched
+    // by the refused PUT above.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/audit/sink"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("fleet admin re-reads the sink"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "{seen}");
+    assert_eq!(
+        seen.json()["uri"],
+        "https://collector.example/audit",
+        "a refused tenant-admin PUT must not have overwritten the sink: {seen}"
+    );
+
+    server.shutdown().await;
+}

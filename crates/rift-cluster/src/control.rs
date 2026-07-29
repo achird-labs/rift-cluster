@@ -558,7 +558,71 @@ pub enum ControlOp {
         tenant: TenantId,
         principal_id: PrincipalId,
     },
+    /// Declare (or replace) the fleet's audit export sink (#164).
+    ///
+    /// Fleet state rather than node config, so every node agrees on where the
+    /// audit stream goes and a node joining inherits it. `auth_ref` is the
+    /// *name* of a credential and never a credential — the same split
+    /// [`ControlOp::SourcePut`] enforces, using the same
+    /// `require_credential_free_uri` check, so a secret cannot enter the
+    /// replicated log by either door.
+    ///
+    /// One sink, fleet-wide. A per-tenant sink would need a checkpoint per
+    /// tenant; the checkpoint here is a single revision, and that is the whole
+    /// mechanism by which a failover resumes rather than restarting.
+    AuditSinkPut {
+        tenant: TenantId,
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_ref: Option<String>,
+        /// Rows per shipped batch. Bounded by [`validate`].
+        batch_max_rows: u32,
+    },
+    /// Remove the audit export sink; the exporter goes quiet without losing its
+    /// checkpoint, so re-declaring a sink resumes rather than re-ships history.
+    AuditSinkDelete {
+        tenant: TenantId,
+    },
+    /// The last revision the leader has successfully shipped (#164).
+    ///
+    /// Committed *after* the batch is on the wire, never before — that ordering
+    /// is the at-least-once guarantee: a leader dying in between re-ships the
+    /// batch, and the consumer dedups on `(revision, op_id)`.
+    ///
+    /// Applied as `max(existing, new)` so a stale leader's late write cannot
+    /// rewind the stream. Deliberately **not** audited — see
+    /// [`ControlOp::audit_action`].
+    AuditCheckpointPut {
+        tenant: TenantId,
+        revision: u64,
+    },
 }
+
+/// The fleet's audit export sink, as applied state (#164).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditSink {
+    /// `https://` (webhook, JSON lines) or `s3://` (bucket, batched objects).
+    /// Never carries credentials — [`validate`] refuses a URI whose authority
+    /// has any.
+    pub uri: String,
+    /// The *name* of a node-local credential, resolved at export time. Safe to
+    /// serve back over the admin API precisely because it is not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_ref: Option<String>,
+    pub batch_max_rows: u32,
+    /// The revision of the `AuditSinkPut` that produced this record.
+    pub revision: u64,
+}
+
+/// Rows per shipped batch when an operator does not choose. Small enough that a
+/// re-ship after a failover is cheap, large enough that a busy fleet is not
+/// shipping one row per request.
+pub const DEFAULT_AUDIT_BATCH_MAX_ROWS: u32 = 500;
+
+/// Ceiling on `batch_max_rows`. A batch is buffered in memory and shipped as
+/// one request; an unbounded value is an operator-set OOM.
+pub const MAX_AUDIT_BATCH_MAX_ROWS: u32 = 10_000;
 
 /// How a source is kept current.
 ///
@@ -771,19 +835,32 @@ impl ControlOp {
             | ControlOp::PrincipalCreate { tenant, .. }
             | ControlOp::PrincipalDelete { tenant, .. }
             | ControlOp::BindingPut { tenant, .. }
-            | ControlOp::BindingDelete { tenant, .. } => tenant,
+            | ControlOp::BindingDelete { tenant, .. }
+            | ControlOp::AuditSinkPut { tenant, .. }
+            | ControlOp::AuditSinkDelete { tenant }
+            | ControlOp::AuditCheckpointPut { tenant, .. } => tenant,
         }
     }
 
-    /// The §4.1 action slug for [`AuditRow::action`].
+    /// The §4.1 action slug for [`AuditRow::action`], or `None` for an op that
+    /// is deliberately not audited.
     ///
     /// Exhaustive with no wildcard arm, for the same reason
     /// `admin_front::action_for` is: a new op added without deciding what it is
     /// called in the audit stream should fail to compile, not appear under
-    /// whatever the fallthrough happened to say.
+    /// whatever the fallthrough happened to say. The `Option` keeps that
+    /// property while letting an op opt *out* explicitly — silence has to be a
+    /// decision someone wrote down, not a missing arm.
+    ///
+    /// Exactly one op opts out today, and it has to:
+    /// [`ControlOp::AuditCheckpointPut`] records how far the exporter has
+    /// shipped. Auditing it would append a row, which the exporter would then
+    /// ship, which would write a new checkpoint, which would append a row —
+    /// an unbounded loop whose whole content is the loop itself.
     #[must_use]
-    pub fn audit_action(&self) -> &'static str {
-        match self {
+    pub fn audit_action(&self) -> Option<&'static str> {
+        Some(match self {
+            ControlOp::AuditCheckpointPut { .. } => return None,
             ControlOp::PutImposter { .. } => "imposter.write",
             ControlOp::PatchStubs { .. } => "stub.write",
             ControlOp::DeleteImposter { .. } | ControlOp::DeleteAll { .. } => "imposter.delete",
@@ -803,7 +880,11 @@ impl ControlOp {
             | ControlOp::PrincipalDelete { .. }
             | ControlOp::BindingPut { .. }
             | ControlOp::BindingDelete { .. } => "tenant.manage",
-        }
+            // Where the fleet's audit goes is a fleet-scoped decision, and it
+            // is named the same thing here as the action that gates the
+            // endpoint (`authz::Action::ClusterAdmin`).
+            ControlOp::AuditSinkPut { .. } | ControlOp::AuditSinkDelete { .. } => "cluster.admin",
+        })
     }
 
     /// What this op addressed, for [`AuditRow::resource`].
@@ -832,6 +913,12 @@ impl ControlOp {
             ControlOp::PrincipalDelete { principal_id, .. }
             | ControlOp::BindingPut { principal_id, .. }
             | ControlOp::BindingDelete { principal_id, .. } => principal_id.as_str().to_owned(),
+            // One sink, fleet-wide: it addresses the whole scope, not a named
+            // object. `AuditCheckpointPut` never reaches here (it is not
+            // audited) but must still answer, so it answers the same way.
+            ControlOp::AuditSinkPut { .. }
+            | ControlOp::AuditSinkDelete { .. }
+            | ControlOp::AuditCheckpointPut { .. } => AUDIT_RESOURCE_ALL.to_owned(),
         }
     }
 }
@@ -1157,7 +1244,123 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             require_tenant_or_fleet_scope(tenant)?;
             require_principal_id(principal_id)
         }
+        ControlOp::AuditSinkPut {
+            tenant,
+            uri,
+            auth_ref,
+            batch_max_rows,
+        } => {
+            require_fleet_scope(tenant)?;
+            // The same call, in the same order, as the `SourcePut` arm: hygiene
+            // strictly before shape. #164 asks for "the same error shape as a
+            // source URI", and reusing the function is the only way to keep
+            // that true as either side changes.
+            require_credential_free_uri(uri)?;
+            require_audit_sink_uri(uri)?;
+            if let Some(auth_ref) = auth_ref
+                && !is_source_name(auth_ref)
+            {
+                return Err(
+                    "auth_ref must be a non-empty name of at most 128 characters drawn from \
+                     [A-Za-z0-9._-]"
+                        .to_owned(),
+                );
+            }
+            if *batch_max_rows == 0 || *batch_max_rows > MAX_AUDIT_BATCH_MAX_ROWS {
+                return Err(format!(
+                    "batchMaxRows must be between 1 and {MAX_AUDIT_BATCH_MAX_ROWS}: a batch is \
+                     buffered whole before it is shipped"
+                ));
+            }
+            Ok(())
+        }
+        ControlOp::AuditSinkDelete { tenant } | ControlOp::AuditCheckpointPut { tenant, .. } => {
+            require_fleet_scope(tenant)
+        }
     }
+}
+
+/// The audit-export ops address one fleet-wide sink, so the fleet scope is the
+/// only tenant they may carry.
+///
+/// Refused rather than tolerated: these ops are audited, and `AuditRow::tenant`
+/// means "the tenant the op acted on". Admitting `AuditSinkPut { tenant: "acme" }`
+/// would file a fleet-wide configuration change under one tenant's name, in the
+/// stream this feature exists to produce.
+fn require_fleet_scope(tenant: &TenantId) -> Result<(), String> {
+    if tenant.as_str() == FLEET_SCOPE {
+        Ok(())
+    } else {
+        Err(format!(
+            "the audit export sink is fleet-wide, so its ops carry the reserved fleet scope \
+             {FLEET_SCOPE:?}, not tenant {:?}",
+            tenant.as_str()
+        ))
+    }
+}
+
+/// Whether `uri` is a cleartext webhook that cannot leave this host.
+///
+/// The one exception to the https-only rule, and it is narrow on purpose: a
+/// loopback sink puts no bytes on a network, so there is nothing for the
+/// cleartext rule to protect. It exists so the export path is exercisable end
+/// to end — by this crate's own tests, and by an operator running a collector
+/// as a sidecar — without standing up a TLS terminator to prove it works.
+///
+/// Shared by [`validate`] (admission) and the transport factory (egress) so
+/// the two enforcement points cannot drift into disagreeing about what
+/// cleartext is permitted. They already did once: admission allowed a loopback
+/// sink the transport then refused to build, which is a sink that commits
+/// cleanly and silently exports nothing.
+pub(crate) fn is_loopback_http(uri: &str) -> bool {
+    let Some(rest) = uri.trim().strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // `rsplit_once` so an IPv6 literal's own colons stay with the host.
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => authority,
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+}
+
+/// Which schemes the audit exporter can actually ship to.
+///
+/// Refused at admission rather than at export time for the same reason the
+/// source providers refuse an unfetchable URI: a sink that no transport can
+/// reach would otherwise be committed, agreed by the fleet, and then fail every
+/// batch forever while looking configured.
+///
+/// `http://` is refused as well as unknown schemes, save the narrow loopback
+/// carve-out [`is_loopback_http`] defines. An audit stream names who did what
+/// to which tenant; shipping it in cleartext is not a trade-off an operator
+/// should be able to make by typing one fewer character.
+fn require_audit_sink_uri(uri: &str) -> Result<(), String> {
+    let uri = uri.trim();
+    if uri.starts_with("https://") {
+        return Ok(());
+    }
+    if is_loopback_http(uri) {
+        return Ok(());
+    }
+    if let Some(rest) = uri.strip_prefix("s3://") {
+        // Same shape the s3 source parses: `s3://<bucket>/<key-prefix>`.
+        return match rest.split_once('/') {
+            Some((bucket, prefix)) if !bucket.is_empty() && !prefix.is_empty() => Ok(()),
+            _ => Err(
+                "an s3 audit sink is written `s3://<bucket>/<key-prefix>`: the prefix is where \
+                 the batched objects are written"
+                    .to_owned(),
+            ),
+        };
+    }
+    Err(
+        "an audit sink uri must be https:// (webhook, JSON lines) or s3:// (bucket, batched \
+         objects); http:// is refused because an audit stream must not cross the network in \
+         cleartext"
+            .to_owned(),
+    )
 }
 
 /// The rules every config carried by the log must satisfy, whether an operator
@@ -1522,7 +1725,11 @@ pub(crate) fn precondition_target(op: &ControlOp) -> Option<(&TenantId, u16)> {
         | ControlOp::PrincipalCreate { .. }
         | ControlOp::PrincipalDelete { .. }
         | ControlOp::BindingPut { .. }
-        | ControlOp::BindingDelete { .. } => None,
+        | ControlOp::BindingDelete { .. }
+        // The audit-export ops address the fleet's sink, not an imposter record.
+        | ControlOp::AuditSinkPut { .. }
+        | ControlOp::AuditSinkDelete { .. }
+        | ControlOp::AuditCheckpointPut { .. } => None,
     }
 }
 
@@ -2207,6 +2414,234 @@ mod tests {
                 "the refusal must not echo the credential-bearing uri back: {err}"
             );
         }
+    }
+
+    // -- audit export sink (#164) -------------------------------------------
+
+    fn sink_put(uri: &str) -> ControlOp {
+        ControlOp::AuditSinkPut {
+            tenant: TenantId::new(FLEET_SCOPE),
+            uri: uri.to_owned(),
+            auth_ref: None,
+            batch_max_rows: DEFAULT_AUDIT_BATCH_MAX_ROWS,
+        }
+    }
+
+    /// #164's "no credential in the log" criterion, asserted the strong way:
+    /// not merely that a credential-bearing sink URI is refused, but that it is
+    /// refused with the **byte-identical** message a source URI gets.
+    ///
+    /// Equality rather than a substring match is the point. The criterion says
+    /// "the same error shape as a source URI", and the only way that stays true
+    /// as either path changes is if both call one function — so the test is
+    /// written to fail the moment they diverge, including if someone
+    /// "improves" one message and not the other.
+    #[test]
+    fn a_sink_uri_with_embedded_credentials_is_refused_like_a_source_uri() {
+        for (sink_uri, source_uri) in [
+            (
+                "https://user:pass@collector.example/audit",
+                "https://user:pass@host/x.json",
+            ),
+            (
+                "https://token@collector.example/audit",
+                "https://token@host/x.json",
+            ),
+        ] {
+            let sink_err =
+                validate(&sink_put(sink_uri)).expect_err("a sink URI carrying credentials");
+            let source_err = validate(&source_put("mocks", source_uri))
+                .expect_err("a source URI carrying credentials");
+            assert_eq!(
+                sink_err, source_err,
+                "the sink and source hygiene refusals must be the same message, produced by \
+                 the same check"
+            );
+            assert!(
+                !sink_err.contains(sink_uri) && !sink_err.contains('@'),
+                "the refusal must not echo the credential-bearing uri back: {sink_err}"
+            );
+        }
+    }
+
+    /// Hygiene runs strictly before shape here, exactly as it does for a
+    /// source. A URI that fails both must be caught by the credential check,
+    /// whose message is deliberately free of the URI — running the more
+    /// specific scheme check first would put a secret into an operator-facing
+    /// error string.
+    #[test]
+    fn sink_credential_hygiene_runs_before_the_scheme_check() {
+        // A distinctive secret: the refusal's own text contains the word
+        // "pass" ("pass a credential name as auth_ref"), so a literal
+        // `user:pass@` would make this assertion fire on the message rather
+        // than on a leak.
+        let err = validate(&sink_put("ftp://user:s3cr3t-t0ken@host/audit"))
+            .expect_err("credential-bearing and wrong-scheme");
+        assert!(
+            err.contains("auth_ref"),
+            "the credential check must win: {err}"
+        );
+        assert!(
+            !err.contains("s3cr3t-t0ken"),
+            "the refusal must not echo the secret: {err}"
+        );
+    }
+
+    #[test]
+    fn an_audit_sink_uri_must_be_https_or_s3() {
+        validate(&sink_put("https://collector.example/audit")).expect("https is a webhook sink");
+        validate(&sink_put("s3://bucket/audit-prefix")).expect("s3 is a bucket sink");
+
+        // Cleartext over the network is refused rather than merely
+        // discouraged: an audit stream names who did what to which tenant.
+        let err = validate(&sink_put("http://collector.example/audit"))
+            .expect_err("http:// to a remote host must be refused");
+        assert!(err.contains("cleartext"), "{err}");
+
+        // …but a loopback collector never puts those bytes on a network, so it
+        // is allowed. Asserted so the carve-out stays exactly this narrow: a
+        // later "simplification" that allowed any http:// would pass the check
+        // above and be caught here.
+        for loopback in [
+            "http://127.0.0.1:9000/audit",
+            "http://localhost:9000/audit",
+            "http://[::1]:9000/audit",
+        ] {
+            validate(&sink_put(loopback))
+                .unwrap_or_else(|e| panic!("a loopback collector is allowed: {loopback}: {e}"));
+        }
+        for remote in [
+            "http://127.0.0.1.example.com/audit",
+            "http://evil.com/audit",
+            "http://10.0.0.1/audit",
+        ] {
+            validate(&sink_put(remote))
+                .expect_err("only a genuine loopback host may use cleartext");
+        }
+
+        let err = validate(&sink_put("s3://bucket")).expect_err("an s3 sink needs a key prefix");
+        assert!(err.contains("<bucket>/<key-prefix>"), "{err}");
+    }
+
+    #[test]
+    fn a_sink_batch_size_is_bounded() {
+        for (rows, why) in [
+            (0, "zero would ship nothing forever"),
+            (u32::MAX, "unbounded"),
+        ] {
+            let err = validate(&ControlOp::AuditSinkPut {
+                tenant: TenantId::new(FLEET_SCOPE),
+                uri: "https://collector.example/audit".to_owned(),
+                auth_ref: None,
+                batch_max_rows: rows,
+            })
+            .expect_err(why);
+            assert!(err.contains("batchMaxRows"), "{rows}: {err}");
+        }
+    }
+
+    /// The feedback loop this `None` exists to prevent: a checkpoint write that
+    /// produced an audit row would be shipped by the exporter, which would
+    /// write a new checkpoint, which would produce a new row — forever, with no
+    /// content but the loop itself.
+    #[test]
+    fn audit_checkpoint_writes_are_not_themselves_audited() {
+        assert_eq!(
+            ControlOp::AuditCheckpointPut {
+                tenant: TenantId::new(FLEET_SCOPE),
+                revision: 42,
+            }
+            .audit_action(),
+            None,
+            "auditing the exporter's own checkpoint is an unbounded feedback loop"
+        );
+
+        // Every *other* op still is audited — the opt-out must stay a
+        // deliberate single case, not a hole new ops fall into.
+        for op in [
+            ControlOp::AuditSinkPut {
+                tenant: TenantId::new(FLEET_SCOPE),
+                uri: "https://collector.example/audit".to_owned(),
+                auth_ref: None,
+                batch_max_rows: DEFAULT_AUDIT_BATCH_MAX_ROWS,
+            },
+            ControlOp::AuditSinkDelete {
+                tenant: TenantId::new(FLEET_SCOPE),
+            },
+            ControlOp::DeleteAll {
+                tenant: TenantId::default(),
+            },
+        ] {
+            assert!(
+                op.audit_action().is_some(),
+                "{op:?} must appear in the audit stream"
+            );
+        }
+    }
+
+    /// A fleet-scoped change must be *attributed* to the fleet, not filed under
+    /// whichever tenant happened to be handy.
+    ///
+    /// This shipped wrong once: the admin handler minted the sink ops with
+    /// `TenantId::default()`, so changing where the whole fleet's audit goes
+    /// produced a row claiming the `default` tenant did it — a wrong answer in
+    /// the one stream this feature exists to produce, and one that reads as
+    /// perfectly ordinary.
+    #[test]
+    fn a_fleet_scoped_sink_change_is_audited_against_the_fleet_scope() {
+        for op in [
+            ControlOp::AuditSinkPut {
+                tenant: TenantId::new(FLEET_SCOPE),
+                uri: "https://collector.example/audit".to_owned(),
+                auth_ref: None,
+                batch_max_rows: DEFAULT_AUDIT_BATCH_MAX_ROWS,
+            },
+            ControlOp::AuditSinkDelete {
+                tenant: TenantId::new(FLEET_SCOPE),
+            },
+        ] {
+            validate(&op).expect("the fleet scope is a valid tenant for a sink op");
+            assert_eq!(
+                op.tenant().as_str(),
+                FLEET_SCOPE,
+                "{op:?} must be audited against the fleet, not a tenant"
+            );
+            assert_eq!(
+                op.audit_resource(),
+                AUDIT_RESOURCE_ALL,
+                "one fleet-wide sink addresses a whole scope, not a named object"
+            );
+        }
+    }
+
+    /// The sink record is what a snapshot copies and `GET /admin/audit/sink`
+    /// serves, so the type must be incapable of carrying a secret in the first
+    /// place — a check on the *shape*, not on one instance's contents.
+    #[test]
+    fn the_stored_sink_record_carries_a_name_and_never_a_credential() {
+        let record = AuditSink {
+            uri: "s3://bucket/audit".to_owned(),
+            auth_ref: Some("prod-collector".to_owned()),
+            batch_max_rows: DEFAULT_AUDIT_BATCH_MAX_ROWS,
+            revision: 7,
+        };
+        let encoded = serde_json::to_value(&record).expect("sink record serializes");
+        // Compared as a set: `serde_json::Map` is a sorted map, so key order
+        // here is alphabetical and says nothing about the struct. The claim
+        // being locked is *which* fields exist, not their order.
+        let fields: std::collections::BTreeSet<&str> = encoded
+            .as_object()
+            .expect("a sink record is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            ["authRef", "batchMaxRows", "revision", "uri"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "a new field here is a new chance to leak a secret into the log; add it deliberately"
+        );
     }
 
     // -- per-provider URI shape (#136) --------------------------------------

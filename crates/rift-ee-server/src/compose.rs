@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use rift_cluster::audit_export::{AuditExporter, ExportContext, ExportStatus};
 use rift_cluster::sources;
 use rift_cluster::stores::{
     ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, FlowShard, ShardConfig, flow_routes,
@@ -166,6 +167,12 @@ pub struct ComposedServer {
     /// running delays the node's `Drop`, which is what releases the cluster
     /// port and the redb lock.
     source_scheduler: Option<tokio::task::JoinHandle<()>>,
+    /// The leader-only audit export loop (issue #164). Same lifecycle rules as
+    /// `source_scheduler` — including the same reason: it holds an
+    /// `Arc<RaftNode>` across its leadership wait, so it must be aborted here
+    /// and everywhere else the node is torn down, or the next start fails to
+    /// bind.
+    audit_exporter: Option<tokio::task::JoinHandle<()>>,
     /// Replays parked intents on leader changes (issue #9 R4); same lifecycle
     /// rules as the reconciler.
     intent_replayer: Option<tokio::task::JoinHandle<()>>,
@@ -250,6 +257,9 @@ impl ComposedServer {
         }
         if let Some(scheduler) = self.source_scheduler {
             scheduler.abort();
+        }
+        if let Some(exporter) = self.audit_exporter {
+            exporter.abort();
         }
         if let Some(probes) = self.probes {
             probes.shutdown().await;
@@ -418,6 +428,7 @@ pub async fn start_with_runtimes(
             metrics_sampler: None,
             reconciler: None,
             source_scheduler: None,
+            audit_exporter: None,
             intent_replayer: None,
             cluster_addr: None,
             manager: None,
@@ -536,13 +547,15 @@ pub async fn start_with_runtimes(
     // node then advertises — so the node can only arrive afterwards, through
     // `bind` below. The registry is this node's own view of which schemes it
     // can fetch; deterministic op validation deliberately does not consult it.
-    let puller = match build_source_registry(cli.oss.no_parse) {
-        Ok(registry) => Arc::new(SourcePuller::new(registry)),
-        Err(e) => {
-            probes.shutdown().await;
-            return Err(e.context("registering the built-in imposter sources"));
-        }
-    };
+    let (source_registry, source_resolver, source_s3_config) =
+        match build_source_registry(cli.oss.no_parse) {
+            Ok(built) => built,
+            Err(e) => {
+                probes.shutdown().await;
+                return Err(e.context("registering the built-in imposter sources"));
+            }
+        };
+    let puller = Arc::new(SourcePuller::new(source_registry));
 
     let slot = NodeSlot::default();
     let node = match RaftNode::start_with_front_door_routes(
@@ -617,8 +630,23 @@ pub async fn start_with_runtimes(
     let (poll_status, source_scheduler) =
         SourceScheduler::spawn(&tokio::runtime::Handle::current(), &node, &puller);
     puller.attach_poll_status(&poll_status);
+
+    // The leader-only audit export loop (issue #164), spawned right alongside
+    // the scheduler above and governed by the identical lifecycle rule stated
+    // on `ComposedServer::audit_exporter`: same ambient runtime (never a bare
+    // `Runtime` of its own, #120), same abort-on-every-teardown-path
+    // obligation, for the same reason (it holds an `Arc<RaftNode>` across its
+    // own leadership wait).
+    let export_context = Arc::new(ExportContext {
+        resolver: source_resolver,
+        s3: source_s3_config,
+    });
+    let (export_status, audit_exporter) =
+        AuditExporter::spawn(&tokio::runtime::Handle::current(), &node, export_context);
+
     if let Err(e) = flow_net.bind(&node, FlowBindConfig::default()) {
         source_scheduler.abort();
+        audit_exporter.abort();
         probes.shutdown().await;
         if let Err(e) = node.shutdown().await {
             tracing::error!(error = %e, "cluster node shutdown reported an error");
@@ -640,6 +668,7 @@ pub async fn start_with_runtimes(
         Arc::clone(&manager),
         front_door_routes,
         Arc::clone(&puller),
+        Arc::clone(&export_status),
     )
     .await
     {
@@ -651,6 +680,7 @@ pub async fn start_with_runtimes(
             metrics_sampler: Some(spawn_metrics_sampler(Arc::clone(&node))),
             reconciler: Some(reconciler),
             source_scheduler: Some(source_scheduler),
+            audit_exporter: Some(audit_exporter),
             intent_replayer: Some(spawn_intent_replayer(Arc::clone(&node))),
             node: Some(node),
             cluster_addr: Some(cluster_addr),
@@ -661,6 +691,7 @@ pub async fn start_with_runtimes(
         }),
         Err(e) => {
             source_scheduler.abort();
+            audit_exporter.abort();
             probes.shutdown().await;
             if let Err(e) = node.shutdown().await {
                 tracing::error!(error = %e, "cluster node shutdown reported an error");
@@ -680,6 +711,7 @@ async fn attach_data_plane(
     manager: Arc<ImposterManager>,
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
     puller: Arc<SourcePuller>,
+    export_status: Arc<ExportStatus>,
 ) -> anyhow::Result<(
     RunningServer,
     AdminFront,
@@ -820,6 +852,7 @@ async fn attach_data_plane(
             barrier,
             barrier_timeout,
             admin_async,
+            export_status: Some(export_status),
         },
         node,
     )
@@ -882,7 +915,22 @@ async fn attach_data_plane(
 ///   only when an endpoint is configured: a `registry:` scheme with nothing
 ///   to reach is not a provider worth having, it is a pull failure waiting to
 ///   happen on the first source that names it.
-fn build_source_registry(no_parse: bool) -> anyhow::Result<sources::SourceProviders> {
+///
+/// Also returns the credential resolver and the S3 config it built along the
+/// way — issue #164's audit exporter reaches `s3://` sinks and `auth_ref`-named
+/// credentials through the exact same node-local machinery the `s3:`/`git+*:`
+/// source providers use, and re-reading `RIFT_SOURCE_SECRETS_DIR` /
+/// `RIFT_S3_ENDPOINT` / `RIFT_S3_REGION` a second time in a second function
+/// would risk the two disagreeing (a resolver built with one secrets dir for
+/// sources, another for audit) for no reason other than not having threaded a
+/// value through.
+fn build_source_registry(
+    no_parse: bool,
+) -> anyhow::Result<(
+    sources::SourceProviders,
+    Arc<dyn sources::auth::CredentialResolver>,
+    sources::s3::S3Config,
+)> {
     let mut upstream = SourceRegistry::new();
     upstream.register(Arc::new(FileSource::new(no_parse)))?;
     upstream.register(Arc::new(HttpSource::new()?))?;
@@ -904,14 +952,14 @@ fn build_source_registry(no_parse: bool) -> anyhow::Result<sources::SourceProvid
     };
     providers.register_credentialed(Arc::new(sources::s3::S3Source::new(
         Arc::clone(&resolver),
-        s3_config,
+        s3_config.clone(),
     )?))?;
 
     if let Ok(endpoint) = std::env::var("RIFT_SOURCE_REGISTRY_ENDPOINT") {
         let imposters_pointer = std::env::var("RIFT_SOURCE_REGISTRY_POINTER")
             .unwrap_or_else(|_| "/imposters".to_owned());
         providers.register_credentialed(Arc::new(sources::registry::RegistrySource::new(
-            resolver,
+            Arc::clone(&resolver),
             sources::registry::RegistryConfig {
                 endpoint,
                 imposters_pointer,
@@ -919,7 +967,7 @@ fn build_source_registry(no_parse: bool) -> anyhow::Result<sources::SourceProvid
         )?))?;
     }
 
-    Ok(providers)
+    Ok((providers, resolver, s3_config))
 }
 
 /// Turn `--imposters` into declared sources and pull each once.

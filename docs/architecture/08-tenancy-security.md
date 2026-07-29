@@ -534,6 +534,68 @@ shipped so M3 does not inherit the ambiguity.
 **Q3 — `VerifyRun` granularity** belongs to T2's action matrix and is unchanged
 here.
 
+### What the export sink ships, and what it will not promise (issue #164)
+
+T4 derives the audit stream; the export sink is what carries it off the fleet to
+somewhere the customer owns — an `https://` webhook (JSON Lines) or an
+`s3://<bucket>/<prefix>` (one object per batch). It is **optional and off by
+default**, and it adds **no dependency**: the SigV4 signing and HTTP client are
+the ones the `s3:` imposter-source provider already carries.
+
+**Configuration is fleet state; credentials are node-local.** The sink is a
+control-plane record, so every node agrees on where the audit goes and a node
+joining inherits it. The record carries an `auth_ref` — the *name* of a
+credential, never a credential — validated by the same
+`require_credential_free_uri` the source providers use, in the same
+hygiene-before-shape order. Reusing the function rather than restating the rule
+is deliberate: "the same error shape as a source URI" only stays true if there
+is one implementation, and a test asserts the two refusals are byte-identical.
+Resolution happens node-locally at export time, exactly as it does for a
+credentialed source.
+
+The one cleartext exception is `http://` to a **loopback** host, which puts no
+bytes on a network. Admission and the transport factory ask the same predicate
+(`control::is_loopback_http`) so they cannot drift — they did once during
+development, and the result was the worst available shape: a sink that committed
+cleanly, looked configured on every node, and silently exported nothing.
+
+**Leader-only, checkpointed, at-least-once.** Every node derives the same rows,
+so every node exporting would deliver N copies. The leader exports, grounded on
+the same `RaftMetrics` leadership watch the source scheduler reads — not a second
+notion of leadership. It checkpoints the last shipped revision as a control-plane
+record, so a failover *resumes* rather than restarting from zero or skipping a
+window; the checkpoint applies as `max(existing, new)`, so a deposed leader's
+late write is a no-op instead of a rewind.
+
+The guarantee is **at-least-once, and it is stated rather than implied**. A batch
+is shipped first and checkpointed second; a leader dying in between re-ships that
+batch. The consumer dedups on `(revision, op_id)`, which is why the row carries
+both. Exactly-once would need a transaction spanning the customer's bucket and
+the Raft log, which does not exist — so the weaker guarantee is named and the
+duplicate window is bounded to one batch.
+
+**The exporter's own checkpoint is not audited**, and this is the one deliberate
+hole in the "every op reaches the stream" rule. Auditing it would append a row,
+which the exporter would ship, which would write a new checkpoint, which would
+append a row — an unbounded loop whose only content is the loop. `audit_action()`
+returns `Option`, so opting out is an arm someone had to write rather than a
+missing branch, and adding an op still fails to compile until it decides.
+
+**Backpressure never reaches the write path.** Export reads committed state; no
+admin write waits on it. A sink that is down grows a lag gauge and a failure
+counter (`rift_cluster_audit_export_*`) and retries on bounded exponential
+backoff. If it stays down past `--cluster-audit-retention`, retention removes
+rows the exporter never shipped: that gap is **counted and logged at error
+level**, never passed over. It is reported as a *revision span*
+(`..._skipped_revisions_total`) rather than a row count, because once the rows
+are GC'd there is nothing left to count and revisions are not one-to-one with
+rows — an upper bound named as one is useful, a precise-looking guess is not.
+
+**One sink, fleet-wide — a stated non-goal, not an oversight.** The checkpoint is
+a single revision, which is what makes failover resumption work; per-tenant sinks
+would need a checkpoint per tenant and a per-tenant exporter. Configuring the
+sink is therefore gated on `cluster.admin`, not on a tenant-scoped action.
+
 ## Cluster-internal security
 
 The node-to-node surface (Raft RPCs, owner-forwarded ops, replication, journal
@@ -566,5 +628,6 @@ don't hold credentials.
 Recorded so the boundary cannot be oversold: no per-principal data-plane
 authorization (see the framing rule); no per-tenant TLS identities on imposter
 ports; no compute/memory isolation between tenants (quotas bound object
-counts, not CPU); no cross-cluster tenancy federation. Each of these is a
-conscious "no", not an omission.
+counts, not CPU); no cross-cluster tenancy federation; no per-tenant audit
+export sink, and no exactly-once delivery to the one there is. Each of these is
+a conscious "no", not an omission.
