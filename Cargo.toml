@@ -94,6 +94,9 @@ sha2 = "0.10"
 subtle = "2"
 rand = "0.8"
 parking_lot = "0.12"
+# RFC-002 §3.2/§8.2: principal API keys are stored as argon2id hashes, never
+# raw — this is the only place that hash is produced or verified.
+argon2 = "0.5"
 
 # Control plane (ADR-001): embedded Raft (openraft) over an embedded ACID store
 # (redb). `storage-v2` is required to implement the split RaftLogStorage +

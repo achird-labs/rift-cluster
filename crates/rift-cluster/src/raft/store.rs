@@ -77,14 +77,8 @@ use serde::{Deserialize, Serialize};
 use super::TypeConfig;
 use crate::control::{
     self, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest, FLEET_SCOPE, OnDrift,
-    SourceMode, SourceProvenance, StubEdit, StubEditScript, Tenant,
+    Principal, Role, SourceMode, SourceProvenance, StubEdit, StubEditScript, Tenant, TenantId,
 };
-// Only the test-only row readers below (`test_principal_row`, `test_binding`)
-// name these types outside `mod tests`; production `mutate_tables` never
-// spells them (it only destructures `ControlOp` variant fields), so they are
-// unused in a non-test build without this gate.
-#[cfg(test)]
-use crate::control::{Principal, Role};
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
 
@@ -907,6 +901,95 @@ impl RedbStateMachine {
         let owned = Self::ports_by_source(&configs)
             .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
         Ok(Some(Self::render_source(id, &stored, owned.get(id))))
+    }
+
+    /// The principal record for `id`, or `None` if no such principal exists
+    /// (issue #161). Like [`Self::read_config`], this answers from local
+    /// applied state with no Raft round trip — authenticating a request must
+    /// not require this node to be leader.
+    #[allow(clippy::result_large_err)]
+    pub fn principal(&self, id: &str) -> StorageResult<Option<Principal>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_PRINCIPALS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        table
+            .get(id)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|g| {
+                serde_json::from_str::<Principal>(g.value()).map_err(|e| {
+                    tracing::error!(principal_id = %id, error = %e, "corrupt stored principal");
+                    StorageError::from(StorageIOError::read_state_machine(&e))
+                })
+            })
+            .transpose()
+    }
+
+    /// Every tenant `id` is bound in, with the role for each (RFC-002 §4,
+    /// issue #161) — the whole-of-request read: authenticate, then load
+    /// *this* principal's bindings, then intersect with what was requested.
+    ///
+    /// `sm_bindings` is keyed principal-major exactly so this can be a single
+    /// seek (see the `TableDefinition`'s doc); this reads the whole table and
+    /// filters instead, matching [`Self::sources`]'s and
+    /// [`Self::configured_ports`]'s tenant-filtered scans in this same file.
+    /// A fleet's principal/binding count is nowhere near what would make that
+    /// choice matter — simplicity over the seek this key order enables but
+    /// does not require.
+    #[allow(clippy::result_large_err)]
+    pub fn principal_bindings(&self, id: &str) -> StorageResult<Vec<(TenantId, Role)>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_BINDINGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut bindings = Vec::new();
+        for item in table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (principal_id, tenant) = key.value();
+            if principal_id != id {
+                continue;
+            }
+            // A row that will not parse is committed-state corruption, not an
+            // absent binding: reported as an error rather than skipped, or a
+            // principal with a broken row would silently lose access instead
+            // of the operator learning their state is corrupt.
+            let role: Role = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(principal_id = %id, tenant, error = %e, "corrupt stored binding");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            bindings.push((TenantId::new(tenant), role));
+        }
+        Ok(bindings)
+    }
+
+    /// Whether the fleet has any principal defined at all (RFC-002 §3.4).
+    /// Governs the legacy-admin-plane bypass and the `rift_cluster_no_principals`
+    /// gauge: presence is presence regardless of whether a given row happens
+    /// to parse, so a corrupt row still counts — the wrong answer here is
+    /// "false" (it would silently reopen the pre-#161 open admin plane on a
+    /// fleet that in fact has principals).
+    #[allow(clippy::result_large_err)]
+    pub fn has_any_principals(&self) -> StorageResult<bool> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_PRINCIPALS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut iter = table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Ok(iter.next().is_some())
     }
 
     /// `(port, provenance)` for every source-owned config, ascending by port —
@@ -4552,6 +4635,107 @@ mod tests {
         .await;
         assert_eq!(response.outcome, ControlOutcome::Applied);
         assert_eq!(sm.test_binding("alice", "acme"), Some(Role::Editor));
+    }
+
+    // -- issue #161: the production read path (`principal`, `principal_bindings`,
+    // `has_any_principals`) that authentication and authorization are built on --
+
+    #[tokio::test]
+    async fn has_any_principals_reflects_the_fleet_before_and_after_a_put() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        assert!(!sm.has_any_principals().expect("read"));
+
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme Corp")).await;
+        apply_one(
+            &mut sm,
+            2,
+            principal_put_req(2, "acme", test_principal("alice")),
+        )
+        .await;
+        assert!(sm.has_any_principals().expect("read"));
+    }
+
+    #[tokio::test]
+    async fn principal_reads_back_the_stored_record_and_none_for_an_unknown_id() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        assert_eq!(sm.principal("alice").expect("read"), None);
+
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme Corp")).await;
+        apply_one(
+            &mut sm,
+            2,
+            principal_put_req(2, "acme", test_principal("alice")),
+        )
+        .await;
+
+        let principal = sm.principal("alice").expect("read").expect("stored");
+        assert_eq!(principal.id, PrincipalId::new("alice"));
+        assert_eq!(principal.display_name, "alice");
+        assert_eq!(sm.principal("bob").expect("read"), None);
+    }
+
+    /// `sm_bindings` is principal-major (`(principal id, tenant)`), so this is
+    /// the read that proves a lookup by principal id actually collects every
+    /// tenant it names, not just the first — and that a different principal's
+    /// rows never leak in.
+    #[tokio::test]
+    async fn principal_bindings_collects_every_tenant_and_nothing_belonging_to_another_principal() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme Corp")).await;
+        apply_one(&mut sm, 2, tenant_put_req(2, "globex", "Globex Inc")).await;
+        apply_one(
+            &mut sm,
+            3,
+            principal_put_req(3, "acme", test_principal("alice")),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            4,
+            principal_put_req(4, "acme", test_principal("bob")),
+        )
+        .await;
+
+        apply_one(
+            &mut sm,
+            5,
+            binding_put_req(5, "acme", "alice", Role::Editor),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            6,
+            binding_put_req(6, "globex", "alice", Role::Viewer),
+        )
+        .await;
+        // Bob's own binding must never appear in Alice's read.
+        apply_one(
+            &mut sm,
+            7,
+            binding_put_req(7, "acme", "bob", Role::TenantAdmin),
+        )
+        .await;
+
+        let mut alice = sm.principal_bindings("alice").expect("read");
+        alice.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        assert_eq!(
+            alice,
+            vec![
+                (TenantId::new("acme"), Role::Editor),
+                (TenantId::new("globex"), Role::Viewer),
+            ]
+        );
+
+        assert_eq!(
+            sm.principal_bindings("bob").expect("read"),
+            vec![(TenantId::new("acme"), Role::TenantAdmin)]
+        );
+
+        assert_eq!(
+            sm.principal_bindings("nobody").expect("read"),
+            Vec::new(),
+            "an unbound (or unknown) principal has no bindings, not an error"
+        );
     }
 
     /// `validate` cannot see whether "acme" exists — that is state, checked in

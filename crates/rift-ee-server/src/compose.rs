@@ -29,6 +29,7 @@ use rift_ee::seams::{
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
+use crate::authorizer;
 use crate::cli::EeCli;
 use crate::cluster_api::{self, NodeSlot};
 use crate::probes::{self, ProbeListener};
@@ -585,6 +586,13 @@ pub async fn start_with_runtimes(
         }
         return Err(anyhow::Error::new(e).context("binding the operator surface to the node"));
     }
+    // Sampled once here so the gauge is already correct on `/metrics` before
+    // the periodic sampler's first tick (issue #161) — unlike `set_insecure`
+    // above, this cannot run before the node exists: it reads the state
+    // machine. `spawn_metrics_sampler` keeps it current from here on, because
+    // (unlike "is the cluster port authenticated") whether the fleet has any
+    // principal can change at any moment a `PrincipalPut` commits.
+    sample_no_principals(&node);
     pull_on_miss.bind(&node);
     if let Err(e) = puller.bind(&node) {
         probes.shutdown().await;
@@ -690,6 +698,27 @@ async fn attach_data_plane(
     let scripts_dir = cli.oss.scripts_dir.clone();
     cli.oss.host = "127.0.0.1".to_owned();
     cli.oss.port = 0;
+    // Withheld from the loopback deliberately (issue #161, B4): upstream's own
+    // `ServerBuilder` gates the loopback admin on a raw compare of the
+    // `Authorization` header against `--api-key` (`rift-http-proxy`'s
+    // `admin_api::server`), unconditionally, *before* the `admin_authorizer`
+    // hook ever runs — see `attach_data_plane`'s `.admin_authorizer(...)` a
+    // few lines down. `admin_front` has already authenticated and authorized
+    // every request that reaches this loopback (terminated routes render
+    // straight from `admin_front`; proxied routes were authorized in
+    // `admin_front::handle` first), so leaving `cli.oss.api_key` set would
+    // install a *second*, independent api-key gate behind the first. With
+    // real principals also configured, a principal's own key almost never
+    // equals the legacy `--api-key` string, so upstream's raw compare would
+    // 401 every proxied and terminated-render request for every principal but
+    // the one holding the legacy key — the entire admin surface, for a fleet
+    // mid-migration off it. `api_key` (the local binding above, captured
+    // before this clears the copy `ServerBuilder` sees) still flows to
+    // `admin_front`'s own `FrontConfig` and to `EeAuthorizer` below, so the
+    // legacy key keeps resolving to its synthetic principal and the loopback
+    // stays gated — `EeAuthorizer` is its gate now, not upstream's raw
+    // compare.
+    cli.oss.api_key = None;
 
     // Taken, not read: when clustered, this node binds the front door itself
     // (below), against the table the state machine maintains rather than the
@@ -726,9 +755,20 @@ async fn attach_data_plane(
     let barrier_timeout = Duration::from_secs(cli.cluster.cluster_write_barrier_timeout);
     let admin_async = cli.cluster.cluster_admin_async;
     let seeds = cli.cluster.cluster_seeds.clone();
+    let legacy_key_is_fleet_admin = cli.cluster.cluster_legacy_key_is_fleet_admin;
 
     let server = ServerBuilder::from_cli(cli.oss)
         .manager(Arc::clone(&manager))
+        // Defence in depth (issue #161): `admin_front` decides first and is
+        // the only surface that can render RFC-002 §8.4's cross-tenant 404
+        // (this hook can only answer 403 — see `authorizer::EeAuthorizer`'s
+        // module doc), but the loopback OSS admin `admin_front` proxies to
+        // must not be an unguarded second door.
+        .admin_authorizer(Arc::new(authorizer::EeAuthorizer {
+            node: Arc::downgrade(node),
+            api_key: api_key.clone(),
+            legacy_key_is_fleet_admin,
+        }))
         .start()
         .await?;
 
@@ -773,6 +813,7 @@ async fn attach_data_plane(
             public_addr: public_admin.clone(),
             upstream_admin: server.admin_addr(),
             api_key,
+            legacy_key_is_fleet_admin,
             allow_injection,
             scripts_dir,
             barrier,
@@ -1112,8 +1153,21 @@ fn spawn_metrics_sampler(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
             ticker.tick().await;
             let Some(node) = node.upgrade() else { return };
             metrics::observe_node(&node.status(), &node.ring());
+            sample_no_principals(&node);
         }
     })
+}
+
+/// Resample `rift_cluster_no_principals` (issue #161). A read error is logged
+/// rather than propagated: this is an observability gauge, not a decision —
+/// the authorization path (`principal::should_bypass`) makes its own read and
+/// fails closed on the same error, so a sampler that skips a tick here costs
+/// a stale metric, never a wrong access decision.
+fn sample_no_principals(node: &RaftNode) {
+    match node.has_any_principals() {
+        Ok(has_any) => metrics::set_no_principals(!has_any),
+        Err(e) => tracing::warn!(error = %e, "could not sample rift_cluster_no_principals"),
+    }
 }
 
 /// The open-source manager the builder would have constructed, plus the cluster

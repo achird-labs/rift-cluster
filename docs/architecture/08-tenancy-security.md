@@ -237,6 +237,68 @@ Every applied ControlOp emits
 `{ts, principal, tenant, action, resource, op_id, revision, outcome}` into a
 retained, queryable audit table. One stream, not a bolted-on second system.
 
+### What T2 ships — enforcement, and its two deliberate over-restrictions
+
+Slice T2 (issue #161) turns the model into a boundary. The closed 19-action set
+and the `Role → Action` table live in `rift-ee-server`'s `authz` module as a
+**pure** evaluator — no I/O, no HTTP — so the whole matrix is unit-testable
+without a cluster. Bindings are read fresh from the local state machine on every
+request; there is **no authorization cache**, ever (§8.5), because a per-node TTL
+would reintroduce exactly the revocation window consensus is being paid for.
+
+**One evaluator, but authorization happens at the front, for every request.**
+The design in the issue put the enterprise check on terminated routes and left
+proxied ones to the U-9 hook. That cannot satisfy §8.4: upstream's
+`AuthzDecision` is `Allow`/`Deny` only and `Deny` renders **403
+unconditionally**, so a cross-tenant probe on a proxied route would answer 403
+and thereby confirm the tenant exists. So `admin_front` authorizes *everything*
+before the terminated/proxied split and renders 401/403/404 itself, classifying
+proxied routes with **upstream's own exported `classify`** (rift#889) rather than
+a second parser — upstream has already shipped a bug from exactly that
+divergence. The `AdminAuthorizer` stays installed on the loopback as defence in
+depth.
+
+Two places T2 is deliberately **stricter** than RFC-002 §4.2. Both are
+fail-closed responses to a capability this build does not yet have, and both lift
+without a redesign:
+
+1. **`/events` requires `ClusterAdmin`, not `StreamSubscribe`.** §4.3 point 2 has
+   two halves — authorize the subscribe, and filter the stream server-side — and
+   only the first is built, because the SSE payload is upstream's own and carries
+   no tenant to filter on. Serving it at `StreamSubscribe` (a *Viewer* grant)
+   would hand a viewer of one tenant every other tenant's recorded request
+   bodies, which is worse than the 403-vs-404 oracle this slice closes. Only a
+   fleet admin — entitled to all of it anyway — may subscribe until #163 adds
+   filtering, at which point the route returns to `StreamSubscribe`.
+2. **Resource operations are servable only for the `default` tenant.** T1 made
+   the state machine *store* by tenant but not *serve* by tenant:
+   `desired_configs` and `desired_routes` still skip everything that is not
+   `default` when binding the local engine, and `route_table()` is the default
+   tenant's. Authorizing a read for tenant `acme` and then serving it from that
+   engine returns **`default`'s** data — a documented scope limit turned into a
+   cross-tenant bypass. So a decided tenant other than `default` is refused with
+   the same indistinguishable 404 a cross-tenant probe gets, in a single guard at
+   the one choke point every admin request passes through. The terminated ops
+   already thread the decided tenant through, so lifting this guard when serving
+   becomes tenant-aware does not also require re-plumbing them.
+
+The second is the honest statement of where multi-tenancy actually stands: the
+records exist and are enforced against, but until the read and sync paths are
+tenant-aware, `default` is the only tenant that can be served. **That work must
+land the read paths and this guard's removal in the same change** — separating
+them is what produced the bypass in the first place.
+
+**Legacy migration.** The `--api-key` maps to a synthetic principal
+(`legacy:api-key`, which cannot collide with a real `key:<fingerprint>` id) bound
+`TenantAdmin` on `default`, plus `FleetAdmin` on `"*"` while
+`--cluster-legacy-key-is-fleet-admin` is set — default **true** for one release,
+then false, then removed. The key is deliberately withheld from upstream's own
+builder: leaving it set would install a second, independent api-key gate on the
+loopback that runs *before* the authorizer hook, and would 401 every real
+principal on every route for any fleet mid-migration. A fleet with neither an
+api-key nor any principal keeps the pre-T2 open admin plane, and
+`rift_cluster_no_principals` reports that state for Prometheus.
+
 ## Cluster-internal security
 
 The node-to-node surface (Raft RPCs, owner-forwarded ops, replication, journal

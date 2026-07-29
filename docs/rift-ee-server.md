@@ -164,9 +164,42 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-write-barrier-timeout <SECONDS>` | How long the barrier waits (default `2`) before answering anyway with a `Rift-Cluster-Warnings: unapplied=<node,…>` header |
 | `--cluster-admin-async` | Answer admin writes with an immediate `202` + op id after durably parking them; poll `GET /_cluster/ops/:id` for the outcome |
 | `--cluster-flow-fsync-interval-ms <MILLIS>` | Group-fsync cadence for `durability: "async"` flow-state writes (default `50`) — the bound on what a whole-fleet crash can lose for imposters that did not choose `"sync"` or `"none"` |
+| `--cluster-legacy-key-is-fleet-admin <true\|false>` | Whether the legacy `--api-key`'s synthetic principal also gets `FleetAdmin` on the fleet scope, on top of its `TenantAdmin` binding on `default` (RFC-002 §3.4). **Default `true`** — see below |
 
 Each flag also has an environment-variable spelling (`RIFT_CLUSTER_BIND`,
 `RIFT_CLUSTER_SECRET_FILE`, …), which is the intended vehicle for the secret.
+
+### RBAC and the legacy `--api-key` migration (issue #161)
+
+Every admin request — terminated or proxied — is authenticated and authorized
+against RFC-002's principal/role/tenant model. A request's credential resolves
+to a principal one of two ways:
+
+- **A stored principal** (`PrincipalPut`, minted via `BindingPut` into a
+  tenant): its bindings, read fresh from the Raft state machine on every
+  request — never cached, so a revoked binding is refused on the very next
+  request through any node.
+- **The legacy `--api-key`**, mapped to a synthetic principal bound
+  `TenantAdmin` on `default`. This is what keeps every pre-#161 deployment
+  working unchanged: the day of an upgrade, nothing observable changes.
+
+`--cluster-legacy-key-is-fleet-admin` is the staged default that turns that
+into a deprecation rather than a breaking change:
+
+1. **This release: default `true`.** The legacy key also gets `FleetAdmin` on
+   the fleet scope, so it can do everything it always could, including
+   fleet-wide and cluster-admin operations.
+2. **A future release: default `false`.** The legacy key stays `TenantAdmin`
+   on `default` only; fleet-wide operations need a real `FleetAdmin`
+   principal.
+3. **A later release: the flag is removed**, along with the `FleetAdmin`
+   grant.
+
+If a fleet has **no principal defined at all and no `--api-key` configured**,
+the admin plane stays fully open — the pre-#161 behavior, so an upgrade never
+starts denying a fleet that never set up authorization. `GET /metrics` reports
+this as `rift_cluster_no_principals` (see below), so it is something to audit
+for rather than discover.
 
 ### Startup guards
 
@@ -381,6 +414,7 @@ there is nothing extra to scrape:
 | `rift_cluster_members{state="leader"}` | `1` on the leader, `0` elsewhere — summing it across the fleet answers "is there exactly one leader?" |
 | `rift_cluster_ring_epoch` | membership log index the ownership ring is derived from; two nodes reporting different epochs have not converged |
 | `rift_cluster_insecure` | `1` when this node's cluster port runs unauthenticated, so a fleet can be audited for it |
+| `rift_cluster_no_principals` | `1` when the fleet has no principal defined at all (issue #161) — the condition under which the admin plane's open-by-default bypass applies. Resampled continuously, not only at startup: a `PrincipalPut` can flip it at any moment the fleet is running |
 
 These are sampled from Raft metrics every 5s rather than pushed, because
 leadership and membership change without the cluster crate being called; an

@@ -52,3 +52,7 @@ tempfile = "3"
 # Drives the composed admin API / probe listeners over real HTTP, the way an
 # operator, a load balancer and the upstream integration suites all do.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# Reads `rift_cluster_no_principals` straight off the global registry
+# `rift_cluster::metrics` registers into — the same technique that crate's own
+# tests use, and the reason the workspace pins one `prometheus` version.
+prometheus.workspace = true

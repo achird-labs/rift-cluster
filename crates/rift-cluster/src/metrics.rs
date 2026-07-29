@@ -56,6 +56,17 @@ lazy_static! {
     )
     .expect("rift_cluster_insecure registers once");
 
+    /// `rift_cluster_no_principals` — 1 when the fleet has no principal
+    /// defined at all (RFC-002 §3.4, issue #161). This is what makes the
+    /// pre-#161 open-admin-plane bypass (no `--api-key`, no principals)
+    /// visible on `/metrics` instead of a silent property of an upgraded
+    /// fleet — the same audit-over-trust reasoning as `rift_cluster_insecure`.
+    static ref NO_PRINCIPALS: Gauge = register_gauge!(
+        "rift_cluster_no_principals",
+        "1 when the fleet has no principal defined at all"
+    )
+    .expect("rift_cluster_no_principals registers once");
+
     // -- config-sync (issue #9) ---------------------------------------------
 
     /// `rift_cluster_write_forwards_total` — writes this node accepted and
@@ -402,6 +413,14 @@ pub fn set_insecure(insecure: bool) {
     INSECURE.set(f64::from(u8::from(insecure)));
 }
 
+/// Record whether the fleet has no principal defined at all (issue #161).
+/// Unlike [`set_insecure`], this is not a startup-only fact — a `PrincipalPut`
+/// can change it at any moment the fleet is running — so the composition
+/// samples it on the same timer as the other fleet gauges, not once.
+pub fn set_no_principals(no_principals: bool) {
+    NO_PRINCIPALS.set(f64::from(u8::from(no_principals)));
+}
+
 /// Publish a sample of the node's Raft-derived state.
 ///
 /// Called on a timer by the composition: nothing in this crate is notified when
@@ -660,6 +679,21 @@ mod tests {
         set_insecure(false);
         assert_eq!(
             gauge_from_registry("rift_cluster_insecure", None),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn no_principals_is_auditable_in_both_directions() {
+        let _guard = counter_guard();
+        set_no_principals(true);
+        assert_eq!(
+            gauge_from_registry("rift_cluster_no_principals", None),
+            Some(1.0)
+        );
+        set_no_principals(false);
+        assert_eq!(
+            gauge_from_registry("rift_cluster_no_principals", None),
             Some(0.0)
         );
     }
