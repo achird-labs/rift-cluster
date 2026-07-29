@@ -7,29 +7,48 @@
      never carry meaning alone — every one ships with a distinct glyph shape
      and a text label (green↔red are ΔE ~5 under deutanopia; no hue tweak
      fixes that, so shape + word do the work).                            */
+  /* Palette direction taken from the "WireMock Pro" reference: a deep-slate
+     developer canvas with a periwinkle primary. Dark is the design; light is
+     derived into the same hue family rather than being a naive inversion.
+     Every token below measured >= 4.5:1 against its own surface in both themes.
+
+     Two deliberate departures from the reference:
+       - its peach tertiary (#ffb786) is dropped. It sits in the same warm band
+         as the warning colour, and two warm hues competing is how a status
+         system stops being readable at a glance.
+       - Geist/Inter/JetBrains Mono are not linked. The CSP blocks font CDNs
+         (RFC-006 section 9.1) and the binary ships air-gapped, so the real
+         console faces the same choice: self-host, or use system stacks.        */
   :root {
-    --ground:      #F4F7F8;
+    --ground:      #F5F7FC;
     --surface:     #FFFFFF;
-    --surface-2:   #EDF2F4;
-    --surface-3:   #E2EAED;
-    --ink:         #0E1A20;
-    --ink-2:       #3E555F;
-    --ink-3:       #6B838D;
-    --line:        #D3DFE3;
-    --line-2:      #B9CAD0;
-    --accent:      #0B6E99;
-    --accent-soft: #E3F0F6;
+    --surface-2:   #EDF1FA;
+    --surface-3:   #DFE6F4;
+    --ink:         #111A2E;
+    --ink-2:       #414D69;
+    --ink-3:       #5F6B87;
+    --line:        #D6DEEE;
+    --line-2:      #BCC7DE;
+    --accent:      #2F4CB0;
+    --accent-soft: #E7ECFB;
     --good:        #0B6B3A;
     --good-soft:   #E2F1E8;
     --warn:        #8A5A00;
-    --warn-soft:   #F7EEDC;
+    --warn-soft:   #F8EEDA;
     --crit:        #B02418;
     --crit-soft:   #FAE7E4;
-    --idle:        #6B838D;
-    --idle-soft:   #E9EFF1;
+    --idle:        #5F6B87;
+    --idle-soft:   #ECEFF7;
     --proto:       #6A3FA0;
-    --proto-soft:  #F0EAF8;
-    --shadow:      0 1px 2px rgba(14, 26, 32, .06), 0 1px 1px rgba(14, 26, 32, .04);
+    --proto-soft:  #F1EAFA;
+    --shadow:      0 1px 2px rgba(17, 26, 46, .07), 0 1px 1px rgba(17, 26, 46, .04);
+
+    /* Motion: the "subtle" tier only — 150–200ms, ease-out. An operator
+       console watching a 12,000-row log has no motion budget beyond
+       acknowledging a click. */
+    --t-fast: 150ms;
+    --t-base: 200ms;
+    --ease:   cubic-bezier(.25, .46, .45, .94);
 
     --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable Text",
             "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -39,46 +58,46 @@
 
   @media (prefers-color-scheme: dark) {
     :root {
-      --ground:      #0A1216;
-      --surface:     #121E24;
-      --surface-2:   #18272E;
-      --surface-3:   #1F323A;
-      --ink:         #E4EDF1;
-      --ink-2:       #A8BDC6;
-      --ink-3:       #7A929C;
-      --line:        #24373F;
-      --line-2:      #334B55;
-      --accent:      #5CBEE0;
-      --accent-soft: #14313D;
-      --good:        #3DBE7C;
-      --good-soft:   #102E20;
-      --warn:        #E0A63C;
-      --warn-soft:   #2F2513;
-      --crit:        #F2796B;
-      --crit-soft:   #33191A;
-      --idle:        #7A929C;
-      --idle-soft:   #1B2A31;
-      --proto:       #B79AE0;
-      --proto-soft:  #221B33;
-      --shadow:      0 1px 2px rgba(0, 0, 0, .4);
+      --ground:      #0B1326;
+      --surface:     #171F33;
+      --surface-2:   #1E273D;
+      --surface-3:   #273148;
+      --ink:         #E6ECFA;
+      --ink-2:       #A9B7D2;
+      --ink-3:       #8394B3;
+      --line:        #2A344C;
+      --line-2:      #3A4664;
+      --accent:      #ADC6FF;
+      --accent-soft: #1B2743;
+      --good:        #22C55E;
+      --good-soft:   #102C1E;
+      --warn:        #F0B849;
+      --warn-soft:   #302512;
+      --crit:        #FF8A7A;
+      --crit-soft:   #35191A;
+      --idle:        #8394B3;
+      --idle-soft:   #1C2438;
+      --proto:       #C4A9F0;
+      --proto-soft:  #241C38;
+      --shadow:      0 1px 2px rgba(0, 0, 0, .45);
     }
   }
   /* The viewer's toggle must win over the media query in BOTH directions. */
   :root[data-theme="dark"] {
-    --ground:#0A1216; --surface:#121E24; --surface-2:#18272E; --surface-3:#1F323A;
-    --ink:#E4EDF1; --ink-2:#A8BDC6; --ink-3:#7A929C; --line:#24373F; --line-2:#334B55;
-    --accent:#5CBEE0; --accent-soft:#14313D; --good:#3DBE7C; --good-soft:#102E20;
-    --warn:#E0A63C; --warn-soft:#2F2513; --crit:#F2796B; --crit-soft:#33191A;
-    --idle:#7A929C; --idle-soft:#1B2A31; --proto:#B79AE0; --proto-soft:#221B33;
-    --shadow:0 1px 2px rgba(0,0,0,.4);
+    --ground:#0B1326; --surface:#171F33; --surface-2:#1E273D; --surface-3:#273148;
+    --ink:#E6ECFA; --ink-2:#A9B7D2; --ink-3:#8394B3; --line:#2A344C; --line-2:#3A4664;
+    --accent:#ADC6FF; --accent-soft:#1B2743; --good:#22C55E; --good-soft:#102C1E;
+    --warn:#F0B849; --warn-soft:#302512; --crit:#FF8A7A; --crit-soft:#35191A;
+    --idle:#8394B3; --idle-soft:#1C2438; --proto:#C4A9F0; --proto-soft:#241C38;
+    --shadow:0 1px 2px rgba(0,0,0,.45);
   }
   :root[data-theme="light"] {
-    --ground:#F4F7F8; --surface:#FFFFFF; --surface-2:#EDF2F4; --surface-3:#E2EAED;
-    --ink:#0E1A20; --ink-2:#3E555F; --ink-3:#6B838D; --line:#D3DFE3; --line-2:#B9CAD0;
-    --accent:#0B6E99; --accent-soft:#E3F0F6; --good:#0B6B3A; --good-soft:#E2F1E8;
-    --warn:#8A5A00; --warn-soft:#F7EEDC; --crit:#B02418; --crit-soft:#FAE7E4;
-    --idle:#6B838D; --idle-soft:#E9EFF1; --proto:#6A3FA0; --proto-soft:#F0EAF8;
-    --shadow:0 1px 2px rgba(14,26,32,.06), 0 1px 1px rgba(14,26,32,.04);
+    --ground:#F5F7FC; --surface:#FFFFFF; --surface-2:#EDF1FA; --surface-3:#DFE6F4;
+    --ink:#111A2E; --ink-2:#414D69; --ink-3:#5F6B87; --line:#D6DEEE; --line-2:#BCC7DE;
+    --accent:#2F4CB0; --accent-soft:#E7ECFB; --good:#0B6B3A; --good-soft:#E2F1E8;
+    --warn:#8A5A00; --warn-soft:#F8EEDA; --crit:#B02418; --crit-soft:#FAE7E4;
+    --idle:#5F6B87; --idle-soft:#ECEFF7; --proto:#6A3FA0; --proto-soft:#F1EAFA;
+    --shadow:0 1px 2px rgba(17,26,46,.07), 0 1px 1px rgba(17,26,46,.04);
   }
 
   * { box-sizing: border-box; }
@@ -352,6 +371,94 @@
   .empty .mark { font: 400 24px/1 var(--mono); color: var(--line-2); }
   .empty h3 { margin: 0; font: 600 15px/1.3 var(--sans); }
   .empty p { margin: 0; max-width: 52ch; color: var(--ink-2); font-size: 13px; }
+  /* ── Toolbar: search + bulk actions ───────────────────────────────────*/
+  .toolbar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+    background: var(--surface-2);
+  }
+  .search { position: relative; flex: 0 1 300px; }
+  .search input {
+    width: 100%;
+    font: 500 13px/1 var(--mono);
+    padding: 7px 9px 7px 26px;
+    border: 1px solid var(--line-2); border-radius: 3px;
+    background: var(--surface); color: var(--ink);
+    transition: border-color var(--t-fast) var(--ease);
+  }
+  .search input:focus { border-color: var(--accent); }
+  .search .si {
+    position: absolute; left: 8px; top: 50%; transform: translateY(-50%);
+    color: var(--ink-3); font: 400 12px/1 var(--mono); pointer-events: none;
+  }
+  .toolbar .filters { display: flex; gap: 6px; }
+  .toolbar select {
+    font: 500 12px/1 var(--sans); padding: 6px 8px;
+    border: 1px solid var(--line-2); border-radius: 3px;
+    background: var(--surface); color: var(--ink); cursor: pointer;
+  }
+  .toolbar .right { margin-left: auto; display: flex; align-items: center; gap: 9px; }
+
+  .bulkbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 14px;
+    background: var(--accent-soft);
+    border-bottom: 1px solid var(--accent);
+    font-size: 13px;
+  }
+  .bulkbar b { font-family: var(--mono); }
+  .bulkbar .right { margin-left: auto; display: flex; gap: 7px; }
+  td.cb, th.cb { width: 34px; padding-right: 0; }
+  input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+
+  /* ── Toast: never a silent success ────────────────────────────────────*/
+  .toasts {
+    position: fixed; right: 18px; bottom: 18px;
+    display: flex; flex-direction: column; gap: 8px;
+    z-index: 50; max-width: 380px;
+  }
+  .toast {
+    display: flex; gap: 9px; align-items: flex-start;
+    background: var(--surface);
+    border: 1px solid var(--line-2);
+    border-left: 3px solid var(--good);
+    border-radius: 4px;
+    padding: 11px 13px;
+    box-shadow: 0 6px 18px rgba(0,0,0,.18);
+    font-size: 13px;
+    animation: toast-in var(--t-base) var(--ease);
+  }
+  .toast.err { border-left-color: var(--crit); }
+  .toast .tg { font: 700 11px/1.35 var(--mono); color: var(--good); flex: none; }
+  .toast.err .tg { color: var(--crit); }
+  .toast .tx b { display: block; font-weight: 650; }
+  .toast .tx span { color: var(--ink-2); }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
+
+  /* ── Confirm dialog for destructive actions ───────────────────────────*/
+  .scrim {
+    position: fixed; inset: 0; background: rgba(6, 10, 20, .55);
+    display: grid; place-items: center; z-index: 60; padding: 20px;
+  }
+  .confirm {
+    width: min(430px, 100%);
+    background: var(--surface); border: 1px solid var(--line-2);
+    border-radius: 5px; padding: 20px;
+    box-shadow: 0 12px 32px rgba(0,0,0,.3);
+    display: flex; flex-direction: column; gap: 13px;
+  }
+  .confirm h2 { margin: 0; font: 600 15px/1.3 var(--sans); }
+  .confirm p { margin: 0; font-size: 13px; color: var(--ink-2); }
+  .confirm .acts { display: flex; gap: 8px; justify-content: flex-end; }
+  .btn.danger { background: var(--crit); border-color: var(--crit); color: #fff; }
+  .btn.danger:hover { filter: brightness(1.08); }
+
+  .btn, .nav-item, .seg button, .tabs button {
+    transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease),
+                border-color var(--t-fast) var(--ease);
+  }
+
   .empty pre {
     margin: 6px 0 0; padding: 9px 12px;
     background: var(--surface-2); border: 1px solid var(--line);
@@ -712,9 +819,35 @@
   </div>
 </div>
 
+<div class="toasts" id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
+<div id="confirm-host"></div>
+
 <footer class="notes">
   <h2>Prototype notes — decisions worth arguing with</h2>
   <ul>
+    <li><strong>Visual language taken from the &ldquo;WireMock Pro&rdquo; reference</strong> — deep-slate canvas
+      (<code>#0b1326</code>), containers (<code>#171f33</code>), periwinkle primary (<code>#adc6ff</code>),
+      mono for endpoints and payloads. Dark is the design; light is derived into the same hue family
+      rather than inverted. Every token measured ≥ 4.5:1 against its own surface in both themes.</li>
+    <li><strong>Three things from that reference were deliberately not adopted.</strong> Its
+      <em>multi-trace health chart over time (Dev/QA/Prod)</em> and its <em>Uptime 30d / 24h requests /
+      P95 latency</em> tiles would fabricate both a metrics history and an environment model this
+      product does not have — <code>/_fleet/health</code> is a point-in-time read, and §3 rule 2 says a
+      screen that needs data the API cannot give is an API feature, not a UI liberty. Its
+      <em>Geist/Inter/JetBrains Mono</em> are CDN webfonts the CSP blocks. And its <em>peach tertiary</em>
+      (<code>#ffb786</code>) sits in the same warm band as the warning colour, so it was dropped rather
+      than left to compete with it.</li>
+    <li><strong>Deep linking now works both ways.</strong> The URL is written on every state change, not
+      just read at boot — a state explorer you cannot share the state of is half a tool.</li>
+    <li><strong>Writes are never silent.</strong> Every mutation confirms with a toast that auto-dismisses
+      at 4s, and every destructive action confirms first with a dialog that <em>names what is being
+      destroyed</em> instead of asking &ldquo;are you sure?&rdquo;. Motion is capped at the subtle tier —
+      150–200ms, ease-out — because a console watching a 12,000-row log has no motion budget beyond
+      acknowledging a click.</li>
+    <li><strong>Search, sort and bulk actions</strong> on the imposter table. At <em>Data → 200 + long
+      names</em> a plain list is unusable, and enabling twelve mocks one at a time is the kind of tedium
+      an operator tool should absorb. Bulk enable/disable is described as <em>one committed write</em>,
+      which is what it should be.</li>
     <li><strong>No trend charts on the fleet screen.</strong> <code>/_fleet/health</code> and <code>/_fleet/members</code> are point-in-time reads. A sparkline would imply history the API does not have — RFC-006 §3 rule 2 (&ldquo;nothing UI-only&rdquo;). The one chart here is magnitude-by-identity over <code>numberOfRequests</code>, which the imposter body genuinely carries.</li>
     <li><strong>Partial answers are named, never averaged.</strong> Switch <em>Fleet → Node unreachable</em>: the tiles that cannot be known say so, and the banner names which node is missing and how many are represented. The console never fans out and merges client-side — that would reinvent the verification plane (#147) without its cursors or gap repair.</li>
     <li><strong>Empty distinguishes &ldquo;nothing here&rdquo; from &ldquo;cannot answer&rdquo;.</strong> Try <em>Data → Empty</em> against each fleet state. On the request log the two are entirely different screens: an unreachable node says its log is <em>unknown</em>, a reachable one says it recorded <em>nothing</em>.</li>
@@ -736,15 +869,72 @@
     screen: "fleet", role: "fleet-admin", fleet: "healthy", data: "normal",
     tenant: "default", selected: null,
     scopeNode: "rift-1", selectedReq: null,
-    stubCase: "simple", adminTab: "tenants", newKey: false
+    stubCase: "simple", adminTab: "tenants", newKey: false,
+    q: "", methodFilter: "all", sort: "requests", picked: new Set(), confirm: null
   };
+
+  /* Deep linking: the URL must describe what you are looking at, or a state
+     explorer cannot be shared. The read side existed from the start; writing
+     it back is what closes the loop. */
+  function writeUrl() {
+    if (typeof history === "undefined" || !history.replaceState) return;
+    const q = new URLSearchParams();
+    const defaults = { screen: "fleet", role: "fleet-admin", fleet: "healthy", data: "normal",
+                       tenant: "default", scopeNode: "rift-1", stubCase: "simple", adminTab: "tenants" };
+    for (const [k, d] of Object.entries(defaults)) if (state[k] !== d) q.set(k, state[k]);
+    if (state.selectedReq) q.set("req", state.selectedReq);
+    if (state.selected) q.set("imposter", String(state.selected));
+    if (state.q) q.set("q", state.q);
+    const s = q.toString();
+    history.replaceState(null, "", s ? `?${s}` : location.pathname);
+  }
+
+  let toastSeq = 0;
+  /* A control says what happens, then confirms that it happened. Silent
+     success is the anti-pattern; a toast that never leaves is the other one,
+     so these auto-dismiss at 4s. */
+  function toast(title, detail, kind) {
+    const host = document.getElementById("toasts");
+    if (!host) return;
+    const id = `t${++toastSeq}`;
+    const el = document.createElement("div");
+    el.className = `toast${kind === "err" ? " err" : ""}`;
+    el.id = id;
+    el.innerHTML = `<span class="tg" aria-hidden="true">${kind === "err" ? "■" : "●"}</span>
+      <span class="tx"><b>${esc(title)}</b><span>${esc(detail || "")}</span></span>`;
+    host.appendChild(el);
+    setTimeout(() => { const n = document.getElementById(id); if (n) n.remove(); }, 4000);
+  }
+
+  /* Irreversible actions confirm first, and the dialog names the thing being
+     destroyed rather than asking "are you sure?". */
+  function askConfirm(title, body, label, onYes) {
+    const host = document.getElementById("confirm-host");
+    if (!host) return;
+    host.innerHTML = `
+      <div class="scrim" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+        <div class="confirm">
+          <h2>${esc(title)}</h2>
+          <p>${body}</p>
+          <div class="acts">
+            <button class="btn" type="button" id="c-no">Cancel</button>
+            <button class="btn danger" type="button" id="c-yes">${esc(label)}</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => { host.innerHTML = ""; };
+    document.getElementById("c-no").addEventListener("click", close);
+    document.getElementById("c-yes").addEventListener("click", () => { close(); onYes(); });
+    const yes = document.getElementById("c-yes");
+    if (yes && yes.focus) yes.focus();
+  }
 
   /* Boot from the query string so a specific state is linkable — and so the
      screenshots committed alongside this file are reproducible rather than
      hand-posed. */
   (function readUrl() {
     const q = new URLSearchParams(location.search);
-    for (const k of ["screen", "role", "fleet", "data", "tenant", "scopeNode", "stubCase", "adminTab"]) {
+    for (const k of ["screen", "role", "fleet", "data", "tenant", "scopeNode", "stubCase", "adminTab", "q"]) {
       if (q.has(k)) state[k] = q.get(k);
     }
     if (q.has("req")) state.selectedReq = q.get("req");
@@ -858,10 +1048,13 @@
     return `${stems[i % stems.length]}-regional-failover-${String(i).padStart(3, "0")}`;
   }
 
+  /* Memoized: the overflow set has to be the SAME array across renders, or a
+     toggle would mutate a throwaway copy and appear not to work. */
+  let OVERFLOW = null;
   function imposters() {
     if (state.data === "empty") return [];
     if (state.data === "overflow") {
-      return Array.from({ length: 200 }, (_, i) => ({
+      if (!OVERFLOW) OVERFLOW = Array.from({ length: 200 }, (_, i) => ({
         port: 6100 + i,
         name: longName(i),
         protocol: i % 7 === 0 ? "https" : "http",
@@ -869,6 +1062,7 @@
         requests: Math.max(0, 5200 - i * 26),
         stubs: 1 + (i % 9)
       }));
+      return OVERFLOW;
     }
     return BASE_IMPOSTERS;
   }
@@ -1008,11 +1202,56 @@
         <div class="card">${body}</div>`;
     }
 
-    const shown = list.slice(0, 12);
+    /* Search, filter and sort: with 200 imposters a plain list is unusable,
+       and this is the screen an operator lands on first. */
+    const q = state.q.trim().toLowerCase();
+    let filtered = list.filter(i =>
+      (!q || i.name.toLowerCase().includes(q) || String(i.port).includes(q))
+      && (state.methodFilter === "all" || i.protocol === state.methodFilter));
+    filtered = filtered.slice().sort((a, b) =>
+      state.sort === "port" ? a.port - b.port
+      : state.sort === "name" ? a.name.localeCompare(b.name)
+      : b.requests - a.requests);
+
+    const shown = filtered.slice(0, 12);
     const sel = list.find(i => i.port === state.selected) || null;
+    const picked = [...state.picked].filter(p => filtered.some(i => i.port === p));
+
+    const toolbar = `
+      <div class="toolbar">
+        <label class="search">
+          <span class="si" aria-hidden="true">⌕</span>
+          <input id="imp-q" type="search" value="${esc(state.q)}" placeholder="name or port" aria-label="Search imposters">
+        </label>
+        <span class="filters">
+          <select id="imp-proto" aria-label="Protocol filter">
+            <option value="all"${state.methodFilter === "all" ? " selected" : ""}>All protocols</option>
+            <option value="http"${state.methodFilter === "http" ? " selected" : ""}>http</option>
+            <option value="https"${state.methodFilter === "https" ? " selected" : ""}>https</option>
+          </select>
+          <select id="imp-sort" aria-label="Sort by">
+            <option value="requests"${state.sort === "requests" ? " selected" : ""}>Most requests</option>
+            <option value="port"${state.sort === "port" ? " selected" : ""}>Port</option>
+            <option value="name"${state.sort === "name" ? " selected" : ""}>Name</option>
+          </select>
+        </span>
+        <span class="right"><span class="readonly-hint">${filtered.length.toLocaleString("en-US")} of ${list.length.toLocaleString("en-US")}</span></span>
+      </div>`;
+
+    const bulkbar = picked.length && canWrite ? `
+      <div class="bulkbar" role="status">
+        <b>${picked.length}</b> selected
+        <span class="right">
+          <button class="btn sm" type="button" data-bulk="enable">Enable</button>
+          <button class="btn sm" type="button" data-bulk="disable">Disable</button>
+          <button class="btn sm" type="button" data-bulk="delete">Delete…</button>
+          <button class="btn sm" type="button" data-bulk="clear">Clear</button>
+        </span>
+      </div>` : "";
 
     const rows = shown.map(i => `
-      <tr>
+      <tr${i.port === state.selected ? ' aria-selected="true"' : ""}>
+        ${canWrite ? `<td class="cb"><input type="checkbox" data-pick="${i.port}"${state.picked.has(i.port) ? " checked" : ""} aria-label="Select ${esc(i.name)}"></td>` : ""}
         <td class="port">${esc(String(i.port))}</td>
         <td>
           <div class="id-cell">
@@ -1024,13 +1263,14 @@
         <td class="r num">${i.requests.toLocaleString("en-US")}</td>
         <td class="r">
           <button class="btn sm" type="button" data-inspect="${i.port}">Inspect</button>
-          ${canWrite ? `<button class="btn sm" type="button">${i.enabled ? "Disable" : "Enable"}</button>` : ""}
+          ${canWrite ? `<button class="btn sm" type="button" data-toggle="${i.port}">${i.enabled ? "Disable" : "Enable"}</button>
+          <button class="btn sm" type="button" data-del="${i.port}">Delete</button>` : ""}
         </td>
       </tr>`).join("");
 
-    const truncated = list.length > shown.length
+    const truncated = filtered.length > shown.length
       ? `<div class="card-body" style="border-top:1px solid var(--line)">
-           <span class="readonly-hint">Showing ${shown.length} of ${list.length.toLocaleString("en-US")} — the real screen virtualizes; a busy tenant has thousands.</span>
+           <span class="readonly-hint">Showing ${shown.length} of ${filtered.length.toLocaleString("en-US")} matching — the real screen virtualizes; a busy tenant has thousands.</span>
          </div>`
       : "";
 
@@ -1077,14 +1317,21 @@
       <div class="card">
         <div class="card-head"><h2>Configured</h2><div class="spacer"></div>
           <span class="readonly-hint">refreshes every 5s while visible</span></div>
+        ${toolbar}
+        ${bulkbar}
         <div class="scroll-x">
           <table>
-            <thead><tr><th>Port</th><th>Imposter</th><th>State</th><th class="r">Requests</th><th class="r">Actions</th></tr></thead>
+            <thead><tr>${canWrite ? '<th class="cb"><input type="checkbox" id="pick-all" aria-label="Select all shown"></th>' : ""}<th>Port</th><th>Imposter</th><th>State</th><th class="r">Requests</th><th class="r">Actions</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>
         ${truncated}
       </div>
+      ${filtered.length === 0 ? `<div class="card"><div class="empty">
+        <span class="mark" aria-hidden="true">⌕</span>
+        <h3>Nothing matches <code>${esc(state.q)}</code></h3>
+        <p>${list.length.toLocaleString("en-US")} imposters exist in this tenant. Clear the search to see them.</p>
+      </div></div>` : ""}
       ${detail}
       <div class="card">
         <div class="card-head"><h2>Busiest imposters</h2><div class="spacer"></div>
@@ -1741,6 +1988,67 @@
         state.selected = state.selected === p ? null : p;
         render();
       }));
+
+    const bind = (id, ev, fn) => { const n = document.getElementById(id); if (n) n.addEventListener(ev, fn); };
+    bind("imp-q", "input", e => { state.q = e.target.value; state.picked.clear(); render();
+      const n = document.getElementById("imp-q"); if (n && n.focus) { n.focus(); if (n.setSelectionRange) n.setSelectionRange(n.value.length, n.value.length); } });
+    bind("imp-proto", "change", e => { state.methodFilter = e.target.value; render(); });
+    bind("imp-sort", "change", e => { state.sort = e.target.value; render(); });
+
+    document.querySelectorAll("[data-pick]").forEach(cb =>
+      cb.addEventListener("change", () => {
+        const p = Number(cb.dataset.pick);
+        if (cb.checked) state.picked.add(p); else state.picked.delete(p);
+        render();
+      }));
+    bind("pick-all", "change", e => {
+      document.querySelectorAll("[data-pick]").forEach(cb => {
+        const p = Number(cb.dataset.pick);
+        if (e.target.checked) state.picked.add(p); else state.picked.delete(p);
+      });
+      render();
+    });
+
+    document.querySelectorAll("[data-toggle]").forEach(b =>
+      b.addEventListener("click", () => {
+        const port = Number(b.dataset.toggle);
+        const it = imposters().find(i => i.port === port);
+        const now = it ? !it.enabled : true;
+        if (it) it.enabled = now;
+        toast(now ? "Enabled" : "Disabled", `Imposter ${port} — committed at rev 1285.`);
+        render();
+      }));
+
+    document.querySelectorAll("[data-del]").forEach(b =>
+      b.addEventListener("click", () => {
+        const port = Number(b.dataset.del);
+        const it = imposters().find(i => i.port === port);
+        askConfirm("Delete this imposter?",
+          `<code>${esc(String(port))}</code>${it ? ` — <b>${esc(it.name)}</b>` : ""} stops serving on every node in the fleet. Recorded requests for it are discarded with it. This cannot be undone.`,
+          "Delete imposter",
+          () => { toast("Deleted", `Imposter ${port} removed fleet-wide.`); render(); });
+      }));
+
+    document.querySelectorAll("[data-bulk]").forEach(b =>
+      b.addEventListener("click", () => {
+        const act = b.dataset.bulk;
+        const n = state.picked.size;
+        if (act === "clear") { state.picked.clear(); render(); return; }
+        if (act === "delete") {
+          askConfirm(`Delete ${n} imposter${n > 1 ? "s" : ""}?`,
+            `All ${n} stop serving on every node. Recorded requests go with them. This cannot be undone.`,
+            `Delete ${n}`,
+            () => { state.picked.clear(); toast("Deleted", `${n} imposters removed fleet-wide.`); render(); });
+          return;
+        }
+        const on = act === "enable";
+        imposters().forEach(i => { if (state.picked.has(i.port)) i.enabled = on; });
+        state.picked.clear();
+        toast(on ? "Enabled" : "Disabled", `${n} imposter${n > 1 ? "s" : ""} — one committed write.`);
+        render();
+      }));
+
+    writeUrl();
   }
 
   function wireSeg(id, key) {
