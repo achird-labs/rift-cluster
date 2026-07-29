@@ -463,6 +463,140 @@
   }
   .pager .count { font: 500 12px/1 var(--mono); color: var(--ink-3); margin-left: auto; }
 
+  /* ── Front-door routes (C6) ───────────────────────────────────────────
+     The list is ordered by RouteTable::effective_order — priority, then host
+     rank, then prefix length, then header count, then id — NOT by authoring
+     order. Showing authoring order would be showing something that does not
+     decide anything.                                                     */
+  .order-rank {
+    font: 650 11px/1 var(--mono);
+    color: var(--ink-3);
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    padding: 3px 5px;
+    min-width: 2.4ch;
+    display: inline-block; text-align: center;
+  }
+  .order-rank.off { opacity: .55; }
+  .match-clauses { display: flex; flex-wrap: wrap; gap: 4px; }
+  .clause {
+    font: 500 11px/1 var(--mono);
+    border: 1px solid var(--line-2);
+    border-radius: 2px;
+    padding: 3px 5px;
+    color: var(--ink-2);
+    background: var(--surface);
+    white-space: nowrap;
+  }
+  .clause.any { border-style: dashed; color: var(--warn); border-color: var(--warn); }
+  .tiebreak { display: flex; flex-direction: column; gap: 5px; }
+  .tiebreak li { font-size: 12.5px; color: var(--ink-2); }
+  .tiebreak code { font-size: 11.5px; }
+
+  /* ── Editors (C5) ──────────────────────────────────────────────────────*/
+  .editor-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  @media (min-width: 1200px) { .editor-grid.split { grid-template-columns: 1fr 1fr; align-items: start; } }
+  .code-surface {
+    margin: 0;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    font: 500 12px/1.6 var(--mono);
+    color: var(--ink);
+    overflow: auto;
+    max-height: 380px;
+    padding: 0;
+  }
+  .code-surface .ln {
+    display: grid; grid-template-columns: 3.5ch 1fr;
+    gap: 12px;
+  }
+  .code-surface .ln > i {
+    font-style: normal; color: var(--ink-3); text-align: right;
+    user-select: none; background: var(--surface-3); padding: 0 4px;
+  }
+  .code-surface .ln > span { white-space: pre; padding-right: 12px; }
+  .code-surface .ln.err > span { background: var(--crit-soft); }
+  .tok-key { color: var(--accent); }
+  .tok-str { color: var(--good); }
+  .tok-num { color: var(--warn); }
+
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font: 600 10px/1 var(--mono); letter-spacing: .09em; text-transform: uppercase; color: var(--ink-3); }
+  .field input, .field select, .field textarea {
+    font: 500 13px/1.4 var(--mono);
+    padding: 7px 9px;
+    border: 1px solid var(--line-2);
+    border-radius: 3px;
+    background: var(--surface);
+    color: var(--ink);
+    width: 100%;
+  }
+  .field textarea { resize: vertical; min-height: 72px; }
+  .field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .lint {
+    display: flex; gap: 8px; align-items: flex-start;
+    font-size: 12.5px; padding: 8px 10px; border-radius: 3px; border: 1px solid;
+  }
+  .lint.info { background: var(--accent-soft); border-color: var(--accent); }
+  .lint.warn { background: var(--warn-soft); border-color: var(--warn); }
+  .lint .lg { font: 700 11px/1.35 var(--mono); flex: none; }
+  .lint.info .lg { color: var(--accent); }
+  .lint.warn .lg { color: var(--warn); }
+
+  .diff-row { display: grid; grid-template-columns: 8ch 1fr; gap: 10px; font: 500 12px/1.6 var(--mono); }
+  .diff-row .side { color: var(--ink-3); }
+  .diff-row .mine { color: var(--crit); }
+  .diff-row .theirs { color: var(--good); }
+
+  /* ── Administration (C7) ──────────────────────────────────────────────*/
+  .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); }
+  .tabs button {
+    font: 500 13px/1 var(--sans);
+    padding: 9px 13px;
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    color: var(--ink-2); cursor: pointer;
+  }
+  .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
+  .tabs button:hover { color: var(--ink); }
+
+  .key-once {
+    border: 1px solid var(--warn);
+    background: var(--warn-soft);
+    border-radius: 4px;
+    padding: 14px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .key-once .kh { font: 650 11px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--warn); display: flex; align-items: center; gap: 6px; }
+  .key-once .kval {
+    font: 600 13px/1.5 var(--mono);
+    word-break: break-all;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 3px; padding: 9px 11px;
+  }
+  .role-matrix td:first-child { font: 500 12.5px/1 var(--mono); }
+  .role-matrix .yes { color: var(--good); font: 700 12px/1 var(--mono); }
+  .role-matrix .no  { color: var(--ink-3); font: 400 12px/1 var(--mono); }
+  .role-matrix th:not(:first-child), .role-matrix td:not(:first-child) { text-align: center; }
+
+  /* ── Sign in (C2) ─────────────────────────────────────────────────────*/
+  .signin-wrap { display: grid; place-items: center; padding: 40px 0; }
+  .signin {
+    width: min(430px, 100%);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    box-shadow: var(--shadow);
+    padding: 26px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .signin .mark { display: flex; align-items: baseline; gap: 8px; }
+  .signin .mark b { font: 700 19px/1 var(--sans); }
+  .signin .mark span { font: 500 10px/1 var(--mono); color: var(--ink-3); letter-spacing: .08em; }
+  .signin h1 { margin: 0; font: 600 16px/1.3 var(--sans); }
+  .signin p { margin: 0; font-size: 13px; color: var(--ink-2); }
+
   .detail { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
   .kv { display: flex; flex-direction: column; gap: 3px; }
   .kv dt { font: 600 10px/1 var(--mono); letter-spacing: .09em; text-transform: uppercase; color: var(--ink-3); }
@@ -492,6 +626,10 @@
       <button data-v="fleet" aria-pressed="true">Cluster &amp; fleet</button>
       <button data-v="imposters" aria-pressed="false">Imposters</button>
       <button data-v="requests" aria-pressed="false">Request log</button>
+      <button data-v="routes" aria-pressed="false">Front-door routes</button>
+      <button data-v="stub" aria-pressed="false">Stub editor</button>
+      <button data-v="admin" aria-pressed="false">Administration</button>
+      <button data-v="login" aria-pressed="false">Sign in</button>
     </span>
   </span>
   <span class="proto-group"><span>Role</span>
@@ -524,8 +662,9 @@
     <div class="nav-group">
       <div class="eyebrow">Mocks</div>
       <button class="nav-item" data-screen="imposters" type="button"><span class="glyph">▤</span>Imposters</button>
+      <button class="nav-item" data-screen="stub" type="button"><span class="glyph">▤</span>Stub editor</button>
       <button class="nav-item" data-screen="requests" type="button"><span class="glyph">▤</span>Request log</button>
-      <button class="nav-item pending" type="button" disabled><span class="glyph">▤</span>Front-door routes<span class="issue">#189</span></button>
+      <button class="nav-item" data-screen="routes" type="button"><span class="glyph">▤</span>Front-door routes</button>
     </div>
 
     <div class="nav-group">
@@ -535,8 +674,8 @@
 
     <div class="nav-group">
       <div class="eyebrow">Administration</div>
-      <button class="nav-item pending" type="button" disabled><span class="glyph">◇</span>Tenants &amp; principals<span class="issue">#190</span></button>
-      <button class="nav-item pending" type="button" disabled><span class="glyph">◇</span>Audit<span class="issue">#190</span></button>
+      <button class="nav-item" data-screen="admin" type="button"><span class="glyph">◇</span>Tenants &amp; principals</button>
+      <button class="nav-item" data-screen="admin" data-tab="audit" type="button"><span class="glyph">◇</span>Audit</button>
     </div>
 
     <div class="nav-group">
@@ -596,7 +735,8 @@
   const state = {
     screen: "fleet", role: "fleet-admin", fleet: "healthy", data: "normal",
     tenant: "default", selected: null,
-    scopeNode: "rift-1", selectedReq: null
+    scopeNode: "rift-1", selectedReq: null,
+    stubCase: "simple", adminTab: "tenants", newKey: false
   };
 
   /* Boot from the query string so a specific state is linkable — and so the
@@ -604,7 +744,7 @@
      hand-posed. */
   (function readUrl() {
     const q = new URLSearchParams(location.search);
-    for (const k of ["screen", "role", "fleet", "data", "tenant", "scopeNode"]) {
+    for (const k of ["screen", "role", "fleet", "data", "tenant", "scopeNode", "stubCase", "adminTab"]) {
       if (q.has(k)) state[k] = q.get(k);
     }
     if (q.has("req")) state.selectedReq = q.get("req");
@@ -660,6 +800,50 @@
       body: '{\n  "amount": -1\n}',
       matched: true, why: ['method equals <code>POST</code>', 'path equals <code>/v1/payments/authorize</code>', 'stub 3 is a fault injection returning 500'] }
   ];
+
+  /* Real Route shape: RouteTable { routes: [ { id, priority, match:{host?,
+     pathPrefix?, headers[], method?}, target:{port, stripPrefix, setHost?},
+     enabled } ] } — vendor/rift/.../front_door/route_table.rs. */
+  const ROUTES = [
+    { id: "payments-v2",   priority: 20, enabled: true,  host: "payments.test",   pathPrefix: "/v2",  headers: [], method: null,   port: 6001, stripPrefix: true  },
+    { id: "payments-v1",   priority: 20, enabled: true,  host: "payments.test",   pathPrefix: "/v1",  headers: [], method: null,   port: 6002, stripPrefix: false },
+    { id: "partner-wild",  priority: 10, enabled: true,  host: "*.partner.test",  pathPrefix: null,   headers: [{ name: "x-partner", value: "acme" }], method: null, port: 6003, stripPrefix: false },
+    { id: "identity-post", priority: 10, enabled: true,  host: null,              pathPrefix: "/oauth", headers: [], method: "POST", port: 6004, stripPrefix: false },
+    { id: "catch-all",     priority: 0,  enabled: true,  host: null,              pathPrefix: null,   headers: [], method: null,   port: 6005, stripPrefix: false },
+    { id: "legacy-soap",   priority: 30, enabled: false, host: "soap.test",       pathPrefix: null,   headers: [], method: null,   port: 6006, stripPrefix: false }
+  ];
+
+  /* Two audit fixtures worth having: an applied write and a quota refusal,
+     because a refusal being a *committed decision* is the surprising part of
+     RFC-002 T4 and the viewer has to show it as a row, not hide it. */
+  const AUDIT = [
+    { revision: 1284, action: "imposter.write", resource: "6001",  tenant: "acme",    principal: "ci@acme",       outcome: "applied", ts: "17:42:09" },
+    { revision: 1283, action: "tenant.manage",  resource: "ci@acme", tenant: "acme",  principal: "ops@achird",    outcome: "applied", ts: "17:41:55" },
+    { revision: 1282, action: "imposter.write", resource: "6099",  tenant: "acme",    principal: "ci@acme",       outcome: "refused", ts: "17:40:12", reason: "quota: imposters 24/24" },
+    { revision: 1281, action: "audit.read",     resource: "*",     tenant: "acme",    principal: "auditor@acme",  outcome: "applied", ts: "17:38:41" },
+    { revision: 1280, action: "cluster.admin",  resource: "sink",  tenant: "*",       principal: "ops@achird",    outcome: "applied", ts: "17:31:02" }
+  ];
+
+  const PRINCIPALS = [
+    { id: "ci@acme",       display: "CI pipeline",   role: "editor",       disabled: false, created: "2026-06-02" },
+    { id: "auditor@acme",  display: "Compliance",    role: "tenant-admin", disabled: false, created: "2026-06-14" },
+    { id: "readonly@acme", display: "Dashboards",    role: "viewer",       disabled: false, created: "2026-07-01" },
+    { id: "old-runner",    display: "Retired runner", role: "editor",      disabled: true,  created: "2026-02-11" }
+  ];
+
+  /* RFC-002 §4.2, as authz.rs::role_allows spells it — a strict superset
+     ladder. Rendered as a matrix because that is the artefact a security
+     reviewer reads, and authz.rs is written as explicit per-role arms for
+     exactly that reason. */
+  const ACTIONS = ["imposter.read", "imposter.write", "lifecycle.toggle", "verify.run", "tenant.manage", "audit.read", "cluster.admin"];
+  const LADDER = ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"];
+  const GRANTS = {
+    "viewer":       ["imposter.read"],
+    "operator":     ["imposter.read", "lifecycle.toggle"],
+    "editor":       ["imposter.read", "lifecycle.toggle", "imposter.write", "verify.run"],
+    "tenant-admin": ["imposter.read", "lifecycle.toggle", "imposter.write", "verify.run", "tenant.manage", "audit.read"],
+    "fleet-admin":  ACTIONS.slice()
+  };
 
   const ROLES = {
     "fleet-admin": { id: "ops@achird",     label: "FleetAdmin · fleet scope", initials: "FA", write: true,  fleet: true  },
@@ -1052,6 +1236,440 @@
       <p class="hint">Payloads are rendered as text, never as markup — this is the most attacker-influenced surface in the console, since whatever called the mock chose the path, headers and body. Row <code>r-8812</code> carries a script tag and an <code>onerror</code> attribute on purpose.</p>`;
   }
 
+  /* ── Front-door routes (C6, second half) ──────────────────────────────*/
+
+  const hostRank = r => r.host == null ? 2 : r.host.startsWith("*.") ? 1 : 0;
+
+  function effectiveOrder(routes) {
+    return routes.filter(r => r.enabled).slice().sort((a, b) =>
+      (b.priority - a.priority)
+      || (hostRank(a) - hostRank(b))
+      || ((b.pathPrefix ? b.pathPrefix.length : 0) - (a.pathPrefix ? a.pathPrefix.length : 0))
+      || (b.headers.length - a.headers.length)
+      || a.id.localeCompare(b.id));
+  }
+
+  /* Mirrors RouteTable::validate / Route::validate: strip-without-prefix,
+     malformed host, and ambiguity between two enabled routes that can both
+     win. The server rejects these, so the editor must surface them BEFORE the
+     whole-table PUT rather than after. */
+  function routeProblems(routes) {
+    const out = [];
+    for (const r of routes) {
+      if (r.stripPrefix && !r.pathPrefix)
+        out.push({ kind: "StripWithoutPrefix", text: `<code>${esc(r.id)}</code> sets <code>stripPrefix</code> with no <code>pathPrefix</code> to strip.` });
+      if (r.host) {
+        const rest = r.host.startsWith("*.") ? r.host.slice(2) : r.host;
+        if (rest.includes("*") || rest === "")
+          out.push({ kind: "MalformedHost", text: `<code>${esc(r.id)}</code> host <code>${esc(r.host)}</code> — at most one leading <code>*.</code> label is allowed.` });
+      }
+    }
+    const enabled = routes.filter(r => r.enabled);
+    for (let i = 0; i < enabled.length; i++)
+      for (let j = i + 1; j < enabled.length; j++) {
+        const a = enabled[i], b = enabled[j];
+        const same = a.priority === b.priority
+          && (a.host || "") === (b.host || "")
+          && (a.pathPrefix || "") === (b.pathPrefix || "")
+          && (a.method || "") === (b.method || "")
+          && a.headers.length === b.headers.length;
+        if (same)
+          out.push({ kind: "AmbiguousMatch", text: `<code>${esc(a.id)}</code> and <code>${esc(b.id)}</code> match identically at the same priority — the server refuses the table rather than picking one.` });
+      }
+    return out;
+  }
+
+  function routesScreen() {
+    const canWrite = ROLES[state.role].write;
+    const routes = ROUTES;
+    const order = effectiveOrder(routes);
+    const disabled = routes.filter(r => !r.enabled);
+    const problems = routeProblems(routes);
+
+    const clauses = r => {
+      const c = [];
+      if (r.host) c.push(`host ${r.host}`);
+      if (r.pathPrefix) c.push(`path ${r.pathPrefix}*`);
+      if (r.method) c.push(`method ${r.method}`);
+      r.headers.forEach(h => c.push(`${h.name}: ${h.value}`));
+      return c.length
+        ? c.map(x => `<span class="clause">${esc(x)}</span>`).join("")
+        : `<span class="clause any">matches everything</span>`;
+    };
+
+    const row = (r, rank) => `
+      <tr>
+        <td><span class="order-rank ${rank == null ? "off" : ""}">${rank == null ? "—" : rank}</span></td>
+        <td><div class="id-cell"><span class="name mono">${esc(r.id)}</span>
+          <span class="meta">priority ${esc(String(r.priority))}</span></div></td>
+        <td><div class="match-clauses">${clauses(r)}</div></td>
+        <td class="num">→ ${esc(String(r.port))}${r.stripPrefix ? ' <span class="clause">strip</span>' : ""}</td>
+        <td>${r.enabled ? pill("good", "●", "Enabled") : pill("idle", "○", "Disabled")}</td>
+        <td class="r">${canWrite
+            ? `<button class="btn sm" type="button">Edit</button> <button class="btn sm" type="button">Delete</button>`
+            : '<span class="readonly-hint">read-only</span>'}</td>
+      </tr>`;
+
+    const rows = order.map((r, i) => row(r, i + 1)).join("") + disabled.map(r => row(r, null)).join("");
+
+    return `
+      <div class="page-head">
+        <div><h1>Front-door routes</h1>
+          <div class="sub">One table, replicated. The front door dispatches host/path to an imposter port.</div></div>
+        <div class="spacer"></div>
+        <span class="readonly-hint">GET · PUT /front-door/routes</span>
+      </div>
+
+      ${problems.length ? `
+        <div class="banner crit" role="alert">
+          <span class="b-glyph" aria-hidden="true">■</span>
+          <div><strong>${problems.length} problem${problems.length > 1 ? "s" : ""} — the server will refuse this table.</strong>
+            <ul style="margin:6px 0 0;padding-left:18px;display:flex;flex-direction:column;gap:4px">
+              ${problems.map(p => `<li><code>${esc(p.kind)}</code> — ${p.text}</li>`).join("")}
+            </ul>
+          </div>
+        </div>` : `
+        <div class="banner info" role="status">
+          <span class="b-glyph" aria-hidden="true">●</span>
+          <div><strong>Table validates.</strong>
+            <p>No ambiguous pair, no <code>stripPrefix</code> without a prefix, no malformed host. Checked here before the write, because the server refuses the whole table rather than repairing it.</p></div>
+        </div>`}
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Effective order</h2>
+          <div class="spacer"></div>
+          <span class="readonly-hint">loaded at rev 1284</span>
+          ${canWrite ? '<button class="btn primary" type="button">Save table</button>' : ""}
+        </div>
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>#</th><th>Route</th><th>Matches</th><th>Target</th><th>State</th><th class="r">Actions</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Why this order</h2></div>
+        <div class="card-body">
+          <ol class="tiebreak">
+            <li><b>Priority</b>, descending — the only knob you set directly.</li>
+            <li><b>Host specificity</b> — exact host, then one-label wildcard (<code>*.x</code>), then no host clause.</li>
+            <li><b>Path prefix length</b>, descending — <code>/v2</code> before <code>/</code>. Prefixes are segment-aligned: <code>/api/v1</code> matches <code>/api/v1/x</code> but never <code>/api/v1x</code>.</li>
+            <li><b>Header clause count</b>, descending — more clauses is more specific.</li>
+            <li><b>Route id</b>, as a last resort so the order is total.</li>
+          </ol>
+          <p class="hint" style="margin-top:12px">This list is the <em>effective</em> order, not the authoring order — <code>effective_order()</code> is independent of input order, so a table showing the order you typed would be showing something that decides nothing. Disabled routes are excluded from dispatch entirely and shown with <code>—</code>.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Saving replaces the whole table</h2></div>
+        <div class="card-body section-stack">
+          <div class="lint warn">
+            <span class="lg" aria-hidden="true">▲</span>
+            <div><b>PUT /front-door/routes</b> replaces every route; <b>DELETE /front-door/routes/:id</b> removes one.
+              A whole-table write from a long-open editor is a lost-update waiting to happen: if the
+              table moved since <code>rev 1284</code>, saving would silently discard whatever changed.
+              The editor loads a revision, sends it back, and on a mismatch shows the refresh-and-reapply
+              path rather than overwriting — the same discipline as C5's <code>If-Match</code> 409 rebase (#188).</div>
+          </div>
+          <p class="hint" style="margin:0">Deleting one route is the safe operation and should be preferred over a table replace when that is what the user meant.</p>
+        </div>
+      </div>`;
+  }
+
+  /* ── Stub editor (C5) ─────────────────────────────────────────────────*/
+
+  const STUB_SIMPLE = {
+    predicates: [{ equals: { path: "/v1/payments/authorize", method: "POST" } }],
+    responses: [{ is: { statusCode: 200, headers: { "content-type": "application/json" }, body: '{"status":"authorized"}' } }]
+  };
+  const STUB_UNMODELLED = {
+    id: "auth-happy",
+    scenarioName: "checkout",
+    requiredScenarioState: "cart-filled",
+    newScenarioState: "authorized",
+    space: "tenant-acme-run-42",
+    predicates: [{ equals: { path: "/v1/payments/authorize" } }],
+    responses: [{ is: { statusCode: 200, body: "ok" }, behaviors: { wait: 120 } }]
+  };
+
+  function jsonBlock(obj, errLine) {
+    const lines = JSON.stringify(obj, null, 2).split("\n");
+    return `<pre class="code-surface">${lines.map((l, i) => {
+      const painted = esc(l)
+        .replace(/&quot;([^&]*?)&quot;(\s*:)/g, '<span class="tok-key">&quot;$1&quot;</span>$2')
+        .replace(/:\s&quot;(.*?)&quot;/g, ': <span class="tok-str">&quot;$1&quot;</span>')
+        .replace(/:\s(\d+)/g, ': <span class="tok-num">$1</span>');
+      return `<span class="ln${errLine === i + 1 ? " err" : ""}"><i>${i + 1}</i><span>${painted}</span></span>`;
+    }).join("")}</pre>`;
+  }
+
+  function stubScreen() {
+    const canWrite = ROLES[state.role].write;
+    const mode = state.stubCase;
+    const raw = mode === "unmodelled";
+    const stub = raw ? STUB_UNMODELLED : STUB_SIMPLE;
+
+    const caseSeg = `
+      <div class="scope">
+        <span class="proto-tag">Prototype state</span>
+        <span class="seg" id="seg-stub" role="group" aria-label="Stub editor case">
+          <button data-v="simple" aria-pressed="${mode === "simple"}">Form-modelled</button>
+          <button data-v="unmodelled" aria-pressed="${mode === "unmodelled"}">Unknown keys</button>
+          <button data-v="conflict" aria-pressed="${mode === "conflict"}">409 conflict</button>
+        </span>
+        <span class="coverage">JSON is canonical. The form is a projection of it, and round-trips losslessly or refuses to open.</span>
+      </div>`;
+
+    if (mode === "conflict") {
+      return `
+        <div class="page-head">
+          <div><h1>Stub editor</h1><div class="sub">Imposter <code>6001</code> · stub <code>auth-happy</code></div></div>
+          <div class="spacer"></div><span class="readonly-hint">PUT /imposters/6001/stubs/auth-happy</span>
+        </div>
+        ${caseSeg}
+        <div class="banner crit" role="alert">
+          <span class="b-glyph" aria-hidden="true">■</span>
+          <div><strong>409 — this stub changed while you were editing.</strong>
+            <p>Your <code>If-Match</code> was <code>rev 1284</code>; the stub is now at <code>rev 1291</code>. Nothing has been written. Rebase your change onto the current version and save again — the console never auto-merges, and two humans editing one imposter get exactly the same treatment a lagging agent does.</p></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>What changed underneath</h2><div class="spacer"></div>
+            <span class="readonly-hint">rev 1284 → 1291</span></div>
+          <div class="card-body section-stack">
+            <div class="diff-row"><span class="side">yours</span><span class="mine">responses[0].is.statusCode: 200 → 201</span></div>
+            <div class="diff-row"><span class="side">theirs</span><span class="theirs">responses[0].is.body: "ok" → "{\\"status\\":\\"authorized\\"}"</span></div>
+            <p class="hint" style="margin:0">These two edits do not overlap, so re-applying yours is safe — but that is a judgement the person makes, not one the console makes for them.</p>
+            <div style="display:flex;gap:8px">
+              <button class="btn primary" type="button">Reapply my change on 1291</button>
+              <button class="btn" type="button">Discard mine and reload</button>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    const formPane = raw ? `
+      <div class="card">
+        <div class="card-head"><h2>Form</h2><div class="spacer"></div>${pill("warn", "▲", "unavailable")}</div>
+        <div class="card-body section-stack">
+          <div class="lint warn">
+            <span class="lg" aria-hidden="true">▲</span>
+            <div><b>Raw-only mode.</b> This stub uses keys the form does not model:
+              <code>space</code>, <code>requiredScenarioState</code>, <code>newScenarioState</code>,
+              <code>behaviors.wait</code>. Rather than drop them, the form refuses to open. Edit the
+              JSON directly — the config you save is the config you wrote.</div>
+          </div>
+          <p class="hint" style="margin:0">Which shapes get first-class controls is RFC-006 §12 Q2, still open: the proposal is the shapes <code>rift-tui</code>'s dialogs already model, then demand-driven. Silently dropping an unmodelled key is the one option that is not on the table.</p>
+        </div>
+      </div>` : `
+      <div class="card">
+        <div class="card-head"><h2>Form</h2><div class="spacer"></div>${pill("good", "●", "round-trips")}</div>
+        <div class="card-body section-stack">
+          <div class="field-row">
+            <div class="field"><label for="f-method">Method</label>
+              <select id="f-method"><option>POST</option><option>GET</option><option>PUT</option><option>DELETE</option></select></div>
+            <div class="field"><label for="f-path">Path equals</label>
+              <input id="f-path" value="/v1/payments/authorize"></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label for="f-status">Status code</label><input id="f-status" value="200"></div>
+            <div class="field"><label for="f-ctype">Content-Type</label><input id="f-ctype" value="application/json"></div>
+          </div>
+          <div class="field"><label for="f-body">Response body</label>
+            <textarea id="f-body">{"status":"authorized"}</textarea></div>
+        </div>
+      </div>`;
+
+    return `
+      <div class="page-head">
+        <div><h1>Stub editor</h1><div class="sub">Imposter <code>6001</code> · stub <code>${raw ? "auth-happy" : "0"}</code></div></div>
+        <div class="spacer"></div>
+        ${canWrite
+          ? '<button class="btn primary" type="button">Save stub</button>'
+          : '<span class="readonly-hint">read-only — Viewer holds no stub.write</span>'}
+      </div>
+      ${caseSeg}
+      <div class="editor-grid split">
+        ${formPane}
+        <div class="card">
+          <div class="card-head"><h2>JSON</h2><div class="spacer"></div>
+            <span class="readonly-hint">canonical</span></div>
+          <div class="card-body section-stack">
+            ${jsonBlock(stub)}
+            <div class="lint info">
+              <span class="lg" aria-hidden="true">●</span>
+              <div><b>rift-lint</b> ran in the browser (wasm) and found nothing. The server's
+                <code>validate_stub</code> is still the authority — a wasm gap is a cosmetic gap, not a
+                correctness one. Whether the dependency tree compiles to
+                <code>wasm32-unknown-unknown</code> is RFC-006 §12 Q1, and the documented fallback is a
+                dry-run lint endpoint added to the published schema.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="hint">Writes go by <b>id</b>, not index: <code>PUT /imposters/6001/stubs/auth-happy</code> with <code>If-Match</code>. Index edits are the documented lost-update window, and an editor a human leaves open for minutes is the worst possible client for them.</p>`;
+  }
+
+  /* ── Administration (C7) ──────────────────────────────────────────────*/
+
+  function adminScreen() {
+    const tab = state.adminTab;
+    const canManage = state.role === "fleet-admin" || state.role === "editor";
+
+    const tabs = `
+      <div class="tabs" id="admin-tabs" role="tablist">
+        <button role="tab" data-v="tenants"    aria-selected="${tab === "tenants"}">Tenants</button>
+        <button role="tab" data-v="principals" aria-selected="${tab === "principals"}">Principals &amp; roles</button>
+        <button role="tab" data-v="audit"      aria-selected="${tab === "audit"}">Audit</button>
+      </div>`;
+
+    let body = "";
+
+    if (tab === "tenants") {
+      body = `
+        <div class="card">
+          <div class="card-head"><h2>Tenants</h2><div class="spacer"></div>
+            ${state.role === "fleet-admin" ? '<button class="btn primary" type="button">New tenant</button>' : '<span class="readonly-hint">fleet scope required</span>'}</div>
+          <div class="scroll-x">
+            <table>
+              <thead><tr><th>Tenant</th><th class="r">Imposters</th><th class="r">Quota</th><th class="r">Journal retention</th><th>State</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">default</td><td class="r num">6</td><td class="r num">—</td><td class="r num">7d</td><td>${pill("good", "●", "Active")}</td></tr>
+                <tr><td class="mono">acme</td><td class="r num">24</td><td class="r num">24</td><td class="r num">30d</td><td>${pill("warn", "▲", "At quota")}</td></tr>
+                <tr><td class="mono">beta</td><td class="r num">3</td><td class="r num">50</td><td class="r num">7d</td><td>${pill("good", "●", "Active")}</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <p class="hint"><code>journalRetentionSecs</code> lives on the tenant record, not in <code>Quotas</code> — it is a duration policy rather than an object count (RFC-002 §11 Q2). Showing it in the quota column would re-introduce exactly the confusion that move was made to avoid, so it gets its own.</p>`;
+    }
+
+    if (tab === "principals") {
+      const rows = PRINCIPALS.map(p => `
+        <tr>
+          <td><div class="id-cell"><span class="name mono">${esc(p.id)}</span><span class="meta">${esc(p.display)}</span></div></td>
+          <td><span class="clause">${esc(p.role)}</span></td>
+          <td class="num">${esc(p.created)}</td>
+          <td>${p.disabled ? pill("crit", "■", "Disabled") : pill("good", "●", "Active")}</td>
+          <td class="r">${canManage
+              ? `<button class="btn sm" type="button">${p.disabled ? "Enable" : "Disable"}</button> <button class="btn sm" type="button">Delete</button>`
+              : '<span class="readonly-hint">read-only</span>'}</td>
+        </tr>`).join("");
+
+      body = `
+        ${state.newKey ? `
+        <div class="key-once">
+          <div class="kh"><span aria-hidden="true">▲</span>Copy this key now — it will not be shown again</div>
+          <div class="kval">rk_acme_7Q2mV9xTt4Lb8dZpN1sRwEyH6uKcJf3A</div>
+          <p style="margin:0;font-size:13px;color:var(--ink-2)">The fleet stores an argon2id hash, not the key. There is no reveal-later action because there is nothing to reveal — offering one would teach operators to expect a feature that cannot exist. Not written to local storage, never placed in a URL.</p>
+          <div><button class="btn" type="button" id="dismiss-key">I have copied it</button></div>
+        </div>` : ""}
+        <div class="card">
+          <div class="card-head"><h2>Principals in <code>${esc(state.tenant)}</code></h2><div class="spacer"></div>
+            ${canManage ? '<button class="btn primary" type="button" id="mint-key">Mint principal</button>' : '<span class="readonly-hint">Viewer holds no tenant.manage</span>'}</div>
+          <div class="scroll-x">
+            <table>
+              <thead><tr><th>Principal</th><th>Role</th><th>Created</th><th>State</th><th class="r">Actions</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Role grants</h2><div class="spacer"></div>
+            <span class="readonly-hint">RFC-002 §4.2 · authz.rs role_allows</span></div>
+          <div class="scroll-x">
+            <table class="role-matrix">
+              <thead><tr><th>Action</th>${LADDER.map(r => `<th>${esc(r)}</th>`).join("")}</tr></thead>
+              <tbody>
+                ${ACTIONS.map(a => `<tr><td>${esc(a)}</td>${LADDER.map(r =>
+                  `<td>${GRANTS[r].includes(a) ? '<span class="yes" title="granted">✓</span>' : '<span class="no" title="not granted">·</span>'}</td>`).join("")}</tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
+          <div class="card-body">
+            <p class="hint" style="margin:0">A strict superset ladder: Viewer ⊂ Operator ⊂ Editor ⊂ TenantAdmin ⊂ FleetAdmin. Two placements are deliberate and worth reading twice — <code>audit.read</code> is <em>not</em> a Viewer grant despite being a read, and it is <em>not</em> part of <code>tenant.manage</code> either, so managing principals does not make you an auditor. <b>FleetAdmin binds only on the fleet scope <code>*</code></b>, never inside a tenant, so it is not offered as an in-tenant role.</p>
+          </div>
+        </div>
+        <div class="banner info">
+          <span class="b-glyph" aria-hidden="true">◈</span>
+          <div><strong>Disable is not delete.</strong>
+            <p>Disabling revokes a key without waiting on rotation and is a Raft-committed fact with no per-node cache behind it — which is what <code>c25_key_revocation_survives_a_partition</code> pins. Deleting removes the record.</p></div>
+        </div>`;
+    }
+
+    if (tab === "audit") {
+      const rows = AUDIT.map(a => `
+        <tr>
+          <td class="num">${esc(String(a.revision))}</td>
+          <td class="num">${esc(a.ts)}</td>
+          <td><span class="clause">${esc(a.action)}</span></td>
+          <td class="mono">${esc(a.resource)}</td>
+          <td class="mono">${esc(a.tenant)}</td>
+          <td class="mono">${esc(a.principal)}</td>
+          <td>${a.outcome === "applied"
+                ? pill("good", "●", "applied")
+                : pill("warn", "▲", "refused")}${a.reason ? `<div class="meta mono" style="margin-top:3px;color:var(--ink-3);font-size:11px">${esc(a.reason)}</div>` : ""}</td>
+        </tr>`).join("");
+
+      body = `
+        <div class="card">
+          <div class="card-head"><h2>Audit</h2><div class="spacer"></div>
+            <span class="readonly-hint">GET /admin/audit?since=0&amp;limit=50</span></div>
+          <div class="scroll-x">
+            <table>
+              <thead><tr><th class="r">Rev</th><th>Time</th><th>Action</th><th>Resource</th><th>Tenant</th><th>Principal</th><th>Outcome</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+          <div class="pager">
+            <button class="btn sm" type="button" disabled>Newer</button>
+            <button class="btn sm" type="button">Older</button>
+            <span class="count">rev 1280–1284 · ${state.role === "fleet-admin" ? "fleet-wide" : `filtered to ${esc(state.tenant)}`}</span>
+          </div>
+        </div>
+        <div class="banner info">
+          <span class="b-glyph" aria-hidden="true">◈</span>
+          <div><strong>A refusal is a committed row, not a missing one.</strong>
+            <p>Revision 1282 is a quota refusal. Quotas are validated where the op applies, so a refusal is a decision the fleet agreed to and it appears in the stream like any other outcome — an audit view that showed only successes would make the interesting half invisible.</p></div>
+        </div>
+        <p class="hint">Rows are ordered by revision, which is the fleet's own total order — not by wall-clock, which can disagree across nodes. Reads are tenant-filtered from the caller's bindings: a TenantAdmin sees their tenant, a FleetAdmin sees the fleet. <code>resource</code> and <code>principal</code> are attacker-influenceable and render as text.</p>`;
+    }
+
+    return `
+      <div class="page-head">
+        <div><h1>Administration</h1><div class="sub">Tenancy, identity and the audit stream.</div></div>
+      </div>
+      ${tabs}
+      <div class="section-stack">${body}</div>`;
+  }
+
+  /* ── Sign in (C2) ─────────────────────────────────────────────────────*/
+  function loginScreen() {
+    return `
+      <div class="signin-wrap">
+        <div class="signin">
+          <div class="mark"><b>Rift</b><span>CONSOLE</span></div>
+          <h1>Sign in with an API key</h1>
+          <p>The key is exchanged for a session cookie and then discarded. It is held in component state only — never local storage, never a URL.</p>
+          <div class="field">
+            <label for="k">API key</label>
+            <input id="k" type="password" value="rk_acme_7Q2mV9xTt4Lb8dZpN1sRwEyH6uKcJf3A" autocomplete="off">
+          </div>
+          <button class="btn primary" type="button" style="padding:9px">Sign in</button>
+          <div class="lint info">
+            <span class="lg" aria-hidden="true">●</span>
+            <div>The cookie is <code>HttpOnly</code>, <code>Secure</code>, <code>SameSite=Strict</code>,
+              8-hour <code>Max-Age</code>. Being HttpOnly, no script in the page — injected or
+              otherwise — can read the key or the session.</div>
+          </div>
+          <p class="hint" style="margin:0">No SSO in v1: the exchange takes an API key, and OIDC arrives later as a second way to mint the same cookie. There is no per-session revocation either — the bounds are the TTL, signing-key rotation, and disabling the principal. Both are stated non-goals rather than gaps.</p>
+        </div>
+      </div>`;
+  }
+
   function render() {
     const r = ROLES[state.role];
     document.getElementById("who-id").textContent = r.id;
@@ -1071,10 +1689,28 @@
     const names = f.nodes.map(n => n.name);
     if (!names.includes(state.scopeNode)) state.scopeNode = names[0];
 
-    document.getElementById("screen").innerHTML =
-      state.screen === "fleet" ? fleetScreen()
-      : state.screen === "requests" ? requestsScreen()
-      : impostersScreen();
+    const SCREENS = {
+      fleet: fleetScreen, imposters: impostersScreen, requests: requestsScreen,
+      routes: routesScreen, stub: stubScreen, admin: adminScreen, login: loginScreen
+    };
+    document.getElementById("screen").innerHTML = (SCREENS[state.screen] || fleetScreen)();
+
+    const stubSeg = document.getElementById("seg-stub");
+    if (stubSeg) stubSeg.addEventListener("click", e => {
+      const b = e.target.closest("button");
+      if (b) { state.stubCase = b.dataset.v; render(); }
+    });
+
+    const adminTabs = document.getElementById("admin-tabs");
+    if (adminTabs) adminTabs.addEventListener("click", e => {
+      const b = e.target.closest("button");
+      if (b) { state.adminTab = b.dataset.v; render(); }
+    });
+
+    const mint = document.getElementById("mint-key");
+    if (mint) mint.addEventListener("click", () => { state.newKey = true; render(); });
+    const dismiss = document.getElementById("dismiss-key");
+    if (dismiss) dismiss.addEventListener("click", () => { state.newKey = false; render(); });
 
     const nodeSeg = document.getElementById("seg-node");
     if (nodeSeg) {
@@ -1134,7 +1770,13 @@
   });
 
   document.querySelectorAll(".nav-item[data-screen]").forEach(b =>
-    b.addEventListener("click", () => { state.screen = b.dataset.screen; state.selected = null; render(); }));
+    b.addEventListener("click", () => {
+      state.screen = b.dataset.screen;
+      if (b.dataset.tab) state.adminTab = b.dataset.tab;
+      state.selected = null;
+      state.selectedReq = null;
+      render();
+    }));
 
   render();
 </script>

@@ -1,16 +1,25 @@
-# Console design prototype — C4 and C6 screens
+# Console design prototype — RFC-006 scope A
 
-`c4-c6-console-prototype.html` is a **self-contained, zero-dependency** prototype of the RFC-006
-scope A screens filed as [#187](https://github.com/achird-labs/rift-enterprise/issues/187) (C4 — app
-shell, imposters, cluster/fleet) and
-[#189](https://github.com/achird-labs/rift-enterprise/issues/189) (C6 — request log).
+`console-prototype.html` is a **self-contained, zero-dependency** prototype of every RFC-006 §4 screen
+whose backend has shipped or is sliced:
+
+| Screen | Slice | Issue |
+|---|---|---|
+| Sign in — API key exchanged for a session cookie | C2 | [#185](https://github.com/achird-labs/rift-enterprise/issues/185) |
+| App shell, tenant switcher, imposters, cluster/fleet | C4 | [#187](https://github.com/achird-labs/rift-enterprise/issues/187) |
+| Stub editor — form ⟷ JSON, lint, 409 rebase | C5 | [#188](https://github.com/achird-labs/rift-enterprise/issues/188) |
+| Request log (per-node) and front-door route editor | C6 | [#189](https://github.com/achird-labs/rift-enterprise/issues/189) |
+| Tenants, principals, roles, audit | C7 | [#190](https://github.com/achird-labs/rift-enterprise/issues/190) |
+
+Scenarios and flow state (#149), sources (#20) and specs (#148) appear as greyed nav entries carrying
+their issue number — a visible roadmap rather than a 404, which is what §4 asks for.
 
 Open it in any browser. No build step, no server, no network access — which is deliberate: the real
 console lives under the same constraint (RFC-006 §9.1's `default-src 'self'`, air-gapped, no CDN), so
 a prototype that needed a CDN would be prototyping something we cannot ship.
 
 ```sh
-open docs/design/console/c4-c6-console-prototype.html
+open docs/design/console/console-prototype.html
 ```
 
 ## It is a state explorer, not a mockup
@@ -21,17 +30,20 @@ the state is also readable from the query string so any combination is linkable:
 
 | Parameter | Values |
 |---|---|
-| `screen` | `fleet` · `imposters` · `requests` |
+| `screen` | `login` · `imposters` · `stub` · `requests` · `routes` · `fleet` · `admin` |
 | `role` | `fleet-admin` · `editor` · `viewer` |
 | `fleet` | `healthy` · `degraded` (one node unreachable) · `single` |
 | `data` | `normal` · `empty` · `overflow` (200 imposters, 40+ char names) |
 | `scopeNode` | `rift-1` · `rift-2` · `rift-3` (request log only) |
 | `req` | a request id, e.g. `r-8812` (request log only) |
+| `stubCase` | `simple` · `unmodelled` · `conflict` (stub editor only) |
+| `adminTab` | `tenants` · `principals` · `audit` (administration only) |
 
 ```
-c4-c6-console-prototype.html?screen=requests&fleet=degraded&scopeNode=rift-3
-c4-c6-console-prototype.html?screen=imposters&data=empty&fleet=degraded
-c4-c6-console-prototype.html?screen=requests&req=r-8812
+console-prototype.html?screen=requests&fleet=degraded&scopeNode=rift-3
+console-prototype.html?screen=imposters&data=empty&fleet=degraded
+console-prototype.html?screen=stub&stubCase=conflict
+console-prototype.html?screen=admin&adminTab=principals
 ```
 
 ## The states worth looking at first
@@ -50,6 +62,52 @@ These are the ones that separate an honest operator console from a plausible-loo
    number.
 5. **`?screen=requests&req=r-8812`** — the hostile row (see below).
 6. **`?screen=imposters&role=viewer`** — write affordances gone. UX only; the API is the boundary.
+7. **`?screen=stub&stubCase=unmodelled`** — a stub using `space`, the scenario-FSM fields and
+   `behaviors.wait`. The form **refuses to open** rather than dropping keys it cannot model, because
+   the config the user saves must be the config they wrote.
+8. **`?screen=stub&stubCase=conflict`** — the `If-Match` 409. It names both edits and offers
+   reapply-or-discard; it never auto-merges.
+9. **`?screen=routes`** — the route table in **effective order**, with the tie-break chain spelled out
+   and pre-flight validation for the three errors the server actually raises.
+10. **`?screen=admin&adminTab=principals`** then *Mint principal* — the key-shown-once panel, with no
+    reveal-later action because there is nothing to reveal.
+
+## Front-door routes: what the editor has to get right
+
+The route list is ordered by `RouteTable::effective_order()`, not by authoring order — priority
+descending, then host specificity (exact → one-label wildcard → no host clause), then path-prefix
+length descending, then header-clause count, then id. That order is **independent of input order**, so
+an editor showing the order you typed would be showing something that decides nothing. Disabled routes
+are excluded from dispatch and shown with `—`.
+
+The editor validates before the write, mirroring `RouteTable::validate` / `Route::validate`:
+
+| Error | Condition |
+|---|---|
+| `StripWithoutPrefix` | `stripPrefix` set with no `pathPrefix` to strip |
+| `MalformedHost` | more than one wildcard, or only a leading `*.` |
+| `AmbiguousMatch` | two **enabled** routes that can both win at the same priority |
+
+Pre-flight matters because the server refuses the **whole table** rather than repairing part of it —
+and because `PUT /front-door/routes` replaces everything while `DELETE /front-door/routes/:id` removes
+one. A whole-table write from a long-open editor is a lost update waiting to happen, so the editor
+loads a revision, sends it back, and on a mismatch offers refresh-and-reapply instead of overwriting.
+Deleting a single route is the safe operation and should be preferred where that is what was meant.
+
+## Administration: the two behaviours not to soften
+
+**A key is shown once.** The fleet stores an argon2id hash, so there is nothing to reveal later and no
+reveal action is offered — one would teach operators to expect a feature that cannot exist.
+
+**A refusal is a committed row.** The audit fixture includes a quota refusal at revision 1282. Quotas
+are validated where the op applies, so a refusal is a decision the fleet agreed to and belongs in the
+stream like any other outcome; a viewer showing only successes hides the interesting half.
+
+The role matrix is rendered as a matrix on purpose. `authz.rs::role_allows` is written as explicit
+per-role arms precisely so a security reviewer can read the table, and the UI should have the same
+property. Note `audit.read` is deliberately **not** a Viewer grant and deliberately **not** part of
+`tenant.manage`, and `FleetAdmin` binds only on the fleet scope `*` — so it is never offered as an
+in-tenant role.
 
 ## Design decisions, and why
 
@@ -107,7 +165,7 @@ the intended command is:
   --headless=new --disable-gpu --user-data-dir="$(mktemp -d)" \
   --window-size=1500,1100 --force-device-scale-factor=2 --hide-scrollbars \
   --screenshot=shots/requests-degraded.png \
-  "file://$PWD/docs/design/console/c4-c6-console-prototype.html?screen=requests&fleet=degraded&scopeNode=rift-3"
+  "file://$PWD/docs/design/console/console-prototype.html?screen=requests&fleet=degraded&scopeNode=rift-3"
 ```
 
 The interactive file is the better artefact regardless — a screenshot of a state explorer loses the
