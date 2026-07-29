@@ -138,14 +138,21 @@ impl CredentialedSource for S3Source {
                     anyhow::anyhow!("source uri {} produced an invalid url: {e}", r.uri)
                 })?;
                 let host = host_header(&parsed);
-                let signed = sign_get(
+                // Unsigned-payload GET: the empty-body hash, computed the same
+                // way `sign`'s PUT caller (`audit_export::sink::S3Sink`) hashes
+                // its real body.
+                let payload_hash = sha256_hex(b"");
+                let now = amz_date(SystemTime::now());
+                let signed = sign(&SigningRequest {
+                    method: "GET",
                     access_key_id,
                     secret_access_key,
-                    &self.config.region,
-                    &host,
-                    &canonical_uri,
-                    amz_date(SystemTime::now()).as_str(),
-                );
+                    region: &self.config.region,
+                    host: &host,
+                    canonical_uri: &canonical_uri,
+                    payload_hash: &payload_hash,
+                    amz_date: &now,
+                });
                 request = request
                     .header(reqwest::header::HOST, host)
                     .header("x-amz-date", signed.amz_date)
@@ -205,7 +212,7 @@ fn parse_s3_uri(uri: &str) -> anyhow::Result<(String, String)> {
 
 /// `<access-key-id>:<secret-access-key>`, the documented shape of an
 /// `auth_ref`-resolved S3 credential.
-fn split_credential(value: &str) -> anyhow::Result<(&str, &str)> {
+pub(crate) fn split_credential(value: &str) -> anyhow::Result<(&str, &str)> {
     value.split_once(':').ok_or_else(|| {
         anyhow::anyhow!(
             "the resolved s3 credential is not `<access-key-id>:<secret-access-key>`: it has no \
@@ -222,7 +229,7 @@ fn split_credential(value: &str) -> anyhow::Result<(&str, &str)> {
 /// segments must stay a literal separator both on the wire and in the
 /// canonical URI SigV4 signs; encoding it would change where the request (and
 /// AWS) understands the path to split (RFC 3986 §2.1).
-fn percent_encode_segment(segment: &str) -> String {
+pub(crate) fn percent_encode_segment(segment: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
@@ -246,7 +253,7 @@ fn percent_encode_segment(segment: &str) -> String {
 /// truncated object with a legitimate-looking ETag) or desync the signature
 /// from what actually reached the wire (`?` puts an unsigned query on the
 /// request, which S3 rejects with a 403 that names nothing about the cause).
-fn encode_key_path(key: &str) -> String {
+pub(crate) fn encode_key_path(key: &str) -> String {
     key.split('/')
         .map(percent_encode_segment)
         .collect::<Vec<_>>()
@@ -256,7 +263,7 @@ fn encode_key_path(key: &str) -> String {
 /// The `Host` header value a request to `url` will actually carry — SigV4
 /// signs this exact string, so it must match what the wire sends, port and
 /// all.
-fn host_header(url: &reqwest::Url) -> String {
+pub(crate) fn host_header(url: &reqwest::Url) -> String {
     let host = url.host_str().unwrap_or_default();
     match url.port() {
         Some(port) => format!("{host}:{port}"),
@@ -264,34 +271,65 @@ fn host_header(url: &reqwest::Url) -> String {
     }
 }
 
-/// The headers a signed `GET` needs.
-struct SignedGet {
-    authorization: String,
-    amz_date: String,
-    content_sha256: String,
+/// The headers a signed request needs.
+///
+/// `pub(crate)`, along with [`sign`] and the primitives below it: issue #164's
+/// `audit_export::sink::S3Sink` signs a `PUT` with the same SigV4 machinery
+/// this GET-only source built for issue #136, and duplicating a hand-rolled
+/// signer a second time is exactly the risk of the two silently drifting
+/// apart that sharing one avoids.
+pub(crate) struct Signed {
+    pub(crate) authorization: String,
+    pub(crate) amz_date: String,
+    pub(crate) content_sha256: String,
 }
 
-/// Sign an unsigned-payload `GET` with SigV4.
-///
-/// `amz_date` is a parameter rather than read from the clock in here, so the
-/// pure signing arithmetic below is testable without mocking time.
-fn sign_get(
-    access_key_id: &str,
-    secret_access_key: &str,
-    region: &str,
-    host: &str,
-    canonical_uri: &str,
-    amz_date: &str,
-) -> SignedGet {
+/// Everything [`sign`] needs, named rather than positional: eight bare `&str`
+/// arguments (`region` next to `host` next to `canonical_uri`, all the same
+/// type) is exactly the shape that invites a call site to pass two of them in
+/// the wrong order without either the compiler or a reviewer noticing.
+#[derive(Clone, Copy)]
+pub(crate) struct SigningRequest<'a> {
+    pub(crate) method: &'a str,
+    pub(crate) access_key_id: &'a str,
+    pub(crate) secret_access_key: &'a str,
+    pub(crate) region: &'a str,
+    pub(crate) host: &'a str,
+    pub(crate) canonical_uri: &'a str,
+    /// The caller's to compute, rather than derived in here: an
+    /// unsigned-payload `GET` passes the well-known hash of the empty body,
+    /// while a `PUT` must pass the hash of the *real* body it is about to
+    /// send. Defaulting this to `UNSIGNED-PAYLOAD` or to the empty hash would
+    /// let a `PUT`'s signature validate against content that was never
+    /// signed at all.
+    pub(crate) payload_hash: &'a str,
+    /// A parameter rather than read from the clock in [`sign`], so the pure
+    /// signing arithmetic below is testable without mocking time.
+    pub(crate) amz_date: &'a str,
+}
+
+/// Sign a request with SigV4.
+pub(crate) fn sign(request: &SigningRequest<'_>) -> Signed {
+    let SigningRequest {
+        method,
+        access_key_id,
+        secret_access_key,
+        region,
+        host,
+        canonical_uri,
+        payload_hash,
+        amz_date,
+    } = *request;
+
     let date_stamp = &amz_date[..8];
-    let payload_hash = sha256_hex(b"");
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
     let canonical_headers =
         format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
-    // Canonical query string is empty: this provider never signs a query,
-    // only headers.
-    let canonical_request =
-        format!("GET\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    // Canonical query string is empty: this signer never signs a query, only
+    // headers.
+    let canonical_request = format!(
+        "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
     let hashed_canonical_request = sha256_hex(canonical_request.as_bytes());
 
     let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
@@ -306,16 +344,21 @@ fn sign_get(
          SignedHeaders={signed_headers}, Signature={signature}"
     );
 
-    SignedGet {
+    Signed {
         authorization,
         amz_date: amz_date.to_owned(),
-        content_sha256: payload_hash,
+        content_sha256: payload_hash.to_owned(),
     }
 }
 
 /// The SigV4 signing-key derivation: `AWS4<secret>` → date → region → service
 /// → `aws4_request`, each step an HMAC-SHA256 keyed by the previous result.
-fn signing_key(secret_access_key: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
+pub(crate) fn signing_key(
+    secret_access_key: &str,
+    date_stamp: &str,
+    region: &str,
+    service: &str,
+) -> Vec<u8> {
     let k_date = hmac_sha256(
         format!("AWS4{secret_access_key}").as_bytes(),
         date_stamp.as_bytes(),
@@ -325,7 +368,7 @@ fn signing_key(secret_access_key: &str, date_stamp: &str, region: &str, service:
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     type HmacSha256 = Hmac<Sha256>;
     // An HMAC key may be any length (RFC 2104 pads/hashes as needed), so this
     // cannot fail on the keys this module ever constructs.
@@ -334,7 +377,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&Sha256::digest(bytes))
 }
 
@@ -345,7 +388,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// calendar arithmetic is implemented directly rather than adding a dependency
 /// for it. `civil_from_days` is Howard Hinnant's algorithm
 /// (<https://howardhinnant.github.io/date_algorithms.html>), reused unchanged.
-fn amz_date(now: SystemTime) -> String {
+pub(crate) fn amz_date(now: SystemTime) -> String {
     let secs = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -482,6 +525,119 @@ mod tests {
         assert_eq!(
             split_credential("AKIAEXAMPLE:sec:ret:with:colons").unwrap(),
             ("AKIAEXAMPLE", "sec:ret:with:colons")
+        );
+    }
+
+    // -- issue #164 review: the PUT / real-payload-hash signing path ---------
+    //
+    // Every test above this line only ever signs the GET/empty-payload shape
+    // `S3Source::fetch_with_auth` builds. `sign`'s `SigningRequest` also
+    // serves `audit_export::sink::S3Sink`'s PUT, which signs the *real* body
+    // hash — and until now nothing here ever built a `SigningRequest` with a
+    // non-empty `payload_hash` to prove that half of the contract.
+    // `SigningRequest::payload_hash`'s own doc names the risk directly:
+    // defaulting a PUT to the empty hash "would let a PUT's signature
+    // validate against content that was never signed at all."
+
+    /// A PUT signed against a real body hash must produce a different
+    /// `Authorization` than the same request signed against the well-known
+    /// empty-payload hash — otherwise the body never actually entered the
+    /// signature, and a PUT's signature would validate against content that
+    /// was never sent.
+    #[test]
+    fn a_put_signed_with_a_real_body_hash_differs_from_the_same_request_signed_empty() {
+        let empty_hash = sha256_hex(b"");
+        let body_hash = sha256_hex(br#"{"tsSecs":1,"tenant":"*","action":"cluster.admin"}"#);
+        assert_ne!(
+            empty_hash, body_hash,
+            "the two hashes must genuinely differ, or this test proves nothing"
+        );
+
+        let base = SigningRequest {
+            method: "PUT",
+            access_key_id: "AKIAEXAMPLE",
+            secret_access_key: "wJalrXUtnFEMIsupersecret",
+            region: "us-east-1",
+            host: "bucket.s3.us-east-1.amazonaws.com",
+            canonical_uri: "/bucket/audit/00000000000000000042.jsonl",
+            payload_hash: &empty_hash,
+            amz_date: "20240101T000000Z",
+        };
+        let signed_empty = sign(&base);
+        let signed_real = sign(&SigningRequest {
+            payload_hash: &body_hash,
+            ..base
+        });
+
+        assert_ne!(
+            signed_empty.authorization, signed_real.authorization,
+            "signing a PUT against the empty-body hash must not produce the same signature as \
+             signing it against the real body's hash"
+        );
+    }
+
+    /// The general case, not merely "empty differs from real": two PUTs that
+    /// differ *only* in which real body they hash must sign differently. This
+    /// is what proves the payload hash actually participates in the
+    /// signature, rather than the previous test passing for some other reason
+    /// specific to the empty hash.
+    #[test]
+    fn a_puts_signature_changes_when_only_the_payload_hash_changes() {
+        let hash_a = sha256_hex(br#"{"revision":1}"#);
+        let hash_b = sha256_hex(br#"{"revision":2}"#);
+        assert_ne!(hash_a, hash_b, "the two hashes must genuinely differ");
+
+        let base = SigningRequest {
+            method: "PUT",
+            access_key_id: "AKIAEXAMPLE",
+            secret_access_key: "wJalrXUtnFEMIsupersecret",
+            region: "us-east-1",
+            host: "bucket.s3.us-east-1.amazonaws.com",
+            canonical_uri: "/bucket/audit/00000000000000000001.jsonl",
+            payload_hash: &hash_a,
+            amz_date: "20240101T000000Z",
+        };
+        let signed_a = sign(&base);
+        let signed_b = sign(&SigningRequest {
+            payload_hash: &hash_b,
+            ..base
+        });
+
+        assert_ne!(
+            signed_a.authorization, signed_b.authorization,
+            "all else equal, a different payload hash must produce a different signature"
+        );
+    }
+
+    /// Regression lock for the PUT/real-payload-hash shape, the same way
+    /// `signing_key_and_canonical_hash_are_stable_for_fixed_inputs` locks the
+    /// GET/empty-payload shape above. Fixed inputs, pinned output: a refactor
+    /// of `sign` that stops folding `payload_hash` into the signature is
+    /// caught here even on a change that leaves the GET path untouched.
+    #[test]
+    fn a_puts_signature_is_stable_for_fixed_inputs_including_a_real_payload_hash() {
+        let body_hash = sha256_hex(br#"{"a":1}"#);
+        assert_eq!(
+            body_hash, "015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862",
+            "the fixed body's hash must not silently change shape"
+        );
+
+        let signed = sign(&SigningRequest {
+            method: "PUT",
+            access_key_id: "AKIAEXAMPLE",
+            secret_access_key: "wJalrXUtnFEMIsupersecret",
+            region: "us-east-1",
+            host: "bucket.s3.us-east-1.amazonaws.com",
+            canonical_uri: "/bucket/audit/00000000000000000042.jsonl",
+            payload_hash: &body_hash,
+            amz_date: "20240101T000000Z",
+        });
+        assert_eq!(
+            signed.authorization,
+            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20240101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+             Signature=e93f084bf5b4101a99d74970ee6ce9cb0fbd0fc4af0bd8969c433bf9743ae0ca",
+            "the PUT signing computation for a real payload hash must not silently change shape"
         );
     }
 }

@@ -381,6 +381,78 @@ rows are kept, not a promise to delete at the instant it passes.
 Audit history survives a full-cluster restart and a node joining by snapshot
 install.
 
+### Exporting the audit stream (issue #164)
+
+Optional, **off by default**, and it adds no dependency to the binary — the HTTP
+client and SigV4 signing are the ones the `s3:` imposter-source provider already
+carries. With no sink declared no export task runs, nothing is read from the
+audit table, and nothing reaches the network.
+
+Declare a sink — fleet state, so you set it once and every node (including one
+that joins later) inherits it:
+
+```sh
+curl -s -X PUT "http://$ADMIN/admin/audit/sink" \
+  -H "X-Rift-Key: $FLEET_ADMIN_KEY" -H 'content-type: application/json' \
+  -d '{"uri":"s3://acme-audit/rift/","authRef":"audit-bucket","batchMaxRows":500}'
+
+curl -s "http://$ADMIN/admin/audit/sink" -H "X-Rift-Key: $FLEET_ADMIN_KEY"
+curl -s -X DELETE "http://$ADMIN/admin/audit/sink" -H "X-Rift-Key: $FLEET_ADMIN_KEY"
+```
+
+All three require the `cluster.admin` action, not `audit.read`: where the fleet's
+audit is shipped is a fleet-scoped decision. **There is one sink, fleet-wide** —
+per-tenant sinks are a stated non-goal (the resume checkpoint is a single
+revision).
+
+| Scheme | Shape | Wire format |
+|---|---|---|
+| `https://…` | webhook `POST` per batch | JSON Lines (`application/x-ndjson`) |
+| `s3://<bucket>/<prefix>` | one object `PUT` per batch, key `<prefix>/<20-digit revision>.jsonl` | JSON Lines |
+
+`http://` is refused **except** to a loopback host — a sidecar collector on the
+same machine puts no bytes on a network, which is the only thing the cleartext
+rule protects against. The S3 key is zero-padded so a lexicographic bucket
+listing is in revision order.
+
+**Credentials never enter the log.** The record carries `authRef` — the *name* of
+a credential — and a URI with credentials in its authority is refused at
+admission with the same error a source URI gets. Resolution is node-local at
+export time, through the same secrets directory the imposter sources use
+(`RIFT_SOURCE_SECRETS_DIR`); `RIFT_S3_ENDPOINT` / `RIFT_S3_REGION` apply to an
+`s3://` sink as they do to an `s3:` source. A named `authRef` that fails to
+resolve **fails the ship** — it never falls back to an unauthenticated request.
+An S3 credential is `<access-key-id>:<secret-access-key>`; a webhook credential
+is sent as `Authorization: Bearer <value>`.
+
+**Delivery is at-least-once, not exactly-once**, and the difference is
+operational, not academic. The leader ships a batch and *then* commits its
+checkpoint; a leader that dies in between re-ships that batch when its successor
+resumes. **Your consumer must dedup on `(revision, opId)`** — that is why both
+are on every row. Duplicates are bounded to one batch and appear only across a
+failover.
+
+**A dead sink cannot stall admin writes.** Export runs in a background task
+reading committed state, so nothing on the write path waits on it. Watch:
+
+| Metric | Meaning |
+|---|---|
+| `rift_cluster_audit_export_shipped_total` | Rows accepted by the sink (re-ships counted — at-least-once) |
+| `rift_cluster_audit_export_failures_total` | Failed ship attempts; rising while `shipped` is flat means the sink is down |
+| `rift_cluster_audit_export_lag_revisions` | Applied revision minus checkpoint, on the leader |
+| `rift_cluster_audit_export_skipped_revisions_total` | **Rows that aged out before they shipped** — see below |
+
+> **`skipped_revisions_total` moving is data loss, and it is permanent.** If a
+> sink stays down longer than `--cluster-audit-retention`, the GC removes rows the
+> exporter never shipped. Those rows are gone from every replica, so the gap
+> cannot be backfilled. The exporter counts the span and logs it at error level
+> rather than passing over it quietly — a silent hole in an exported audit trail
+> is the worst failure this feature could have. It is reported as a **revision
+> span**, an upper bound on rows lost: revisions are not one-to-one with audit
+> rows, and once the rows are GC'd there is nothing left to count exactly. Alert
+> on this counter, and size `--cluster-audit-retention` against how long you can
+> tolerate your collector being down.
+
 > **A badly skewed node clock can erase history early.** The replicated clock is
 > a running maximum over the `issued_at_secs` each submitting node stamps from
 > its *own* wall clock. One node whose clock is a year fast can therefore advance

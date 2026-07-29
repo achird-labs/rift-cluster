@@ -25,11 +25,12 @@
 //! scans the on-disk redb bytes to prove it.
 
 use hyper::{Method, StatusCode};
+use rift_cluster::audit_export::{ExportStatus, ExportStatusSnapshot};
 use rift_cluster::control::{
     AuthSource, FLEET_SCOPE, Principal, PrincipalId, Quotas, Role, Tenant, api_key_principal_id,
     generate_api_key, hash_api_key,
 };
-use rift_cluster::{ControlOp, ControlRequest, RaftNode, TenantId};
+use rift_cluster::{ControlOp, ControlRequest, DEFAULT_AUDIT_BATCH_MAX_ROWS, RaftNode, TenantId};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -41,6 +42,16 @@ use crate::principal::Resolved;
 pub(crate) const WHOAMI_PATH: &str = "/admin/whoami";
 
 const AUDIT_PATH: &str = "/admin/audit";
+
+/// Where the fleet's audit export sink (issue #164) is declared and read.
+///
+/// A prefix of neither `AUDIT_PATH` nor `TENANTS_PATH`, but checked ahead of
+/// both in [`classify`] anyway, defensively: `AUDIT_PATH` is matched by exact
+/// equality today, so `"/admin/audit/sink"` cannot already fall into
+/// [`Route::AuditRead`] by accident — but a later change to that comparison
+/// (a prefix match, say) must not be able to silently swallow this path and
+/// hand a `TenantAdmin` the fleet's sink under an `AuditRead` authorization.
+const AUDIT_SINK_PATH: &str = "/admin/audit/sink";
 
 /// Rows returned when the caller names no `limit`, and the ceiling on what they
 /// may ask for. A bound rather than an option: the audit table is a journal, so
@@ -89,6 +100,15 @@ pub(crate) enum Route {
     /// from the tenant the authorization decision was made against, never from
     /// the route and never from anything the request body said.
     AuditRead { since: u64, limit: usize },
+    /// `GET /admin/audit/sink` (issue #164): the fleet's declared export sink,
+    /// plus this node's own export status when it is reachable.
+    AuditSinkRead,
+    /// `PUT /admin/audit/sink`: declare or replace the sink.
+    AuditSinkPut,
+    /// `DELETE /admin/audit/sink`: stop exporting without losing the
+    /// checkpoint (`AuditSink::revision` is what a re-declared sink resumes
+    /// from, not this delete).
+    AuditSinkDelete,
 }
 
 impl Route {
@@ -104,7 +124,17 @@ impl Route {
     /// right answer for a surface a tenant admin should not learn the shape of.
     pub(crate) fn scope(&self) -> Option<TenantId> {
         match self {
-            Route::TenantCreate | Route::TenantList => Some(TenantId::new(FLEET_SCOPE)),
+            Route::TenantCreate
+            | Route::TenantList
+            // The sink is fleet state (one export, fleet-wide — see
+            // `ControlOp::AuditSinkPut`'s doc), never a tenant's own record, so
+            // it scopes the same way the tenant-record routes do: to the fleet
+            // scope, not to whatever tenant the caller's header happens to
+            // name. A `TenantAdmin` of `acme` sending `X-Rift-Tenant: acme`
+            // must not become eligible for a route this decision pins to `*`.
+            | Route::AuditSinkRead
+            | Route::AuditSinkPut
+            | Route::AuditSinkDelete => Some(TenantId::new(FLEET_SCOPE)),
             Route::TenantRead(tenant)
             | Route::TenantPut(tenant)
             | Route::TenantDelete(tenant)
@@ -160,7 +190,15 @@ impl Route {
             | Route::TenantPut(_)
             | Route::TenantDelete(_)
             | Route::PrincipalPut(_, _)
-            | Route::PrincipalDelete(_, _) => Action::ClusterAdmin,
+            | Route::PrincipalDelete(_, _)
+            // Where the fleet's audit stream ships to is a fleet-scoped
+            // decision, not a tenant-scoped read — RFC-002 §4.1's ceiling for
+            // this surface. Deliberately NOT `AuditRead`: a `TenantAdmin`
+            // trusted to read their own tenant's audit rows is not thereby
+            // trusted to redirect where every tenant's rows are shipped.
+            | Route::AuditSinkRead
+            | Route::AuditSinkPut
+            | Route::AuditSinkDelete => Action::ClusterAdmin,
             Route::PrincipalCreate(_) | Route::PrincipalList(_) => Action::TenantManage,
             // Deliberately NOT `TenantManage` (RFC-002 §4.1): reading who did
             // what and changing who may do what are different powers, so a
@@ -184,6 +222,17 @@ impl Route {
 /// it fall through to the proxy and answer upstream's own 404/405 — the same
 /// thing `admin_front::classify` does for every other route it half-matches.
 pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Option<Route> {
+    // Checked ahead of `AUDIT_PATH` (see `AUDIT_SINK_PATH`'s doc): this route
+    // must never be reachable through `Route::AuditRead`'s `TenantManage`-
+    // adjacent authorization tier.
+    if path == AUDIT_SINK_PATH {
+        return match *method {
+            Method::GET => Some(Route::AuditSinkRead),
+            Method::PUT => Some(Route::AuditSinkPut),
+            Method::DELETE => Some(Route::AuditSinkDelete),
+            _ => None,
+        };
+    }
     if path == AUDIT_PATH {
         return match *method {
             Method::GET => Some(audit_route(query)),
@@ -323,6 +372,62 @@ pub(crate) struct BindingBody {
     pub role: Role,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuditSinkBody {
+    pub uri: String,
+    #[serde(default)]
+    pub auth_ref: Option<String>,
+    /// Optional: an omitted value takes [`DEFAULT_AUDIT_BATCH_MAX_ROWS`], not
+    /// `0` — `#[serde(default)]` on a bare `u32` would silently ship nothing
+    /// forever, which `control::validate` already refuses, but refusing a
+    /// caller who simply left the field out (the documented, supported shape)
+    /// would be the wrong way to enforce that.
+    #[serde(default)]
+    pub batch_max_rows: Option<u32>,
+}
+
+/// The sink as the admin surface reports it: what `AuditSink` itself carries
+/// (a URI and a credential *name*, never a credential — see that type's doc),
+/// plus this node's own view of whether it is currently exporting.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditSinkView {
+    uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_ref: Option<String>,
+    batch_max_rows: u32,
+    /// The revision of the `AuditSinkPut` that produced this record.
+    revision: u64,
+    /// `None` when this node cannot report export status — `audit_sink()`
+    /// answers from every replica's own applied state, but only the leader
+    /// runs the exporter, so a follower's `GET` still names the fleet's sink
+    /// with no status attached rather than fabricating one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export_status: Option<ExportStatusView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportStatusView {
+    running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    shipped_rows: u64,
+    consecutive_failures: u32,
+}
+
+impl From<ExportStatusSnapshot> for ExportStatusView {
+    fn from(snapshot: ExportStatusSnapshot) -> Self {
+        Self {
+            running: snapshot.running,
+            last_error: snapshot.last_error,
+            shipped_rows: snapshot.shipped_rows,
+            consecutive_failures: snapshot.consecutive_failures,
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TenantView {
@@ -459,6 +564,12 @@ pub(crate) fn dispatch(
     // `admin_front::terminate_tenancy`.
     authorized_tenant: &TenantId,
     bindings: &[(TenantId, Role)],
+    // This node's own exporter status (issue #164), when one is wired up.
+    // `None` on a build that never spawned an `AuditExporter` (a test harness,
+    // say) — [`Route::AuditSinkRead`] is the only arm that reads it, and it
+    // already treats a follower's own absent status as unremarkable, so a
+    // wholly absent exporter is unremarkable too.
+    export_status: Option<&ExportStatus>,
 ) -> Result<Outcome, TenancyError> {
     match route {
         Route::AuditRead { since, limit } => {
@@ -505,6 +616,64 @@ pub(crate) fn dispatch(
                 body: json(&rows).map_err(TenancyError::Storage)?,
             })
         }
+        Route::AuditSinkRead => {
+            let Some(sink) = node
+                .audit_sink()
+                .map_err(|e| TenancyError::Storage(e.to_string()))?
+            else {
+                return Err(TenancyError::NotFound);
+            };
+            let view = AuditSinkView {
+                uri: sink.uri,
+                auth_ref: sink.auth_ref,
+                batch_max_rows: sink.batch_max_rows,
+                revision: sink.revision,
+                // Only the leader exports, so only the leader has a status
+                // worth reporting. A follower's exporter sits parked with
+                // `running: false, shippedRows: 0, consecutiveFailures: 0` —
+                // which is byte-identical to a *leader* whose exporter is
+                // wedged and has shipped nothing. Omitting the field on a
+                // follower keeps "no status here" distinguishable from "status,
+                // and it is all zeroes", which is the whole question an
+                // operator is asking when they read this endpoint.
+                export_status: export_status
+                    .filter(|_| node.is_leader())
+                    .map(ExportStatus::snapshot)
+                    .map(Into::into),
+            };
+            Ok(Outcome::Body {
+                status: StatusCode::OK,
+                body: json(&view).map_err(TenancyError::Storage)?,
+            })
+        }
+        Route::AuditSinkPut => {
+            let parsed: AuditSinkBody = parse(body)?;
+            Ok(Outcome::Commit {
+                op: ControlOp::AuditSinkPut {
+                    // The fleet scope, not `TenantId::default()`. This op *is*
+                    // audited, and `AuditRow::tenant` means "the tenant the op
+                    // acted on" — a fleet-wide sink acts on the fleet. Writing
+                    // `default` here would file a fleet-scoped configuration
+                    // change under one ordinary tenant's name, in the very
+                    // stream this feature exists to produce.
+                    tenant: TenantId::new(FLEET_SCOPE),
+                    uri: parsed.uri,
+                    auth_ref: parsed.auth_ref,
+                    batch_max_rows: parsed
+                        .batch_max_rows
+                        .unwrap_or(DEFAULT_AUDIT_BATCH_MAX_ROWS),
+                },
+                status: StatusCode::OK,
+                then: None,
+            })
+        }
+        Route::AuditSinkDelete => Ok(Outcome::Commit {
+            op: ControlOp::AuditSinkDelete {
+                tenant: TenantId::new(FLEET_SCOPE),
+            },
+            status: StatusCode::NO_CONTENT,
+            then: None,
+        }),
         Route::TenantCreate => {
             let parsed: TenantBody = parse(body)?;
             let Some(id) = parsed.id.as_deref() else {
@@ -1003,5 +1172,97 @@ mod tests {
         assert!(a.starts_with("rift_"), "{a}");
         assert_ne!(a, b, "two mints must not collide");
         assert!(a.len() > 40, "256 bits of entropy, base64: {a}");
+    }
+
+    // -- audit export sink admin surface (issue #164) -----------------------
+
+    #[test]
+    fn the_audit_sink_route_classifies_by_method() {
+        assert_eq!(
+            classify(&Method::GET, AUDIT_SINK_PATH, None),
+            Some(Route::AuditSinkRead)
+        );
+        assert_eq!(
+            classify(&Method::PUT, AUDIT_SINK_PATH, None),
+            Some(Route::AuditSinkPut)
+        );
+        assert_eq!(
+            classify(&Method::DELETE, AUDIT_SINK_PATH, None),
+            Some(Route::AuditSinkDelete)
+        );
+        // A recognized path with an unsupported method falls through to the
+        // proxy rather than being claimed and 405'd here — the same rule
+        // every other route on this surface follows.
+        assert_eq!(
+            classify(&Method::POST, AUDIT_SINK_PATH, None),
+            None,
+            "POST is not one of this route's supported methods"
+        );
+    }
+
+    /// The exact swallow `AUDIT_SINK_PATH`'s doc warns about: the sink path
+    /// must classify as its own route — with its own `ClusterAdmin` action —
+    /// never fall through to `Route::AuditRead`'s `AuditRead` (tenant-reader)
+    /// tier. A `TenantAdmin` must not gain fleet-sink visibility by that route
+    /// mixup.
+    #[test]
+    fn the_audit_sink_route_is_never_classified_as_audit_read() {
+        let classified = classify(&Method::GET, AUDIT_SINK_PATH, None);
+        assert_eq!(classified, Some(Route::AuditSinkRead));
+        assert_ne!(
+            classified,
+            Some(Route::AuditRead {
+                since: 0,
+                limit: AUDIT_DEFAULT_LIMIT,
+            }),
+            "the sink route must never be indistinguishable from a plain audit read"
+        );
+        assert_eq!(
+            classified.as_ref().map(Route::action),
+            Some(Action::ClusterAdmin),
+            "and it must carry the sink's own (fleet-tier) action, not AuditRead's"
+        );
+    }
+
+    /// RFC-002 §4.1: where the fleet's audit ships to is fleet business, so
+    /// every method on this route is `ClusterAdmin`, scoped to the fleet —
+    /// never `TenantManage` and never a tenant named by the caller's header.
+    #[test]
+    fn every_audit_sink_route_is_cluster_admin_scoped_to_the_fleet() {
+        for route in [
+            Route::AuditSinkRead,
+            Route::AuditSinkPut,
+            Route::AuditSinkDelete,
+        ] {
+            assert_eq!(route.action(), Action::ClusterAdmin, "{route:?}");
+            assert_eq!(
+                route.scope().as_ref().map(TenantId::as_str),
+                Some(FLEET_SCOPE),
+                "{route:?}"
+            );
+        }
+    }
+
+    /// A malformed `PUT` body is a client-shaped `400`, never a silent
+    /// default: the rule this repo learned the hard way (a serde failure that
+    /// becomes an empty `200 OK` is a shipped-bug shape here).
+    #[test]
+    fn a_malformed_audit_sink_put_body_is_refused_not_defaulted() {
+        let result: Result<AuditSinkBody, TenancyError> = parse(b"not json at all");
+        assert!(
+            matches!(result, Err(TenancyError::BadRequest(_))),
+            "a malformed body must produce a real refusal, not a defaulted success"
+        );
+    }
+
+    /// An absent `batchMaxRows` takes the documented default rather than the
+    /// bare-`u32` zero `#[serde(default)]` would otherwise produce — a `0`
+    /// would ship nothing forever, and `control::validate` already refuses it,
+    /// so a caller who simply omitted the field must not be refused for it.
+    #[test]
+    fn an_omitted_batch_max_rows_parses_as_none_not_zero() {
+        let parsed: AuditSinkBody =
+            parse(br#"{"uri":"https://collector.example/audit"}"#).expect("parses");
+        assert_eq!(parsed.batch_max_rows, None);
     }
 }

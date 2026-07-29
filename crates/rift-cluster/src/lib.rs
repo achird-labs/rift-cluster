@@ -20,6 +20,7 @@
 //! * [`decorate`] — the response decorator that turns cluster op notes into
 //!   `Rift-Cluster-*` headers, so the open-source handlers stay cluster-unaware.
 
+pub mod audit_export;
 pub mod bridge;
 pub mod config;
 pub mod control;
@@ -34,8 +35,9 @@ pub mod stores;
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use control::{
-    AUDIT_RESOURCE_ALL, AuditRow, ControlOp, ControlOutcome, ControlRequest, ControlResponse,
-    DEFAULT_TENANT, Digest, MAX_SOURCE_PAYLOAD_BYTES, OnDrift, SourceMode, SourceProvenance,
+    AUDIT_RESOURCE_ALL, AuditRow, AuditSink, ControlOp, ControlOutcome, ControlRequest,
+    ControlResponse, DEFAULT_AUDIT_BATCH_MAX_ROWS, DEFAULT_TENANT, Digest, FLEET_SCOPE,
+    MAX_AUDIT_BATCH_MAX_ROWS, MAX_SOURCE_PAYLOAD_BYTES, OnDrift, SourceMode, SourceProvenance,
     StubEdit, StubEditScript, TenantId,
 };
 pub use decorate::ClusterDecorator;
