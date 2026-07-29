@@ -1,0 +1,2090 @@
+<title>Rift Console — C4 screens prototype</title>
+
+<style>
+  /* ── Tokens ─────────────────────────────────────────────────────────────
+     Neutrals are biased cool blue-green toward the accent, not mid-grey.
+     Status colours are a RESERVED set, never reused as chart series, and
+     never carry meaning alone — every one ships with a distinct glyph shape
+     and a text label (green↔red are ΔE ~5 under deutanopia; no hue tweak
+     fixes that, so shape + word do the work).                            */
+  /* Palette direction taken from the "WireMock Pro" reference: a deep-slate
+     developer canvas with a periwinkle primary. Dark is the design; light is
+     derived into the same hue family rather than being a naive inversion.
+     Every token below measured >= 4.5:1 against its own surface in both themes.
+
+     Two deliberate departures from the reference:
+       - its peach tertiary (#ffb786) is dropped. It sits in the same warm band
+         as the warning colour, and two warm hues competing is how a status
+         system stops being readable at a glance.
+       - Geist/Inter/JetBrains Mono are not linked. The CSP blocks font CDNs
+         (RFC-006 section 9.1) and the binary ships air-gapped, so the real
+         console faces the same choice: self-host, or use system stacks.        */
+  :root {
+    --ground:      #F5F7FC;
+    --surface:     #FFFFFF;
+    --surface-2:   #EDF1FA;
+    --surface-3:   #DFE6F4;
+    --ink:         #111A2E;
+    --ink-2:       #414D69;
+    --ink-3:       #5F6B87;
+    --line:        #D6DEEE;
+    --line-2:      #BCC7DE;
+    --accent:      #2F4CB0;
+    --accent-soft: #E7ECFB;
+    --good:        #0B6B3A;
+    --good-soft:   #E2F1E8;
+    --warn:        #8A5A00;
+    --warn-soft:   #F8EEDA;
+    --crit:        #B02418;
+    --crit-soft:   #FAE7E4;
+    --idle:        #5F6B87;
+    --idle-soft:   #ECEFF7;
+    --proto:       #6A3FA0;
+    --proto-soft:  #F1EAFA;
+    --shadow:      0 1px 2px rgba(17, 26, 46, .07), 0 1px 1px rgba(17, 26, 46, .04);
+
+    /* Motion: the "subtle" tier only — 150–200ms, ease-out. An operator
+       console watching a 12,000-row log has no motion budget beyond
+       acknowledging a click. */
+    --t-fast: 150ms;
+    --t-base: 200ms;
+    --ease:   cubic-bezier(.25, .46, .45, .94);
+
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable Text",
+            "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono",
+            "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:      #0B1326;
+      --surface:     #171F33;
+      --surface-2:   #1E273D;
+      --surface-3:   #273148;
+      --ink:         #E6ECFA;
+      --ink-2:       #A9B7D2;
+      --ink-3:       #8394B3;
+      --line:        #2A344C;
+      --line-2:      #3A4664;
+      --accent:      #ADC6FF;
+      --accent-soft: #1B2743;
+      --good:        #22C55E;
+      --good-soft:   #102C1E;
+      --warn:        #F0B849;
+      --warn-soft:   #302512;
+      --crit:        #FF8A7A;
+      --crit-soft:   #35191A;
+      --idle:        #8394B3;
+      --idle-soft:   #1C2438;
+      --proto:       #C4A9F0;
+      --proto-soft:  #241C38;
+      --shadow:      0 1px 2px rgba(0, 0, 0, .45);
+    }
+  }
+  /* The viewer's toggle must win over the media query in BOTH directions. */
+  :root[data-theme="dark"] {
+    --ground:#0B1326; --surface:#171F33; --surface-2:#1E273D; --surface-3:#273148;
+    --ink:#E6ECFA; --ink-2:#A9B7D2; --ink-3:#8394B3; --line:#2A344C; --line-2:#3A4664;
+    --accent:#ADC6FF; --accent-soft:#1B2743; --good:#22C55E; --good-soft:#102C1E;
+    --warn:#F0B849; --warn-soft:#302512; --crit:#FF8A7A; --crit-soft:#35191A;
+    --idle:#8394B3; --idle-soft:#1C2438; --proto:#C4A9F0; --proto-soft:#241C38;
+    --shadow:0 1px 2px rgba(0,0,0,.45);
+  }
+  :root[data-theme="light"] {
+    --ground:#F5F7FC; --surface:#FFFFFF; --surface-2:#EDF1FA; --surface-3:#DFE6F4;
+    --ink:#111A2E; --ink-2:#414D69; --ink-3:#5F6B87; --line:#D6DEEE; --line-2:#BCC7DE;
+    --accent:#2F4CB0; --accent-soft:#E7ECFB; --good:#0B6B3A; --good-soft:#E2F1E8;
+    --warn:#8A5A00; --warn-soft:#F8EEDA; --crit:#B02418; --crit-soft:#FAE7E4;
+    --idle:#5F6B87; --idle-soft:#ECEFF7; --proto:#6A3FA0; --proto-soft:#F1EAFA;
+    --shadow:0 1px 2px rgba(17,26,46,.07), 0 1px 1px rgba(17,26,46,.04);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font: 400 14px/1.5 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  }
+
+  code, .mono, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  .eyebrow {
+    font: 600 10px/1 var(--mono);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  /* ── Prototype control strip ───────────────────────────────────────────
+     Deliberately styled as NOT product UI: violet, dashed, and labelled.  */
+  .proto-bar {
+    background: var(--proto-soft);
+    border-bottom: 1px dashed var(--proto);
+    padding: 10px 20px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 22px;
+  }
+  .proto-bar .proto-tag {
+    font: 600 10px/1 var(--mono);
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--proto);
+    border: 1px solid var(--proto);
+    border-radius: 2px;
+    padding: 4px 7px;
+  }
+  .proto-group { display: flex; align-items: center; gap: 7px; }
+  .proto-group > span { font: 600 10px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+  .seg { display: flex; border: 1px solid var(--line-2); border-radius: 3px; overflow: hidden; background: var(--surface); }
+  .seg button {
+    font: 500 12px/1 var(--sans);
+    padding: 6px 10px;
+    border: 0;
+    background: transparent;
+    color: var(--ink-2);
+    cursor: pointer;
+    border-right: 1px solid var(--line);
+  }
+  .seg button:last-child { border-right: 0; }
+  .seg button[aria-pressed="true"] { background: var(--proto); color: #fff; }
+  .seg button:hover:not([aria-pressed="true"]) { background: var(--surface-2); color: var(--ink); }
+
+  /* ── App frame ─────────────────────────────────────────────────────────*/
+  .app { display: grid; grid-template-columns: 232px 1fr; min-height: 88vh; }
+
+  .rail {
+    background: var(--surface);
+    border-right: 1px solid var(--line);
+    padding: 18px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+  }
+  .brand { padding: 0 18px; display: flex; align-items: baseline; gap: 8px; }
+  .brand b { font: 700 16px/1 var(--sans); letter-spacing: -.01em; }
+  .brand span { font: 500 10px/1 var(--mono); color: var(--ink-3); letter-spacing: .06em; }
+
+  .nav-group { display: flex; flex-direction: column; gap: 1px; }
+  .nav-group > .eyebrow { padding: 0 18px 6px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 9px;
+    padding: 7px 18px;
+    color: var(--ink-2);
+    text-decoration: none;
+    border-left: 2px solid transparent;
+    font-size: 13.5px;
+    background: none; border-top: 0; border-right: 0; border-bottom: 0;
+    width: 100%; text-align: left; cursor: pointer; font-family: var(--sans);
+  }
+  .nav-item:hover { background: var(--surface-2); color: var(--ink); }
+  .nav-item[aria-current="page"] {
+    border-left-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .nav-item.pending { color: var(--ink-3); cursor: default; }
+  .nav-item.pending:hover { background: none; color: var(--ink-3); }
+  .nav-item.pending .issue {
+    margin-left: auto;
+    font: 500 10.5px/1 var(--mono);
+    color: var(--ink-3);
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    padding: 2px 4px;
+  }
+  .nav-item .glyph { width: 14px; text-align: center; color: var(--ink-3); font-size: 11px; }
+  .nav-item[aria-current="page"] .glyph { color: var(--accent); }
+
+  /* ── Top bar ───────────────────────────────────────────────────────────*/
+  .topbar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+    padding: 11px 22px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .tenant-switch {
+    display: flex; align-items: center; gap: 8px;
+    border: 1px solid var(--line-2); border-radius: 3px;
+    padding: 5px 9px; background: var(--surface);
+  }
+  .tenant-switch .eyebrow { font-size: 9.5px; }
+  .tenant-switch select {
+    font: 600 13px/1 var(--mono);
+    border: 0; background: transparent; color: var(--ink); cursor: pointer;
+  }
+  .who { margin-left: auto; display: flex; align-items: center; gap: 10px; text-align: right; }
+  .who .id { font: 600 12.5px/1.35 var(--mono); }
+  .who .role { font: 500 10px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3); }
+  .avatar {
+    width: 28px; height: 28px; border-radius: 3px;
+    background: var(--accent-soft); color: var(--accent);
+    display: grid; place-items: center;
+    font: 700 11px/1 var(--mono);
+    border: 1px solid var(--accent);
+  }
+
+  main { padding: 22px; display: flex; flex-direction: column; gap: 18px; }
+
+  .page-head { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
+  .page-head h1 { margin: 0; font: 600 21px/1.2 var(--sans); letter-spacing: -.015em; text-wrap: balance; }
+  .page-head .sub { color: var(--ink-2); font-size: 13px; }
+  .page-head .spacer { margin-left: auto; }
+
+  /* ── Banners ───────────────────────────────────────────────────────────*/
+  .banner {
+    display: flex; gap: 11px; align-items: flex-start;
+    padding: 11px 13px;
+    border-radius: 4px;
+    border: 1px solid;
+    font-size: 13px;
+  }
+  .banner .b-glyph { font: 700 12px/1.35 var(--mono); flex: none; }
+  .banner strong { font-weight: 650; }
+  .banner p { margin: 3px 0 0; color: var(--ink-2); }
+  .banner.warn { background: var(--warn-soft); border-color: var(--warn); }
+  .banner.warn .b-glyph, .banner.warn strong { color: var(--warn); }
+  .banner.crit { background: var(--crit-soft); border-color: var(--crit); }
+  .banner.crit .b-glyph, .banner.crit strong { color: var(--crit); }
+  .banner.info { background: var(--accent-soft); border-color: var(--accent); }
+  .banner.info .b-glyph, .banner.info strong { color: var(--accent); }
+
+  /* ── Stat tiles ────────────────────────────────────────────────────────
+     No sparklines here on purpose: /_fleet/health and /_fleet/members are
+     point-in-time. Inventing a trend line would imply an API that does not
+     exist, which is exactly the "nothing UI-only" rule.                  */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); gap: 12px; }
+  .tile {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 13px 14px;
+    box-shadow: var(--shadow);
+    display: flex; flex-direction: column; gap: 7px;
+    position: relative;
+    overflow: hidden;
+  }
+  /* Severity stripe: state encoded in form, not only colour. */
+  .tile.is-warn::before, .tile.is-crit::before, .tile.is-good::before {
+    content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+  }
+  .tile.is-good::before { background: var(--good); }
+  .tile.is-warn::before { background: var(--warn); }
+  .tile.is-crit::before { background: var(--crit); }
+  .tile .v { font: 600 25px/1 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .tile .v small { font-size: 13px; font-weight: 500; color: var(--ink-3); letter-spacing: 0; }
+  .tile .note { font-size: 12px; color: var(--ink-3); }
+
+  /* ── Status pill: glyph SHAPE + colour + word (triple-encoded) ─────────*/
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font: 600 11.5px/1 var(--sans);
+    padding: 4px 8px 4px 6px;
+    border-radius: 3px;
+    border: 1px solid;
+    white-space: nowrap;
+  }
+  .pill .g { font: 700 10px/1 var(--mono); }
+  .pill.good { color: var(--good); background: var(--good-soft); border-color: var(--good); }
+  .pill.warn { color: var(--warn); background: var(--warn-soft); border-color: var(--warn); }
+  .pill.crit { color: var(--crit); background: var(--crit-soft); border-color: var(--crit); }
+  .pill.idle { color: var(--ink-2); background: var(--idle-soft); border-color: var(--line-2); }
+  .pill.accent { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+
+  /* ── Cards & tables ───────────────────────────────────────────────────*/
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .card-head {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .card-head h2 { margin: 0; font: 600 14px/1.3 var(--sans); }
+  .card-head .spacer { margin-left: auto; }
+  .card-body { padding: 14px; }
+  .scroll-x { overflow-x: auto; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left;
+    font: 600 10px/1 var(--mono);
+    letter-spacing: .09em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface-2);
+    white-space: nowrap;
+  }
+  td { padding: 9px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--surface-2); }
+  td.r, th.r { text-align: right; }
+  .id-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .id-cell .name {
+    font: 500 13px/1.35 var(--sans);
+    /* Long imposter names must truncate, not blow the layout out. */
+    max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .id-cell .meta { font: 500 11px/1 var(--mono); color: var(--ink-3); }
+  .port { font: 600 13px/1 var(--mono); font-variant-numeric: tabular-nums; }
+
+  .btn {
+    font: 500 12.5px/1 var(--sans);
+    padding: 6px 10px;
+    border: 1px solid var(--line-2);
+    border-radius: 3px;
+    background: var(--surface);
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .btn:hover { background: var(--surface-2); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn.sm { padding: 4px 8px; font-size: 12px; }
+
+  .readonly-hint {
+    font: 500 11px/1 var(--mono);
+    color: var(--ink-3);
+    letter-spacing: .04em;
+  }
+
+  /* ── Empty states ─────────────────────────────────────────────────────*/
+  .empty { padding: 40px 22px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 9px; }
+  .empty .mark { font: 400 24px/1 var(--mono); color: var(--line-2); }
+  .empty h3 { margin: 0; font: 600 15px/1.3 var(--sans); }
+  .empty p { margin: 0; max-width: 52ch; color: var(--ink-2); font-size: 13px; }
+  /* ── Toolbar: search + bulk actions ───────────────────────────────────*/
+  .toolbar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+    background: var(--surface-2);
+  }
+  .search { position: relative; flex: 0 1 300px; }
+  .search input {
+    width: 100%;
+    font: 500 13px/1 var(--mono);
+    padding: 7px 9px 7px 26px;
+    border: 1px solid var(--line-2); border-radius: 3px;
+    background: var(--surface); color: var(--ink);
+    transition: border-color var(--t-fast) var(--ease);
+  }
+  .search input:focus { border-color: var(--accent); }
+  .search .si {
+    position: absolute; left: 8px; top: 50%; transform: translateY(-50%);
+    color: var(--ink-3); font: 400 12px/1 var(--mono); pointer-events: none;
+  }
+  .toolbar .filters { display: flex; gap: 6px; }
+  .toolbar select {
+    font: 500 12px/1 var(--sans); padding: 6px 8px;
+    border: 1px solid var(--line-2); border-radius: 3px;
+    background: var(--surface); color: var(--ink); cursor: pointer;
+  }
+  .toolbar .right { margin-left: auto; display: flex; align-items: center; gap: 9px; }
+
+  .bulkbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 14px;
+    background: var(--accent-soft);
+    border-bottom: 1px solid var(--accent);
+    font-size: 13px;
+  }
+  .bulkbar b { font-family: var(--mono); }
+  .bulkbar .right { margin-left: auto; display: flex; gap: 7px; }
+  td.cb, th.cb { width: 34px; padding-right: 0; }
+  input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+
+  /* ── Toast: never a silent success ────────────────────────────────────*/
+  .toasts {
+    position: fixed; right: 18px; bottom: 18px;
+    display: flex; flex-direction: column; gap: 8px;
+    z-index: 50; max-width: 380px;
+  }
+  .toast {
+    display: flex; gap: 9px; align-items: flex-start;
+    background: var(--surface);
+    border: 1px solid var(--line-2);
+    border-left: 3px solid var(--good);
+    border-radius: 4px;
+    padding: 11px 13px;
+    box-shadow: 0 6px 18px rgba(0,0,0,.18);
+    font-size: 13px;
+    animation: toast-in var(--t-base) var(--ease);
+  }
+  .toast.err { border-left-color: var(--crit); }
+  .toast .tg { font: 700 11px/1.35 var(--mono); color: var(--good); flex: none; }
+  .toast.err .tg { color: var(--crit); }
+  .toast .tx b { display: block; font-weight: 650; }
+  .toast .tx span { color: var(--ink-2); }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
+
+  /* ── Confirm dialog for destructive actions ───────────────────────────*/
+  .scrim {
+    position: fixed; inset: 0; background: rgba(6, 10, 20, .55);
+    display: grid; place-items: center; z-index: 60; padding: 20px;
+  }
+  .confirm {
+    width: min(430px, 100%);
+    background: var(--surface); border: 1px solid var(--line-2);
+    border-radius: 5px; padding: 20px;
+    box-shadow: 0 12px 32px rgba(0,0,0,.3);
+    display: flex; flex-direction: column; gap: 13px;
+  }
+  .confirm h2 { margin: 0; font: 600 15px/1.3 var(--sans); }
+  .confirm p { margin: 0; font-size: 13px; color: var(--ink-2); }
+  .confirm .acts { display: flex; gap: 8px; justify-content: flex-end; }
+  .btn.danger { background: var(--crit); border-color: var(--crit); color: #fff; }
+  .btn.danger:hover { filter: brightness(1.08); }
+
+  .btn, .nav-item, .seg button, .tabs button {
+    transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease),
+                border-color var(--t-fast) var(--ease);
+  }
+
+  .empty pre {
+    margin: 6px 0 0; padding: 9px 12px;
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 3px;
+    font: 500 12px/1.5 var(--mono);
+    color: var(--ink-2);
+    text-align: left; overflow-x: auto; max-width: 100%;
+  }
+
+  /* ── Chart: magnitude by identity ─────────────────────────────────────*/
+  .bars { display: flex; flex-direction: column; gap: 9px; }
+  .bar-row { display: grid; grid-template-columns: 20ch 1fr 6ch; align-items: center; gap: 10px; }
+  .bar-row .lab {
+    font: 500 12px/1 var(--sans);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--ink-2);
+  }
+  .track { height: 12px; background: var(--surface-3); border-radius: 2px; position: relative; }
+  .fill {
+    height: 100%;
+    /* 4px rounded data-end, anchored square to the baseline. */
+    border-radius: 0 4px 4px 0;
+    background: var(--accent);
+    min-width: 2px;
+  }
+  .bar-row .val { font: 600 12px/1 var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+  .bar-row:hover .fill { filter: brightness(1.12); }
+
+  .hint {
+    font-size: 12.5px; color: var(--ink-3);
+    border-left: 2px solid var(--line-2);
+    padding-left: 10px;
+  }
+
+  /* ── Request log (C6) ─────────────────────────────────────────────────
+     The scope selector is deliberately prominent and permanently visible:
+     this data is per-node, and a console that lets you forget that is the
+     failure mode #189 exists to prevent.                                 */
+  .scope {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 11px 14px;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+  }
+  .scope .eyebrow { flex: none; }
+  .scope .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .scope .coverage { margin-left: auto; font: 500 12px/1.4 var(--sans); color: var(--ink-2); }
+  .scope .coverage b { font-family: var(--mono); font-weight: 650; color: var(--ink); }
+
+  .log-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  @media (min-width: 1180px) { .log-grid.has-sel { grid-template-columns: minmax(0, 1.35fr) minmax(340px, 1fr); align-items: start; } }
+
+  .method {
+    font: 650 10.5px/1 var(--mono);
+    letter-spacing: .05em;
+    padding: 3px 5px;
+    border-radius: 2px;
+    border: 1px solid var(--line-2);
+    color: var(--ink-2);
+    background: var(--surface-2);
+  }
+  .method.post, .method.put, .method.patch { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+  .method.delete { color: var(--crit); border-color: var(--crit); background: var(--crit-soft); }
+
+  .path {
+    font: 500 12.5px/1 var(--mono);
+    max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    display: inline-block; vertical-align: middle;
+  }
+  .status-code { font: 650 12.5px/1 var(--mono); font-variant-numeric: tabular-nums; }
+  .status-code.s2 { color: var(--good); }
+  .status-code.s4 { color: var(--warn); }
+  .status-code.s5 { color: var(--crit); }
+  tbody tr[aria-selected="true"] { background: var(--accent-soft); }
+  tbody tr.clickable { cursor: pointer; }
+
+  /* Recorded payloads are the most attacker-influenced surface in the
+     console: always text in a <pre>, never interpreted as markup. */
+  .payload {
+    margin: 0;
+    padding: 10px 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    font: 500 12px/1.55 var(--mono);
+    color: var(--ink-2);
+    overflow-x: auto;
+    white-space: pre;
+    max-height: 200px; overflow-y: auto;
+  }
+  .diag {
+    border: 1px solid; border-radius: 3px;
+    padding: 10px 12px;
+    font-size: 12.5px;
+  }
+  .diag.matched { background: var(--good-soft); border-color: var(--good); }
+  .diag.unmatched { background: var(--warn-soft); border-color: var(--warn); }
+  .diag .dh { font: 650 11px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; display: flex; align-items: center; gap: 6px; }
+  .diag.matched .dh { color: var(--good); }
+  .diag.unmatched .dh { color: var(--warn); }
+  .diag ul { margin: 8px 0 0; padding-left: 16px; display: flex; flex-direction: column; gap: 4px; color: var(--ink-2); }
+  .diag code { font-size: 11.5px; }
+
+  .section-stack { display: flex; flex-direction: column; gap: 12px; }
+  .pager {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-top: 1px solid var(--line);
+  }
+  .pager .count { font: 500 12px/1 var(--mono); color: var(--ink-3); margin-left: auto; }
+
+  /* ── Front-door routes (C6) ───────────────────────────────────────────
+     The list is ordered by RouteTable::effective_order — priority, then host
+     rank, then prefix length, then header count, then id — NOT by authoring
+     order. Showing authoring order would be showing something that does not
+     decide anything.                                                     */
+  .order-rank {
+    font: 650 11px/1 var(--mono);
+    color: var(--ink-3);
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    padding: 3px 5px;
+    min-width: 2.4ch;
+    display: inline-block; text-align: center;
+  }
+  .order-rank.off { opacity: .55; }
+  .match-clauses { display: flex; flex-wrap: wrap; gap: 4px; }
+  .clause {
+    font: 500 11px/1 var(--mono);
+    border: 1px solid var(--line-2);
+    border-radius: 2px;
+    padding: 3px 5px;
+    color: var(--ink-2);
+    background: var(--surface);
+    white-space: nowrap;
+  }
+  .clause.any { border-style: dashed; color: var(--warn); border-color: var(--warn); }
+  .tiebreak { display: flex; flex-direction: column; gap: 5px; }
+  .tiebreak li { font-size: 12.5px; color: var(--ink-2); }
+  .tiebreak code { font-size: 11.5px; }
+
+  /* ── Editors (C5) ──────────────────────────────────────────────────────*/
+  .editor-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  @media (min-width: 1200px) { .editor-grid.split { grid-template-columns: 1fr 1fr; align-items: start; } }
+  .code-surface {
+    margin: 0;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    font: 500 12px/1.6 var(--mono);
+    color: var(--ink);
+    overflow: auto;
+    max-height: 380px;
+    padding: 0;
+  }
+  .code-surface .ln {
+    display: grid; grid-template-columns: 3.5ch 1fr;
+    gap: 12px;
+  }
+  .code-surface .ln > i {
+    font-style: normal; color: var(--ink-3); text-align: right;
+    user-select: none; background: var(--surface-3); padding: 0 4px;
+  }
+  .code-surface .ln > span { white-space: pre; padding-right: 12px; }
+  .code-surface .ln.err > span { background: var(--crit-soft); }
+  .tok-key { color: var(--accent); }
+  .tok-str { color: var(--good); }
+  .tok-num { color: var(--warn); }
+
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font: 600 10px/1 var(--mono); letter-spacing: .09em; text-transform: uppercase; color: var(--ink-3); }
+  .field input, .field select, .field textarea {
+    font: 500 13px/1.4 var(--mono);
+    padding: 7px 9px;
+    border: 1px solid var(--line-2);
+    border-radius: 3px;
+    background: var(--surface);
+    color: var(--ink);
+    width: 100%;
+  }
+  .field textarea { resize: vertical; min-height: 72px; }
+  .field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .lint {
+    display: flex; gap: 8px; align-items: flex-start;
+    font-size: 12.5px; padding: 8px 10px; border-radius: 3px; border: 1px solid;
+  }
+  .lint.info { background: var(--accent-soft); border-color: var(--accent); }
+  .lint.warn { background: var(--warn-soft); border-color: var(--warn); }
+  .lint .lg { font: 700 11px/1.35 var(--mono); flex: none; }
+  .lint.info .lg { color: var(--accent); }
+  .lint.warn .lg { color: var(--warn); }
+
+  .diff-row { display: grid; grid-template-columns: 8ch 1fr; gap: 10px; font: 500 12px/1.6 var(--mono); }
+  .diff-row .side { color: var(--ink-3); }
+  .diff-row .mine { color: var(--crit); }
+  .diff-row .theirs { color: var(--good); }
+
+  /* ── Administration (C7) ──────────────────────────────────────────────*/
+  .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); }
+  .tabs button {
+    font: 500 13px/1 var(--sans);
+    padding: 9px 13px;
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    color: var(--ink-2); cursor: pointer;
+  }
+  .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
+  .tabs button:hover { color: var(--ink); }
+
+  .key-once {
+    border: 1px solid var(--warn);
+    background: var(--warn-soft);
+    border-radius: 4px;
+    padding: 14px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .key-once .kh { font: 650 11px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--warn); display: flex; align-items: center; gap: 6px; }
+  .key-once .kval {
+    font: 600 13px/1.5 var(--mono);
+    word-break: break-all;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 3px; padding: 9px 11px;
+  }
+  .role-matrix td:first-child { font: 500 12.5px/1 var(--mono); }
+  .role-matrix .yes { color: var(--good); font: 700 12px/1 var(--mono); }
+  .role-matrix .no  { color: var(--ink-3); font: 400 12px/1 var(--mono); }
+  .role-matrix th:not(:first-child), .role-matrix td:not(:first-child) { text-align: center; }
+
+  /* ── Sign in (C2) ─────────────────────────────────────────────────────*/
+  .signin-wrap { display: grid; place-items: center; padding: 40px 0; }
+  .signin {
+    width: min(430px, 100%);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    box-shadow: var(--shadow);
+    padding: 26px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .signin .mark { display: flex; align-items: baseline; gap: 8px; }
+  .signin .mark b { font: 700 19px/1 var(--sans); }
+  .signin .mark span { font: 500 10px/1 var(--mono); color: var(--ink-3); letter-spacing: .08em; }
+  .signin h1 { margin: 0; font: 600 16px/1.3 var(--sans); }
+  .signin p { margin: 0; font-size: 13px; color: var(--ink-2); }
+
+  .detail { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+  .kv { display: flex; flex-direction: column; gap: 3px; }
+  .kv dt { font: 600 10px/1 var(--mono); letter-spacing: .09em; text-transform: uppercase; color: var(--ink-3); }
+  .kv dd { margin: 0; font: 500 13px/1.4 var(--mono); word-break: break-all; }
+
+  footer.notes {
+    border-top: 1px dashed var(--proto);
+    background: var(--proto-soft);
+    padding: 16px 22px;
+    font-size: 13px;
+    color: var(--ink-2);
+  }
+  footer.notes h2 { margin: 0 0 8px; font: 600 13px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--proto); }
+  footer.notes ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
+  footer.notes code { background: var(--surface); border: 1px solid var(--line); border-radius: 2px; padding: 1px 4px; font-size: 12px; }
+
+  @media (max-width: 900px) {
+    .app { grid-template-columns: 1fr; }
+    .rail { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  }
+</style>
+
+<div class="proto-bar">
+  <span class="proto-tag">Prototype controls · not part of the console</span>
+  <span class="proto-group"><span>Screen</span>
+    <span class="seg" id="seg-screen" role="group" aria-label="Screen">
+      <button data-v="fleet" aria-pressed="true">Cluster &amp; fleet</button>
+      <button data-v="imposters" aria-pressed="false">Imposters</button>
+      <button data-v="requests" aria-pressed="false">Request log</button>
+      <button data-v="routes" aria-pressed="false">Front-door routes</button>
+      <button data-v="stub" aria-pressed="false">Stub editor</button>
+      <button data-v="admin" aria-pressed="false">Administration</button>
+      <button data-v="login" aria-pressed="false">Sign in</button>
+    </span>
+  </span>
+  <span class="proto-group"><span>Role</span>
+    <span class="seg" id="seg-role" role="group" aria-label="Role">
+      <button data-v="fleet-admin" aria-pressed="true">FleetAdmin</button>
+      <button data-v="editor" aria-pressed="false">Editor</button>
+      <button data-v="viewer" aria-pressed="false">Viewer</button>
+    </span>
+  </span>
+  <span class="proto-group"><span>Fleet</span>
+    <span class="seg" id="seg-fleet" role="group" aria-label="Fleet state">
+      <button data-v="healthy" aria-pressed="true">Healthy</button>
+      <button data-v="degraded" aria-pressed="false">Node unreachable</button>
+      <button data-v="single" aria-pressed="false">Single node</button>
+    </span>
+  </span>
+  <span class="proto-group"><span>Data</span>
+    <span class="seg" id="seg-data" role="group" aria-label="Data volume">
+      <button data-v="normal" aria-pressed="true">Normal</button>
+      <button data-v="empty" aria-pressed="false">Empty</button>
+      <button data-v="overflow" aria-pressed="false">200 + long names</button>
+    </span>
+  </span>
+</div>
+
+<div class="app">
+  <nav class="rail" aria-label="Console sections">
+    <div class="brand"><b>Rift</b><span>CONSOLE</span></div>
+
+    <div class="nav-group">
+      <div class="eyebrow">Mocks</div>
+      <button class="nav-item" data-screen="imposters" type="button"><span class="glyph">▤</span>Imposters</button>
+      <button class="nav-item" data-screen="stub" type="button"><span class="glyph">▤</span>Stub editor</button>
+      <button class="nav-item" data-screen="requests" type="button"><span class="glyph">▤</span>Request log</button>
+      <button class="nav-item" data-screen="routes" type="button"><span class="glyph">▤</span>Front-door routes</button>
+    </div>
+
+    <div class="nav-group">
+      <div class="eyebrow">Fleet</div>
+      <button class="nav-item" data-screen="fleet" aria-current="page" type="button"><span class="glyph">◈</span>Cluster &amp; fleet</button>
+    </div>
+
+    <div class="nav-group">
+      <div class="eyebrow">Administration</div>
+      <button class="nav-item" data-screen="admin" type="button"><span class="glyph">◇</span>Tenants &amp; principals</button>
+      <button class="nav-item" data-screen="admin" data-tab="audit" type="button"><span class="glyph">◇</span>Audit</button>
+    </div>
+
+    <div class="nav-group">
+      <div class="eyebrow">Not yet shipped</div>
+      <button class="nav-item pending" type="button" disabled><span class="glyph">○</span>Scenarios &amp; state<span class="issue">#149</span></button>
+      <button class="nav-item pending" type="button" disabled><span class="glyph">○</span>Sources<span class="issue">#20</span></button>
+      <button class="nav-item pending" type="button" disabled><span class="glyph">○</span>Specs<span class="issue">#148</span></button>
+    </div>
+  </nav>
+
+  <div>
+    <header class="topbar">
+      <label class="tenant-switch">
+        <span class="eyebrow">Tenant</span>
+        <select id="tenant" aria-label="Active tenant">
+          <option value="default">default</option>
+          <option value="acme">acme</option>
+          <option value="beta">beta</option>
+        </select>
+      </label>
+      <span class="pill accent" id="revision-pill" title="Rift-Cluster-Revision on the last read">
+        <span class="g">◈</span><span id="revision-text">rev 1284</span>
+      </span>
+      <div class="who">
+        <div>
+          <div class="id" id="who-id">ops@achird</div>
+          <div class="role" id="who-role">FleetAdmin · fleet scope</div>
+        </div>
+        <div class="avatar" id="who-avatar">FA</div>
+      </div>
+    </header>
+
+    <main id="screen"></main>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
+<div id="confirm-host"></div>
+
+<footer class="notes">
+  <h2>Prototype notes — decisions worth arguing with</h2>
+  <ul>
+    <li><strong>Visual language taken from the &ldquo;WireMock Pro&rdquo; reference</strong> — deep-slate canvas
+      (<code>#0b1326</code>), containers (<code>#171f33</code>), periwinkle primary (<code>#adc6ff</code>),
+      mono for endpoints and payloads. Dark is the design; light is derived into the same hue family
+      rather than inverted. Every token measured ≥ 4.5:1 against its own surface in both themes.</li>
+    <li><strong>Three things from that reference were deliberately not adopted.</strong> Its
+      <em>multi-trace health chart over time (Dev/QA/Prod)</em> and its <em>Uptime 30d / 24h requests /
+      P95 latency</em> tiles would fabricate both a metrics history and an environment model this
+      product does not have — <code>/_fleet/health</code> is a point-in-time read, and §3 rule 2 says a
+      screen that needs data the API cannot give is an API feature, not a UI liberty. Its
+      <em>Geist/Inter/JetBrains Mono</em> are CDN webfonts the CSP blocks. And its <em>peach tertiary</em>
+      (<code>#ffb786</code>) sits in the same warm band as the warning colour, so it was dropped rather
+      than left to compete with it.</li>
+    <li><strong>Deep linking now works both ways.</strong> The URL is written on every state change, not
+      just read at boot — a state explorer you cannot share the state of is half a tool.</li>
+    <li><strong>Writes are never silent.</strong> Every mutation confirms with a toast that auto-dismisses
+      at 4s, and every destructive action confirms first with a dialog that <em>names what is being
+      destroyed</em> instead of asking &ldquo;are you sure?&rdquo;. Motion is capped at the subtle tier —
+      150–200ms, ease-out — because a console watching a 12,000-row log has no motion budget beyond
+      acknowledging a click.</li>
+    <li><strong>Search, sort and bulk actions</strong> on the imposter table. At <em>Data → 200 + long
+      names</em> a plain list is unusable, and enabling twelve mocks one at a time is the kind of tedium
+      an operator tool should absorb. Bulk enable/disable is described as <em>one committed write</em>,
+      which is what it should be.</li>
+    <li><strong>No trend charts on the fleet screen.</strong> <code>/_fleet/health</code> and <code>/_fleet/members</code> are point-in-time reads. A sparkline would imply history the API does not have — RFC-006 §3 rule 2 (&ldquo;nothing UI-only&rdquo;). The one chart here is magnitude-by-identity over <code>numberOfRequests</code>, which the imposter body genuinely carries.</li>
+    <li><strong>Partial answers are named, never averaged.</strong> Switch <em>Fleet → Node unreachable</em>: the tiles that cannot be known say so, and the banner names which node is missing and how many are represented. The console never fans out and merges client-side — that would reinvent the verification plane (#147) without its cursors or gap repair.</li>
+    <li><strong>Empty distinguishes &ldquo;nothing here&rdquo; from &ldquo;cannot answer&rdquo;.</strong> Try <em>Data → Empty</em> against each fleet state. On the request log the two are entirely different screens: an unreachable node says its log is <em>unknown</em>, a reachable one says it recorded <em>nothing</em>.</li>
+    <li><strong>The request log's scope selector never collapses.</strong> Per-node is the fact that screen has to keep in front of the reader, so the node in scope and the count of nodes <em>not</em> represented sit above the table permanently, not in a dismissible banner. The merged journal (#147) drops the label and keeps the shape.</li>
+    <li><strong>Match diagnostics are the reason to open the log.</strong> An unmatched request lists every stub that was tried and the predicate that rejected it — that is what an operator is actually looking for when a system under test gets a 404.</li>
+    <li><strong>Row <code>r-8812</code> is hostile on purpose.</strong> Its path carries a <code>&lt;script&gt;</code> tag and its user-agent an <code>onerror</code> attribute. Recorded payloads are the most attacker-influenced surface in the console, so they render as text in a <code>&lt;pre&gt;</code>, never as markup — if you ever see that row execute, the escaping regressed.</li>
+    <li><strong>Status is triple-encoded</strong> — glyph shape (● ▲ ■ ○), colour, and word. Green↔red sit ~ΔE 5 apart under deutanopia, so colour alone would fail; the validator confirmed that rather than my eye. Light-mode amber was darkened to <code>#8A5A00</code> after it measured 2.24:1 against white.</li>
+    <li><strong>Viewer hides write affordances but that is UX only.</strong> RFC-006 §3 rule 3: the API re-checks every call. A hidden control is never the only guard.</li>
+    <li><strong>Every identifier is monospace</strong> — ports, revisions, op-ids, node names. These are values an operator pastes into curl, and <code>rift-tui</code> is the interaction precedent RFC-006 §4 names deliberately.</li>
+    <li><strong>Cross-tenant is 404, not 403.</strong> Not shown on these two screens, but it lands in #190: a tenant you are not bound to must be indistinguishable from one that does not exist (RFC-002 §8.4).</li>
+    <li><strong>Desktop only</strong> (RFC-006 §10). The narrow-window collapse here is prototype convenience, not a mobile layout.</li>
+  </ul>
+</footer>
+
+<script>
+  "use strict";
+
+  const state = {
+    screen: "fleet", role: "fleet-admin", fleet: "healthy", data: "normal",
+    tenant: "default", selected: null,
+    scopeNode: "rift-1", selectedReq: null,
+    stubCase: "simple", adminTab: "tenants", newKey: false,
+    q: "", methodFilter: "all", sort: "requests", picked: new Set(), confirm: null
+  };
+
+  /* Deep linking: the URL must describe what you are looking at, or a state
+     explorer cannot be shared. The read side existed from the start; writing
+     it back is what closes the loop. */
+  function writeUrl() {
+    if (typeof history === "undefined" || !history.replaceState) return;
+    const q = new URLSearchParams();
+    const defaults = { screen: "fleet", role: "fleet-admin", fleet: "healthy", data: "normal",
+                       tenant: "default", scopeNode: "rift-1", stubCase: "simple", adminTab: "tenants" };
+    for (const [k, d] of Object.entries(defaults)) if (state[k] !== d) q.set(k, state[k]);
+    if (state.selectedReq) q.set("req", state.selectedReq);
+    if (state.selected) q.set("imposter", String(state.selected));
+    if (state.q) q.set("q", state.q);
+    const s = q.toString();
+    history.replaceState(null, "", s ? `?${s}` : location.pathname);
+  }
+
+  let toastSeq = 0;
+  /* A control says what happens, then confirms that it happened. Silent
+     success is the anti-pattern; a toast that never leaves is the other one,
+     so these auto-dismiss at 4s. */
+  function toast(title, detail, kind) {
+    const host = document.getElementById("toasts");
+    if (!host) return;
+    const id = `t${++toastSeq}`;
+    const el = document.createElement("div");
+    el.className = `toast${kind === "err" ? " err" : ""}`;
+    el.id = id;
+    el.innerHTML = `<span class="tg" aria-hidden="true">${kind === "err" ? "■" : "●"}</span>
+      <span class="tx"><b>${esc(title)}</b><span>${esc(detail || "")}</span></span>`;
+    host.appendChild(el);
+    setTimeout(() => { const n = document.getElementById(id); if (n) n.remove(); }, 4000);
+  }
+
+  /* Irreversible actions confirm first, and the dialog names the thing being
+     destroyed rather than asking "are you sure?". */
+  function askConfirm(title, body, label, onYes) {
+    const host = document.getElementById("confirm-host");
+    if (!host) return;
+    host.innerHTML = `
+      <div class="scrim" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+        <div class="confirm">
+          <h2>${esc(title)}</h2>
+          <p>${body}</p>
+          <div class="acts">
+            <button class="btn" type="button" id="c-no">Cancel</button>
+            <button class="btn danger" type="button" id="c-yes">${esc(label)}</button>
+          </div>
+        </div>
+      </div>`;
+    const close = () => { host.innerHTML = ""; };
+    document.getElementById("c-no").addEventListener("click", close);
+    document.getElementById("c-yes").addEventListener("click", () => { close(); onYes(); });
+    const yes = document.getElementById("c-yes");
+    if (yes && yes.focus) yes.focus();
+  }
+
+  /* Boot from the query string so a specific state is linkable — and so the
+     screenshots committed alongside this file are reproducible rather than
+     hand-posed. */
+  (function readUrl() {
+    const q = new URLSearchParams(location.search);
+    for (const k of ["screen", "role", "fleet", "data", "tenant", "scopeNode", "stubCase", "adminTab", "q"]) {
+      if (q.has(k)) state[k] = q.get(k);
+    }
+    if (q.has("req")) state.selectedReq = q.get("req");
+    if (q.has("imposter")) state.selected = Number(q.get("imposter"));
+  })();
+
+  const NODES = [
+    { name: "rift-1", addr: "10.4.1.11:5251", leader: true,  ready: true, applied: 1284, mIdx: 7 },
+    { name: "rift-2", addr: "10.4.1.12:5251", leader: false, ready: true, applied: 1284, mIdx: 7 },
+    { name: "rift-3", addr: "10.4.1.13:5251", leader: false, ready: true, applied: 1283, mIdx: 7 }
+  ];
+
+  const BASE_IMPOSTERS = [
+    { port: 6001, name: "payments-api-sandbox",     protocol: "http",  enabled: true,  requests: 4821, stubs: 12 },
+    { port: 6002, name: "identity-provider-stub",   protocol: "https", enabled: true,  requests: 2960, stubs: 8  },
+    { port: 6003, name: "inventory-service",        protocol: "http",  enabled: true,  requests: 1447, stubs: 5  },
+    { port: 6004, name: "shipping-quotes",          protocol: "http",  enabled: false, requests: 318,  stubs: 3  },
+    { port: 6005, name: "legacy-soap-gateway",      protocol: "http",  enabled: true,  requests: 96,   stubs: 21 },
+    { port: 6006, name: "webhook-sink",             protocol: "http",  enabled: true,  requests: 12,   stubs: 1  }
+  ];
+
+  /* Recorded requests carry attacker-controlled content by construction —
+     whatever called the mock chose the path, headers and body. The unmatched
+     one below is deliberately hostile so the escaping is visible in the
+     prototype rather than assumed. */
+  const REQUESTS = [
+    { id: "r-8814", t: "14:22:07.412", method: "POST", path: "/v1/payments/authorize", status: 200, ms: 4,
+      stub: 2, port: 6001,
+      headers: 'content-type: application/json\nidempotency-key: 8f2c-4a1b\nuser-agent: acme-checkout/3.1',
+      body: '{\n  "amount": 4200,\n  "currency": "GBP",\n  "card": "tok_visa"\n}',
+      matched: true, why: ['method equals <code>POST</code>', 'path equals <code>/v1/payments/authorize</code>', 'body matches jsonpath <code>$.currency</code>'] },
+    { id: "r-8813", t: "14:22:06.980", method: "GET", path: "/v1/payments/pi_3Nx8/status", status: 200, ms: 2,
+      stub: 0, port: 6001,
+      headers: 'accept: application/json\nuser-agent: acme-checkout/3.1',
+      body: "", matched: true, why: ['method equals <code>GET</code>', 'path matches <code>/v1/payments/*/status</code>'] },
+    { id: "r-8812", t: "14:22:04.118", method: "POST", path: '/v1/payments/<script>alert("xss")</script>', status: 404, ms: 1,
+      stub: null, port: 6001,
+      headers: 'content-type: text/plain\nx-forwarded-for: 203.0.113.9\nuser-agent: <img src=x onerror=alert(1)>',
+      body: '<not json>\n"unterminated',
+      matched: false,
+      why: ['stub 0 — path predicate <code>/v1/payments/*/status</code> did not match',
+            'stub 1 — method predicate expected <code>GET</code>, saw <code>POST</code>',
+            'stub 2 — path predicate expected <code>/v1/payments/authorize</code>',
+            'no remaining stubs; the imposter answered its default 404'] },
+    { id: "r-8811", t: "14:21:58.733", method: "DELETE", path: "/v1/payments/pi_3Nx8", status: 405, ms: 1,
+      stub: null, port: 6001,
+      headers: 'user-agent: curl/8.4.0',
+      body: "", matched: false,
+      why: ['no stub declares <code>DELETE</code> on this imposter'] },
+    { id: "r-8810", t: "14:21:52.004", method: "POST", path: "/v1/payments/authorize", status: 500, ms: 61,
+      stub: 3, port: 6001,
+      headers: 'content-type: application/json\nuser-agent: acme-checkout/3.1',
+      body: '{\n  "amount": -1\n}',
+      matched: true, why: ['method equals <code>POST</code>', 'path equals <code>/v1/payments/authorize</code>', 'stub 3 is a fault injection returning 500'] }
+  ];
+
+  /* Real Route shape: RouteTable { routes: [ { id, priority, match:{host?,
+     pathPrefix?, headers[], method?}, target:{port, stripPrefix, setHost?},
+     enabled } ] } — vendor/rift/.../front_door/route_table.rs. */
+  const ROUTES = [
+    { id: "payments-v2",   priority: 20, enabled: true,  host: "payments.test",   pathPrefix: "/v2",  headers: [], method: null,   port: 6001, stripPrefix: true  },
+    { id: "payments-v1",   priority: 20, enabled: true,  host: "payments.test",   pathPrefix: "/v1",  headers: [], method: null,   port: 6002, stripPrefix: false },
+    { id: "partner-wild",  priority: 10, enabled: true,  host: "*.partner.test",  pathPrefix: null,   headers: [{ name: "x-partner", value: "acme" }], method: null, port: 6003, stripPrefix: false },
+    { id: "identity-post", priority: 10, enabled: true,  host: null,              pathPrefix: "/oauth", headers: [], method: "POST", port: 6004, stripPrefix: false },
+    { id: "catch-all",     priority: 0,  enabled: true,  host: null,              pathPrefix: null,   headers: [], method: null,   port: 6005, stripPrefix: false },
+    { id: "legacy-soap",   priority: 30, enabled: false, host: "soap.test",       pathPrefix: null,   headers: [], method: null,   port: 6006, stripPrefix: false }
+  ];
+
+  /* Two audit fixtures worth having: an applied write and a quota refusal,
+     because a refusal being a *committed decision* is the surprising part of
+     RFC-002 T4 and the viewer has to show it as a row, not hide it. */
+  const AUDIT = [
+    { revision: 1284, action: "imposter.write", resource: "6001",  tenant: "acme",    principal: "ci@acme",       outcome: "applied", ts: "17:42:09" },
+    { revision: 1283, action: "tenant.manage",  resource: "ci@acme", tenant: "acme",  principal: "ops@achird",    outcome: "applied", ts: "17:41:55" },
+    { revision: 1282, action: "imposter.write", resource: "6099",  tenant: "acme",    principal: "ci@acme",       outcome: "refused", ts: "17:40:12", reason: "quota: imposters 24/24" },
+    { revision: 1281, action: "audit.read",     resource: "*",     tenant: "acme",    principal: "auditor@acme",  outcome: "applied", ts: "17:38:41" },
+    { revision: 1280, action: "cluster.admin",  resource: "sink",  tenant: "*",       principal: "ops@achird",    outcome: "applied", ts: "17:31:02" }
+  ];
+
+  const PRINCIPALS = [
+    { id: "ci@acme",       display: "CI pipeline",   role: "editor",       disabled: false, created: "2026-06-02" },
+    { id: "auditor@acme",  display: "Compliance",    role: "tenant-admin", disabled: false, created: "2026-06-14" },
+    { id: "readonly@acme", display: "Dashboards",    role: "viewer",       disabled: false, created: "2026-07-01" },
+    { id: "old-runner",    display: "Retired runner", role: "editor",      disabled: true,  created: "2026-02-11" }
+  ];
+
+  /* RFC-002 §4.2, as authz.rs::role_allows spells it — a strict superset
+     ladder. Rendered as a matrix because that is the artefact a security
+     reviewer reads, and authz.rs is written as explicit per-role arms for
+     exactly that reason. */
+  const ACTIONS = ["imposter.read", "imposter.write", "lifecycle.toggle", "verify.run", "tenant.manage", "audit.read", "cluster.admin"];
+  const LADDER = ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"];
+  const GRANTS = {
+    "viewer":       ["imposter.read"],
+    "operator":     ["imposter.read", "lifecycle.toggle"],
+    "editor":       ["imposter.read", "lifecycle.toggle", "imposter.write", "verify.run"],
+    "tenant-admin": ["imposter.read", "lifecycle.toggle", "imposter.write", "verify.run", "tenant.manage", "audit.read"],
+    "fleet-admin":  ACTIONS.slice()
+  };
+
+  const ROLES = {
+    "fleet-admin": { id: "ops@achird",     label: "FleetAdmin · fleet scope", initials: "FA", write: true,  fleet: true  },
+    "editor":      { id: "ci@acme",        label: "Editor · acme",            initials: "ED", write: true,  fleet: false },
+    "viewer":      { id: "readonly@acme",  label: "Viewer · acme",            initials: "VW", write: false, fleet: false }
+  };
+
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+  function longName(i) {
+    const stems = ["checkout-orchestrator", "fraud-scoring-engine", "partner-settlement-bridge", "notification-fanout"];
+    return `${stems[i % stems.length]}-regional-failover-${String(i).padStart(3, "0")}`;
+  }
+
+  /* Memoized: the overflow set has to be the SAME array across renders, or a
+     toggle would mutate a throwaway copy and appear not to work. */
+  let OVERFLOW = null;
+  function imposters() {
+    if (state.data === "empty") return [];
+    if (state.data === "overflow") {
+      if (!OVERFLOW) OVERFLOW = Array.from({ length: 200 }, (_, i) => ({
+        port: 6100 + i,
+        name: longName(i),
+        protocol: i % 7 === 0 ? "https" : "http",
+        enabled: i % 11 !== 0,
+        requests: Math.max(0, 5200 - i * 26),
+        stubs: 1 + (i % 9)
+      }));
+      return OVERFLOW;
+    }
+    return BASE_IMPOSTERS;
+  }
+
+  function fleet() {
+    if (state.fleet === "single") return { nodes: [{ ...NODES[0], mIdx: 1 }], reachable: 1, total: 1, quorum: true };
+    if (state.fleet === "degraded") {
+      const nodes = NODES.map((n, i) => i === 2 ? { ...n, unreachable: true, ready: false, applied: null } : n);
+      return { nodes, reachable: 2, total: 3, quorum: true };
+    }
+    return { nodes: NODES.map(n => ({ ...n })), reachable: 3, total: 3, quorum: true };
+  }
+
+  const pill = (kind, glyph, text) => `<span class="pill ${kind}"><span class="g" aria-hidden="true">${glyph}</span>${esc(text)}</span>`;
+
+  /* Status is glyph shape + colour + word. Never colour alone. */
+  function nodePill(n) {
+    if (n.unreachable) return pill("crit", "■", "Unreachable");
+    if (!n.ready)      return pill("warn", "▲", "Not ready");
+    return n.leader ? pill("good", "●", "Leader") : pill("good", "●", "Follower");
+  }
+
+  function fleetScreen() {
+    const f = fleet();
+    const partial = f.reachable < f.total;
+    const missing = f.nodes.filter(n => n.unreachable).map(n => n.name);
+
+    const banner = partial
+      ? `<div class="banner warn" role="status">
+           <span class="b-glyph" aria-hidden="true">▲</span>
+           <div><strong>Partial fleet view — ${f.reachable} of ${f.total} nodes answered.</strong>
+             <p>No answer from <code>${missing.map(esc).join("</code>, <code>")}</code>. Quorum is intact, so writes still commit; the figures below describe only the nodes that replied and may lag the fleet. This screen does not merge node views — that arrives with the verification plane (#147).</p>
+           </div>
+         </div>`
+      : state.fleet === "single"
+        ? `<div class="banner info" role="status">
+             <span class="b-glyph" aria-hidden="true">◈</span>
+             <div><strong>Single-node fleet.</strong>
+               <p>One voter, so every write is trivially quorate and there is no follower to lag. Ring epoch stays at <code>1</code>.</p>
+             </div>
+           </div>`
+        : "";
+
+    const applied = f.nodes.filter(n => n.applied != null).map(n => n.applied);
+    const spread = applied.length > 1 ? Math.max(...applied) - Math.min(...applied) : 0;
+    const leader = f.nodes.find(n => n.leader);
+
+    const tiles = `
+      <div class="tiles">
+        <div class="tile is-good">
+          <span class="eyebrow">Quorum</span>
+          <span class="v">${f.reachable}<small> / ${f.total}</small></span>
+          <span class="note">${f.quorum ? "Writes commit" : "Writes park"}</span>
+        </div>
+        <div class="tile is-good">
+          <span class="eyebrow">Leader</span>
+          <span class="v" style="font-size:19px">${leader ? esc(leader.name) : "—"}</span>
+          <span class="note">${leader ? esc(leader.addr) : "no leader"}</span>
+        </div>
+        <div class="tile">
+          <span class="eyebrow">Ring epoch</span>
+          <span class="v">${esc(String(f.nodes[0].mIdx))}</span>
+          <span class="note">membership index</span>
+        </div>
+        <div class="tile ${partial ? "is-warn" : spread > 0 ? "is-warn" : "is-good"}">
+          <span class="eyebrow">Applied spread</span>
+          <span class="v">${partial ? "—" : spread}</span>
+          <span class="note">${partial ? `unknown for ${missing.length} node${missing.length > 1 ? "s" : ""}` : spread === 0 ? "all nodes level" : "revisions behind"}</span>
+        </div>
+        <div class="tile">
+          <span class="eyebrow">Pending ops</span>
+          <span class="v">0</span>
+          <span class="note">nothing parked</span>
+        </div>
+      </div>`;
+
+    const rows = f.nodes.map(n => `
+      <tr>
+        <td><div class="id-cell"><span class="name mono">${esc(n.name)}</span><span class="meta">${esc(n.addr)}</span></div></td>
+        <td>${nodePill(n)}</td>
+        <td class="r num">${n.applied == null ? '<span class="readonly-hint">unknown</span>' : esc(String(n.applied))}</td>
+        <td class="r num">${esc(String(n.mIdx))}</td>
+      </tr>`).join("");
+
+    return `
+      <div class="page-head">
+        <div>
+          <h1>Cluster &amp; fleet</h1>
+          <div class="sub">Read-only projection of the operator surface, served on the admin port.</div>
+        </div>
+        <div class="spacer"></div>
+        <span class="readonly-hint">GET /_fleet/members · GET /_fleet/health</span>
+      </div>
+      ${banner}
+      ${tiles}
+      <div class="card">
+        <div class="card-head"><h2>Members</h2><div class="spacer"></div>
+          <span class="readonly-hint">refreshes every 5s while visible</span></div>
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>Node</th><th>State</th><th class="r">Applied</th><th class="r">Ring</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+      <p class="hint">The cluster port's <code>/_cluster/*</code> is unchanged and still requires the HMAC credential. Comparing node against node — its actual purpose — still means asking each node directly; this projection deliberately does not do that for you.</p>`;
+  }
+
+  function impostersScreen() {
+    const list = imposters();
+    const f = fleet();
+    const partial = f.reachable < f.total;
+    const canWrite = ROLES[state.role].write;
+
+    if (list.length === 0) {
+      const body = partial
+        ? `<div class="empty">
+             <span class="mark" aria-hidden="true">▲</span>
+             <h3>Cannot confirm this tenant is empty</h3>
+             <p>${f.reachable} of ${f.total} nodes answered, and an imposter configured on a node that did not reply would not appear here. This is not the same as having none.</p>
+           </div>`
+        : `<div class="empty">
+             <span class="mark" aria-hidden="true">▤</span>
+             <h3>No imposters in <code>${esc(state.tenant)}</code></h3>
+             <p>An imposter is a mock listening on its own port. Every node in the fleet will serve it once the write commits.</p>
+             <pre>curl -X POST $ADMIN/imposters \\
+  -H "authorization: $KEY" \\
+  -H "X-Rift-Tenant: ${esc(state.tenant)}" \\
+  -d '{"port":6001,"protocol":"http","stubs":[…]}'</pre>
+           </div>`;
+      return `
+        <div class="page-head">
+          <div><h1>Imposters</h1><div class="sub">Mocks in <code>${esc(state.tenant)}</code>.</div></div>
+          <div class="spacer"></div>
+          ${canWrite ? '<button class="btn primary" type="button">New imposter</button>' : '<span class="readonly-hint">read-only — Viewer holds no imposter.write</span>'}
+        </div>
+        <div class="card">${body}</div>`;
+    }
+
+    /* Search, filter and sort: with 200 imposters a plain list is unusable,
+       and this is the screen an operator lands on first. */
+    const q = state.q.trim().toLowerCase();
+    let filtered = list.filter(i =>
+      (!q || i.name.toLowerCase().includes(q) || String(i.port).includes(q))
+      && (state.methodFilter === "all" || i.protocol === state.methodFilter));
+    filtered = filtered.slice().sort((a, b) =>
+      state.sort === "port" ? a.port - b.port
+      : state.sort === "name" ? a.name.localeCompare(b.name)
+      : b.requests - a.requests);
+
+    const shown = filtered.slice(0, 12);
+    const sel = list.find(i => i.port === state.selected) || null;
+    const picked = [...state.picked].filter(p => filtered.some(i => i.port === p));
+
+    const toolbar = `
+      <div class="toolbar">
+        <label class="search">
+          <span class="si" aria-hidden="true">⌕</span>
+          <input id="imp-q" type="search" value="${esc(state.q)}" placeholder="name or port" aria-label="Search imposters">
+        </label>
+        <span class="filters">
+          <select id="imp-proto" aria-label="Protocol filter">
+            <option value="all"${state.methodFilter === "all" ? " selected" : ""}>All protocols</option>
+            <option value="http"${state.methodFilter === "http" ? " selected" : ""}>http</option>
+            <option value="https"${state.methodFilter === "https" ? " selected" : ""}>https</option>
+          </select>
+          <select id="imp-sort" aria-label="Sort by">
+            <option value="requests"${state.sort === "requests" ? " selected" : ""}>Most requests</option>
+            <option value="port"${state.sort === "port" ? " selected" : ""}>Port</option>
+            <option value="name"${state.sort === "name" ? " selected" : ""}>Name</option>
+          </select>
+        </span>
+        <span class="right"><span class="readonly-hint">${filtered.length.toLocaleString("en-US")} of ${list.length.toLocaleString("en-US")}</span></span>
+      </div>`;
+
+    const bulkbar = picked.length && canWrite ? `
+      <div class="bulkbar" role="status">
+        <b>${picked.length}</b> selected
+        <span class="right">
+          <button class="btn sm" type="button" data-bulk="enable">Enable</button>
+          <button class="btn sm" type="button" data-bulk="disable">Disable</button>
+          <button class="btn sm" type="button" data-bulk="delete">Delete…</button>
+          <button class="btn sm" type="button" data-bulk="clear">Clear</button>
+        </span>
+      </div>` : "";
+
+    const rows = shown.map(i => `
+      <tr${i.port === state.selected ? ' aria-selected="true"' : ""}>
+        ${canWrite ? `<td class="cb"><input type="checkbox" data-pick="${i.port}"${state.picked.has(i.port) ? " checked" : ""} aria-label="Select ${esc(i.name)}"></td>` : ""}
+        <td class="port">${esc(String(i.port))}</td>
+        <td>
+          <div class="id-cell">
+            <span class="name" title="${esc(i.name)}">${esc(i.name)}</span>
+            <span class="meta">${esc(i.protocol)} · ${i.stubs} stub${i.stubs === 1 ? "" : "s"}</span>
+          </div>
+        </td>
+        <td>${i.enabled ? pill("good", "●", "Serving") : pill("idle", "○", "Disabled")}</td>
+        <td class="r num">${i.requests.toLocaleString("en-US")}</td>
+        <td class="r">
+          <button class="btn sm" type="button" data-inspect="${i.port}">Inspect</button>
+          ${canWrite ? `<button class="btn sm" type="button" data-toggle="${i.port}">${i.enabled ? "Disable" : "Enable"}</button>
+          <button class="btn sm" type="button" data-del="${i.port}">Delete</button>` : ""}
+        </td>
+      </tr>`).join("");
+
+    const truncated = filtered.length > shown.length
+      ? `<div class="card-body" style="border-top:1px solid var(--line)">
+           <span class="readonly-hint">Showing ${shown.length} of ${filtered.length.toLocaleString("en-US")} matching — the real screen virtualizes; a busy tenant has thousands.</span>
+         </div>`
+      : "";
+
+    /* Magnitude by identity: single series, so one hue and no legend —
+       the title names it. Direct labels on every bar because there are few. */
+    const top = [...list].sort((a, b) => b.requests - a.requests).slice(0, 6);
+    const max = Math.max(...top.map(i => i.requests), 1);
+    const bars = top.map(i => `
+      <div class="bar-row" title="${esc(i.name)} — ${i.requests.toLocaleString("en-US")} requests">
+        <span class="lab">${esc(i.name)}</span>
+        <span class="track"><span class="fill" style="width:${Math.max(2, (i.requests / max) * 100)}%"></span></span>
+        <span class="val">${i.requests.toLocaleString("en-US")}</span>
+      </div>`).join("");
+
+    const detail = sel ? `
+      <div class="card">
+        <div class="card-head"><h2>Imposter <code>${esc(String(sel.port))}</code></h2>
+          <div class="spacer"></div>
+          <span class="readonly-hint">GET /imposters/${esc(String(sel.port))}</span>
+        </div>
+        <div class="card-body detail">
+          <dl class="kv"><dt>Name</dt><dd>${esc(sel.name)}</dd></dl>
+          <dl class="kv"><dt>Port</dt><dd>${esc(String(sel.port))}</dd></dl>
+          <dl class="kv"><dt>Protocol</dt><dd>${esc(sel.protocol)}</dd></dl>
+          <dl class="kv"><dt>Stubs</dt><dd>${sel.stubs}</dd></dl>
+          <dl class="kv"><dt>Requests recorded</dt><dd>${sel.requests.toLocaleString("en-US")}</dd></dl>
+          <dl class="kv"><dt>Owning tenant</dt><dd>${esc(state.tenant)}</dd></dl>
+        </div>
+      </div>` : "";
+
+    return `
+      <div class="page-head">
+        <div><h1>Imposters</h1><div class="sub">Mocks in <code>${esc(state.tenant)}</code>.</div></div>
+        <div class="spacer"></div>
+        ${canWrite
+          ? '<button class="btn primary" type="button">New imposter</button>'
+          : '<span class="readonly-hint">read-only — Viewer holds no imposter.write</span>'}
+      </div>
+      ${partial ? `<div class="banner warn" role="status">
+          <span class="b-glyph" aria-hidden="true">▲</span>
+          <div><strong>${f.reachable} of ${f.total} nodes answered.</strong>
+            <p>This list is the replicated set as the responding nodes see it. Request counts are per-node and are not fleet totals.</p></div>
+        </div>` : ""}
+      <div class="card">
+        <div class="card-head"><h2>Configured</h2><div class="spacer"></div>
+          <span class="readonly-hint">refreshes every 5s while visible</span></div>
+        ${toolbar}
+        ${bulkbar}
+        <div class="scroll-x">
+          <table>
+            <thead><tr>${canWrite ? '<th class="cb"><input type="checkbox" id="pick-all" aria-label="Select all shown"></th>' : ""}<th>Port</th><th>Imposter</th><th>State</th><th class="r">Requests</th><th class="r">Actions</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        ${truncated}
+      </div>
+      ${filtered.length === 0 ? `<div class="card"><div class="empty">
+        <span class="mark" aria-hidden="true">⌕</span>
+        <h3>Nothing matches <code>${esc(state.q)}</code></h3>
+        <p>${list.length.toLocaleString("en-US")} imposters exist in this tenant. Clear the search to see them.</p>
+      </div></div>` : ""}
+      ${detail}
+      <div class="card">
+        <div class="card-head"><h2>Busiest imposters</h2><div class="spacer"></div>
+          <span class="readonly-hint">numberOfRequests, this node</span></div>
+        <div class="card-body">
+          <div class="bars">${bars}</div>
+          <p class="hint" style="margin-top:14px">Point-in-time counts from the imposter body, on the node that answered — not a fleet total and not a time series. A per-node count presented as a fleet figure is the failure mode the request-log screen (#189) has to label rather than hide.</p>
+        </div>
+      </div>`;
+  }
+
+  function requestsScreen() {
+    const f = fleet();
+    const nodes = f.nodes;
+    const scoped = nodes.find(n => n.name === state.scopeNode) || nodes[0];
+    const others = nodes.filter(n => n.name !== scoped.name);
+    const unreachable = !!scoped.unreachable;
+
+    /* Scope selector — always visible, never collapsible. Per-node is the
+       fact this screen has to keep in front of the reader. */
+    const scope = `
+      <div class="scope">
+        <span class="eyebrow">Showing</span>
+        <span class="seg" id="seg-node" role="group" aria-label="Node in scope">
+          ${nodes.map(n => `<button data-v="${esc(n.name)}" aria-pressed="${n.name === scoped.name}">${esc(n.name)}${n.unreachable ? " ·" : ""}</button>`).join("")}
+        </span>
+        <span class="coverage">
+          One node's traffic — <b>${esc(scoped.name)}</b>.
+          ${others.length ? `<b>${others.length}</b> other node${others.length > 1 ? "s" : ""} not represented.` : "This fleet has one node, so this is the whole fleet."}
+        </span>
+      </div>`;
+
+    const banner = others.length
+      ? `<div class="banner warn" role="status">
+           <span class="b-glyph" aria-hidden="true">▲</span>
+           <div><strong>Per-node view — not the fleet.</strong>
+             <p>A request served by <code>${others.map(n => esc(n.name)).join("</code> or <code>")}</code> does not appear here, and this fleet has no merged journal yet. If a call is missing, check the other nodes before concluding it never arrived. The fleet-merged log arrives with the verification plane (#147); this screen keeps its shape and drops the label.</p>
+           </div>
+         </div>`
+      : "";
+
+    if (unreachable) {
+      return `
+        <div class="page-head">
+          <div><h1>Request log</h1><div class="sub">Recorded requests and match diagnostics.</div></div>
+        </div>
+        ${scope}
+        <div class="card">
+          <div class="empty">
+            <span class="mark" aria-hidden="true">■</span>
+            <h3><code>${esc(scoped.name)}</code> did not answer</h3>
+            <p>This is <em>not</em> an empty log. The node is unreachable, so its recorded requests are unknown — a request it served would be invisible here. Pick another node, or wait for it to return.</p>
+          </div>
+        </div>`;
+    }
+
+    if (state.data === "empty") {
+      return `
+        <div class="page-head">
+          <div><h1>Request log</h1><div class="sub">Recorded requests and match diagnostics.</div></div>
+        </div>
+        ${scope}
+        ${banner}
+        <div class="card">
+          <div class="empty">
+            <span class="mark" aria-hidden="true">▤</span>
+            <h3><code>${esc(scoped.name)}</code> has recorded nothing</h3>
+            <p>The node answered, and its log is genuinely empty — no request has reached this imposter on this node. That is a different fact from a node that could not be asked.</p>
+            <pre>curl $DATA_PLANE/v1/payments/authorize -d '{"amount":4200}'</pre>
+          </div>
+        </div>`;
+    }
+
+    const total = state.data === "overflow" ? 12480 : REQUESTS.length;
+    const sel = REQUESTS.find(r => r.id === state.selectedReq) || null;
+
+    const rows = REQUESTS.map(r => `
+      <tr class="clickable" data-req="${esc(r.id)}" aria-selected="${r.id === (sel && sel.id)}">
+        <td class="num" style="white-space:nowrap">${esc(r.t)}</td>
+        <td><span class="method ${esc(r.method.toLowerCase())}">${esc(r.method)}</span></td>
+        <td><span class="path" title="${esc(r.path)}">${esc(r.path)}</span></td>
+        <td><span class="status-code s${String(r.status)[0]}">${esc(String(r.status))}</span></td>
+        <td>${r.matched
+              ? pill("good", "●", `stub ${r.stub}`)
+              : pill("warn", "▲", "no match")}</td>
+        <td class="r num">${esc(String(r.ms))} ms</td>
+      </tr>`).join("");
+
+    const detail = sel ? `
+      <div class="card">
+        <div class="card-head">
+          <h2>${esc(sel.method)} <code>${esc(sel.id)}</code></h2>
+          <div class="spacer"></div>
+          <span class="readonly-hint">${esc(scoped.name)} · port ${esc(String(sel.port))}</span>
+        </div>
+        <div class="card-body section-stack">
+          <div class="diag ${sel.matched ? "matched" : "unmatched"}">
+            <div class="dh"><span aria-hidden="true">${sel.matched ? "●" : "▲"}</span>
+              ${sel.matched ? `Matched stub ${esc(String(sel.stub))}` : "No stub matched"}</div>
+            <ul>${sel.why.map(w => `<li>${w}</li>`).join("")}</ul>
+          </div>
+          <div>
+            <div class="eyebrow" style="margin-bottom:6px">Request path</div>
+            <pre class="payload">${esc(sel.path)}</pre>
+          </div>
+          <div>
+            <div class="eyebrow" style="margin-bottom:6px">Headers</div>
+            <pre class="payload">${esc(sel.headers)}</pre>
+          </div>
+          <div>
+            <div class="eyebrow" style="margin-bottom:6px">Body</div>
+            <pre class="payload">${sel.body ? esc(sel.body) : "(empty)"}</pre>
+          </div>
+        </div>
+      </div>` : `
+      <div class="card">
+        <div class="card-body">
+          <p class="hint" style="margin:0">Select a request to see why it matched — or why it did not. The unmatched rows are the ones worth opening: they list each stub that was tried and the predicate that rejected it.</p>
+        </div>
+      </div>`;
+
+    return `
+      <div class="page-head">
+        <div><h1>Request log</h1><div class="sub">Recorded requests and match diagnostics for <code>payments-api-sandbox</code>.</div></div>
+        <div class="spacer"></div>
+        <span class="readonly-hint">GET /imposters/6001/requests · refreshes every 2s</span>
+      </div>
+      ${scope}
+      ${banner}
+      <div class="log-grid ${sel ? "has-sel" : ""}">
+        <div class="card">
+          <div class="card-head"><h2>Requests</h2><div class="spacer"></div>
+            ${ROLES[state.role].write ? '<button class="btn sm" type="button">Clear log</button>' : '<span class="readonly-hint">read-only</span>'}
+          </div>
+          <div class="scroll-x">
+            <table>
+              <thead><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Match</th><th class="r">Latency</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+          <div class="pager">
+            <button class="btn sm" type="button" disabled>Newer</button>
+            <button class="btn sm" type="button" ${total > REQUESTS.length ? "" : "disabled"}>Older</button>
+            <span class="count">${REQUESTS.length} of ${total.toLocaleString("en-US")} on this node</span>
+          </div>
+        </div>
+        ${detail}
+      </div>
+      <p class="hint">Payloads are rendered as text, never as markup — this is the most attacker-influenced surface in the console, since whatever called the mock chose the path, headers and body. Row <code>r-8812</code> carries a script tag and an <code>onerror</code> attribute on purpose.</p>`;
+  }
+
+  /* ── Front-door routes (C6, second half) ──────────────────────────────*/
+
+  const hostRank = r => r.host == null ? 2 : r.host.startsWith("*.") ? 1 : 0;
+
+  function effectiveOrder(routes) {
+    return routes.filter(r => r.enabled).slice().sort((a, b) =>
+      (b.priority - a.priority)
+      || (hostRank(a) - hostRank(b))
+      || ((b.pathPrefix ? b.pathPrefix.length : 0) - (a.pathPrefix ? a.pathPrefix.length : 0))
+      || (b.headers.length - a.headers.length)
+      || a.id.localeCompare(b.id));
+  }
+
+  /* Mirrors RouteTable::validate / Route::validate: strip-without-prefix,
+     malformed host, and ambiguity between two enabled routes that can both
+     win. The server rejects these, so the editor must surface them BEFORE the
+     whole-table PUT rather than after. */
+  function routeProblems(routes) {
+    const out = [];
+    for (const r of routes) {
+      if (r.stripPrefix && !r.pathPrefix)
+        out.push({ kind: "StripWithoutPrefix", text: `<code>${esc(r.id)}</code> sets <code>stripPrefix</code> with no <code>pathPrefix</code> to strip.` });
+      if (r.host) {
+        const rest = r.host.startsWith("*.") ? r.host.slice(2) : r.host;
+        if (rest.includes("*") || rest === "")
+          out.push({ kind: "MalformedHost", text: `<code>${esc(r.id)}</code> host <code>${esc(r.host)}</code> — at most one leading <code>*.</code> label is allowed.` });
+      }
+    }
+    const enabled = routes.filter(r => r.enabled);
+    for (let i = 0; i < enabled.length; i++)
+      for (let j = i + 1; j < enabled.length; j++) {
+        const a = enabled[i], b = enabled[j];
+        const same = a.priority === b.priority
+          && (a.host || "") === (b.host || "")
+          && (a.pathPrefix || "") === (b.pathPrefix || "")
+          && (a.method || "") === (b.method || "")
+          && a.headers.length === b.headers.length;
+        if (same)
+          out.push({ kind: "AmbiguousMatch", text: `<code>${esc(a.id)}</code> and <code>${esc(b.id)}</code> match identically at the same priority — the server refuses the table rather than picking one.` });
+      }
+    return out;
+  }
+
+  function routesScreen() {
+    const canWrite = ROLES[state.role].write;
+    const routes = ROUTES;
+    const order = effectiveOrder(routes);
+    const disabled = routes.filter(r => !r.enabled);
+    const problems = routeProblems(routes);
+
+    const clauses = r => {
+      const c = [];
+      if (r.host) c.push(`host ${r.host}`);
+      if (r.pathPrefix) c.push(`path ${r.pathPrefix}*`);
+      if (r.method) c.push(`method ${r.method}`);
+      r.headers.forEach(h => c.push(`${h.name}: ${h.value}`));
+      return c.length
+        ? c.map(x => `<span class="clause">${esc(x)}</span>`).join("")
+        : `<span class="clause any">matches everything</span>`;
+    };
+
+    const row = (r, rank) => `
+      <tr>
+        <td><span class="order-rank ${rank == null ? "off" : ""}">${rank == null ? "—" : rank}</span></td>
+        <td><div class="id-cell"><span class="name mono">${esc(r.id)}</span>
+          <span class="meta">priority ${esc(String(r.priority))}</span></div></td>
+        <td><div class="match-clauses">${clauses(r)}</div></td>
+        <td class="num">→ ${esc(String(r.port))}${r.stripPrefix ? ' <span class="clause">strip</span>' : ""}</td>
+        <td>${r.enabled ? pill("good", "●", "Enabled") : pill("idle", "○", "Disabled")}</td>
+        <td class="r">${canWrite
+            ? `<button class="btn sm" type="button">Edit</button> <button class="btn sm" type="button">Delete</button>`
+            : '<span class="readonly-hint">read-only</span>'}</td>
+      </tr>`;
+
+    const rows = order.map((r, i) => row(r, i + 1)).join("") + disabled.map(r => row(r, null)).join("");
+
+    return `
+      <div class="page-head">
+        <div><h1>Front-door routes</h1>
+          <div class="sub">One table, replicated. The front door dispatches host/path to an imposter port.</div></div>
+        <div class="spacer"></div>
+        <span class="readonly-hint">GET · PUT /front-door/routes</span>
+      </div>
+
+      ${problems.length ? `
+        <div class="banner crit" role="alert">
+          <span class="b-glyph" aria-hidden="true">■</span>
+          <div><strong>${problems.length} problem${problems.length > 1 ? "s" : ""} — the server will refuse this table.</strong>
+            <ul style="margin:6px 0 0;padding-left:18px;display:flex;flex-direction:column;gap:4px">
+              ${problems.map(p => `<li><code>${esc(p.kind)}</code> — ${p.text}</li>`).join("")}
+            </ul>
+          </div>
+        </div>` : `
+        <div class="banner info" role="status">
+          <span class="b-glyph" aria-hidden="true">●</span>
+          <div><strong>Table validates.</strong>
+            <p>No ambiguous pair, no <code>stripPrefix</code> without a prefix, no malformed host. Checked here before the write, because the server refuses the whole table rather than repairing it.</p></div>
+        </div>`}
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Effective order</h2>
+          <div class="spacer"></div>
+          <span class="readonly-hint">loaded at rev 1284</span>
+          ${canWrite ? '<button class="btn primary" type="button">Save table</button>' : ""}
+        </div>
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>#</th><th>Route</th><th>Matches</th><th>Target</th><th>State</th><th class="r">Actions</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Why this order</h2></div>
+        <div class="card-body">
+          <ol class="tiebreak">
+            <li><b>Priority</b>, descending — the only knob you set directly.</li>
+            <li><b>Host specificity</b> — exact host, then one-label wildcard (<code>*.x</code>), then no host clause.</li>
+            <li><b>Path prefix length</b>, descending — <code>/v2</code> before <code>/</code>. Prefixes are segment-aligned: <code>/api/v1</code> matches <code>/api/v1/x</code> but never <code>/api/v1x</code>.</li>
+            <li><b>Header clause count</b>, descending — more clauses is more specific.</li>
+            <li><b>Route id</b>, as a last resort so the order is total.</li>
+          </ol>
+          <p class="hint" style="margin-top:12px">This list is the <em>effective</em> order, not the authoring order — <code>effective_order()</code> is independent of input order, so a table showing the order you typed would be showing something that decides nothing. Disabled routes are excluded from dispatch entirely and shown with <code>—</code>.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Saving replaces the whole table</h2></div>
+        <div class="card-body section-stack">
+          <div class="lint warn">
+            <span class="lg" aria-hidden="true">▲</span>
+            <div><b>PUT /front-door/routes</b> replaces every route; <b>DELETE /front-door/routes/:id</b> removes one.
+              A whole-table write from a long-open editor is a lost-update waiting to happen: if the
+              table moved since <code>rev 1284</code>, saving would silently discard whatever changed.
+              The editor loads a revision, sends it back, and on a mismatch shows the refresh-and-reapply
+              path rather than overwriting — the same discipline as C5's <code>If-Match</code> 409 rebase (#188).</div>
+          </div>
+          <p class="hint" style="margin:0">Deleting one route is the safe operation and should be preferred over a table replace when that is what the user meant.</p>
+        </div>
+      </div>`;
+  }
+
+  /* ── Stub editor (C5) ─────────────────────────────────────────────────*/
+
+  const STUB_SIMPLE = {
+    predicates: [{ equals: { path: "/v1/payments/authorize", method: "POST" } }],
+    responses: [{ is: { statusCode: 200, headers: { "content-type": "application/json" }, body: '{"status":"authorized"}' } }]
+  };
+  const STUB_UNMODELLED = {
+    id: "auth-happy",
+    scenarioName: "checkout",
+    requiredScenarioState: "cart-filled",
+    newScenarioState: "authorized",
+    space: "tenant-acme-run-42",
+    predicates: [{ equals: { path: "/v1/payments/authorize" } }],
+    responses: [{ is: { statusCode: 200, body: "ok" }, behaviors: { wait: 120 } }]
+  };
+
+  function jsonBlock(obj, errLine) {
+    const lines = JSON.stringify(obj, null, 2).split("\n");
+    return `<pre class="code-surface">${lines.map((l, i) => {
+      const painted = esc(l)
+        .replace(/&quot;([^&]*?)&quot;(\s*:)/g, '<span class="tok-key">&quot;$1&quot;</span>$2')
+        .replace(/:\s&quot;(.*?)&quot;/g, ': <span class="tok-str">&quot;$1&quot;</span>')
+        .replace(/:\s(\d+)/g, ': <span class="tok-num">$1</span>');
+      return `<span class="ln${errLine === i + 1 ? " err" : ""}"><i>${i + 1}</i><span>${painted}</span></span>`;
+    }).join("")}</pre>`;
+  }
+
+  function stubScreen() {
+    const canWrite = ROLES[state.role].write;
+    const mode = state.stubCase;
+    const raw = mode === "unmodelled";
+    const stub = raw ? STUB_UNMODELLED : STUB_SIMPLE;
+
+    const caseSeg = `
+      <div class="scope">
+        <span class="proto-tag">Prototype state</span>
+        <span class="seg" id="seg-stub" role="group" aria-label="Stub editor case">
+          <button data-v="simple" aria-pressed="${mode === "simple"}">Form-modelled</button>
+          <button data-v="unmodelled" aria-pressed="${mode === "unmodelled"}">Unknown keys</button>
+          <button data-v="conflict" aria-pressed="${mode === "conflict"}">409 conflict</button>
+        </span>
+        <span class="coverage">JSON is canonical. The form is a projection of it, and round-trips losslessly or refuses to open.</span>
+      </div>`;
+
+    if (mode === "conflict") {
+      return `
+        <div class="page-head">
+          <div><h1>Stub editor</h1><div class="sub">Imposter <code>6001</code> · stub <code>auth-happy</code></div></div>
+          <div class="spacer"></div><span class="readonly-hint">PUT /imposters/6001/stubs/auth-happy</span>
+        </div>
+        ${caseSeg}
+        <div class="banner crit" role="alert">
+          <span class="b-glyph" aria-hidden="true">■</span>
+          <div><strong>409 — this stub changed while you were editing.</strong>
+            <p>Your <code>If-Match</code> was <code>rev 1284</code>; the stub is now at <code>rev 1291</code>. Nothing has been written. Rebase your change onto the current version and save again — the console never auto-merges, and two humans editing one imposter get exactly the same treatment a lagging agent does.</p></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>What changed underneath</h2><div class="spacer"></div>
+            <span class="readonly-hint">rev 1284 → 1291</span></div>
+          <div class="card-body section-stack">
+            <div class="diff-row"><span class="side">yours</span><span class="mine">responses[0].is.statusCode: 200 → 201</span></div>
+            <div class="diff-row"><span class="side">theirs</span><span class="theirs">responses[0].is.body: "ok" → "{\\"status\\":\\"authorized\\"}"</span></div>
+            <p class="hint" style="margin:0">These two edits do not overlap, so re-applying yours is safe — but that is a judgement the person makes, not one the console makes for them.</p>
+            <div style="display:flex;gap:8px">
+              <button class="btn primary" type="button">Reapply my change on 1291</button>
+              <button class="btn" type="button">Discard mine and reload</button>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    const formPane = raw ? `
+      <div class="card">
+        <div class="card-head"><h2>Form</h2><div class="spacer"></div>${pill("warn", "▲", "unavailable")}</div>
+        <div class="card-body section-stack">
+          <div class="lint warn">
+            <span class="lg" aria-hidden="true">▲</span>
+            <div><b>Raw-only mode.</b> This stub uses keys the form does not model:
+              <code>space</code>, <code>requiredScenarioState</code>, <code>newScenarioState</code>,
+              <code>behaviors.wait</code>. Rather than drop them, the form refuses to open. Edit the
+              JSON directly — the config you save is the config you wrote.</div>
+          </div>
+          <p class="hint" style="margin:0">Which shapes get first-class controls is RFC-006 §12 Q2, still open: the proposal is the shapes <code>rift-tui</code>'s dialogs already model, then demand-driven. Silently dropping an unmodelled key is the one option that is not on the table.</p>
+        </div>
+      </div>` : `
+      <div class="card">
+        <div class="card-head"><h2>Form</h2><div class="spacer"></div>${pill("good", "●", "round-trips")}</div>
+        <div class="card-body section-stack">
+          <div class="field-row">
+            <div class="field"><label for="f-method">Method</label>
+              <select id="f-method"><option>POST</option><option>GET</option><option>PUT</option><option>DELETE</option></select></div>
+            <div class="field"><label for="f-path">Path equals</label>
+              <input id="f-path" value="/v1/payments/authorize"></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label for="f-status">Status code</label><input id="f-status" value="200"></div>
+            <div class="field"><label for="f-ctype">Content-Type</label><input id="f-ctype" value="application/json"></div>
+          </div>
+          <div class="field"><label for="f-body">Response body</label>
+            <textarea id="f-body">{"status":"authorized"}</textarea></div>
+        </div>
+      </div>`;
+
+    return `
+      <div class="page-head">
+        <div><h1>Stub editor</h1><div class="sub">Imposter <code>6001</code> · stub <code>${raw ? "auth-happy" : "0"}</code></div></div>
+        <div class="spacer"></div>
+        ${canWrite
+          ? '<button class="btn primary" type="button">Save stub</button>'
+          : '<span class="readonly-hint">read-only — Viewer holds no stub.write</span>'}
+      </div>
+      ${caseSeg}
+      <div class="editor-grid split">
+        ${formPane}
+        <div class="card">
+          <div class="card-head"><h2>JSON</h2><div class="spacer"></div>
+            <span class="readonly-hint">canonical</span></div>
+          <div class="card-body section-stack">
+            ${jsonBlock(stub)}
+            <div class="lint info">
+              <span class="lg" aria-hidden="true">●</span>
+              <div><b>rift-lint</b> ran in the browser (wasm) and found nothing. The server's
+                <code>validate_stub</code> is still the authority — a wasm gap is a cosmetic gap, not a
+                correctness one. Whether the dependency tree compiles to
+                <code>wasm32-unknown-unknown</code> is RFC-006 §12 Q1, and the documented fallback is a
+                dry-run lint endpoint added to the published schema.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="hint">Writes go by <b>id</b>, not index: <code>PUT /imposters/6001/stubs/auth-happy</code> with <code>If-Match</code>. Index edits are the documented lost-update window, and an editor a human leaves open for minutes is the worst possible client for them.</p>`;
+  }
+
+  /* ── Administration (C7) ──────────────────────────────────────────────*/
+
+  function adminScreen() {
+    const tab = state.adminTab;
+    const canManage = state.role === "fleet-admin" || state.role === "editor";
+
+    const tabs = `
+      <div class="tabs" id="admin-tabs" role="tablist">
+        <button role="tab" data-v="tenants"    aria-selected="${tab === "tenants"}">Tenants</button>
+        <button role="tab" data-v="principals" aria-selected="${tab === "principals"}">Principals &amp; roles</button>
+        <button role="tab" data-v="audit"      aria-selected="${tab === "audit"}">Audit</button>
+      </div>`;
+
+    let body = "";
+
+    if (tab === "tenants") {
+      body = `
+        <div class="card">
+          <div class="card-head"><h2>Tenants</h2><div class="spacer"></div>
+            ${state.role === "fleet-admin" ? '<button class="btn primary" type="button">New tenant</button>' : '<span class="readonly-hint">fleet scope required</span>'}</div>
+          <div class="scroll-x">
+            <table>
+              <thead><tr><th>Tenant</th><th class="r">Imposters</th><th class="r">Quota</th><th class="r">Journal retention</th><th>State</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">default</td><td class="r num">6</td><td class="r num">—</td><td class="r num">7d</td><td>${pill("good", "●", "Active")}</td></tr>
+                <tr><td class="mono">acme</td><td class="r num">24</td><td class="r num">24</td><td class="r num">30d</td><td>${pill("warn", "▲", "At quota")}</td></tr>
+                <tr><td class="mono">beta</td><td class="r num">3</td><td class="r num">50</td><td class="r num">7d</td><td>${pill("good", "●", "Active")}</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <p class="hint"><code>journalRetentionSecs</code> lives on the tenant record, not in <code>Quotas</code> — it is a duration policy rather than an object count (RFC-002 §11 Q2). Showing it in the quota column would re-introduce exactly the confusion that move was made to avoid, so it gets its own.</p>`;
+    }
+
+    if (tab === "principals") {
+      const rows = PRINCIPALS.map(p => `
+        <tr>
+          <td><div class="id-cell"><span class="name mono">${esc(p.id)}</span><span class="meta">${esc(p.display)}</span></div></td>
+          <td><span class="clause">${esc(p.role)}</span></td>
+          <td class="num">${esc(p.created)}</td>
+          <td>${p.disabled ? pill("crit", "■", "Disabled") : pill("good", "●", "Active")}</td>
+          <td class="r">${canManage
+              ? `<button class="btn sm" type="button">${p.disabled ? "Enable" : "Disable"}</button> <button class="btn sm" type="button">Delete</button>`
+              : '<span class="readonly-hint">read-only</span>'}</td>
+        </tr>`).join("");
+
+      body = `
+        ${state.newKey ? `
+        <div class="key-once">
+          <div class="kh"><span aria-hidden="true">▲</span>Copy this key now — it will not be shown again</div>
+          <div class="kval">rk_acme_7Q2mV9xTt4Lb8dZpN1sRwEyH6uKcJf3A</div>
+          <p style="margin:0;font-size:13px;color:var(--ink-2)">The fleet stores an argon2id hash, not the key. There is no reveal-later action because there is nothing to reveal — offering one would teach operators to expect a feature that cannot exist. Not written to local storage, never placed in a URL.</p>
+          <div><button class="btn" type="button" id="dismiss-key">I have copied it</button></div>
+        </div>` : ""}
+        <div class="card">
+          <div class="card-head"><h2>Principals in <code>${esc(state.tenant)}</code></h2><div class="spacer"></div>
+            ${canManage ? '<button class="btn primary" type="button" id="mint-key">Mint principal</button>' : '<span class="readonly-hint">Viewer holds no tenant.manage</span>'}</div>
+          <div class="scroll-x">
+            <table>
+              <thead><tr><th>Principal</th><th>Role</th><th>Created</th><th>State</th><th class="r">Actions</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Role grants</h2><div class="spacer"></div>
+            <span class="readonly-hint">RFC-002 §4.2 · authz.rs role_allows</span></div>
+          <div class="scroll-x">
+            <table class="role-matrix">
+              <thead><tr><th>Action</th>${LADDER.map(r => `<th>${esc(r)}</th>`).join("")}</tr></thead>
+              <tbody>
+                ${ACTIONS.map(a => `<tr><td>${esc(a)}</td>${LADDER.map(r =>
+                  `<td>${GRANTS[r].includes(a) ? '<span class="yes" title="granted">✓</span>' : '<span class="no" title="not granted">·</span>'}</td>`).join("")}</tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
+          <div class="card-body">
+            <p class="hint" style="margin:0">A strict superset ladder: Viewer ⊂ Operator ⊂ Editor ⊂ TenantAdmin ⊂ FleetAdmin. Two placements are deliberate and worth reading twice — <code>audit.read</code> is <em>not</em> a Viewer grant despite being a read, and it is <em>not</em> part of <code>tenant.manage</code> either, so managing principals does not make you an auditor. <b>FleetAdmin binds only on the fleet scope <code>*</code></b>, never inside a tenant, so it is not offered as an in-tenant role.</p>
+          </div>
+        </div>
+        <div class="banner info">
+          <span class="b-glyph" aria-hidden="true">◈</span>
+          <div><strong>Disable is not delete.</strong>
+            <p>Disabling revokes a key without waiting on rotation and is a Raft-committed fact with no per-node cache behind it — which is what <code>c25_key_revocation_survives_a_partition</code> pins. Deleting removes the record.</p></div>
+        </div>`;
+    }
+
+    if (tab === "audit") {
+      const rows = AUDIT.map(a => `
+        <tr>
+          <td class="num">${esc(String(a.revision))}</td>
+          <td class="num">${esc(a.ts)}</td>
+          <td><span class="clause">${esc(a.action)}</span></td>
+          <td class="mono">${esc(a.resource)}</td>
+          <td class="mono">${esc(a.tenant)}</td>
+          <td class="mono">${esc(a.principal)}</td>
+          <td>${a.outcome === "applied"
+                ? pill("good", "●", "applied")
+                : pill("warn", "▲", "refused")}${a.reason ? `<div class="meta mono" style="margin-top:3px;color:var(--ink-3);font-size:11px">${esc(a.reason)}</div>` : ""}</td>
+        </tr>`).join("");
+
+      body = `
+        <div class="card">
+          <div class="card-head"><h2>Audit</h2><div class="spacer"></div>
+            <span class="readonly-hint">GET /admin/audit?since=0&amp;limit=50</span></div>
+          <div class="scroll-x">
+            <table>
+              <thead><tr><th class="r">Rev</th><th>Time</th><th>Action</th><th>Resource</th><th>Tenant</th><th>Principal</th><th>Outcome</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+          <div class="pager">
+            <button class="btn sm" type="button" disabled>Newer</button>
+            <button class="btn sm" type="button">Older</button>
+            <span class="count">rev 1280–1284 · ${state.role === "fleet-admin" ? "fleet-wide" : `filtered to ${esc(state.tenant)}`}</span>
+          </div>
+        </div>
+        <div class="banner info">
+          <span class="b-glyph" aria-hidden="true">◈</span>
+          <div><strong>A refusal is a committed row, not a missing one.</strong>
+            <p>Revision 1282 is a quota refusal. Quotas are validated where the op applies, so a refusal is a decision the fleet agreed to and it appears in the stream like any other outcome — an audit view that showed only successes would make the interesting half invisible.</p></div>
+        </div>
+        <p class="hint">Rows are ordered by revision, which is the fleet's own total order — not by wall-clock, which can disagree across nodes. Reads are tenant-filtered from the caller's bindings: a TenantAdmin sees their tenant, a FleetAdmin sees the fleet. <code>resource</code> and <code>principal</code> are attacker-influenceable and render as text.</p>`;
+    }
+
+    return `
+      <div class="page-head">
+        <div><h1>Administration</h1><div class="sub">Tenancy, identity and the audit stream.</div></div>
+      </div>
+      ${tabs}
+      <div class="section-stack">${body}</div>`;
+  }
+
+  /* ── Sign in (C2) ─────────────────────────────────────────────────────*/
+  function loginScreen() {
+    return `
+      <div class="signin-wrap">
+        <div class="signin">
+          <div class="mark"><b>Rift</b><span>CONSOLE</span></div>
+          <h1>Sign in with an API key</h1>
+          <p>The key is exchanged for a session cookie and then discarded. It is held in component state only — never local storage, never a URL.</p>
+          <div class="field">
+            <label for="k">API key</label>
+            <input id="k" type="password" value="rk_acme_7Q2mV9xTt4Lb8dZpN1sRwEyH6uKcJf3A" autocomplete="off">
+          </div>
+          <button class="btn primary" type="button" style="padding:9px">Sign in</button>
+          <div class="lint info">
+            <span class="lg" aria-hidden="true">●</span>
+            <div>The cookie is <code>HttpOnly</code>, <code>Secure</code>, <code>SameSite=Strict</code>,
+              8-hour <code>Max-Age</code>. Being HttpOnly, no script in the page — injected or
+              otherwise — can read the key or the session.</div>
+          </div>
+          <p class="hint" style="margin:0">No SSO in v1: the exchange takes an API key, and OIDC arrives later as a second way to mint the same cookie. There is no per-session revocation either — the bounds are the TTL, signing-key rotation, and disabling the principal. Both are stated non-goals rather than gaps.</p>
+        </div>
+      </div>`;
+  }
+
+  function render() {
+    const r = ROLES[state.role];
+    document.getElementById("who-id").textContent = r.id;
+    document.getElementById("who-role").textContent = r.label;
+    document.getElementById("who-avatar").textContent = r.initials;
+
+    const f = fleet();
+    document.getElementById("revision-text").textContent =
+      f.reachable < f.total ? "rev 1284 · partial" : "rev 1284";
+
+    const tenantSel = document.getElementById("tenant");
+    tenantSel.value = state.tenant;
+    /* A single-tenant principal has nothing to switch between. */
+    tenantSel.closest(".tenant-switch").style.display = r.fleet ? "" : "none";
+
+    /* Keep the scoped node valid when the fleet shape changes under it. */
+    const names = f.nodes.map(n => n.name);
+    if (!names.includes(state.scopeNode)) state.scopeNode = names[0];
+
+    const SCREENS = {
+      fleet: fleetScreen, imposters: impostersScreen, requests: requestsScreen,
+      routes: routesScreen, stub: stubScreen, admin: adminScreen, login: loginScreen
+    };
+    document.getElementById("screen").innerHTML = (SCREENS[state.screen] || fleetScreen)();
+
+    const stubSeg = document.getElementById("seg-stub");
+    if (stubSeg) stubSeg.addEventListener("click", e => {
+      const b = e.target.closest("button");
+      if (b) { state.stubCase = b.dataset.v; render(); }
+    });
+
+    const adminTabs = document.getElementById("admin-tabs");
+    if (adminTabs) adminTabs.addEventListener("click", e => {
+      const b = e.target.closest("button");
+      if (b) { state.adminTab = b.dataset.v; render(); }
+    });
+
+    const mint = document.getElementById("mint-key");
+    if (mint) mint.addEventListener("click", () => { state.newKey = true; render(); });
+    const dismiss = document.getElementById("dismiss-key");
+    if (dismiss) dismiss.addEventListener("click", () => { state.newKey = false; render(); });
+
+    const nodeSeg = document.getElementById("seg-node");
+    if (nodeSeg) {
+      nodeSeg.addEventListener("click", e => {
+        const b = e.target.closest("button");
+        if (!b) return;
+        state.scopeNode = b.dataset.v;
+        state.selectedReq = null;
+        render();
+      });
+    }
+    document.querySelectorAll("[data-req]").forEach(tr =>
+      tr.addEventListener("click", () => {
+        state.selectedReq = state.selectedReq === tr.dataset.req ? null : tr.dataset.req;
+        render();
+      }));
+
+    document.querySelectorAll(".nav-item[data-screen]").forEach(b => {
+      const on = b.dataset.screen === state.screen;
+      if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+    });
+    document.querySelectorAll("#seg-screen button").forEach(b =>
+      b.setAttribute("aria-pressed", String(b.dataset.v === state.screen)));
+
+    document.querySelectorAll("[data-inspect]").forEach(b =>
+      b.addEventListener("click", () => {
+        const p = Number(b.dataset.inspect);
+        state.selected = state.selected === p ? null : p;
+        render();
+      }));
+
+    const bind = (id, ev, fn) => { const n = document.getElementById(id); if (n) n.addEventListener(ev, fn); };
+    bind("imp-q", "input", e => { state.q = e.target.value; state.picked.clear(); render();
+      const n = document.getElementById("imp-q"); if (n && n.focus) { n.focus(); if (n.setSelectionRange) n.setSelectionRange(n.value.length, n.value.length); } });
+    bind("imp-proto", "change", e => { state.methodFilter = e.target.value; render(); });
+    bind("imp-sort", "change", e => { state.sort = e.target.value; render(); });
+
+    document.querySelectorAll("[data-pick]").forEach(cb =>
+      cb.addEventListener("change", () => {
+        const p = Number(cb.dataset.pick);
+        if (cb.checked) state.picked.add(p); else state.picked.delete(p);
+        render();
+      }));
+    bind("pick-all", "change", e => {
+      document.querySelectorAll("[data-pick]").forEach(cb => {
+        const p = Number(cb.dataset.pick);
+        if (e.target.checked) state.picked.add(p); else state.picked.delete(p);
+      });
+      render();
+    });
+
+    document.querySelectorAll("[data-toggle]").forEach(b =>
+      b.addEventListener("click", () => {
+        const port = Number(b.dataset.toggle);
+        const it = imposters().find(i => i.port === port);
+        const now = it ? !it.enabled : true;
+        if (it) it.enabled = now;
+        toast(now ? "Enabled" : "Disabled", `Imposter ${port} — committed at rev 1285.`);
+        render();
+      }));
+
+    document.querySelectorAll("[data-del]").forEach(b =>
+      b.addEventListener("click", () => {
+        const port = Number(b.dataset.del);
+        const it = imposters().find(i => i.port === port);
+        askConfirm("Delete this imposter?",
+          `<code>${esc(String(port))}</code>${it ? ` — <b>${esc(it.name)}</b>` : ""} stops serving on every node in the fleet. Recorded requests for it are discarded with it. This cannot be undone.`,
+          "Delete imposter",
+          () => { toast("Deleted", `Imposter ${port} removed fleet-wide.`); render(); });
+      }));
+
+    document.querySelectorAll("[data-bulk]").forEach(b =>
+      b.addEventListener("click", () => {
+        const act = b.dataset.bulk;
+        const n = state.picked.size;
+        if (act === "clear") { state.picked.clear(); render(); return; }
+        if (act === "delete") {
+          askConfirm(`Delete ${n} imposter${n > 1 ? "s" : ""}?`,
+            `All ${n} stop serving on every node. Recorded requests go with them. This cannot be undone.`,
+            `Delete ${n}`,
+            () => { state.picked.clear(); toast("Deleted", `${n} imposters removed fleet-wide.`); render(); });
+          return;
+        }
+        const on = act === "enable";
+        imposters().forEach(i => { if (state.picked.has(i.port)) i.enabled = on; });
+        state.picked.clear();
+        toast(on ? "Enabled" : "Disabled", `${n} imposter${n > 1 ? "s" : ""} — one committed write.`);
+        render();
+      }));
+
+    writeUrl();
+  }
+
+  function wireSeg(id, key) {
+    const el = document.getElementById(id);
+    el.addEventListener("click", e => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      state[key] = b.dataset.v;
+      if (key === "role") state.tenant = ROLES[b.dataset.v].fleet ? state.tenant : "acme";
+      state.selected = null;
+      state.selectedReq = null;
+      el.querySelectorAll("button").forEach(x =>
+        x.setAttribute("aria-pressed", String(x === b)));
+      render();
+    });
+  }
+
+  wireSeg("seg-screen", "screen");
+  wireSeg("seg-role", "role");
+  wireSeg("seg-fleet", "fleet");
+  wireSeg("seg-data", "data");
+
+  document.getElementById("tenant").addEventListener("change", e => {
+    state.tenant = e.target.value;
+    state.selected = null;
+    render();
+  });
+
+  document.querySelectorAll(".nav-item[data-screen]").forEach(b =>
+    b.addEventListener("click", () => {
+      state.screen = b.dataset.screen;
+      if (b.dataset.tab) state.adminTab = b.dataset.tab;
+      state.selected = null;
+      state.selectedReq = null;
+      render();
+    }));
+
+  render();
+</script>
