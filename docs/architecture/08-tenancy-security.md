@@ -86,7 +86,8 @@ identity providers recycle. Rows already committed to the log cannot be
 repaired afterwards, which is why this is settled here rather than in #161.
 
 **Quotas are stored, not enforced.** `Quotas` rides the `Tenant` record so the
-shape is in the log format now; enforcement is #163.
+shape is in the log format now; enforcement is #163. *(T4 has since shipped —
+`max_imposters` and `max_stubs_per_imposter` are enforced; see "What T4 ships".)*
 
 ## Principals and roles
 
@@ -223,13 +224,36 @@ every construction site. #161 populates it from `AuthzDecision::Allow`, and #163
 reads it at apply time. `EventContext` remains the attribution path for the
 embedded/single-node case.
 
-  One gap neither mechanism closes: `AllDeleted` carries no port, therefore no
-  tenant. Its audit record gets `tenant: null, resource: "*"` — correct, and
-  stated here so the null is not later read as a bug.
+**T4 closes the event-path half of this too.** Reading the principal at apply
+fixes the *audit table*, but not `EventContext` — and M3's SSE and the #164
+export sink ride the event path, not the log. So `drive_engine` now **re-opens**
+the scope the request task could not carry across the task boundary: each engine
+action is paired with the `ControlRequest.principal` of the entry that produced
+it, and the engine call runs inside `with_principal_scope(principal, …)`. The
+diagram above is therefore the *pre-T4* picture; `current_principal()` at `emit`
+now yields the committing principal.
 
-Quotas (max imposters, stubs per imposter, flow-KV entries, journal retention)
-enforce at the one place that sees a tenant's entire write stream — the Raft
-leader's pre-append validation — plus the flow owner for KV counts.
+Attribution is per action, not per apply batch: one batch can hold entries from
+several principals, and naming whichever came first would be worse than the
+`None` it replaced — wrong attribution in an audit-adjacent stream is not a
+smaller error than missing attribution. A drive with no single request behind it
+(restart reconciliation, snapshot install) stays `None`, which is what
+`EventContext`'s own contract asks for: absent attribution is reported as absent,
+never guessed.
+
+  ~~One gap neither mechanism closes: `AllDeleted` carries no port, therefore no
+  tenant. Its audit record gets `tenant: null, resource: "*"`.~~ **Superseded by
+  T1.** #159 put an explicit `tenant` on *every* `ControlOp`, so a fleet-wide
+  delete knows exactly whose imposters it destroyed. Recording `null` would hide
+  that in the row describing the most destructive operation in the set, so the
+  shipped row carries the **real tenant** and puts the wildcard in `resource`.
+  Asserted in `delete_all_is_audited_with_the_real_tenant_and_a_wildcard_resource`
+  so the decision is pinned rather than re-litigated as a bug.
+
+Quotas (max imposters, stubs per imposter, flow-KV entries) enforce at the one
+place that sees a tenant's entire write stream — the replicated apply path — plus
+the flow owner for KV counts. (Journal retention was originally listed here; T4
+moved it off `Quotas`, see below.)
 
 **Audit** falls out of machinery that already exists: the intent log (Chapter
 4) records *what was asked, when, with which op-id*; U-10 adds *by whom*.
@@ -383,8 +407,16 @@ per tenant but read back through default-only paths. The tenancy tables are not
 like that — `tenant`, `tenant_principals` and `principal_bindings` all take the
 tenant as an argument and honour it — so keeping the guard over them would 404
 the entire surface for exactly the tenants it exists to administer. The
-exemption is scoped to routes that name their own tenant, so a new action stays
+exemption is scoped to the tenancy surface, so a new action outside it stays
 subject to the guard until someone states otherwise.
+
+  T3 originally keyed that exemption on "routes that name their own tenant"
+  (`scope.is_some()`), which coincided with "tenancy surface" until T4 added
+  `GET /admin/audit` — a tenancy route whose path names no tenant, because the
+  caller's `X-Rift-Tenant` names it. Under the old inference it 404'd every
+  tenant admin reading their own audit stream, from a guard whose stated subject
+  is config data the audit read never touches. The exemption now asks the route
+  directly (`serves_any_tenant`), which is what it always meant.
 
 **No verification cache.** RFC-002 §11 raised caching
 `hash(credential) → principal_id` to avoid an argon2id verify per request. T3
@@ -396,6 +428,111 @@ that fails *open* — is not earned by that. Operators should expect roughly
 constraint for a console or MCP client, the state-machine-invalidated cache
 described in §11 is the shape to build, and it should land as its own slice with
 its own revocation test.
+
+### What T4 ships — the audit stream, and quotas as committed decisions
+
+Slice T4 (issue #163) makes the audit trail real and turns quotas from a stored
+shape into an enforced one.
+
+**The audit row is a projection of the log, not a second log.** It is derived at
+**apply**, from the committed entry the replica already holds — never written by
+the handler that accepted the request. Everything the row needs is already in the
+envelope: `ControlRequest` carries `principal`, `issued_at_secs` and `op_id`, the
+op carries its tenant, and the response carries the outcome and revision. An
+audit log that can disagree with the thing it audits is worse than none, and
+deriving it from the log is what makes disagreement unrepresentable.
+
+That yields a property worth stating because it is unusual in this system:
+**`GET /admin/audit` needs no fan-out.** Every replica applies the same log and
+therefore derives byte-identical rows, so any node answers for the fleet from
+local state. (Contrast the M3 request journal, Chapter 7, which is genuinely
+per-node and needs merge-on-read — that machinery does not belong here.) The
+claim is asserted rather than narrated: `the_audit_stream_is_identical_on_every_node`
+writes on the leader and compares all three nodes' streams.
+
+The projection sits **below** the dedup short-circuit in `apply`. A replayed
+`op_id` returns the original response and changes nothing, so it must not append
+a second row — "exactly once per write" is that ordering, not a separate check.
+Refusals are recorded too: a `Failed` outcome is a committed decision, and *who
+tried to do what and was refused* is the half of an audit log that matters most.
+
+**Reads are not audited in v1** (RFC-002 §9, on log volume). One consequence is
+worth stating plainly rather than discovering later: the reads-that-mutate served
+over the **proxy** path — `ScenarioReset`, `SavedRequestsClear`, `FlowStateClear`
+— are forwarded to the loopback OSS admin and never become a `ControlOp`, so a
+log-derived projection cannot see them. RFC-002 §9 asks for a `ScenarioReset`
+row; producing one would mean recording at the front door, i.e. a second,
+per-node audit path that can disagree with the log — the one thing this design
+refuses. Auditing them properly means putting them on consensus, which is its own
+slice. **This is a known gap, not an oversight.**
+
+**Retention runs on the replicated clock.** `--cluster-audit-retention` (default
+30 d, `0` = keep forever) is swept inside `apply` against
+`SnapshotPayload.logical_clock_secs` — never a replica's `SystemTime::now()`, for
+the same reason the dedup GC already documents: replicas would disagree about
+which rows had expired and their audit tables would permanently diverge, which
+would destroy the any-node-can-answer property above. The sweep uses the clock as
+it stood *before* the batch, so expiry lags the boundary-crossing write by one
+apply — identically on every replica, and a retention window is a floor on how
+long rows are kept rather than a promise to delete them the instant it passes.
+Because the value feeds a GC inside `apply`, **every node in a fleet must be
+given the same one**; it is node configuration rather than replicated state
+because it is an operator's storage budget, not a tenant's policy.
+
+`sm_audit` is in `SnapshotPayload` with `#[serde(default)]`, the #134/#137
+lesson: a table omitted from that payload is a table that vanishes the next time
+a follower catches up by snapshot install, and for an audit stream that failure
+is silent and permanent.
+
+**Who sees what.** `AuditRead` is its own action, deliberately *not* folded into
+`TenantManage`: reading who did what and changing who may do what are different
+powers, so a principal-manager is not automatically an auditor, and an `Editor`
+gets `403`. A `FleetAdmin` sees the fleet; anyone else sees exactly the tenant
+they were authorized as. The narrowing is **server-side**, keyed on the tenant
+the authorization decision was made against — handing a tenant admin the fleet's
+rows and trusting a client to hide the rest would mean the server had already
+sent another tenant's audit history.
+
+**Quotas are enforced at apply, and a refusal is a committed decision.** RFC-002
+§4.4 says "at the Raft leader during validation", meaning: in the one place that
+sees a tenant's whole write stream, rather than in a handler counting its own
+node's view (which over-commits under concurrent writes). Apply satisfies that
+*and* one thing leader-side pre-validation cannot — the refusal lands in the log,
+so all three nodes record the same `Failed` outcome at the same revision, and it
+stays discoverable through `op_status` afterwards. `max_imposters` counts the
+tenant's existing ports *excluding the one being written* (replacing an imposter
+adds none, so a full tenant is full rather than frozen);
+`max_stubs_per_imposter` is checked on the payload for a `PutImposter` and on the
+*result* for a `PatchStubs`, since only the config an edit script produces knows
+how many stubs the imposter ends up with. A tenant with no stored record gets the
+generous default, not zero: a fleet that never configured tenancy must not find
+every write refused. `max_flow_entries` stays with the flow owner and
+`journal_retention` with the M3 shards (#147) — stated rather than
+half-implemented. Quotas bound **object counts, not compute**: one tenant's
+pathological regex still degrades a shared node, which is a stated non-goal.
+
+#### RFC-002 §11 open questions, settled here
+
+**Q1 — a parked write can be refused on replay.** Quotas are validated where the
+op applies, so a minority-side write is parked (RFC-001 §7.6) and validated on
+replay against the quota *as it stands then*. A tenant at its limit can therefore
+receive `503 + op-id` at submit and a refusal at replay. **Resolution: no quota
+reservation at park time.** A reservation would have to survive a leader change
+and expire on its own — more machinery than the problem earns, and a new source
+of divergence. Instead: a parked write's outcome is not knowable until it
+applies, quota refusal is one of its possible outcomes, and it surfaces as the
+existing committed `ControlOutcome::Failed { reason }`, discoverable through
+`op_status`. If reservations are ever wanted, that is a different slice.
+
+**Q2 — `journal_retention` moved off `Quotas` onto the tenant record.** It was
+the only field there that is a duration policy rather than an object count, and
+the only one enforced somewhere no other field is (the M3 shards). Leaving it
+would have handed #147 a field whose name says "quota" and whose meaning is "how
+long to keep data". It is now `Tenant::journal_retention_secs`, decided before M2
+shipped so M3 does not inherit the ambiguity.
+
+**Q3 — `VerifyRun` granularity** belongs to T2's action matrix and is unchanged
+here.
 
 ## Cluster-internal security
 

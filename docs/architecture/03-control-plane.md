@@ -38,7 +38,7 @@ flowchart TB
     subgraph Node["each rift-ee-server process"]
         RN["openraft node<br/>(leader OR follower/learner)"]
         SM["State machine (apply loop)"]
-        DB[("redb — cluster-state-dir<br/>raft_log · raft_vote · snapshot<br/>sm_configs · sm_tenants · sm_principals<br/>sm_bindings · sm_op_dedup · pending_intents")]
+        DB[("redb — cluster-state-dir<br/>raft_log · raft_vote · snapshot<br/>sm_configs · sm_tenants · sm_principals<br/>sm_bindings · sm_audit · sm_op_dedup · pending_intents")]
         IM["ImposterManager (OSS engine)"]
         RPC["cluster RPC (hyper + HMAC)<br/>/internal/v1/raft/append · vote · snapshot"]
     end

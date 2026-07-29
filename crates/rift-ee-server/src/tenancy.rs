@@ -84,17 +84,17 @@ pub(crate) enum Route {
     ///
     /// Carries the parsed query rather than the raw string so `dispatch` never
     /// re-parses what `classify` already read.
-    AuditRead {
-        since: u64,
-        limit: usize,
-        /// `None` = the fleet. Filled in by `dispatch` from the caller's
-        /// bindings, **never** from the request — see its arm.
-        tenant: Option<TenantId>,
-    },
+    ///
+    /// Carries no tenant of its own: the row filter is derived in `dispatch`
+    /// from the tenant the authorization decision was made against, never from
+    /// the route and never from anything the request body said.
+    AuditRead { since: u64, limit: usize },
 }
 
 impl Route {
-    /// The tenant this route is authorized against.
+    /// The tenant this route is authorized against, or `None` when the route
+    /// names none of its own and the caller's `X-Rift-Tenant` decides — the
+    /// same rule every imposter route already follows.
     ///
     /// The fleet-level routes ([`Route::TenantCreate`], [`Route::TenantList`])
     /// scope to [`FLEET_SCOPE`] rather than to any tenant: creating and
@@ -102,9 +102,9 @@ impl Route {
     /// allows a `FleetAdmin` there (its binding names `"*"`) and refuses
     /// everyone else with `NotBoundToTenant` → the §8.4 `404`, which is the
     /// right answer for a surface a tenant admin should not learn the shape of.
-    pub(crate) fn scope(&self) -> TenantId {
+    pub(crate) fn scope(&self) -> Option<TenantId> {
         match self {
-            Route::TenantCreate | Route::TenantList => TenantId::new(FLEET_SCOPE),
+            Route::TenantCreate | Route::TenantList => Some(TenantId::new(FLEET_SCOPE)),
             Route::TenantRead(tenant)
             | Route::TenantPut(tenant)
             | Route::TenantDelete(tenant)
@@ -113,15 +113,21 @@ impl Route {
             | Route::PrincipalPut(tenant, _)
             | Route::PrincipalDelete(tenant, _)
             | Route::BindingPut(tenant, _)
-            | Route::BindingDelete(tenant, _) => tenant.clone(),
-            // Scoped to the fleet, and the tenant narrowing happens *after*
-            // the decision rather than in it. A `TenantAdmin` holds no binding
-            // on `"*"`, so scoping this to the fleet would 404 them — but
-            // RFC-002 §9 says they may read their own tenant's rows. So the
-            // authorization scope is the caller's own requested tenant (the
-            // header, or `default`), and `dispatch` derives the row filter from
-            // the bindings that decision was made against.
-            Route::AuditRead { .. } => TenantId::default(),
+            | Route::BindingDelete(tenant, _) => Some(tenant.clone()),
+            // `None`, and the distinction matters: the path carries no tenant,
+            // so the caller's header names the tenant they are acting as, and
+            // the authorization decision is made against *that*.
+            //
+            // Returning a constant here instead — `default`, or `FLEET_SCOPE` —
+            // is the shape that looks harmless and is not. A route scope
+            // *replaces* the header (see `admin_front::authorize_action`), so a
+            // constant `default` authorizes every audit read against the default
+            // tenant: a `TenantAdmin` of any other tenant holds no binding there
+            // and is refused `NotBoundToTenant` → `404` on their own audit
+            // stream, which RFC-002 §9 explicitly grants them. `FLEET_SCOPE`
+            // fails the same way for the same reason. Only the header can name
+            // a tenant this route was not told about.
+            Route::AuditRead { .. } => None,
         }
     }
 
@@ -264,11 +270,7 @@ fn audit_route(query: Option<&str>) -> Route {
             _ => {}
         }
     }
-    Route::AuditRead {
-        since,
-        limit,
-        tenant: None,
-    }
+    Route::AuditRead { since, limit }
 }
 
 // ---------------------------------------------------------------------------
@@ -453,36 +455,47 @@ pub(crate) fn dispatch(
     node: &Arc<RaftNode>,
     route: Route,
     body: &[u8],
+    // The tenant `authz::decide` allowed this call against; see
+    // `admin_front::terminate_tenancy`.
+    authorized_tenant: &TenantId,
     bindings: &[(TenantId, Role)],
 ) -> Result<Outcome, TenancyError> {
     match route {
-        Route::AuditRead { since, limit, .. } => {
-            // Who sees what (RFC-002 §9). The filter is derived **here**, from
-            // the bindings the authorization decision was made against — never
-            // from anything the request said. A `FleetAdmin` sees the fleet; a
-            // `TenantAdmin` sees its own tenant and nothing else.
+        Route::AuditRead { since, limit } => {
+            // Who sees what (RFC-002 §9). A `FleetAdmin` sees the fleet; anyone
+            // else sees exactly the tenant they were authorized as, and nothing
+            // else.
             //
             // Server-side, deliberately. Handing a tenant admin the fleet's
             // rows and trusting a client to narrow them would mean the server
             // had already sent another tenant's audit history — the same
             // mistake §4.3 warns about for the event stream, and the reason
             // `/events` is still fleet-admin-only.
-            let fleet_wide = bindings
-                .iter()
-                .any(|(tenant, role)| *role == Role::FleetAdmin && tenant.as_str() == FLEET_SCOPE);
+            //
+            // The narrowing key is `authorized_tenant` — the very tenant
+            // `authz::decide` allowed this call against — so the rows returned
+            // and the decision that permitted them cannot disagree. Deriving it
+            // instead by scanning `bindings` for the first tenant-admin binding
+            // would quietly serve the wrong tenant to a principal bound to more
+            // than one, and would do it while looking authorized.
+            //
+            // Empty bindings mean the RBAC **bypass** — no principals are
+            // configured on this fleet, so `authorize_action` never resolved a
+            // credential and there is no principal to scope to. That is
+            // fleet-wide, not `default`-wide: narrowing to `authorized_tenant`
+            // there would silently hide every non-default tenant's rows during
+            // exactly the window an operator uses to provision the first tenants
+            // and principals, and it would do it behind a normal `200`. On an
+            // unenforced fleet there is no authorization to respect, so hiding
+            // rows buys no isolation — only a wrong answer.
+            let fleet_wide = bindings.is_empty()
+                || bindings.iter().any(|(tenant, role)| {
+                    *role == Role::FleetAdmin && tenant.as_str() == FLEET_SCOPE
+                });
             let filter = if fleet_wide {
                 None
             } else {
-                // The tenant this principal holds `AuditRead` in. `decide`
-                // already established they hold it somewhere; with no fleet
-                // binding that somewhere is a single tenant, and a principal
-                // bound to several sees the one it is acting as.
-                Some(
-                    bindings
-                        .iter()
-                        .find(|(_, role)| matches!(role, Role::TenantAdmin | Role::FleetAdmin))
-                        .map_or_else(TenantId::default, |(tenant, _)| tenant.clone()),
-                )
+                Some(authorized_tenant.clone())
             };
             let rows = node
                 .audit_since(since, filter.as_ref().map(TenantId::as_str), limit)
@@ -863,9 +876,78 @@ mod tests {
 
     #[test]
     fn the_fleet_level_routes_scope_to_the_fleet_not_to_a_tenant() {
-        assert_eq!(Route::TenantCreate.scope().as_str(), FLEET_SCOPE);
-        assert_eq!(Route::TenantList.scope().as_str(), FLEET_SCOPE);
-        assert_eq!(Route::TenantRead(tenant("acme")).scope().as_str(), "acme");
+        assert_eq!(
+            Route::TenantCreate.scope().as_ref().map(TenantId::as_str),
+            Some(FLEET_SCOPE)
+        );
+        assert_eq!(
+            Route::TenantList.scope().as_ref().map(TenantId::as_str),
+            Some(FLEET_SCOPE)
+        );
+        assert_eq!(
+            Route::TenantRead(tenant("acme"))
+                .scope()
+                .as_ref()
+                .map(TenantId::as_str),
+            Some("acme")
+        );
+    }
+
+    /// `GET /admin/audit` names no tenant in its path, so it must defer to the
+    /// caller's `X-Rift-Tenant` rather than pin a constant. A route scope
+    /// *replaces* that header, so any `Some(..)` here would authorize every
+    /// audit read against one fixed tenant — and a `TenantAdmin` of any other
+    /// would get `404` on the stream RFC-002 §9 grants them.
+    #[test]
+    fn the_audit_route_defers_to_the_callers_tenant_rather_than_pinning_one() {
+        assert_eq!(
+            Route::AuditRead {
+                since: 0,
+                limit: 10,
+            }
+            .scope(),
+            None
+        );
+    }
+
+    /// `?since=&limit=` is parsed once, in `classify`, so `dispatch` never
+    /// re-parses it. The fallbacks are a domain-optional parse — both parameters
+    /// are pure pagination with a safe default — but "safe default" is a claim
+    /// worth checking, particularly the `limit` clamp: without it any caller
+    /// with `audit.read` could ask for the whole journal in one response.
+    #[test]
+    fn the_audit_query_is_parsed_clamped_and_defaulted() {
+        let route = |q: Option<&str>| match audit_route(q) {
+            Route::AuditRead { since, limit } => (since, limit),
+            other => panic!("audit_route must always classify as AuditRead, got {other:?}"),
+        };
+
+        assert_eq!(
+            route(None),
+            (0, AUDIT_DEFAULT_LIMIT),
+            "no query = the start of the journal, one default page"
+        );
+        assert_eq!(route(Some("since=42&limit=10")), (42, 10));
+        assert_eq!(
+            route(Some("limit=10&since=42")),
+            (42, 10),
+            "order is not significant"
+        );
+        assert_eq!(
+            route(Some("limit=999999")),
+            (0, AUDIT_MAX_LIMIT),
+            "an unbounded read is an unbounded response: limit must be clamped"
+        );
+        assert_eq!(
+            route(Some("since=notanumber")),
+            (0, AUDIT_DEFAULT_LIMIT),
+            "an unparseable page cursor falls back to the start rather than 400ing"
+        );
+        assert_eq!(
+            route(Some("unrelated=1")),
+            (0, AUDIT_DEFAULT_LIMIT),
+            "unknown parameters are ignored, not fatal"
+        );
     }
 
     /// The type that renders a principal has no field a key could occupy.

@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rift_cluster::{Authority, NodeConfig, NodeId, RaftNode, Router};
+use rift_cluster::{Authority, ControlRequest, NodeConfig, NodeId, RaftNode, Router};
 use tempfile::TempDir;
 
 const SECRET: &str = "harness-cluster-secret";
@@ -56,7 +56,12 @@ struct Member {
     node: Option<Arc<RaftNode>>,
 }
 
-async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> Arc<RaftNode> {
+async fn spawn(
+    id: NodeId,
+    addr: SocketAddr,
+    dir: &Path,
+    audit_retention_secs: u64,
+) -> Arc<RaftNode> {
     let config = NodeConfig {
         node_id: id,
         bind: addr,
@@ -65,7 +70,7 @@ async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> Arc<RaftNode> {
         secret: Some(SECRET.to_owned()),
         routes: Router::new(),
         engine: None,
-        audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
+        audit_retention_secs,
     };
     // No retry-on-lock-contention: `RaftNode::shutdown` now waits for the Raft
     // core to release its storage handles before returning (#41), so a restart on
@@ -80,12 +85,22 @@ async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> Arc<RaftNode> {
 /// A running in-process cluster.
 struct TestCluster {
     members: Vec<Member>,
+    /// Retained so `restart` brings a node back with the same retention it was
+    /// started with. A node that silently reverted to the 30-day default on
+    /// restart would look like a GC bug rather than a harness bug.
+    audit_retention_secs: u64,
 }
 
 impl TestCluster {
     /// Start `n` nodes, bootstrap node 1, and seed-join the rest through it, so
     /// the returned cluster is one converged group of `n` voters.
     async fn start(n: usize) -> Self {
+        Self::start_with_audit_retention(n, rift_cluster::DEFAULT_AUDIT_RETENTION_SECS).await
+    }
+
+    /// [`Self::start`] with an explicit audit retention window, for the tests
+    /// that need GC to actually run within a test's lifetime.
+    async fn start_with_audit_retention(n: usize, audit_retention_secs: u64) -> Self {
         assert!(n >= 1, "a cluster needs at least one node");
         let mut members: Vec<Member> = reserve_ports(n)
             .into_iter()
@@ -98,20 +113,35 @@ impl TestCluster {
             })
             .collect();
 
-        let n1 = spawn(members[0].id, members[0].addr, members[0].dir.path()).await;
+        let n1 = spawn(
+            members[0].id,
+            members[0].addr,
+            members[0].dir.path(),
+            audit_retention_secs,
+        )
+        .await;
         n1.cluster_init().await.expect("bootstrap node 1");
         members[0].node = Some(n1);
 
         let seed = Authority::from(members[0].addr);
         for member in members.iter_mut().skip(1) {
-            let node = spawn(member.id, member.addr, member.dir.path()).await;
+            let node = spawn(
+                member.id,
+                member.addr,
+                member.dir.path(),
+                audit_retention_secs,
+            )
+            .await;
             node.join_via(&seed)
                 .await
                 .unwrap_or_else(|e| panic!("node {} join: {e}", member.id));
             member.node = Some(node);
         }
 
-        let cluster = Self { members };
+        let cluster = Self {
+            members,
+            audit_retention_secs,
+        };
         let all: BTreeSet<NodeId> = cluster.members.iter().map(|m| m.id).collect();
         assert!(
             cluster.wait_voters(&all, CONVERGE_DEADLINE).await,
@@ -258,7 +288,7 @@ impl TestCluster {
         // Ensure the previous instance is gone before rebinding the port.
         self.kill(id).await;
         let dir = self.member(id).dir.path().to_path_buf();
-        let node = spawn(mid, addr, &dir).await;
+        let node = spawn(mid, addr, &dir, self.audit_retention_secs).await;
         self.member_mut(id).node = Some(node);
     }
 
@@ -407,12 +437,14 @@ async fn test_uninitialized_fleet_never_ready() {
         1,
         format!("127.0.0.1:{}", ports[0]).parse().unwrap(),
         da.path(),
+        rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
     )
     .await;
     let b = spawn(
         2,
         format!("127.0.0.1:{}", ports[1]).parse().unwrap(),
         db.path(),
+        rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
     )
     .await;
 
@@ -889,7 +921,7 @@ async fn test_rejoin_after_leave() {
     let new_dir = TempDir::new().expect("tempdir");
     let addr = cluster.member(departed).addr;
     let seed = cluster.leader().expect("a leader to seed off").advertise();
-    let rejoined = spawn(departed, addr, new_dir.path()).await;
+    let rejoined = spawn(departed, addr, new_dir.path(), cluster.audit_retention_secs).await;
     rejoined.join_via(seed).await.expect("rejoin via seed");
     cluster.member_mut(departed).node = Some(rejoined);
     // Keep the fresh directory alive for the rest of the test (and
@@ -970,7 +1002,7 @@ async fn test_rejoin_after_leave_with_retained_state_dir() {
     let dir = cluster.member(departed).dir.path().to_path_buf();
     let addr = cluster.member(departed).addr;
     let seed = cluster.leader().expect("a leader to seed off").advertise();
-    let rejoined = spawn(departed, addr, &dir).await;
+    let rejoined = spawn(departed, addr, &dir, cluster.audit_retention_secs).await;
     rejoined
         .join_via(seed)
         .await
@@ -1566,5 +1598,314 @@ async fn deleting_a_tracking_source_stops_its_poller() {
     );
 
     task.abort();
+    cluster.shutdown_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #163 — the audit stream and leader-side quotas across a real cluster.
+//
+// The state-machine unit tests in `raft/store.rs` already pin the projection's
+// shape. What can only be asserted here is the claim that makes the endpoint
+// fan-out-free: every replica derives the *same* rows from the same log, so any
+// node answers for the fleet. Narrating that property is not the same as
+// checking it, so these tests query all three nodes and compare.
+// ---------------------------------------------------------------------------
+
+/// Poll, bounded, until every live node's audit stream is byte-identical.
+/// Returns the agreed rows, or `None` on timeout — never a synthetic pass.
+async fn wait_audit_agreed(
+    cluster: &TestCluster,
+    deadline: Duration,
+) -> Option<Vec<rift_cluster::AuditRow>> {
+    let start = Instant::now();
+    loop {
+        let per_node: Vec<Vec<rift_cluster::AuditRow>> = cluster
+            .live()
+            .map(|n| n.audit_since(0, None, 10_000).expect("read audit"))
+            .collect();
+        if let Some(first) = per_node.first()
+            && !first.is_empty()
+            && per_node.iter().all(|rows| rows == first)
+        {
+            return Some(first.clone());
+        }
+        if start.elapsed() > deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn submit_request(op_id: u128, issued_at_secs: u64, op: rift_cluster::ControlOp) -> ControlRequest {
+    ControlRequest {
+        op_id: uuid::Uuid::from_u128(op_id),
+        principal: Some("default/alice".to_owned()),
+        issued_at_secs,
+        expected_revision: None,
+        op,
+    }
+}
+
+/// AC1: every write appears exactly once, with the same revision, on every node
+/// — asserted by querying all three and comparing, which is the whole of the
+/// "no fan-out needed" claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_audit_stream_is_identical_on_every_node() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
+
+    let ports = [18081u16, 18082, 18083];
+    for (i, port) in ports.iter().enumerate() {
+        cluster.write_on_leader(*port, &format!("cfg-{i}")).await;
+    }
+    for (i, port) in ports.iter().enumerate() {
+        assert!(
+            cluster
+                .wait_converged(*port, &format!("cfg-{i}"), CONVERGE_DEADLINE)
+                .await
+        );
+    }
+
+    let rows = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
+        .await
+        .expect("every node must derive the same audit rows from the same log");
+
+    for port in ports {
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|r| r.resource == port.to_string())
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "each write is audited exactly once, not once per node and not \
+             twice on a replay: {matching:?}"
+        );
+        assert_eq!(matching[0].action, "imposter.write");
+    }
+
+    let mut revisions: Vec<u64> = rows.iter().map(|r| r.revision).collect();
+    let unique = revisions.len();
+    revisions.sort_unstable();
+    revisions.dedup();
+    assert_eq!(
+        revisions.len(),
+        unique,
+        "revisions are unique per row: {rows:?}"
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// AC2: a quota refusal is a *committed* decision — the same `Failed` outcome at
+/// the same revision on all three nodes. That is what §11 open question 1 turns
+/// on: the refusal is discoverable through `op_status` precisely because it is
+/// in the log, not because the submitter saw an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quota_refusal_is_the_same_committed_decision_on_every_node() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
+
+    let leader = cluster.leader().expect("a leader");
+    leader
+        .write(submit_request(
+            1,
+            1_700_000_000,
+            rift_cluster::ControlOp::TenantPut {
+                tenant: rift_cluster::TenantId::new("acme"),
+                display_name: "Acme".to_owned(),
+                quotas: rift_cluster::control::Quotas {
+                    max_imposters: 1,
+                    ..rift_cluster::control::Quotas::default()
+                },
+                journal_retention_secs: 0,
+            },
+        ))
+        .await
+        .expect("tenant put commits");
+
+    let imposter = |port: u16| {
+        serde_json::from_value(serde_json::json!({
+            "port": port,
+            "protocol": "http",
+            "host": "127.0.0.1",
+        }))
+        .expect("test config parses")
+    };
+
+    let first = leader
+        .write(submit_request(
+            2,
+            1_700_000_001,
+            rift_cluster::ControlOp::PutImposter {
+                tenant: rift_cluster::TenantId::new("acme"),
+                config: Box::new(imposter(18091)),
+            },
+        ))
+        .await
+        .expect("first imposter commits");
+    assert_eq!(first.outcome, rift_cluster::ControlOutcome::Applied);
+
+    let refused = leader
+        .write(submit_request(
+            3,
+            1_700_000_002,
+            rift_cluster::ControlOp::PutImposter {
+                tenant: rift_cluster::TenantId::new("acme"),
+                config: Box::new(imposter(18092)),
+            },
+        ))
+        .await
+        .expect("the refusal is a committed write, not a transport error");
+    let rift_cluster::ControlOutcome::Failed { .. } = &refused.outcome else {
+        panic!("the second imposter is over the ceiling: {refused:?}");
+    };
+
+    let rows = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
+        .await
+        .expect("the audit stream must agree across nodes");
+
+    let refusal: Vec<_> = rows.iter().filter(|r| r.resource == "18092").collect();
+    assert_eq!(refusal.len(), 1, "the refusal is audited once: {rows:?}");
+    assert_eq!(
+        refusal[0].revision, refused.revision,
+        "the audited refusal sits at the revision the write returned"
+    );
+    assert_eq!(
+        refusal[0].outcome, refused.outcome,
+        "the committed outcome is the audited one, verbatim"
+    );
+    assert_eq!(refusal[0].tenant, rift_cluster::TenantId::new("acme"));
+
+    // And the refusal really is the same decision everywhere, not just the same
+    // row shape: every node reports the identical outcome at that revision.
+    for node in cluster.live() {
+        let node_rows = node.audit_since(refused.revision, None, 10).expect("read");
+        let row = node_rows
+            .iter()
+            .find(|r| r.revision == refused.revision)
+            .expect("every node holds the refusal");
+        assert_eq!(row.outcome, refused.outcome);
+    }
+
+    cluster.shutdown_all().await;
+}
+
+/// AC4, the restart half: audit history is committed state, so it survives every
+/// node going down and coming back — not just the leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_rows_survive_a_full_cluster_restart() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
+
+    cluster.write_on_leader(18095, "before-restart").await;
+    assert!(
+        cluster
+            .wait_converged(18095, "before-restart", CONVERGE_DEADLINE)
+            .await
+    );
+    let before = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
+        .await
+        .expect("the audit stream agrees before the restart");
+
+    for id in [1, 2, 3] {
+        cluster.restart(id).await;
+    }
+    assert!(
+        cluster.wait_for_leader(LEADER_DEADLINE).await.is_some(),
+        "the cluster must re-elect after a full restart"
+    );
+
+    let after = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
+        .await
+        .expect("the audit stream agrees after the restart");
+    assert_eq!(
+        after, before,
+        "audit history is committed state and must survive a full-cluster \
+         restart unchanged"
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// AC3 across a real cluster.
+///
+/// The store-level test is the one that proves the *mechanism* is clock-agnostic
+/// — it uses timestamps decades in the past, so a `SystemTime::now()`-based GC
+/// would sweep everything and fail it. The criterion's literal phrasing ("a node
+/// whose local clock is skewed by a week") cannot be staged in-process for
+/// exactly the reason the feature is correct: nothing in the retention path
+/// reads a local clock, so there is no local clock to skew.
+///
+/// What is worth asserting here is the consequence: retention GC, running inside
+/// apply on every replica, leaves the three streams **in agreement**. A GC that
+/// read node-local state would diverge them, and this is where that would show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retention_gc_leaves_every_node_holding_the_same_rows() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start_with_audit_retention(3, 100).await;
+    assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
+
+    let leader = cluster.leader().expect("a leader");
+    let imposter = |port: u16| {
+        serde_json::from_value(serde_json::json!({
+            "port": port,
+            "protocol": "http",
+            "host": "127.0.0.1",
+        }))
+        .expect("test config parses")
+    };
+
+    // Three writes on an old logical clock, then two that advance it well past
+    // the retention window — the second of which triggers the sweep.
+    for (op_id, port, ts) in [
+        (1u128, 19201u16, 1_000u64),
+        (2, 19202, 1_050),
+        (3, 19203, 1_090),
+        (4, 19204, 5_000),
+        (5, 19205, 5_001),
+    ] {
+        leader
+            .write(submit_request(
+                op_id,
+                ts,
+                rift_cluster::ControlOp::PutImposter {
+                    tenant: rift_cluster::TenantId::default(),
+                    config: Box::new(imposter(port)),
+                },
+            ))
+            .await
+            .expect("write commits");
+    }
+
+    let rows = wait_audit_agreed(&cluster, CONVERGE_DEADLINE)
+        .await
+        .expect("every node must agree after retention GC has run");
+
+    assert!(
+        rows.iter().all(|r| r.ts_secs >= 4_901),
+        "rows outside the retention window must be gone on every node: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.resource == "19205"),
+        "and the recent ones must remain: {rows:?}"
+    );
+
+    // Belt and braces: compare the three streams element-wise, not just their
+    // agreed-upon length.
+    let per_node: Vec<Vec<rift_cluster::AuditRow>> = cluster
+        .live()
+        .map(|n| n.audit_since(0, None, 10_000).expect("read audit"))
+        .collect();
+    for stream in &per_node {
+        assert_eq!(
+            stream, &rows,
+            "a node that GC'd differently would show up here"
+        );
+    }
+
     cluster.shutdown_all().await;
 }

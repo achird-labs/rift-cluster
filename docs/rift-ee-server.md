@@ -165,6 +165,7 @@ it, so a stray flag on a single node is not an error.
 | `--cluster-admin-async` | Answer admin writes with an immediate `202` + op id after durably parking them; poll `GET /_cluster/ops/:id` for the outcome |
 | `--cluster-flow-fsync-interval-ms <MILLIS>` | Group-fsync cadence for `durability: "async"` flow-state writes (default `50`) — the bound on what a whole-fleet crash can lose for imposters that did not choose `"sync"` or `"none"` |
 | `--cluster-legacy-key-is-fleet-admin <true\|false>` | Whether the legacy `--api-key`'s synthetic principal also gets `FleetAdmin` on the fleet scope, on top of its `TenantAdmin` binding on `default` (RFC-002 §3.4). **Default `true`** — see below |
+| `--cluster-audit-retention <SECONDS>` | How long audit rows are kept (default `2592000`, i.e. 30 d; `0` = forever). **Give every node in a fleet the same value** — see "The audit stream" below |
 
 Each flag also has an environment-variable spelling (`RIFT_CLUSTER_BIND`,
 `RIFT_CLUSTER_SECRET_FILE`, …), which is the intended vehicle for the secret.
@@ -274,7 +275,10 @@ curl -sX POST http://$ADMIN/admin/tenants \
   -H "authorization: $FLEET_KEY" \
   -d '{"id":"acme","displayName":"Acme Corp",
        "quotas":{"maxImposters":100,"maxStubsPerImposter":500,
-                 "maxFlowEntries":100000,"journalRetentionSecs":0}}'
+                 "maxFlowEntries":100000},
+       "journalRetentionSecs":0}'
+# journalRetentionSecs sits beside `quotas`, not inside it: it is a duration
+# policy rather than an object count (RFC-002 §11 Q2). See "Quotas" below.
 
 # 2. Mint a principal in it. The response is the ONLY place the key appears.
 curl -sX POST http://$ADMIN/admin/tenants/acme/principals \
@@ -320,6 +324,138 @@ admin plane. It does not touch the data plane — gateway traffic under
 A credential that matches no principal is refused having performed **zero**
 argon2id work, so an unauthenticated caller cannot use the admin port as a
 memory-amplification lever.
+
+### The audit stream (issue #163)
+
+```sh
+curl -s "http://$ADMIN/admin/audit?since=0&limit=100" \
+  -H "authorization: $KEY" -H "x-rift-tenant: acme"
+# [{"tsSecs":1700000000,"principal":"acme/ci-runner","tenant":"acme",
+#   "action":"imposter.write","resource":"8080",
+#   "opId":"3f2a…","revision":42,"outcome":"applied"}]
+```
+
+**Any node answers, and every node answers the same.** The row is derived at
+apply from the committed log entry, so all replicas compute identical rows and
+the read needs no fan-out — unlike `/_cluster/*` operator reads, you do not have
+to reach a particular node, and you never get a partial view.
+
+| Parameter | Meaning |
+|---|---|
+| `since` | First revision to return, inclusive. Default `0`. This is a **revision**, not a timestamp — page by taking the last row's `revision + 1` |
+| `limit` | Rows to return. Default `500`, capped at `5000` |
+
+`x-rift-tenant` names the tenant you are acting as, exactly as on every other
+tenant-scoped route; the path carries no tenant, so there is nothing else to go
+on. It defaults to `default`.
+
+**Visibility.** `audit.read` is its own action and is **not** part of
+`tenant.manage`: reading who did what and changing who may do what are different
+powers. A `FleetAdmin` sees the whole fleet; a `TenantAdmin` sees exactly the
+tenant it is acting as; `Editor` and below get `403`. The narrowing happens on
+the server — a tenant admin is never sent another tenant's rows.
+
+**What is and is not in the stream.**
+
+- Every replicated **write** — including one that was **refused**. A refusal is a
+  committed decision, and its row is often the one you want.
+- **Reads are not audited.** Neither are the mutating operations served over the
+  *proxy* path (`POST /imposters/:port/scenarios/:id/reset`,
+  `DELETE …/savedRequests`, flow-state clears): they are forwarded to the
+  embedded OSS admin and never become replicated ops, so a log-derived stream
+  cannot see them. This is a **known gap** — auditing them means putting them on
+  consensus, which is a future slice. Do not read their absence as "it did not
+  happen".
+- A fleet-wide delete records the **tenant whose imposters were destroyed** and
+  `"resource": "*"`.
+
+**Retention.** `--cluster-audit-retention` (default 30 d, `0` = forever). The
+sweep runs against the cluster's replicated logical clock, never a node's local
+wall clock, so a node whose clock is skewed drops exactly the rows its peers do.
+That is also why **every node must be given the same value**: the GC runs inside
+the replicated apply path, so nodes configured differently would drop different
+rows and their audit tables would permanently diverge. Expiry lags the write that
+crosses the retention boundary by one apply — the window is a floor on how long
+rows are kept, not a promise to delete at the instant it passes.
+
+Audit history survives a full-cluster restart and a node joining by snapshot
+install.
+
+> **A badly skewed node clock can erase history early.** The replicated clock is
+> a running maximum over the `issued_at_secs` each submitting node stamps from
+> its *own* wall clock. One node whose clock is a year fast can therefore advance
+> the whole fleet's logical clock by a year with a single write, and the next GC
+> — deterministically, on every replica — drops everything older than the new
+> cutoff. The clock never goes backwards, so this is not recoverable. The same
+> exposure exists for the 24 h dedup GC, where it costs a day of replay collapse;
+> here it costs the retention window. **Keep cluster nodes on NTP**, and treat a
+> large unexplained jump in retained history as a clock incident rather than a
+> quota or storage one.
+
+### Upgrading a fleet
+
+`--cluster-audit-retention` and quota enforcement both take effect **inside the
+replicated apply path**, which makes them upgrade-sensitive in two ways:
+
+- **Give every node the same retention value.** Nodes configured differently drop
+  different rows from the same log and their audit tables diverge permanently.
+- **Finish rolling out a version before writing against its new rules.** This
+  release adds two apply-time refusals (a quota ceiling, and a zero-valued quota
+  at validation). A node still running the previous version applies the *same*
+  committed entry without them, so during a partial rollout two nodes can reach
+  different outcomes for one entry and diverge. Upgrade all nodes, then start
+  using the new behaviour. (This is the same rule earlier tenancy slices
+  introduced; it is written down here because this release is the first to make
+  it easy to trip on a routine write.)
+
+### Quotas (issue #163)
+
+`quotas` on the tenant record bounds **object counts**, and is enforced on the
+replicated apply path:
+
+| Field | Enforced |
+|---|---|
+| `maxImposters` | Yes. Counts the tenant's existing ports *excluding* the one being written, so replacing an imposter you already own never trips the ceiling |
+| `maxStubsPerImposter` | Yes — on the payload for a create/replace, and on the *result* for a stub edit |
+| `maxFlowEntries` | Stored; enforced by the flow owner |
+| `journalRetentionSecs` | Moved **off** `quotas` onto the tenant record itself (it is a duration policy, not a count). Stored; applied by the request shards in M3 |
+
+> **If you set `quotas.journalRetentionSecs` on an earlier M2 build, re-set it.**
+> The field moved to the top level of the tenant body; a stored record still
+> carrying it under `quotas` decodes with the *new* field at its default of `0`
+> (unlimited), silently. Nothing enforces the value yet — M3 (#147) is what will
+> read it — so the practical window to fix this is before that lands, but the
+> value is lost now rather than then.
+
+A ceiling of `0` is refused at validation rather than stored: it makes the tenant
+permanently unusable, and "unlimited" has its own spelling (a large number). A
+tenant with no stored record gets generous defaults, so a fleet that never
+configured tenancy is not capacity-locked.
+
+Quotas bound object counts, **not compute**. One tenant's pathological regex
+still degrades a shared node; that is a stated non-goal, not a gap.
+
+**A quota refusal is a committed decision, not a submit-time error.** This
+matters for the async/parked write path. Enforcement happens where the op
+applies, so a write parked during a minority-side outage
+(`--cluster-admin-async`, or a `503 + op-id`) is validated **on replay, against
+the quota as it stands then**. A tenant at its ceiling can therefore be accepted
+at submit and refused at replay:
+
+```sh
+curl -sX POST http://$ADMIN/imposters -H "authorization: $KEY" -d @imposter.json
+# 202  {"opId":"3f2a…"}          <- parked, outcome not yet knowable
+
+curl -s http://$ADMIN/_cluster/ops/3f2a… -H "authorization: $KEY"
+# {"outcome":"failed","reason":"tenant \"acme\" is at its ceiling of 100 imposters",
+#  "revision":93}
+```
+
+There is deliberately **no quota reservation at park time**: a reservation would
+have to survive a leader change and expire on its own, which is more machinery
+than the problem earns and a new source of divergence between nodes. Poll
+`GET /_cluster/ops/:id` for the real outcome — that is the contract for every
+parked write, and a quota refusal is simply one of the outcomes it can report.
 
 ### Startup guards
 

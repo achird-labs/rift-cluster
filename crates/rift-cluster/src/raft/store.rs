@@ -685,6 +685,43 @@ enum EngineAction {
     },
 }
 
+/// An [`EngineAction`] paired with the principal whose committed op caused it
+/// (U-10, upstream #855; issue #163).
+///
+/// This pairing exists because the upstream attribution channel is a
+/// **task-local**, and a task-local does not cross a task boundary. The admin
+/// request task opens `with_principal_scope` and then hands the op to openraft;
+/// the mutation is applied later, on the state-machine task, where that scope is
+/// long gone and `current_principal()` is `None`. So the clustered path carries
+/// attribution in the log — `ControlRequest.principal` — and **re-opens** the
+/// scope here, around the engine call, which is the only place a listener runs.
+/// Without this, every clustered change event reaches M3's SSE and the #164
+/// export sink with `EventContext::principal == None`, and the fact that the
+/// audit table is correctly attributed does not help them: they are on the event
+/// path, not the log path.
+///
+/// `principal` is `None` for a drive with no single request behind it — a
+/// restart replay or a snapshot install, which materialize a whole table rather
+/// than one caller's write. That is the honest answer, and `EventContext`'s own
+/// doc asks for exactly it: absent attribution is reported as absent, never
+/// guessed.
+#[derive(Debug)]
+struct AttributedAction {
+    principal: Option<String>,
+    action: EngineAction,
+}
+
+impl AttributedAction {
+    /// A drive that no single principal caused: restart reconciliation, or a
+    /// snapshot install.
+    fn unattributed(action: EngineAction) -> Self {
+        Self {
+            principal: None,
+            action,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RedbStateMachine {
     db: Arc<Database>,
@@ -1428,7 +1465,13 @@ impl RedbStateMachine {
             };
             (config_action, routes_action)
         };
-        self.drive_engine(vec![config_action, routes_action]).await;
+        // Unattributed: this materializes a whole table on restart, not one
+        // caller's write, so there is no principal to name.
+        self.drive_engine(vec![
+            AttributedAction::unattributed(config_action),
+            AttributedAction::unattributed(routes_action),
+        ])
+        .await;
         Ok(())
     }
 
@@ -1542,7 +1585,16 @@ impl RedbStateMachine {
     ///
     /// Rows are expired on `ts_secs`, the applying entry's `issued_at_secs`,
     /// so "how old is this row" is answered with the same replicated clock that
-    /// wrote it. A row whose JSON will not parse is dropped and logged rather
+    /// wrote it.
+    ///
+    /// Called once per `apply` against the clock as it stood *before* that
+    /// batch, exactly as [`Self::gc_dedup`] is — so expiry lags the write that
+    /// crosses the boundary by one apply. That is deliberate and harmless here:
+    /// the lag is identical on every replica (they run the same GC at the same
+    /// log point with the same clock), and a retention window is a floor on how
+    /// long rows are kept, not a promise to delete them the instant it passes.
+    ///
+    /// A row whose JSON will not parse is dropped and logged rather
     /// than kept forever: it is committed-state corruption, it cannot be served
     /// to anyone, and it would otherwise pin the table's growth with something
     /// no reader can use.
@@ -1927,26 +1979,43 @@ impl RedbStateMachine {
         }
     }
 
-    /// The tenant's quotas, or [`Quotas::default`] when it has no stored record
+    /// The tenant's quotas: [`Quotas::default`] when it has **no** stored
+    /// record, and a committed refusal when the record exists but will not parse
     /// (issue #163).
     ///
-    /// The default is the *generous* one, not a zero — `default` has no stored
-    /// row on a fresh cluster (nothing writes one; see `require_live_tenant`),
-    /// and a fleet that never configured tenancy must not find every write
-    /// refused because an absent record read as a quota of nothing.
+    /// The two cases are deliberately not the same, and conflating them is a
+    /// fail-open:
+    ///
+    /// - **No record** is a domain value, not an error. `default` has no stored
+    ///   row on a fresh cluster (nothing writes one), so a fleet that never
+    ///   configured tenancy must not find every write refused because an absent
+    ///   record read as a quota of nothing. The *generous* default is correct.
+    /// - **A corrupt record** is a gate that cannot read what it is gating.
+    ///   Answering `Quotas::default()` there would hand the tenant the generous
+    ///   ceiling precisely when the operator's real — possibly much tighter —
+    ///   one became unreadable, and nothing downstream would notice: a quota is
+    ///   a resource gate, and a gate that cannot classify its input must treat
+    ///   it as the dangerous class. So it refuses, the same way `TenantDelete`
+    ///   already refuses against an unreadable row.
+    ///
+    /// An earlier version of this defended the fail-open by claiming
+    /// `require_live_tenant` had already refused corruption upstream. It had
+    /// not: that helper is called only from the `PrincipalPut` /
+    /// `PrincipalCreate` / `BindingPut` arms, and *neither* caller of this
+    /// function — `PutImposter` via [`Self::quota_refusal_for_config`], or
+    /// `PatchStubs` directly — goes through it.
     #[allow(clippy::result_large_err)]
     fn quotas_for(
         tenants: &Table<'_, &'static str, &'static str>,
         tenant: &str,
-    ) -> StorageResult<Quotas> {
+    ) -> StorageResult<Result<Quotas, String>> {
         Ok(match Self::stored_tenant(tenants, tenant)? {
-            // A corrupt record is not a licence to ignore the ceiling, but it
-            // is also not a reason to refuse every write: the op's own arm has
-            // already surfaced corruption where it matters (`require_live_tenant`
-            // refuses against an unreadable row), so falling back to the default
-            // here cannot let a write past a check that would otherwise have run.
-            Err(_) | Ok(None) => Quotas::default(),
-            Ok(Some(record)) => record.quotas,
+            Err(reason) => Err(format!(
+                "tenant {tenant:?} has an unreadable record, so its quota cannot \
+                 be checked: {reason}"
+            )),
+            Ok(None) => Ok(Quotas::default()),
+            Ok(Some(record)) => Ok(record.quotas),
         })
     }
 
@@ -1966,7 +2035,10 @@ impl RedbStateMachine {
         port: u16,
         config: &ImposterConfig,
     ) -> StorageResult<Option<String>> {
-        let quotas = Self::quotas_for(tenants, tenant)?;
+        let quotas = match Self::quotas_for(tenants, tenant)? {
+            Ok(quotas) => quotas,
+            Err(reason) => return Ok(Some(reason)),
+        };
         let stubs = config.stubs.len();
         if stubs > quotas.max_stubs_per_imposter as usize {
             return Ok(Some(format!(
@@ -2166,7 +2238,10 @@ impl RedbStateMachine {
                 // how many stubs the imposter ends up with. `max_imposters` is
                 // not re-checked — a patch edits an imposter that already
                 // exists and cannot add one.
-                let quotas = Self::quotas_for(tenants, tenant.as_str())?;
+                let quotas = match Self::quotas_for(tenants, tenant.as_str())? {
+                    Ok(quotas) => quotas,
+                    Err(reason) => return Ok(Err(reason)),
+                };
                 if config.stubs.len() > quotas.max_stubs_per_imposter as usize {
                     return Ok(Err(format!(
                         "tenant {:?} allows at most {} stubs per imposter; this edit would leave {}",
@@ -2437,7 +2512,7 @@ impl RedbStateMachine {
                 // §8.4): naming it would make this refusal a cross-tenant
                 // enumeration oracle. Do not "improve" the message.
                 for config in fetched {
-                    // Both refusals live in this pre-pass so the arm below is
+                    // Every refusal lives in this pre-pass so the arm below is
                     // structurally free of late failures, rather than free of
                     // them only because `validate` happens to run first.
                     let Some(port) = config.port else {
@@ -2456,6 +2531,60 @@ impl RedbStateMachine {
                 };
                 let previously_owned = Self::ports_of_source(configs, tenant_str, id)?;
                 let declared: BTreeSet<u16> = fetched.iter().filter_map(|c| c.port).collect();
+
+                // Quotas bind the pull path too (RFC-002 §4.4, issue #163).
+                //
+                // Enforcing them only on `PutImposter`/`PatchStubs` is exactly
+                // the drift the comment above warns about, and the quieter half
+                // of it: a tenant capped at five imposters could hold five
+                // hundred by pointing a source at a document that declares them,
+                // without anyone typing a port. A ceiling that one write path
+                // ignores is not a ceiling.
+                //
+                // In the pre-pass, and for the same load-bearing reason as the
+                // port checks: `Ok(Err(_))` is a committed `Failed`, not a
+                // rollback, so a refusal raised after the de-declared-port
+                // removals below would leave a half-pull reported as a clean
+                // failure.
+                //
+                // Counted as *the whole post-pull set*, not incrementally: a
+                // pull replaces this source's ports outright, so what matters is
+                // what the tenant ends up holding — everything it holds that
+                // this source does not own, plus everything this pull declares.
+                {
+                    let quotas = match Self::quotas_for(tenants, tenant_str)? {
+                        Ok(quotas) => quotas,
+                        Err(reason) => return Ok(Err(reason)),
+                    };
+                    for config in fetched {
+                        let stubs = config.stubs.len();
+                        if stubs > quotas.max_stubs_per_imposter as usize {
+                            let port = config.port.unwrap_or_default();
+                            return Ok(Err(format!(
+                                "tenant {tenant_str:?} allows at most {} stubs per imposter; \
+                                 the pulled config for port {port} carries {stubs}",
+                                quotas.max_stubs_per_imposter
+                            )));
+                        }
+                    }
+                    let mut retained = 0u32;
+                    for item in configs.iter().map_err(io)? {
+                        let (key, _) = item.map_err(io)?;
+                        let (stored_tenant, stored_port) = key.value();
+                        if stored_tenant == tenant_str && !previously_owned.contains(&stored_port) {
+                            retained = retained.saturating_add(1);
+                        }
+                    }
+                    let total =
+                        retained.saturating_add(u32::try_from(declared.len()).unwrap_or(u32::MAX));
+                    if total > quotas.max_imposters {
+                        return Ok(Err(format!(
+                            "tenant {tenant_str:?} is limited to {} imposters; this pull would \
+                             leave it holding {total}",
+                            quotas.max_imposters
+                        )));
+                    }
+                }
 
                 for port in previously_owned.iter().filter(|p| !declared.contains(p)) {
                     configs.remove((tenant_str, *port)).map_err(io)?;
@@ -2734,78 +2863,95 @@ impl RedbStateMachine {
     /// `ImposterManager`), and vice versa. Neither handle's absence gates the
     /// other's actions — unlike the pre-#131 shape, which could return early
     /// only because every action was engine-bound.
-    async fn drive_engine(&self, actions: Vec<EngineAction>) {
-        for action in actions {
-            match action {
-                EngineAction::Sync(desired) => {
-                    let Some(engine) = &self.engine else { continue };
-                    let desired_ports: std::collections::BTreeSet<u16> =
-                        desired.iter().filter_map(|c| c.port).collect();
-                    match engine.apply_config(desired).await {
-                        Ok(report) => self.record_report(&report, &desired_ports),
-                        Err(e) => {
-                            tracing::error!(error = %e, "engine refused the applied config set");
-                            self.apply_failures.lock().insert(0, e.to_string());
-                        }
-                    }
-                }
-                EngineAction::RefuseSync { port, error } => {
-                    if self.engine.is_none() {
-                        continue;
-                    }
-                    tracing::error!(
-                        port,
-                        error = %error,
-                        "refusing engine sync: a stored record will not parse \
-                         (a partial sync would delete live imposters)"
-                    );
-                    self.apply_failures.lock().insert(port, error);
-                }
-                EngineAction::SetEnabled { port, enabled } => {
-                    let Some(engine) = &self.engine else { continue };
-                    match engine.set_imposter_enabled(port, enabled).await {
-                        Ok(()) => {
-                            self.apply_failures.lock().remove(&port);
-                        }
-                        Err(e) => {
-                            tracing::error!(port, error = %e, "engine refused a committed toggle");
-                            self.apply_failures.lock().insert(port, e.to_string());
-                        }
-                    }
-                }
-                EngineAction::Patch { port, edit } => {
-                    let Some(engine) = &self.engine else { continue };
-                    match Self::drive_patch(engine, port, &edit).await {
-                        Ok(()) => {
-                            self.apply_failures.lock().remove(&port);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                port,
-                                error = %e,
-                                "engine refused a committed stub edit"
-                            );
-                            self.apply_failures.lock().insert(port, e.to_string());
-                        }
-                    }
-                }
-                EngineAction::SyncRoutes(table) => {
-                    if let Some(routes) = &self.routes {
-                        routes.store(Arc::new(CompiledRoutes::new(&table)));
-                    }
-                }
-                EngineAction::RefuseRoutesSync { id, error } => {
-                    tracing::error!(
-                        route_id = %id,
-                        error = %error,
-                        "refusing route-table sync: a stored record will not parse \
-                         (the front door keeps its last-known-good table)"
-                    );
-                }
-            }
+    async fn drive_engine(&self, actions: Vec<AttributedAction>) {
+        for AttributedAction { principal, action } in actions {
+            // U-10: re-open the attribution scope the admin request task could
+            // not carry across the task boundary, so the listener upstream
+            // invokes sees `EventContext::principal`. Wrapping each action
+            // individually is deliberate — one `apply` batch can hold entries
+            // from different principals, and attributing the whole batch to
+            // whichever one happened to be first would be worse than the `None`
+            // it replaces: wrong attribution in an audit-adjacent stream is not
+            // a smaller error than missing attribution.
+            rift_ee::seams::with_principal_scope(principal, async {
+                self.drive_one(action).await;
+            })
+            .await;
         }
         if self.engine.is_some() {
             crate::metrics::observe_apply_failures(&self.apply_failures.lock());
+        }
+    }
+
+    /// One action against the engine / route table. Runs inside the caller's
+    /// principal scope; see [`AttributedAction`].
+    async fn drive_one(&self, action: EngineAction) {
+        match action {
+            EngineAction::Sync(desired) => {
+                let Some(engine) = &self.engine else { return };
+                let desired_ports: std::collections::BTreeSet<u16> =
+                    desired.iter().filter_map(|c| c.port).collect();
+                match engine.apply_config(desired).await {
+                    Ok(report) => self.record_report(&report, &desired_ports),
+                    Err(e) => {
+                        tracing::error!(error = %e, "engine refused the applied config set");
+                        self.apply_failures.lock().insert(0, e.to_string());
+                    }
+                }
+            }
+            EngineAction::RefuseSync { port, error } => {
+                if self.engine.is_none() {
+                    return;
+                }
+                tracing::error!(
+                    port,
+                    error = %error,
+                    "refusing engine sync: a stored record will not parse \
+                     (a partial sync would delete live imposters)"
+                );
+                self.apply_failures.lock().insert(port, error);
+            }
+            EngineAction::SetEnabled { port, enabled } => {
+                let Some(engine) = &self.engine else { return };
+                match engine.set_imposter_enabled(port, enabled).await {
+                    Ok(()) => {
+                        self.apply_failures.lock().remove(&port);
+                    }
+                    Err(e) => {
+                        tracing::error!(port, error = %e, "engine refused a committed toggle");
+                        self.apply_failures.lock().insert(port, e.to_string());
+                    }
+                }
+            }
+            EngineAction::Patch { port, edit } => {
+                let Some(engine) = &self.engine else { return };
+                match Self::drive_patch(engine, port, &edit).await {
+                    Ok(()) => {
+                        self.apply_failures.lock().remove(&port);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            port,
+                            error = %e,
+                            "engine refused a committed stub edit"
+                        );
+                        self.apply_failures.lock().insert(port, e.to_string());
+                    }
+                }
+            }
+            EngineAction::SyncRoutes(table) => {
+                if let Some(routes) = &self.routes {
+                    routes.store(Arc::new(CompiledRoutes::new(&table)));
+                }
+            }
+            EngineAction::RefuseRoutesSync { id, error } => {
+                tracing::error!(
+                    route_id = %id,
+                    error = %error,
+                    "refusing route-table sync: a stored record will not parse \
+                     (the front door keeps its last-known-good table)"
+                );
+            }
         }
     }
 
@@ -3161,7 +3307,16 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                         };
                         let response = match outcome {
                             Ok(actions) => {
-                                engine_actions.extend(actions);
+                                // U-10: each action remembers who caused it, so
+                                // the engine drive below can re-open the
+                                // attribution scope per action rather than per
+                                // batch (see `AttributedAction`).
+                                engine_actions.extend(actions.into_iter().map(|action| {
+                                    AttributedAction {
+                                        principal: request.principal.clone(),
+                                        action,
+                                    }
+                                }));
                                 ControlResponse::applied(log_id.index)
                             }
                             Err(reason) => ControlResponse::failed(log_id.index, reason),
@@ -3417,8 +3572,14 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
         // A snapshot replaces the whole applied state, so the engine and the
         // front door's compiled table both converge on it the same way apply
-        // does — after the durable write, best-effort.
-        self.drive_engine(vec![config_action, routes_action]).await;
+        // does — after the durable write, best-effort. Unattributed: a snapshot
+        // is the sum of many principals' writes, so naming any one of them
+        // would be a lie.
+        self.drive_engine(vec![
+            AttributedAction::unattributed(config_action),
+            AttributedAction::unattributed(routes_action),
+        ])
+        .await;
 
         Ok(())
     }
@@ -3457,7 +3618,7 @@ mod tests {
     use openraft::{
         CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder, StorageError,
     };
-    use redb::ReadableTable;
+    use redb::{ReadableDatabase, ReadableTable};
     use rift_ee::seams::{
         CompiledRoutes, ImposterConfig, ImposterManager, Route, RouteMatch, RouteTable, RouteTarget,
     };
@@ -3466,13 +3627,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        DEDUP_TTL_SECS, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine, SM_DEDUP_TABLE,
-        SM_TENANTS_TABLE, SourceRecord, new,
+        DEDUP_TTL_SECS, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine, SM_CONFIGS_TABLE,
+        SM_DEDUP_TABLE, SM_TENANTS_TABLE, SourceRecord, StoredImposter, new,
     };
     use crate::control::{
-        AuthSource, ControlOp, ControlOutcome, ControlRequest, ControlResponse, Digest,
-        FLEET_SCOPE, OnDrift, Principal, PrincipalId, Quotas, Role, SourceMode, StubEdit,
-        StubEditScript, TenantId,
+        AUDIT_RESOURCE_ALL, AuditRow, AuthSource, ControlOp, ControlOutcome, ControlRequest,
+        ControlResponse, Digest, FLEET_SCOPE, OnDrift, Principal, PrincipalId, Quotas, Role,
+        SourceMode, StubEdit, StubEditScript, TenantId,
     };
     use crate::raft::TypeConfig;
 
@@ -5937,5 +6098,1015 @@ mod tests {
             "reconcile_engine must re-seed the routes handle from sm_routes, \
              not only the engine"
         );
+    }
+
+    // -- issue #163: the audit projection and leader-side quotas --------------
+    //
+    // RFC-002 §9/§4.4. These are the state-machine half of the gate; the
+    // every-node claims are asserted across a real three-node cluster in
+    // `tests/cluster.rs`, and the RBAC-visibility claims over HTTP in
+    // `rift-ee-server/tests/rbac.rs`.
+
+    fn audit_rows(sm: &RedbStateMachine) -> Vec<AuditRow> {
+        sm.audit_since(0, None, 10_000).expect("read audit")
+    }
+
+    /// The ports a tenant currently holds, ascending. `configured_ports` answers
+    /// for the default tenant only, and a quota test needs a real tenant record
+    /// — which `default` cannot have.
+    fn ports_in_tenant(sm: &RedbStateMachine, tenant: &str) -> Vec<u16> {
+        let read_txn = sm.db.begin_read().expect("read txn");
+        let table = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .expect("open sm_configs");
+        let mut ports: Vec<u16> = Vec::new();
+        for item in table.iter().expect("iter configs") {
+            let (key, _) = item.expect("config row");
+            let (stored_tenant, port) = key.value();
+            if stored_tenant == tenant {
+                ports.push(port);
+            }
+        }
+        ports.sort_unstable();
+        ports
+    }
+
+    /// A `SourcePut` in a named tenant — the existing `source_put` helper is
+    /// default-tenant only.
+    fn source_put_in(op_id: u128, tenant: &str, id: &str) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::SourcePut {
+                tenant: TenantId::new(tenant),
+                id: id.to_owned(),
+                uri: "https://h/i.json".to_owned(),
+                mode: SourceMode::Pinned,
+                auth_ref: None,
+                on_drift: OnDrift::Overwrite,
+                poll_secs: None,
+            },
+        )
+    }
+
+    /// A `SourcePullResult` in a named tenant, with `stubs_each` stubs per port.
+    fn pull_in(
+        op_id: u128,
+        tenant: &str,
+        id: &str,
+        ports: &[u16],
+        stubs_each: usize,
+    ) -> ControlRequest {
+        let configs: Vec<ImposterConfig> = ports
+            .iter()
+            .map(|port| {
+                let stubs: Vec<serde_json::Value> = (0..stubs_each)
+                    .map(|i| json!({ "id": format!("s{port}-{i}") }))
+                    .collect();
+                config(*port, serde_json::Value::Array(stubs))
+            })
+            .collect();
+        request(
+            op_id,
+            ControlOp::SourcePullResult {
+                tenant: TenantId::new(tenant),
+                id: id.to_owned(),
+                version: Some("v1".to_owned()),
+                digest: Digest::new("digest-v1"),
+                configs,
+            },
+        )
+    }
+
+    /// [`RedbStateMachine::read_config`] answers for the default tenant only, so
+    /// a quota test — which needs a real tenant record, and `default` cannot
+    /// have one — reads the table directly.
+    fn stub_ids_in_tenant(sm: &RedbStateMachine, tenant: &str, port: u16) -> Vec<String> {
+        let read_txn = sm.db.begin_read().expect("read txn");
+        let table = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .expect("open sm_configs");
+        let guard = table
+            .get((tenant, port))
+            .expect("get config")
+            .expect("config present");
+        let stored: StoredImposter =
+            serde_json::from_str(guard.value()).expect("stored imposter parses");
+        let config: serde_json::Value =
+            serde_json::from_str(&stored.config_json).expect("config parses");
+        config["stubs"]
+            .as_array()
+            .expect("stubs array")
+            .iter()
+            .map(|s| s["id"].as_str().expect("test stubs carry ids").to_owned())
+            .collect()
+    }
+
+    fn tenant_put_with_quotas(
+        op_id: u128,
+        tenant: &str,
+        quotas: Quotas,
+        journal_retention_secs: u64,
+    ) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::TenantPut {
+                tenant: TenantId::new(tenant),
+                display_name: tenant.to_owned(),
+                quotas,
+                journal_retention_secs,
+            },
+        )
+    }
+
+    fn put_in_tenant(op_id: u128, tenant: &str, port: u16) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::PutImposter {
+                tenant: TenantId::new(tenant),
+                config: Box::new(config(port, json!([{ "id": "a" }]))),
+            },
+        )
+    }
+
+    /// A write is audited once, with every field taken from the committed entry
+    /// rather than from anything a handler decided.
+    #[tokio::test]
+    async fn a_committed_write_is_projected_into_exactly_one_audit_row() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let mut req = put(7, 8080, json!([{ "id": "a" }]));
+        req.principal = Some("default/alice".to_owned());
+        req.issued_at_secs = 1_700_000_000;
+
+        let response = apply_one(&mut sm, 5, req).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+
+        let rows = audit_rows(&sm);
+        assert_eq!(rows.len(), 1, "one write, one row: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.principal.as_deref(), Some("default/alice"));
+        assert_eq!(row.tenant, TenantId::default());
+        assert_eq!(row.action, "imposter.write");
+        assert_eq!(row.resource, "8080");
+        assert_eq!(row.op_id, Uuid::from_u128(7));
+        assert_eq!(
+            row.revision, 5,
+            "the row carries the applying log index, which is the same revision \
+             the write's own response returned"
+        );
+        assert_eq!(row.outcome, ControlOutcome::Applied);
+        assert_eq!(
+            row.ts_secs, 1_700_000_000,
+            "the timestamp is the entry's replicated issued_at_secs, so every \
+             replica derives the same one — never a local SystemTime::now()"
+        );
+    }
+
+    /// The exactly-once claim, against the one thing that can break it: a
+    /// replayed `op_id`. The projection sits below the dedup short-circuit, so a
+    /// replay returns the original response and appends nothing.
+    #[tokio::test]
+    async fn a_replayed_op_id_does_not_append_a_second_audit_row() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let first = apply_one(&mut sm, 1, put(7, 8080, json!([{ "id": "a" }]))).await;
+        let replay = apply_one(&mut sm, 2, put(7, 8080, json!([{ "id": "a" }]))).await;
+        assert_eq!(replay, first, "the replay returns the original response");
+
+        let rows = audit_rows(&sm);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a replay is not a second write and must not be a second row: {rows:?}"
+        );
+        assert_eq!(rows[0].revision, 1, "the row keeps the original revision");
+    }
+
+    /// A refusal is a committed decision, and the audit stream records it. "Who
+    /// tried to do what and was refused" is the half of an audit log that
+    /// matters most.
+    #[tokio::test]
+    async fn a_refusal_is_audited_as_a_committed_failed_decision() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let mut req = request(
+            9,
+            ControlOp::PatchStubs {
+                tenant: TenantId::default(),
+                port: 4444,
+                edit: StubEditScript(vec![StubEdit::DeleteById {
+                    id: "nope".to_owned(),
+                }]),
+            },
+        );
+        req.principal = Some("default/mallory".to_owned());
+
+        let response = apply_one(&mut sm, 3, req).await;
+        let ControlOutcome::Failed { .. } = &response.outcome else {
+            panic!(
+                "patching an absent port must fail, got {:?}",
+                response.outcome
+            );
+        };
+
+        let rows = audit_rows(&sm);
+        assert_eq!(rows.len(), 1, "a refusal is still a row: {rows:?}");
+        assert_eq!(rows[0].principal.as_deref(), Some("default/mallory"));
+        assert_eq!(rows[0].revision, 3);
+        assert_eq!(
+            rows[0].outcome, response.outcome,
+            "the audited outcome is the committed one, verbatim"
+        );
+    }
+
+    /// §11 open question 1, as a test: a quota refusal is not an error the
+    /// submitter sees at submit time — it is a committed `Failed` at a revision,
+    /// which is exactly what makes it discoverable through `op_status` after a
+    /// parked write replays.
+    #[tokio::test]
+    async fn a_quota_refusal_is_a_committed_failed_decision_naming_the_ceiling() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            tenant_put_with_quotas(
+                1,
+                "acme",
+                Quotas {
+                    max_imposters: 1,
+                    ..Quotas::default()
+                },
+                0,
+            ),
+        )
+        .await;
+
+        let first = apply_one(&mut sm, 2, put_in_tenant(2, "acme", 8080)).await;
+        assert_eq!(
+            first.outcome,
+            ControlOutcome::Applied,
+            "the first imposter is inside the ceiling"
+        );
+
+        let refused = apply_one(&mut sm, 3, put_in_tenant(3, "acme", 8081)).await;
+        let ControlOutcome::Failed { reason } = &refused.outcome else {
+            panic!("the second imposter is over the ceiling: {refused:?}");
+        };
+        assert!(
+            reason.contains("ceiling") && reason.contains('1'),
+            "the refusal must name the ceiling it hit, not just fail: {reason}"
+        );
+        assert_eq!(refused.revision, 3, "the refusal has a revision of its own");
+
+        assert!(
+            sm.read_config(8081).expect("read").is_none(),
+            "a refused write must not land"
+        );
+
+        let refusal_row = audit_rows(&sm)
+            .into_iter()
+            .find(|r| r.revision == 3)
+            .expect("the refusal is audited");
+        assert_eq!(refusal_row.outcome, refused.outcome);
+        assert_eq!(refusal_row.tenant, TenantId::new("acme"));
+        assert_eq!(refusal_row.resource, "8081");
+    }
+
+    /// The `max_imposters` count excludes the port being written, so a tenant
+    /// sitting exactly at its ceiling can still update what it already owns.
+    /// Without this, a full tenant would be frozen rather than merely full.
+    #[tokio::test]
+    async fn a_tenant_at_its_ceiling_can_still_replace_an_imposter_it_owns() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            tenant_put_with_quotas(
+                1,
+                "acme",
+                Quotas {
+                    max_imposters: 1,
+                    ..Quotas::default()
+                },
+                0,
+            ),
+        )
+        .await;
+        apply_one(&mut sm, 2, put_in_tenant(2, "acme", 8080)).await;
+
+        let replace = apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::PutImposter {
+                    tenant: TenantId::new("acme"),
+                    config: Box::new(config(8080, json!([{ "id": "b" }]))),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            replace.outcome,
+            ControlOutcome::Applied,
+            "replacing an owned imposter adds none, so the ceiling is not reached"
+        );
+    }
+
+    /// The per-imposter stub ceiling applies to a `PutImposter` payload and to
+    /// the *result* of a `PatchStubs` — a script is a sequence of edits, so only
+    /// the config it produces knows how many stubs the imposter ends up with.
+    #[tokio::test]
+    async fn the_stub_ceiling_refuses_both_a_config_and_an_edit_that_would_exceed_it() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            tenant_put_with_quotas(
+                1,
+                "acme",
+                Quotas {
+                    max_stubs_per_imposter: 2,
+                    ..Quotas::default()
+                },
+                0,
+            ),
+        )
+        .await;
+
+        let too_many = apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::PutImposter {
+                    tenant: TenantId::new("acme"),
+                    config: Box::new(config(
+                        8080,
+                        json!([{ "id": "a" }, { "id": "b" }, { "id": "c" }]),
+                    )),
+                },
+            ),
+        )
+        .await;
+        let ControlOutcome::Failed { reason } = &too_many.outcome else {
+            panic!("three stubs against a ceiling of two must fail: {too_many:?}");
+        };
+        assert!(reason.contains('2'), "{reason}");
+
+        // At the ceiling: accepted.
+        let at_ceiling = apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::PutImposter {
+                    tenant: TenantId::new("acme"),
+                    config: Box::new(config(8080, json!([{ "id": "a" }, { "id": "b" }]))),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(at_ceiling.outcome, ControlOutcome::Applied);
+
+        // And an edit that would push it over is refused on its result.
+        let over_by_edit = apply_one(
+            &mut sm,
+            4,
+            request(
+                4,
+                ControlOp::PatchStubs {
+                    tenant: TenantId::new("acme"),
+                    port: 8080,
+                    edit: StubEditScript(vec![StubEdit::Add {
+                        stub: serde_json::from_value(json!({ "id": "c" }))
+                            .expect("test stub parses"),
+                        index: None,
+                    }]),
+                },
+            ),
+        )
+        .await;
+        let ControlOutcome::Failed { reason } = &over_by_edit.outcome else {
+            panic!("an edit taking the imposter to three stubs must fail: {over_by_edit:?}");
+        };
+        assert!(reason.contains('2'), "{reason}");
+        assert_eq!(
+            stub_ids_in_tenant(&sm, "acme", 8080),
+            vec!["a".to_owned(), "b".to_owned()],
+            "the refused edit left the stored config untouched"
+        );
+    }
+
+    /// A fleet with no tenant records configured must not find every write
+    /// refused because an absent record read as a quota of nothing.
+    #[tokio::test]
+    async fn a_tenant_with_no_stored_record_gets_the_generous_default_quota() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        for (index, port) in (8080u16..8090).enumerate() {
+            let response = apply_one(
+                &mut sm,
+                index as u64 + 1,
+                put(index as u128 + 1, port, json!([{ "id": "a" }])),
+            )
+            .await;
+            assert_eq!(
+                response.outcome,
+                ControlOutcome::Applied,
+                "an unconfigured default tenant must not be capacity-locked"
+            );
+        }
+    }
+
+    /// AC3. Retention is measured on the replicated logical clock, and this test
+    /// is built so that a local `SystemTime::now()` could not possibly pass it:
+    /// every timestamp here is decades in the past, so a GC reading the wall
+    /// clock would find *everything* expired and drop the row that must survive.
+    #[tokio::test]
+    async fn audit_retention_gc_runs_on_the_replicated_clock_not_the_local_one() {
+        let (_td, sm) = fresh_sm(None).await;
+        let mut sm = sm.with_audit_retention_secs(100);
+
+        // Three writes on a logical clock that has nothing to do with now.
+        for (index, ts) in [(1u64, 1_000u64), (2, 1_050), (3, 1_090)] {
+            let mut req = put(
+                u128::from(index),
+                8080 + index as u16,
+                json!([{ "id": "a" }]),
+            );
+            req.issued_at_secs = ts;
+            apply_one(&mut sm, index, req).await;
+        }
+        assert_eq!(audit_rows(&sm).len(), 3, "nothing has expired yet");
+
+        // A fourth write advances the replicated clock to 1_200. GC runs against
+        // the clock as it stood *before* its batch (see `gc_audit`), so this
+        // apply does not yet sweep — the fifth one does, with a cutoff of 1_100.
+        let mut advance = put(4, 8099, json!([{ "id": "a" }]));
+        advance.issued_at_secs = 1_200;
+        apply_one(&mut sm, 4, advance).await;
+        assert_eq!(
+            audit_rows(&sm).len(),
+            4,
+            "expiry lags the clock-advancing write by one apply, identically on \
+             every replica"
+        );
+
+        let mut sweep = put(5, 8098, json!([{ "id": "a" }]));
+        sweep.issued_at_secs = 1_200;
+        apply_one(&mut sm, 5, sweep).await;
+
+        let rows = audit_rows(&sm);
+        assert_eq!(
+            rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
+            vec![4, 5],
+            "GC must expire on the replicated clock's cutoff of 1_100, keeping \
+             only the rows inside the window: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r.ts_secs == 1_200),
+            "a wall-clock GC would have dropped these too — every timestamp in \
+             this test is decades old, so this assertion is what distinguishes \
+             the replicated clock from SystemTime::now(): {rows:?}"
+        );
+    }
+
+    /// `0` means keep everything. An operator who turns retention off must not
+    /// lose their history to a zero that reads as "expire immediately".
+    #[tokio::test]
+    async fn audit_retention_of_zero_keeps_every_row() {
+        let (_td, sm) = fresh_sm(None).await;
+        let mut sm = sm.with_audit_retention_secs(0);
+        for index in 1u64..=3 {
+            let mut req = put(
+                u128::from(index),
+                8080 + index as u16,
+                json!([{ "id": "a" }]),
+            );
+            req.issued_at_secs = index * 1_000_000;
+            apply_one(&mut sm, index, req).await;
+        }
+        assert_eq!(
+            audit_rows(&sm).len(),
+            3,
+            "retention 0 is 'forever', not 'expire immediately'"
+        );
+    }
+
+    /// AC4, snapshot half — and the #134/#137 mutant #165 keeps standing: drop
+    /// `audit` from `SnapshotPayload` and a follower that joins by snapshot
+    /// install comes back with an empty history and nothing reports a gap.
+    #[tokio::test]
+    async fn audit_rows_survive_a_snapshot_build_and_install() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let mut req = put(7, 8080, json!([{ "id": "a" }]));
+        req.principal = Some("default/alice".to_owned());
+        apply_one(&mut sm, 1, req).await;
+        let before = audit_rows(&sm);
+        assert_eq!(before.len(), 1);
+
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+
+        assert_eq!(
+            audit_rows(&follower),
+            before,
+            "a node that joins by snapshot install must hold the same audit \
+             history as the node it joined from"
+        );
+    }
+
+    /// AC4, restart half: the rows are in redb, not in memory, so reopening the
+    /// same database file serves them.
+    #[tokio::test]
+    async fn audit_rows_survive_reopening_the_database() {
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("raft.redb");
+        let before = {
+            let (_, mut sm) = new(&path).await.expect("open store");
+            apply_one(&mut sm, 1, put(7, 8080, json!([{ "id": "a" }]))).await;
+            audit_rows(&sm)
+        };
+        let (_, sm) = new(&path).await.expect("reopen store");
+        assert_eq!(
+            audit_rows(&sm),
+            before,
+            "audit history must survive a restart"
+        );
+        assert_eq!(before.len(), 1);
+    }
+
+    /// `since` is a range scan from a revision, and `limit` bounds the response.
+    /// The endpoint is reachable by any tenant admin, so an unbounded read would
+    /// be an unbounded response.
+    #[tokio::test]
+    async fn audit_since_scans_from_a_revision_and_respects_its_limit() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        for index in 1u64..=5 {
+            apply_one(
+                &mut sm,
+                index,
+                put(
+                    u128::from(index),
+                    8080 + index as u16,
+                    json!([{ "id": "a" }]),
+                ),
+            )
+            .await;
+        }
+
+        let from_three = sm.audit_since(3, None, 10_000).expect("read");
+        assert_eq!(
+            from_three.iter().map(|r| r.revision).collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "since is inclusive and ascending by revision"
+        );
+
+        let limited = sm.audit_since(0, None, 2).expect("read");
+        assert_eq!(limited.len(), 2, "limit bounds the response");
+        assert_eq!(limited[0].revision, 1, "and takes the oldest first");
+    }
+
+    /// The tenant filter is applied in the store, not by the caller: handing a
+    /// tenant admin the fleet's rows and trusting a client to narrow them would
+    /// mean the server had already sent another tenant's audit history.
+    #[tokio::test]
+    async fn audit_since_filters_by_tenant_in_the_store() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(&mut sm, 2, tenant_put_req(2, "globex", "Globex")).await;
+        apply_one(&mut sm, 3, put_in_tenant(3, "acme", 8080)).await;
+        apply_one(&mut sm, 4, put_in_tenant(4, "globex", 8081)).await;
+
+        let acme = sm.audit_since(0, Some("acme"), 10_000).expect("read");
+        assert!(
+            acme.iter().all(|r| r.tenant.as_str() == "acme"),
+            "a tenant-scoped read must not leak another tenant's rows: {acme:?}"
+        );
+        assert!(
+            acme.iter().any(|r| r.resource == "8080"),
+            "and must still contain its own: {acme:?}"
+        );
+
+        let fleet = sm.audit_since(0, None, 10_000).expect("read");
+        assert!(
+            fleet.len() > acme.len(),
+            "an unfiltered read is the fleet's"
+        );
+    }
+
+    /// AC6, as deviated. RFC-002 §6 reasons that a fleet-wide delete "carries no
+    /// port, therefore no tenant" and asks for `tenant: null`. #159 has since put
+    /// an explicit tenant on every op, so the delete knows exactly whose
+    /// imposters it destroyed — and recording `null` would hide that in the row
+    /// describing the most destructive operation in the set. The wildcard
+    /// belongs in `resource`, and this asserts it lands there, so the choice is
+    /// pinned rather than left to be re-litigated as a bug.
+    #[tokio::test]
+    async fn delete_all_is_audited_with_the_real_tenant_and_a_wildcard_resource() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(&mut sm, 2, put_in_tenant(2, "acme", 8080)).await;
+        apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::DeleteAll {
+                    tenant: TenantId::new("acme"),
+                },
+            ),
+        )
+        .await;
+
+        let row = audit_rows(&sm)
+            .into_iter()
+            .find(|r| r.revision == 3)
+            .expect("the delete is audited");
+        assert_eq!(
+            row.tenant,
+            TenantId::new("acme"),
+            "the row names whose imposters were destroyed"
+        );
+        assert_eq!(row.resource, AUDIT_RESOURCE_ALL);
+        assert_eq!(row.action, "imposter.delete");
+    }
+
+    /// U-10 (upstream #855). The admin request task's `with_principal_scope` does
+    /// not survive the hop to openraft's state-machine task, so without the
+    /// re-opened scope in `drive_engine` every clustered change event reaches
+    /// M3's SSE and the #164 export sink unattributed. The audit table being
+    /// correctly attributed does not help them — they are on the event path, not
+    /// the log path.
+    #[tokio::test]
+    async fn a_clustered_change_event_carries_the_principal_from_the_log() {
+        use rift_ee::seams::{EventContext, ImposterEvent, ImposterEventListener};
+
+        #[derive(Default)]
+        struct Recorder(parking_lot::Mutex<Vec<Option<String>>>);
+        impl ImposterEventListener for Recorder {
+            fn on_event(&self, _event: &ImposterEvent, ctx: &EventContext) {
+                self.0.lock().push(ctx.principal.clone());
+            }
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let engine = Arc::new(
+            ImposterManager::new()
+                .with_event_listener(Arc::clone(&recorder) as Arc<dyn ImposterEventListener>),
+        );
+        let (_td, mut sm) = fresh_sm(Some(engine)).await;
+
+        let mut req = put(7, 18080, json!([{ "id": "a" }]));
+        req.principal = Some("acme/alice".to_owned());
+        apply_one(&mut sm, 1, req).await;
+
+        let seen = recorder.0.lock().clone();
+        assert!(
+            !seen.is_empty(),
+            "the apply must have driven the engine and emitted at least one event"
+        );
+        assert!(
+            seen.iter().all(|p| p.as_deref() == Some("acme/alice")),
+            "every event from this apply must carry the committing principal, \
+             not None: {seen:?}"
+        );
+    }
+
+    /// The other half of the same contract: a drive with no request behind it —
+    /// a restart replay — reports absent attribution as absent rather than
+    /// borrowing whoever wrote the record originally.
+    #[tokio::test]
+    async fn a_restart_replay_emits_unattributed_events() {
+        use rift_ee::seams::{EventContext, ImposterEvent, ImposterEventListener};
+
+        #[derive(Default)]
+        struct Recorder(parking_lot::Mutex<Vec<Option<String>>>);
+        impl ImposterEventListener for Recorder {
+            fn on_event(&self, _event: &ImposterEvent, ctx: &EventContext) {
+                self.0.lock().push(ctx.principal.clone());
+            }
+        }
+
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("raft.redb");
+        {
+            let (_, mut sm) = new(&path).await.expect("open store");
+            let mut req = put(7, 18081, json!([{ "id": "a" }]));
+            req.principal = Some("acme/alice".to_owned());
+            apply_one(&mut sm, 1, req).await;
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let engine = Arc::new(
+            ImposterManager::new()
+                .with_event_listener(Arc::clone(&recorder) as Arc<dyn ImposterEventListener>),
+        );
+        let (_, sm) = new(&path).await.expect("reopen store");
+        let sm = sm.with_engine(engine);
+        sm.reconcile_engine().await.expect("reconcile");
+
+        let seen = recorder.0.lock().clone();
+        assert!(
+            seen.iter().all(Option::is_none),
+            "a restart materializes a table, not one caller's write — absent \
+             attribution is reported as absent, never guessed: {seen:?}"
+        );
+    }
+
+    /// A zero ceiling is refused at validation rather than stored. It is
+    /// representable and almost never intended: it makes the tenant permanently
+    /// unable to hold a single imposter, and the operator finds out later from a
+    /// write that fails for a reason they will not connect to a quota they set.
+    #[tokio::test]
+    async fn a_zero_quota_ceiling_is_refused_rather_than_stored() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        for quotas in [
+            Quotas {
+                max_imposters: 0,
+                ..Quotas::default()
+            },
+            Quotas {
+                max_stubs_per_imposter: 0,
+                ..Quotas::default()
+            },
+        ] {
+            let response =
+                apply_one(&mut sm, 1, tenant_put_with_quotas(1, "acme", quotas, 0)).await;
+            let ControlOutcome::Failed { reason } = &response.outcome else {
+                panic!("a zero ceiling must be refused: {response:?}");
+            };
+            assert!(reason.contains('0'), "{reason}");
+        }
+    }
+
+    /// A quota is a resource gate, and a gate that cannot read what it is
+    /// gating must treat it as the dangerous class. A corrupt tenant record used
+    /// to yield `Quotas::default()` — the *generous* ceiling — on the strength
+    /// of a comment claiming `require_live_tenant` had already refused upstream.
+    /// It had not: that helper is wired only to the principal/binding arms, and
+    /// neither `PutImposter` nor `PatchStubs` goes through it. So the operator's
+    /// real ceiling silently became 1000 exactly when it became unreadable.
+    #[tokio::test]
+    async fn a_corrupt_tenant_record_refuses_a_write_rather_than_granting_the_default_quota() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            tenant_put_with_quotas(
+                1,
+                "acme",
+                Quotas {
+                    max_imposters: 1,
+                    ..Quotas::default()
+                },
+                0,
+            ),
+        )
+        .await;
+
+        // Corrupt acme's row behind the state machine's back.
+        {
+            let txn = sm.db.begin_write().expect("test txn");
+            {
+                let mut table = txn.open_table(SM_TENANTS_TABLE).expect("test table");
+                table.insert("acme", "{not json").expect("test insert");
+            }
+            txn.commit().expect("test commit");
+        }
+
+        let refused = apply_one(&mut sm, 2, put_in_tenant(2, "acme", 8080)).await;
+        let ControlOutcome::Failed { reason } = &refused.outcome else {
+            panic!("an unreadable quota must refuse, never fall open: {refused:?}");
+        };
+        assert!(
+            reason.contains("unreadable") || reason.contains("corrupt"),
+            "the refusal must say the quota could not be read: {reason}"
+        );
+        assert!(
+            sm.read_config(8080).expect("read").is_none(),
+            "nothing may land while the ceiling is unknown"
+        );
+
+        // And the same for the edit path, which reaches `quotas_for` directly.
+        let refused = apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::PatchStubs {
+                    tenant: TenantId::new("acme"),
+                    port: 8080,
+                    edit: StubEditScript(vec![StubEdit::Add {
+                        stub: serde_json::from_value(json!({ "id": "a" }))
+                            .expect("test stub parses"),
+                        index: None,
+                    }]),
+                },
+            ),
+        )
+        .await;
+        assert!(
+            matches!(refused.outcome, ControlOutcome::Failed { .. }),
+            "the edit path must fail closed too: {refused:?}"
+        );
+    }
+
+    /// A ceiling that one write path ignores is not a ceiling. Enforcing quotas
+    /// only on `PutImposter`/`PatchStubs` let a tenant capped at N imposters hold
+    /// far more by pointing a **source** at a document declaring them — the
+    /// quieter half of the drift `validate_replicable_config` exists to prevent,
+    /// since nobody typed the port.
+    #[tokio::test]
+    async fn a_source_pull_cannot_carry_a_tenant_past_its_imposter_ceiling() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            tenant_put_with_quotas(
+                1,
+                "acme",
+                Quotas {
+                    max_imposters: 2,
+                    ..Quotas::default()
+                },
+                0,
+            ),
+        )
+        .await;
+        apply_one(&mut sm, 2, source_put_in(2, "acme", "mocks")).await;
+
+        let refused = apply_one(
+            &mut sm,
+            3,
+            pull_in(3, "acme", "mocks", &[9001, 9002, 9003], 1),
+        )
+        .await;
+        let ControlOutcome::Failed { reason } = &refused.outcome else {
+            panic!("three imposters against a ceiling of two must refuse: {refused:?}");
+        };
+        assert!(reason.contains('2'), "{reason}");
+        assert_eq!(
+            ports_in_tenant(&sm, "acme"),
+            Vec::<u16>::new(),
+            "a refused pull must be a *whole* refusal — no half-applied set"
+        );
+
+        // Inside the ceiling: applies.
+        let applied = apply_one(&mut sm, 4, pull_in(4, "acme", "mocks", &[9001, 9002], 1)).await;
+        assert_eq!(applied.outcome, ControlOutcome::Applied);
+        assert_eq!(ports_in_tenant(&sm, "acme"), vec![9001, 9002]);
+    }
+
+    /// The stub ceiling binds the pull path too.
+    #[tokio::test]
+    async fn a_source_pull_cannot_carry_an_imposter_past_the_stub_ceiling() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            tenant_put_with_quotas(
+                1,
+                "acme",
+                Quotas {
+                    max_stubs_per_imposter: 1,
+                    ..Quotas::default()
+                },
+                0,
+            ),
+        )
+        .await;
+        apply_one(&mut sm, 2, source_put_in(2, "acme", "mocks")).await;
+
+        let refused = apply_one(&mut sm, 3, pull_in(3, "acme", "mocks", &[9010], 2)).await;
+        let ControlOutcome::Failed { reason } = &refused.outcome else {
+            panic!("two stubs against a ceiling of one must refuse: {refused:?}");
+        };
+        assert!(reason.contains("9010"), "{reason}");
+        assert_eq!(
+            ports_in_tenant(&sm, "acme"),
+            Vec::<u16>::new(),
+            "nothing lands from a refused pull"
+        );
+    }
+
+    /// The audit projection lives in the `Normal` arm, so entries that carry no
+    /// `ControlOp` must produce no rows at all. This is the other half of
+    /// exactly-once: not just "no duplicates", but "nothing invented".
+    #[tokio::test]
+    async fn a_blank_entry_produces_no_audit_row() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let blank = Entry::<TypeConfig> {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Blank,
+        };
+        sm.apply(vec![blank, entry(2, put(7, 8080, json!([{ "id": "a" }])))])
+            .await
+            .expect("apply");
+
+        let rows = audit_rows(&sm);
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the write is audited; a Blank entry is not a write: {rows:?}"
+        );
+        assert_eq!(rows[0].revision, 2);
+    }
+
+    /// Every other test here applies one entry at a time. A committed batch is
+    /// the shape that would break a projection keyed on anything batch-scoped,
+    /// and `gc_audit`'s clock genuinely *is* batch-scoped — so the batch case is
+    /// worth its own assertion rather than an assumption.
+    #[tokio::test]
+    async fn every_entry_in_one_committed_batch_gets_its_own_audit_row() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let batch: Vec<_> = (1u64..=3)
+            .map(|i| {
+                entry(
+                    i,
+                    put(u128::from(i), 8080 + i as u16, json!([{ "id": "a" }])),
+                )
+            })
+            .collect();
+        let responses = sm.apply(batch).await.expect("apply");
+        assert_eq!(responses.len(), 3);
+
+        let rows = audit_rows(&sm);
+        assert_eq!(
+            rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "one row per entry, at its own revision: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.resource.as_str()).collect::<Vec<_>>(),
+            vec!["8081", "8082", "8083"]
+        );
+    }
+
+    /// The snapshot-install call site of `AttributedAction::unattributed`. The
+    /// restart path is covered above; this is the other one, and it is the one a
+    /// joining follower takes — where inventing attribution would be worst,
+    /// because a snapshot is the sum of many principals' writes.
+    #[tokio::test]
+    async fn a_snapshot_install_emits_unattributed_events() {
+        use rift_ee::seams::{EventContext, ImposterEvent, ImposterEventListener};
+
+        #[derive(Default)]
+        struct Recorder(parking_lot::Mutex<Vec<Option<String>>>);
+        impl ImposterEventListener for Recorder {
+            fn on_event(&self, _event: &ImposterEvent, ctx: &EventContext) {
+                self.0.lock().push(ctx.principal.clone());
+            }
+        }
+
+        let (_td, mut leader) = fresh_sm(None).await;
+        let mut req = put(7, 18085, json!([{ "id": "a" }]));
+        req.principal = Some("acme/alice".to_owned());
+        apply_one(&mut leader, 1, req).await;
+
+        let mut builder = leader.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let recorder = Arc::new(Recorder::default());
+        let engine = Arc::new(
+            ImposterManager::new()
+                .with_event_listener(Arc::clone(&recorder) as Arc<dyn ImposterEventListener>),
+        );
+        let (_td2, mut follower) = fresh_sm(Some(engine)).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+
+        let seen = recorder.0.lock().clone();
+        assert!(
+            seen.iter().all(Option::is_none),
+            "a snapshot is the sum of many principals' writes, so naming any one \
+             of them would be a lie: {seen:?}"
+        );
+    }
+
+    /// §11 open question 2, pinned: `journal_retention_secs` is a per-tenant
+    /// policy on the tenant record, not a field of `Quotas`. Stored now, applied
+    /// by the M3 shards (#147) — so this asserts it round-trips, which is the
+    /// whole of what this slice owes it.
+    #[tokio::test]
+    async fn journal_retention_round_trips_on_the_tenant_record_not_in_quotas() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            tenant_put_with_quotas(1, "acme", Quotas::default(), 3_600),
+        )
+        .await;
+
+        let tenant = sm
+            .tenant("acme")
+            .expect("read tenant")
+            .expect("tenant present");
+        assert_eq!(tenant.journal_retention_secs, 3_600);
     }
 }

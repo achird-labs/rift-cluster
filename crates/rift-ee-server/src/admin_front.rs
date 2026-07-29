@@ -369,9 +369,21 @@ enum Terminated {
 /// against the header would let a `TenantAdmin` of `a` administer `b` by
 /// sending one header — the confused-deputy shape RFC-002 §8.1 exists to
 /// close, reached through the one surface where the header is not the subject.
+/// Whether this build can serve `kind` for a tenant other than `default`.
+///
+/// True for the tenancy surface only. Its reads (`RaftNode::tenant`,
+/// `tenant_principals`, `principal_bindings`, `audit_since`) all take the tenant
+/// as an argument and honour it. Everything else — imposters, stubs, routes — is
+/// stored per tenant but read back through default-only paths, so serving a
+/// non-default tenant there would hand back the *default* tenant's data. See the
+/// guard in [`authorize_action`]'s `Allow` arm.
+fn serves_any_tenant(kind: &Terminated) -> bool {
+    matches!(kind, Terminated::Tenancy(_))
+}
+
 fn scope_for(kind: &Terminated) -> Option<TenantId> {
     match kind {
-        Terminated::Tenancy(route) => Some(route.scope()),
+        Terminated::Tenancy(route) => route.scope(),
         Terminated::Create
         | Terminated::ReplaceAllImposters
         | Terminated::DeleteAllImposters
@@ -497,7 +509,7 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     // never reaches `classify` (write-only) or `proxy` (there is no upstream
     // `/front-door/routes` to proxy to — U-11's admin CRUD was deferred).
     if req.method() == Method::GET && path == "/front-door/routes" {
-        return match authorize_action(&state, &req, Action::ImposterRead, None) {
+        return match authorize_action(&state, &req, Action::ImposterRead, None, false) {
             Ok(..) => read_routes(&state, &req).await,
             Err(response) => response,
         };
@@ -524,7 +536,13 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
 
     if let Some(kind) = classify(req.method(), &path, req.uri().query()) {
         let scope = scope_for(&kind);
-        return match authorize_action(&state, &req, action_for(&kind), scope.as_ref()) {
+        return match authorize_action(
+            &state,
+            &req,
+            action_for(&kind),
+            scope.as_ref(),
+            serves_any_tenant(&kind),
+        ) {
             Ok((tenant, principal_id, bindings)) => {
                 terminate(state, req, kind, tenant, principal_id, bindings).await
             }
@@ -550,7 +568,7 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                 target.space.is_some(),
                 target.params.iter().any(|(name, _)| *name == "scenario"),
             );
-            match authorize_action(&state, &req, action, None) {
+            match authorize_action(&state, &req, action, None, false) {
                 // The tenant this front just decided rides along as
                 // upstream's own `x-rift-scope` header, so `EeAuthorizer` —
                 // the loopback's independent defence-in-depth check — sees
@@ -633,6 +651,12 @@ fn authorize_action(
     req: &Request<Incoming>,
     action: Action,
     scope: Option<&TenantId>,
+    // Whether this route can actually *serve* a non-default tenant; see
+    // `serves_any_tenant` and the fail-closed guard in the `Allow` arm below.
+    // Separate from `scope` on purpose: a tenancy-surface route may legitimately
+    // name no tenant of its own (`GET /admin/audit` takes it from the header),
+    // and inferring "not tenant-aware" from "no scope" would 404 it.
+    serves_any_tenant: bool,
 ) -> Result<Authorized, Response<FrontBody>> {
     let resolved = authenticate(state, req)?;
     let Some(resolved) = resolved else {
@@ -691,17 +715,24 @@ fn authorize_action(
             // done so that day does not also require re-plumbing the ops —
             // defence in depth for a guard that, today, makes it unreachable.
             //
-            // Exempt when the route named its own tenant (`scope.is_some()`,
-            // i.e. the tenancy surface — see `scope_for`). The guard is about
-            // **resource** state: `sm_configs`/`sm_routes`/`sm_sources` are
-            // stored per tenant but read back through default-only paths. The
-            // tenancy tables are not like that — `RaftNode::tenant`,
-            // `tenant_principals` and `principal_bindings` all take the tenant
-            // as an argument and honour it, so there is no `default` fallback
-            // for them to land in. Keeping the guard over them would 404 the
-            // entire surface for exactly the tenants it exists to administer,
-            // which is not caution, just a broken feature.
-            if tenant != TenantId::default() && scope.is_none() {
+            // Exempt for the tenancy surface (`serves_any_tenant` — see that
+            // function). The guard is about **resource** state:
+            // `sm_configs`/`sm_routes`/`sm_sources` are stored per tenant but
+            // read back through default-only paths. The tenancy tables are not
+            // like that — `RaftNode::tenant`, `tenant_principals`,
+            // `principal_bindings` and `audit_since` all take the tenant as an
+            // argument and honour it, so there is no `default` fallback for them
+            // to land in. Keeping the guard over them would 404 the entire
+            // surface for exactly the tenants it exists to administer, which is
+            // not caution, just a broken feature.
+            //
+            // This asks the route directly rather than inferring it from
+            // `scope.is_none()`. The two coincided until `GET /admin/audit`,
+            // which *is* tenancy-surface and *does* take its tenant from the
+            // caller's header — under the old inference it 404'd every tenant
+            // admin reading their own audit stream, and did so from a guard
+            // whose stated subject is config data it never touches.
+            if tenant != TenantId::default() && !serves_any_tenant {
                 return Err(tenant_boundary_not_found());
             }
             Ok((tenant, Some(resolved.principal_id), resolved.bindings))
@@ -916,7 +947,8 @@ async fn terminate(
     // to condition an `If-Match` on, no `_rift.script` to resolve, and no
     // loopback route to re-read for the render.
     if let Terminated::Tenancy(route) = kind {
-        return terminate_tenancy(&state, &node, req, route, principal_id, &bindings).await;
+        return terminate_tenancy(&state, &node, req, route, principal_id, &tenant, &bindings)
+            .await;
     }
 
     // Authorization already ran in `handle`, once, for every admin request —
@@ -1335,6 +1367,12 @@ async fn terminate_tenancy(
     req: Request<Incoming>,
     route: tenancy::Route,
     principal_id: Option<String>,
+    // `authorized_tenant` is the tenant the authorization decision was actually
+    // made against — the route's own scope where it has one, else the caller's
+    // `X-Rift-Tenant`. `GET /admin/audit` narrows its rows to exactly this, so
+    // the rows a caller receives and the tenant they were authorized as can
+    // never disagree.
+    authorized_tenant: &TenantId,
     bindings: &[(TenantId, Role)],
 ) -> Response<FrontBody> {
     let idempotency = req
@@ -1384,8 +1422,7 @@ async fn terminate_tenancy(
         }
     };
 
-    let scope = route.scope();
-    let outcome = match tenancy::dispatch(node, route, &body, bindings) {
+    let outcome = match tenancy::dispatch(node, route, &body, authorized_tenant, bindings) {
         Ok(outcome) => outcome,
         Err(tenancy::TenancyError::BadRequest(reason)) => {
             return typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &reason);
@@ -1506,7 +1543,7 @@ async fn terminate_tenancy(
     set_header(
         &mut response,
         HEADER_REVISION,
-        &format!("{scope}@{}", committed.revision),
+        &format!("{authorized_tenant}@{}", committed.revision),
     );
     set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
     if !unapplied.is_empty() {
