@@ -534,6 +534,48 @@ shipped so M3 does not inherit the ambiguity.
 **Q3 — `VerifyRun` granularity** belongs to T2's action matrix and is unchanged
 here.
 
+**Q4 — what a stale minority node does with an authorization read.** Settled
+while writing C25 (issue #165), because the container tier forced the question
+into the open: during a partition, a minority replica has not applied a
+revocation committed on the majority side, so it will still allow. That is
+inherent to consensus, not a defect — §3.1's guarantee is against *replication
+lag in a healthy fleet*, never against a replica that cannot see the commit.
+
+**Resolution: a stale node serves authorization reads from its own applied
+state, and does not refuse outright.** Refusing would make a partition
+indistinguishable from a misconfiguration and would take the entire read surface
+down on a node that is merely behind — and the fleet already has a way to say
+"this answer may be stale", the M3 `Rift-Cluster-Partial` signal, rather than
+needing a second, harsher one here. What is **not** acceptable, and what C25
+pins, is serving stale *authority* once the node can see the commit again: the
+very first request through the previously-minority node after the heal must be
+refused, and the convergence window is measured and bounded. Any TTL cache over
+authorization data breaks exactly that, which is why it is C25's named mutant.
+
+**Q5 — tenanted resource state is stored but not served, and the boundary is a
+404.** Also surfaced by #165. `authorize_action` can decide correctly that a
+principal holds an action in tenant `acme` and still refuse the request, because
+`desired_configs` / `desired_routes` bind only the default tenant's data into the
+local engine: serving it would hand a correctly-authorized caller the **default**
+tenant's resources. The guard (#161, blockers B2/B3) therefore answers §8.4's
+indistinguishable 404 for every non-tenancy route whose decided tenant is not
+`default`.
+
+Two consequences worth stating plainly, because both are easy to misread as bugs:
+
+- **No imposter can be created or read in a non-default tenant by anyone**,
+  fleet admin included. The tenancy surface itself (`/admin/tenants/...`,
+  `/admin/audit`) *is* tenant-aware and is exempt.
+- **The refusal is deliberately identical** to "you hold no binding here" and to
+  "no such resource". `rbac.rs`'s
+  `cross_tenant_probes_are_indistinguishable_from_probes_of_nothing` pins that in
+  process and C27 pins it against a real fleet. Making them distinguishable would
+  turn the surface into an oracle for other tenants' ports.
+
+When the read/sync paths become tenant-aware, this 404 becomes a `200` and both
+tests must be updated deliberately — they are the record that the limit was a
+decision, not an oversight.
+
 ### What the export sink ships, and what it will not promise (issue #164)
 
 T4 derives the audit stream; the export sink is what carries it off the fleet to
@@ -631,3 +673,10 @@ ports; no compute/memory isolation between tenants (quotas bound object
 counts, not CPU); no cross-cluster tenancy federation; no per-tenant audit
 export sink, and no exactly-once delivery to the one there is. Each of these is
 a conscious "no", not an omission.
+
+The data-plane one is the load-bearing one, and it is asserted rather than only
+written down: `c27_tenancy_isolates_ownership_but_not_the_data_plane` requires
+both imposters to answer unauthenticated traffic through every node, and goes red
+the moment a credential is required. Tenancy governs who may *configure* a mock,
+never who may call it — putting a credential in front of the data plane would
+break every system under test the mock exists to serve.

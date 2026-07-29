@@ -252,7 +252,11 @@ Implemented and passing: `test_config_sync_converges`, `test_node_rejoin`,
 `c20_source_pull_converges_and_fetches_once`,
 `c21_tracking_poll_is_leader_only_and_survives_failover`,
 `c22_sources_survive_a_full_cluster_restart`,
-`c23_drift_flags_and_pull_overwrites`.
+`c23_drift_flags_and_pull_overwrites`,
+`c24_rbac_enforcement_is_identical_through_any_node`,
+`c25_key_revocation_survives_a_partition`,
+`c26_audit_chain_survives_a_full_cluster_restart`,
+`c27_tenancy_isolates_ownership_but_not_the_data_plane`.
 
 `c5_rolling_restart_never_stops_accepting_writes` was committed **failing**, as
 the reproduction for a real defect this tier found (#72): a node that gracefully
@@ -492,6 +496,77 @@ The demo these four back is `deploy/compose/sources-demo.yml` — one
 `RIFT_IMPOSTERS` variable, three nodes serving the same mocks, and one
 `POST /admin/sources/:id/pull` rolling the fleet onto new content. See
 `deploy/README.md`'s "Imposter sources demo".
+
+## C24–C27: tenancy, RBAC and audit
+
+Issue #165 closes #146's acceptance list. These four are the **only** scenarios in
+this tier that run against a *closed* admin plane: every other one relies on
+RFC-002 §3.4 leaving the plane open while the fleet holds no principal, which is
+why they send no credential. `tenancy.overlay.yml` boots the fleet with
+`MB_APIKEY`, so a fleet-admin credential exists from the first request — see that
+file's header for why a scenario cannot bootstrap one over HTTP itself.
+
+| scenario | asserts | mutation story |
+|---|---|---|
+| `c24_rbac_enforcement_is_identical_through_any_node` | one Viewer, the §4.1 action matrix through all three nodes, every verdict identical **including the response body** — plus vacuity guards requiring the matrix to contain a `200`, a `403` and a `404`, so "everyone agreed" cannot be satisfied by a fleet that refuses everything | `RaftNode::principal_bindings` returning empty on a non-leader (a leader-only authorizer) went red on the follower: `node rift-2 never applied the viewer's binding: 404` while the leader answered `200` |
+| `c25_key_revocation_survives_a_partition` | (a) a partitioned minority cannot itself perform an authorization write (`503`/`504`), and (b) the **first** request through the previously-minority node after the heal is refused, with the convergence window measured and bounded | a 60 s TTL cache over `principal_bindings` went red on the majority side immediately: `the side that committed the revocation must refuse the revoked key at once` |
+| `c26_audit_chain_survives_a_full_cluster_restart` | a session spanning `tenant.manage` and `imposter.write` through all three nodes; after a full-fleet stop/start every node's `(revision, action, resource)` projection is byte-identical to its own pre-restart one **and** to every other node's | clearing `sm_audit` whenever the store is opened — rows behaving as if held in memory — went red at `node rift-1 lost or reordered audit rows across the restart` |
+| `c27_tenancy_isolates_ownership_but_not_the_data_plane` | a resource the caller may not see refuses with a `404` **byte-identical** to a port that does not exist and to a tenant this build cannot serve; the tenancy surface refuses cross-tenant reads the same way; and both imposters answer unauthenticated data-plane traffic through every node | requiring an `authorization` header in `handle_request_inner` went red at `alpha's imposter must answer unauthenticated traffic through rift-1 — RFC-002 §7` |
+
+**C24 runs its matrix in the `default` tenant, and that is a statement about the
+build, not a convenience.** This slice *stores* resource state per tenant but
+serves only `default`: `admin_front::authorize_action`'s fail-closed guard (#161,
+blockers B2/B3) answers §8.4's 404 for every non-tenancy route whose decided
+tenant is not `default`, because `raft::store`'s `desired_configs` /
+`desired_routes` skip non-default tenants when binding the local engine. Run in
+`acme`, **every** probe is a 404 regardless of role — authorization is not being
+measured at all, and the vacuity guards are what caught it. The 404 half of the
+403/404 split therefore comes from the *fleet-scoped* routes (`GET /admin/tenants`
+and `GET /admin/audit/sink` both scope to `FLEET_SCOPE`), which a tenant-bound
+principal holds no binding for.
+
+**The same limit reshapes C27.** The issue asks for "two tenants, one imposter
+each"; that is not constructible here, because an imposter cannot be created in
+any tenant but `default` by anyone, fleet admin included. Both tenants and both
+Editors still exist, the imposters live in `default`, and the hidden-resource
+assertion is made from `alpha`'s Editor — which holds no binding there, so it is a
+genuine `NotBoundToTenant` refusal of a resource that genuinely exists. C27 also
+pins the *bound-but-unservable* case (`X-Rift-Tenant: alpha`) as byte-identical to
+both the not-bound and the never-existed refusals: that is the container-tier
+counterpart of `rbac.rs`'s in-process
+`cross_tenant_probes_are_indistinguishable_from_probes_of_nothing`, and it is the
+assertion that must change first — to a `200` — when the read/sync paths become
+tenant-aware.
+
+**Correction to C26's named mutation.** The issue names "the `audit` table omitted
+from `SnapshotPayload`", and requires C26 to exercise "the snapshot-install path,
+not only restart-and-replay". Applied and measured, that mutant **survives here**,
+for the reason this README already records twice for C18 and C22: the default
+`LogEntries(5000)` policy means a chaos stack never builds a snapshot, so
+`stop`/`start` restores from each node's own redb. The snapshot round trip is
+gated in process by `audit_rows_survive_a_snapshot_build_and_install` and
+`the_audit_export_sink_checkpoint_and_gc_watermark_survive_a_snapshot_install` in
+`crates/rift-cluster/src/raft/store.rs`, which drive `build_snapshot` /
+`install_snapshot` directly. What C26 adds is process death, and the mutant that
+kills it is the one in the table. Recorded rather than papered over: a mutant that
+survives is evidence about *where* a property is enforced.
+
+**`GET /admin/whoami` is not a revocation probe, and neither is it a binding
+probe.** It classifies no action (§4.3's `None` case), so it answers `200` to
+anyone who authenticates — including a principal whose every binding has just been
+revoked, since revoking a binding does not delete the key. C25 uses
+`GET /admin/tenants/acme/principals` (`TenantManage`, path-scoped) against a
+`tenant-admin`, giving a sharp `200` → `404`; C24's convergence gate uses the
+Viewer's own read of the seeded imposter, because whoami would go green on a node
+that had replicated the principal row but not the binding.
+
+**Two harness gaps these four exposed**, both fixed in `src/lib.rs`:
+`imposter_ports` sent no credential *and* ignored the status, so on a closed plane
+a `401` read as "this node has no imposters" and `wait_converged` reported a
+*convergence* failure for a *missing credential*; and `wait_admin_reachable` had
+the same shape, reporting a reachable partitioned node as an unreachable one. Both
+now have `_with_key` variants, a non-2xx is a real error, and the last read error
+is carried into the timeout message.
 
 ## Quarantine convention
 

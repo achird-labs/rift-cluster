@@ -136,6 +136,29 @@ jobs:
           # measured at ~18s/iteration, so 100 lands near 30 min.
           - scenario: c23_drift_flags_and_pull_overwrites
             iterations: 100
+          # Stack up, two tenancy writes, one imposter, then 18 probes (6 actions
+          # x 3 nodes) — measured at ~18s/iteration on a warm image, the same
+          # shape and cost as C17/C20/C23, so the same 100, landing near 30 min.
+          # Measure with the image already built: a run that rebuilds the
+          # container absorbs ~90s and is not the per-iteration cost.
+          - scenario: c24_rbac_enforcement_is_identical_through_any_node
+            iterations: 100
+          # A partition, a revocation on the majority, a heal, and a polled
+          # convergence window — measured at ~40s/iteration, the same cost as
+          # C18's and C22's restarts, so the same 80, landing near 53 min. Rides
+          # the chaos overlay as well as the tenancy one, which is what makes the
+          # partition possible at all.
+          - scenario: c25_key_revocation_survives_a_partition
+            iterations: 80
+          # One full-fleet stop/start on top of a four-write session — measured
+          # at ~40s/iteration, identical to C18/C22, so the same 80 (~53 min).
+          - scenario: c26_audit_chain_survives_a_full_cluster_restart
+            iterations: 80
+          # Stack up, two tenants, two principals, two imposters, a handful of
+          # refusal probes and six data-plane reads, no restart — measured at
+          # ~18s/iteration, so 100 lands near 30 min.
+          - scenario: c27_tenancy_isolates_ownership_but_not_the_data_plane
+            iterations: 100
 
     steps:
       - uses: actions/checkout@v4
@@ -175,11 +198,11 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: |
           set -euo pipefail
-          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,39090,42525,45251-45253,45261-45263,46525,48474,49901
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901
           # Assert the read-back, do not merely print it: `sysctl <key>` exits 0
           # whatever the value is, so echoing it would prove nothing about a
           # partially applied or silently truncated write.
-          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,39090,42525,45251-45253,45261-45263,46525,48474,49901"
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901"
 
       # Once per job rather than once per iteration: the image is identical
       # across iterations, and rebuilding it 100 times would dominate the budget.

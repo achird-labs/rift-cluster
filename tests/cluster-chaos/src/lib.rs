@@ -429,7 +429,7 @@ impl Cluster {
 /// with themselves.
 #[must_use]
 pub fn published_host_ports() -> Vec<u16> {
-    let mut ports = Vec::with_capacity(NODES.len() * 5 + 6);
+    let mut ports = Vec::with_capacity(NODES.len() * 5 + 12);
     for node in &NODES {
         ports.extend([
             node.admin,
@@ -444,6 +444,8 @@ pub fn published_host_ports() -> Vec<u16> {
     ports.extend(FLOW_STATE_HOST_PORTS);
     ports.extend(FRONT_DOOR_HOST_PORTS);
     ports.extend(SOURCES_HOST_PORTS);
+    ports.extend(TENANCY_A_HOST_PORTS);
+    ports.extend(TENANCY_B_HOST_PORTS);
     ports
 }
 
@@ -599,12 +601,27 @@ pub async fn probe(port: u16, path: &str) -> anyhow::Result<u16> {
 
 /// GET a JSON document from any published HTTP port.
 pub async fn get_json(port: u16, path: &str) -> anyhow::Result<(u16, serde_json::Value)> {
-    let response = reqwest::Client::new()
+    get_json_with_key(port, path, None).await
+}
+
+/// [`get_json`] carrying an `authorization` header, for the scenarios that run
+/// against a closed admin plane (C24-C27 under `tenancy.overlay.yml`).
+pub async fn get_json_with_key(
+    port: u16,
+    path: &str,
+    key: Option<&str>,
+) -> anyhow::Result<(u16, serde_json::Value)> {
+    let mut request = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}{path}"))
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?;
+        .timeout(Duration::from_secs(10));
+    if let Some(key) = key {
+        request = request.header("authorization", key);
+    }
+    let response = request.send().await?;
     let status = response.status().as_u16();
+    // The status is the subject here, so a body that is not JSON (or is empty)
+    // must not mask it — callers assert on the status and use the body only as
+    // forensics. `imposter_ports_with_key` is where a non-2xx becomes an error.
     let body = response.json().await.unwrap_or(serde_json::Value::Null);
     Ok((status, body))
 }
@@ -619,9 +636,23 @@ pub async fn get_json(port: u16, path: &str) -> anyhow::Result<(u16, serde_json:
 /// a second later -- which reads as "the mgmt network did not hold" and is
 /// wrong. A genuinely unreachable node still fails, just after the timeout.
 pub async fn wait_admin_reachable(admin: u16, timeout: Duration) -> anyhow::Result<()> {
+    wait_admin_reachable_with_key(admin, timeout, None).await
+}
+
+/// [`wait_admin_reachable`] carrying a credential — C25's closed admin plane.
+///
+/// Reachability and authorization are different questions, and on a closed plane
+/// the unauthenticated probe cannot tell them apart: it answers `401` from a node
+/// that is perfectly reachable, and the poll then burns its whole timeout before
+/// reporting what reads as a partition that did not hold.
+pub async fn wait_admin_reachable_with_key(
+    admin: u16,
+    timeout: Duration,
+    key: Option<&str>,
+) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let attempt = match get_json(admin, "/imposters").await {
+        let attempt = match get_json_with_key(admin, "/imposters", key).await {
             Ok((200, _)) => return Ok(()),
             Ok((status, _)) => format!("status {status}"),
             Err(e) => e.to_string(),
@@ -741,6 +772,130 @@ pub async fn put_imposter_with_key(
     Ok((status, headers, envelope))
 }
 
+/// An admin-plane request carrying an API key, returning `(status, body)`.
+///
+/// Forensic body, not a bare status, for the same reason every other helper
+/// here returns one: C24 compares whole responses across three nodes, and a
+/// `403` that agrees on the status while disagreeing on the reason is exactly
+/// the divergence the scenario exists to catch.
+///
+/// `key: None` sends no credential at all — which is a distinct case from a
+/// wrong key, and the two must be distinguishable: an open plane answers the
+/// first and a closed one refuses it.
+pub async fn admin_with_key(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    key: Option<&str>,
+) -> anyhow::Result<(u16, serde_json::Value)> {
+    admin_as(port, method, path, body, key, None).await
+}
+
+/// [`admin_with_key`] naming the tenant the caller is acting under.
+///
+/// `X-Rift-Tenant` **selects among the principal's existing bindings; it never
+/// grants one** (RFC-002 §8.1). Sent explicitly rather than left to default,
+/// because for a create it is the header that decides which tenant *acquires*
+/// the resource — so a scenario that omitted it would be asserting against
+/// whichever tenant the server picked, not the one it meant.
+pub async fn admin_as(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    key: Option<&str>,
+    tenant: Option<&str>,
+) -> anyhow::Result<(u16, serde_json::Value)> {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let client = reqwest::Client::new();
+    let mut request = match method {
+        "GET" => client.get(url),
+        "POST" => client.post(url),
+        "PUT" => client.put(url),
+        "DELETE" => client.delete(url),
+        other => anyhow::bail!("unsupported method {other:?}"),
+    }
+    .timeout(Duration::from_secs(30));
+    if let Some(key) = key {
+        request = request.header("authorization", key);
+    }
+    if let Some(tenant) = tenant {
+        request = request.header("X-Rift-Tenant", tenant);
+    }
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    // A non-JSON body surfaces as null rather than as an error: the status is
+    // what the caller came for, and an unparseable body is itself a finding.
+    let parsed = response.json().await.unwrap_or(serde_json::Value::Null);
+    Ok((status, parsed))
+}
+
+/// Create a tenant as the fleet admin. Returns `(status, body)`.
+pub async fn create_tenant(
+    admin: u16,
+    tenant: &str,
+    key: &str,
+) -> anyhow::Result<(u16, serde_json::Value)> {
+    admin_with_key(
+        admin,
+        "POST",
+        "/admin/tenants",
+        Some(&serde_json::json!({ "id": tenant, "displayName": tenant })),
+        Some(key),
+    )
+    .await
+}
+
+/// Mint a principal bound to `tenant` with `role`, returning `(id, raw key)`.
+///
+/// `role` is the **kebab-case** wire form (`"viewer"`, `"operator"`, `"editor"`,
+/// `"tenant-admin"`) — `Role`'s serde representation, not its Rust spelling.
+///
+/// The id is returned alongside the key because revoking a binding addresses
+/// the principal by id (`DELETE /admin/tenants/:t/bindings/:pid`), and the id is
+/// derived from the key rather than chosen, so a caller cannot reconstruct it.
+///
+/// The key is returned in this one response and never again (RFC-002 §5 shows
+/// it once), so a scenario that drops it cannot recover it — hence returning it
+/// rather than the whole body.
+pub async fn mint_principal(
+    admin: u16,
+    tenant: &str,
+    role: &str,
+    key: &str,
+) -> anyhow::Result<(String, String)> {
+    let (status, body) = admin_with_key(
+        admin,
+        "POST",
+        &format!("/admin/tenants/{tenant}/principals"),
+        Some(&serde_json::json!({ "displayName": format!("{tenant}-{role}"), "role": role })),
+        Some(key),
+    )
+    .await?;
+    anyhow::ensure!(
+        status == 201,
+        "minting a {role} in {tenant} failed: {status} {body}"
+    );
+    // `apiKey`, not `key` — the field name is the contract `tenancy_api.rs`
+    // already asserts in process, and reading the wrong one here would fail as
+    // "no raw key" rather than as the typo it is.
+    let id = body
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("the mint response carried no id: {body}"))?;
+    let raw = body
+        .get("apiKey")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("the mint response carried no raw key: {body}"))?;
+    Ok((id, raw))
+}
+
 /// The one imposter data port the `pull-on-miss` overlay publishes, and the
 /// host ports it appears on — indexed like [`NODES`]. C16 only.
 ///
@@ -756,6 +911,31 @@ pub const PULL_ON_MISS_HOST_PORTS: [u16; 3] = [16300, 26300, 36300];
 /// way a load balancer would.
 pub const FLOW_STATE_IMPOSTER_PORT: u16 = 6400;
 pub const FLOW_STATE_HOST_PORTS: [u16; 3] = [16400, 26400, 36400];
+
+/// C27's two imposter data ports — one per tenant — and the host ports
+/// `tenancy.overlay.yml` publishes them on, indexed like [`NODES`].
+///
+/// Two tenants, two ports, published on every node, because C27's claim is that
+/// tenancy isolates *ownership* and not the data plane: both imposters must
+/// answer unauthenticated traffic through any node. One port would prove only
+/// that one tenant's imposter serves; one node would prove nothing about the
+/// fleet.
+///
+/// Both sit below Linux's ephemeral range (32768-60999), so unlike
+/// [`FLOW_STATE_HOST_PORTS`]'s 36400 they need no `ip_local_reserved_ports`
+/// entry — see #117 and the overlay's header.
+pub const TENANCY_A_IMPOSTER_PORT: u16 = 6500;
+pub const TENANCY_A_HOST_PORTS: [u16; 3] = [16500, 26500, 36500];
+pub const TENANCY_B_IMPOSTER_PORT: u16 = 6501;
+pub const TENANCY_B_HOST_PORTS: [u16; 3] = [16501, 26501, 36501];
+
+/// The fleet-admin credential `tenancy.overlay.yml` boots the fleet with.
+///
+/// A constant rather than a generated value: it is set in the overlay, so the
+/// scenario and the compose file have to agree on it, and a literal that
+/// appears in both is easier to keep true than a value threaded through the
+/// environment.
+pub const TENANCY_FLEET_KEY: &str = "chaos-fleet-admin-key";
 
 /// The front door's host ports under `front-door.overlay.yml` — one per node,
 /// in `NODES` order. C17 and C18 only: no other scenario binds `--front-door`.
@@ -986,13 +1166,31 @@ pub async fn clear_toxics(proxy: &str) -> anyhow::Result<()> {
 
 /// The ports a node currently has configured, read from its admin API.
 pub async fn imposter_ports(admin: u16) -> anyhow::Result<Vec<u64>> {
-    let body: serde_json::Value = reqwest::Client::new()
+    imposter_ports_with_key(admin, None).await
+}
+
+/// [`imposter_ports`] carrying a credential, for the scenarios that run against
+/// a *closed* admin plane (C24-C27 under `tenancy.overlay.yml`).
+///
+/// **Why the status is checked rather than the body simply parsed.** Without the
+/// check a `401` body has no `imposters` array, so it read as "this node has no
+/// imposters" — and `wait_converged` then reported `reached only 0/3 nodes`, a
+/// convergence failure, for what was actually a missing credential. That cost a
+/// full container run to diagnose. An unauthorized read is not an empty read,
+/// and the two must not be spelled the same way.
+pub async fn imposter_ports_with_key(admin: u16, key: Option<&str>) -> anyhow::Result<Vec<u64>> {
+    let mut request = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{admin}/imposters"))
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?
-        .json()
-        .await?;
+        .timeout(Duration::from_secs(10));
+    if let Some(key) = key {
+        request = request.header("authorization", key);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await?;
+    if !status.is_success() {
+        bail!("GET /imposters on {admin} answered {status}: {body}");
+    }
     Ok(body["imposters"]
         .as_array()
         .map(|imposters| {
@@ -1010,6 +1208,15 @@ pub async fn wait_converged(port: u64, timeout: Duration) -> anyhow::Result<()> 
     wait_converged_on(&NODES.iter().collect::<Vec<_>>(), port, timeout).await
 }
 
+/// [`wait_converged`] carrying a credential — C24-C27's closed admin plane.
+pub async fn wait_converged_with_key(
+    port: u64,
+    timeout: Duration,
+    key: &str,
+) -> anyhow::Result<()> {
+    wait_converged_on_with_key(&NODES.iter().collect::<Vec<_>>(), port, timeout, Some(key)).await
+}
+
 /// [`wait_converged`], restricted to a named subset — for scenarios where some
 /// node is deliberately down.
 pub async fn wait_converged_on(
@@ -1017,22 +1224,41 @@ pub async fn wait_converged_on(
     port: u64,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    wait_converged_on_with_key(nodes, port, timeout, None).await
+}
+
+/// The one implementation behind the three wrappers above.
+///
+/// The last read error is carried into the timeout message. Polling must treat
+/// an error as "not yet" — a node that is still starting legitimately refuses —
+/// but discarding it entirely is what made the missing-credential failure above
+/// present as a bare `0/3 nodes` with nothing to act on.
+pub async fn wait_converged_on_with_key(
+    nodes: &[&Node],
+    port: u64,
+    timeout: Duration,
+    key: Option<&str>,
+) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut last_error = None;
     loop {
         let mut seen = 0;
         for node in nodes {
-            if imposter_ports(node.admin)
-                .await
-                .is_ok_and(|ports| ports.contains(&port))
-            {
-                seen += 1;
+            match imposter_ports_with_key(node.admin, key).await {
+                Ok(ports) if ports.contains(&port) => seen += 1,
+                Ok(_) => {}
+                Err(e) => last_error = Some(format!("{}: {e}", node.name)),
             }
         }
         if seen == nodes.len() {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!("imposter {port} reached only {seen}/{} nodes", nodes.len());
+            let detail = last_error.map_or_else(String::new, |e| format!(" (last error: {e})"));
+            bail!(
+                "imposter {port} reached only {seen}/{} nodes{detail}",
+                nodes.len()
+            );
         }
         tokio::time::sleep(POLL).await;
     }
