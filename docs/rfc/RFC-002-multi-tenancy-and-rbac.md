@@ -555,6 +555,20 @@ Listed rather than papered over:
    can execute stub scripts; an argument exists for Operator. Decide with a user,
    not in the abstract.
 
+**All three are settled**, in `docs/architecture/08-tenancy-security.md`, "RFC-002
+§11 open questions, settled here" — read that section, not this list, for the
+current answer. Building T2–T4 also forced two questions this RFC did not think
+to ask, settled in the same place:
+
+4. **What a stale minority node does with an authorization read** — it serves
+   from its own applied state rather than refusing, and what is pinned instead is
+   that the first request after a heal is refused (`c25_key_revocation_survives_a_partition`).
+5. **Tenanted resource state is stored but not served** — authorization can
+   correctly allow an action in a tenant whose resources this slice cannot bind
+   into the local engine, so the request is refused with §8.4's indistinguishable
+   404. That makes §7's "no data-plane change" and §8.4's anti-oracle rule
+   interact in a way worth reading before assuming a cross-tenant 404 is a bug.
+
 ---
 
 ## Appendix A — what this RFC does not change

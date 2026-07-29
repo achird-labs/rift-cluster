@@ -1,0 +1,63 @@
+# Overlay: give the fleet a fleet-admin credential, and publish the two
+# imposter data ports C27 needs.
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/tenancy.overlay.yml up
+#
+# Why C24-C27 need it: every other scenario in this tier runs against an *open*
+# admin plane. That is not an oversight — RFC-002 §3.4 leaves the plane open
+# while the fleet has no principal at all, so a fleet that never configured
+# tenancy keeps working. These four scenarios are the ones that need it shut,
+# and they cannot shut it from the outside: the moment a scenario mints the
+# first principal over the open plane the plane closes, and
+# `POST /admin/tenants/:id/principals` refuses `FleetAdmin` (fleet privilege
+# binds only on the fleet scope, never inside a tenant). Bootstrapping a tenant
+# admin first therefore locks the scenario out of ever creating a fleet admin.
+#
+# `MB_APIKEY` is the way in, and deliberately so: it mints the legacy synthetic
+# principal, and `--cluster-legacy-key-is-fleet-admin` (default true) binds it
+# `FleetAdmin` on the fleet scope. So the scenario boots holding a real fleet
+# credential and adds **no test-only door** to the product — it exercises the
+# same §3.4 migration path an operator upgrading into tenancy actually uses.
+#
+# Note what this does NOT do: `compose.rs` clears `cli.oss.api_key` after
+# capturing it, so upstream's own raw-compare gate is not installed on top of
+# the enterprise authorizer. That matters for C24, whose whole claim is about
+# which verdict the *EE* authorizer returns — a second upstream gate in front of
+# it would short-circuit the 403-vs-404 distinction being asserted.
+#
+# The two data ports are C27's, which asserts the RFC-002 §7 non-goal: tenancy
+# isolates *ownership*, not the data plane, so two tenants' imposters must both
+# answer unauthenticated traffic. Proving that needs a real client reading a
+# real body from the host, which `exec_probe` cannot do.
+#
+# 16500/26500/36500 and 16501/26501/36501 follow the base file's 1xxxx/2xxxx/
+# 3xxxx convention. All six are registered in `published_host_ports()`, and
+# **36500-36501 are additionally reserved** in both `ci.yml` and
+# `nightly-chaos.yml`: they sit inside Linux's ephemeral range (32768-60999), so
+# an unrelated outbound connection can hold one and make `compose up` fail to
+# bind it — exactly flow-state's 36400 lesson. The 1xxxx/2xxxx ports are below
+# the range and need no entry.
+#
+# This comment first claimed all six were below the range. They are not, and
+# `ci_reserves_every_published_port_that_linux_could_hand_out` (#117) failed and
+# named the two — which is the whole reason that test exists.
+services:
+  rift-1:
+    environment:
+      MB_APIKEY: "chaos-fleet-admin-key"
+    ports:
+      - "16500:6500"
+      - "16501:6501"
+  rift-2:
+    environment:
+      MB_APIKEY: "chaos-fleet-admin-key"
+    ports:
+      - "26500:6500"
+      - "26501:6501"
+  rift-3:
+    environment:
+      MB_APIKEY: "chaos-fleet-admin-key"
+    ports:
+      - "36500:6500"
+      - "36501:6501"

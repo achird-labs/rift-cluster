@@ -2529,11 +2529,18 @@ async fn the_checkpoint_never_moves_backwards() {
     cluster.shutdown_all().await;
 }
 
-/// The #134/#137 standing mutant, now guarding two more tables: omit either
-/// from `SnapshotPayload` and a node that catches up by snapshot comes back
-/// either not exporting at all or re-shipping the entire retained history.
+/// The sink and checkpoint survive a node restart.
+///
+/// **Restart, not snapshot install** — the name said otherwise until it was
+/// measured. openraft here runs the default `LogEntries(5000)` snapshot policy,
+/// and this harness commits a few dozen entries, so no snapshot is ever built:
+/// the restarted node restores from its own redb. The chaos README records the
+/// same correction for C18 and C22. The snapshot round trip is gated in process
+/// by `the_audit_export_sink_checkpoint_and_gc_watermark_survive_a_snapshot_install`
+/// in `raft/store.rs`, which drives `build_snapshot`/`install_snapshot`
+/// directly; what this scenario covers is durability across a process death.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sink_and_checkpoint_survive_a_restart_and_snapshot_install() {
+async fn sink_and_checkpoint_survive_a_node_restart() {
     let _serial = TEST_LOCK.lock().await;
     let mut cluster = TestCluster::start(3).await;
     cluster

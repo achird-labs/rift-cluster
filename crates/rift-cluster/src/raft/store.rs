@@ -6925,6 +6925,142 @@ mod tests {
         );
     }
 
+    /// The #164 tables must ride the snapshot too — and this test exists
+    /// because the one that was supposed to cover them did not.
+    ///
+    /// `sink_and_checkpoint_survive_a_restart_and_snapshot_install` in
+    /// `tests/cluster.rs` restarts a node in a 3-node fleet. openraft here runs
+    /// the default `LogEntries(5000)` snapshot policy, and that fleet commits a
+    /// few dozen entries, so **no snapshot is ever built**: the node restores
+    /// from its own redb and the test proves restart-and-replay, not
+    /// `install_snapshot`. The chaos README already records the same correction
+    /// for C18 and C22. So the snapshot round trip is gated here, in process,
+    /// by driving `build_snapshot`/`install_snapshot` directly — exactly as
+    /// `audit_rows_survive_a_snapshot_build_and_install` does for #163's rows.
+    ///
+    /// The standing mutant (#134/#137): drop any of these three from
+    /// `SnapshotPayload` and a node joining by snapshot comes back either not
+    /// exporting at all, re-shipping the whole retained history to the
+    /// customer's bucket, or reporting a clean stream over a window retention
+    /// has already deleted.
+    #[tokio::test]
+    async fn the_audit_export_sink_checkpoint_and_gc_watermark_survive_a_snapshot_install() {
+        let (_td, sm) = fresh_sm(None).await;
+        // Retention short enough that GC actually runs below, so the watermark
+        // under test is a real one rather than a zero that would pass whether
+        // or not it was carried.
+        let mut sm = sm.with_audit_retention_secs(100);
+
+        apply_one(
+            &mut sm,
+            1,
+            request_at(
+                1,
+                1_000,
+                ControlOp::AuditSinkPut {
+                    tenant: TenantId::new(FLEET_SCOPE),
+                    uri: "s3://acme-audit/rift/".to_owned(),
+                    auth_ref: Some("prod-collector".to_owned()),
+                    batch_max_rows: 250,
+                },
+            ),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            2,
+            request_at(
+                2,
+                1_000,
+                ControlOp::AuditCheckpointPut {
+                    tenant: TenantId::new(FLEET_SCOPE),
+                    revision: 1,
+                },
+            ),
+        )
+        .await;
+
+        // Age the sink-declaration row out so GC records a watermark, the same
+        // clock-advance-then-sweep shape
+        // `audit_retention_gc_runs_on_the_replicated_clock_not_the_local_one`
+        // uses (expiry lags the advancing write by one apply).
+        for (index, ts) in [(3u64, 1_200u64), (4, 1_200)] {
+            let mut advance = put(
+                u128::from(index),
+                8080 + index as u16,
+                json!([{ "id": "a" }]),
+            );
+            advance.issued_at_secs = ts;
+            apply_one(&mut sm, index, advance).await;
+        }
+
+        let sink_before = sm.audit_sink().expect("read sink");
+        let checkpoint_before = sm.audit_checkpoint().expect("read checkpoint");
+        let watermark_before = sm.audit_gc_watermark().expect("read watermark");
+        assert!(sink_before.is_some(), "a sink was declared");
+        assert_eq!(checkpoint_before, 1);
+        assert!(
+            watermark_before > 0,
+            "GC must have run for the watermark to be worth carrying; without              this the assertion below would pass on a payload that dropped it"
+        );
+
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+
+        assert_eq!(
+            follower.audit_sink().expect("read sink"),
+            sink_before,
+            "a node joining by snapshot install must inherit the fleet's sink;              without it, it stops exporting the moment it wins an election"
+        );
+        assert_eq!(
+            follower.audit_checkpoint().expect("read checkpoint"),
+            checkpoint_before,
+            "without the checkpoint it resumes from zero and re-ships the whole              retained history to the customer's bucket"
+        );
+        assert_eq!(
+            follower.audit_gc_watermark().expect("read watermark"),
+            watermark_before,
+            "without the watermark it forgets retention ever deleted anything              and reports a clean stream over a permanent hole"
+        );
+    }
+
+    /// An older snapshot, written before #164 existed, must still install —
+    /// same `#[serde(default)]` contract every table added since #134 carries.
+    #[tokio::test]
+    async fn a_pre_audit_export_snapshot_still_installs() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, put(1, 8080, json!([{ "id": "a" }]))).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        // Strip the three #164 fields, standing in for a payload serialized by a
+        // binary that predates them.
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(snapshot.get_ref()).expect("snapshot payload is JSON");
+        for field in ["audit_sink", "audit_checkpoint", "audit_gc_watermark"] {
+            payload
+                .as_object_mut()
+                .expect("payload is an object")
+                .remove(field);
+        }
+        let stripped = std::io::Cursor::new(serde_json::to_vec(&payload).expect("re-encode"));
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, Box::new(stripped))
+            .await
+            .expect("a pre-#164 snapshot must still install");
+        assert_eq!(follower.audit_sink().expect("read sink"), None);
+        assert_eq!(follower.audit_checkpoint().expect("read checkpoint"), 0);
+        assert_eq!(follower.audit_gc_watermark().expect("read watermark"), 0);
+    }
+
     /// AC4, restart half: the rows are in redb, not in memory, so reopening the
     /// same database file serves them.
     #[tokio::test]
