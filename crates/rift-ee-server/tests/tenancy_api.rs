@@ -682,7 +682,7 @@ async fn the_tenant_surface_round_trips_through_create_read_list_and_delete() {
                 "id": "acme",
                 "displayName": "Acme Corp",
                 "quotas": { "maxImposters": 7, "maxStubsPerImposter": 11,
-                            "maxFlowEntries": 13, "journalRetentionSecs": 0 },
+                            "maxFlowEntries": 13 },
             }))
             .send()
             .await
@@ -880,7 +880,8 @@ async fn quotas_written_through_the_surface_reach_the_record() {
             .json(&json!({
                 "displayName": "Acme",
                 "quotas": { "maxImposters": 3, "maxStubsPerImposter": 5,
-                            "maxFlowEntries": 9, "journalRetentionSecs": 60 },
+                            "maxFlowEntries": 9 },
+                "journalRetentionSecs": 60,
             }))
             .send()
             .await
@@ -899,7 +900,6 @@ async fn quotas_written_through_the_surface_reach_the_record() {
             max_imposters: 3,
             max_stubs_per_imposter: 5,
             max_flow_entries: 9,
-            journal_retention_secs: 60,
         }
     );
 

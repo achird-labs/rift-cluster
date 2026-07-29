@@ -63,6 +63,7 @@ async fn spawn_member(
         secret: Some(SECRET.to_owned()),
         routes: flow_routes(Arc::clone(&net)),
         engine: None,
+        audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
     })
     .await
     .unwrap_or_else(|e| panic!("start node {id}: {e}"));

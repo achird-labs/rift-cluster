@@ -34,15 +34,15 @@ pub mod stores;
 pub use bridge::{Bridge, BridgeConfig, CallerClass};
 pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use control::{
-    ControlOp, ControlOutcome, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
-    MAX_SOURCE_PAYLOAD_BYTES, OnDrift, SourceMode, SourceProvenance, StubEdit, StubEditScript,
-    TenantId,
+    AUDIT_RESOURCE_ALL, AuditRow, ControlOp, ControlOutcome, ControlRequest, ControlResponse,
+    DEFAULT_TENANT, Digest, MAX_SOURCE_PAYLOAD_BYTES, OnDrift, SourceMode, SourceProvenance,
+    StubEdit, StubEditScript, TenantId,
 };
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;
 pub use raft::{
-    KeyClass, LeaveOutcome, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey,
-    PullOutcome, RaftNode, Ring, SourceRecord, StatusReport,
+    DEFAULT_AUDIT_RETENTION_SECS, KeyClass, LeaveOutcome, NodeConfig, NodeError, NodeId,
+    NodeIdentity, OwnStatus, OwnedKey, PullOutcome, RaftNode, Ring, SourceRecord, StatusReport,
 };
 pub use rpc::{Authority, AuthorityError, Router, RpcClient, RpcError, RpcServer};
 pub use sources::scheduler::{PollStatus, SourceScheduler};

@@ -87,18 +87,35 @@ impl std::fmt::Display for PrincipalId {
 
 /// Per-tenant resource ceilings (RFC-002 §3.4).
 ///
-/// This slice (#159 T1) stores quotas; it does not enforce them — enforcement
-/// is #163. `Default` picks generous ceilings rather than zero, so a tenant
-/// created without an explicit quota is immediately usable instead of
-/// silently capacity-locked.
+/// Every field here is a **count of objects**, and that is the whole definition
+/// (§7): quotas bound how much a tenant may *have*, never how much CPU it may
+/// burn. One tenant's pathological regex still degrades a shared node — a
+/// stated non-goal, not a gap in this struct.
+///
+/// `Default` picks generous ceilings rather than zero, so a tenant created
+/// without an explicit quota is immediately usable instead of silently
+/// capacity-locked.
+///
+/// # §11 open question 2, settled here
+///
+/// `journal_retention` used to live on this struct and no longer does — it is a
+/// **duration policy**, not a count, and it is enforced by the M3 request
+/// shards rather than by anything that counts objects. Leaving it here would
+/// hand M3 (#147) a field whose name says "quota" and whose meaning is "how
+/// long to keep data", enforced somewhere no other field in this struct is. It
+/// now sits on [`Tenant::journal_retention_secs`], beside the other per-tenant
+/// policy. Moved before M2 ships, so nothing inherits the ambiguity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Quotas {
+    /// Committed imposters a tenant may hold. Enforced at apply (#163).
     pub max_imposters: u32,
+    /// Stubs on any one imposter. Enforced at apply (#163).
     pub max_stubs_per_imposter: u32,
+    /// Flow-state entries. Enforced by the flow owner, not at apply — the
+    /// entries are not in the state machine — so this slice stores it and #147
+    /// applies it.
     pub max_flow_entries: u64,
-    /// `0` = unlimited.
-    pub journal_retention_secs: u64,
 }
 
 impl Default for Quotas {
@@ -107,7 +124,6 @@ impl Default for Quotas {
             max_imposters: 1_000,
             max_stubs_per_imposter: 1_000,
             max_flow_entries: 100_000,
-            journal_retention_secs: 0,
         }
     }
 }
@@ -132,6 +148,15 @@ pub struct Tenant {
     /// same reasoning [`ControlRequest::issued_at_secs`]'s doc gives for dedup.
     pub created_at_secs: u64,
     pub deleted: bool,
+    /// How long the M3 request shards keep this tenant's journal, in seconds;
+    /// `0` = unlimited. See [`Quotas`]' doc for why it lives here rather than
+    /// there (RFC-002 §11 open question 2).
+    ///
+    /// Stored now, applied by #147 — the shards are what that milestone builds,
+    /// so there is nothing here to enforce it against yet. Defaulted so a
+    /// `Tenant` written before this field existed still decodes.
+    #[serde(default)]
+    pub journal_retention_secs: u64,
 }
 
 /// How a principal authenticates (RFC-002 §3.2).
@@ -463,6 +488,12 @@ pub enum ControlOp {
         tenant: TenantId,
         display_name: String,
         quotas: Quotas,
+        /// See [`Tenant::journal_retention_secs`]. Defaulted so a `TenantPut`
+        /// written before this field moved off [`Quotas`] still decodes — it
+        /// lands as `0` (unlimited), which is what the old field's own default
+        /// was.
+        #[serde(default)]
+        journal_retention_secs: u64,
     },
     /// Tombstone a tenant and cascade-remove its `sm_configs`/`sm_routes`/
     /// `sm_sources` rows, in the same committed op — see `mutate_tables`'s
@@ -657,6 +688,152 @@ pub enum StubEdit {
         from: usize,
         to: usize,
     },
+}
+
+/// One audit record (RFC-002 §9, issue #163).
+///
+/// **Derived at apply, from the committed log entry** — never written by the
+/// handler that accepted the request. That is the entire design: the #14 intent
+/// log *is* the write-path audit record, so a row computed from it cannot
+/// disagree with it, and every replica applying the same entry computes the
+/// identical row. An audit log that can disagree with the thing it audits is
+/// worse than none.
+///
+/// The consequence worth stating, because it is unusual in this crate:
+/// **`GET /admin/audit` needs no fan-out.** Any node answers from local state.
+/// (Contrast the M3 request journal, #147, which is genuinely per-node and
+/// needs merge-on-read — do not import that machinery here.)
+///
+/// # What is not in here
+///
+/// Only ops that reach the log. Reads are not audited in v1 (§9, on volume),
+/// and — the part that is easy to misread as a bug — neither are the
+/// *reads-that-mutate* served over the **proxy** path (`ScenarioReset`,
+/// `SavedRequestsClear`, `FlowStateClear`). Those are forwarded to the loopback
+/// OSS admin and never become a [`ControlOp`], so a log-derived projection
+/// cannot see them. Auditing them means putting them on consensus; recording
+/// them at the front door instead would produce per-node rows that can disagree
+/// with the log, which is the one thing this design refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditRow {
+    /// The applying entry's `issued_at_secs` — the replicated clock, so the
+    /// timestamp is identical on every replica rather than each node's idea of
+    /// now.
+    pub ts_secs: u64,
+    /// Who ([`ControlRequest::principal`]). `None` for an op submitted with no
+    /// attribution — the open admin plane, or an internal submitter.
+    pub principal: Option<String>,
+    /// The tenant the op acted on.
+    ///
+    /// Never null, and deliberately so. RFC-002 §6 reasons that a fleet-wide
+    /// delete "carries no port, therefore no tenant" — but #159 put an explicit
+    /// `tenant` on **every** op, so a [`ControlOp::DeleteAll`] destroys one
+    /// named tenant's imposters and knows exactly which. Recording `null` there
+    /// would hide whose data was destroyed, in the row describing the most
+    /// destructive operation in the set. The wildcard belongs in `resource`,
+    /// which is where it is.
+    pub tenant: TenantId,
+    /// The RFC-002 §4.1 action slug — the same strings `authz::Action::as_str`
+    /// produces, so an audit row and an authorization decision name the same
+    /// thing.
+    pub action: String,
+    /// What was acted on: a port, an id, or `"*"` for a whole-scope op.
+    pub resource: String,
+    pub op_id: Uuid,
+    /// The applying log index — the same number the write's response carried.
+    pub revision: u64,
+    pub outcome: ControlOutcome,
+}
+
+/// The wildcard [`AuditRow::resource`] for an op that addresses a whole scope
+/// rather than one object.
+pub const AUDIT_RESOURCE_ALL: &str = "*";
+
+impl ControlOp {
+    /// The tenant this op acts on. Every variant has one (#159).
+    #[must_use]
+    pub fn tenant(&self) -> &TenantId {
+        match self {
+            ControlOp::PutImposter { tenant, .. }
+            | ControlOp::PatchStubs { tenant, .. }
+            | ControlOp::DeleteImposter { tenant, .. }
+            | ControlOp::DeleteAll { tenant }
+            | ControlOp::SetEnabled { tenant, .. }
+            | ControlOp::PutRoutes { tenant, .. }
+            | ControlOp::DeleteRoute { tenant, .. }
+            | ControlOp::SourcePut { tenant, .. }
+            | ControlOp::SourceDelete { tenant, .. }
+            | ControlOp::SourcePullResult { tenant, .. }
+            | ControlOp::TenantPut { tenant, .. }
+            | ControlOp::TenantDelete { tenant }
+            | ControlOp::PrincipalPut { tenant, .. }
+            | ControlOp::PrincipalCreate { tenant, .. }
+            | ControlOp::PrincipalDelete { tenant, .. }
+            | ControlOp::BindingPut { tenant, .. }
+            | ControlOp::BindingDelete { tenant, .. } => tenant,
+        }
+    }
+
+    /// The §4.1 action slug for [`AuditRow::action`].
+    ///
+    /// Exhaustive with no wildcard arm, for the same reason
+    /// `admin_front::action_for` is: a new op added without deciding what it is
+    /// called in the audit stream should fail to compile, not appear under
+    /// whatever the fallthrough happened to say.
+    #[must_use]
+    pub fn audit_action(&self) -> &'static str {
+        match self {
+            ControlOp::PutImposter { .. } => "imposter.write",
+            ControlOp::PatchStubs { .. } => "stub.write",
+            ControlOp::DeleteImposter { .. } | ControlOp::DeleteAll { .. } => "imposter.delete",
+            ControlOp::SetEnabled { .. } => "lifecycle.toggle",
+            // The front door's route table predates §4.1's closed list and has
+            // no action of its own; `admin_front::action_for` gates it as an
+            // imposter-tier config write, and this matches that decision rather
+            // than inventing a second name for the same thing.
+            ControlOp::PutRoutes { .. } => "imposter.write",
+            ControlOp::DeleteRoute { .. } => "imposter.write",
+            ControlOp::SourcePut { .. } | ControlOp::SourcePullResult { .. } => "imposter.write",
+            ControlOp::SourceDelete { .. } => "imposter.delete",
+            ControlOp::TenantPut { .. }
+            | ControlOp::TenantDelete { .. }
+            | ControlOp::PrincipalPut { .. }
+            | ControlOp::PrincipalCreate { .. }
+            | ControlOp::PrincipalDelete { .. }
+            | ControlOp::BindingPut { .. }
+            | ControlOp::BindingDelete { .. } => "tenant.manage",
+        }
+    }
+
+    /// What this op addressed, for [`AuditRow::resource`].
+    #[must_use]
+    pub fn audit_resource(&self) -> String {
+        match self {
+            ControlOp::PutImposter { config, .. } => config
+                .port
+                .map_or_else(|| AUDIT_RESOURCE_ALL.to_owned(), |port| port.to_string()),
+            ControlOp::PatchStubs { port, .. }
+            | ControlOp::DeleteImposter { port, .. }
+            | ControlOp::SetEnabled { port, .. } => port.to_string(),
+            // A whole-scope op names no single object. Wildcard rather than an
+            // empty string so a reader never has to guess whether the field was
+            // omitted or the op really did address everything.
+            ControlOp::DeleteAll { .. }
+            | ControlOp::PutRoutes { .. }
+            | ControlOp::TenantDelete { .. } => AUDIT_RESOURCE_ALL.to_owned(),
+            ControlOp::DeleteRoute { id, .. } => id.clone(),
+            ControlOp::SourcePut { id, .. }
+            | ControlOp::SourceDelete { id, .. }
+            | ControlOp::SourcePullResult { id, .. } => id.clone(),
+            ControlOp::TenantPut { tenant, .. } => tenant.as_str().to_owned(),
+            ControlOp::PrincipalPut { principal, .. } => principal.id.as_str().to_owned(),
+            ControlOp::PrincipalCreate { principal, .. } => principal.id.as_str().to_owned(),
+            ControlOp::PrincipalDelete { principal_id, .. }
+            | ControlOp::BindingPut { principal_id, .. }
+            | ControlOp::BindingDelete { principal_id, .. } => principal_id.as_str().to_owned(),
+        }
+    }
 }
 
 /// How applying a [`ControlOp`] turned out — deterministic on every replica.
@@ -870,15 +1047,32 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
         ControlOp::TenantPut {
             tenant,
             display_name,
-            quotas: _,
+            quotas,
+            journal_retention_secs: _,
         } => {
             require_real_tenant(tenant)?;
             if display_name.trim().is_empty() {
                 return Err("tenant display_name must not be empty".to_owned());
             }
-            // No bounds on `quotas`' values: this slice stores them, it does
-            // not enforce them (#163), so there is nothing here to reject a
-            // number against yet — see `Quotas`' doc comment.
+            // A zero ceiling is refused rather than stored (#163). It is
+            // *representable* and it is almost never what anyone means: it
+            // makes the tenant permanently unable to hold a single imposter,
+            // and the operator finds out later, from a write that fails for a
+            // reason they will not connect to a quota they set. "Unlimited" has
+            // its own spelling — a large number — so a zero here is a typo far
+            // more often than an intention.
+            if quotas.max_imposters == 0 {
+                return Err(
+                    "maxImposters must be at least 1: a ceiling of 0 makes the tenant unusable"
+                        .to_owned(),
+                );
+            }
+            if quotas.max_stubs_per_imposter == 0 {
+                return Err(
+                    "maxStubsPerImposter must be at least 1: a ceiling of 0 refuses every imposter"
+                        .to_owned(),
+                );
+            }
             Ok(())
         }
         ControlOp::TenantDelete { tenant } => {
@@ -1615,6 +1809,7 @@ mod tests {
                     tenant: TenantId::new("acme"),
                     display_name: "Acme Corp".to_owned(),
                     quotas: Quotas::default(),
+                    journal_retention_secs: 0,
                 },
                 "TenantPut",
             ),
@@ -2481,6 +2676,7 @@ mod tests {
             tenant: TenantId::new(id),
             display_name: "Acme Corp".to_owned(),
             quotas: Quotas::default(),
+            journal_retention_secs: 0,
         }
     }
 
@@ -2495,6 +2691,7 @@ mod tests {
             tenant: TenantId::new("acme"),
             display_name: "   ".to_owned(),
             quotas: Quotas::default(),
+            journal_retention_secs: 0,
         };
         let err = validate(&op).expect_err("an empty display name names nothing");
         assert!(err.contains("display_name"), "{err}");

@@ -25,7 +25,7 @@ sequenceDiagram
     F-->>L: fsync'd ✓
     B-->>L: fsync'd ✓
     Note over L: entry N COMMITTED (majority, on disk)
-    L->>L: apply N — sm_configs + ImposterManager::apply_config<br/>revision := N · record sm_op_dedup[k1] = N
+    L->>L: apply N — quota check · sm_configs + ImposterManager::apply_config<br/>revision := N · project sm_audit[N] · record sm_op_dedup[k1] = N
     par barrier: wait for Ready nodes to APPLY N
         F-->>L: applied ≥ N (piggybacked on AppendEntries resp)
         B-->>L: applied ≥ N
@@ -76,6 +76,19 @@ corrupted silently). Hence op-ids, end to end:
   original revision), applying nothing.
 - Entries GC after 24 h; a retry older than that is a new operation
   (documented; retention configurable).
+
+The same apply step also **projects the entry into `sm_audit`** (Chapter 8) — one
+row per committed write, derived from the entry rather than recorded by the
+handler, and placed *below* the dedup short-circuit so a replay adds no second
+row. Because it is derived at apply, every replica computes the identical row and
+`GET /admin/audit` needs no fan-out.
+
+**Quotas are checked at this step too, not before the append.** A refusal is
+therefore a *committed* decision: it lands in the log as
+`ControlOutcome::Failed { reason }` at a revision, identical on every node, and a
+write that was parked during an outage discovers it through
+`GET /_cluster/ops/:id` on replay rather than at submit time. See Chapter 8,
+"What T4 ships".
 
 ## Every failure mode, and what the client sees
 

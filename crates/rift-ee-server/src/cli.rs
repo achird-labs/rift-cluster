@@ -89,6 +89,19 @@ pub struct ClusterArgs {
     )]
     pub cluster_leave_timeout: u64,
 
+    /// How long audit rows are kept, in seconds (0 = forever).
+    ///
+    /// Give every node in a fleet the same value: retention GC runs inside
+    /// apply, so nodes configured differently drop different rows from the same
+    /// log and their audit tables diverge.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
+        env = "RIFT_CLUSTER_AUDIT_RETENTION"
+    )]
+    pub cluster_audit_retention: u64,
+
     /// Address for the unauthenticated /readyz and /healthz probes
     #[arg(
         long,

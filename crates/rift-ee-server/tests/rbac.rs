@@ -119,6 +119,7 @@ fn tenant_put(tenant: &str, display_name: &str) -> ControlOp {
         tenant: TenantId::new(tenant),
         display_name: display_name.to_owned(),
         quotas: Quotas::default(),
+        journal_retention_secs: 0,
     }
 }
 
@@ -924,6 +925,285 @@ async fn a_real_principals_own_key_is_not_401d_by_the_legacy_api_key_gate() {
         401,
         "clearing --api-key from the loopback's own gate must not leave it open; \
          EeAuthorizer is the gate now"
+    );
+
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #163 — who may read `GET /admin/audit`, and what they see.
+//
+// RFC-002 §9 gives `AuditRead` its own action, deliberately *not* folded into
+// `TenantManage` (§4.1): reading who did what and changing who may do what are
+// different powers, so a principal-manager is not automatically an auditor. The
+// tenant narrowing is server-side — the alternative is a server that has already
+// sent another tenant's audit history and is trusting the client to hide it.
+// ---------------------------------------------------------------------------
+
+/// AC5. One server, three callers, three different answers — driven over real
+/// HTTP because the claim is about what the wire returns, not what the evaluator
+/// concludes.
+#[tokio::test]
+async fn the_audit_stream_is_visible_by_role_and_scoped_by_tenant() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 9_000u128;
+
+    seed(node, op_id, tenant_put("acme", "Acme")).await;
+    op_id += 1;
+    seed(node, op_id, tenant_put("globex", "Globex")).await;
+    op_id += 1;
+
+    let editor = seed_bound_principal(node, &mut op_id, "audit-editor", "acme", Role::Editor).await;
+    let acme_admin =
+        seed_bound_principal(node, &mut op_id, "audit-acme", "acme", Role::TenantAdmin).await;
+    let fleet_admin =
+        seed_bound_principal(node, &mut op_id, "audit-fleet", "acme", Role::FleetAdmin).await;
+
+    // Two writes, one per tenant, so a leak is visible rather than hypothetical.
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::new("acme"),
+            config: Box::new(
+                serde_json::from_value(minimal_imposter(19081)).expect("config parses"),
+            ),
+        },
+    )
+    .await;
+    op_id += 1;
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::new("globex"),
+            config: Box::new(
+                serde_json::from_value(minimal_imposter(19082)).expect("config parses"),
+            ),
+        },
+    )
+    .await;
+
+    // `X-Rift-Tenant` names the tenant the caller is acting as, exactly as it
+    // does on every other tenant-scoped route: `GET /admin/audit` carries no
+    // tenant in its path, so it has nothing else to go on.
+    let read_audit = |key: String, tenant: &'static str| {
+        let client = client.clone();
+        async move {
+            client
+                .get(format!("http://{admin}/admin/audit"))
+                .header("authorization", key)
+                .header("x-rift-tenant", tenant)
+                .send()
+                .await
+                .expect("audit read")
+        }
+    };
+
+    // An Editor may write imposters all day and still not read who did.
+    let response = read_audit(editor, "acme").await;
+    assert_eq!(
+        response.status().as_u16(),
+        403,
+        "AuditRead is not part of the Editor tier: reading who did what and \
+         doing it are different powers"
+    );
+
+    // A TenantAdmin sees its own tenant and nothing else.
+    let response = read_audit(acme_admin, "acme").await;
+    assert_eq!(response.status().as_u16(), 200);
+    let rows: Vec<serde_json::Value> = response.json().await.expect("audit body is JSON");
+    assert!(
+        !rows.is_empty(),
+        "a tenant admin must see its own tenant's rows"
+    );
+    assert!(
+        rows.iter().all(|r| r["tenant"] == "acme"),
+        "a tenant admin must never receive another tenant's audit history: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r["resource"] == "19081"),
+        "and must see its own write: {rows:?}"
+    );
+
+    // A FleetAdmin sees the fleet.
+    let response = read_audit(fleet_admin, "acme").await;
+    assert_eq!(response.status().as_u16(), 200);
+    let fleet_rows: Vec<serde_json::Value> = response.json().await.expect("audit body is JSON");
+    assert!(
+        fleet_rows.iter().any(|r| r["tenant"] == "globex"),
+        "a fleet admin sees every tenant's rows: {fleet_rows:?}"
+    );
+    assert!(
+        fleet_rows.len() > rows.len(),
+        "the fleet view is strictly wider than one tenant's"
+    );
+
+    server.shutdown().await;
+}
+
+/// The isolation claim, tested against the implementation that would break it.
+///
+/// A principal bound `TenantAdmin` in **two** tenants is the case where deriving
+/// the row filter by scanning bindings for the first tenant-admin binding — the
+/// obvious implementation, and the one this code deliberately does not use —
+/// silently serves the wrong tenant while looking perfectly authorized. With one
+/// binding per principal (every other test here) that bug is invisible, because
+/// the first match is always the right one.
+#[tokio::test]
+async fn a_principal_bound_to_two_tenants_sees_only_the_one_it_is_acting_as() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 9_800u128;
+
+    seed(node, op_id, tenant_put("acme", "Acme")).await;
+    op_id += 1;
+    seed(node, op_id, tenant_put("globex", "Globex")).await;
+    op_id += 1;
+
+    // One principal, TenantAdmin in both tenants.
+    let raw_key = "rbac-key-audit-dual".to_owned();
+    let principal = principal_with_key("audit-dual", &raw_key);
+    let principal_id = principal.id.clone();
+    seed(node, op_id, principal_put("acme", principal)).await;
+    op_id += 1;
+    for tenant in ["acme", "globex"] {
+        seed(
+            node,
+            op_id,
+            binding_put(tenant, &principal_id, Role::TenantAdmin),
+        )
+        .await;
+        op_id += 1;
+    }
+
+    for (tenant, port) in [("acme", 19181u16), ("globex", 19182)] {
+        seed(
+            node,
+            op_id,
+            ControlOp::PutImposter {
+                tenant: TenantId::new(tenant),
+                config: Box::new(
+                    serde_json::from_value(minimal_imposter(port)).expect("config parses"),
+                ),
+            },
+        )
+        .await;
+        op_id += 1;
+    }
+
+    // Acting as each tenant in turn must yield that tenant's rows and no others.
+    for (acting_as, own_port, other_port) in
+        [("acme", "19181", "19182"), ("globex", "19182", "19181")]
+    {
+        let response = client
+            .get(format!("http://{admin}/admin/audit"))
+            .header("authorization", &raw_key)
+            .header("x-rift-tenant", acting_as)
+            .send()
+            .await
+            .expect("audit read");
+        assert_eq!(response.status().as_u16(), 200, "acting as {acting_as}");
+        let rows: Vec<serde_json::Value> = response.json().await.expect("audit body is JSON");
+
+        assert!(
+            rows.iter().all(|r| r["tenant"] == acting_as),
+            "acting as {acting_as}, every row must be {acting_as}'s: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r["resource"] == own_port),
+            "acting as {acting_as}, its own write must be present: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r["resource"] == other_port),
+            "acting as {acting_as}, the other tenant's write must NOT be: {rows:?}"
+        );
+    }
+
+    server.shutdown().await;
+}
+
+/// AC7, as far as the §9 design permits it. The criteria ask for a
+/// `ScenarioReset` row; that mutation is **proxied** to the loopback OSS admin
+/// and never becomes a `ControlOp`, so a log-derived projection cannot see it.
+/// Producing one would mean recording at the front door — a second, per-node
+/// audit path that can disagree with the log, which is the one thing §9 refuses.
+/// What is real and asserted here is the distinction the criterion is actually
+/// about: a replicated **write** is audited, and a plain **read** is not.
+#[tokio::test]
+async fn a_replicated_write_is_audited_and_a_plain_read_is_not() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 9_500u128;
+
+    let auditor =
+        seed_bound_principal(node, &mut op_id, "audit-reads", "default", Role::FleetAdmin).await;
+
+    let before = node.audit_since(0, None, 10_000).expect("read audit").len();
+
+    // A read over the admin surface.
+    let response = client
+        .get(format!("http://{admin}/imposters"))
+        .header("authorization", &auditor)
+        .send()
+        .await
+        .expect("list imposters");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        node.audit_since(0, None, 10_000).expect("read audit").len(),
+        before,
+        "reads are not audited in v1 (§9, on log volume)"
+    );
+
+    // A write over the same surface.
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .header("authorization", &auditor)
+        .json(&minimal_imposter(19091))
+        .send()
+        .await
+        .expect("create imposter");
+    assert!(
+        response.status().is_success(),
+        "the write must land: {}",
+        response.status()
+    );
+
+    let rows = node.audit_since(0, None, 10_000).expect("read audit");
+    assert_eq!(
+        rows.len(),
+        before + 1,
+        "a replicated write is audited exactly once: {rows:?}"
+    );
+    let row = rows.last().expect("the write's row");
+    assert_eq!(row.action, "imposter.write");
+    assert_eq!(row.resource, "19091");
+    assert!(
+        row.principal.is_some(),
+        "U-10: the row names the principal the admin front authenticated, not \
+         an anonymous write: {row:?}"
     );
 
     server.shutdown().await;
