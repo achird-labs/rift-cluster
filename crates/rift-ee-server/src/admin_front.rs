@@ -77,6 +77,7 @@ use uuid::Uuid;
 use crate::authz::{self, Action, Decision, Denial};
 use crate::cli::WriteBarrier;
 use crate::principal;
+use crate::tenancy;
 
 /// Largest admin request body the front accepts on a terminated route. The
 /// proxied path streams and is not subject to this.
@@ -351,9 +352,47 @@ enum Terminated {
     /// CRUD was deferred), so this is provided here, not there.
     PutRoutes,
     DeleteRoute(String),
+    /// RFC-002 §5's tenancy admin surface (issue #162). Every one of these
+    /// **terminates**, reads included — there is no upstream `/admin/tenants`
+    /// to proxy to, exactly as with `GET /front-door/routes`.
+    Tenancy(tenancy::Route),
+}
+
+/// The tenant a terminated route is authorized against, when the route names
+/// one itself.
+///
+/// `None` means "use `X-Rift-Tenant`", which is right for every resource route:
+/// the header selects which of the caller's bindings they are acting under.
+/// It is wrong for the tenancy surface, where the tenant is a **path segment**
+/// naming the record being administered. Authorizing `/admin/tenants/b/...`
+/// against the header would let a `TenantAdmin` of `a` administer `b` by
+/// sending one header — the confused-deputy shape RFC-002 §8.1 exists to
+/// close, reached through the one surface where the header is not the subject.
+fn scope_for(kind: &Terminated) -> Option<TenantId> {
+    match kind {
+        Terminated::Tenancy(route) => Some(route.scope()),
+        Terminated::Create
+        | Terminated::ReplaceAllImposters
+        | Terminated::DeleteAllImposters
+        | Terminated::DeleteImposter(_)
+        | Terminated::AddStub(_)
+        | Terminated::ReplaceStubs(_)
+        | Terminated::ReplaceStubAt(_, _)
+        | Terminated::DeleteStubAt(_, _)
+        | Terminated::ReplaceStubById(_, _)
+        | Terminated::DeleteStubById(_, _)
+        | Terminated::SetEnabled(_, _)
+        | Terminated::PutRoutes
+        | Terminated::DeleteRoute(_) => None,
+    }
 }
 
 fn classify(method: &Method, path: &str) -> Option<Terminated> {
+    // The tenancy surface first: it is EE-only and terminates in full, so it
+    // must never fall through to the imposter classifiers or the proxy.
+    if let Some(route) = tenancy::classify(method, path) {
+        return Some(Terminated::Tenancy(route));
+    }
     if path == "/front-door/routes" {
         // `GET` is a read, not a mutation — it terminates in `handle` directly
         // rather than through this (write-only) classifier.
@@ -431,10 +470,10 @@ fn action_for(kind: &Terminated) -> Action {
         Terminated::SetEnabled(_, _) => Action::LifecycleToggle,
         // The front-door route table (issue #131) predates RFC-002 and has no
         // action of its own in its closed §4.1 list. Treated as an ordinary
-        // imposter-tier config write pending a dedicated action, should #162
-        // ever expose an admin surface for tenant-scoped route ownership.
+        // imposter-tier config write pending a dedicated action.
         Terminated::PutRoutes => Action::ImposterWrite,
         Terminated::DeleteRoute(_) => Action::ImposterWrite,
+        Terminated::Tenancy(route) => route.action(),
     }
 }
 
@@ -457,14 +496,34 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     // never reaches `classify` (write-only) or `proxy` (there is no upstream
     // `/front-door/routes` to proxy to — U-11's admin CRUD was deferred).
     if req.method() == Method::GET && path == "/front-door/routes" {
-        return match authorize_action(&state, &req, Action::ImposterRead) {
+        return match authorize_action(&state, &req, Action::ImposterRead, None) {
             Ok(_) => read_routes(&state, &req).await,
             Err(response) => response,
         };
     }
 
+    // `GET /admin/whoami` is the one admin route with **no** action (RFC-002
+    // §4.1): it reports the caller's own identity and bindings and nothing
+    // else, so there is nothing to authorize beyond having authenticated.
+    // Handled ahead of `classify` for that reason — routing it through
+    // `authorize_action` would require inventing an action for it, and any
+    // action would be the wrong answer for a principal reading only itself.
+    if req.method() == Method::GET && path == tenancy::WHOAMI_PATH {
+        return match authenticate(&state, &req) {
+            Ok(resolved) => match tenancy::whoami_body(resolved.as_ref()) {
+                Ok(body) => {
+                    buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
+                        .unwrap_or_else(|response| response)
+                }
+                Err(e) => internal(&e),
+            },
+            Err(response) => response,
+        };
+    }
+
     if let Some(kind) = classify(req.method(), &path) {
-        return match authorize_action(&state, &req, action_for(&kind)) {
+        let scope = scope_for(&kind);
+        return match authorize_action(&state, &req, action_for(&kind), scope.as_ref()) {
             Ok((tenant, principal_id)) => terminate(state, req, kind, tenant, principal_id).await,
             Err(response) => response,
         };
@@ -488,7 +547,7 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                 target.space.is_some(),
                 target.params.iter().any(|(name, _)| *name == "scenario"),
             );
-            match authorize_action(&state, &req, action) {
+            match authorize_action(&state, &req, action, None) {
                 // The tenant this front just decided rides along as
                 // upstream's own `x-rift-scope` header, so `EeAuthorizer` —
                 // the loopback's independent defence-in-depth check — sees
@@ -553,11 +612,16 @@ async fn read_routes(state: &Arc<FrontState>, _req: &Request<Incoming>) -> Respo
 ///
 /// Fail closed throughout: a state-machine read that errors becomes a `500`,
 /// never a fallthrough to allow.
+/// `scope`, when given, is the tenant the *route itself* names (the tenancy
+/// surface's path segment — see [`scope_for`]); it replaces `X-Rift-Tenant`
+/// for that request. `None` reads the header, which is the behaviour every
+/// resource route wants.
 #[allow(clippy::result_large_err)]
 fn authorize_action(
     state: &FrontState,
     req: &Request<Incoming>,
     action: Action,
+    scope: Option<&TenantId>,
 ) -> Result<(TenantId, Option<String>), Response<FrontBody>> {
     let resolved = authenticate(state, req)?;
     let Some(resolved) = resolved else {
@@ -570,9 +634,14 @@ fn authorize_action(
         // unauthenticated caller's tenant claim would start being honored
         // the moment a fleet upgrades, before anyone configured any
         // authorization data at all.
-        return Ok((TenantId::default(), None));
+        //
+        // The route-named `scope` IS honored here, unlike the header: it is not
+        // a caller's claim about who they are acting as, it is which record the
+        // request addresses, and answering `/admin/tenants/b/principals` from
+        // tenant `default` would be wrong rather than merely conservative.
+        return Ok((scope.cloned().unwrap_or_default(), None));
     };
-    let requested = requested_tenant(req);
+    let requested = scope.cloned().unwrap_or_else(|| requested_tenant(req));
 
     match authz::decide(&resolved.bindings, action, &requested) {
         Decision::Allow { tenant } => {
@@ -606,7 +675,18 @@ fn authorize_action(
             // every terminated op (below and in `build_mutation`) is already
             // done so that day does not also require re-plumbing the ops —
             // defence in depth for a guard that, today, makes it unreachable.
-            if tenant != TenantId::default() {
+            //
+            // Exempt when the route named its own tenant (`scope.is_some()`,
+            // i.e. the tenancy surface — see `scope_for`). The guard is about
+            // **resource** state: `sm_configs`/`sm_routes`/`sm_sources` are
+            // stored per tenant but read back through default-only paths. The
+            // tenancy tables are not like that — `RaftNode::tenant`,
+            // `tenant_principals` and `principal_bindings` all take the tenant
+            // as an argument and honour it, so there is no `default` fallback
+            // for them to land in. Keeping the guard over them would 404 the
+            // entire surface for exactly the tenants it exists to administer,
+            // which is not caution, just a broken feature.
+            if tenant != TenantId::default() && scope.is_none() {
                 return Err(tenant_boundary_not_found());
             }
             Ok((tenant, Some(resolved.principal_id)))
@@ -813,6 +893,15 @@ async fn terminate(
             "cluster node is shutting down",
         );
     };
+
+    // The tenancy surface takes its own path from here. It shares the gate
+    // above (authentication, authorization, the §8.4 404) — which is the part
+    // that must not be duplicated — but none of what follows: there is no port
+    // to condition an `If-Match` on, no `_rift.script` to resolve, and no
+    // loopback route to re-read for the render.
+    if let Terminated::Tenancy(route) = kind {
+        return terminate_tenancy(&state, &node, req, route, principal_id).await;
+    }
 
     // Authorization already ran in `handle`, once, for every admin request —
     // terminated, proxied, or the front door's own read. Nothing here
@@ -1211,6 +1300,213 @@ async fn build_and_run(
     Ok(response)
 }
 
+/// Serve one RFC-002 §5 tenancy route (issue #162): read from local applied
+/// state, or commit one `ControlOp` and answer for it.
+///
+/// Deliberately *not* routed through `build_and_run`. That path is built around
+/// a single imposter record — `If-Match` parsing against a port, `_rift.script`
+/// resolution, a post-commit re-read of a loopback path — and none of it
+/// applies here. Threading a "skip all of that" flag through it would make the
+/// imposter path harder to read in order to reuse the ten lines these two
+/// genuinely share.
+///
+/// One op per route, always, so there is no partial-commit case to reason
+/// about: the only multi-record write on this surface (`PrincipalCreate`) is
+/// atomic *inside* the state machine, which is why it is one op rather than two.
+async fn terminate_tenancy(
+    state: &Arc<FrontState>,
+    node: &Arc<RaftNode>,
+    req: Request<Incoming>,
+    route: tenancy::Route,
+    principal_id: Option<String>,
+) -> Response<FrontBody> {
+    let idempotency = req
+        .headers()
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Minting a credential cannot be made idempotent, and pretending otherwise
+    // hands the client a key that does not work.
+    //
+    // `Idempotency-Key` derives a deterministic `op_id`, and a replayed `op_id`
+    // is collapsed by `sm_op_dedup` to the *original* committed response with
+    // nothing re-applied. But the key and the principal id are minted here, per
+    // request, before any op id exists — so a retry (exactly what a client does
+    // after the 504/503 paths below) would commit nothing and still answer
+    // `201` carrying a freshly-minted key that was never stored, against a
+    // principal id that does not exist. The first attempt's key, the only one
+    // that ever worked, is unrecoverable by construction.
+    //
+    // Refused rather than silently ignored: a client that sent the header
+    // believes its retry is safe, and quietly not honouring that is how it
+    // would go on believing it. `op_id_for`'s doc already asks that
+    // non-idempotent ops stay out of this path; this keeps that true.
+    if idempotency.is_some() && matches!(route, tenancy::Route::PrincipalCreate(_)) {
+        return typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            "Idempotency-Key is not supported when minting a principal: the key is generated \
+             per request and shown once, so a replayed request cannot return the credential \
+             the original one issued. Retry without the header and delete the surplus \
+             principal if both attempts committed.",
+        );
+    }
+
+    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return typed_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorKind::RequestTooLarge,
+                &format!("admin request body refused: {e}"),
+            );
+        }
+    };
+
+    let scope = route.scope();
+    let outcome = match tenancy::dispatch(node, route, &body) {
+        Ok(outcome) => outcome,
+        Err(tenancy::TenancyError::BadRequest(reason)) => {
+            return typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &reason);
+        }
+        // Byte-identical to a cross-tenant refusal, by construction: both
+        // render through `tenant_boundary_not_found`. A caller must not be
+        // able to tell "no such tenant" from "not yours" (RFC-002 §8.4).
+        Err(tenancy::TenancyError::NotFound) => return tenant_boundary_not_found(),
+        Err(tenancy::TenancyError::Storage(reason)) => return internal(&reason),
+    };
+
+    let (op, status, rendered) = match outcome {
+        tenancy::Outcome::Body { status, body } => {
+            return buffered_response(status, Bytes::from(body), json_content_type())
+                .unwrap_or_else(|response| response);
+        }
+        tenancy::Outcome::Commit { op, status, then } => (op, status, then),
+    };
+
+    // The same order every write on this front follows (R4): validate, park
+    // durably, submit. Parking before submitting is what makes an accepted op
+    // survive a crash — the replay loop finishes what this request cannot.
+    if let Err(reason) = control::validate(&op) {
+        return refusal_response(&reason);
+    }
+    let op_id = base_op_id(idempotency.as_deref());
+    let request = tenancy::mint_request(op, principal_id, op_id);
+    if let Err(e) = node.park_intent(&request) {
+        return typed_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorKind::InternalError,
+            &format!("cannot durably accept the write: {e}"),
+        );
+    }
+
+    let committed = match tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await {
+        Err(_) => {
+            node.request_replay();
+            let mut response = typed_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                ErrorKind::Timeout,
+                "write did not commit within the deadline; parked for replay",
+            );
+            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
+            return response;
+        }
+        Ok(Err(NodeError::Unavailable(detail))) => {
+            node.request_replay();
+            let mut response = typed_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorKind::Unavailable,
+                &format!("no quorum / leader unreachable (parked for replay): {detail}"),
+            );
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
+            return response;
+        }
+        Ok(Err(e)) => {
+            node.request_replay();
+            let mut response = typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorKind::InternalError,
+                &e.to_string(),
+            );
+            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
+            return response;
+        }
+        Ok(Ok(response)) => response,
+    };
+    if let Err(e) = node.unpark_intent(&op_id) {
+        tracing::error!(%op_id, error = %e, "op terminal but could not unpark");
+    }
+    if let ControlOutcome::Failed { reason } = &committed.outcome {
+        return refusal_response(reason);
+    }
+
+    // Wait for *this* node to apply before answering, for the same reason the
+    // imposter path does (#99): a `whoami` or a principal listing issued
+    // immediately after this response must not read state older than the write
+    // it just acknowledged.
+    let unapplied = match state.barrier {
+        WriteBarrier::None => {
+            if node
+                .await_local_applied(committed.revision, state.barrier_timeout)
+                .await
+            {
+                Vec::new()
+            } else {
+                vec![node.id()]
+            }
+        }
+        WriteBarrier::ReadyNodes => {
+            node.await_applied(committed.revision, state.barrier_timeout)
+                .await
+        }
+    };
+
+    let body = rendered.map_or_else(Bytes::new, Bytes::from);
+    // Content type follows the body, not the status. A `204` has no body, and
+    // neither do the upsert/delete routes that render nothing — advertising
+    // `application/json` over zero bytes makes every strict client's `.json()`
+    // fail on a response that succeeded.
+    let content_type = if body.is_empty() {
+        None
+    } else {
+        json_content_type()
+    };
+    let mut response = match buffered_response(status, body, content_type) {
+        Ok(response) => response,
+        Err(response) => return response,
+    };
+    // The tenant the op actually addressed, not `default`. This header's
+    // documented shape names a tenant, so reporting `default@N` for a write
+    // against `acme` would be a plain falsehood in the one place a client
+    // looks to correlate a write with the record it touched.
+    set_header(
+        &mut response,
+        HEADER_REVISION,
+        &format!("{scope}@{}", committed.revision),
+    );
+    set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
+    if !unapplied.is_empty() {
+        let nodes = unapplied
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        set_header(
+            &mut response,
+            HEADER_WARNINGS,
+            &format!("unapplied={nodes}"),
+        );
+    }
+    response
+}
+
 /// Translate one terminated route into ops + a render plan. Reads that inform
 /// the mutation (current stubs for index-addressed edits, capture-before-delete
 /// bodies) come from the local applied state / loopback admin.
@@ -1511,6 +1807,16 @@ async fn build_mutation(
                 },
             })
         }
+        // `terminate` diverts the tenancy surface to `terminate_tenancy` before
+        // this is reached, so this arm is unreachable through the front's own
+        // routing. Answered as an internal error rather than `unreachable!`:
+        // if a future edit *does* route one here, a 500 names a bug in this
+        // file, whereas a panic would take the whole admin listener down with
+        // it — and an admin front that dies on a routing mistake is a worse
+        // failure than the mistake.
+        Terminated::Tenancy(_) => Err(internal(
+            "tenancy routes are served by terminate_tenancy, not build_mutation",
+        )),
     }
 }
 
