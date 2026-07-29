@@ -299,6 +299,104 @@ principal on every route for any fleet mid-migration. A fleet with neither an
 api-key nor any principal keeps the pre-T2 open admin plane, and
 `rift_cluster_no_principals` reports that state for Prometheus.
 
+### What T3 ships — the admin surface, and keys that are shown once
+
+Slice T3 (issue #162) is what makes the model reachable: RFC-002 §5's routes on
+the admin front, argon2id key issuance, and `whoami`.
+
+```
+POST/GET         /admin/tenants                      FleetAdmin
+GET/PUT/DELETE   /admin/tenants/:id                  FleetAdmin
+POST/GET         /admin/tenants/:id/principals       TenantAdmin
+PUT/DELETE       /admin/tenants/:id/principals/:pid  FleetAdmin
+PUT/DELETE       /admin/tenants/:id/bindings/:pid    TenantAdmin (FleetAdmin on "*")
+GET              /admin/whoami                       any authenticated principal
+```
+
+Every one of these **terminates at the front door**, reads included — these
+records live only in the clustered control plane, so there is no upstream route
+to proxy to. That is the same shape `GET /front-door/routes` already has.
+
+**The tenant comes from the path, not `X-Rift-Tenant`.** On a resource route the
+header selects which of the caller's bindings they are acting under; here the
+tenant *is* the record being administered. Authorizing `/admin/tenants/b/...`
+against the header would let a tenant admin of `a` administer `b` by sending one
+header — the confused-deputy shape §8.1 exists to close, reached through the one
+surface where the header is not the subject.
+
+**Why bindings split across two tiers.** The route
+`/admin/tenants/:id/bindings/:pid` is `TenantManage` inside a real tenant and
+`ClusterAdmin` on the fleet scope `"*"`. This is not a special case bolted on:
+`validate` refuses every role but `FleetAdmin` on `"*"`, so a binding *there* is
+by definition a grant of fleet privilege, and granting fleet privilege must
+require fleet privilege (§4.2). Inside a tenant, re-binding a principal is a
+tenant admin's own job and grants nothing beyond their own scope. What decides
+the tier is the privilege being granted, not the shape of the path.
+
+`PrincipalPut` and `PrincipalDelete` are fleet-only for the reason §3 gives:
+`sm_principals` is keyed by principal id **alone**, so a tenant admin of A
+deleting a principal would destroy a credential B also relies on. The one
+exception is `POST /admin/tenants/:id/principals`, which is `TenantManage` —
+minting an identity inside a tenant grants nothing outside it. It is also
+refused if it asks for `fleet-admin`, for the same reason the fleet-scope
+binding needs fleet privilege.
+
+**One op, one revision.** That mint is a single `ControlOp::PrincipalCreate`,
+not a `PrincipalPut` followed by a `BindingPut`. Two ops are two revisions, and
+the gap between them is observable on every replica: a principal that
+authenticates and is authorized for nothing, or — if the second op is lost to a
+leader change — a binding naming a principal that does not exist. Neither state
+is reachable through one op, because apply already runs inside a single redb
+write transaction.
+
+**Keys are shown once, and the disk is the assertion.** The response to that
+mint is the only place the raw key ever exists. The control plane stores the
+argon2id hash and the SHA-256 fingerprint the id is derived from, and neither
+can reproduce it. The acceptance test does not merely check that a later `GET`
+omits the key — that would prove only that one renderer omits it — it scans
+every byte under the state directory after shutdown. The log and the snapshot
+are where a leaked credential would become *permanently* unredactable, because
+a committed Raft entry cannot be rewritten.
+
+**An unknown key performs zero argon2id verifications.** A principal's id is
+`key:<sha256(raw)>`, so a presented credential resolves by one keyed lookup and
+argon2id verifies exactly the one candidate it finds. A credential that matches
+nothing misses that lookup and is refused having hashed nothing. This is not an
+optimisation: argon2id at the pinned cost allocates 19 MiB per attempt, so
+hashing on every presented credential would make an endpoint anyone can reach a
+memory-amplification lever. It is asserted with a counter
+(`control::argon2_verifications`) rather than a timer, because a timing
+assertion for this property is flaky by construction and would be the first test
+anyone disabled.
+
+The cost parameters are pinned in `control.rs` to the OWASP 2024 baseline
+(m = 19456 KiB, t = 2, p = 1) rather than inherited from the argon2 crate's
+default, even though the two agree today. A cost parameter is the whole strength
+of a password hash and it fails silently in both directions. Raising it later
+does not invalidate existing keys: the PHC string records the parameters each
+hash was produced with, and verification reads them from there.
+
+**The T2 default-tenant guard does not apply here.** T2 refuses any decided
+tenant other than `default`, because resource *serving* is still default-only.
+That reasoning is about `sm_configs`/`sm_routes`/`sm_sources`, which are stored
+per tenant but read back through default-only paths. The tenancy tables are not
+like that — `tenant`, `tenant_principals` and `principal_bindings` all take the
+tenant as an argument and honour it — so keeping the guard over them would 404
+the entire surface for exactly the tenants it exists to administer. The
+exemption is scoped to routes that name their own tenant, so a new action stays
+subject to the guard until someone states otherwise.
+
+**No verification cache.** RFC-002 §11 raised caching
+`hash(credential) → principal_id` to avoid an argon2id verify per request. T3
+does **not** ship one. §8.5's ban on cached authorization holds either way, but
+the cost this would save is one verify on an admin-plane request, and the
+machinery — an invalidation hook on four op variants, with a correctness bug
+that fails *open* — is not earned by that. Operators should expect roughly
+20–50 ms of argon2id per authenticated admin request. If that becomes a real
+constraint for a console or MCP client, the state-machine-invalidated cache
+described in §11 is the shape to build, and it should land as its own slice with
+its own revocation test.
+
 ## Cluster-internal security
 
 The node-to-node surface (Raft RPCs, owner-forwarded ops, replication, journal

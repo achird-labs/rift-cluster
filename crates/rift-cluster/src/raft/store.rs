@@ -971,6 +971,123 @@ impl RedbStateMachine {
         Ok(bindings)
     }
 
+    /// One tenant record by id, or `None` when no row exists (issue #162).
+    ///
+    /// Tombstones are returned rather than hidden: `GET /admin/tenants/:id`
+    /// reporting `deleted: true` is how an operator learns an id is spent
+    /// rather than free, and hiding it here would make a deleted tenant
+    /// indistinguishable from one that never existed on the one surface whose
+    /// job is to tell them apart.
+    #[allow(clippy::result_large_err)]
+    pub fn tenant(&self, id: &str) -> StorageResult<Option<Tenant>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_TENANTS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        table
+            .get(id)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|g| {
+                serde_json::from_str::<Tenant>(g.value()).map_err(|e| {
+                    tracing::error!(tenant = %id, error = %e, "corrupt stored tenant");
+                    StorageError::from(StorageIOError::read_state_machine(&e))
+                })
+            })
+            .transpose()
+    }
+
+    /// Every tenant record, id-ascending, tombstones included (issue #162) —
+    /// what `GET /admin/tenants` reports. Like [`Self::principal`], this
+    /// answers from local applied state and needs no leadership.
+    #[allow(clippy::result_large_err)]
+    pub fn tenants(&self) -> StorageResult<Vec<Tenant>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_TENANTS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut out = Vec::new();
+        for item in table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            // Corruption is an error, not a skipped row, for the same reason
+            // `principal_bindings` gives: silently omitting a tenant from the
+            // listing is how an operator concludes it was already deleted.
+            let tenant: Tenant = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(tenant = key.value(), error = %e, "corrupt stored tenant");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            out.push(tenant);
+        }
+        Ok(out)
+    }
+
+    /// Every principal bound to `tenant`, with the role each holds there,
+    /// principal-id-ascending (issue #162) — what
+    /// `GET /admin/tenants/:id/principals` reports.
+    ///
+    /// This is the listing `sm_bindings`' principal-major key order pays for
+    /// with a full scan (see its `TableDefinition`'s doc): the trade is
+    /// deliberate, because the per-request direction — one principal's
+    /// bindings — is the one that had to stay a single seek.
+    ///
+    /// A binding naming a principal with no `sm_principals` row is impossible
+    /// through the ops (`PrincipalDelete` cascades its bindings away, and
+    /// `PrincipalCreate` writes both rows in one revision), so one found here
+    /// is committed-state corruption and is reported as an error rather than
+    /// skipped — a silently-dropped row would hide exactly the inconsistency
+    /// worth knowing about.
+    #[allow(clippy::result_large_err)]
+    pub fn tenant_principals(&self, tenant: &str) -> StorageResult<Vec<(Principal, Role)>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let bindings = read_txn
+            .open_table(SM_BINDINGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let principals = read_txn
+            .open_table(SM_PRINCIPALS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut out = Vec::new();
+        for item in bindings
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (principal_id, bound_tenant) = key.value();
+            if bound_tenant != tenant {
+                continue;
+            }
+            let role: Role = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(principal_id, tenant, error = %e, "corrupt stored binding");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            let guard = principals
+                .get(principal_id)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+                .ok_or_else(|| {
+                    tracing::error!(principal_id, tenant, "binding names an absent principal");
+                    StorageError::from(StorageIOError::read_state_machine(&std::io::Error::other(
+                        format!("binding names principal {principal_id:?}, which has no record"),
+                    )))
+                })?;
+            let principal: Principal = serde_json::from_str(guard.value()).map_err(|e| {
+                tracing::error!(principal_id, error = %e, "corrupt stored principal");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            out.push((principal, role));
+        }
+        Ok(out)
+    }
+
     /// Whether the fleet has any principal defined at all (RFC-002 §3.4).
     /// Governs the legacy-admin-plane bypass and the `rift_cluster_no_principals`
     /// gauge: presence is presence regardless of whether a given row happens
@@ -2260,6 +2377,34 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
+            // Both rows, one transaction, one revision (issue #162). Every
+            // arm in this match already runs inside the apply's single write
+            // txn, so writing the principal and its binding here is atomic by
+            // construction — that is precisely why this is one op rather than
+            // the caller submitting two.
+            ControlOp::PrincipalCreate {
+                tenant,
+                principal,
+                role,
+            } => {
+                if let Err(reason) = Self::require_live_tenant(tenants, tenant.as_str())? {
+                    return Ok(Err(reason));
+                }
+                let principal_value = serde_json::to_string(principal)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                let role_value = serde_json::to_string(role)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                principals
+                    .insert(principal.id.as_str(), principal_value.as_str())
+                    .map_err(io)?;
+                bindings
+                    .insert(
+                        (principal.id.as_str(), tenant.as_str()),
+                        role_value.as_str(),
+                    )
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
             // `tenant` addresses no stored record here — `sm_principals` is
             // fleet-wide, keyed by principal id alone (see its
             // `TableDefinition`'s doc) — so, like every other delete in this
@@ -2293,6 +2438,29 @@ impl RedbStateMachine {
                     && let Err(reason) = Self::require_live_tenant(tenants, tenant.as_str())?
                 {
                     return Ok(Err(reason));
+                }
+                // The principal must exist. Before #162 this op was reachable
+                // only through `RaftNode::submit`, so a binding naming nothing
+                // was a fixture mistake; the admin surface now exposes it to
+                // any tenant admin, where a mistyped id would durably and
+                // replicatedly commit a binding with no principal behind it.
+                //
+                // That is not merely untidy: `tenant_principals` resolves every
+                // binding to its principal to answer
+                // `GET /admin/tenants/:id/principals`, and a row it cannot
+                // resolve is committed-state corruption it reports as an error
+                // — so one typo would permanently 500 the very listing an
+                // operator would use to find and remove it.
+                //
+                // Enforced here, at the write, rather than tolerated at the
+                // read: skipping an unresolvable row in the listing would hide
+                // a binding that really does grant access, which is the worse
+                // failure of the two.
+                if principals.get(principal_id.as_str()).map_err(io)?.is_none() {
+                    return Ok(Err(format!(
+                        "unknown principal {:?}: a binding must name a principal that exists",
+                        principal_id.as_str()
+                    )));
                 }
                 let value = serde_json::to_string(role)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;

@@ -201,6 +201,126 @@ starts denying a fleet that never set up authorization. `GET /metrics` reports
 this as `rift_cluster_no_principals` (see below), so it is something to audit
 for rather than discover.
 
+### The tenancy admin surface (issue #162)
+
+Tenants, principals and bindings are managed over the public admin address.
+Every route here is answered by the cluster's own control plane — none of it is
+proxied to the OSS admin — so any node can serve the reads.
+
+| Route | Method | Requires |
+|---|---|---|
+| `/admin/tenants` | `POST`, `GET` | `FleetAdmin` |
+| `/admin/tenants/:id` | `GET`, `PUT`, `DELETE` | `FleetAdmin` |
+| `/admin/tenants/:id/principals` | `POST`, `GET` | `TenantAdmin` of `:id` |
+| `/admin/tenants/:id/principals/:pid` | `PUT`, `DELETE` | `FleetAdmin` |
+| `/admin/tenants/:id/bindings/:pid` | `PUT`, `DELETE` | `TenantAdmin` of `:id` — `FleetAdmin` when `:id` is `*` |
+| `/admin/whoami` | `GET` | any authenticated principal |
+
+The tenant is taken from the **path**, not from `X-Rift-Tenant`. That header
+selects which of your bindings you are acting under on a *resource* route; on
+these routes the tenant is the record you are addressing.
+
+Two asymmetries worth knowing before they surprise you:
+
+- **Deleting a principal is a fleet operation, even on a tenant-shaped path.**
+  Principals are fleet-global — one identity may be bound in several tenants —
+  so a tenant admin deleting one would destroy a credential another tenant
+  depends on. *Minting* one is tenant-scoped, because a new identity grants
+  nothing outside the tenant it is bound to.
+- **Binding on `*` requires `FleetAdmin`.** `*` is the reserved fleet scope, and
+  the only role that may be bound there is `fleet-admin` — so a write to
+  `/admin/tenants/*/bindings/:pid` is a grant of fleet privilege regardless of
+  how the path reads.
+
+A refusal on this surface is a `404`, not a `403`, whenever you hold no binding
+in the tenant named — byte-identical to the answer for a tenant that does not
+exist. That is deliberate (RFC-002 §8.4): a `403` would confirm which tenants
+your neighbours have.
+
+#### Bootstrapping the first fleet admin
+
+Every route above needs a `FleetAdmin`, and a fresh fleet has none. **Use
+`--api-key` to bootstrap**, not the open admin plane:
+
+```sh
+rift-ee-server --cluster … --api-key "$BOOTSTRAP_KEY"     # fleet-admin, see below
+curl -sX POST http://$ADMIN/admin/tenants/default/principals \
+  -H "authorization: $BOOTSTRAP_KEY" \
+  -d '{"displayName":"ops","role":"tenant-admin"}'
+curl -sX PUT "http://$ADMIN/admin/tenants/*/bindings/key:…" \
+  -H "authorization: $BOOTSTRAP_KEY" -d '{"role":"fleet-admin"}'
+```
+
+The legacy key is bound `FleetAdmin` on `*` while
+`--cluster-legacy-key-is-fleet-admin` is on (default `true` this release, see
+above), which is what makes the second call land. Drop the flag — and the
+`--api-key` — once a real fleet admin exists.
+
+The open plane (no principals *and* no `--api-key`) does not get you there, and
+it is worth knowing why rather than discovering it: it stops being open the
+instant the first principal exists, and a tenant-scoped mint may not ask for
+`fleet-admin` — fleet privilege binds only on `*`, and binding on `*` requires
+fleet privilege you do not yet have. So the very first call closes the door
+behind itself and leaves you a `tenant-admin` that cannot promote anything,
+including itself. That refusal is the design working (a tenant admin must never
+be able to self-promote), which is precisely why bootstrapping is `--api-key`'s
+job and not the open plane's.
+
+#### Creating a tenant and issuing a key
+
+```sh
+# 1. Create the tenant (FleetAdmin).
+curl -sX POST http://$ADMIN/admin/tenants \
+  -H "authorization: $FLEET_KEY" \
+  -d '{"id":"acme","displayName":"Acme Corp",
+       "quotas":{"maxImposters":100,"maxStubsPerImposter":500,
+                 "maxFlowEntries":100000,"journalRetentionSecs":0}}'
+
+# 2. Mint a principal in it. The response is the ONLY place the key appears.
+curl -sX POST http://$ADMIN/admin/tenants/acme/principals \
+  -H "authorization: $FLEET_KEY" \
+  -d '{"displayName":"ci-runner","role":"editor"}'
+# {"id":"key:9f86d0…","displayName":"ci-runner","role":"editor",
+#  "tenant":"acme","apiKey":"rift_kZ3v…"}
+
+# 3. Use it.
+curl -s http://$ADMIN/admin/whoami -H "authorization: rift_kZ3v…"
+# {"principalId":"key:9f86d0…","bindings":[{"tenant":"acme","role":"editor"}],
+#  "authorizationDisabled":false}
+```
+
+**`apiKey` is shown once.** Capture it at creation or it is gone: the control
+plane stores an argon2id hash and a SHA-256 fingerprint, and neither can
+reproduce the key. There is no "reveal" endpoint and there will not be one —
+a key that can be re-read is a key that leaks from whatever stores it. To rotate,
+mint a new principal and `DELETE` the old one; the id is derived from the key, so
+a new key is necessarily a new principal.
+
+`PUT /admin/tenants/:id/principals/:pid` changes the display name and the
+`disabled` flag only. Disabling is the immediate revocation lever: it is a
+Raft-committed fact with no cache in front of it, so the key stops
+authenticating on the very next request through **any** node.
+
+**`whoami` is the cheapest check that authorization is wired at all.** It
+reports the caller's own identity and bindings and authorizes nothing beyond
+having authenticated. `"authorizationDisabled": true` with a null `principalId`
+means the fleet has no principals and no `--api-key` — the open admin plane
+described above, not an unbound principal.
+
+#### The per-request cost of a key
+
+Each authenticated admin request performs **one** argon2id verification, roughly
+20–50 ms, at the pinned OWASP 2024 cost (m = 19456 KiB, t = 2, p = 1). There is
+no verification cache: caching authorization data is what RFC-002 §8.5 forbids,
+and a cache keyed on the credential would need invalidating on four separate op
+variants with a failure mode that fails *open*. Budget for that latency on the
+admin plane. It does not touch the data plane — gateway traffic under
+`/__rift/` is never authenticated.
+
+A credential that matches no principal is refused having performed **zero**
+argon2id work, so an unauthenticated caller cannot use the admin port as a
+memory-amplification lever.
+
 ### Startup guards
 
 These run **before anything binds**, and each exists because the alternative is

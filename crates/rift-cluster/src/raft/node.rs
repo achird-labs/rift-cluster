@@ -33,7 +33,7 @@ use super::ring::Ring;
 use super::store::{self, RedbStateMachine, SourceRecord};
 use super::{NodeId, TypeConfig};
 use crate::control::{
-    ControlOp, ControlRequest, ControlResponse, Principal, Role, SourceProvenance, TenantId,
+    ControlOp, ControlRequest, ControlResponse, Principal, Role, SourceProvenance, Tenant, TenantId,
 };
 use crate::rpc::{
     Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer,
@@ -1220,6 +1220,30 @@ impl RaftNode {
     pub fn principal_bindings(&self, id: &str) -> Result<Vec<(TenantId, Role)>, NodeError> {
         self.sm_reader
             .principal_bindings(id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// One tenant record by id, tombstone included, or `None` when no row
+    /// exists (issue #162). Answers from local applied state.
+    pub fn tenant(&self, id: &str) -> Result<Option<Tenant>, NodeError> {
+        self.sm_reader
+            .tenant(id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Every tenant record, id-ascending, tombstones included (issue #162) —
+    /// what `GET /admin/tenants` reports.
+    pub fn tenants(&self) -> Result<Vec<Tenant>, NodeError> {
+        self.sm_reader
+            .tenants()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Every principal bound to `tenant` and the role it holds there
+    /// (issue #162) — what `GET /admin/tenants/:id/principals` reports.
+    pub fn tenant_principals(&self, tenant: &str) -> Result<Vec<(Principal, Role)>, NodeError> {
+        self.sm_reader
+            .tenant_principals(tenant)
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 

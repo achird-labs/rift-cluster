@@ -178,20 +178,73 @@ pub fn api_key_principal_id(raw: &str) -> PrincipalId {
     PrincipalId::new(format!("key:{}", api_key_fingerprint(raw)))
 }
 
+/// The argon2id cost this fleet issues keys at: the OWASP 2024 baseline,
+/// m = 19456 KiB, t = 2, p = 1 (RFC-002 §8.2, issue #162).
+///
+/// Written out rather than taken from `Params::default()` even though the two
+/// agree today. A cost parameter is the entire strength of a password hash and
+/// it fails silently in both directions — too low and every stored hash is
+/// cheaper to attack than anyone believes, too high and the memory cost
+/// becomes a self-inflicted DoS — so the number a fleet actually runs at must
+/// be visible in this file and asserted by a test, not inherited from whatever
+/// a dependency's default happens to become at its next minor release.
+///
+/// Changing these does **not** invalidate stored hashes: the PHC string
+/// records the parameters it was produced with, and [`verify_api_key`] reads
+/// them from there, so old keys keep verifying at their original cost.
+const ARGON2_M_COST_KIB: u32 = 19_456;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
+
+/// How many argon2id verifications this process has performed
+/// ([`verify_api_key`]).
+///
+/// Exposed for one specific assertion (issue #162): a credential whose
+/// fingerprint indexes no principal must answer `401` having hashed
+/// **nothing**, because argon2id is deliberately expensive and an endpoint
+/// anyone can reach must not be a memory-amplification lever. Counting is how
+/// that is asserted — a timing assertion for the same property is flaky by
+/// construction.
+static ARGON2_VERIFICATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The running count of [`verify_api_key`] calls that reached the hash
+/// comparison. See [`ARGON2_VERIFICATIONS`].
+///
+/// Hidden from the docs: this exists for one acceptance assertion, not as a
+/// supported metric. `rift_cluster_*` on `/metrics` is where observable
+/// counters live.
+#[doc(hidden)]
+#[must_use]
+pub fn argon2_verifications() -> u64 {
+    ARGON2_VERIFICATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The pinned hasher. See [`ARGON2_M_COST_KIB`].
+fn argon2() -> argon2::Argon2<'static> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    // `Params::new` rejects only out-of-range combinations, and these three
+    // constants are in range by inspection — a failure here would be a typo in
+    // this file, not anything a caller or an attacker can reach.
+    let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+        .expect("the pinned OWASP 2024 argon2id parameters are in range");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 /// Hash a raw API key for storage as an [`AuthSource::ApiKey`] (RFC-002 §8.2):
-/// argon2id, a fresh random salt per call. The PHC string this returns is
-/// what [`validate_auth_source`] requires and what [`verify_api_key`] checks
-/// against — the raw key itself is never stored.
+/// argon2id at the pinned [`ARGON2_M_COST_KIB`] cost, a fresh random salt per
+/// call. The PHC string this returns is what [`validate_auth_source`] requires
+/// and what [`verify_api_key`] checks against — the raw key itself is never
+/// stored.
 #[must_use]
 pub fn hash_api_key(raw: &str) -> String {
-    use argon2::Argon2;
     use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
 
     let salt = SaltString::generate(&mut OsRng);
     // The only way this fails is an internal encoding bug in the hasher, not
     // anything about `raw` (argon2 has no length limit this crate approaches)
     // — an `expect` here names a defect in the algorithm, not attacker input.
-    Argon2::default()
+    argon2()
         .hash_password(raw.as_bytes(), &salt)
         .expect("argon2id hashing does not fail for a well-formed salt")
         .to_string()
@@ -201,17 +254,57 @@ pub fn hash_api_key(raw: &str) -> String {
 /// that is not a match, including a `stored_hash` that will not even parse as
 /// a PHC string — a corrupt or foreign hash format must refuse, never panic
 /// or read as a pass.
+///
+/// Counted in [`ARGON2_VERIFICATIONS`]. The counter is incremented only once
+/// the hash has parsed, i.e. exactly when a real argon2id computation is about
+/// to happen: an unparseable stored hash costs nothing and must not be counted
+/// as though it did.
 #[must_use]
 pub fn verify_api_key(raw: &str, stored_hash: &str) -> bool {
-    use argon2::Argon2;
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
 
     let Ok(parsed) = PasswordHash::new(stored_hash) else {
         return false;
     };
-    Argon2::default()
-        .verify_password(raw.as_bytes(), &parsed)
-        .is_ok()
+    ARGON2_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The stored PHC string carries the parameters this hash was produced
+    // with, so verification runs at *its* cost, not the currently-pinned one —
+    // which is what lets the pinned cost be raised without invalidating every
+    // key already issued.
+    argon2().verify_password(raw.as_bytes(), &parsed).is_ok()
+}
+
+/// The number of random bytes behind an issued API key. 32 bytes = 256 bits of
+/// entropy, so the key is unguessable independently of the argon2id cost that
+/// protects it at rest — the two defences are deliberately not the same
+/// defence.
+const API_KEY_RANDOM_BYTES: usize = 32;
+
+/// The prefix every issued key carries (RFC-002 §8.2, issue #162).
+///
+/// Not a security property — it is a *leak-detection* one. A key that
+/// announces what it is can be recognized on sight in a log, a pasted
+/// snippet, or a secret scanner's ruleset; an opaque blob of base64 cannot.
+pub const API_KEY_PREFIX: &str = "rift_";
+
+/// Mint a fresh API key: [`API_KEY_PREFIX`] followed by
+/// [`API_KEY_RANDOM_BYTES`] of OS randomness, URL-safe base64, unpadded.
+///
+/// The returned string is the **only** copy that will ever exist — the control
+/// plane stores [`hash_api_key`]'s output and
+/// [`api_key_principal_id`]'s fingerprint, neither of which can reproduce it.
+/// A caller that does not hand it to the operator has destroyed it.
+#[must_use]
+pub fn generate_api_key() -> String {
+    use argon2::password_hash::rand_core::{OsRng, RngCore as _};
+    use base64::Engine as _;
+
+    let mut bytes = [0u8; API_KEY_RANDOM_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    format!(
+        "{API_KEY_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
 }
 
 /// A principal's binding to one tenant (RFC-002 §3.3): what [`ControlOp::BindingPut`]
@@ -395,6 +488,28 @@ pub enum ControlOp {
     PrincipalPut {
         tenant: TenantId,
         principal: Principal,
+    },
+    /// Mint a principal **and** its binding to `tenant` as one committed op
+    /// (RFC-002 §5, issue #162) — what `POST /admin/tenants/:id/principals`
+    /// becomes.
+    ///
+    /// Not sugar for a [`ControlOp::PrincipalPut`] followed by a
+    /// [`ControlOp::BindingPut`]. Two ops are two revisions, and the gap
+    /// between them is observable on every replica: a principal exists holding
+    /// no binding (a credential that authenticates and is authorized for
+    /// nothing), or — if the pair is ever reordered or the second op is lost to
+    /// a leader change — a binding naming a principal that does not exist.
+    /// Neither state is reachable through this op, which is the property the
+    /// issue asks for and the reason the op exists.
+    ///
+    /// `role` may not be [`Role::FleetAdmin`]: this binds against `tenant`, and
+    /// fleet privilege binds only on [`FLEET_SCOPE`]. Minting an identity
+    /// inside a tenant must never be a way to grant authority outside it — see
+    /// [`validate`]'s arm.
+    PrincipalCreate {
+        tenant: TenantId,
+        principal: Principal,
+        role: Role,
     },
     PrincipalDelete {
         tenant: TenantId,
@@ -782,6 +897,31 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             require_principal_id(&principal.id)?;
             if principal.display_name.trim().is_empty() {
                 return Err("principal display_name must not be empty".to_owned());
+            }
+            validate_auth_source(&principal.auth)
+        }
+        ControlOp::PrincipalCreate {
+            tenant,
+            principal,
+            role,
+        } => {
+            require_real_tenant(tenant)?;
+            require_principal_id(&principal.id)?;
+            if principal.display_name.trim().is_empty() {
+                return Err("principal display_name must not be empty".to_owned());
+            }
+            // The binding half of this op targets `tenant`, never
+            // `FLEET_SCOPE` — so a `FleetAdmin` role here would be a binding
+            // `BindingPut` itself refuses (see its arm below), reached through
+            // a different door. Refused for the same reason and with the same
+            // wording, rather than silently downgraded: an operator who asked
+            // for fleet privilege must learn they did not get it.
+            if matches!(role, Role::FleetAdmin) {
+                return Err(format!(
+                    "fleet-admin may only be bound on the reserved fleet scope {FLEET_SCOPE:?}, \
+                     not tenant {:?}",
+                    tenant.as_str()
+                ));
             }
             validate_auth_source(&principal.auth)
         }
@@ -1185,6 +1325,7 @@ pub(crate) fn precondition_target(op: &ControlOp) -> Option<(&TenantId, u16)> {
         | ControlOp::TenantPut { .. }
         | ControlOp::TenantDelete { .. }
         | ControlOp::PrincipalPut { .. }
+        | ControlOp::PrincipalCreate { .. }
         | ControlOp::PrincipalDelete { .. }
         | ControlOp::BindingPut { .. }
         | ControlOp::BindingDelete { .. } => None,
