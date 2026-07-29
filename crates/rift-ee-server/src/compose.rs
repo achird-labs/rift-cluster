@@ -568,6 +568,7 @@ pub async fn start_with_runtimes(
                 Arc::clone(&puller),
             ),
             engine: Some(Arc::clone(&manager)),
+            audit_retention_secs: cli.cluster.cluster_audit_retention,
         },
         Arc::clone(&front_door_routes),
     )

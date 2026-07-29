@@ -65,6 +65,7 @@ async fn spawn(id: NodeId, addr: SocketAddr, dir: &Path) -> Arc<RaftNode> {
         secret: Some(SECRET.to_owned()),
         routes: Router::new(),
         engine: None,
+        audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
     };
     // No retry-on-lock-contention: `RaftNode::shutdown` now waits for the Raft
     // core to release its storage handles before returning (#41), so a restart on

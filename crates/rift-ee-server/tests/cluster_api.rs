@@ -31,6 +31,7 @@ async fn start() -> Fixture {
         secret: Some(SECRET.to_owned()),
         routes: cluster_api::routes(rift_cluster::Router::new(), slot.clone(), readiness.clone()),
         engine: None,
+        audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
     };
     let node = Arc::new(RaftNode::start(config).await.expect("node starts"));
     slot.set(&node).expect("the slot is bound exactly once");

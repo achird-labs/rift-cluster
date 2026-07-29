@@ -76,8 +76,9 @@ use serde::{Deserialize, Serialize};
 
 use super::TypeConfig;
 use crate::control::{
-    self, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest, FLEET_SCOPE, OnDrift,
-    Principal, Role, SourceMode, SourceProvenance, StubEdit, StubEditScript, Tenant, TenantId,
+    self, AuditRow, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
+    FLEET_SCOPE, OnDrift, Principal, Quotas, Role, SourceMode, SourceProvenance, StubEdit,
+    StubEditScript, Tenant, TenantId,
 };
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
@@ -116,12 +117,28 @@ const SM_PRINCIPALS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("s
 /// that trade is deliberate. Keying tenant-major would flip the cost onto
 /// every authorized request instead of onto an occasional admin query.
 const SM_BINDINGS_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_bindings");
+/// `(revision, op_id) -> AuditRow` (JSON): the RFC-002 §9 audit projection
+/// (issue #163), journal-style.
+///
+/// Keyed **revision-major** so a `?since=` read is a range scan from that
+/// revision rather than a full-table filter, and so the natural key order is
+/// the order things happened. `op_id` is the tiebreaker component and exists
+/// only because redb keys must be unique — one revision applies exactly one
+/// op, so it never actually disambiguates anything today; it is there so that
+/// a future batched apply cannot silently overwrite a row.
+const SM_AUDIT_TABLE: TableDefinition<(u64, &str), &str> = TableDefinition::new("sm_audit");
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
 /// Node-local durable intents (issue #9 R4): ops this node accepted but has
 /// not yet seen commit. NOT replicated state — never in snapshots, never
 /// touched by apply; each node parks and replays only what it accepted.
 const PENDING_INTENTS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("pending_intents");
+
+/// How long audit rows are kept when nothing says otherwise: 30 days
+/// (RFC-002 §9, issue #163). Long enough to answer "who changed this last
+/// month", short enough that the table does not grow without bound on a busy
+/// fleet. Overridden by `--cluster-audit-retention`.
+pub const DEFAULT_AUDIT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// How long an applied op's response is retained for dedup: 24 h (issue #9).
 /// After expiry a replay of the same `op_id` re-applies — the durable-intent
@@ -322,6 +339,16 @@ struct SnapshotPayload {
     /// `(principal id, tenant, Role JSON)` rows of `sm_bindings` (issue #159).
     #[serde(default)]
     bindings: Vec<(String, String, String)>,
+    /// `(revision, op_id, AuditRow JSON)` rows of `sm_audit` (issue #163).
+    ///
+    /// Defaulted for the same reason `routes`/`sources`/`tenants` are, and the
+    /// reason is worth restating because this crate has already been bitten by
+    /// it once (#134/#137): **a table omitted from this payload is a table that
+    /// vanishes the next time a follower catches up by snapshot.** For an audit
+    /// stream that failure is silent and permanent — the node comes back with
+    /// an empty history and nothing reports a gap.
+    #[serde(default)]
+    audit: Vec<(u64, String, String)>,
     /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
     dedup: Vec<(String, String)>,
     last_applied_log: Option<LogId<u64>>,
@@ -369,6 +396,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_TENANTS_TABLE).map_err(io)?;
         write_txn.open_table(SM_PRINCIPALS_TABLE).map_err(io)?;
         write_txn.open_table(SM_BINDINGS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_AUDIT_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
         write_txn.open_table(PENDING_INTENTS_TABLE).map_err(io)?;
@@ -677,6 +705,17 @@ pub struct RedbStateMachine {
     /// refusal that names no single port). This is node status, not replicated
     /// state — every replica has its own bind outcomes.
     apply_failures: Arc<Mutex<BTreeMap<u16, String>>>,
+    /// How long audit rows are kept, in seconds; `0` = forever (issue #163).
+    ///
+    /// **Every node in a fleet must be configured identically.** This value
+    /// feeds `gc_audit`, which runs inside `apply` — so two nodes with
+    /// different retention would drop different rows from the same log and
+    /// their audit tables would diverge, which is exactly the property the
+    /// replicated clock exists to protect. It is node configuration rather than
+    /// replicated state because it is an operator's storage-budget decision,
+    /// not a tenant's; `docs/rift-ee-server.md` says so where the flag is
+    /// documented.
+    audit_retention_secs: u64,
 }
 
 impl std::fmt::Debug for RedbStateMachine {
@@ -696,7 +735,17 @@ impl RedbStateMachine {
             engine: None,
             routes: None,
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
+            audit_retention_secs: DEFAULT_AUDIT_RETENTION_SECS,
         }
+    }
+
+    /// Set the audit retention window. Same before-`Raft::new` contract as
+    /// [`Self::with_engine`] — and see `audit_retention_secs`' doc for why every
+    /// node in a fleet must be given the same value.
+    #[must_use]
+    pub fn with_audit_retention_secs(mut self, secs: u64) -> Self {
+        self.audit_retention_secs = secs;
+        self
     }
 
     /// Attach the local engine committed ops are applied to. Call before the
@@ -1483,6 +1532,96 @@ impl RedbStateMachine {
         )
     }
 
+    /// Drop audit rows older than `retention_secs` relative to `now_secs` — the
+    /// replicated logical clock, exactly as [`Self::gc_dedup`] takes it, and
+    /// never a local `SystemTime::now()`.
+    ///
+    /// `retention_secs == 0` means keep everything: an operator who turns
+    /// retention off must not silently lose their history to a zero that reads
+    /// as "expire immediately".
+    ///
+    /// Rows are expired on `ts_secs`, the applying entry's `issued_at_secs`,
+    /// so "how old is this row" is answered with the same replicated clock that
+    /// wrote it. A row whose JSON will not parse is dropped and logged rather
+    /// than kept forever: it is committed-state corruption, it cannot be served
+    /// to anyone, and it would otherwise pin the table's growth with something
+    /// no reader can use.
+    fn gc_audit(
+        table: &mut Table<'_, (u64, &'static str), &'static str>,
+        now_secs: u64,
+        retention_secs: u64,
+    ) -> Result<(), redb::StorageError> {
+        if retention_secs == 0 {
+            return Ok(());
+        }
+        let cutoff = now_secs.saturating_sub(retention_secs);
+        table.retain(|(revision, op_id), value| {
+            match serde_json::from_str::<AuditRow>(value) {
+                Ok(row) => row.ts_secs >= cutoff,
+                Err(e) => {
+                    tracing::error!(revision, op_id, error = %e, "dropping unparseable sm_audit row");
+                    false
+                }
+            }
+        })
+    }
+
+    /// Audit rows at or after `since`, ascending by revision, optionally
+    /// narrowed to one tenant (issue #163).
+    ///
+    /// `tenant: Some(..)` is what a `TenantAdmin` gets — the filter is applied
+    /// **here, server-side**, not by the caller. Handing a tenant admin the
+    /// fleet's rows and trusting a client to narrow them would mean the server
+    /// had already sent another tenant's audit history, which is the same
+    /// mistake RFC-002 §4.3 warns about for the event stream.
+    ///
+    /// Answers from local applied state and needs no leadership or fan-out:
+    /// every replica derived the same rows from the same log.
+    #[allow(clippy::result_large_err)]
+    pub fn audit_since(
+        &self,
+        since: u64,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<AuditRow>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_AUDIT_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut out = Vec::new();
+        // Revision-major keys, so this is a range scan from `since` rather than
+        // a scan of everything followed by a filter.
+        for item in table
+            .range((since, "")..)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            if out.len() >= limit {
+                break;
+            }
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (revision, op_id) = key.value();
+            // A row that will not parse is committed-state corruption, not an
+            // absent row — surfaced as an error rather than skipped, for the
+            // same reason `principal_bindings` does it: an audit stream that
+            // quietly omits what it cannot read is worse than one that admits
+            // it is broken.
+            let row: AuditRow = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(revision, op_id, error = %e, "corrupt stored audit row");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            if let Some(tenant) = tenant
+                && row.tenant.as_str() != tenant
+            {
+                continue;
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+
     /// The desired engine state as of now, read from an open (possibly
     /// mid-transaction) view of `sm_configs`: every default-tenant config,
     /// parsed — disabled ones included (a paused imposter stays bound, #817).
@@ -1788,6 +1927,74 @@ impl RedbStateMachine {
         }
     }
 
+    /// The tenant's quotas, or [`Quotas::default`] when it has no stored record
+    /// (issue #163).
+    ///
+    /// The default is the *generous* one, not a zero — `default` has no stored
+    /// row on a fresh cluster (nothing writes one; see `require_live_tenant`),
+    /// and a fleet that never configured tenancy must not find every write
+    /// refused because an absent record read as a quota of nothing.
+    #[allow(clippy::result_large_err)]
+    fn quotas_for(
+        tenants: &Table<'_, &'static str, &'static str>,
+        tenant: &str,
+    ) -> StorageResult<Quotas> {
+        Ok(match Self::stored_tenant(tenants, tenant)? {
+            // A corrupt record is not a licence to ignore the ceiling, but it
+            // is also not a reason to refuse every write: the op's own arm has
+            // already surfaced corruption where it matters (`require_live_tenant`
+            // refuses against an unreadable row), so falling back to the default
+            // here cannot let a write past a check that would otherwise have run.
+            Err(_) | Ok(None) => Quotas::default(),
+            Ok(Some(record)) => record.quotas,
+        })
+    }
+
+    /// `Some(reason)` when committing `config` on `port` would put `tenant`
+    /// over a ceiling (RFC-002 §4.4, issue #163).
+    ///
+    /// Two ceilings apply. `max_stubs_per_imposter` is a property of the
+    /// payload alone. `max_imposters` counts what the tenant already holds —
+    /// and counts it **excluding `port`**, because replacing an existing
+    /// imposter does not add one; without that, a tenant sitting exactly at its
+    /// limit could never update anything it already owned.
+    #[allow(clippy::result_large_err)]
+    fn quota_refusal_for_config(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+        tenants: &Table<'_, &'static str, &'static str>,
+        tenant: &str,
+        port: u16,
+        config: &ImposterConfig,
+    ) -> StorageResult<Option<String>> {
+        let quotas = Self::quotas_for(tenants, tenant)?;
+        let stubs = config.stubs.len();
+        if stubs > quotas.max_stubs_per_imposter as usize {
+            return Ok(Some(format!(
+                "tenant {tenant:?} allows at most {} stubs per imposter; this config carries {stubs}",
+                quotas.max_stubs_per_imposter
+            )));
+        }
+        let mut held = 0u32;
+        for item in configs
+            .iter()
+            .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?
+        {
+            let (key, _) =
+                item.map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
+            let (stored_tenant, stored_port) = key.value();
+            if stored_tenant == tenant && stored_port != port {
+                held = held.saturating_add(1);
+            }
+        }
+        if held >= quotas.max_imposters {
+            return Ok(Some(format!(
+                "tenant {tenant:?} is at its ceiling of {} imposters",
+                quotas.max_imposters
+            )));
+        }
+        Ok(None)
+    }
+
     /// `Err` when `tenant` names no live tenant record — used by every op that
     /// addresses an *existing* tenant rather than creating one
     /// (`PrincipalPut`, `BindingPut` against an ordinary tenant). A deleted
@@ -1886,6 +2093,24 @@ impl RedbStateMachine {
                 if Self::port_claimed_by_another_tenant(configs, tenant.as_str(), port)? {
                     return Ok(Err(format!("port {port} is already bound in this fleet")));
                 }
+                // Quotas (RFC-002 §4.4, issue #163). Checked here, at apply, on
+                // every replica — not pre-commit at the leader.
+                //
+                // The issue says "enforced at the Raft leader", meaning: in the
+                // one place that sees the tenant's whole write stream, rather
+                // than in a handler counting its own node's view (which
+                // over-commits under concurrent writes). Apply satisfies that
+                // and one thing leader-side validation cannot: a refusal here
+                // is a *committed* decision, so all three nodes record the same
+                // `Failed` outcome at the same revision — which is what the
+                // acceptance criteria actually demand, and what makes the
+                // refusal discoverable through `op_status` after a parked
+                // replay.
+                if let Some(reason) =
+                    Self::quota_refusal_for_config(configs, tenants, tenant.as_str(), port, config)?
+                {
+                    return Ok(Err(reason));
+                }
                 // Provenance survives a manual replace: the source still owns
                 // this port, it just no longer holds what the source declares.
                 // Clearing it instead would orphan the port, and the next
@@ -1934,6 +2159,21 @@ impl RedbStateMachine {
                 };
                 if let Err(reason) = control::apply_edit(&mut config.stubs, edit) {
                     return Ok(Err(reason));
+                }
+                // The per-imposter stub ceiling, checked on the *result* of the
+                // edit rather than on the edit script: a script is a sequence of
+                // adds, moves and deletes, so only the config it produces knows
+                // how many stubs the imposter ends up with. `max_imposters` is
+                // not re-checked — a patch edits an imposter that already
+                // exists and cannot add one.
+                let quotas = Self::quotas_for(tenants, tenant.as_str())?;
+                if config.stubs.len() > quotas.max_stubs_per_imposter as usize {
+                    return Ok(Err(format!(
+                        "tenant {:?} allows at most {} stubs per imposter; this edit would leave {}",
+                        tenant.as_str(),
+                        quotas.max_stubs_per_imposter,
+                        config.stubs.len()
+                    )));
                 }
                 record.config_json = serde_json::to_string(&config)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -2295,6 +2535,7 @@ impl RedbStateMachine {
                 tenant,
                 display_name,
                 quotas,
+                journal_retention_secs,
             } => {
                 let tenant_str = tenant.as_str();
                 // An upsert preserves `created_at_secs` and clears any
@@ -2315,6 +2556,7 @@ impl RedbStateMachine {
                     quotas: quotas.clone(),
                     created_at_secs,
                     deleted: false,
+                    journal_retention_secs: *journal_retention_secs,
                 };
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -2619,7 +2861,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
     async fn build_snapshot(&mut self) -> StorageResult<Snapshot<TypeConfig>> {
         let applied = self.read_applied()?;
 
-        let (configs, routes, sources, tenants, principals, bindings, dedup) = {
+        let (configs, routes, sources, tenants, principals, bindings, audit, dedup) = {
             let read_txn = self
                 .db
                 .begin_read()
@@ -2698,6 +2940,18 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                     value.value().to_owned(),
                 ));
             }
+            let audit_table = read_txn
+                .open_table(SM_AUDIT_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut audit = Vec::new();
+            for item in audit_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (revision, op_id) = key.value();
+                audit.push((revision, op_id.to_owned(), value.value().to_owned()));
+            }
             let dedup_table = read_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -2710,7 +2964,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 dedup.push((key.value().to_owned(), value.value().to_owned()));
             }
             (
-                configs, routes, sources, tenants, principals, bindings, dedup,
+                configs, routes, sources, tenants, principals, bindings, audit, dedup,
             )
         };
 
@@ -2721,6 +2975,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             tenants,
             principals,
             bindings,
+            audit,
             dedup,
             last_applied_log: applied.last_applied_log,
             last_membership: applied.last_membership.clone(),
@@ -2815,6 +3070,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut bindings = write_txn
                 .open_table(SM_BINDINGS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut audit = write_txn
+                .open_table(SM_AUDIT_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut dedup = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -2824,6 +3082,19 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             // re-apply on one replica and collapse on another.
             Self::gc_dedup(&mut dedup, applied.logical_clock_secs)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            // Audit retention runs on the same replicated clock, for a reason
+            // that is the same in kind and worse in consequence: two replicas
+            // disagreeing about which rows have expired would leave their audit
+            // tables permanently different, and the whole claim of this feature
+            // is that any node can answer because every node holds the same
+            // rows. A node whose local wall clock is a week fast must GC
+            // exactly what its peers do — so the local clock is never read.
+            Self::gc_audit(
+                &mut audit,
+                applied.logical_clock_secs,
+                self.audit_retention_secs,
+            )
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
 
             for entry in entries_iter {
                 let log_id = entry.log_id;
@@ -2895,6 +3166,41 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                             }
                             Err(reason) => ControlResponse::failed(log_id.index, reason),
                         };
+
+                        // The audit projection (RFC-002 §9, issue #163).
+                        //
+                        // Here, and only here. Every replica runs this same
+                        // arm for the same committed entry with the same
+                        // inputs, so all three derive a byte-identical row —
+                        // which is what lets `GET /admin/audit` answer from
+                        // local state with no fan-out.
+                        //
+                        // Below the dedup short-circuit above, deliberately: a
+                        // replayed `op_id` returns the original response and
+                        // changes nothing, so it must not append a second row
+                        // for the same write. "Exactly once per write" is an
+                        // acceptance criterion, and this ordering is what
+                        // provides it.
+                        //
+                        // Refusals are recorded too. A `Failed` outcome is a
+                        // committed decision, and "who tried to do what and was
+                        // refused" is the half of an audit log that matters
+                        // most.
+                        let audit_row = AuditRow {
+                            ts_secs: request.issued_at_secs,
+                            principal: request.principal.clone(),
+                            tenant: request.op.tenant().clone(),
+                            action: request.op.audit_action().to_owned(),
+                            resource: request.op.audit_resource(),
+                            op_id: request.op_id,
+                            revision: log_id.index,
+                            outcome: response.outcome.clone(),
+                        };
+                        let audit_value = serde_json::to_string(&audit_row)
+                            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                        audit
+                            .insert((log_id.index, op_key.as_str()), audit_value.as_str())
+                            .map_err(|e| StorageIOError::write_state_machine(&e))?;
 
                         let dedup_entry = DedupEntry {
                             // Stored copy: the same response must come back for
@@ -3057,6 +3363,24 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             for (principal_id, tenant, value) in &payload.bindings {
                 bindings_table
                     .insert((principal_id.as_str(), tenant.as_str()), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
+            // The audit table travels with the snapshot, like every other
+            // replicated table. A node joining by snapshot install must come
+            // back holding the same history as its peers — omitting this is how
+            // an audit stream silently loses everything before the join, with
+            // nothing reporting a gap (#134/#137 taught this crate the same
+            // lesson about sources).
+            let mut audit_table = write_txn
+                .open_table(SM_AUDIT_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            audit_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (revision, op_id, value) in &payload.audit {
+                audit_table
+                    .insert((*revision, op_id.as_str()), value.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -4728,6 +5052,7 @@ mod tests {
                 tenant: TenantId::new(tenant),
                 display_name: display_name.to_owned(),
                 quotas: Quotas::default(),
+                journal_retention_secs: 0,
             },
         )
     }

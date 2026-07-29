@@ -119,6 +119,7 @@ fn tenant_put(tenant: &str, display_name: &str) -> ControlOp {
         tenant: TenantId::new(tenant),
         display_name: display_name.to_owned(),
         quotas: Quotas::default(),
+        journal_retention_secs: 0,
     }
 }
 

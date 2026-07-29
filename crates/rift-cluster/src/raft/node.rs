@@ -33,7 +33,8 @@ use super::ring::Ring;
 use super::store::{self, RedbStateMachine, SourceRecord};
 use super::{NodeId, TypeConfig};
 use crate::control::{
-    ControlOp, ControlRequest, ControlResponse, Principal, Role, SourceProvenance, Tenant, TenantId,
+    AuditRow, ControlOp, ControlRequest, ControlResponse, Principal, Role, SourceProvenance,
+    Tenant, TenantId,
 };
 use crate::rpc::{
     Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer,
@@ -106,6 +107,15 @@ pub struct NodeConfig {
     /// engine yet) — applied configs are then served from the state machine but
     /// no imposters are actually bound.
     pub engine: Option<Arc<ImposterManager>>,
+    /// How long audit rows are kept, in seconds; `0` = forever (issue #163).
+    ///
+    /// **Must be identical on every node of a fleet.** It feeds the retention
+    /// GC that runs inside `apply`, so two nodes configured differently would
+    /// drop different rows from the same log and their audit tables would
+    /// permanently diverge — the one thing the replicated clock exists to
+    /// prevent. Node configuration rather than replicated state because it is
+    /// an operator's storage budget, not a tenant's policy.
+    pub audit_retention_secs: u64,
 }
 
 // Hand-written so the shared secret never lands in a log line — matching the
@@ -295,6 +305,7 @@ impl RaftNode {
             Some(routes) => state_machine.with_routes_handle(routes),
             None => state_machine,
         };
+        let state_machine = state_machine.with_audit_retention_secs(config.audit_retention_secs);
         let sm_reader = state_machine.clone();
 
         let raft_config = Arc::new(
@@ -1247,6 +1258,24 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// Audit rows at or after `since`, ascending by revision, optionally
+    /// narrowed to one tenant (RFC-002 §9, issue #163).
+    ///
+    /// Answers from local applied state — **no fan-out**. Every replica derives
+    /// the same rows from the same log, so any node can answer for the fleet.
+    /// (Contrast the M3 request journal, #147, which is per-node and needs
+    /// merge-on-read.)
+    pub fn audit_since(
+        &self,
+        since: u64,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AuditRow>, NodeError> {
+        self.sm_reader
+            .audit_since(since, tenant, limit)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// Whether the fleet has any principal defined at all (RFC-002 §3.4):
     /// governs the legacy-admin-plane bypass and the
     /// `rift_cluster_no_principals` gauge.
@@ -1454,6 +1483,7 @@ mod tests {
             secret: Some(SECRET.to_owned()),
             routes: Router::new(),
             engine: None,
+            audit_retention_secs: crate::raft::store::DEFAULT_AUDIT_RETENTION_SECS,
         }
     }
 
