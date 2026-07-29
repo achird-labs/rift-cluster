@@ -105,6 +105,27 @@ pub mod seams {
         current_principal, with_principal_scope,
     };
 
+    /// Upstream's own admin route classification (rift#889, this repo's finding
+    /// against U-9).
+    ///
+    /// The authorizer hook alone is only usable when upstream parses your
+    /// routes. The clustered admin front terminates part of the admin surface
+    /// itself and proxies the rest, so to consult an authorizer it must produce
+    /// the action / port / space / params tuple — and producing it by hand
+    /// means a **second route parser**, which upstream has already shipped a
+    /// bug from: a classifier that filtered empty path segments while the
+    /// router did not, so `PUT /imposters/:port/scenarios//state` dispatched a
+    /// mutation it had never classified. Calling [`classify`] is what keeps one
+    /// parser authoritative.
+    ///
+    /// [`SCOPE_HEADER`] is exported for the same reason: an embedder that
+    /// hardcodes `"x-rift-scope"` silently stops seeing scopes the day upstream
+    /// renames it.
+    ///
+    /// [`AuthzTarget`] is `#[non_exhaustive]` — read its fields, and match with
+    /// `..` rather than destructuring exhaustively.
+    pub use rift_http_proxy::admin_api::authz::{AuthzTarget, SCOPE_HEADER, classify};
+
     /// The config types a replicated control op carries (ADR-001 §4.1): the
     /// imposter config itself, the stub type its edit scripts address, and the
     /// error the engine reports when an apply side-effect fails.
@@ -339,6 +360,11 @@ mod tests {
         let _: fn(ServerBuilder, std::sync::Arc<dyn AdminAuthorizer>) -> ServerBuilder =
             ServerBuilder::admin_authorizer;
 
+        // Route classification (rift#889): the half that makes the authorizer
+        // usable from an admin front upstream does not parse.
+        _named::<AuthzTarget>();
+        let _ = SCOPE_HEADER;
+
         // Front-door route table (issue #131).
         _named::<RouteTable>();
         _named::<Route>();
@@ -417,6 +443,40 @@ mod tests {
             panic!("Allow must stay a distinct variant carrying its principal");
         };
         assert_eq!(principal, ctx.principal);
+    }
+
+    /// The clustered admin front can classify a route through the facade —
+    /// which is the whole point of the export (rift#889).
+    ///
+    /// Asserted behaviourally, not by naming the symbols: what #161 needs is the
+    /// action, the port and the **parsed params**, and a `classify` that
+    /// resolved but returned an empty `params` would satisfy a compile check
+    /// while still forcing a hand-rolled parser. The alternative to this call is
+    /// a second route parser, which upstream has already shipped a bug from.
+    #[test]
+    fn the_admin_front_can_classify_a_route_without_a_second_parser() {
+        use crate::seams::{SCOPE_HEADER, actions, classify};
+        use hyper::Method;
+
+        let target = classify(&Method::PUT, "/imposters/4545/stubs/by-id/abc123")
+            .expect("a dispatchable admin route classifies");
+        assert_eq!(target.action, actions::IMPOSTER_WRITE);
+        assert_eq!(target.port, Some(4545));
+        assert!(
+            target.params.contains(&("stubId", "abc123".to_owned())),
+            "the parsed params are the point — without them an embedder must \
+             re-parse the path: {:?}",
+            target.params
+        );
+
+        // `None` means "not an authorizable admin route": the hook is not
+        // consulted and the request 404s. #161's deny-by-default must not read
+        // this as a denial.
+        assert!(classify(&Method::GET, "/definitely-not-a-route").is_none());
+
+        // The header name comes from upstream, so a rename cannot silently
+        // strand an embedder that hardcoded it.
+        assert_eq!(SCOPE_HEADER, "x-rift-scope");
     }
 
     /// [`AuthzRequest`]'s `Debug` must redact the credential.

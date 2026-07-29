@@ -21,3 +21,7 @@ tracing.workspace = true
 # re-exports upstream's types — but asserting that a seam still *behaves* (not
 # merely that it resolves) means driving it with real JSON.
 serde_json.workspace = true
+# `classify` takes an `&http::Method`, so exercising the route-classification
+# seam for real (rather than only naming its types) needs one here. Dev-only:
+# the facade itself takes no HTTP dependency.
+hyper.workspace = true
