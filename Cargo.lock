@@ -2508,6 +2508,7 @@ dependencies = [
 name = "rift-ee"
 version = "0.1.0"
 dependencies = [
+ "hyper",
  "rift-http-proxy",
  "rift-mock-core",
  "rift-types",
