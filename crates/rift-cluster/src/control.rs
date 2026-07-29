@@ -158,6 +158,62 @@ pub struct Principal {
     pub disabled: bool,
 }
 
+/// The fast, non-secret index a raw API key resolves to (RFC-002 §3.2's
+/// `PrincipalId` format, `"key:<fingerprint>"`): SHA-256 of the key, hex.
+///
+/// This is **not** the security boundary — [`verify_api_key`]'s argon2id
+/// check is — it only lets a presented key find its principal row in one
+/// lookup (issue #161) instead of a full-table scan. A collision here would
+/// merely point two different keys at the same row to *attempt* verification
+/// against; the argon2id compare downstream is what actually authenticates.
+#[must_use]
+pub fn api_key_fingerprint(raw: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(raw.as_bytes()))
+}
+
+/// The [`PrincipalId`] a raw API key resolves to. See [`api_key_fingerprint`].
+#[must_use]
+pub fn api_key_principal_id(raw: &str) -> PrincipalId {
+    PrincipalId::new(format!("key:{}", api_key_fingerprint(raw)))
+}
+
+/// Hash a raw API key for storage as an [`AuthSource::ApiKey`] (RFC-002 §8.2):
+/// argon2id, a fresh random salt per call. The PHC string this returns is
+/// what [`validate_auth_source`] requires and what [`verify_api_key`] checks
+/// against — the raw key itself is never stored.
+#[must_use]
+pub fn hash_api_key(raw: &str) -> String {
+    use argon2::Argon2;
+    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+
+    let salt = SaltString::generate(&mut OsRng);
+    // The only way this fails is an internal encoding bug in the hasher, not
+    // anything about `raw` (argon2 has no length limit this crate approaches)
+    // — an `expect` here names a defect in the algorithm, not attacker input.
+    Argon2::default()
+        .hash_password(raw.as_bytes(), &salt)
+        .expect("argon2id hashing does not fail for a well-formed salt")
+        .to_string()
+}
+
+/// Verify a raw API key against a stored argon2id hash. `false` on anything
+/// that is not a match, including a `stored_hash` that will not even parse as
+/// a PHC string — a corrupt or foreign hash format must refuse, never panic
+/// or read as a pass.
+#[must_use]
+pub fn verify_api_key(raw: &str, stored_hash: &str) -> bool {
+    use argon2::Argon2;
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+
+    let Ok(parsed) = PasswordHash::new(stored_hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(raw.as_bytes(), &parsed)
+        .is_ok()
+}
+
 /// A principal's binding to one tenant (RFC-002 §3.3): what [`ControlOp::BindingPut`]
 /// stores.
 ///
@@ -1238,6 +1294,48 @@ mod tests {
             },
             disabled: false,
         }
+    }
+
+    // -- API key hashing / verification (issue #161) ---------------------------
+
+    #[test]
+    fn hash_api_key_produces_a_verifiable_argon2id_hash() {
+        let hash = hash_api_key("s3cr3t-key");
+        assert!(
+            hash.starts_with("$argon2id$"),
+            "must satisfy validate_auth_source's prefix check: {hash}"
+        );
+        assert!(verify_api_key("s3cr3t-key", &hash));
+        assert!(
+            !verify_api_key("wrong-key", &hash),
+            "a different key must not verify"
+        );
+    }
+
+    #[test]
+    fn hash_api_key_salts_per_call() {
+        // Two hashes of the same key must differ (random salt) but both verify.
+        let a = hash_api_key("same-key");
+        let b = hash_api_key("same-key");
+        assert_ne!(a, b, "argon2id must not reuse a salt across calls");
+        assert!(verify_api_key("same-key", &a));
+        assert!(verify_api_key("same-key", &b));
+    }
+
+    #[test]
+    fn verify_api_key_fails_closed_on_a_corrupt_hash() {
+        assert!(!verify_api_key("any-key", "not a phc string"));
+        assert!(!verify_api_key("any-key", ""));
+    }
+
+    #[test]
+    fn api_key_fingerprint_is_deterministic_and_key_sensitive() {
+        assert_eq!(api_key_fingerprint("a"), api_key_fingerprint("a"));
+        assert_ne!(api_key_fingerprint("a"), api_key_fingerprint("b"));
+        assert_eq!(
+            api_key_principal_id("a").as_str(),
+            format!("key:{}", api_key_fingerprint("a"))
+        );
     }
 
     // -- log-format stability -------------------------------------------------

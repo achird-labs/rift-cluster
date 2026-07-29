@@ -139,6 +139,19 @@ pub struct ClusterArgs {
         env = "RIFT_CLUSTER_FLOW_FSYNC_INTERVAL_MS"
     )]
     pub cluster_flow_fsync_interval_ms: u64,
+
+    /// Also bind the legacy `--api-key`'s synthetic principal to `FleetAdmin`
+    /// on the fleet scope, on top of its `TenantAdmin` binding on `default`
+    /// (RFC-002 §3.4 migration). **Defaults to true for this release** so an
+    /// upgrade changes nothing observable; the schedule is default true, then
+    /// default false, then the flag is removed — see `docs/rift-ee-server.md`.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        env = "RIFT_CLUSTER_LEGACY_KEY_IS_FLEET_ADMIN"
+    )]
+    pub cluster_legacy_key_is_fleet_admin: bool,
 }
 
 /// `--cluster-write-barrier` modes (issue #9 §4).
@@ -331,6 +344,31 @@ mod tests {
         let cli = EeCli::try_parse_from(["rift-ee-server", "--runtime", "work-stealing"])
             .expect("parses");
         assert_eq!(cli.runtime_topology(), RuntimeTopology::WorkStealing);
+    }
+
+    /// RFC-002 §3.4: the staged default is the whole migration story, so the
+    /// flag's default must actually be `true` until this is explicitly
+    /// re-staged, and it must still be possible to turn off.
+    #[test]
+    fn legacy_key_is_fleet_admin_defaults_true_and_is_settable() {
+        let cli = EeCli::try_parse_from(["rift-ee-server"]).expect("parses");
+        assert!(cli.cluster.cluster_legacy_key_is_fleet_admin);
+
+        let off = EeCli::try_parse_from([
+            "rift-ee-server",
+            "--cluster-legacy-key-is-fleet-admin",
+            "false",
+        ])
+        .expect("parses");
+        assert!(!off.cluster.cluster_legacy_key_is_fleet_admin);
+
+        let on = EeCli::try_parse_from([
+            "rift-ee-server",
+            "--cluster-legacy-key-is-fleet-admin",
+            "true",
+        ])
+        .expect("parses");
+        assert!(on.cluster.cluster_legacy_key_is_fleet_admin);
     }
 
     #[test]

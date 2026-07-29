@@ -19,10 +19,13 @@
 //!   cluster port.
 
 pub mod admin_front;
+pub mod authorizer;
+pub mod authz;
 pub mod bootstrap;
 pub mod cli;
 pub mod cluster_api;
 pub mod compose;
+pub mod principal;
 pub mod probes;
 pub mod readiness;
 

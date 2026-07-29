@@ -32,7 +32,9 @@ use super::network::{
 use super::ring::Ring;
 use super::store::{self, RedbStateMachine, SourceRecord};
 use super::{NodeId, TypeConfig};
-use crate::control::{ControlOp, ControlRequest, ControlResponse, SourceProvenance, TenantId};
+use crate::control::{
+    ControlOp, ControlRequest, ControlResponse, Principal, Role, SourceProvenance, TenantId,
+};
 use crate::rpc::{
     Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer,
     RpcServerConfig, Signer, TrackedPeerHealth, Verifier,
@@ -1200,6 +1202,33 @@ impl RaftNode {
     pub fn config_provenance(&self) -> Result<Vec<(u16, SourceProvenance)>, NodeError> {
         self.sm_reader
             .config_provenance()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The principal record for `id`, or `None` if no such principal exists
+    /// (issue #161). Answers from local applied state — authenticating a
+    /// request must not require this node to be leader.
+    pub fn principal(&self, id: &str) -> Result<Option<Principal>, NodeError> {
+        self.sm_reader
+            .principal(id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Every tenant `id` is bound in, with the role for each (RFC-002 §4,
+    /// issue #161) — the read `authz::decide` is built on. Like
+    /// [`Self::principal`], this answers from local applied state.
+    pub fn principal_bindings(&self, id: &str) -> Result<Vec<(TenantId, Role)>, NodeError> {
+        self.sm_reader
+            .principal_bindings(id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Whether the fleet has any principal defined at all (RFC-002 §3.4):
+    /// governs the legacy-admin-plane bypass and the
+    /// `rift_cluster_no_principals` gauge.
+    pub fn has_any_principals(&self) -> Result<bool, NodeError> {
+        self.sm_reader
+            .has_any_principals()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
