@@ -94,11 +94,18 @@ async fn config_and_imposters_report_committed_state() {
         .await
         .expect("committed write");
 
+    // Tenant-qualified rows, not bare ports (issue #182). `/_cluster/*` is the *operator* surface
+    // and stays fleet-wide — it answers "what has this node converged on", and once more than one
+    // tenant's config can be applied, the honest answer names the tenant.
     let config = get(&client, fixture.addr, "/_cluster/config").await;
-    assert_eq!(config["ports"], serde_json::json!([4545]));
+    assert_eq!(
+        config["ports"],
+        serde_json::json!([{ "tenant": "default", "port": 4545 }])
+    );
 
     let imposters = get(&client, fixture.addr, "/_cluster/imposters").await;
     assert_eq!(imposters["imposters"][0]["port"], 4545);
+    assert_eq!(imposters["imposters"][0]["tenant"], "default");
     assert_eq!(
         imposters["imposters"][0]["config"]["protocol"], "http",
         "the committed body is reported as JSON, not an escaped string"

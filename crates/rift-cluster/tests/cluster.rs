@@ -16,7 +16,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rift_cluster::{Authority, ControlRequest, NodeConfig, NodeId, RaftNode, Router};
+use rift_cluster::{
+    Authority, ControlRequest, DEFAULT_TENANT, NodeConfig, NodeId, RaftNode, Router,
+};
 use tempfile::TempDir;
 
 const SECRET: &str = "harness-cluster-secret";
@@ -213,7 +215,7 @@ impl TestCluster {
             let mut live = self.live().peekable();
             let converged = live.peek().is_some()
                 && live.all(|n| {
-                    n.get_imposter(port)
+                    n.get_imposter(DEFAULT_TENANT, port)
                         .expect("read config")
                         .and_then(name_of)
                         .as_deref()
@@ -1141,7 +1143,7 @@ async fn source_pull_fetches_exactly_once_and_converges_the_fleet() {
     // And every node can answer for the source itself, not just its imposters.
     for node in cluster.live() {
         let record = node
-            .source("mocks")
+            .source(DEFAULT_TENANT, "mocks")
             .expect("read source")
             .expect("the source is replicated, not node-local");
         assert_eq!(record.last_version.as_deref(), Some("v1"));
@@ -1247,7 +1249,7 @@ async fn a_credential_bearing_source_uri_never_reaches_the_log() {
         cluster
             .leader()
             .expect("a leader")
-            .sources()
+            .sources(DEFAULT_TENANT)
             .expect("read sources")
             .is_empty()
     );

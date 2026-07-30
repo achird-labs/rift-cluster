@@ -347,40 +347,72 @@ async fn cross_tenant_probes_are_indistinguishable_from_probes_of_nothing() {
     )
     .await;
 
-    // Probe 2: genuinely bound to `acme` with `TenantAdmin` — `decide` grants
-    // `ImposterRead` there — but `acme` is not `default`, so the B2/B3
-    // tenant-serving guard refuses it before any resource lookup happens.
-    // The port named is irrelevant to that guard (it fires on the tenant
-    // alone), which is exactly the point: this probe never gets far enough
-    // to distinguish an existing port from a nonexistent one either.
-    let unservable_port = reserve_port();
-    let unservable_tenant = Seen::of(
+    // Probe 2: genuinely bound to `acme` with `TenantAdmin` — `decide` grants `ImposterRead`
+    // there — reaching for a port that belongs to **`default`**. This is the probe that matters
+    // now, and it did not exist before issue #182: until then the blanket serving guard refused
+    // every non-default tenant on the tenant alone, so no request ever reached a resource lookup
+    // and there was no cross-tenant *resource* boundary to test. Now that `acme` is served, the
+    // ownership gate is the only thing standing between an authorized `acme` admin and
+    // `default`'s imposter — and it must refuse indistinguishably from "you are not bound here".
+    let cross_tenant = Seen::of(
         client
-            .get(format!("http://{admin}/imposters/{unservable_port}"))
+            .get(format!("http://{admin}/imposters/{existing_port}"))
             .header("authorization", &raw_key)
             .header("x-rift-tenant", "acme")
             .send()
             .await
-            .expect("probe a genuinely-bound but unservable tenant"),
+            .expect("probe another tenant's port from a tenant this principal IS bound to"),
     )
     .await;
 
     assert_eq!(not_bound.status, 404, "{not_bound}");
     assert_eq!(
-        unservable_tenant.status, 404,
-        "a bound-but-unservable tenant must still read as not-found: {unservable_tenant}"
+        cross_tenant.status, 404,
+        "another tenant's imposter must read as not-found: {cross_tenant}"
     );
     assert_eq!(
-        not_bound.body, unservable_tenant.body,
-        "a caller must not be able to tell 'not bound' from 'bound, but unservable' by body"
+        not_bound.body, cross_tenant.body,
+        "a caller must not be able to tell 'not bound here' from 'bound here, but that port is \
+         another tenant's' by body"
     );
     assert_eq!(
         headers_excluding_date(&not_bound),
-        headers_excluding_date(&unservable_tenant),
+        headers_excluding_date(&cross_tenant),
         "nor by headers (aside from `date`, which every response carries and which hyper's \
          server stamps with the real wall-clock time of each request — comparing it would fail \
          two genuinely identical responses sent a second apart, not detect a leak) — \
-         {not_bound} vs {unservable_tenant}"
+         {not_bound} vs {cross_tenant}"
+    );
+
+    // And the other half, which is what makes the two assertions above meaningful rather than
+    // vacuous (issue #182's acceptance criterion): `acme` reading **its own** imposter succeeds.
+    // Before this change this was a 404 too — every tenant but `default` was refused wholesale —
+    // so a test that only asserted the refusals would have passed just as well against a build
+    // that serves nobody.
+    let acme_port = reserve_port();
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::new("acme"),
+            config: serde_json::from_value(minimal_imposter(acme_port)).expect("config parses"),
+        },
+    )
+    .await;
+
+    let own = Seen::of(
+        client
+            .get(format!("http://{admin}/imposters/{acme_port}"))
+            .header("authorization", &raw_key)
+            .header("x-rift-tenant", "acme")
+            .send()
+            .await
+            .expect("read acme's own imposter"),
+    )
+    .await;
+    assert_eq!(
+        own.status, 200,
+        "an Editor of acme must be served acme's own imposter: {own}"
     );
 
     server.shutdown().await;
@@ -471,9 +503,15 @@ async fn a_refused_cross_tenant_delete_leaves_the_default_tenant_untouched() {
         .await
         .expect("delete-all authorized against acme");
     let seen = Seen::of(response).await;
+    // Issue #182 changed *why* `default`'s imposter survives, and the new reason is the stronger
+    // one. It used to survive because the serving guard refused the request outright — acme was
+    // unservable, so nothing ran. Now acme is served: the delete-all succeeds, over **acme's own
+    // set**, which is empty. The invariant this test is named for is unchanged and is now being
+    // tested against a request that actually executes rather than one that was turned away at the
+    // door.
     assert_eq!(
-        seen.status, 404,
-        "acme is a real, authorized tenant this build still cannot serve: {seen}"
+        seen.status, 200,
+        "acme's delete-all is authorized and now genuinely runs, over acme's own set: {seen}"
     );
 
     let response = client
@@ -1204,6 +1242,321 @@ async fn a_replicated_write_is_audited_and_a_plain_read_is_not() {
         row.principal.is_some(),
         "U-10: the row names the principal the admin front authenticated, not \
          an anonymous write: {row:?}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #182 AC5: the imposter listing is narrowed to the caller's own tenant — **including
+/// `default`**.
+///
+/// The listing is the one proxied read the ownership gate cannot cover: it names no port, so there
+/// is nothing to check ownership of, and it goes verbatim to a local engine that now binds every
+/// tenant's imposters. Without the response filter an authorized caller would be handed the whole
+/// fleet's imposters, which is the same leak the per-port gate closes, reached by a route that has
+/// no port.
+///
+/// The `default` half is the deliberate behaviour change: before this, `default` saw everything
+/// because everything *was* default's.
+#[tokio::test]
+async fn an_imposter_listing_shows_only_the_callers_own_tenant() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let default_port = reserve_port();
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: serde_json::from_value(minimal_imposter(default_port)).expect("config parses"),
+        },
+    )
+    .await;
+    op_id += 1;
+
+    seed(node, op_id, tenant_put("acme", "Acme Corp")).await;
+    op_id += 1;
+    let acme_port = reserve_port();
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::new("acme"),
+            config: serde_json::from_value(minimal_imposter(acme_port)).expect("config parses"),
+        },
+    )
+    .await;
+    op_id += 1;
+
+    let acme_key = seed_bound_principal(node, &mut op_id, "acme-admin", "acme", Role::Viewer).await;
+    let default_key =
+        seed_bound_principal(node, &mut op_id, "default-reader", "default", Role::Viewer).await;
+
+    let ports_seen_by = |key: String, tenant: Option<&'static str>| {
+        let client = client.clone();
+        async move {
+            let mut request = client
+                .get(format!("http://{admin}/imposters"))
+                .header("authorization", key);
+            if let Some(tenant) = tenant {
+                request = request.header("x-rift-tenant", tenant);
+            }
+            let seen = Seen::of(request.send().await.expect("list imposters")).await;
+            assert_eq!(seen.status, 200, "{seen}");
+            seen.json()["imposters"]
+                .as_array()
+                .expect("an imposters array")
+                .iter()
+                .filter_map(|e| e["port"].as_u64())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let acme_sees = ports_seen_by(acme_key, Some("acme")).await;
+    assert_eq!(
+        acme_sees,
+        vec![u64::from(acme_port)],
+        "acme's listing must contain acme's imposter and nothing else"
+    );
+
+    let default_sees = ports_seen_by(default_key, None).await;
+    assert_eq!(
+        default_sees,
+        vec![u64::from(default_port)],
+        "default no longer sees other tenants' imposters — the deliberate behaviour change"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #182 AC3: tenancy isolates *administration*, not traffic.
+///
+/// RFC-002 §7 keeps the data plane open, and this change must not narrow it: an imposter owned by
+/// a non-default tenant answers on its own port, with **no credential at all**. That is the half
+/// of the tenancy boundary it would be easy to over-enforce while closing the admin one — and the
+/// union engine-sync is what makes it true, since the local engine now binds every tenant's ports
+/// rather than only `default`'s.
+#[tokio::test]
+async fn a_tenanted_imposter_answers_the_data_plane_with_no_credential() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let mut op_id = 1u128;
+
+    seed(node, op_id, tenant_put("acme", "Acme Corp")).await;
+    op_id += 1;
+    let acme_port = reserve_port();
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::new("acme"),
+            config: serde_json::from_value(minimal_imposter(acme_port)).expect("config parses"),
+        },
+    )
+    .await;
+
+    // The bind happens on the engine-sync that follows the apply, so poll rather than assert once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(response) = reqwest::get(format!("http://127.0.0.1:{acme_port}/")).await {
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "acme's imposter must answer the data plane unauthenticated"
+            );
+            assert_eq!(response.text().await.expect("body"), "hi");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the local engine never bound acme's imposter — union sync did not reach it"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    server.shutdown().await;
+}
+
+/// Issue #182, found in review: the **set-level** imposter ops answer with a re-read of the
+/// collection, and that body is just as much a listing as `GET /imposters` is.
+///
+/// `PUT /imposters` renders the set afterwards; `DELETE /imposters` captures it beforehand as
+/// "what was removed". Both go through the loopback to an engine that now binds every tenant, so
+/// filtering only the proxied `GET` left two routes handing an Editor of one tenant the whole
+/// fleet's imposters — with `?replayable=true`, their stubs too. The narrowing lives in `fetch`
+/// precisely so these two cannot diverge from the `GET` path again.
+#[tokio::test]
+async fn set_level_imposter_ops_do_not_answer_with_another_tenants_imposters() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let default_port = reserve_port();
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: serde_json::from_value(minimal_imposter(default_port)).expect("config parses"),
+        },
+    )
+    .await;
+    op_id += 1;
+
+    seed(node, op_id, tenant_put("acme", "Acme Corp")).await;
+    op_id += 1;
+    let acme_key =
+        seed_bound_principal(node, &mut op_id, "acme-editor", "acme", Role::Editor).await;
+
+    let acme_port = reserve_port();
+    let replaced = Seen::of(
+        client
+            .put(format!("http://{admin}/imposters"))
+            .header("authorization", &acme_key)
+            .header("x-rift-tenant", "acme")
+            .json(&json!({ "imposters": [minimal_imposter(acme_port)] }))
+            .send()
+            .await
+            .expect("wholesale replace as acme"),
+    )
+    .await;
+    assert_eq!(replaced.status, 200, "{replaced}");
+    let ports: Vec<u64> = replaced.json()["imposters"]
+        .as_array()
+        .expect("an imposters array")
+        .iter()
+        .filter_map(|e| e["port"].as_u64())
+        .collect();
+    assert!(
+        !ports.contains(&u64::from(default_port)),
+        "the replace re-read leaked another tenant's imposter: {ports:?}"
+    );
+    assert_eq!(ports, vec![u64::from(acme_port)]);
+
+    let deleted = Seen::of(
+        client
+            .delete(format!("http://{admin}/imposters"))
+            .header("authorization", &acme_key)
+            .header("x-rift-tenant", "acme")
+            .send()
+            .await
+            .expect("delete-all as acme"),
+    )
+    .await;
+    assert_eq!(deleted.status, 200, "{deleted}");
+    let deleted_ports: Vec<u64> = deleted.json()["imposters"]
+        .as_array()
+        .expect("an imposters array")
+        .iter()
+        .filter_map(|e| e["port"].as_u64())
+        .collect();
+    assert!(
+        !deleted_ports.contains(&u64::from(default_port)),
+        "the delete-all capture leaked another tenant's imposter: {deleted_ports:?}"
+    );
+
+    // And the delete really was scoped: default's imposter is still there.
+    let default_key =
+        seed_bound_principal(node, &mut op_id, "default-reader", "default", Role::Viewer).await;
+    let survivor = Seen::of(
+        client
+            .get(format!("http://{admin}/imposters/{default_port}"))
+            .header("authorization", &default_key)
+            .send()
+            .await
+            .expect("re-read default's imposter"),
+    )
+    .await;
+    assert_eq!(
+        survivor.status, 200,
+        "acme's delete-all must not have touched default's imposter: {survivor}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #182, found in review: the ownership gate must not become a port-existence oracle.
+///
+/// A port owned by another tenant and a port owned by nobody must answer identically. They did not:
+/// the gate renders §8.4's terse "Not Found" while an unowned port fell through to upstream, whose
+/// 404 names the port. Sweeping the range would then have mapped exactly which ports other tenants
+/// hold — reconnaissance that §8.4 exists to deny.
+#[tokio::test]
+async fn an_unowned_port_is_indistinguishable_from_another_tenants_port() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let default_port = reserve_port();
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: serde_json::from_value(minimal_imposter(default_port)).expect("config parses"),
+        },
+    )
+    .await;
+    op_id += 1;
+
+    seed(node, op_id, tenant_put("acme", "Acme Corp")).await;
+    op_id += 1;
+    let acme_key = seed_bound_principal(node, &mut op_id, "acme-admin", "acme", Role::Viewer).await;
+
+    let probe = |port: u16| {
+        let client = client.clone();
+        let key = acme_key.clone();
+        async move {
+            Seen::of(
+                client
+                    .get(format!("http://{admin}/imposters/{port}"))
+                    .header("authorization", key)
+                    .header("x-rift-tenant", "acme")
+                    .send()
+                    .await
+                    .expect("probe"),
+            )
+            .await
+        }
+    };
+
+    let owned_by_other = probe(default_port).await;
+    let owned_by_nobody = probe(reserve_port()).await;
+
+    assert_eq!(owned_by_other.status, 404, "{owned_by_other}");
+    assert_eq!(owned_by_nobody.status, 404, "{owned_by_nobody}");
+    assert_eq!(
+        owned_by_other.body, owned_by_nobody.body,
+        "a port held by another tenant must not be distinguishable from a free one — otherwise \
+         sweeping the range maps every other tenant's ports"
     );
 
     server.shutdown().await;

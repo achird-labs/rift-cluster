@@ -2604,8 +2604,11 @@ async fn c18_routes_survive_a_full_cluster_restart() {
 
 /// The imposter port `bind-squat.overlay.yml` squats inside rift-2's network
 /// namespace only. Not published to the host -- see that overlay's header for
-/// why. 6520 continues the numbering C17/C18 (6500-6512) and C20-C23
-/// (6610-6640) already use in this file; nothing else in this tier binds it.
+/// why. 6520 continues the numbering C17/C18 (6500-6512) and C20-C23 (6610-6640) already use in
+/// this file. C26 also uses 6520-6522, which is safe only because this tier runs `--test-threads=1`
+/// and every scenario brings up and tears down its own stack — the overlays differ, so the two
+/// never coexist. Reusing a number across scenarios is fine *for that reason*, not because the
+/// number is unused; anything that made these run concurrently would have to revisit it.
 const C19_IMPOSTER_PORT: u16 = 6520;
 
 /// Poll `docker inspect` until `name`'s healthcheck reports `healthy`, or bail
@@ -3732,6 +3735,53 @@ async fn c23_assert_committed_body(port: u16, marker: &str) {
 // the scenario cannot bootstrap one over HTTP itself.
 // ---------------------------------------------------------------------------
 
+/// Poll every node until `GET /imposters/{port}` (sent as `credential`, acting
+/// explicitly as `tenant`) answers `200` — C24 and C27's convergence gate for
+/// an imposter owned by a non-default tenant.
+///
+/// Not [`wait_converged_with_key`]: that reads `GET /imposters`, the
+/// collection listing, which issue #182 filters to the caller's own tenant —
+/// and the fleet admin's list defaults to `default` when no `X-Rift-Tenant` is
+/// sent, so it can never observe a port owned by `acme`, `alpha` or `beta`. A
+/// single-port read carries the tenant explicitly and is filtered by the
+/// per-resource ownership gate, not the list filter, so it sees exactly the
+/// resource asked for.
+///
+/// Doubles as the binding-convergence check when `credential` is the tenant's
+/// own principal rather than the fleet admin's: a `200` here requires both the
+/// imposter *and* the principal's binding to have replicated to that node.
+/// Probed this way rather than `GET /admin/whoami`, which classifies no
+/// action and would answer `200` to anyone who authenticates — going green on
+/// a node that replicated the principal row but not the binding, the exact
+/// race this gate exists to exclude. (C25 lost a container run to that
+/// mistake; see `c25_probe`.)
+async fn wait_imposter_visible_as(port: u16, credential: &str, tenant: &str, timeout: Duration) {
+    for node in &NODES {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let (status, body) = admin_as(
+                node.admin,
+                "GET",
+                &format!("/imposters/{port}"),
+                None,
+                Some(credential),
+                Some(tenant),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: read {port} as {tenant}: {e}", node.name));
+            if status == 200 || std::time::Instant::now() > deadline {
+                assert_eq!(
+                    status, 200,
+                    "{}: {port} never became visible to {tenant}: {body}",
+                    node.name
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
 /// One probe in C24's matrix: what to ask, and how to ask it.
 struct MatrixProbe {
     label: &'static str,
@@ -3749,10 +3799,12 @@ struct MatrixProbe {
 fn c24_matrix(port: u16) -> Vec<MatrixProbe> {
     vec![
         // A read of a resource the caller's own tenant owns. `GET /imposters`
-        // is deliberately not the probe here: with an empty tenant it answers
-        // `404 no such resource`, which is a real answer about the resource and
-        // says nothing about authorization — the matrix would then contain no
-        // allowed action at all, and "every node agreed" would be vacuous.
+        // (the collection) is deliberately not the probe here: issue #182
+        // filters that list to the caller's own tenant, so it would also
+        // answer `200` — but through `tenant_owned_ports`, a different code
+        // path from the per-port ownership gate in `authorize_action` that is
+        // the actual thing this issue added. Addressing the port directly
+        // exercises that gate itself, which is the sharper claim.
         MatrixProbe {
             label: "imposter.read",
             method: "GET",
@@ -3834,18 +3886,33 @@ fn c24_canonical(admin: u16, body: serde_json::Value) -> serde_json::Value {
 /// a different reason — or a different `403`/`404` classification — has diverged
 /// in exactly the way that is invisible to a status-only assertion.
 ///
-/// **Why the matrix runs in `default` and not in a fresh tenant.** This build
-/// *stores* resource state per tenant but only *serves* the default one:
-/// `admin_front::authorize_action`'s fail-closed guard (issue #161, blockers
-/// B2/B3) answers RFC-002 §8.4's 404 for every non-tenancy route whose decided
-/// tenant is not `default`, because `raft::store`'s `desired_configs` /
-/// `desired_routes` skip non-default tenants when binding the local engine.
-/// Running the matrix in `acme` therefore made **every** probe 404 regardless of
-/// role — authorization was never the thing being measured, and the vacuity
-/// assertions at the foot of this scenario are what caught it. In `default` the
-/// role genuinely discriminates, and the 404 half of the split comes from the
-/// fleet-scoped routes (`GET /admin/tenants`, `GET /admin/audit/sink` both scope
-/// to `FLEET_SCOPE`), which a tenant-bound principal holds no binding for.
+/// **Runs in a non-default tenant (`acme`), not `default`.** This used to be
+/// unrunnable: `admin_front::authorize_action`'s fail-closed guard (issue
+/// #161, blockers B2/B3) answered RFC-002 §8.4's 404 for every non-`default`
+/// tenant, because `raft::store`'s `desired_configs`/`desired_routes` skipped
+/// non-default tenants when binding the local engine — running the matrix in
+/// `acme` made **every** probe 404 regardless of role, so authorization was
+/// never the thing being measured, and the vacuity assertions at the foot of
+/// this scenario are what caught it.
+///
+/// Issue #182 replaced that blanket guard with a narrower per-resource
+/// ownership gate (see `authorize_action`'s doc for both halves: the read/sync
+/// paths becoming tenant-aware, and the gate that had to land before the old
+/// guard could come off). A tenant other than `default` is now genuinely
+/// served, and running the matrix there is the stronger claim of the two —
+/// agreement across nodes for a tenant that used to be unreachable, rather
+/// than for the one every route quietly fell back to. The role still
+/// genuinely discriminates in `acme`: the `imposter.read`/`write`/`delete`
+/// probes come from the viewer's tenant-scoped binding, and the 404 half of
+/// the split comes from the fleet-scoped routes (`GET /admin/tenants`,
+/// `GET /admin/audit/sink` both scope to `FLEET_SCOPE`), which a tenant-bound
+/// principal holds no binding for regardless of which tenant it is bound to.
+///
+/// Every request the viewer sends below carries an explicit `X-Rift-Tenant:
+/// acme`: unlike `default`, `acme` is not what an omitted header resolves to
+/// (`requested_tenant` defaults to `default`), and the viewer holds no
+/// binding in `default` at all — an omitted header would deny every probe
+/// with `NotBoundToTenant` before the matrix measured anything.
 ///
 /// *Mutant:* an authorizer reading bindings from a per-node cache, or only from
 /// the leader, must go red on the node that did not accept the binding write.
@@ -3860,7 +3927,10 @@ async fn c24_rbac_enforcement_is_identical_through_any_node() {
         .expect("a leader settles");
 
     // One tenant, one principal, one role — created once, through one node.
-    let (status, body) = create_tenant(NODES[0].admin, "default", TENANCY_FLEET_KEY)
+    // `acme`, not `default` (see this scenario's doc comment): this is now the
+    // non-vacuous case.
+    const C24_TENANT: &str = "acme";
+    let (status, body) = create_tenant(NODES[0].admin, C24_TENANT, TENANCY_FLEET_KEY)
         .await
         .expect("create tenant");
     assert!(
@@ -3868,17 +3938,19 @@ async fn c24_rbac_enforcement_is_identical_through_any_node() {
         "the fleet admin must be able to create a tenant: {status} {body}"
     );
     let (_viewer_id, viewer) =
-        mint_principal(NODES[0].admin, "default", "viewer", TENANCY_FLEET_KEY)
+        mint_principal(NODES[0].admin, C24_TENANT, "viewer", TENANCY_FLEET_KEY)
             .await
-            .expect("mint a viewer in default");
+            .expect("mint a viewer in acme");
 
-    // One imposter the viewer's own tenant owns, created by the fleet admin, so
-    // the matrix has a resource the viewer is genuinely entitled to read.
-    // Without it every probe answers 403/404 and agreement across nodes proves
-    // nothing — which is exactly what the vacuity assertions at the end of this
-    // scenario caught the first time it ran.
+    // One imposter the viewer's own tenant owns, created by the fleet admin
+    // acting explicitly *as* `acme` — the fleet admin's own binding is the
+    // fleet scope, not `acme`, so an omitted `X-Rift-Tenant` would create in
+    // `default` instead. The matrix needs a resource the viewer is genuinely
+    // entitled to read; without it every probe answers 403/404 and agreement
+    // across nodes proves nothing — which is exactly what the vacuity
+    // assertions at the end of this scenario caught the first time it ran.
     const C24_PORT: u16 = 6510;
-    let (status, body) = admin_with_key(
+    let (status, body) = admin_as(
         NODES[0].admin,
         "POST",
         "/imposters",
@@ -3888,63 +3960,38 @@ async fn c24_rbac_enforcement_is_identical_through_any_node() {
             "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": "acme" } }] }]
         })),
         Some(TENANCY_FLEET_KEY),
+        Some(C24_TENANT),
     )
     .await
-    .expect("seed an imposter in the default tenant");
+    .expect("seed an imposter in acme");
     assert!(
         (200..300).contains(&status),
-        "the fleet admin must be able to create in default: {status} {body}"
+        "the fleet admin must be able to create in acme: {status} {body}"
     );
-    wait_converged_with_key(u64::from(C24_PORT), CONVERGE_TIMEOUT, TENANCY_FLEET_KEY)
-        .await
-        .expect("the seeded imposter converges before the matrix reads it");
 
-    // Every node must have applied the *binding* before it can be asked about
-    // it, or the scenario would be racing consensus and calling the race a
-    // divergence.
-    //
-    // Probed with the viewer's own read rather than `GET /admin/whoami`: whoami
-    // classifies no action, so it answers `200` to anyone who authenticates and
-    // would go green on a node that had replicated the principal row but not the
-    // binding — the exact race this gate exists to exclude. (C25 lost a container
-    // run to the same mistake; see `c25_probe`.)
-    for node in &NODES {
-        let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
-        loop {
-            let (status, body) = admin_with_key(
-                node.admin,
-                "GET",
-                &format!("/imposters/{C24_PORT}"),
-                None,
-                Some(&viewer),
-            )
-            .await
-            .expect("viewer read");
-            if status == 200 || std::time::Instant::now() > deadline {
-                assert_eq!(
-                    status, 200,
-                    "node {} never applied the viewer's binding: {body}",
-                    node.name
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
+    // Every node must have applied both the imposter *and* the viewer's
+    // binding before either can be asked about — or the scenario would be
+    // racing consensus and calling the race a divergence. See
+    // `wait_imposter_visible_as`'s doc for why `wait_converged_with_key`
+    // cannot be used here, and for why polling as the viewer also covers the
+    // binding.
+    wait_imposter_visible_as(C24_PORT, TENANCY_FLEET_KEY, C24_TENANT, CONVERGE_TIMEOUT).await;
+    wait_imposter_visible_as(C24_PORT, &viewer, C24_TENANT, CONVERGE_TIMEOUT).await;
 
     let mut verdicts: Vec<(&'static str, Vec<(u16, serde_json::Value)>)> = Vec::new();
     for probe in c24_matrix(C24_PORT) {
         let mut per_node = Vec::new();
         for node in &NODES {
-            // No `X-Rift-Tenant`: the viewer acts as its own tenant, `default`.
-            // Naming any other tenant here would make every verdict the
-            // unservable-tenant 404 — see this scenario's doc comment.
-            let seen = admin_with_key(
+            // Explicit `X-Rift-Tenant: acme` — see this scenario's doc comment
+            // for why an omitted header would deny every probe instead of
+            // measuring anything.
+            let seen = admin_as(
                 node.admin,
                 probe.method,
                 &probe.path,
                 probe.body.as_ref(),
                 Some(&viewer),
+                Some(C24_TENANT),
             )
             .await
             .unwrap_or_else(|e| panic!("{} on {}: {e}", probe.label, node.name));
@@ -4211,9 +4258,10 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
     // node's local view of its own work. A `tenant.manage` write leads, so the
     // session spans two action kinds rather than only `imposter.write`.
     //
-    // The imposters go to the **default** tenant: this build serves resource
-    // routes for no other (see C24's doc comment), so a create into `acme` would
-    // be refused 404 and the session would audit nothing but the refusals.
+    // The imposters go to the **default** tenant. Not a limitation any more — issue #182 made
+    // resource routes servable in every tenant — but this scenario is about the *audit chain*
+    // surviving a restart, and `default` keeps that the only variable under test. `acme` is still
+    // created below because the session under audit spans tenant writes too.
     create_tenant(NODES[0].admin, "acme", TENANCY_FLEET_KEY)
         .await
         .expect("create tenant");
@@ -4332,33 +4380,30 @@ async fn c26_audit_on_every_node(key: &str) -> Vec<Vec<(u64, String, String)>> {
 
 /// C27 — tenancy isolates *ownership*, not the data plane.
 ///
-/// Tenant A's Editor can neither see nor edit a resource it does not own, and
-/// the refusal is a **404** — byte-identical to a resource that does not exist,
-/// so the surface cannot be used to enumerate ports it is not entitled to
+/// Two tenants, one imposter each — the issue's own shape, and constructible
+/// as of issue #182 (see C24's doc comment for what changed: the read/sync
+/// paths are tenant-aware now, gated by a per-resource ownership check rather
+/// than a blanket default-only refusal). `alpha`'s Editor can read and manage
+/// its own imposter; so can `beta`'s. Neither can see the other's, and the
+/// refusal is a **404** — byte-identical to a resource that does not exist, so
+/// the surface cannot be used to enumerate ports a caller is not entitled to
 /// (RFC-002 §8.4). The same boundary is asserted on the tenancy surface, where
-/// tenants are genuinely served per-tenant: A's Editor cannot list B's
-/// principals.
+/// tenants are genuinely served per-tenant: `alpha`'s Editor cannot list
+/// `beta`'s principals, and `beta`'s Editor cannot list `alpha`'s.
 ///
-/// **And the imposters answer unauthenticated traffic.** That second half is
-/// RFC-002 §7's stated non-goal asserted in anger, so nobody later "fixes" it
-/// into a breaking change for every system under test: the data plane is the
-/// thing being mocked, and putting a credential in front of it would break every
-/// caller the mock exists to serve.
-///
-/// **Deviation from the issue's literal shape, stated rather than smuggled.**
-/// The issue asks for "two tenants, one imposter each". That is not
-/// constructible in this build: resource state is *stored* per tenant but only
-/// the **default** tenant is *served* (see C24's doc comment for the guard and
-/// the store paths behind it), so an imposter cannot be created in `alpha` or
-/// `beta` by anyone, fleet admin included. The imposters therefore live in
-/// `default` and the hidden-resource assertion is made from `alpha`'s Editor,
-/// which holds no binding there — a genuine `NotBoundToTenant` refusal of a
-/// resource that genuinely exists, which is the property the issue is after. The
-/// two tenants still exist and still carry an Editor each, and the cross-tenant
-/// half of the claim is asserted on the surface that actually honours tenants.
+/// **And the imposters answer unauthenticated traffic — through every node,
+/// with no credential at all, even a wrong one.** That is RFC-002 §7's stated
+/// non-goal asserted in anger, so nobody later "fixes" it into a breaking
+/// change for every system under test: the data plane is the thing being
+/// mocked, and putting a credential in front of it would break every caller
+/// the mock exists to serve. This half of the claim is untouched by issue
+/// #182: ownership governs who may *configure* a mock, exactly as much as
+/// before, and still never who may call it.
 ///
 /// *Mutant:* authenticating the data plane must go red. So must rendering the
-/// cross-tenant refusal as `403`, or as a body distinguishable from the ghost's.
+/// cross-tenant refusal as `403`, or as a body distinguishable from the
+/// ghost's, or a `beta` credential reaching `alpha`'s imposter (or the
+/// reverse).
 #[tokio::test]
 #[ignore = "needs a container runtime"]
 async fn c27_tenancy_isolates_ownership_but_not_the_data_plane() {
@@ -4377,100 +4422,160 @@ async fn c27_tenancy_isolates_ownership_but_not_the_data_plane() {
     let (_a_id, a_editor) = mint_principal(NODES[0].admin, "alpha", "editor", TENANCY_FLEET_KEY)
         .await
         .expect("mint alpha editor");
-    let (_b_id, _b_editor) = mint_principal(NODES[0].admin, "beta", "editor", TENANCY_FLEET_KEY)
+    let (_b_id, b_editor) = mint_principal(NODES[0].admin, "beta", "editor", TENANCY_FLEET_KEY)
         .await
         .expect("mint beta editor");
 
-    // Both imposters in `default`, seeded by the fleet admin — the only tenant
-    // whose resource routes this build serves. Two ports, because the data-plane
-    // half of the claim needs two independently reachable mocks.
-    for (label, port) in [
+    // One imposter per tenant, each created by the fleet admin acting
+    // explicitly *as* that tenant — the fleet admin's own binding is the
+    // fleet scope, not `alpha` or `beta`, so an omitted `X-Rift-Tenant` would
+    // create in `default` instead. Genuinely owned by `alpha` and `beta`
+    // respectively, not both parked in `default` the way issue #161's guard
+    // used to force.
+    for (tenant, port) in [
         ("alpha", TENANCY_A_IMPOSTER_PORT),
         ("beta", TENANCY_B_IMPOSTER_PORT),
     ] {
-        let (status, body) = admin_with_key(
+        let (status, body) = admin_as(
             NODES[0].admin,
             "POST",
             "/imposters",
             Some(&serde_json::json!({
                 "port": port,
                 "protocol": "http",
-                "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": label } }] }]
+                "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": tenant } }] }]
             })),
             Some(TENANCY_FLEET_KEY),
+            Some(tenant),
         )
         .await
         .expect("create imposter");
         assert!(
             (200..300).contains(&status),
-            "the fleet admin must be able to create in default: {status} {body}"
+            "the fleet admin must be able to create in {tenant}: {status} {body}"
         );
-        wait_converged_with_key(u64::from(port), CONVERGE_TIMEOUT, TENANCY_FLEET_KEY)
-            .await
-            .expect("converged");
+    }
+    // `wait_converged_with_key` cannot be used here — see
+    // `wait_imposter_visible_as`'s doc. Polling as each tenant's own editor
+    // also proves that editor's binding replicated, not just the imposter.
+    wait_imposter_visible_as(
+        TENANCY_A_IMPOSTER_PORT,
+        &a_editor,
+        "alpha",
+        CONVERGE_TIMEOUT,
+    )
+    .await;
+    wait_imposter_visible_as(TENANCY_B_IMPOSTER_PORT, &b_editor, "beta", CONVERGE_TIMEOUT).await;
+
+    // Each tenant's Editor can read and manage its own imposter: a read, and
+    // a write. `AddStub` is the write chosen because — unlike delete or a
+    // whole-imposter replace — it does not remove the imposter this
+    // scenario's later assertions still need.
+    for (tenant, editor, port) in [
+        ("alpha", &a_editor, TENANCY_A_IMPOSTER_PORT),
+        ("beta", &b_editor, TENANCY_B_IMPOSTER_PORT),
+    ] {
+        let (status, body) = admin_as(
+            NODES[0].admin,
+            "GET",
+            &format!("/imposters/{port}"),
+            None,
+            Some(editor),
+            Some(tenant),
+        )
+        .await
+        .expect("own-tenant read");
+        assert_eq!(
+            status, 200,
+            "{tenant}'s editor must be able to read its own imposter: {body}"
+        );
+
+        let (status, body) = admin_as(
+            NODES[0].admin,
+            "POST",
+            &format!("/imposters/{port}/stubs"),
+            Some(&serde_json::json!({
+                "stub": {
+                    "predicates": [{ "equals": { "path": "/c27-managed" } }],
+                    "responses": [{ "is": { "statusCode": 200, "body": "managed" } }]
+                }
+            })),
+            Some(editor),
+            Some(tenant),
+        )
+        .await
+        .expect("own-tenant manage");
+        assert!(
+            (200..300).contains(&status),
+            "{tenant}'s editor must be able to manage its own imposter: {status} {body}"
+        );
     }
 
-    // Ownership is isolated, and invisibly so: 404, never 403. `alpha`'s Editor
-    // holds no binding in `default`, so a resource that plainly exists must be
-    // as invisible to it as one that never did.
+    // Ownership is isolated, and invisibly so: 404, never 403. Each editor
+    // acts explicitly *as its own tenant* (`X-Rift-Tenant` matches its only
+    // binding) and addresses the *other* tenant's port, so `decide` allows
+    // the action and it is `authorize_action`'s ownership gate (issue #182)
+    // that refuses it — a genuine cross-tenant attempt, not an accident of an
+    // omitted header the way a bound-but-wrong-tenant request would be.
     let mut refusals = Vec::new();
-    for (label, path, method) in [
+    for (label, editor, tenant, method, other_port) in [
         (
-            "read",
-            format!("/imposters/{TENANCY_A_IMPOSTER_PORT}"),
+            "alpha reads beta's",
+            &a_editor,
+            "alpha",
             "GET",
+            TENANCY_B_IMPOSTER_PORT,
         ),
         (
-            "delete",
-            format!("/imposters/{TENANCY_A_IMPOSTER_PORT}"),
+            "alpha deletes beta's",
+            &a_editor,
+            "alpha",
             "DELETE",
+            TENANCY_B_IMPOSTER_PORT,
+        ),
+        (
+            "beta reads alpha's",
+            &b_editor,
+            "beta",
+            "GET",
+            TENANCY_A_IMPOSTER_PORT,
+        ),
+        (
+            "beta deletes alpha's",
+            &b_editor,
+            "beta",
+            "DELETE",
+            TENANCY_A_IMPOSTER_PORT,
         ),
     ] {
-        let (status, body) = admin_with_key(NODES[0].admin, method, &path, None, Some(&a_editor))
-            .await
-            .expect("cross-tenant attempt");
+        let (status, body) = admin_as(
+            NODES[0].admin,
+            method,
+            &format!("/imposters/{other_port}"),
+            None,
+            Some(editor),
+            Some(tenant),
+        )
+        .await
+        .expect("cross-tenant attempt");
         assert_eq!(
             status, 404,
-            "alpha's editor {label} of an imposter it does not own must be 404 — a 403 would \
-             confirm the port exists and turn this into an enumeration oracle: {body}"
+            "{label} imposter must be 404 — a 403 would confirm the port exists and turn this \
+             into an enumeration oracle: {body}"
         );
         refusals.push((label, status, body));
     }
 
-    // And the same answer when alpha's Editor names the tenant it *is* bound to:
-    // authorization allows it, and the fail-closed "storing is not serving"
-    // guard refuses it anyway, because no tenant but `default` is served. This
-    // is the container-tier counterpart of `rbac.rs`'s in-process
-    // `cross_tenant_probes_are_indistinguishable_from_probes_of_nothing`, and it
-    // is the assertion that will need revisiting first when the read/sync paths
-    // become tenant-aware — at which point this must become a 200, not stay a
-    // 404 nobody noticed was load-bearing.
-    let (status, body) = admin_as(
-        NODES[0].admin,
-        "GET",
-        &format!("/imposters/{TENANCY_A_IMPOSTER_PORT}"),
-        None,
-        Some(&a_editor),
-        Some("alpha"),
-    )
-    .await
-    .expect("bound-but-unservable read");
-    assert_eq!(
-        status, 404,
-        "a tenant this build cannot serve must refuse identically to one the caller is not \
-         bound to — otherwise the pair distinguishes 'yours but unserved' from 'not yours': {body}"
-    );
-    refusals.push(("unservable-tenant", status, body));
-
-    // A nonexistent port must be indistinguishable from one it may not see —
-    // status *and* body, since a differing body is an oracle just as surely as a
-    // differing status.
-    let (ghost_status, ghost_body) = admin_with_key(
+    // A nonexistent port must be indistinguishable from one a caller may not
+    // see — status *and* body, since a differing body is an oracle just as
+    // surely as a differing status.
+    let (ghost_status, ghost_body) = admin_as(
         NODES[0].admin,
         "GET",
         "/imposters/6599",
         None,
         Some(&a_editor),
+        Some("alpha"),
     )
     .await
     .expect("ghost read");
@@ -4483,29 +4588,35 @@ async fn c27_tenancy_isolates_ownership_but_not_the_data_plane() {
         assert_eq!(
             (*status, body),
             (ghost_status, &ghost_body),
-            "the {label} refusal of an existing imposter differs from the refusal of a port that \
-             does not exist — that difference is the oracle RFC-002 §8.4 forbids"
+            "the {label} refusal differs from the refusal of a port that does not exist — that \
+             difference is the oracle RFC-002 §8.4 forbids"
         );
     }
 
     // The same boundary on the tenancy surface, which *is* served per tenant:
-    // alpha's Editor cannot enumerate beta's principals.
-    let (status, body) = admin_with_key(
-        NODES[0].admin,
-        "GET",
-        "/admin/tenants/beta/principals",
-        None,
-        Some(&a_editor),
-    )
-    .await
-    .expect("cross-tenant principal list");
-    assert_eq!(
-        status, 404,
-        "alpha's editor listing beta's principals must be 404, not 403: {body}"
-    );
+    // neither editor may enumerate the other's principals.
+    for (label, editor, other_tenant) in [
+        ("alpha lists beta's", &a_editor, "beta"),
+        ("beta lists alpha's", &b_editor, "alpha"),
+    ] {
+        let (status, body) = admin_with_key(
+            NODES[0].admin,
+            "GET",
+            &format!("/admin/tenants/{other_tenant}/principals"),
+            None,
+            Some(editor),
+        )
+        .await
+        .expect("cross-tenant principal list");
+        assert_eq!(
+            status, 404,
+            "{label} principals must be 404, not 403: {body}"
+        );
+    }
 
     // …and the data plane answers everybody, through every node, with no
-    // credential at all.
+    // credential at all — and would even with a wrong one, since the data
+    // plane does not check, rather than merely not being asked.
     for (tenant, host_ports) in [
         ("alpha", TENANCY_A_HOST_PORTS),
         ("beta", TENANCY_B_HOST_PORTS),
@@ -4523,6 +4634,27 @@ async fn c27_tenancy_isolates_ownership_but_not_the_data_plane() {
             assert_eq!(
                 body, tenant,
                 "{tenant}'s imposter served the wrong body through {}",
+                NODES[i].name
+            );
+
+            let (status, _, body) =
+                get_data_plane_with(*host_port, "/", &[("authorization", "not-a-real-key")])
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{tenant} data plane (bad credential) via {}: {e}",
+                            NODES[i].name
+                        )
+                    });
+            assert_eq!(
+                status, 200,
+                "{tenant}'s imposter must ignore a bogus credential through {} — the data plane \
+                 has no authentication to fail, not merely none presented",
+                NODES[i].name
+            );
+            assert_eq!(
+                body, tenant,
+                "{tenant}'s imposter served the wrong body (bad credential) through {}",
                 NODES[i].name
             );
         }

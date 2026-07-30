@@ -887,8 +887,8 @@ impl RedbStateMachine {
 }
 
 impl RedbStateMachine {
-    /// Read the applied config JSON for the default tenant's `port`, or `None`
-    /// if no config has been applied for it.
+    /// Read the applied config JSON for `tenant`'s `port`, or `None` if no
+    /// config has been applied for it.
     ///
     /// This is the node's read path: reads answer from the applied state machine
     /// directly and never go through Raft, so a follower or a restarted node can
@@ -896,7 +896,7 @@ impl RedbStateMachine {
     /// state machine as `&mut self`, so the node keeps a cheap `Clone` of this
     /// handle (both share one `Arc<Database>`) purely for reads.
     #[allow(clippy::result_large_err)]
-    pub fn read_config(&self, port: u16) -> StorageResult<Option<String>> {
+    pub fn read_config(&self, tenant: &str, port: u16) -> StorageResult<Option<String>> {
         let read_txn = self
             .db
             .begin_read()
@@ -905,7 +905,7 @@ impl RedbStateMachine {
             .open_table(SM_CONFIGS_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
         table
-            .get((DEFAULT_TENANT, port))
+            .get((tenant, port))
             .map_err(|e| StorageIOError::read_state_machine(&e))?
             .map(|g| {
                 serde_json::from_str::<StoredImposter>(g.value())
@@ -915,13 +915,18 @@ impl RedbStateMachine {
             .transpose()
     }
 
-    /// Every default-tenant port that currently has an applied config, ascending.
+    /// `(tenant, port)` for every port fleet-wide that currently has an applied
+    /// config, ascending — `redb` iterates `sm_configs` key-ordered
+    /// `(tenant, port)`, so this is tenant-major then port-ascending within
+    /// each tenant.
     ///
-    /// Ports rather than bodies: the operator endpoints report *what* the node
-    /// has converged on, and a fleet's full config set is far larger than the
-    /// answer to that question.
+    /// Fleet-wide and not tenant-scoped on purpose: this backs the operator
+    /// surface `GET /_cluster/config`, which reports what the whole node has
+    /// converged on, not one tenant's view of it. Ports rather than bodies:
+    /// the operator endpoints report *what* the node has converged on, and a
+    /// fleet's full config set is far larger than the answer to that question.
     #[allow(clippy::result_large_err)]
-    pub fn configured_ports(&self) -> StorageResult<Vec<u16>> {
+    pub fn configured_ports(&self) -> StorageResult<Vec<(TenantId, u16)>> {
         let read_txn = self
             .db
             .begin_read()
@@ -936,22 +941,19 @@ impl RedbStateMachine {
         {
             let (key, _) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
             let (tenant, port) = key.value();
-            if tenant == DEFAULT_TENANT {
-                ports.push(port);
-            }
+            ports.push((TenantId::new(tenant), port));
         }
         Ok(ports)
     }
 
-    /// The default tenant's route table, as currently applied. Like
-    /// [`Self::read_config`], this is the node's own read path — it answers
-    /// from local durable state without a Raft round trip. It is also the
-    /// *only* read path for routes: upstream has no `GET /front-door/routes`
-    /// to proxy to (U-11's admin CRUD was deferred), so `GET
-    /// /front-door/routes` in the clustered admin front calls straight
-    /// through to this.
+    /// `tenant`'s route table, as currently applied. Like [`Self::read_config`],
+    /// this is the node's own read path — it answers from local durable state
+    /// without a Raft round trip. It is also the *only* read path for routes:
+    /// upstream has no `GET /front-door/routes` to proxy to (U-11's admin CRUD
+    /// was deferred), so `GET /front-door/routes` in the clustered admin front
+    /// calls straight through to this.
     #[allow(clippy::result_large_err)]
-    pub fn route_table(&self) -> StorageResult<RouteTable> {
+    pub fn route_table(&self, tenant: &str) -> StorageResult<RouteTable> {
         let read_txn = self
             .db
             .begin_read()
@@ -959,26 +961,38 @@ impl RedbStateMachine {
         let table = read_txn
             .open_table(SM_ROUTES_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        match Self::desired_routes(&table)
-            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+        let mut routes = Vec::new();
+        for item in table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
         {
-            Ok(table) => Ok(table),
-            Err((id, error)) => {
-                tracing::error!(route_id = %id, error = %error, "corrupt stored route");
-                Err(StorageError::from(StorageIOError::read_state_machine(
-                    &std::io::Error::other(format!("corrupt stored route {id}: {error}")),
-                )))
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (row_tenant, id) = key.value();
+            if row_tenant != tenant {
+                continue;
+            }
+            match serde_json::from_str::<Route>(value.value()) {
+                Ok(route) => routes.push(route),
+                Err(e) => {
+                    tracing::error!(route_id = %id, error = %e, "corrupt stored route");
+                    return Err(StorageError::from(StorageIOError::read_state_machine(
+                        &std::io::Error::other(format!(
+                            "corrupt stored route {id}: stored route will not parse: {e}"
+                        )),
+                    )));
+                }
             }
         }
+        Ok(RouteTable { routes })
     }
 
-    /// Every declared source for the default tenant, id-ascending (issue #134).
+    /// Every declared source for `tenant`, id-ascending (issue #134).
     ///
     /// Like [`Self::read_config`], this answers from local applied state with no
     /// Raft round trip, so comparing two nodes' answers is what tells an
     /// operator whether a `SourcePut` has converged.
     #[allow(clippy::result_large_err)]
-    pub fn sources(&self) -> StorageResult<Vec<SourceRecord>> {
+    pub fn sources(&self, tenant: &str) -> StorageResult<Vec<SourceRecord>> {
         let read_txn = self
             .db
             .begin_read()
@@ -989,7 +1003,7 @@ impl RedbStateMachine {
         let configs = read_txn
             .open_table(SM_CONFIGS_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let owned = Self::ports_by_source(&configs)
+        let owned = Self::ports_by_source(&configs, tenant)
             .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
         let mut records = Vec::new();
@@ -998,8 +1012,8 @@ impl RedbStateMachine {
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         {
             let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let (tenant, id) = key.value();
-            if tenant != DEFAULT_TENANT {
+            let (row_tenant, id) = key.value();
+            if row_tenant != tenant {
                 continue;
             }
             // A source row that will not parse is committed-state corruption.
@@ -1014,9 +1028,9 @@ impl RedbStateMachine {
         Ok(records)
     }
 
-    /// One source by id, or `None` if the default tenant has no such source.
+    /// One source by id, or `None` if `tenant` has no such source.
     #[allow(clippy::result_large_err)]
-    pub fn source(&self, id: &str) -> StorageResult<Option<SourceRecord>> {
+    pub fn source(&self, tenant: &str, id: &str) -> StorageResult<Option<SourceRecord>> {
         let read_txn = self
             .db
             .begin_read()
@@ -1025,7 +1039,7 @@ impl RedbStateMachine {
             .open_table(SM_SOURCES_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
         let Some(guard) = sources
-            .get((DEFAULT_TENANT, id))
+            .get((tenant, id))
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         else {
             return Ok(None);
@@ -1037,9 +1051,41 @@ impl RedbStateMachine {
         let configs = read_txn
             .open_table(SM_CONFIGS_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
-        let owned = Self::ports_by_source(&configs)
+        let owned = Self::ports_by_source(&configs, tenant)
             .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
         Ok(Some(Self::render_source(id, &stored, owned.get(id))))
+    }
+
+    /// The tenant that owns `port`'s applied config, or `None` if no tenant
+    /// has one.
+    ///
+    /// **Not O(1).** `sm_configs` is keyed `(tenant, port)` — tenant-major —
+    /// so there is no index that seeks directly to a port; this is a full
+    /// scan of every applied config fleet-wide, `O(configured ports)`. Ports
+    /// are fleet-unique (RFC-002 §3.2, enforced by
+    /// [`Self::port_claimed_by_another_tenant`]), so at most one row can ever
+    /// match — this stops at the first hit rather than scanning to confirm
+    /// uniqueness.
+    #[allow(clippy::result_large_err)]
+    pub fn owning_tenant(&self, port: u16) -> StorageResult<Option<TenantId>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        for item in table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, _) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (tenant, row_port) = key.value();
+            if row_port == port {
+                return Ok(Some(TenantId::new(tenant)));
+            }
+        }
+        Ok(None)
     }
 
     /// The principal record for `id`, or `None` if no such principal exists
@@ -1073,11 +1119,10 @@ impl RedbStateMachine {
     ///
     /// `sm_bindings` is keyed principal-major exactly so this can be a single
     /// seek (see the `TableDefinition`'s doc); this reads the whole table and
-    /// filters instead, matching [`Self::sources`]'s and
-    /// [`Self::configured_ports`]'s tenant-filtered scans in this same file.
-    /// A fleet's principal/binding count is nowhere near what would make that
-    /// choice matter — simplicity over the seek this key order enables but
-    /// does not require.
+    /// filters instead, matching [`Self::sources`]'s tenant-filtered scan in
+    /// this same file. A fleet's principal/binding count is nowhere near what
+    /// would make that choice matter — simplicity over the seek this key
+    /// order enables but does not require.
     #[allow(clippy::result_large_err)]
     pub fn principal_bindings(&self, id: &str) -> StorageResult<Vec<(TenantId, Role)>> {
         let read_txn = self
@@ -1248,11 +1293,15 @@ impl RedbStateMachine {
         Ok(iter.next().is_some())
     }
 
-    /// `(port, provenance)` for every source-owned config, ascending by port —
-    /// what `GET /_cluster/config` reports so an operator can see which
-    /// imposters a source owns and at which version.
+    /// `(tenant, port, provenance)` for every source-owned config fleet-wide,
+    /// tenant-major then port-ascending (the `sm_configs` key order) — what
+    /// `GET /_cluster/config` reports so an operator can see which imposters a
+    /// source owns and at which version.
+    ///
+    /// Fleet-wide and not tenant-scoped on purpose, like [`Self::configured_ports`]:
+    /// this backs the same operator surface, not a tenant-facing one.
     #[allow(clippy::result_large_err)]
-    pub fn config_provenance(&self) -> StorageResult<Vec<(u16, SourceProvenance)>> {
+    pub fn config_provenance(&self) -> StorageResult<Vec<(TenantId, u16, SourceProvenance)>> {
         let read_txn = self
             .db
             .begin_read()
@@ -1267,29 +1316,27 @@ impl RedbStateMachine {
         {
             let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
             let (tenant, port) = key.value();
-            if tenant != DEFAULT_TENANT {
-                continue;
-            }
             let stored: StoredImposter = serde_json::from_str(value.value())
                 .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
             if let Some(provenance) = stored.source {
-                owned.push((port, provenance));
+                owned.push((TenantId::new(tenant), port, provenance));
             }
         }
         Ok(owned)
     }
 
-    /// Source id -> the ports it owns, from `sm_configs` provenance. Read from
-    /// an open (possibly mid-transaction) view so both the read paths and apply
-    /// can use it.
+    /// Source id -> the ports it owns for `tenant`, from `sm_configs`
+    /// provenance. Read from an open (possibly mid-transaction) view so both
+    /// the read paths and apply can use it.
     fn ports_by_source(
         table: &impl ReadableTable<(&'static str, u16), &'static str>,
+        tenant: &str,
     ) -> Result<BTreeMap<String, Vec<u16>>, redb::StorageError> {
         let mut owned: BTreeMap<String, Vec<u16>> = BTreeMap::new();
         for item in table.iter()? {
             let (key, value) = item?;
-            let (tenant, port) = key.value();
-            if tenant != DEFAULT_TENANT {
+            let (row_tenant, port) = key.value();
+            if row_tenant != tenant {
                 continue;
             }
             // A record that will not parse owns no port *as far as provenance
@@ -1830,25 +1877,30 @@ impl RedbStateMachine {
     }
 
     /// The desired engine state as of now, read from an open (possibly
-    /// mid-transaction) view of `sm_configs`: every default-tenant config,
+    /// mid-transaction) view of `sm_configs`: every tenant's config, unioned —
     /// parsed — disabled ones included (a paused imposter stays bound, #817).
+    ///
+    /// Union rather than default-tenant-only: ports are fleet-unique across
+    /// tenants (RFC-002 §3.2, enforced by [`Self::port_claimed_by_another_tenant`]),
+    /// so one shared `ImposterManager` can bind every tenant's imposters with
+    /// no collision — there is nothing tenant-specific for the engine to key
+    /// on.
     ///
     /// `Ok(Err((port, reason)))` means a stored record failed to parse. That
     /// must abort the sync, not shrink it: `apply_config` deletes every live
     /// imposter missing from the desired set, so silently skipping a broken
     /// record would tear down a healthy imposter and report it as an
     /// operator-issued delete. The caller refuses the sync and records the
-    /// failure instead — the engine keeps serving its last-known state.
+    /// failure instead — the engine keeps serving its last-known state. This
+    /// still holds with the union: a broken record in *any* tenant aborts the
+    /// whole sync, exactly as it did when only the default tenant was read.
     fn desired_configs(
         table: &impl ReadableTable<(&'static str, u16), &'static str>,
     ) -> Result<Result<Vec<ImposterConfig>, (u16, String)>, redb::StorageError> {
         let mut desired = Vec::new();
         for item in table.iter()? {
             let (key, value) = item?;
-            let (tenant, port) = key.value();
-            if tenant != DEFAULT_TENANT {
-                continue;
-            }
+            let (_tenant, port) = key.value();
             let stored = match serde_json::from_str::<StoredImposter>(value.value()) {
                 Ok(stored) => stored,
                 Err(e) => {
@@ -1883,12 +1935,34 @@ impl RedbStateMachine {
     }
 
     /// The desired route table as of now, read from an open (possibly
-    /// mid-transaction) view of `sm_routes`: every default-tenant route.
+    /// mid-transaction) view of `sm_routes`: the **default tenant's** routes only.
+    ///
+    /// Deliberately NOT the union, unlike [`Self::desired_configs`] — and the asymmetry is the
+    /// point, so it is spelled out here rather than left to be "fixed" later.
+    ///
+    /// Imposters can be unioned safely because a request names the resource it wants: a port is
+    /// fleet-unique (RFC-002 §3.2), so binding every tenant's ports into one engine is collision-
+    /// free and each request resolves to exactly one owner. **Front-door routes have no such
+    /// discriminator.** The front door is a single listener and an arriving data-plane request
+    /// carries no tenant identity — RFC-002 §7 keeps that plane open and anonymous on purpose — so
+    /// a unioned table is one shared *matching* namespace that every tenant writes into.
+    ///
+    /// Concretely, unioning here would let any principal holding `imposter.write` in any tenant
+    /// publish `{"match": {}, "priority": i32::MAX}` — an empty match is an explicitly legal
+    /// catch-all and the priority is unbounded — and capture **100% of front-door traffic
+    /// fleet-wide**. That is a denial of service against every other tenant, and where the target
+    /// names another tenant's now-bound port, a public read of its mocks. Constraining
+    /// `RouteTarget.port` to the writing tenant's own ports does not fix it: the shadowing lives in
+    /// the match, not the target.
+    ///
+    /// So routes stay default-only until the front door has a tenant dimension to route on (a host
+    /// mapping, a listener per tenant, or an explicit per-tenant prefix). Tenanted routes are still
+    /// *stored*, and [`Self::route_table`] reads them back per tenant so a tenant sees what it
+    /// wrote — they are simply not compiled into the shared front door.
     ///
     /// `Ok(Err((id, reason)))` means a stored record failed to parse — this
     /// crate is the only writer of `sm_routes`, so it should never happen in
-    /// practice, but the read path stays defensive rather than trusting that
-    /// (mirrors [`Self::desired_configs`]).
+    /// practice, but the read path stays defensive rather than trusting that.
     fn desired_routes(
         table: &impl ReadableTable<(&'static str, &'static str), &'static str>,
     ) -> Result<Result<RouteTable, (String, String)>, redb::StorageError> {
@@ -3961,8 +4035,8 @@ mod tests {
     };
     use crate::control::{
         AUDIT_RESOURCE_ALL, AuditRow, AuthSource, ControlOp, ControlOutcome, ControlRequest,
-        ControlResponse, Digest, FLEET_SCOPE, OnDrift, Principal, PrincipalId, Quotas, Role,
-        SourceMode, StubEdit, StubEditScript, TenantId,
+        ControlResponse, DEFAULT_TENANT, Digest, FLEET_SCOPE, OnDrift, Principal, PrincipalId,
+        Quotas, Role, SourceMode, StubEdit, StubEditScript, TenantId,
     };
     use crate::raft::TypeConfig;
 
@@ -4089,7 +4163,7 @@ mod tests {
 
     fn stored_stub_ids(sm: &RedbStateMachine, port: u16) -> Vec<String> {
         let body = sm
-            .read_config(port)
+            .read_config(DEFAULT_TENANT, port)
             .expect("read config")
             .expect("config present");
         let config: serde_json::Value = serde_json::from_str(&body).expect("parses");
@@ -4171,7 +4245,9 @@ mod tests {
     }
 
     fn one_source(sm: &RedbStateMachine, id: &str) -> SourceRecord {
-        sm.source(id).expect("read source").expect("source present")
+        sm.source(DEFAULT_TENANT, id)
+            .expect("read source")
+            .expect("source present")
     }
 
     #[tokio::test]
@@ -4193,7 +4269,7 @@ mod tests {
         assert!(!record.drifted);
         assert_eq!(record.last_digest, None, "a fresh source has never pulled");
         assert_eq!(record.revision, 1);
-        assert_eq!(sm.sources().expect("list").len(), 1);
+        assert_eq!(sm.sources(DEFAULT_TENANT).expect("list").len(), 1);
 
         let response = apply_one(
             &mut sm,
@@ -4208,8 +4284,8 @@ mod tests {
         )
         .await;
         assert_eq!(response.outcome, ControlOutcome::Applied);
-        assert!(sm.source("mocks").expect("read").is_none());
-        assert!(sm.sources().expect("list").is_empty());
+        assert!(sm.source(DEFAULT_TENANT, "mocks").expect("read").is_none());
+        assert!(sm.sources(DEFAULT_TENANT).expect("list").is_empty());
     }
 
     /// Re-declaring the same source is an upsert, not a duplicate — this is
@@ -4303,7 +4379,8 @@ mod tests {
 
         let provenance = sm.config_provenance().expect("provenance");
         assert_eq!(provenance.len(), 2);
-        for (port, source) in provenance {
+        for (tenant, port, source) in provenance {
+            assert_eq!(tenant, TenantId::default());
             assert!(port == 8080 || port == 8081);
             assert_eq!(source.id, "mocks");
             assert_eq!(source.version.as_deref(), Some("v1"));
@@ -4320,7 +4397,11 @@ mod tests {
             ControlOutcome::Failed { reason } => assert!(reason.contains("ghost"), "{reason}"),
             other => panic!("a raced delete must refuse, got {other:?}"),
         }
-        assert!(sm.read_config(8080).expect("read").is_none());
+        assert!(
+            sm.read_config(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .is_none()
+        );
     }
 
     /// The incremental-apply criterion: a pull that changes one imposter leaves
@@ -4338,7 +4419,10 @@ mod tests {
         )
         .await;
         apply_one(&mut sm, 3, pull(3, "mocks", "v1", &[8080, 8081])).await;
-        let sibling_before = sm.read_config(8081).expect("read").expect("present");
+        let sibling_before = sm
+            .read_config(DEFAULT_TENANT, 8081)
+            .expect("read")
+            .expect("present");
 
         // v2 drops 8081 and keeps 8080.
         let changed = request(
@@ -4359,11 +4443,15 @@ mod tests {
             "the changed imposter is replaced"
         );
         assert!(
-            sm.read_config(8081).expect("read").is_none(),
+            sm.read_config(DEFAULT_TENANT, 8081)
+                .expect("read")
+                .is_none(),
             "a port the document dropped is removed from the source's set"
         );
         assert!(
-            sm.read_config(9000).expect("read").is_some(),
+            sm.read_config(DEFAULT_TENANT, 9000)
+                .expect("read")
+                .is_some(),
             "an imposter no source owns is never touched by a pull"
         );
         assert_eq!(one_source(&sm, "mocks").ports, vec![8080]);
@@ -4384,7 +4472,10 @@ mod tests {
         )
         .await;
         apply_one(&mut sm, 2, pull(2, "mocks", "v1", &[8080, 8081])).await;
-        let untouched_before = sm.read_config(8081).expect("read").expect("present");
+        let untouched_before = sm
+            .read_config(DEFAULT_TENANT, 8081)
+            .expect("read")
+            .expect("present");
 
         let changed = request(
             3,
@@ -4402,7 +4493,9 @@ mod tests {
         apply_one(&mut sm, 3, changed).await;
 
         assert_eq!(
-            sm.read_config(8081).expect("read").expect("present"),
+            sm.read_config(DEFAULT_TENANT, 8081)
+                .expect("read")
+                .expect("present"),
             untouched_before,
             "an identical config must not be rewritten: the rewrite is what resets runtime state"
         );
@@ -4658,7 +4751,9 @@ mod tests {
         .await;
 
         assert!(
-            sm.read_config(8080).expect("read").is_some(),
+            sm.read_config(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .is_some(),
             "the imposter keeps serving"
         );
         assert!(
@@ -4713,7 +4808,7 @@ mod tests {
             .expect("install snapshot");
 
         let record = restored
-            .source("mocks")
+            .source(DEFAULT_TENANT, "mocks")
             .expect("read source")
             .expect("source survived the snapshot");
         assert_eq!(record.uri, "https://h/i.json");
@@ -4724,9 +4819,10 @@ mod tests {
 
         let provenance = restored.config_provenance().expect("provenance");
         assert_eq!(provenance.len(), 1);
-        assert_eq!(provenance[0].0, 8080);
-        assert_eq!(provenance[0].1.id, "mocks");
-        assert_eq!(provenance[0].1.version.as_deref(), Some("v7"));
+        assert_eq!(provenance[0].0, TenantId::default());
+        assert_eq!(provenance[0].1, 8080);
+        assert_eq!(provenance[0].2.id, "mocks");
+        assert_eq!(provenance[0].2.version.as_deref(), Some("v7"));
     }
 
     /// A snapshot written before sources existed still installs — the field
@@ -4743,7 +4839,7 @@ mod tests {
         let payload: super::SnapshotPayload =
             serde_json::from_value(legacy).expect("a pre-#134 snapshot payload still decodes");
         assert!(payload.sources.is_empty());
-        assert!(sm.sources().expect("list").is_empty());
+        assert!(sm.sources(DEFAULT_TENANT).expect("list").is_empty());
     }
 
     /// A pull drives the engine: the imposters a source declares are actually
@@ -4801,10 +4897,16 @@ mod tests {
             .await
             .expect("apply");
         assert_eq!(responses, vec![ControlResponse::applied(5)]);
-        let body = sm.read_config(8080).expect("read").expect("present");
+        let body = sm
+            .read_config(DEFAULT_TENANT, 8080)
+            .expect("read")
+            .expect("present");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("parses");
         assert_eq!(parsed["port"], 8080);
-        assert_eq!(sm.configured_ports().expect("ports"), vec![8080]);
+        assert_eq!(
+            sm.configured_ports().expect("ports"),
+            vec![(TenantId::default(), 8080)]
+        );
     }
 
     /// A validation refusal is a committed, deterministic outcome: the response
@@ -4833,7 +4935,11 @@ mod tests {
             }
             other => panic!("expected failed outcome, got {other:?}"),
         }
-        assert_eq!(sm.read_config(1).expect("read"), None, "nothing mutated");
+        assert_eq!(
+            sm.read_config(DEFAULT_TENANT, 1).expect("read"),
+            None,
+            "nothing mutated"
+        );
     }
 
     /// Same `op_id` twice — the crash-replay / same-`Idempotency-Key` case —
@@ -4952,7 +5058,9 @@ mod tests {
             .expect("apply must not fail on a bind failure");
         assert_eq!(responses, vec![ControlResponse::applied(1)]);
         assert!(
-            sm.read_config(port).expect("read").is_some(),
+            sm.read_config(DEFAULT_TENANT, port)
+                .expect("read")
+                .is_some(),
             "the committed config is in the tables regardless"
         );
         let failures = sm.apply_failures();
@@ -5032,7 +5140,10 @@ mod tests {
         .await
         .expect("apply delete");
         assert_eq!(engine.count(), 1);
-        assert_eq!(sm.configured_ports().expect("ports"), vec![18085]);
+        assert_eq!(
+            sm.configured_ports().expect("ports"),
+            vec![(TenantId::default(), 18085)]
+        );
 
         sm.apply(vec![entry(
             4,
@@ -5068,7 +5179,10 @@ mod tests {
             .await
             .expect("install");
         assert!(
-            follower.read_config(8080).expect("read").is_some(),
+            follower
+                .read_config(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .is_some(),
             "installed snapshot serves the config"
         );
 
@@ -5295,7 +5409,10 @@ mod tests {
         let responses = sm.apply(vec![entry(2, disable)]).await.expect("apply");
         assert_eq!(responses, vec![ControlResponse::applied(2)]);
 
-        let body = sm.read_config(18090).expect("read").expect("present");
+        let body = sm
+            .read_config(DEFAULT_TENANT, 18090)
+            .expect("read")
+            .expect("present");
         assert!(
             body.contains("\"enabled\":false"),
             "the stored config carries the flag: {body}"
@@ -5890,7 +6007,9 @@ mod tests {
         .await;
         apply_one(&mut sm, 4, pull(4, "mocks", "v1", &[8080])).await;
         assert!(
-            sm.read_config(8080).expect("read").is_some(),
+            sm.read_config(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .is_some(),
             "precondition: the source owns 8080"
         );
 
@@ -5917,7 +6036,9 @@ mod tests {
             other => panic!("a pull must not take another tenant's port, got {other:?}"),
         }
         assert!(
-            sm.read_config(8080).expect("read").is_some(),
+            sm.read_config(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .is_some(),
             "the refusal must be atomic: the port this pull would have dropped is still here"
         );
     }
@@ -6238,7 +6359,9 @@ mod tests {
         let response = apply_one(&mut sm, 1, put(1, 9300, json!([{ "id": "a" }]))).await;
         assert_eq!(response.outcome, ControlOutcome::Applied);
         assert!(
-            sm.read_config(9300).expect("read").is_some(),
+            sm.read_config(DEFAULT_TENANT, 9300)
+                .expect("read")
+                .is_some(),
             "the default-tenant read path is unaffected by #159"
         );
         assert!(
@@ -6257,7 +6380,7 @@ mod tests {
             .await
             .expect("apply");
         assert_eq!(responses, vec![ControlResponse::applied(1)]);
-        let table = sm.route_table().expect("read route table");
+        let table = sm.route_table(DEFAULT_TENANT).expect("read route table");
         assert_eq!(table.routes.len(), 1);
         assert_eq!(table.routes[0].id, "a");
     }
@@ -6276,7 +6399,7 @@ mod tests {
         sm.apply(vec![entry(2, put_routes(2, vec![test_route("c", 3)]))])
             .await
             .expect("apply replacement table");
-        let table = sm.route_table().expect("read route table");
+        let table = sm.route_table(DEFAULT_TENANT).expect("read route table");
         assert_eq!(
             table
                 .routes
@@ -6306,7 +6429,12 @@ mod tests {
         };
         let responses = sm.apply(vec![entry(2, delete(2))]).await.expect("delete");
         assert_eq!(responses, vec![ControlResponse::applied(2)]);
-        assert!(sm.route_table().expect("read").routes.is_empty());
+        assert!(
+            sm.route_table(DEFAULT_TENANT)
+                .expect("read")
+                .routes
+                .is_empty()
+        );
 
         // Deleting again (an absent route) is idempotent, like DeleteImposter.
         let responses = sm
@@ -6362,7 +6490,7 @@ mod tests {
             "the replay must return the ORIGINAL revision, not its own index"
         );
         assert_eq!(
-            sm.route_table().expect("read").routes[0].id,
+            sm.route_table(DEFAULT_TENANT).expect("read").routes[0].id,
             "a",
             "the replayed op_id must not have applied a second time"
         );
@@ -6389,7 +6517,7 @@ mod tests {
             .expect("install");
 
         let mut ids: Vec<String> = follower
-            .route_table()
+            .route_table(DEFAULT_TENANT)
             .expect("read")
             .routes
             .into_iter()
@@ -6440,9 +6568,11 @@ mod tests {
         sm.audit_since(0, None, 10_000).expect("read audit")
     }
 
-    /// The ports a tenant currently holds, ascending. `configured_ports` answers
-    /// for the default tenant only, and a quota test needs a real tenant record
-    /// — which `default` cannot have.
+    /// The ports a tenant currently holds, ascending. `configured_ports` is
+    /// fleet-wide (it backs the operator surface, not a tenant-scoped read),
+    /// and a quota test needs a real tenant record — which `default` cannot
+    /// have — so this reads the table directly instead of filtering
+    /// `configured_ports`'s output.
     fn ports_in_tenant(sm: &RedbStateMachine, tenant: &str) -> Vec<u16> {
         let read_txn = sm.db.begin_read().expect("read txn");
         let table = read_txn
@@ -6458,6 +6588,30 @@ mod tests {
         }
         ports.sort_unstable();
         ports
+    }
+
+    /// A `PutImposter` in a named tenant — the existing `put` helper is
+    /// default-tenant only (issue #182).
+    fn put_in(op_id: u128, tenant: &str, port: u16, stubs: serde_json::Value) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::PutImposter {
+                tenant: TenantId::new(tenant),
+                config: Box::new(config(port, stubs)),
+            },
+        )
+    }
+
+    /// A `PutRoutes` in a named tenant — the existing `put_routes` helper is
+    /// default-tenant only (issue #182).
+    fn put_routes_in(op_id: u128, tenant: &str, routes: Vec<Route>) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::PutRoutes {
+                tenant: TenantId::new(tenant),
+                table: RouteTable { routes },
+            },
+        )
     }
 
     /// A `SourcePut` in a named tenant — the existing `source_put` helper is
@@ -6506,9 +6660,9 @@ mod tests {
         )
     }
 
-    /// [`RedbStateMachine::read_config`] answers for the default tenant only, so
-    /// a quota test — which needs a real tenant record, and `default` cannot
-    /// have one — reads the table directly.
+    /// Like [`RedbStateMachine::read_config`], but parses straight to the
+    /// stub ids a quota test wants to assert on, instead of the raw config
+    /// JSON.
     fn stub_ids_in_tenant(sm: &RedbStateMachine, tenant: &str, port: u16) -> Vec<String> {
         let read_txn = sm.db.begin_read().expect("read txn");
         let table = read_txn
@@ -6685,7 +6839,9 @@ mod tests {
         assert_eq!(refused.revision, 3, "the refusal has a revision of its own");
 
         assert!(
-            sm.read_config(8081).expect("read").is_none(),
+            sm.read_config(DEFAULT_TENANT, 8081)
+                .expect("read")
+                .is_none(),
             "a refused write must not land"
         );
 
@@ -7352,7 +7508,9 @@ mod tests {
             "the refusal must say the quota could not be read: {reason}"
         );
         assert!(
-            sm.read_config(8080).expect("read").is_none(),
+            sm.read_config(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .is_none(),
             "nothing may land while the ceiling is unknown"
         );
 
@@ -7573,5 +7731,197 @@ mod tests {
             .expect("read tenant")
             .expect("tenant present");
         assert_eq!(tenant.journal_retention_secs, 3_600);
+    }
+
+    // -- issue #182: tenant-aware reads and engine sync ------------------------
+
+    /// Two tenants, one imposter each on distinct ports: each tenant's
+    /// `read_config` sees only its own port, never the other's.
+    #[tokio::test]
+    async fn read_config_is_isolated_per_tenant() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(
+            1,
+            put_in(1, "acme", 19001, json!([{ "id": "a" }])),
+        )])
+        .await
+        .expect("apply acme");
+        sm.apply(vec![entry(
+            2,
+            put_in(2, "globex", 19002, json!([{ "id": "b" }])),
+        )])
+        .await
+        .expect("apply globex");
+
+        assert!(
+            sm.read_config("acme", 19001).expect("read").is_some(),
+            "acme sees its own port"
+        );
+        assert!(
+            sm.read_config("acme", 19002).expect("read").is_none(),
+            "acme must not see globex's port"
+        );
+        assert!(
+            sm.read_config("globex", 19002).expect("read").is_some(),
+            "globex sees its own port"
+        );
+        assert!(
+            sm.read_config("globex", 19001).expect("read").is_none(),
+            "globex must not see acme's port"
+        );
+    }
+
+    /// `desired_configs` (the engine-sync read) is the union of every tenant's
+    /// configs, not just the default tenant's — one shared `ImposterManager`
+    /// binds them all because ports are fleet-unique across tenants
+    /// (RFC-002 §3.2).
+    #[tokio::test]
+    async fn engine_sync_binds_the_union_of_every_tenant() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+
+        sm.apply(vec![
+            entry(1, put_in(1, "acme", 19011, json!([{ "id": "a" }]))),
+            entry(2, put_in(2, "globex", 19012, json!([{ "id": "b" }]))),
+        ])
+        .await
+        .expect("apply");
+
+        assert_eq!(
+            engine.count(),
+            2,
+            "the engine must bind both tenants' imposters from one sync"
+        );
+        assert_eq!(engine_stub_ids(&engine, 19011), vec!["a"]);
+        assert_eq!(engine_stub_ids(&engine, 19012), vec!["b"]);
+
+        engine.shutdown().await;
+    }
+
+    /// `desired_routes` compiles the **default tenant's routes only** — unlike `desired_configs`,
+    /// which unions.
+    ///
+    /// This asymmetry is a security property, not an oversight, so it is pinned rather than left
+    /// to a comment. A front-door request carries no tenant identity (RFC-002 §7 keeps the data
+    /// plane anonymous), so a unioned table would be one shared matching namespace: an empty match
+    /// is a legal catch-all and `priority` is an unbounded `i32`, so any tenant could publish
+    /// `{match: {}, priority: i32::MAX}` and swallow every other tenant's front-door traffic
+    /// fleet-wide. Flip `desired_routes` back to a union and the second half of this test goes red.
+    #[tokio::test]
+    async fn route_sync_compiles_only_the_default_tenants_routes() {
+        let (_td, mut sm, routes) = fresh_sm_with_routes().await;
+
+        sm.apply(vec![entry(
+            1,
+            put_routes_in(1, DEFAULT_TENANT, vec![test_route("default-a", 19021)]),
+        )])
+        .await
+        .expect("apply default routes");
+        sm.apply(vec![entry(
+            2,
+            put_routes_in(2, "globex", vec![test_route("globex-a", 19022)]),
+        )])
+        .await
+        .expect("apply globex routes");
+
+        let loaded = routes.load();
+        let default_route = loaded
+            .resolve(
+                None,
+                &hyper::Method::GET,
+                "/default-a",
+                &hyper::HeaderMap::new(),
+            )
+            .expect("the default tenant's route compiles");
+        assert_eq!(default_route.target.port, 19021);
+        assert!(
+            loaded
+                .resolve(
+                    None,
+                    &hyper::Method::GET,
+                    "/globex-a",
+                    &hyper::HeaderMap::new(),
+                )
+                .is_none(),
+            "a non-default tenant's route must NOT reach the shared front door — it would be \
+             matching in a namespace every other tenant also routes through"
+        );
+
+        // Stored, though — `route_table` reads it back, so a tenant still sees what it wrote.
+        let stored = sm.route_table("globex").expect("read globex's table");
+        assert_eq!(
+            stored.routes.len(),
+            1,
+            "globex's route is stored, just not compiled"
+        );
+    }
+
+    /// `owning_tenant` resolves a fleet-unique port to the tenant that holds
+    /// it, and `None` for a port nobody has configured.
+    #[tokio::test]
+    async fn owning_tenant_resolves_the_right_tenant_and_none_when_unconfigured() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, put_in(1, "acme", 19031, json!([])))])
+            .await
+            .expect("apply acme");
+        sm.apply(vec![entry(2, put_in(2, "globex", 19032, json!([])))])
+            .await
+            .expect("apply globex");
+
+        assert_eq!(
+            sm.owning_tenant(19031).expect("read"),
+            Some(TenantId::new("acme"))
+        );
+        assert_eq!(
+            sm.owning_tenant(19032).expect("read"),
+            Some(TenantId::new("globex"))
+        );
+        assert_eq!(
+            sm.owning_tenant(19099).expect("read"),
+            None,
+            "an unconfigured port owns nothing"
+        );
+    }
+
+    /// The union must preserve `desired_configs`'s existing abort semantics:
+    /// one broken record — in *any* tenant, not just the one being written —
+    /// still refuses the whole engine sync rather than silently shrinking it.
+    #[tokio::test]
+    async fn a_broken_record_in_one_tenant_still_aborts_the_whole_sync() {
+        let engine = Arc::new(ImposterManager::new());
+        let (_td, mut sm) = fresh_sm(Some(engine.clone())).await;
+        sm.apply(vec![entry(
+            1,
+            put_in(1, "acme", 19041, json!([{ "id": "a" }])),
+        )])
+        .await
+        .expect("apply acme");
+        assert_eq!(engine.count(), 1);
+
+        // Corrupt a *different* tenant's record directly, bypassing
+        // validation (the broken-record path is unreachable through the
+        // public API, like `a_broken_stored_record_refuses_sync_instead_of_deleting`).
+        sm.inject_raw_config("globex", 19042, "not json");
+
+        let responses = sm
+            .apply(vec![entry(2, put_in(2, "acme", 19043, json!([])))])
+            .await
+            .expect("apply still succeeds — the refusal is engine status");
+        assert_eq!(responses, vec![ControlResponse::applied(2)]);
+        assert_eq!(
+            engine.count(),
+            1,
+            "globex's broken record must abort the union sync fleet-wide: \
+             acme's new imposter must not be created by a partial sync, and \
+             acme's live one must not be torn down"
+        );
+        assert_eq!(engine_stub_ids(&engine, 19041), vec!["a"]);
+        assert!(
+            sm.apply_failures().contains_key(&19042),
+            "the broken record is surfaced as node status: {:?}",
+            sm.apply_failures()
+        );
+
+        engine.shutdown().await;
     }
 }

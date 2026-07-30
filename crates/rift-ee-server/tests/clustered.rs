@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use clap::Parser;
+use rift_cluster::{DEFAULT_TENANT, TenantId};
 use rift_ee_server::cli::EeCli;
 use rift_ee_server::compose;
 use tempfile::TempDir;
@@ -911,7 +912,7 @@ async fn imposters_flag_becomes_a_replicated_source_under_cluster() {
     .expect("a node with --imposters must start");
 
     let node = server.node().expect("clustered");
-    let sources = node.sources().expect("read sources");
+    let sources = node.sources(DEFAULT_TENANT).expect("read sources");
     assert_eq!(
         sources.len(),
         1,
@@ -923,11 +924,11 @@ async fn imposters_flag_becomes_a_replicated_source_under_cluster() {
     assert!(!source.drifted);
     assert_eq!(
         node.configured_ports().expect("ports"),
-        vec![port],
+        vec![(TenantId::new(DEFAULT_TENANT), port)],
         "the imposter must be in the replicated log, not just this node's manager"
     );
     assert_eq!(
-        node.config_provenance().expect("provenance")[0].1.id,
+        node.config_provenance().expect("provenance")[0].2.id,
         source.id,
         "the config carries the provenance of the source that produced it"
     );
@@ -949,7 +950,7 @@ async fn imposters_flag_becomes_a_replicated_source_under_cluster() {
     let sources = restarted
         .node()
         .expect("clustered")
-        .sources()
+        .sources(DEFAULT_TENANT)
         .expect("read sources");
     assert_eq!(
         sources.len(),

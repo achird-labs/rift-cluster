@@ -59,7 +59,8 @@ use rift_ee::seams::{FetchedImposters, ImposterConfig, SourceRef, SourceRegistry
 use uuid::Uuid;
 
 use crate::control::{
-    ControlOp, ControlOutcome, ControlRequest, Digest, OnDrift, SourceMode, TenantId,
+    ControlOp, ControlOutcome, ControlRequest, DEFAULT_TENANT, Digest, OnDrift, SourceMode,
+    TenantId,
 };
 use crate::raft::{NodeError, PullOutcome, RaftNode, SourceRecord};
 use crate::rpc::{HandlerFuture, Router, RpcError};
@@ -379,7 +380,7 @@ impl SourcePuller {
     pub async fn pull(&self, id: &str, principal: Option<String>) -> Result<PullReport, PullError> {
         let node = self.node()?;
         let record = node
-            .source(id)
+            .source(DEFAULT_TENANT, id)
             .map_err(|e| PullError::Internal(e.to_string()))?
             .ok_or_else(|| PullError::UnknownSource(id.to_owned()))?;
 
@@ -510,7 +511,7 @@ impl SourcePuller {
         // "source pull applied" line in the audit log and name ports in
         // `changed` that were never touched.
         let skipped = node
-            .source(id)
+            .source(DEFAULT_TENANT, id)
             .map_err(|e| PullError::Internal(e.to_string()))?
             .is_some_and(|after| {
                 after.revision == response.revision
@@ -779,7 +780,7 @@ pub fn routes(base: Router, puller: Arc<SourcePuller>) -> Router {
             let puller = Arc::clone(&list);
             Box::pin(async move {
                 let node = puller.node().map_err(pull_error)?;
-                let sources = node.sources().map_err(handler_error)?;
+                let sources = node.sources(DEFAULT_TENANT).map_err(handler_error)?;
                 serde_json::to_vec(&serde_json::json!({ "sources": sources }))
                     .map_err(handler_error)
             })
@@ -907,7 +908,7 @@ async fn create_source(puller: &SourcePuller, body: &[u8]) -> Result<Vec<u8>, Rp
     node.await_local_applied(response.revision, LOCAL_APPLY_TIMEOUT)
         .await;
     let record = node
-        .source(&parsed.id)
+        .source(DEFAULT_TENANT, &parsed.id)
         .map_err(handler_error)?
         .ok_or_else(|| RpcError::Unavailable {
             detail: "source committed but not yet applied on this node".to_owned(),
@@ -920,7 +921,7 @@ async fn read_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, Rpc
     let id = path_id(suffix)?;
     let node = puller.node().map_err(pull_error)?;
     let record = node
-        .source(id)
+        .source(DEFAULT_TENANT, id)
         .map_err(handler_error)?
         .ok_or_else(|| unknown_route("GET", id))?;
     // The durable record says what the fleet holds; the poll status says why a

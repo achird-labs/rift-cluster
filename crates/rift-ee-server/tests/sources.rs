@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, RpcError, Signer};
-use rift_cluster::{NodeConfig, RaftNode, SourcePuller, sources};
+use rift_cluster::{DEFAULT_TENANT, NodeConfig, RaftNode, SourcePuller, TenantId, sources};
 use rift_ee::seams::{
     FetchedImposters, ImposterConfig, ImposterSource, SourceMeta, SourceRef, SourceRegistry,
 };
@@ -253,7 +253,7 @@ async fn a_source_round_trips_through_create_list_get_pull_and_delete() {
     assert_eq!(fixture.fetches.load(Ordering::SeqCst), 1);
     assert_eq!(
         fixture.node.configured_ports().expect("ports"),
-        vec![9301],
+        vec![(TenantId::new(DEFAULT_TENANT), 9301)],
         "the pull's configs are committed, not just reported"
     );
 
@@ -268,7 +268,9 @@ async fn a_source_round_trips_through_create_list_get_pull_and_delete() {
     .await;
     assert_eq!(
         config["provenance"],
-        serde_json::json!([{ "port": 9301, "sourceId": "mocks", "version": "v1" }])
+        // issue #182: `/_cluster/config` now carries the owning tenant per
+        // row (fleet-wide resource reads went tenant-aware).
+        serde_json::json!([{ "tenant": DEFAULT_TENANT, "port": 9301, "sourceId": "mocks", "version": "v1" }])
     );
 
     let after = call(
@@ -302,7 +304,7 @@ async fn a_source_round_trips_through_create_list_get_pull_and_delete() {
     assert_eq!(listed["sources"], serde_json::json!([]));
     assert_eq!(
         fixture.node.configured_ports().expect("ports"),
-        vec![9301],
+        vec![(TenantId::new(DEFAULT_TENANT), 9301)],
         "deleting a source stops tracking the uri; it does not tear down live imposters"
     );
 }
@@ -524,7 +526,7 @@ async fn a_skipped_pull_does_not_short_circuit_the_pull_that_resolves_it() {
     assert_eq!(record["drifted"], false);
     let body = fixture
         .node
-        .get_imposter(9301)
+        .get_imposter(DEFAULT_TENANT, 9301)
         .expect("read")
         .expect("present");
     assert!(
@@ -624,7 +626,11 @@ async fn operator_errors_are_refusals_not_internal_failures() {
     }
 
     assert!(
-        fixture.node.sources().expect("sources").is_empty(),
+        fixture
+            .node
+            .sources(DEFAULT_TENANT)
+            .expect("sources")
+            .is_empty(),
         "no refused source may have been stored"
     );
 }
@@ -663,7 +669,10 @@ async fn a_routes_block_in_a_source_document_is_reported_not_silently_dropped() 
         "the warning must say where routes DO come from: {warning}"
     );
     // The imposters still applied — the block is ignored, not fatal.
-    assert_eq!(fixture.node.configured_ports().expect("ports"), vec![9301]);
+    assert_eq!(
+        fixture.node.configured_ports().expect("ports"),
+        vec![(TenantId::new(DEFAULT_TENANT), 9301)]
+    );
 }
 
 /// A document declaring an `intercept` block refuses the pull outright. The
@@ -748,7 +757,7 @@ async fn a_pull_repairs_drift_even_when_the_document_is_unchanged() {
     assert_eq!(repaired["skipped"], false);
     let body = fixture
         .node
-        .get_imposter(9301)
+        .get_imposter(DEFAULT_TENANT, 9301)
         .expect("read")
         .expect("present");
     assert!(

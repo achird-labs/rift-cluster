@@ -1209,6 +1209,12 @@ pub async fn wait_converged(port: u64, timeout: Duration) -> anyhow::Result<()> 
 }
 
 /// [`wait_converged`] carrying a credential — C24-C27's closed admin plane.
+///
+/// **Only observes the credential's own tenant.** These wrappers poll `GET /imposters`, and since
+/// issue #182 that listing is filtered to the caller's tenant — so waiting here for a port owned by
+/// a *different* tenant does not fail, it hangs until the timeout, which reads as "the fleet never
+/// converged" rather than "you asked the wrong tenant". A tenant-owned port wants a per-port poll
+/// with an explicit `X-Rift-Tenant` instead; see `wait_imposter_visible_as` in `scenarios.rs`.
 pub async fn wait_converged_with_key(
     port: u64,
     timeout: Duration,
