@@ -1636,11 +1636,16 @@ async fn test_reconcile_preserves_state() {
     );
 
     for node in &NODES {
-        // Same reason as the `intents_pending` check above: a node whose `/metrics` cannot be read
-        // must fail this assertion, not satisfy it by defaulting to the value being asserted.
+        // `unwrap_or(0.0)` is correct here and must stay — unlike the `intents_pending` check
+        // above, which reads an unlabelled `Gauge` that is always emitted. `bind_failures` is a
+        // `GaugeVec{port}`, and `observe_apply_failures` `reset()`s it before setting the failing
+        // ports, so a healthy node publishes **no series at all** for `port="0"` and `metric()`
+        // reports the family as absent. Absence is the domain-optional "no failures" answer, not a
+        // swallowed error. (Treating it as one was tried, and turned this into a hard failure on a
+        // perfectly healthy fleet.)
         let failures = metric(node.metrics, r#"rift_cluster_bind_failures{port="0"}"#)
             .await
-            .unwrap_or_else(|e| panic!("{}: metrics endpoint did not answer: {e}", node.name));
+            .unwrap_or(0.0);
         assert_eq!(failures, 0.0, "{} reported a bind failure", node.name);
     }
     drop(cluster);
@@ -2716,19 +2721,23 @@ async fn c19_front_door_routes_around_bind_divergence() {
     // A scrape error is distinguished from a genuine `0`: collapsing both into `0.0` would let a
     // fleet that never exposed the gauge at all fail with "did not report the bind failure", which
     // sends the next reader looking in the wrong place.
+    // Polled, not read once. `wait_converged` proves the *config* reached every node's map, which
+    // is a different event from the local apply having recorded its bind outcome, and this tier's
+    // single-shot timing assertions are its main flake source.
+    //
+    // An absent family counts as "not yet", not as an error: `bind_failures` is a `GaugeVec{port}`
+    // that `observe_apply_failures` `reset()`s, so before the failure is recorded this series does
+    // not exist at all. Failing on absence would abort the poll on exactly the state it is waiting
+    // to leave.
     let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
     let family = format!(r#"rift_cluster_bind_failures{{port="{C19_IMPOSTER_PORT}"}}"#);
     loop {
-        let sample = metric(NODES[1].metrics, &family)
-            .await
-            .unwrap_or_else(|e| panic!("rift-2's metrics endpoint did not answer: {e}"));
-        if sample == 1.0 {
+        if metric(NODES[1].metrics, &family).await.unwrap_or(0.0) == 1.0 {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "rift-2 never reported the bind failure the squat should have caused \
-             (last sample {sample})"
+            "rift-2 never reported the bind failure the squat should have caused"
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
