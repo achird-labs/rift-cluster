@@ -77,8 +77,8 @@ use serde::{Deserialize, Serialize};
 use super::TypeConfig;
 use crate::control::{
     self, AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
-    FLEET_SCOPE, OnDrift, Principal, Quotas, Role, SourceMode, SourceProvenance, StubEdit,
-    StubEditScript, Tenant, TenantId,
+    FLEET_SCOPE, OnDrift, Principal, Quotas, Role, SessionKey, SourceMode, SourceProvenance,
+    StubEdit, StubEditScript, Tenant, TenantId,
 };
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
@@ -157,6 +157,16 @@ const SM_AUDIT_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
 const SM_AUDIT_GC_WATERMARK_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("sm_audit_gc_watermark");
 const AUDIT_SINK_KEY: &str = "sink";
+/// The fleet's session-signing key as JSON, under [`SESSION_KEY_ROW`] (RFC-006 §5.3, issue
+/// #185). A one-row table, same shape as `sm_audit_sink` and for the same reason: it snapshots,
+/// installs and gets cleared through exactly the same code path as every other replicated
+/// table, rather than through a hand-written special case that is one commit away from missing
+/// the snapshot path and silently logging every console user out after a compaction.
+const SM_SESSION_KEY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_session_key");
+/// The single key `sm_session_key` uses, named rather than `()` for the same reason
+/// [`AUDIT_SINK_KEY`] is: it reads like the rest of the schema and a second signing key, if one
+/// is ever wanted, is a key change and not a schema migration.
+const SESSION_KEY_ROW: &str = "key";
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
 /// Node-local durable intents (issue #9 R4): ops this node accepted but has
@@ -395,6 +405,14 @@ struct SnapshotPayload {
     /// its exporter then reports a clean stream over a window that is gone.
     #[serde(default)]
     audit_gc_watermark: Option<u64>,
+    /// The `sm_session_key` row, if a console login has ever minted one (RFC-006 §5.3, issue
+    /// #185). `#[serde(default)]` for the same reason `audit_sink` is, and the same failure
+    /// shape if it is ever forgotten here: a node that installs a snapshot without it and then
+    /// serves a console login mints a *second* key at a fresh revision, which silently
+    /// invalidates every session issued by every other node — the exact fleet-wide logout this
+    /// field exists to prevent from happening by accident.
+    #[serde(default)]
+    session_key: Option<String>,
     /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
     dedup: Vec<(String, String)>,
     last_applied_log: Option<LogId<u64>>,
@@ -450,6 +468,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn
             .open_table(SM_AUDIT_GC_WATERMARK_TABLE)
             .map_err(io)?;
+        write_txn.open_table(SM_SESSION_KEY_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
         write_txn.open_table(PENDING_INTENTS_TABLE).map_err(io)?;
@@ -1836,6 +1855,36 @@ impl RedbStateMachine {
         Ok(Some(record))
     }
 
+    /// The fleet's session-signing key, or `None` when no console login has minted one yet
+    /// (RFC-006 §5.3, issue #185). Answered from local applied state, like `audit_sink`.
+    ///
+    /// # Errors
+    /// Storage I/O, or a stored record that will not parse.
+    #[allow(clippy::result_large_err)]
+    pub fn session_key(&self) -> StorageResult<Option<SessionKey>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_SESSION_KEY_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let Some(value) = table
+            .get(SESSION_KEY_ROW)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        else {
+            return Ok(None);
+        };
+        // Surfaced, never defaulted away: an unparseable key record must not read as "no key
+        // minted yet", which would silently mint a second one and rotate every session out from
+        // under whoever was relying on the first — same reasoning as `audit_sink`.
+        let record: SessionKey = serde_json::from_str(value.value()).map_err(|e| {
+            tracing::error!(error = %e, "corrupt stored session key record");
+            StorageError::from(StorageIOError::read_state_machine(&e))
+        })?;
+        Ok(Some(record))
+    }
+
     /// The last revision shipped to the sink; `0` when nothing has shipped
     /// (issue #164).
     ///
@@ -2373,6 +2422,7 @@ impl RedbStateMachine {
         bindings: &mut Table<'_, (&'static str, &'static str), &'static str>,
         audit_sink: &mut Table<'_, &'static str, &'static str>,
         audit_checkpoint: &mut Table<'_, &'static str, u64>,
+        session_key: &mut Table<'_, &'static str, &'static str>,
         op: &ControlOp,
         index: u64,
         issued_at_secs: u64,
@@ -3131,6 +3181,24 @@ impl RedbStateMachine {
                 }
                 Ok(Ok(Vec::new()))
             }
+            ControlOp::SessionKeyPut { key, .. } => {
+                // Overwrites unconditionally: minting the *first* key and rotating an existing
+                // one are the same op (RFC-006 §5.3), and the record's `revision` — stamped from
+                // this apply's log index, not carried in the op — is what `session::verify`
+                // binds into every token it mints. A rotation therefore invalidates every
+                // outstanding session the instant this commits, on every replica, with no table
+                // of live sessions to sweep.
+                let record = SessionKey {
+                    key: key.clone(),
+                    revision: index,
+                };
+                let value = serde_json::to_string(&record)
+                    .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
+                session_key
+                    .insert(SESSION_KEY_ROW, value.as_str())
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
         }
     }
 
@@ -3300,6 +3368,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             audit_sink,
             audit_checkpoint,
             audit_gc_watermark,
+            session_key,
             dedup,
         ) = {
             let read_txn = self
@@ -3415,6 +3484,18 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 .get(AUDIT_SINK_KEY)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
                 .map(|v| v.value());
+            // Travels with the snapshot for the same reason the sink does, with a sharper
+            // failure than a missed export: a follower that installs without it and then wins an
+            // election either has no key to sign a login with (if none had ever been minted) or,
+            // worse, mints its own on first login — silently rotating out from under every
+            // session issued by every other node, with nothing reporting that a fleet-wide logout
+            // just happened.
+            let session_key = read_txn
+                .open_table(SM_SESSION_KEY_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+                .get(SESSION_KEY_ROW)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+                .map(|v| v.value().to_owned());
             let dedup_table = read_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -3437,6 +3518,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 audit_sink,
                 audit_checkpoint,
                 audit_gc_watermark,
+                session_key,
                 dedup,
             )
         };
@@ -3452,6 +3534,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             audit_sink,
             audit_checkpoint,
             audit_gc_watermark,
+            session_key,
             dedup,
             last_applied_log: applied.last_applied_log,
             last_membership: applied.last_membership.clone(),
@@ -3558,6 +3641,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut audit_gc_watermark = write_txn
                 .open_table(SM_AUDIT_GC_WATERMARK_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut session_key = write_txn
+                .open_table(SM_SESSION_KEY_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut dedup = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -3641,6 +3727,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut bindings,
                                         &mut audit_sink,
                                         &mut audit_checkpoint,
+                                        &mut session_key,
                                         &request.op,
                                         log_id.index,
                                         applied.logical_clock_secs,
@@ -3655,6 +3742,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut bindings,
                                     &mut audit_sink,
                                     &mut audit_checkpoint,
+                                    &mut session_key,
                                     &request.op,
                                     log_id.index,
                                     applied.logical_clock_secs,
@@ -3943,6 +4031,22 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             if let Some(revision) = payload.audit_gc_watermark {
                 audit_gc_watermark_table
                     .insert(AUDIT_SINK_KEY, revision)
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
+            // Cleared before it is repopulated, like the sink above: a payload carrying no key
+            // means no console login has ever minted one on the leader, and leaving a stale local
+            // key in place would let this node keep verifying cookies against a revision the
+            // fleet no longer agrees is current.
+            let mut session_key_table = write_txn
+                .open_table(SM_SESSION_KEY_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            session_key_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            if let Some(value) = &payload.session_key {
+                session_key_table
+                    .insert(SESSION_KEY_ROW, value.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -7222,11 +7326,16 @@ mod tests {
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
 
-        // Strip the three #164 fields, standing in for a payload serialized by a
-        // binary that predates them.
+        // Strip the #164 fields plus #185's `session_key`, standing in for a payload serialized
+        // by a binary that predates all of them.
         let mut payload: serde_json::Value =
             serde_json::from_slice(snapshot.get_ref()).expect("snapshot payload is JSON");
-        for field in ["audit_sink", "audit_checkpoint", "audit_gc_watermark"] {
+        for field in [
+            "audit_sink",
+            "audit_checkpoint",
+            "audit_gc_watermark",
+            "session_key",
+        ] {
             payload
                 .as_object_mut()
                 .expect("payload is an object")
@@ -7238,10 +7347,51 @@ mod tests {
         follower
             .install_snapshot(&meta, Box::new(stripped))
             .await
-            .expect("a pre-#164 snapshot must still install");
+            .expect("a pre-#164/#185 snapshot must still install");
         assert_eq!(follower.audit_sink().expect("read sink"), None);
         assert_eq!(follower.audit_checkpoint().expect("read checkpoint"), 0);
         assert_eq!(follower.audit_gc_watermark().expect("read watermark"), 0);
+        assert_eq!(follower.session_key().expect("read session key"), None);
+    }
+
+    /// RFC-006 §5.3, issue #185: the session-signing key must travel through a snapshot install
+    /// exactly like `sm_audit_sink` does — miss this and a node that joins by snapshot cannot
+    /// verify cookies the rest of the fleet accepts, and if it is the one that later serves a
+    /// login, it silently mints a second key that invalidates every outstanding session fleet-wide.
+    #[tokio::test]
+    async fn session_key_survives_a_snapshot_install() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            request_at(
+                1,
+                1_000,
+                ControlOp::SessionKeyPut {
+                    tenant: TenantId::new(FLEET_SCOPE),
+                    key: "42".repeat(32),
+                },
+            ),
+        )
+        .await;
+
+        let key_before = sm.session_key().expect("read session key");
+        assert!(key_before.is_some(), "a session key was minted");
+
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+
+        assert_eq!(
+            follower.session_key().expect("read session key"),
+            key_before,
+            "a node joining by snapshot install must inherit the fleet's session-signing key"
+        );
     }
 
     /// AC4, restart half: the rows are in redb, not in memory, so reopening the

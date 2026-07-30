@@ -130,19 +130,23 @@ async fn openapi_json_endpoint_serves_the_contract() {
     server.shutdown().await;
 }
 
-/// AC6, the half that a contract-only check cannot reach: C2's routes are not *served* yet either.
+/// The successor to #184's C2 tripwire, and a stronger check than the one it replaces.
 ///
-/// `c2_fleet_surface_is_tracked_as_pending` asserts these paths are absent from the contract, which
-/// on its own proves nothing about what the binary answers. These are reads, and a read served
-/// directly from `handle` never reaches `classify`, so it gains no `Terminated` variant and trips no
-/// compile-time tripwire: #185 could serve `/_fleet/members`, forget both `HANDLE_DIRECT_ROUTES` and
-/// the contract, and every parity test would still pass — comparing two sets that are each missing
-/// the same route. Probing the live surface is the only thing that catches that shape.
+/// #184 carried a `C2_PENDING_ROUTES` guard asserting the `/_fleet/*` and `/session` routes were not
+/// yet served. This PR serves them, so that guard has done its job and is gone. What replaces it is
+/// the general form: **every route declared in `HANDLE_DIRECT_ROUTES` must actually be answered by a
+/// running node.**
 ///
-/// When #185 lands, this test goes red. That is its job: it is the reminder to publish the routes
-/// and delete `C2_PENDING_ROUTES`, in the same PR that serves them.
+/// This closes a tautology a reviewer found in #184. `every_published_ee_path_is_routable` cannot
+/// pin these routes, because `is_terminated_here` short-circuits on the same constant before it
+/// would consult the real router — so the constant checks itself, and deleting the `/admin/whoami`
+/// arm from `handle` would leave the contract publishing a route nothing serves, with every test
+/// green. Only an HTTP probe against a live node catches that.
+///
+/// A 404 is the failure being hunted. Any other status — including `401`/`403`, which mean the route
+/// exists and the gate ran — proves the arm is wired.
 #[tokio::test]
-async fn c2_pending_routes_are_not_served_yet() {
+async fn every_direct_route_is_actually_served() {
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &[]))
         .await
@@ -151,9 +155,20 @@ async fn c2_pending_routes_are_not_served_yet() {
     let admin = server.admin_addr().to_string();
     let client = reqwest::Client::new();
 
-    for (method, template) in rift_cluster_server::openapi::C2_PENDING_ROUTES {
-        // The templates carry OpenAPI placeholders; any concrete value reaches the same router arm.
-        let path = template.replace("{opId}", "op-1");
+    for (method, template) in rift_cluster_server::openapi::HANDLE_DIRECT_ROUTES {
+        // `/_fleet/ops/{opId}` is the one entry whose *correct* answer for a resource that does not
+        // exist is itself a 404 — an unknown op id and an unrouted path are deliberately
+        // indistinguishable there, the same posture the cluster port takes. A 404 therefore proves
+        // nothing either way and this check cannot speak to it. Its routing **and its
+        // authorization** are pinned instead by `tests/fleet_session.rs`:
+        // `fleet_routes_refuse_a_non_fleet_admin` includes it, and
+        // `fleet_ops_reports_a_committed_op` polls a real committed op through it.
+        if template.contains("{opId}") {
+            continue;
+        }
+        // A real UUID: `/_fleet/ops/{opId}` parses the segment, and a malformed id names no op at
+        // all — so a placeholder would probe a different arm than the one under test.
+        let path = template.replace("{opId}", "0189dcf0-0454-4e0b-a10c-8a8f8dccce1f");
         let verb = reqwest::Method::from_bytes(method.as_bytes()).expect("known method");
         let response = client
             .request(verb, format!("http://{admin}{path}"))
@@ -161,11 +176,11 @@ async fn c2_pending_routes_are_not_served_yet() {
             .await
             .unwrap_or_else(|e| panic!("{method} {path} request failed: {e}"));
         let seen = Seen::of(response).await;
-        assert_eq!(
+        assert_ne!(
             seen.status, 404,
-            "{method} {path} is being served, so C2 (#185) has landed. Publish these operations \
-             in openapi-ee.yaml, add the reads to HANDLE_DIRECT_ROUTES, and delete \
-             C2_PENDING_ROUTES along with this test — in the same PR that serves them: {seen}"
+            "{method} {path} is declared in HANDLE_DIRECT_ROUTES and published in the contract, \
+             but no node serves it — either the arm was never added to `handle`, or it was \
+             removed while the declaration stayed behind: {seen}"
         );
     }
 

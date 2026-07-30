@@ -60,13 +60,17 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rand::RngCore;
 use rift_cluster::audit_export::ExportStatus;
 use rift_cluster::control::Role;
 use rift_cluster::control::{self, ControlOp, ControlRequest, StubEdit, StubEditScript};
 use rift_cluster::decorate::{
     HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS,
 };
-use rift_cluster::{ControlOutcome, ControlResponse, NodeError, RaftNode, TenantId};
+use rift_cluster::{
+    ControlOutcome, ControlResponse, FLEET_SCOPE, NodeError, RaftNode, SESSION_KEY_BYTES,
+    SessionKey, TenantId,
+};
 use rift_cluster_base::seams::{
     ErrorKind, ImposterConfig, RiftScriptConfig, RouteTable, SCOPE_HEADER, ScriptBaseDir, Stub,
     classify as classify_upstream, config_uses_script_surface, error_response_typed,
@@ -80,8 +84,11 @@ use uuid::Uuid;
 
 use crate::authz::{self, Action, Decision, Denial};
 use crate::cli::WriteBarrier;
+use crate::fleet;
 use crate::openapi;
 use crate::principal;
+use crate::readiness::Readiness;
+use crate::session;
 use crate::tenancy;
 
 /// Largest admin request body the front accepts on a terminated route. The
@@ -128,6 +135,10 @@ pub struct FrontConfig {
     /// attached, the same way it does for a follower (see
     /// `tenancy::AuditSinkView`'s doc).
     pub export_status: Option<Arc<ExportStatus>>,
+    /// This node's startup-readiness latch, threaded through so `/_fleet/health` (RFC-006 §5.2,
+    /// issue #185) can report the same state `/readyz` does without a second latch to keep in
+    /// sync.
+    pub readiness: Arc<Readiness>,
 }
 
 /// A bound, serving admin front.
@@ -243,6 +254,7 @@ struct FrontState {
     barrier_timeout: Duration,
     admin_async: bool,
     export_status: Option<Arc<ExportStatus>>,
+    readiness: Arc<Readiness>,
     /// Streams proxied requests through unchanged (SSE included).
     proxy: Client<hyper_util::client::legacy::connect::HttpConnector, Incoming>,
     /// Issues the internal re-reads mutation responses are rendered from.
@@ -270,6 +282,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         barrier_timeout: config.barrier_timeout,
         admin_async: config.admin_async,
         export_status: config.export_status,
+        readiness: config.readiness,
         proxy: Client::builder(TokioExecutor::new()).build_http(),
         fetch: Client::builder(TokioExecutor::new()).build_http(),
     });
@@ -544,6 +557,61 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
         return proxy(state, req, None).await;
     }
 
+    // `POST /session` / `DELETE /session` (RFC-006 §5.3, issue #185): minting and clearing a
+    // console session cookie. Neither is a `Terminated` route — a login is a credential exchange,
+    // not a config mutation, and a logout touches no replicated state at all — so both are
+    // handled directly here, ahead of `classify`, the same way `/admin/whoami` is.
+    if path == "/session" {
+        return match *req.method() {
+            Method::POST => session_login(&state, req).await,
+            Method::DELETE => session_logout(),
+            _ => typed_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                ErrorKind::BadData,
+                "/session supports POST (login) and DELETE (logout) only",
+            ),
+        };
+    }
+
+    // `/_fleet/*` (RFC-006 §5.2, issue #185): the same members/health/op-status projection
+    // `/_cluster/*` answers, re-exposed on the admin port so an operator working the admin API
+    // does not also need a cluster-port credential to ask "is this node healthy". Gated at
+    // `Action::ClusterAdmin` — a settled design decision (FleetAdmin only, not per-tenant) —
+    // through the same `authorize_action` chokepoint as every other route, so it inherits the
+    // CSRF gate and the bypass/401 handling for free.
+    if let Some(route) = fleet::classify(req.method(), &path) {
+        return match authorize_action(&state, &req, Action::ClusterAdmin, None, None) {
+            Ok(_) => {
+                let Some(node) = state.node.upgrade() else {
+                    return typed_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ErrorKind::Unavailable,
+                        "cluster node is shutting down",
+                    );
+                };
+                match fleet::body(&route, &node, &state.readiness) {
+                    Ok(Some(body)) => match serde_json::to_vec(&body) {
+                        Ok(bytes) => buffered_response(
+                            StatusCode::OK,
+                            Bytes::from(bytes),
+                            json_content_type(),
+                        )
+                        .unwrap_or_else(|response| response),
+                        Err(e) => internal(&e.to_string()),
+                    },
+                    // The one case `fleet::body` can 404 on: a well-formed but unknown op id.
+                    Ok(None) => typed_error(
+                        StatusCode::NOT_FOUND,
+                        ErrorKind::NoSuchResource,
+                        "Not Found",
+                    ),
+                    Err(e) => internal(&e),
+                }
+            }
+            Err(response) => response,
+        };
+    }
+
     // `GET /front-door/routes` is a state-machine read, not a mutation: it
     // never reaches `classify` (write-only) or `proxy` (there is no upstream
     // `/front-door/routes` to proxy to — U-11's admin CRUD was deferred).
@@ -563,7 +631,11 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     // action would be the wrong answer for a principal reading only itself.
     if req.method() == Method::GET && path == tenancy::WHOAMI_PATH {
         return match authenticate(&state, &req) {
-            Ok(resolved) => match tenancy::whoami_body(resolved.as_ref()) {
+            Ok(authenticated) => match tenancy::whoami_body(
+                authenticated
+                    .as_ref()
+                    .map(|authenticated| &authenticated.resolved),
+            ) {
                 Ok(body) => {
                     buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
                         .unwrap_or_else(|response| response)
@@ -755,7 +827,11 @@ fn authorize_action(
     // *tenant record* the route names, this is which *resource* it touches.
     addressed_port: Option<u16>,
 ) -> Result<Authorized, Response<FrontBody>> {
-    let resolved = authenticate(state, req)?;
+    let authenticated = authenticate(state, req)?;
+    // The CSRF gate (RFC-006 §5.3) already ran inside `authenticate` for a cookie-resolved
+    // identity, before this function ever sees it — there is nothing left here that needs to know
+    // which credential carried the request.
+    let resolved = authenticated.map(|authenticated| authenticated.resolved);
     let Some(resolved) = resolved else {
         // The bypass (see `authenticate`'s doc): there is no principal to
         // check a role against, and no binding to intersect `X-Rift-Tenant`
@@ -878,6 +954,25 @@ fn tenant_boundary_not_found() -> Response<FrontBody> {
     )
 }
 
+/// The `Cookie` name a session token rides in (RFC-006 §5.3, issue #185).
+const SESSION_COOKIE_NAME: &str = "rift_session";
+
+/// The CSRF header [`csrf_gate`] requires on a state-changing, cookie-authenticated request. Any
+/// value counts — its presence is what matters (it proves the caller is same-origin JavaScript
+/// that could read a response header or set a custom one, which a cross-site form submission or
+/// `<img>`/`<script>` tag cannot do), not its content.
+const CSRF_HEADER: &str = "x-rift-csrf";
+
+/// What [`authenticate`] resolved a request to.
+///
+/// A newtype rather than a bare [`principal::Resolved`] so the CSRF decision stays *inside*
+/// `authenticate`: the gate (RFC-006 §5.3) runs on the cookie branch only — a bearer cannot be
+/// attached by a victim's browser, which is the entire attack — and by the time a caller holds one
+/// of these, that decision has already been made and there is nothing left for it to re-derive.
+struct Authenticated {
+    resolved: principal::Resolved,
+}
+
 /// Resolve the request's credential to a principal, without checking any
 /// action against it. Used directly for a route with no classified action to
 /// check (RFC-002 §4.3's `None` case) — mirroring upstream's own hook
@@ -886,16 +981,25 @@ fn tenant_boundary_not_found() -> Response<FrontBody> {
 /// first step of [`authorize_action`], so the two never resolve a credential
 /// two different ways.
 ///
-/// `Ok(Some(resolved))` is an authenticated principal. `Ok(None)` is the
+/// `Ok(Some(authenticated))` is an authenticated principal. `Ok(None)` is the
 /// bypass: the fleet defines no principal and no `--api-key` is configured,
 /// so there is nobody to check a credential against — the pre-#161
 /// open-admin-plane behavior. `Err` is `401` (or `500` on a state-machine
-/// read failure — fail closed, never a fallthrough to allow).
+/// read failure — fail closed, never a fallthrough to allow), or — new in
+/// #185 — `403` from the CSRF gate below.
+///
+/// # The bearer path is byte-identical to before #185
+///
+/// When an `Authorization` header is present, the block below runs the exact call and the exact
+/// three-way match this function ran before session cookies existed, and returns from inside
+/// that `if`. The cookie branch (RFC-006 §5.3) is only ever reached when there is **no**
+/// `Authorization` header at all — sessions are strictly additive, never a second opinion on a
+/// request a bearer credential already resolved.
 #[allow(clippy::result_large_err)]
 fn authenticate(
     state: &FrontState,
     req: &Request<Incoming>,
-) -> Result<Option<principal::Resolved>, Response<FrontBody>> {
+) -> Result<Option<Authenticated>, Response<FrontBody>> {
     let Some(node) = state.node.upgrade() else {
         return Err(typed_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -908,20 +1012,380 @@ fn authenticate(
         .get("authorization")
         .and_then(|v| v.to_str().ok());
 
-    match principal::resolve_bindings(
-        &node,
-        state.api_key.as_deref(),
-        state.legacy_key_is_fleet_admin,
-        credential,
-    ) {
-        Ok(Some(resolved)) => Ok(Some(resolved)),
+    if let Some(credential) = credential {
+        // See "The bearer path is byte-identical to before #185" above.
+        return match principal::resolve_bindings(
+            &node,
+            state.api_key.as_deref(),
+            state.legacy_key_is_fleet_admin,
+            Some(credential),
+        ) {
+            Ok(Some(resolved)) => Ok(Some(Authenticated { resolved })),
+            Ok(None) => match principal::should_bypass(&node, state.api_key.as_deref()) {
+                Ok(true) => Ok(None),
+                Ok(false) => Err(unauthorized()),
+                Err(e) => Err(internal(&e.to_string())),
+            },
+            Err(e) => Err(internal(&e.to_string())),
+        };
+    }
+
+    // No `Authorization` header: try the session cookie (RFC-006 §5.3, issue #185), falling back
+    // to the same bypass-or-401 the bearer branch above would have when there is no cookie
+    // either — an unauthenticated request is refused exactly as it was before #185 shipped.
+    match resolve_cookie(&node, req) {
+        Ok(Some(resolved)) => {
+            csrf_gate(req)?;
+            Ok(Some(Authenticated { resolved }))
+        }
         Ok(None) => match principal::should_bypass(&node, state.api_key.as_deref()) {
             Ok(true) => Ok(None),
             Ok(false) => Err(unauthorized()),
             Err(e) => Err(internal(&e.to_string())),
         },
-        Err(e) => Err(internal(&e.to_string())),
+        // `resolve_cookie`'s `Err` is already the rendered response (a `500` from a
+        // state-machine read failure) — propagate it as-is rather than re-wrapping it.
+        Err(response) => Err(response),
     }
+}
+
+/// Resolve the `rift_session` cookie to a principal's bindings (RFC-006 §5.3, issue #185).
+///
+/// `Ok(None)` flattens every "not authenticated by cookie" case alike — no cookie present, no
+/// signing key committed yet, a token that fails [`session::verify`] for any reason, a principal
+/// since deleted or disabled — the same flattening `principal::resolve_bindings` already applies
+/// to a bad bearer credential, and for the same reason: the caller cannot act on *why*, only on
+/// whether a principal resolved.
+///
+/// [`session::verify`] proves authentication only (see that module's doc). The bindings below
+/// are read fresh from applied state on every call — never cached alongside the verified
+/// identity — so a principal disabled or unbound after the cookie was issued loses access on its
+/// very next request, not merely at its next login. This is deliberately the same shape
+/// `resolve_bindings` already uses for the bearer path; do not special-case the cookie path with
+/// a cache anywhere in this function (issue #165's `c25_key_revocation_survives_a_partition`
+/// exists to catch exactly that mutant).
+#[allow(clippy::result_large_err)]
+fn resolve_cookie(
+    node: &RaftNode,
+    req: &Request<Incoming>,
+) -> Result<Option<principal::Resolved>, Response<FrontBody>> {
+    let Some(token) = session_cookie(req) else {
+        return Ok(None);
+    };
+    let Some(key) = node.session_key().map_err(|e| internal(&e.to_string()))? else {
+        // No console login has ever minted a signing key on this fleet, so no cookie this node
+        // issued could exist — but a client can still present garbage, and that is `None`, not
+        // an error.
+        return Ok(None);
+    };
+    let principal_id = match session::verify(&key, &token, now_secs()) {
+        Ok(principal_id) => principal_id,
+        Err(_) => return Ok(None),
+    };
+    // Deliberately the *same* function the bearer path's session branch uses, rather than a second
+    // copy of "load principal, reject if disabled, read bindings fresh". Two copies of a
+    // disabled-check in an authentication path is precisely the pair that drifts, and the one that
+    // stops rejecting is the one nobody notices.
+    principal::resolve_stored_principal(node, principal_id).map_err(|e| internal(&e.to_string()))
+}
+
+/// The `rift_session` cookie's raw value, if the request carries one. No percent-decoding: the
+/// token alphabet (base64url plus `.`) never needs it.
+fn session_cookie(req: &Request<Incoming>) -> Option<String> {
+    cookie_value(req.headers())
+}
+
+/// The cookie lookup against a bare header map, so the proxy leg — which has already destructured
+/// the request into parts — can reach it too.
+fn cookie_value(headers: &hyper::HeaderMap) -> Option<String> {
+    let raw = headers.get(hyper::header::COOKIE)?.to_str().ok()?;
+    raw.split(';').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name.trim() == SESSION_COOKIE_NAME).then(|| value.trim().to_owned())
+    })
+}
+
+/// RFC-006 §5.3's CSRF gate: a request authenticated **by cookie** that is state-changing
+/// (anything but `GET`/`HEAD`/`OPTIONS`) must carry [`CSRF_HEADER`] (any value) or is refused
+/// with `403`. A bearer credential is exempt — see [`Authenticated`]'s doc.
+///
+/// Called from inside [`authenticate`] itself, on the one branch that resolves a cookie, so
+/// every caller of `authenticate` — `authorize_action` (and therefore every terminated and
+/// proxied route, plus the `/_fleet/*` routes added by #185) and the direct callers
+/// (`/admin/whoami`, `/openapi.json`, `/session`) — gets this for free. There is no second call
+/// site to add and no route that reaches a cookie-resolved identity without passing through it:
+/// a route that "terminates early" still had to call `authenticate` (or `authorize_action`,
+/// which calls it) to have a cookie-resolved identity to terminate with in the first place.
+#[allow(clippy::result_large_err)]
+fn csrf_gate(req: &Request<Incoming>) -> Result<(), Response<FrontBody>> {
+    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return Ok(());
+    }
+    if req.headers().contains_key(CSRF_HEADER) {
+        return Ok(());
+    }
+    Err(typed_error(
+        StatusCode::FORBIDDEN,
+        ErrorKind::InsufficientAccess,
+        &format!(
+            "state-changing requests authenticated by session cookie must carry {CSRF_HEADER}"
+        ),
+    ))
+}
+
+/// Seconds since the Unix epoch, floored to `0` on a pre-epoch clock — the same convention
+/// [`mint`]'s op-issuing sibling uses, so a session's `iat`/`exp` and an op's `issued_at_secs`
+/// degrade the same way under a broken clock rather than in two different directions.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Session cookies (RFC-006 §5.3, issue #185)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SessionLoginBody {
+    #[serde(rename = "apiKey")]
+    api_key: String,
+}
+
+/// `POST /session`: exchange an API key for a session cookie (RFC-006 §5.3, issue #185).
+///
+/// Credential verification is exactly `authenticate`'s bearer path — `principal::resolve_bindings`,
+/// the same argon2id lookup — called here directly rather than reimplemented, so there is only
+/// ever one way to check an API key on this front (the issue's explicit requirement). What is
+/// new is only what happens *after* a key checks out: minting a signed cookie instead of
+/// authorizing the one request that presented it.
+async fn session_login(state: &Arc<FrontState>, req: Request<Incoming>) -> Response<FrontBody> {
+    let Some(node) = state.node.upgrade() else {
+        return typed_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Unavailable,
+            "cluster node is shutting down",
+        );
+    };
+
+    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return typed_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorKind::RequestTooLarge,
+                &format!("admin request body refused: {e}"),
+            );
+        }
+    };
+    let login: SessionLoginBody = match serde_json::from_slice(&body) {
+        Ok(login) => login,
+        Err(e) => {
+            return typed_error(
+                StatusCode::BAD_REQUEST,
+                ErrorKind::BadData,
+                &format!("invalid request JSON: {e}"),
+            );
+        }
+    };
+
+    // Byte-for-byte the same check `authenticate`'s bearer branch runs against an `Authorization`
+    // header — see this function's doc.
+    let resolved = match principal::resolve_bindings(
+        &node,
+        state.api_key.as_deref(),
+        state.legacy_key_is_fleet_admin,
+        Some(login.api_key.as_str()),
+    ) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return unauthorized(),
+        Err(e) => return internal(&e.to_string()),
+    };
+
+    // The legacy `--api-key` (RFC-002 §3.4) resolves to a *synthetic* identity with no principal
+    // row behind it. A session token names a principal and every later request re-reads that row to
+    // get current bindings, so a cookie minted for the synthetic id would authenticate exactly
+    // never: the login would answer `200` with a real `Set-Cookie`, and every subsequent request
+    // would be `401` with nothing to distinguish it from a rotated key or a skewed clock.
+    //
+    // Refused explicitly rather than papered over, and refused *here* rather than by letting the
+    // cookie fail later, because a `200` for a credential exchange that cannot produce a usable
+    // credential is the silent-fallback shape this codebase treats as a defect.
+    if principal::is_legacy_identity(resolved.principal_id.as_str()) {
+        return typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            "the legacy --api-key cannot hold a console session: it names no principal, so a \
+             session minted for it could never be resolved back to one. Create a principal \
+             (POST /admin/tenants/{tenant}/principals) and log in with its key.",
+        );
+    }
+
+    let key = match ensure_session_key(state, &node, resolved.principal_id.as_str()).await {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let token = session::mint(
+        &key,
+        resolved.principal_id.as_str(),
+        now_secs(),
+        session::SESSION_TTL_SECS,
+    );
+
+    let mut response = match buffered_response(StatusCode::OK, Bytes::new(), None) {
+        Ok(response) => response,
+        Err(response) => return response,
+    };
+    match set_session_cookie(&mut response, &token, session::SESSION_TTL_SECS) {
+        Ok(()) => response,
+        Err(response) => response,
+    }
+}
+
+/// `DELETE /session`: clear the session cookie (RFC-006 §5.3, issue #185).
+///
+/// Unconditional and unauthenticated on purpose: logging out never fails, whether or not the
+/// caller holds a live session — there is no server-side state to invalidate (a session is
+/// nothing but a signed claim the fleet did not have to remember making), only a cookie the
+/// browser is told to stop sending. Requiring a valid session first would turn "log out of an
+/// already-expired session" into a `401` instead of the no-op it should be.
+fn session_logout() -> Response<FrontBody> {
+    let mut response = match buffered_response(StatusCode::NO_CONTENT, Bytes::new(), None) {
+        Ok(response) => response,
+        Err(response) => return response,
+    };
+    match clear_session_cookie(&mut response) {
+        Ok(()) => response,
+        Err(response) => response,
+    }
+}
+
+/// The fleet's session-signing key, minting one first if no console login has ever committed one
+/// (issue #185). The only branch of this front's entire session surface that is a Raft write —
+/// every other login reads the record this one commits.
+async fn ensure_session_key(
+    state: &FrontState,
+    node: &Arc<RaftNode>,
+    principal_id: &str,
+) -> Result<SessionKey, Response<FrontBody>> {
+    if let Some(key) = node.session_key().map_err(|e| internal(&e.to_string()))? {
+        return Ok(key);
+    }
+
+    let mut bytes = [0u8; SESSION_KEY_BYTES];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let op = ControlOp::SessionKeyPut {
+        tenant: TenantId::new(FLEET_SCOPE),
+        key: session::hex_encode(&bytes),
+    };
+    // R4's usual order (validate, park durably, submit) even though a locally-generated key can
+    // only fail this for a programming error in this function, not anything a caller controls —
+    // every other write on this front validates before parking, and there is no reason for the
+    // one write minting a *signing* key to be the exception.
+    if let Err(reason) = control::validate(&op) {
+        return Err(refusal_response(&reason));
+    }
+    let op_id = Uuid::new_v4();
+    let request = mint(op_id, op, None, Some(principal_id.to_owned()));
+    if let Err(e) = node.park_intent(&request) {
+        return Err(typed_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorKind::InternalError,
+            &format!("cannot durably accept the write: {e}"),
+        ));
+    }
+
+    let committed = match tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await {
+        Err(_) => {
+            node.request_replay();
+            return Err(typed_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                ErrorKind::Timeout,
+                "write did not commit within the deadline; parked for replay",
+            ));
+        }
+        Ok(Err(NodeError::Unavailable(detail))) => {
+            node.request_replay();
+            return Err(typed_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorKind::Unavailable,
+                &format!("no quorum / leader unreachable (parked for replay): {detail}"),
+            ));
+        }
+        Ok(Err(e)) => {
+            node.request_replay();
+            return Err(typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorKind::InternalError,
+                &e.to_string(),
+            ));
+        }
+        Ok(Ok(response)) => response,
+    };
+    if let Err(e) = node.unpark_intent(&op_id) {
+        tracing::error!(%op_id, error = %e, "op terminal but could not unpark");
+    }
+    if let ControlOutcome::Failed { reason } = &committed.outcome {
+        return Err(refusal_response(reason));
+    }
+
+    // This node must see its own write before the re-read below can be trusted: `submit`
+    // guarantees the op committed on a quorum, not that *this* node's local state machine has
+    // caught up to it — a follower forwards to the leader and gets the leader's answer back.
+    node.await_local_applied(committed.revision, state.barrier_timeout)
+        .await;
+
+    // Re-read rather than trust the bytes generated above: two concurrent first logins can both
+    // observe `None` at the top of this function and both submit a `SessionKeyPut`. Both commit —
+    // the op is an unconditional overwrite, not a compare-and-swap — so only the *second* one to
+    // apply is the row every node actually agrees on, and it is not necessarily this call's own.
+    match node.session_key().map_err(|e| internal(&e.to_string()))? {
+        Some(key) => Ok(key),
+        None => Err(internal(
+            "session key committed but not yet visible on this node",
+        )),
+    }
+}
+
+/// Render the `Set-Cookie` header for a freshly minted session token.
+///
+/// `HttpOnly` (unreachable from `document.cookie`, so XSS cannot exfiltrate it), `Secure` (never
+/// sent over plaintext HTTP), `SameSite=Strict` (never attached to a cross-site navigation or
+/// subrequest at all). The last is most of what makes [`csrf_gate`]'s job small: `SameSite=Strict`
+/// already blocks the classic top-level-navigation CSRF; the gate closes the same-site
+/// XHR/`fetch` case a `SameSite` cookie alone does not (a same-site page can still issue a
+/// request the browser *will* attach the cookie to).
+#[allow(clippy::result_large_err)]
+fn set_session_cookie(
+    response: &mut Response<FrontBody>,
+    token: &str,
+    ttl_secs: u64,
+) -> Result<(), Response<FrontBody>> {
+    let value = format!(
+        "{SESSION_COOKIE_NAME}={token}; HttpOnly; Secure; SameSite=Strict; Max-Age={ttl_secs}; Path=/"
+    );
+    let header = HeaderValue::from_str(&value).map_err(|e| internal(&e.to_string()))?;
+    response
+        .headers_mut()
+        .append(hyper::header::SET_COOKIE, header);
+    Ok(())
+}
+
+/// The logout half of [`set_session_cookie`]: the same attributes, an empty value, and
+/// `Max-Age=0` — the standard way to tell a browser to forget a cookie immediately.
+#[allow(clippy::result_large_err)]
+fn clear_session_cookie(response: &mut Response<FrontBody>) -> Result<(), Response<FrontBody>> {
+    let value =
+        format!("{SESSION_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Max-Age=0; Path=/");
+    let header = HeaderValue::from_str(&value).map_err(|e| internal(&e.to_string()))?;
+    response
+        .headers_mut()
+        .append(hyper::header::SET_COOKIE, header);
+    Ok(())
 }
 
 /// The tenant a request asks to act as: `X-Rift-Tenant` when present, else
@@ -1111,6 +1575,17 @@ async fn proxy(
         }
     };
     parts.uri = uri;
+    // A cookie-authenticated request reaches upstream with no `Authorization` header, and
+    // upstream's authorizer seam re-resolves from that value alone — so present the session token
+    // as the credential. `principal::resolve_bindings` accepts it, which is what lets a console
+    // session read a proxied route (`GET /imposters` and friends) at all. Only filled in when the
+    // client sent no `Authorization` of its own, so a bearer request is untouched.
+    if !parts.headers.contains_key("authorization")
+        && let Some(token) = cookie_value(&parts.headers)
+        && let Ok(value) = HeaderValue::from_str(&token)
+    {
+        parts.headers.insert("authorization", value);
+    }
     match scope {
         Some(tenant) => set_scope_header(&mut parts.headers, tenant),
         // Unconditional remove, not skip: the client's own request headers
@@ -1192,11 +1667,20 @@ async fn terminate(
     // Authorization already ran in `handle`, once, for every admin request —
     // terminated, proxied, or the front door's own read. Nothing here
     // re-checks it.
+    //
+    // The internal re-read below still has to *carry* a credential, though: it goes back through
+    // upstream, whose authorizer seam re-resolves from the `Authorization` value alone
+    // (`AuthzRequest` exposes nothing else, and it lives in the vendored submodule). A
+    // cookie-authenticated request has no such header, so the session token is presented in its
+    // place — `principal::resolve_bindings` accepts it, and the same principal resolves on both
+    // legs. Without this the write commits and the render re-read is refused, so the client is told
+    // `403` about a change that actually landed.
     let auth = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| cookie_value(req.headers()));
 
     let host = req.headers().get("host").cloned();
     let idempotency = req
@@ -2847,6 +3331,7 @@ mod tests {
                 barrier_timeout: Duration::from_secs(1),
                 admin_async: false,
                 export_status: None,
+                readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
             },
             &node,
         )

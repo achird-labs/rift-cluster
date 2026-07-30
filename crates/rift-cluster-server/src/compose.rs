@@ -854,6 +854,7 @@ async fn attach_data_plane(
             barrier_timeout,
             admin_async,
             export_status: Some(export_status),
+            readiness: Arc::clone(readiness),
         },
         node,
     )

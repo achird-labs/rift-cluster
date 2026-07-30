@@ -45,6 +45,11 @@ subtle.workspace = true
 uuid.workspace = true
 tokio-util.workspace = true
 arc-swap.workspace = true
+# Session-cookie signing (RFC-006 §5.3, issue #185): HMAC-SHA256 over a base64url payload.
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+base64.workspace = true
 # Same fixed hash the ring uses: a node id derived from a name must be identical
 # on every node and across versions, which the std hasher does not promise.
 xxhash-rust.workspace = true

@@ -27,10 +27,12 @@ pub mod bootstrap;
 pub mod cli;
 pub mod cluster_api;
 pub mod compose;
+pub mod fleet;
 pub mod openapi;
 pub mod principal;
 pub mod probes;
 pub mod readiness;
+pub mod session;
 mod tenancy;
 
 pub use cli::EeCli;

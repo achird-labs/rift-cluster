@@ -65,6 +65,13 @@ tags:
     description: RFC-002 §5 tenants, principals, and bindings — no upstream equivalent.
   - name: audit
     description: RFC-002 §9 audit stream and export sink — no upstream equivalent.
+  - name: fleet
+    description: >
+      RFC-006 §5.2 read-only admin-port projection of the operator
+      surface (`/_cluster/*` on the cluster port) — no upstream
+      equivalent.
+  - name: session
+    description: RFC-006 §5.3 browser session exchange — no upstream equivalent.
   - name: meta
     description: Identity and contract introspection.
   - name: upstream-core
@@ -91,6 +98,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -153,6 +161,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -217,6 +226,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '200':
           description: What was deleted.
@@ -315,6 +325,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '200':
           description: The deleted imposter, as it was just before removal.
@@ -395,6 +406,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '200':
           description: Upstream's own canned message body, byte-identical.
@@ -448,6 +460,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '200':
           description: Upstream's own canned message body, byte-identical.
@@ -507,6 +520,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -570,6 +584,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -671,6 +686,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -725,6 +741,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '200':
           description: The imposter, re-read with the stub removed.
@@ -805,6 +822,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -862,6 +880,7 @@ paths:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '200':
           description: The imposter, re-read with the stub removed.
@@ -1386,6 +1405,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -1477,6 +1497,7 @@ paths:
       x-rift-origin: ee
       parameters:
         - name: routeId
+        - $ref: '#/components/parameters/CsrfHeader'
           in: path
           required: true
           schema:
@@ -1525,10 +1546,15 @@ paths:
         Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — a
         caller unbound at the fleet scope gets the RFC-002 §8.4 `404`, not
         a `403`, so they cannot learn this route exists for them at all.
+        The one `403` this route does answer is the CSRF check (see
+        `CsrfHeader`): a cookie-authenticated request missing
+        `X-Rift-CSRF` is refused before authorization is ever evaluated,
+        so it is unrelated to the fleet-scope `404` above.
       tags: [tenancy]
       x-rift-origin: ee
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -1550,6 +1576,16 @@ paths:
           $ref: '#/components/responses/BadData'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: >
+            Cookie-authenticated request missing the required
+            `X-Rift-CSRF` header (see `CsrfHeader`) — the only `403` this
+            fleet-scoped route answers; role-insufficient access is the
+            `404` above, not this.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: >
             Caller is not bound to the fleet scope — indistinguishable
@@ -1638,6 +1674,7 @@ paths:
       x-rift-origin: ee
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -1684,6 +1721,7 @@ paths:
       x-rift-origin: ee
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '204':
           description: Deleted; no body.
@@ -1728,6 +1766,8 @@ paths:
         safe would be dishonest.
       tags: [tenancy]
       x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -1814,6 +1854,7 @@ paths:
       x-rift-origin: ee
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -1858,6 +1899,7 @@ paths:
       x-rift-origin: ee
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '204':
           description: Deleted; no body.
@@ -1900,6 +1942,7 @@ paths:
       x-rift-origin: ee
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       requestBody:
         required: true
         content:
@@ -1945,6 +1988,7 @@ paths:
       x-rift-origin: ee
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
       responses:
         '204':
           description: Removed; no body.
@@ -2189,6 +2233,214 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  # ---------------------------------------------------------------------
+  # ee: fleet projection (RFC-006 §5.2) — read-only admin-port mirror of
+  # /_cluster/* on the cluster port; no upstream equivalent
+  # ---------------------------------------------------------------------
+  /_fleet/members:
+    get:
+      operationId: getFleetMembers
+      summary: This node's view of raft membership (fleet projection)
+      description: >
+        Terminates. Read-only admin-port projection of the operator
+        surface that otherwise rides the cluster port behind the HMAC
+        secret a browser can never hold (RFC-006 §5.2) — same JSON shape
+        as `/_cluster/members`, rendered by the same builder
+        (`cluster_api.rs`'s `members_body`) so the two ports cannot
+        drift. Fleet-scoped: `ClusterAdmin`, FleetAdmin only — settled in
+        RFC-006 §12 Q3 (`docs/architecture/08-tenancy-security.md`),
+        because this is the same infrastructure-inventory category
+        `principal::map_action` already routes to `Action::ClusterAdmin`
+        (`/config`, `/metrics`, `/logs`), and projecting cluster-port data
+        onto the admin port at a lower tier would be a privilege
+        reduction, not a convenience.
+      tags: [fleet]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: This node's raft membership view.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetMembers'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: >
+            Caller lacks fleet-scoped (`ClusterAdmin`) access —
+            indistinguishable from a route that does not exist for this
+            caller (RFC-002 §8.4), the same posture `listTenants` and
+            `getAuditSink` already use for fleet-scoped denial.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /_fleet/health:
+    get:
+      operationId: getFleetHealth
+      summary: This node's readiness and ring view (fleet projection)
+      description: >
+        Terminates. Same projection as `getFleetMembers`, rendering
+        `cluster_api.rs`'s `health_body` — byte-identical to
+        `/_cluster/health` on the cluster port. Fleet-scoped
+        (`ClusterAdmin`, FleetAdmin only); see `getFleetMembers` for the
+        settled RFC-006 §12 Q3 reasoning.
+      tags: [fleet]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: This node's readiness and ring view.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetHealth'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: >
+            Caller lacks fleet-scoped (`ClusterAdmin`) access —
+            indistinguishable from a route that does not exist for this
+            caller (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /_fleet/ops/{opId}:
+    parameters:
+      - $ref: '#/components/parameters/OpId'
+    get:
+      operationId: getFleetOp
+      summary: An op's commit status (fleet projection)
+      description: >
+        Terminates. Same projection as `getFleetMembers`, rendering
+        `cluster_api.rs`'s `op_body` — the poll target for a `202`-parked
+        or async-committed write's op id, on the admin port instead of the
+        cluster port. Fleet-scoped (`ClusterAdmin`, FleetAdmin only); see
+        `getFleetMembers` for the settled RFC-006 §12 Q3 reasoning.
+      tags: [fleet]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: The op's status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetOpStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: >
+            Either of two indistinguishable cases: the op id names no op
+            (unknown, or its dedup window lapsed — same as
+            `/_cluster/ops/:id`) — a malformed id names no op the same
+            way, so it 404s too, never `400` — or the caller lacks
+            fleet-scoped (`ClusterAdmin`) access (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  # ---------------------------------------------------------------------
+  # ee: session exchange (RFC-006 §5.3) — how a browser holds a
+  # credential; no upstream equivalent
+  # ---------------------------------------------------------------------
+  /session:
+    post:
+      operationId: createSession
+      summary: Exchange an API key for a session cookie
+      description: >
+        Terminates. Not a Raft write: the server verifies the key, then
+        mints an HMAC-signed `{principal_id, issued_at, expiry}` token
+        under the fleet's session-signing key (a control-plane record
+        every node verifies from its own applied state) and returns it as
+        an `HttpOnly` cookie — this is the one moment the long-lived API
+        key transits the page (RFC-006 §9.3), so it belongs in component
+        state only, never `localStorage` and never a URL, and should be
+        dropped as soon as this call returns.
+
+        The cookie proves authentication only. Every later request still
+        resolves the principal's bindings from applied state, so
+        disabling the principal or deleting a binding cuts a live session
+        immediately, with the same committed-or-not semantics a bearer
+        gets. There is no server-side session table and, deliberately,
+        **no per-session revocation in v1** — the documented bounds are
+        the 8-hour `Max-Age`, session-signing-key rotation (invalidates
+        every outstanding session at once), and disabling the principal.
+        This is a stated limit, not a gap.
+      tags: [session]
+      x-rift-origin: ee
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionCreate'
+      responses:
+        '200':
+          description: Session established; body is empty.
+          headers:
+            Set-Cookie:
+              description: >
+                `rift_session=<token>; HttpOnly; Secure; SameSite=Strict;
+                Max-Age=28800; Path=/`. `HttpOnly` means no script on the
+                page — injected or legitimate — can read the token or the
+                key it replaced; `Secure` confines it to TLS;
+                `SameSite=Strict` is this cookie's first CSRF defense,
+                backstopped by the `X-Rift-CSRF` header (`CsrfHeader`) on
+                cookie-authenticated mutations; `Max-Age=28800` (8 hours)
+                is the TTL bound noted in this operation's description.
+              schema:
+                type: string
+                example: 'rift_session=<token>; HttpOnly; Secure; SameSite=Strict; Max-Age=28800; Path=/'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          description: The given API key does not verify.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    delete:
+      operationId: deleteSession
+      summary: Clear the session cookie
+      description: >
+        Terminates. Acts on the cookie the caller already holds, so it is
+        exempt from `apiKeyAuth` the same way `createSession` is — there
+        is no credential to check before clearing a cookie. Not a Raft
+        write and not audited as a principal action: the server only ever
+        mints this cookie at `POST /session`, never adopts a
+        client-presented one, so there is no session-fixation case to
+        guard against here.
+      tags: [session]
+      x-rift-origin: ee
+      security: []
+      responses:
+        '204':
+          description: Session cookie cleared; no body.
+          headers:
+            Set-Cookie:
+              description: >
+                `rift_session=; Max-Age=0; Path=/` — the browser drops the
+                cookie immediately on receipt.
+              schema:
+                type: string
+                example: 'rift_session=; Max-Age=0; Path=/'
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -2486,6 +2738,39 @@ components:
       description: A correlated-isolation space's flow id.
       schema:
         type: string
+    OpId:
+      name: opId
+      in: path
+      required: true
+      description: >
+        An op id, as minted for a terminated write (`Rift-Cluster-Op-Id`)
+        or an `AcceptedParked` `202`'s body. A malformed id names no op
+        the same way an unknown one does — both answer `404`, not `400`,
+        so a probe cannot tell "badly formed" from "never existed".
+      schema:
+        type: string
+        example: 8f14e45f-ceea-467e-bd3a-fce2f5c3f1e0
+    CsrfHeader:
+      name: X-Rift-CSRF
+      in: header
+      required: false
+      description: >
+        RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated
+        state-changing request (anything that would mutate state, sent
+        with the `rift_session` cookie rather than an `Authorization`
+        bearer) that omits this header is refused with `403`, checked
+        before authorization runs. Send any non-empty value —
+        `SameSite=Strict` already stops the cookie riding cross-site, so
+        this header exists only to defeat the narrower case (a
+        same-site-adjacent or misconfigured-CORS request) by requiring a
+        custom header cross-origin HTML cannot attach without a preflight.
+        Bearer-authenticated requests are exempt: a bearer cannot be
+        attached to a request by a victim's browser in the first place,
+        which is the entire attack this header defends against — so
+        requiring it there would add friction without closing a real hole.
+      schema:
+        type: string
+        example: '1'
 
   headers:
     RiftClusterRevision:
@@ -2534,9 +2819,14 @@ components:
             $ref: '#/components/schemas/Error'
     Forbidden:
       description: >
-        Authenticated, but the caller's role does not grant the action
-        within a tenant they ARE bound to (distinct from the RFC-002 §8.4
-        404 used for cross-tenant/unbound-tenant probes).
+        Authenticated, but denied for one of two reasons that share this
+        status: (1) the caller's role does not grant the action within a
+        tenant they ARE bound to (distinct from the RFC-002 §8.4 404 used
+        for cross-tenant/unbound-tenant probes), or (2) a
+        cookie-authenticated mutation omitted the required `X-Rift-CSRF`
+        header (see `CsrfHeader`) — checked before authorization runs, so
+        it can fire even on a route whose role-insufficient case answers
+        404 instead of 403 (e.g. `createTenant`).
       content:
         application/json:
           schema:
@@ -2947,3 +3237,112 @@ components:
         authorizationDisabled:
           type: boolean
           description: True when the fleet enforces nothing at all (distinct from an authenticated principal with zero bindings).
+
+    FleetMembers:
+      type: object
+      description: >
+        This node's view of raft membership — the `/_fleet/members`
+        read-only admin-port projection (RFC-006 §5.2) of
+        `cluster_api.rs`'s `members_body`, byte-identical to
+        `/_cluster/members` on the cluster port. One builder, two ports,
+        so the two cannot drift.
+      required: [node_id, is_leader, current_leader, last_applied, voters]
+      properties:
+        node_id:
+          type: integer
+          format: int64
+          description: This node's raft id.
+        is_leader:
+          type: boolean
+          description: Whether this node is currently the raft leader.
+        current_leader:
+          type: integer
+          format: int64
+          nullable: true
+          description: The current leader's node id, if one is known to this node.
+        last_applied:
+          type: integer
+          format: int64
+          nullable: true
+          description: Index of the last log entry applied to this node's state machine.
+        voters:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: Voter node ids in the currently effective membership.
+
+    FleetHealth:
+      type: object
+      description: >
+        This node's readiness plus its ring view — the `/_fleet/health`
+        read-only admin-port projection (RFC-006 §5.2) of
+        `cluster_api.rs`'s `health_body`.
+      required: [ready, state, pending_gates, isolated, ring]
+      properties:
+        ready:
+          type: boolean
+          description: Whether a load balancer should route to this node.
+        state:
+          type: string
+          enum: [ready, not-ready, draining]
+          description: >
+            `draining` means a graceful leave has begun and the node is
+            finishing in-flight work.
+        pending_gates:
+          type: array
+          items:
+            type: string
+          description: >
+            Startup gates this node has not yet satisfied (e.g.
+            `cluster-joined`, `cluster-reconciled`); empty once `ready`.
+        isolated:
+          type: boolean
+          description: Whether this node currently sees itself as network-isolated from the rest of the fleet.
+        ring:
+          type: object
+          required: [m_idx, members]
+          properties:
+            m_idx:
+              type: integer
+              format: int64
+              description: The ownership ring's membership-epoch index.
+            members:
+              type: array
+              items:
+                type: integer
+                format: int64
+              description: Node ids currently in the ownership ring, in ring order.
+
+    FleetOpStatus:
+      type: object
+      description: >
+        The `/_fleet/ops/{opId}` read-only admin-port projection (RFC-006
+        §5.2) of `cluster_api.rs`'s `op_body` — the poll target for a
+        `202`-parked or async-committed write's op id.
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [applied, failed, pending]
+        revision:
+          type: integer
+          format: int64
+          description: >
+            The applying log index. Present for `applied` and `failed`;
+            absent for `pending`, which has not applied yet.
+        detail:
+          type: string
+          description: The failure reason. Present only when `state` is `failed`.
+
+    SessionCreate:
+      type: object
+      required: [apiKey]
+      description: The `POST /session` request body.
+      properties:
+        apiKey:
+          type: string
+          description: >
+            The admin API key, or a minted principal's API key — the same
+            credential `apiKeyAuth` accepts as a bearer, exchanged here
+            once for a session cookie instead of sent on every request.

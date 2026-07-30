@@ -30,11 +30,12 @@
 //! - a **new upstream route** arriving in a submodule bump — layer 3 is a declared table, so this
 //!   needs a human;
 //! - a **new read served directly from `handle`** — it never reaches `classify`, so it would be
-//!   absent from `HANDLE_DIRECT_ROUTES` *and* from the contract, and the parity comparison would
-//!   stay green comparing two sets that are each missing it. RFC-006 §7's planned
-//!   `GET /console` arm is exactly this shape. Where the future reads are already known — C2's, see
-//!   [`crate::openapi::C2_PENDING_ROUTES`] — the served side is pinned by probing the live surface
-//!   over HTTP instead, which is the only mechanism that catches this class.
+//!   absent from [`HANDLE_DIRECT_ROUTES`] *and* from the contract, and the parity comparison would
+//!   stay green comparing two sets that are each missing it. RFC-006 §7's planned `GET /console`
+//!   arm is exactly this shape. The *declared* half of that list is pinned by probing the live
+//!   surface over HTTP (`tests/openapi.rs::every_direct_route_is_actually_served`), which is the
+//!   only mechanism that catches a route being declared-but-unserved; catching the reverse —
+//!   served-but-undeclared — remains a human step.
 
 use std::sync::OnceLock;
 
@@ -72,26 +73,31 @@ pub(crate) fn contract_json() -> Result<Vec<u8>, &'static str> {
         .map_err(|_| "embedded openapi contract parsed but could not be rendered as JSON")
 }
 
-/// The RFC-006 §5.2 surface C2 (#185) adds: the read-only fleet projection and the session
-/// exchange.
+/// Routes the front terminates in `handle` **before** `classify` ever sees them, because `classify`
+/// is the *write* classifier: these are reads, plus the session exchange, which authenticates rather
+/// than mutating replicated config. None of them acquires a `Terminated` variant.
 ///
-/// A **known-pending set**, guarded from both sides so C2 cannot land these routes undocumented:
+/// **This is a weak layer, and it is the weakest one in the gate.** Being hand-maintained, the
+/// parity comparison only ever checks it in the documented→routable direction — and even that is
+/// tautological, because `is_terminated_here` short-circuits on this very constant before it would
+/// call `classify`, so for these entries the assertion is the constant checking itself. A read arm
+/// added to `handle` and forgotten here is absent from both this list and the contract, so parity
+/// stays green while the route runs undocumented. There is no compile-time tripwire for this shape:
+/// a directly-served read has no variant to hang one on.
 ///
-/// - `c2_fleet_surface_is_tracked_as_pending` (unit) asserts they are absent from the contract;
-/// - `c2_pending_routes_are_not_served_yet` (integration) asserts the running front does not
-///   answer them.
+/// What closes it is probing the **live surface** over HTTP:
+/// `tests/openapi.rs::every_direct_route_is_actually_served` asserts every entry here is really
+/// answered by a running node, which is what catches an arm deleted from `handle` while the contract
+/// still publishes it. Adding a route to `handle` still means adding it here *and* to the contract
+/// by hand — that half remains a human step, stated rather than pretended away.
 ///
-/// The second guard is the one that matters, and it exists because the first is not sufficient on
-/// its own. These are **reads**, and a read served directly from `handle` never reaches `classify`,
-/// so it acquires no `Terminated` variant and trips no compile-time tripwire — it would simply be
-/// absent from `HANDLE_DIRECT_ROUTES`, absent from the contract, and therefore invisible to the
-/// parity comparison, which would stay green while the route ran undocumented in production.
-/// Probing the live surface is what closes that: the moment C2 serves one of these, the
-/// integration test goes red and C2 must publish it and delete this constant in the same PR.
-///
-/// Public so the integration test can reach it — a unit test and an integration test are separate
-/// compilation units, and duplicating the list is exactly how the two halves would drift.
-pub const C2_PENDING_ROUTES: [(&str, &str); 5] = [
+/// Public so that integration test can reach it; a duplicated list is exactly how the two halves
+/// would drift.
+pub const HANDLE_DIRECT_ROUTES: [(&str, &str); 8] = [
+    ("GET", "/front-door/routes"),
+    ("GET", "/admin/whoami"),
+    ("GET", "/openapi.json"),
+    // C2 (#185): the read-only fleet projection and the session exchange.
     ("GET", "/_fleet/members"),
     ("GET", "/_fleet/health"),
     ("GET", "/_fleet/ops/{opId}"),
@@ -322,31 +328,7 @@ mod parity {
         }
     }
 
-    /// Routes the front terminates in `handle` **before** `classify` ever sees them, because they are
-    /// reads and `classify` is the write classifier. They have no `Terminated` variant, so they are
-    /// declared.
-    ///
-    /// Note `every_published_ee_path_is_routable` does **not** meaningfully pin these three:
-    /// `is_terminated_here` short-circuits on this very constant before it ever calls `classify`,
-    /// so for these entries the assertion is the constant checking itself. Deleting the
-    /// `/admin/whoami` arm from `handle` would leave the contract publishing it with every test
-    /// green. `GET /openapi.json` is covered in practice by `tests/openapi.rs` driving it over real
-    /// HTTP; the other two are not.
-    ///
-    /// **This is a weak layer, for the same reason the upstream table is.** Being hand-maintained,
-    /// it is only checked in the documented→routable direction: a new read arm added to `handle`
-    /// and forgotten here is absent from both this list and the contract, so the parity comparison
-    /// never sees it and stays green while the route runs undocumented. There is no compile-time
-    /// tripwire for this shape, because a directly-served read acquires no `Terminated` variant to
-    /// hang one on. Adding a read arm to `handle` therefore means adding it here *and* to the
-    /// contract, by hand. Where a specific set of future reads is already known — C2's, see
-    /// [`crate::openapi::C2_PENDING_ROUTES`] — the served side is pinned by probing the live
-    /// surface instead, which is the only mechanism that catches this class.
-    const HANDLE_DIRECT_ROUTES: [(&str, &str); 3] = [
-        ("GET", "/front-door/routes"),
-        ("GET", "/admin/whoami"),
-        ("GET", "/openapi.json"),
-    ];
+    pub(crate) use super::HANDLE_DIRECT_ROUTES;
 
     /// One representative of every [`Terminated`] variant.
     ///
@@ -466,7 +448,9 @@ mod parity {
             .replace("{principalId}", "p-1")
             .replace("{scenarioName}", "checkout")
             .replace("{flowId}", "flow-1")
-            .replace("{opId}", "op-1")
+            // A real UUID: `/_fleet/ops/{opId}` parses the segment, and a malformed id names no op at
+            // all, so a placeholder like "op-1" would probe a different code path than the live route.
+            .replace("{opId}", "0189dcf0-0454-4e0b-a10c-8a8f8dccce1f")
             .replace("{key}", "k")
     }
 
@@ -475,9 +459,12 @@ mod parity {
     /// Both halves matter: `classify` is the write classifier, and `handle` answers a few reads before
     /// it. Checking only the former would report `GET /front-door/routes` as proxied, which it is not.
     pub(crate) fn is_terminated_here(method: &str, path: &str) -> bool {
+        // Compared against each entry's *sampled* form, not the raw template. Callers pass a
+        // concrete path, and `/_fleet/ops/{opId}` is the first direct route carrying a placeholder —
+        // matching the template verbatim silently missed it and reported a served route as proxied.
         if HANDLE_DIRECT_ROUTES
             .iter()
-            .any(|(m, p)| *m == method && *p == path)
+            .any(|(m, p)| *m == method && sample_path(p) == path)
         {
             return true;
         }
@@ -752,27 +739,6 @@ mod tests {
             assert!(
                 response_headers.contains_key(header),
                 "components.headers.{header} is missing"
-            );
-        }
-    }
-
-    /// AC6: C2's §5.2 surface is tracked as a known-pending set.
-    ///
-    /// Asserts the routes are *absent* today. When C2 (#185) serves them, this test is what makes
-    /// "the contract already covers it" a precondition of that PR rather than an afterthought: C2
-    /// deletes `C2_PENDING_ROUTES` and publishes the operations in the same change.
-    #[test]
-    fn c2_fleet_surface_is_tracked_as_pending() {
-        let documented = contract_routes(parsed()).all();
-        for (method, path) in C2_PENDING_ROUTES {
-            let key = RouteKey {
-                path: path.to_owned(),
-                method: method.to_owned(),
-            };
-            assert!(
-                !documented.contains(&key),
-                "{key} is published, so C2 has landed — delete C2_PENDING_ROUTES and drop this \
-                 test in the same PR that serves it"
             );
         }
     }

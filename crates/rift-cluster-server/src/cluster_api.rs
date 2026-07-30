@@ -84,47 +84,22 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
                         path: format!("/_cluster/ops/{id}"),
                     });
                 };
-                let value = match node.read_op(&op_id).map_err(handler_error)? {
-                    Some(response) => match response.outcome {
-                        rift_cluster::ControlOutcome::Applied => serde_json::json!({
-                            "state": "applied",
-                            "revision": response.revision,
-                        }),
-                        rift_cluster::ControlOutcome::Failed { reason } => serde_json::json!({
-                            "state": "failed",
-                            "revision": response.revision,
-                            "detail": reason,
-                        }),
-                    },
-                    None if node.intent_parked(&op_id).map_err(handler_error)? => {
-                        serde_json::json!({ "state": "pending" })
-                    }
+                match op_body(&node, &op_id)? {
+                    Some(value) => serde_json::to_vec(&value).map_err(handler_error),
                     // Unknown ids and ops whose dedup window has lapsed are
                     // indistinguishable; both answer 404.
-                    None => {
-                        return Err(RpcError::UnknownRoute {
-                            method: "GET".to_owned(),
-                            path: format!("/_cluster/ops/{id}"),
-                        });
-                    }
-                };
-                serde_json::to_vec(&value).map_err(handler_error)
+                    None => Err(RpcError::UnknownRoute {
+                        method: "GET".to_owned(),
+                        path: format!("/_cluster/ops/{id}"),
+                    }),
+                }
             })
         }),
     )
     .route(
         "GET",
         "/_cluster/members",
-        json_handler(move || {
-            let status = members.node()?.status();
-            Ok(serde_json::json!({
-                "node_id": status.node_id,
-                "is_leader": status.is_leader,
-                "current_leader": status.current_leader,
-                "last_applied": status.last_applied,
-                "voters": status.voters,
-            }))
-        }),
+        json_handler(move || Ok(members_body(members.node()?.as_ref()))),
     )
     .route(
         "GET",
@@ -233,21 +208,71 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
     .route(
         "GET",
         "/_cluster/health",
-        json_handler(move || {
-            let node = health.node()?;
-            let ring = node.ring();
-            Ok(serde_json::json!({
-                "ready": readiness.state().is_ready(),
-                "state": readiness.state().as_str(),
-                "pending_gates": readiness.pending(),
-                "isolated": node.is_isolated(),
-                "ring": {
-                    "m_idx": ring.m_idx(),
-                    "members": ring.members(),
-                },
-            }))
-        }),
+        json_handler(move || Ok(health_body(health.node()?.as_ref(), &readiness))),
     )
+}
+
+/// Build the `/_cluster/members` body: this node's view of raft membership.
+///
+/// Shared with the `/_fleet/members` admin-port projection ([`crate::fleet`],
+/// RFC-006 §5.2) so the two ports answer from one code path rather than two
+/// implementations that a test has to keep honest — one implementation
+/// called twice cannot diverge.
+pub(crate) fn members_body(node: &RaftNode) -> serde_json::Value {
+    let status = node.status();
+    serde_json::json!({
+        "node_id": status.node_id,
+        "is_leader": status.is_leader,
+        "current_leader": status.current_leader,
+        "last_applied": status.last_applied,
+        "voters": status.voters,
+    })
+}
+
+/// Build the `/_cluster/health` body: readiness plus this node's ring view.
+///
+/// Shared with `/_fleet/health` for the same reason as [`members_body`].
+pub(crate) fn health_body(node: &RaftNode, readiness: &Readiness) -> serde_json::Value {
+    let ring = node.ring();
+    serde_json::json!({
+        "ready": readiness.state().is_ready(),
+        "state": readiness.state().as_str(),
+        "pending_gates": readiness.pending(),
+        "isolated": node.is_isolated(),
+        "ring": {
+            "m_idx": ring.m_idx(),
+            "members": ring.members(),
+        },
+    })
+}
+
+/// Build the `/_cluster/ops/:id` body for a well-formed op id.
+///
+/// `Ok(None)` means the id names no op — unknown ids and ops whose dedup
+/// window has lapsed are indistinguishable, and both are the caller's 404.
+/// Shared with `/_fleet/ops/:id` for the same reason as [`members_body`].
+pub(crate) fn op_body(
+    node: &RaftNode,
+    op_id: &uuid::Uuid,
+) -> Result<Option<serde_json::Value>, RpcError> {
+    let value = match node.read_op(op_id).map_err(handler_error)? {
+        Some(response) => match response.outcome {
+            rift_cluster::ControlOutcome::Applied => serde_json::json!({
+                "state": "applied",
+                "revision": response.revision,
+            }),
+            rift_cluster::ControlOutcome::Failed { reason } => serde_json::json!({
+                "state": "failed",
+                "revision": response.revision,
+                "detail": reason,
+            }),
+        },
+        None if node.intent_parked(op_id).map_err(handler_error)? => {
+            serde_json::json!({ "state": "pending" })
+        }
+        None => return Ok(None),
+    };
+    Ok(Some(value))
 }
 
 /// Report a node-side failure as a handler error. The node's own error types

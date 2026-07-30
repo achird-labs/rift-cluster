@@ -33,7 +33,7 @@ use super::ring::Ring;
 use super::store::{self, RedbStateMachine, SourceRecord};
 use super::{NodeId, TypeConfig};
 use crate::control::{
-    AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, Principal, Role,
+    AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, Principal, Role, SessionKey,
     SourceProvenance, Tenant, TenantId,
 };
 use crate::rpc::{
@@ -1341,6 +1341,17 @@ impl RaftNode {
     pub fn audit_sink(&self) -> Result<Option<AuditSink>, NodeError> {
         self.sm_reader
             .audit_sink()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The fleet's session-signing key, or `None` when no console login has minted one yet
+    /// (RFC-006 §5.3, issue #185).
+    ///
+    /// # Errors
+    /// Storage I/O, or a stored key record that will not parse.
+    pub fn session_key(&self) -> Result<Option<SessionKey>, NodeError> {
+        self.sm_reader
+            .session_key()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 

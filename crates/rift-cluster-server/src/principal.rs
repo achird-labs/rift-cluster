@@ -33,6 +33,16 @@ pub(crate) struct Resolved {
 /// request apart from a real principal's.
 const LEGACY_PRINCIPAL_ID: &str = "legacy:api-key";
 
+/// Whether a resolved identity is the legacy `--api-key`'s synthetic one rather than a stored
+/// principal.
+///
+/// Anything that needs to *re-resolve* an identity later — a console session is the first such
+/// thing (issue #185) — has to know the difference, because there is no row to re-read.
+#[must_use]
+pub(crate) fn is_legacy_identity(principal_id: &str) -> bool {
+    principal_id == LEGACY_PRINCIPAL_ID
+}
+
 /// Resolve `credential` (the raw `Authorization` header value, verbatim) to a
 /// principal's bindings.
 ///
@@ -56,6 +66,28 @@ pub(crate) fn resolve_bindings(
     let Some(presented) = credential else {
         return Ok(None);
     };
+
+    // A session token presented as the credential (RFC-006 §5.3, issue #185).
+    //
+    // Checked first, and cheaply: only a `v1.`-prefixed value can be one, so no existing API key
+    // reaches the verifier and the bearer path stays byte-identical for every credential that
+    // worked before.
+    //
+    // This branch is what makes a console session work for anything beyond the routes `admin_front`
+    // terminates itself. A cookie-authenticated request carries no `Authorization` header, but the
+    // internal re-read and the proxy leg both re-authorize through this function via
+    // `crate::authorizer` — whose `AuthzRequest` exposes only the `Authorization` value and lives in
+    // the vendored submodule, so it cannot be taught to read a cookie. `admin_front` therefore
+    // presents the session token itself on those legs, and this is where it resolves. Without it a
+    // console could log in and read `/admin/whoami`, then have every imposter write **commit** and
+    // still answer `403` when the render re-read was refused.
+    if presented.starts_with(crate::session::TOKEN_PREFIX)
+        && let Some(key) = node.session_key()?
+        && let Ok(principal_id) =
+            crate::session::verify(&key, presented, crate::session::now_secs())
+    {
+        return resolve_stored_principal(node, principal_id);
+    }
 
     if let Some(expected) = api_key
         && bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
@@ -92,6 +124,29 @@ pub(crate) fn resolve_bindings(
     let bindings = node.principal_bindings(principal_id.as_str())?;
     Ok(Some(Resolved {
         principal_id: principal_id.as_str().to_owned(),
+        bindings,
+    }))
+}
+
+/// Load an already-identified principal and its current bindings.
+///
+/// Split out so the session path resolves a principal exactly the way the bearer path does — the
+/// disabled check included. A session that outlived its principal being disabled must resolve to
+/// nothing, and bindings are read fresh on every call, with no cache: that is what makes revocation
+/// land immediately rather than at the end of the cookie's TTL.
+pub(crate) fn resolve_stored_principal(
+    node: &RaftNode,
+    principal_id: String,
+) -> Result<Option<Resolved>, NodeError> {
+    let Some(stored) = node.principal(principal_id.as_str())? else {
+        return Ok(None);
+    };
+    if stored.disabled {
+        return Ok(None);
+    }
+    let bindings = node.principal_bindings(principal_id.as_str())?;
+    Ok(Some(Resolved {
+        principal_id,
         bindings,
     }))
 }
