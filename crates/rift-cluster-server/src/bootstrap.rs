@@ -639,8 +639,14 @@ mod tests {
                 .expect("runtime");
             rt.block_on(async move {
                 let composed = crate::compose::start(
-                    EeCli::try_parse_from(["rift-cluster-server", "--port", "0", "--host", "127.0.0.1"])
-                        .expect("parses"),
+                    EeCli::try_parse_from([
+                        "rift-cluster-server",
+                        "--port",
+                        "0",
+                        "--host",
+                        "127.0.0.1",
+                    ])
+                    .expect("parses"),
                 )
                 .await
                 .expect("un-clustered server starts");

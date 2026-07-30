@@ -337,8 +337,8 @@ mod tests {
 
     #[test]
     fn state_dir_follows_the_datadir_by_default() {
-        let cli =
-            EeCli::try_parse_from(["rift-cluster-server", "--datadir", "/srv/rift"]).expect("parses");
+        let cli = EeCli::try_parse_from(["rift-cluster-server", "--datadir", "/srv/rift"])
+            .expect("parses");
         assert_eq!(cli.cluster_state_dir(), PathBuf::from("/srv/rift/_cluster"));
 
         let explicit = EeCli::try_parse_from([
@@ -365,8 +365,8 @@ mod tests {
     #[test]
     fn per_core_is_detected_however_it_is_spelled() {
         for spelling in ["per-core", "per-core=4", " per-core"] {
-            let cli =
-                EeCli::try_parse_from(["rift-cluster-server", "--runtime", spelling]).expect("parses");
+            let cli = EeCli::try_parse_from(["rift-cluster-server", "--runtime", spelling])
+                .expect("parses");
             assert_eq!(
                 cli.runtime_topology(),
                 RuntimeTopology::PerCore,

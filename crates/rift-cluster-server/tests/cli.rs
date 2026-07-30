@@ -94,7 +94,12 @@ fn without_the_master_switch_nothing_cluster_related_is_required() {
 
 #[test]
 fn cluster_without_bind_is_refused() {
-    let cli = parse(&["rift-cluster-server", "--cluster", "--cluster-secret", "s3cret"]);
+    let cli = parse(&[
+        "rift-cluster-server",
+        "--cluster",
+        "--cluster-secret",
+        "s3cret",
+    ]);
     assert_eq!(
         cli.resolve_cluster().expect_err("refused"),
         ConfigError::BindRequired
@@ -228,7 +233,10 @@ fn an_explicitly_insecure_cluster_is_allowed_but_marked() {
 #[test]
 fn version_reports_the_edition_and_the_embedded_upstream_rift() {
     let rendered = EeCli::command().render_version();
-    assert!(rendered.contains(rift_cluster_base::version()), "{rendered}");
+    assert!(
+        rendered.contains(rift_cluster_base::version()),
+        "{rendered}"
+    );
     assert!(rendered.contains("cluster"), "{rendered}");
     assert!(
         rendered.contains(rift_cluster_base::UPSTREAM_VERSION),

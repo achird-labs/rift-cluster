@@ -1061,8 +1061,9 @@ impl rift_cluster_base::seams::ImposterSource for CountingSource {
         _r: &'a rift_cluster_base::seams::SourceRef,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = anyhow::Result<rift_cluster_base::seams::FetchedImposters>>
-                + Send
+            dyn std::future::Future<
+                    Output = anyhow::Result<rift_cluster_base::seams::FetchedImposters>,
+                > + Send
                 + 'a,
         >,
     > {
@@ -1459,8 +1460,9 @@ impl rift_cluster::sources::CredentialedSource for CountingCredentialedSource {
         _auth_ref: Option<&'a str>,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = anyhow::Result<rift_cluster_base::seams::FetchedImposters>>
-                + Send
+            dyn std::future::Future<
+                    Output = anyhow::Result<rift_cluster_base::seams::FetchedImposters>,
+                > + Send
                 + 'a,
         >,
     > {
@@ -1500,8 +1502,9 @@ async fn a_credentialed_source_short_circuits_on_unchanged_content() {
         body: std::sync::Mutex::new(vec![source_config(9504, "cred-static")]),
         version: std::sync::Mutex::new("v1".to_owned()),
     });
-    let mut providers =
-        rift_cluster::sources::SourceProviders::new(rift_cluster_base::seams::SourceRegistry::new());
+    let mut providers = rift_cluster::sources::SourceProviders::new(
+        rift_cluster_base::seams::SourceRegistry::new(),
+    );
     providers
         .register_credentialed(source as Arc<dyn rift_cluster::sources::CredentialedSource>)
         .expect("register the credentialed counting source");
