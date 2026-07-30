@@ -1,0 +1,27 @@
+[package]
+name = "rift-cluster-base"
+description = "Rift cluster facade — re-exports the Rift core crates and its extension seams for the clustering layer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rift-mock-core.workspace = true
+rift-types.workspace = true
+rift-http-proxy.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Seam tests only. The facade itself carries no serialization of its own — it
+# re-exports upstream's types — but asserting that a seam still *behaves* (not
+# merely that it resolves) means driving it with real JSON.
+serde_json.workspace = true
+# `classify` takes an `&http::Method`, so exercising the route-classification
+# seam for real (rather than only naming its types) needs one here. Dev-only:
+# the facade itself takes no HTTP dependency.
+hyper.workspace = true

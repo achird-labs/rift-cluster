@@ -1,6 +1,6 @@
 # The "no nginx" demo (issue #132 / #19's U-11): Rift's front door standing in
 # for a reverse-proxy sidecar whose only job was host-based routing to two
-# backends. One `rift-ee-server`, one exposed port, two virtual services --
+# backends. One `rift-cluster-server`, one exposed port, two virtual services --
 # `payments.test` and `search.test` -- distinguished purely by the `Host`
 # header a request arrives with. Nothing outside this container routes
 # between them.
@@ -42,7 +42,7 @@ services:
       - "8080:8080"   # front door -- payments.test and search.test both live here
       - "2525:2525"   # admin API
     healthcheck:
-      test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
+      test: ["CMD", "rift-cluster-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
       interval: 5s
       timeout: 3s
       retries: 5

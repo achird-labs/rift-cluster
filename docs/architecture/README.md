@@ -1,6 +1,6 @@
 # Distributed Rift — The Architecture Guide
 
-This is the definitive guide to the design of **Rift Enterprise's distributed
+This is the definitive guide to the design of **RiftCluster's distributed
 edition**: a fleet of active-active Rift nodes behind a load balancer that share
 one imposter set, keep stateful mocking features correct when a test's requests
 are sprayed across nodes, survive full-cluster restarts without losing
@@ -40,7 +40,7 @@ If you read only three chapters, read **1 (Overview)**, **4 (Write Path)**, and
 | 8 | [Multi-Tenancy & Security](08-tenancy-security.md) | Tenants, roles, audit, cluster-internal auth |
 | 9 | [Durability & Failure](09-durability-failure.md) | What survives what: the restart matrix and partition behavior |
 | 10 | [Operations](10-operations.md) | Deployment, probes, metrics, runbooks, rolling upgrades, sizing |
-| 11 | [The Open-Core Boundary](11-open-core.md) | What lives upstream, what stays enterprise, and how Cargo enforces it |
+| 11 | [The Open-Core Boundary](11-open-core.md) | What lives upstream, what stays cluster, and how Cargo enforces it |
 | 12 | [Testing & Correctness](12-testing.md) | The harness, chaos scenarios, and phase exit criteria |
 | 13 | [The Front Door & Imposter Sources](13-front-door-and-sources.md) | Single-port content routing; pulling mocks from Git/S3/registries, cluster-correctly |
 | 14 | [Deploying on AWS](14-cloud-deployment.md) | EKS reference deployment, ECS/Fargate caveats, EC2, cost & checklist |

@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | **Status** | v1 — design complete, implementation-ready; ships as **Phase T**, parallel to RFC-001 Phases 2–3 |
-| **Tracking issue** | [achird-labs/rift-enterprise#17](https://github.com/achird-labs/rift-enterprise/issues/17) |
-| **Canonical location** | `rift-enterprise:docs/rfc/RFC-002-multi-tenancy-and-rbac.md` |
+| **Tracking issue** | [achird-labs/rift-cluster#17](https://github.com/achird-labs/rift-cluster/issues/17) |
+| **Canonical location** | `rift-cluster:docs/rfc/RFC-002-multi-tenancy-and-rbac.md` |
 | **Depends on** | **ADR-001** (Raft control plane) and **#14** — the state machine this RFC's records live in. Nothing here works on an eventually-consistent store; see §3.1 |
 | **Ground truth** | Verified absent at `919495e`; upstream citations resolve against `vendor/rift` @ v0.16.0 |
 | **Author** | Mohsen Zainalpour |
@@ -14,7 +14,7 @@
 
 ## 1. Summary
 
-Rift Enterprise today has exactly one admin credential: a global bearer token
+RiftCluster today has exactly one admin credential: a global bearer token
 compared against a single string. There is no principal, no role, and no tenant
 anywhere in the system. That is adequate for one team running one fleet, and
 inadequate for the moment two teams share one.
@@ -136,7 +136,7 @@ leader cannot change authorization, and that is deliberate.
 
 ### 3.2 Tenant ↔ resources
 
-`ImposterConfig` gains `tenant: Option<TenantId>` **enterprise-side only**. It is
+`ImposterConfig` gains `tenant: Option<TenantId>` **cluster-side only**. It is
 stored on the control-plane record — the state machine keys configs by
 `(tenant, port)` — and injected or stripped at the API boundary. The
 open-source config schema is untouched and upstream never learns the field. This
@@ -272,7 +272,7 @@ Quotas bound **object counts, not compute** (§7).
 
 ## 5. Admin API surface
 
-Enterprise routes, on the same admin port:
+Cluster routes, on the same admin port:
 
 ```
 POST/GET         /admin/tenants                      FleetAdmin
@@ -351,7 +351,7 @@ wait for it. `AuthzDecision::Deny` on an unauthenticated request still renders
 
 `action` is a **stable string rather than an enum** deliberately: an enum would
 force every embedder's action set to be upstream's, and upstream has no business
-knowing that enterprise has a `TenantManage`. Strings let the hook be extended
+knowing that cluster has a `TenantManage`. Strings let the hook be extended
 without an upstream release.
 
 **Why `scope` and `params` exist — the hook is useless without them.** An earlier
@@ -366,7 +366,7 @@ matrix requires are unmakeable from that:
   from one acting on B, so the hook would authorize the *action* while being blind
   to the *object*.
 
-`scope` carries the enterprise `X-Rift-Tenant` value and `params` carries the
+`scope` carries the cluster `X-Rift-Tenant` value and `params` carries the
 already-parsed route parameters. Both stay tenant-vocabulary-free upstream: they
 are an opaque string and a `&[(&str, &str)]`, and upstream never interprets either.
 
@@ -530,7 +530,7 @@ It depends only on Phase 1's control plane (#14), which is merged.
 | Slice | Contents | Exit criteria |
 |---|---|---|
 | **T1 — model + storage** | `ControlOp` variants, state-machine tables, `TenantId` on the config record, migration to `default` | A pre-tenancy state dir opens, every imposter reads back under `default`, legacy key still administers it |
-| **T2 — U-9 + enforcement** | Upstream U-9 lands; enterprise authorizer; all four enforcement points of §4.3 | Every action in §4.1 is denied to a principal without the role, at every point; `/__rift/` provably unaffected |
+| **T2 — U-9 + enforcement** | Upstream U-9 lands; cluster authorizer; all four enforcement points of §4.3 | Every action in §4.1 is denied to a principal without the role, at every point; `/__rift/` provably unaffected |
 | **T3 — admin surface** | §5 routes, argon2id key issuance, `whoami` | Key returned once and never again; cross-tenant probe answers 404 (§8.4) |
 | **T4 — quotas + audit** | Leader-side quota validation; U-10; audit table, retention, `GET /admin/audit` | Quota refusal is a committed decision, identical on every node; every write in a session appears exactly once in the audit stream |
 | **v2 (separate RFC)** | OIDC and mTLS `AuthSource` variants | — |
@@ -576,7 +576,7 @@ to ask, settled in the same place:
 
 ## Appendix A — what this RFC does not change
 
-- The OSS config schema. `tenant` is enterprise-side, injected and stripped at
+- The OSS config schema. `tenant` is cluster-side, injected and stripped at
   the API boundary (§3.2).
 - The data plane, in any respect (§7).
 - `--api-key`, for one release (§3.4).

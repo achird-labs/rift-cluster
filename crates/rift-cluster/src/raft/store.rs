@@ -69,7 +69,7 @@ use openraft::{
 };
 use parking_lot::Mutex;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDefinition};
-use rift_ee::seams::{
+use rift_cluster_base::seams::{
     ApplyReport, CompiledRoutes, ImposterConfig, ImposterError, ImposterManager, Route, RouteTable,
 };
 use serde::{Deserialize, Serialize};
@@ -803,7 +803,7 @@ pub struct RedbStateMachine {
     /// their audit tables would diverge, which is exactly the property the
     /// replicated clock exists to protect. It is node configuration rather than
     /// replicated state because it is an operator's storage-budget decision,
-    /// not a tenant's; `docs/rift-ee-server.md` says so where the flag is
+    /// not a tenant's; `docs/rift-cluster-server.md` says so where the flag is
     /// documented.
     audit_retention_secs: u64,
 }
@@ -3155,7 +3155,7 @@ impl RedbStateMachine {
             // whichever one happened to be first would be worse than the `None`
             // it replaces: wrong attribution in an audit-adjacent stream is not
             // a smaller error than missing attribution.
-            rift_ee::seams::with_principal_scope(principal, async {
+            rift_cluster_base::seams::with_principal_scope(principal, async {
                 self.drive_one(action).await;
             })
             .await;
@@ -4026,7 +4026,7 @@ mod tests {
         CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder, StorageError,
     };
     use redb::{ReadableDatabase, ReadableTable};
-    use rift_ee::seams::{
+    use rift_cluster_base::seams::{
         CompiledRoutes, ImposterConfig, ImposterManager, Route, RouteMatch, RouteTable, RouteTarget,
     };
     use serde_json::json;
@@ -6566,7 +6566,7 @@ mod tests {
     // RFC-002 §9/§4.4. These are the state-machine half of the gate; the
     // every-node claims are asserted across a real three-node cluster in
     // `tests/cluster.rs`, and the RBAC-visibility claims over HTTP in
-    // `rift-ee-server/tests/rbac.rs`.
+    // `rift-cluster-server/tests/rbac.rs`.
 
     fn audit_rows(sm: &RedbStateMachine) -> Vec<AuditRow> {
         sm.audit_since(0, None, 10_000).expect("read audit")
@@ -7368,7 +7368,7 @@ mod tests {
     /// the log path.
     #[tokio::test]
     async fn a_clustered_change_event_carries_the_principal_from_the_log() {
-        use rift_ee::seams::{EventContext, ImposterEvent, ImposterEventListener};
+        use rift_cluster_base::seams::{EventContext, ImposterEvent, ImposterEventListener};
 
         #[derive(Default)]
         struct Recorder(parking_lot::Mutex<Vec<Option<String>>>);
@@ -7406,7 +7406,7 @@ mod tests {
     /// borrowing whoever wrote the record originally.
     #[tokio::test]
     async fn a_restart_replay_emits_unattributed_events() {
-        use rift_ee::seams::{EventContext, ImposterEvent, ImposterEventListener};
+        use rift_cluster_base::seams::{EventContext, ImposterEvent, ImposterEventListener};
 
         #[derive(Default)]
         struct Recorder(parking_lot::Mutex<Vec<Option<String>>>);
@@ -7679,7 +7679,7 @@ mod tests {
     /// because a snapshot is the sum of many principals' writes.
     #[tokio::test]
     async fn a_snapshot_install_emits_unattributed_events() {
-        use rift_ee::seams::{EventContext, ImposterEvent, ImposterEventListener};
+        use rift_cluster_base::seams::{EventContext, ImposterEvent, ImposterEventListener};
 
         #[derive(Default)]
         struct Recorder(parking_lot::Mutex<Vec<Option<String>>>);

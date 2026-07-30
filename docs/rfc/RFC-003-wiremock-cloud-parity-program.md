@@ -1,12 +1,22 @@
 # RFC-003 — WireMock Cloud Parity Program (milestones M1–M6)
 
+> **Note on terminology (2026-07-30, #193).** The repo-wide rename replaced "enterprise"
+> with "cluster" everywhere **except this file**, because here "Enterprise" is
+> **WireMock Cloud's paid tier** — a third party's product name, not a description of this
+> project. Renaming it would have made the parity table say something false. Occurrences of
+> `rift-enterprise` / `rift-ee` *were* renamed; the WireMock tier names were not.
+>
+> Separately: this document predates the Apache-2.0 relicense (#199) and its framing of a
+> paid tier for **this** project no longer applies — there is none. It is retained as a
+> competitive-analysis and milestone-planning record.
+
 | | |
 |---|---|
 | **Status** | v1 — program plan for review; capability designs split into RFC-004/005/006 |
-| **Tracking issue** | Milestones M1–M6 (repo milestones 1–6); epics [#20](https://github.com/achird-labs/rift-enterprise/issues/20) (M1), [#146](https://github.com/achird-labs/rift-enterprise/issues/146) (M2), [#147](https://github.com/achird-labs/rift-enterprise/issues/147) (M3), [#148](https://github.com/achird-labs/rift-enterprise/issues/148) (M4), [#149](https://github.com/achird-labs/rift-enterprise/issues/149) (M5), [#150](https://github.com/achird-labs/rift-enterprise/issues/150)/[#151](https://github.com/achird-labs/rift-enterprise/issues/151) (M6a/b) |
-| **Canonical location** | `rift-enterprise:docs/rfc/RFC-003-wiremock-cloud-parity-program.md` |
+| **Tracking issue** | Milestones M1–M6 (repo milestones 1–6); epics [#20](https://github.com/achird-labs/rift-cluster/issues/20) (M1), [#146](https://github.com/achird-labs/rift-cluster/issues/146) (M2), [#147](https://github.com/achird-labs/rift-cluster/issues/147) (M3), [#148](https://github.com/achird-labs/rift-cluster/issues/148) (M4), [#149](https://github.com/achird-labs/rift-cluster/issues/149) (M5), [#150](https://github.com/achird-labs/rift-cluster/issues/150)/[#151](https://github.com/achird-labs/rift-cluster/issues/151) (M6a/b) |
+| **Canonical location** | `rift-cluster:docs/rfc/RFC-003-wiremock-cloud-parity-program.md` |
 | **Depends on** | ADR-001 (Raft control plane, merged); RFC-001 Phase 1 (merged); RFC-002 (design complete, unbuilt); Ch.7 verification plane (designed); Ch.13 sources (epic #20, sliced `ready`) |
-| **Ground truth** | rift-enterprise @ `5b98fef`; `vendor/rift` @ `v0.16.0-4-g97757f0`; WireMock Cloud feature set verified live against `wiremock.io` / `docs.wiremock.io` on **2026-07-26** |
+| **Ground truth** | rift-cluster @ `5b98fef`; `vendor/rift` @ `v0.16.0-4-g97757f0`; WireMock Cloud feature set verified live against `wiremock.io` / `docs.wiremock.io` on **2026-07-26** |
 | **Author** | Mohsen Zainalpour |
 | **Date** | 2026-07-26 |
 
@@ -74,11 +84,11 @@ What a 2023-era view of WireMock Cloud misses (all verified 2026-07-26):
 
 Status of every claimed gap, checked against `crates/` at `5b98fef`:
 
-| Capability | WireMock Cloud (verified) | Rift EE today (evidence) | Verdict | Milestone |
+| Capability | WireMock Cloud (verified) | RiftCluster today (evidence) | Verdict | Milestone |
 |---|---|---|---|---|
 | Multi-tenancy | org → team → mock-API ACLs | `require_default_tenant()` rejects all but `"default"` (`rift-cluster/src/control.rs:283-292`); tenant/principal/binding ControlOps reserved (`:272-279`) | **Gap — design complete (RFC-002), unbuilt** | M2 |
 | RBAC | 3-level roles, Enterprise-gated | Only occurrence of "rbac" in `crates/` is a rejection message | **Gap — RFC-002, unbuilt** | M2 |
-| API tokens | account API keys | One optional global static bearer (`rift-ee-server/src/admin_front.rs:98-101,450-463`); no argon2 anywhere | **Gap — RFC-002 T3, unbuilt** | M2 |
+| API tokens | account API keys | One optional global static bearer (`rift-cluster-server/src/admin_front.rs:98-101,450-463`); no argon2 anywhere | **Gap — RFC-002 T3, unbuilt** | M2 |
 | Audit log | events → customer S3 | No audit table; `ControlRequest.principal` is a documented placeholder (`control.rs:56-61`) | **Gap — RFC-002 §9, unbuilt** | M2 (+S3 sink follow-on) |
 | SSO (SAML) / SCIM | Enterprise | Absent; RFC-002 defers OIDC/mTLS to v2, SAML/SCIM never designed | **Gap — deliberately sequenced after M2** (§9) | post-M6 RFC |
 | Request log / inspector | live log with match diagnostics | Per-node in-memory journal only; no `RequestJournal` seam impl in `crates/` (grep: none); Ch.7 merge-on-read design unbuilt | **Gap — design complete (Ch.7), unbuilt** | M3 |
@@ -247,4 +257,4 @@ now ──► M1 (#20, ready) ────────────────�
   teams-and-collaboration, audit-events; Runner and MCP announcement posts.
 - Repo inventory (2026-07-26): capability checklist with file:line evidence at
   `5b98fef`, including per-crate module map of `rift-cluster`,
-  `rift-ee-server`, `rift-ee`.
+  `rift-cluster-server`, `rift-cluster-base`.

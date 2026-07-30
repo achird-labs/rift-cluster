@@ -36,7 +36,7 @@
 # an ordinary control op; followers apply and never fetch. Asserting that needs
 # something that counts requests, and counts them exactly.
 #
-# So the origin is a fourth `rift-ee-server`, run **un-clustered**, whose
+# So the origin is a fourth `rift-cluster-server`, run **un-clustered**, whose
 # imposter's response body *is* the config document the fleet fetches. Its
 # Mountebank-compatible admin API then hands the harness the counter for free:
 # `GET /imposters/6600` reports `numberOfRequests`, maintained whether or not
@@ -92,7 +92,7 @@ services:
     ports:
       - "46525:2525"   # admin API -- where the fetch counter is read
     healthcheck:
-      test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2525/imposters"]
+      test: ["CMD", "rift-cluster-server", "healthcheck", "--url", "http://127.0.0.1:2525/imposters"]
       interval: 5s
       timeout: 3s
       retries: 5

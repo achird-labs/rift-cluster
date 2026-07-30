@@ -42,7 +42,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
 use hmac::{Hmac, Mac};
-use rift_ee::seams::{FetchedImposters, SourceMeta, SourceRef, parse_remote_document};
+use rift_cluster_base::seams::{FetchedImposters, SourceMeta, SourceRef, parse_remote_document};
 use sha2::{Digest, Sha256};
 
 use super::CredentialedSource;

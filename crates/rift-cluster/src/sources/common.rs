@@ -1,11 +1,11 @@
 //! Small helpers that were byte-identical across two or more of the
-//! enterprise source providers (issue #136 review): the multi-document merge
+//! cluster source providers (issue #136 review): the multi-document merge
 //! rule, hex encoding, and a capped body read. Extracted once rather than left
 //! to drift apart as three near-duplicate copies.
 
 use std::collections::HashMap;
 
-use rift_ee::seams::LoadedConfig;
+use rift_cluster_base::seams::LoadedConfig;
 
 /// Merge documents (or per-service responses) into one [`LoadedConfig`], in
 /// the order given, refusing a port / `intercept` / `routes` block declared
@@ -77,7 +77,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Read `response`'s body, refusing anything past
-/// [`rift_ee::seams::MAX_BODY_BYTES`] — enforced while streaming rather than
+/// [`rift_cluster_base::seams::MAX_BODY_BYTES`] — enforced while streaming rather than
 /// trusting `Content-Length`, exactly like upstream's
 /// `HttpSource::read_capped`, since a chunked response has no length to trust
 /// and an attacker-controlled one cannot be relied on anyway.
@@ -87,7 +87,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 /// own wording without this helper needing to know which provider called it.
 pub(crate) async fn read_capped(response: reqwest::Response, what: &str) -> anyhow::Result<String> {
     use futures_util::StreamExt as _;
-    use rift_ee::seams::MAX_BODY_BYTES;
+    use rift_cluster_base::seams::MAX_BODY_BYTES;
 
     let mut body: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();

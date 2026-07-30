@@ -6,7 +6,7 @@ is a build boundary, not a licence one:
 
 - The Rift core is vendored, read-only, as a git submodule at `vendor/rift`,
   pinned to a specific upstream commit.
-- Cluster crates live under `crates/` (e.g. `rift-ee`, `rift-cluster`) and depend
+- Cluster crates live under `crates/` (e.g. `rift-cluster-base`, `rift-cluster`) and depend
   on the core crates via path dependencies into `vendor/rift`.
 - This workspace **excludes** `vendor/rift` (it is its own workspace), so `cargo`
   treats the core crates as ordinary path dependencies.
@@ -19,7 +19,7 @@ it, rather than accumulating here.
 ## First checkout
 
 ```sh
-git clone --recurse-submodules git@github.com:achird-labs/rift-enterprise.git
+git clone --recurse-submodules git@github.com:achird-labs/rift-cluster.git
 # or, if already cloned:
 git submodule update --init --recursive
 cargo check --workspace
@@ -45,14 +45,14 @@ Manual/local:
 scripts/sync-upstream.sh
 ```
 
-## Adding an enterprise feature
+## Adding a cluster feature
 
-1. Build it in a new or existing enterprise crate under `crates/`.
-2. Depend on the core through the **`rift-ee` facade** (`rift-ee = { path =
-   "../rift-ee" }`), never on `rift-mock-core` / `rift-http-proxy` directly.
-   `rift-ee` re-exports the OSS crates plus the upstream extension seams under
-   `rift_ee::seams`; keeping it the sole path means Cargo enforces the
-   open-core boundary instead of a convention nobody checks. Only `rift-ee`
+1. Build it in a new or existing cluster crate under `crates/`.
+2. Depend on the core through the **`rift-cluster-base` facade** (`rift-cluster-base = { path =
+   "../rift-cluster-base" }`), never on `rift-mock-core` / `rift-http-proxy` directly.
+   `rift-cluster-base` re-exports the core crates plus the upstream extension seams under
+   `rift_cluster_base::seams`; keeping it the sole path means Cargo enforces the
+   open-core boundary instead of a convention nobody checks. Only `rift-cluster-base`
    itself carries the vendored path deps (declared in `[workspace.dependencies]`
    at the root).
 3. Extend the core through those seams (flow store, sequencer, journal, proxy
@@ -60,7 +60,7 @@ scripts/sync-upstream.sh
    rather than forking logic. If a seam you need does not exist, that is an
    upstream PR — see the cross-repo flow below — not a local fork.
 
-## When an enterprise feature needs a core change first (cross-repo PR)
+## When a cluster feature needs a core change first (cross-repo PR)
 
 GitHub has no single PR that spans two repos, so split the work:
 
@@ -72,13 +72,13 @@ GitHub has no single PR that spans two repos, so split the work:
    ```
 
 2. Get that PR reviewed and merged into public Rift `master`.
-3. Bump the submodule so the enterprise repo picks up the merged change:
+3. Bump the submodule so the cluster repo picks up the merged change:
 
    ```sh
    scripts/sync-upstream.sh
    ```
 
-4. Now build the enterprise feature on top of the new core capability and open a
+4. Now build the cluster feature on top of the new core capability and open a
    normal PR in this repo.
 
 Keep the upstream PR limited to changes that belong in the core (extension

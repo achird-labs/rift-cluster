@@ -3,7 +3,7 @@
 The control plane is where the cluster agrees on the things it cannot afford to
 disagree about: **who is in the cluster, what the imposters are, who the
 tenants and principals are, and which admin requests have been accepted.** It
-is an embedded Raft group — `openraft` running inside every `rift-ee-server`
+is an embedded Raft group — `openraft` running inside every `rift-cluster-server`
 process, speaking over the same HMAC-authenticated cluster port as everything
 else. There is no external coordinator, no sidecar, no operator-managed quorum
 service. Three Rift binaries behind an LB *are* the consensus group.
@@ -35,7 +35,7 @@ one mechanism instead of three bespoke protocols.
 
 ```mermaid
 flowchart TB
-    subgraph Node["each rift-ee-server process"]
+    subgraph Node["each rift-cluster-server process"]
         RN["openraft node<br/>(leader OR follower/learner)"]
         SM["State machine (apply loop)"]
         DB[("redb — cluster-state-dir<br/>raft_log · raft_vote · snapshot<br/>sm_configs · sm_tenants · sm_principals<br/>sm_bindings · sm_audit · sm_op_dedup · pending_intents")]

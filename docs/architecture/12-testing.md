@@ -79,7 +79,7 @@ LB-independence; C4+C5 together are R1 under adversity.
 ## Standing gates (never waived, any phase)
 
 - **Single-node fidelity**: the entire upstream test suite runs against
-  `rift-ee-server` with `--cluster` off — byte-identical behavior required.
+  `rift-cluster-server` with `--cluster` off — byte-identical behavior required.
 - **Hot-path performance**: `matcher_bench` within 2% of the pre-seam
   baseline; clustering compiled in but disabled must be free.
 - **SDK conformance**: the four language SDKs' conformance suites pass against

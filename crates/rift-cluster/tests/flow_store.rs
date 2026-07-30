@@ -19,7 +19,7 @@ use rift_cluster::stores::{
     ClusteredFlowStoreProvider, FlowNet, FlowShard, ShardConfig, flow_routes,
 };
 use rift_cluster::{Authority, NodeConfig, NodeId, RaftNode};
-use rift_ee::seams::{CasOutcome, FlowStore, FlowStoreProvider, ImposterConfig};
+use rift_cluster_base::seams::{CasOutcome, FlowStore, FlowStoreProvider, ImposterConfig};
 use tempfile::TempDir;
 
 const SECRET: &str = "flow-store-test-secret";

@@ -8,7 +8,7 @@ on-prem environments, usually without a dedicated platform team.
 ## CLI surface (cluster-relevant)
 
 ```
-rift-ee-server \
+rift-cluster-server \
   --cluster                          # master switch; everything below inert without it
   --cluster-init                     # FIRST node of a NEW cluster, exactly once
   --cluster-bind 10.0.0.5:4790       # required: Raft + owner RPC (TCP, one port)
@@ -96,14 +96,14 @@ loss), `rift_cluster_flow_wal_lag_ops` (async durability backlog),
 - **Scale up**: start pod with seeds → auto learner → voter if < 9. Nothing
   else.
 - **Scale down / retire**: SIGTERM, wait for exit (graceful leave does the
-  rest). Crash-retire: `rift-ee-server cluster remove-node <id>` against any
+  rest). Crash-retire: `rift-cluster-server cluster remove-node <id>` against any
   live node.
 - **Restore quorum after majority loss**: last-resort
   `cluster force-recover --from-state-dir` on the best surviving node (log
   end inspected via `cluster inspect`), then rejoin others empty. Documented
   as data-loss-possible, operator-confirmed, twice.
 - **Backup**: configs are exportable at any moment via `GET /imposters`
-  (Mountebank-compatible JSON) or the OSS `--datadir` write-through; the
+  (Mountebank-compatible JSON) or the core `--datadir` write-through; the
   state dir itself is snapshot-friendly (redb single file, crash-consistent).
 - **Stuck scenario triage**: `/_cluster/ring?key=flow` → `/_cluster/kv/:flow`
   → compare owner vs replica `(m_idx, v)` → the answer is one of: owner

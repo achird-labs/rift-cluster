@@ -1,7 +1,7 @@
-//! Distributed clustering for Rift Enterprise.
+//! Distributed clustering for RiftCluster.
 //!
 //! This crate holds the cluster runtime that turns independent Rift nodes into
-//! one fleet. It reaches the open-source engine only through the `rift_ee`
+//! one fleet. It reaches the open-source engine only through the `rift_cluster_base`
 //! facade — never through the vendored crates directly — so the open-core
 //! boundary is enforced by the dependency graph rather than by convention.
 //!

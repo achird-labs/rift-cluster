@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 use openraft::error::{ClientWriteError, InitializeError, RaftError};
 use openraft::metrics::WaitError;
 use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
-use rift_ee::seams::{CompiledRoutes, ImposterConfig, ImposterManager, RouteTable};
+use rift_cluster_base::seams::{CompiledRoutes, ImposterConfig, ImposterManager, RouteTable};
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -646,7 +646,7 @@ impl RaftNode {
     /// the leader stops replicating to a node once its removal takes effect, so
     /// a departing node routinely shuts down without ever receiving the entry
     /// that removed it. A restart therefore cannot treat `true` as proof of
-    /// membership — that is what the departure marker in `rift-ee-server` is
+    /// membership — that is what the departure marker in `rift-cluster-server` is
     /// for (issue #72). `false`, on the other hand, is conclusive.
     #[must_use]
     pub fn in_membership(&self) -> bool {

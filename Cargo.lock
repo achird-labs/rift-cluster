@@ -2530,7 +2530,7 @@ dependencies = [
  "rand 0.8.6",
  "redb",
  "reqwest",
- "rift-ee",
+ "rift-cluster-base",
  "serde",
  "serde_json",
  "sha2",
@@ -2544,7 +2544,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rift-ee"
+name = "rift-cluster-base"
 version = "0.1.0"
 dependencies = [
  "hyper",
@@ -2557,7 +2557,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rift-ee-server"
+name = "rift-cluster-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2569,7 +2569,7 @@ dependencies = [
  "prometheus",
  "reqwest",
  "rift-cluster",
- "rift-ee",
+ "rift-cluster-base",
  "serde",
  "serde_json",
  "subtle",

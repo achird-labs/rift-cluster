@@ -1,10 +1,10 @@
-# rift-ee-server — the Rift Enterprise binary.
+# rift-cluster-server — the RiftCluster binary.
 #
 # Build from the REPOSITORY ROOT, not from this directory: the build needs
 # `vendor/rift` (the open-source submodule this binary composes) in its context.
 #
 #     git submodule update --init --recursive
-#     docker build -f deploy/Dockerfile -t rift-ee-server .
+#     docker build -f deploy/Dockerfile -t rift-cluster-server .
 #
 # A checkout without the submodule fails at `cargo build` with a missing-path
 # dependency rather than silently producing a binary without the engine in it.
@@ -15,7 +15,7 @@
 FROM rust:1.92-slim-bookworm AS builder
 
 # `ring` (via rustls) and the scripting engines compile C, so the toolchain is
-# not optional. `git` is here for rift-ee's build script, which reads the
+# not optional. `git` is here for rift-cluster-base's build script, which reads the
 # vendored submodule's pin to put the upstream version in `--version`; without
 # it the banner degrades to `rift unknown` rather than failing the build.
 RUN apt-get update \
@@ -40,7 +40,7 @@ ENV RIFT_UPSTREAM_VERSION=${RIFT_UPSTREAM_VERSION}
 
 # `--locked` so an image can never be built from a silently-resolved dependency
 # graph that differs from the one CI tested.
-RUN cargo build --locked --release -p rift-ee-server
+RUN cargo build --locked --release -p rift-cluster-server
 
 # ---------------------------------------------------------------------------
 # Runtime
@@ -59,7 +59,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 rift
 
-COPY --from=builder /src/target/release/rift-ee-server /usr/local/bin/rift-ee-server
+COPY --from=builder /src/target/release/rift-cluster-server /usr/local/bin/rift-cluster-server
 
 # The data and cluster-state directories are the only paths the process writes.
 RUN mkdir -p /var/lib/rift && chown -R rift:rift /var/lib/rift
@@ -76,6 +76,6 @@ EXPOSE 2525 2526 4790 9090
 # container health check that failed on not-ready would restart a node that is
 # merely still joining — the exact failure /healthz exists to prevent.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-    CMD ["rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
+    CMD ["rift-cluster-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
 
-ENTRYPOINT ["rift-ee-server"]
+ENTRYPOINT ["rift-cluster-server"]

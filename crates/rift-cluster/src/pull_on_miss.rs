@@ -40,7 +40,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use rift_ee::seams::{NoMatchContext, NoMatchDirective, NoMatchInterceptor, annotate};
+use rift_cluster_base::seams::{NoMatchContext, NoMatchDirective, NoMatchInterceptor, annotate};
 
 use tokio::sync::Mutex;
 

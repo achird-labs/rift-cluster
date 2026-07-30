@@ -4,7 +4,7 @@
 //! async request handlers *and* from the blocking script-pool threads — while
 //! clustered implementations perform network RPC. Rather than async-ifying
 //! those traits upstream (which would ripple through both scripting engines and
-//! every call site), the enterprise side owns a small runtime and parks the
+//! every call site), the cluster side owns a small runtime and parks the
 //! calling thread on a channel.
 //!
 //! Two properties make that safe:

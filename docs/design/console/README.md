@@ -5,11 +5,11 @@ whose backend has shipped or is sliced:
 
 | Screen | Slice | Issue |
 |---|---|---|
-| Sign in — API key exchanged for a session cookie | C2 | [#185](https://github.com/achird-labs/rift-enterprise/issues/185) |
-| App shell, tenant switcher, imposters, cluster/fleet | C4 | [#187](https://github.com/achird-labs/rift-enterprise/issues/187) |
-| Stub editor — form ⟷ JSON, lint, 409 rebase | C5 | [#188](https://github.com/achird-labs/rift-enterprise/issues/188) |
-| Request log (per-node) and front-door route editor | C6 | [#189](https://github.com/achird-labs/rift-enterprise/issues/189) |
-| Tenants, principals, roles, audit | C7 | [#190](https://github.com/achird-labs/rift-enterprise/issues/190) |
+| Sign in — API key exchanged for a session cookie | C2 | [#185](https://github.com/achird-labs/rift-cluster/issues/185) |
+| App shell, tenant switcher, imposters, cluster/fleet | C4 | [#187](https://github.com/achird-labs/rift-cluster/issues/187) |
+| Stub editor — form ⟷ JSON, lint, 409 rebase | C5 | [#188](https://github.com/achird-labs/rift-cluster/issues/188) |
+| Request log (per-node) and front-door route editor | C6 | [#189](https://github.com/achird-labs/rift-cluster/issues/189) |
+| Tenants, principals, roles, audit | C7 | [#190](https://github.com/achird-labs/rift-cluster/issues/190) |
 
 Scenarios and flow state (#149), sources (#20) and specs (#148) appear as greyed nav entries carrying
 their issue number — a visible roadmap rather than a 404, which is what §4 asks for.

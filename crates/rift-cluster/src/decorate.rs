@@ -1,15 +1,15 @@
-//! The enterprise [`ResponseDecorator`]: cluster op notes → `Rift-Cluster-*` headers.
+//! The cluster [`ResponseDecorator`]: cluster op notes → `Rift-Cluster-*` headers.
 //!
 //! Cluster-aware code inside an OSS handler cannot reach the response — the
 //! handlers are deliberately cluster-ignorant. Instead it calls
-//! [`rift_ee::seams::annotate`] with a `cluster.*` key, and this decorator turns
+//! [`rift_cluster_base::seams::annotate`] with a `cluster.*` key, and this decorator turns
 //! whatever accumulated on the request into response headers at the boundary.
 //!
 //! The mapping is structural rather than a per-key registry (`cluster.revision`
 //! → `Rift-Cluster-Revision`), so a later phase adds a note by annotating it and
 //! nothing here has to change.
 
-use rift_ee::seams::{ResponseDecorator, ResponsePhase};
+use rift_cluster_base::seams::{ResponseDecorator, ResponsePhase};
 
 /// The annotation-key prefix this decorator claims. Anything else on the request
 /// belongs to another subsystem and is left alone.
@@ -44,7 +44,7 @@ pub const HEADER_WARNINGS: &str = "rift-cluster-warnings";
 /// imposter's port (issue #143).
 ///
 /// Set directly by the front for the same reason as the three above, and with more force: the
-/// affected reads are *proxied*, and the OSS admin phase decorates with `req_port: None`, so no
+/// affected reads are *proxied*, and the core admin phase decorates with `req_port: None`, so no
 /// annotation scope downstream can know which imposter the response is about.
 pub const HEADER_BIND_FAILURES: &str = "rift-cluster-bind-failures";
 

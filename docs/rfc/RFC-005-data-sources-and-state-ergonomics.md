@@ -3,10 +3,10 @@
 | | |
 |---|---|
 | **Status** | v1 — design draft for review |
-| **Tracking issue** | [achird-labs/rift-enterprise#149](https://github.com/achird-labs/rift-enterprise/issues/149) (milestone M5); isolation defect filed as [#152](https://github.com/achird-labs/rift-enterprise/issues/152) |
-| **Canonical location** | `rift-enterprise:docs/rfc/RFC-005-data-sources-and-state-ergonomics.md` |
+| **Tracking issue** | [achird-labs/rift-cluster#149](https://github.com/achird-labs/rift-cluster/issues/149) (milestone M5); isolation defect filed as [#152](https://github.com/achird-labs/rift-cluster/issues/152) |
+| **Canonical location** | `rift-cluster:docs/rfc/RFC-005-data-sources-and-state-ergonomics.md` |
 | **Depends on** | **ADR-001** (Raft control plane), **RFC-002** (tenancy, actions, 404-vs-403 rule), **#20** (ImposterSource SPI — the one-fetch-then-replicate rule this RFC mirrors) |
-| **Ground truth** | verified at `rift-enterprise@5b98fef`, `vendor/rift@v0.16.0-4-g97757f0` |
+| **Ground truth** | verified at `rift-cluster@5b98fef`, `vendor/rift@v0.16.0-4-g97757f0` |
 | **Author** | Mohsen Zainalpour |
 | **Date** | 2026-07-26 |
 
@@ -104,7 +104,7 @@ must work around them:
   the clustered store: owner-routed CAS with `(m_idx, v, origin)` fencing,
   async replication to two HRW successors, versioned tombstones, adoption and
   5 s anti-entropy (`crates/rift-cluster/src/stores/flow.rs`; semantics in
-  `docs/architecture/06-flow-state.md` and `docs/rift-ee-server.md` §"Clustered
+  `docs/architecture/06-flow-state.md` and `docs/rift-cluster-server.md` §"Clustered
   flow state").
 - **Durability and TTL.** `FlowShard` persists `(flow_id, key) →
   Versioned { m_idx, v, origin, expires_at, value, deleted }`
@@ -140,7 +140,7 @@ must work around them:
 | **G1** | No dataset lifecycle: the lookup behavior takes a raw filesystem path, so a clustered fleet has no way to guarantee the file exists — with identical bytes — on every node before a stub referencing it activates. No upload, no versioning, no tenancy, no quota. | `lookup.rs:44-54`; nothing in `crates/` touches `LookupBehavior` |
 | **G2** | Stale-file hazard: `CsvCache` is keyed by path and never invalidated, so editing a CSV in place serves old rows until restart. | `handler.rs:104-106`, `lookup.rs:79-107` |
 | **G3** | No dataset access from templates: the `{{ }}` function set is a **closed match** — `eval_base` ends in `Err("unknown template function")` with no registration hook anywhere (`ServerBuilder`, `ImposterManager`, or otherwise). | `template_fn.rs:205-289` |
-| **G4** | No declarative state writes: a stub that wants to `SET counter = {{request.query.n}}` must become a script, and the clustered admin front gates every scripted config on `--allowInjection` (`config_uses_script_surface`, re-exported at `crates/rift-ee/src/lib.rs:95`, enforced in `admin_front.rs`). A declarative feature that silently converts configs into scripted ones would flip that gate. | `flow_state.rs:18-115` (trait has CRUD, no op list); `types.rs:199-207` (FSM only) |
+| **G4** | No declarative state writes: a stub that wants to `SET counter = {{request.query.n}}` must become a script, and the clustered admin front gates every scripted config on `--allowInjection` (`config_uses_script_surface`, re-exported at `crates/rift-cluster-base/src/lib.rs:95`, enforced in `admin_front.rs`). A declarative feature that silently converts configs into scripted ones would flip that gate. | `flow_state.rs:18-115` (trait has CRUD, no op list); `types.rs:199-207` (FSM only) |
 | **G5** | **Cross-imposter context collision under `--cluster`.** OSS gives each imposter its own store instance, so two imposters both using `flowIdSource: "header:X-Session"` are isolated. The clustered store passes the raw flow id into one fleet-global namespace — `ClusteredFlowStoreProvider::provide` adds no scope (`stores/flow.rs:1299-1321`), and every `FlowStore` method forwards `flow_id` verbatim (`stores/flow.rs:1190+`). Two imposters, same header value ⇒ shared keys. A parity divergence, not a feature. | `matching.rs:285-300`, `stores/flow.rs:1190-1321` |
 | **G6** | No enumeration: `FlowStore` has no "list keys" or "list flows" (`flow_state.rs:18-115`), upstream has no listing route, and the shard's `flow(flow_id)` / `flow_ids()` (`shard.rs:347,371`) are reachable from no API. WireMock's `listState` / state inspector has no counterpart. TTL (`expires_at`) is stored but surfaced nowhere. | `flow_state.rs`, `router.rs:188-241`, `shard.rs:347-384` |
 | **G7** | No cross-context template read (`{{state 'key' context=...}}`): `state.<key>` is hardwired to the request's resolved flow id. | `template_fn.rs:275-286` |
@@ -444,7 +444,7 @@ Carried as `_rift.stateOps: [ ... ]` on a stub response — the same
 config-extension shape as `_rift.templated` and `_rift.flowState`. Executed by
 the imposter handler after response render, sequentially, via the imposter's
 existing `FlowStore` — so in EE they are automatically owner-routed,
-replicated, durable, and scoped (§3.5) with zero enterprise code on the write
+replicated, durable, and scoped (§3.5) with zero cluster code on the write
 path. Errors follow the templating policy (`template_fn.rs:39-42`): fail the
 render in debug, warn-and-continue otherwise.
 
@@ -566,7 +566,7 @@ error text.
 ### 6.3 Not seams, but vocabulary
 
 `DatasetPut` / `DatasetRead` / `DatasetDelete` join RFC-002 §4.1's closed
-action enum (the enum is enterprise-side; no upstream change). New `ControlOp`
+action enum (the enum is cluster-side; no upstream change). New `ControlOp`
 variants `DatasetPut` / `DatasetDelete` join the reserved-op pattern
 (`raft/store.rs:1203-1208`) until their slice lands.
 
@@ -705,9 +705,9 @@ Stated so review knows where the ice is thin:
 
 ---
 
-## Appendix A — WireMock Cloud ↔ Rift EE mapping
+## Appendix A — WireMock Cloud ↔ RiftCluster mapping
 
-| WireMock Cloud | Rift EE (this RFC) | Status after v1 |
+| WireMock Cloud | RiftCluster (this RFC) | Status after v1 |
 |---|---|---|
 | CSV data source upload | Dataset artifact, content-addressed, tenant-owned (§3.1) | parity |
 | Managed DB connection | — (invariant 1) | declined, §7 |

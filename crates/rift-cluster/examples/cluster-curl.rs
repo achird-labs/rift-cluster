@@ -1,7 +1,7 @@
 //! `curl` for the cluster port: a signed request, printed.
 //!
 //! The cluster port carries the operator surface (`/_cluster/*`) and the
-//! imposter-source surface (`/admin/sources*`) — see `docs/rift-ee-server.md`.
+//! imposter-source surface (`/admin/sources*`) — see `docs/rift-cluster-server.md`.
 //! Both are authenticated with the **cluster credential**, not the admin API
 //! key: every request has to carry an HMAC over a canonical encoding of its
 //! timestamp, nonce, method, path and body (RFC-001 §11.2). Plain `curl` cannot

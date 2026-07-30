@@ -103,7 +103,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
 use base64::prelude::{BASE64_STANDARD, Engine as _};
-use rift_ee::seams::{
+use rift_cluster_base::seams::{
     FetchedImposters, LoadedConfig, SourceMeta, SourceRef, parse_remote_document,
 };
 

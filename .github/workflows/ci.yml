@@ -197,7 +197,7 @@ jobs:
         run: docker compose -f deploy/compose/docker-compose.yml logs --tail=100 || true
 
   # Parity (issue #37): upstream's own behavioural suites, run against
-  # `rift-ee-server` with `--cluster` off. This is what turns "composition,
+  # `rift-cluster-server` with `--cluster` off. This is what turns "composition,
   # not a fork: `--cluster` off is byte-identical to rift" from an assertion
   # the composition makes by construction into something verified against the
   # behaviour rift itself guarantees.
@@ -205,7 +205,7 @@ jobs:
   # Only four of upstream's `rift-http-proxy` integration suites can run
   # against an external binary at all — the rest link `ImposterManager`/
   # `AdminApiServer` directly and can never be pointed anywhere else, but they
-  # also don't need to be: `rift-ee-server` links that exact vendored library
+  # also don't need to be: `rift-cluster-server` links that exact vendored library
   # unmodified, so upstream's own CI already gates that code (see the issue's
   # scoping finding). The four that spawn a server process use the shared
   # `server_bin()` helper (`vendor/rift/crates/rift-http-proxy/tests/support/
@@ -265,9 +265,9 @@ jobs:
             .
             vendor/rift
 
-      - name: Build rift-ee-server (release)
+      - name: Build rift-cluster-server (release)
         if: steps.changed.outputs.run == 'true'
-        run: cargo build -p rift-ee-server --release
+        run: cargo build -p rift-cluster-server --release
 
       # `vendor/rift` is its own cargo workspace (excluded from ours), so the
       # suites are run with that directory as the working dir rather than
@@ -275,7 +275,7 @@ jobs:
       #
       # No `--cluster` flags anywhere below — that is the point of "parity
       # mode": these suites exercise exactly the composition an operator gets
-      # by running `rift-ee-server` as a drop-in `rift` replacement.
+      # by running `rift-cluster-server` as a drop-in `rift` replacement.
       #
       # `RIFT_SERVER_BIN` points the suites at our binary instead of their own
       # debug build; `support::server_bin()` panics on a set-but-not-
@@ -314,11 +314,11 @@ jobs:
       # local patches to the pin — and fixed upstream by rift#850, which
       # dispatches those requests sequentially. That fix is in the pin, so the
       # skip now suppresses a test that passes: dropped rather than left to rot.
-      - name: Upstream process-spawning suites against rift-ee-server
+      - name: Upstream process-spawning suites against rift-cluster-server
         if: steps.changed.outputs.run == 'true'
         working-directory: vendor/rift
         env:
-          RIFT_SERVER_BIN: ${{ github.workspace }}/target/release/rift-ee-server
+          RIFT_SERVER_BIN: ${{ github.workspace }}/target/release/rift-cluster-server
           ASSERT_SCENARIOS_RAN: ${{ github.workspace }}/scripts/assert-scenarios-ran.sh
         run: |
           set -euo pipefail

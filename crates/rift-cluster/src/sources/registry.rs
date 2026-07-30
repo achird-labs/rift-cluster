@@ -22,7 +22,7 @@
 //!
 //! The matched array is re-encoded to JSON text and handed to
 //! [`parse_remote_document`] like any other provider's bytes — this module
-//! never constructs an [`rift_ee::seams::ImposterConfig`] itself.
+//! never constructs an [`rift_cluster_base::seams::ImposterConfig`] itself.
 //!
 //! ## Version
 //!
@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
-use rift_ee::seams::{
+use rift_cluster_base::seams::{
     FetchedImposters, LoadedConfig, SourceMeta, SourceRef, parse_remote_document,
 };
 use sha2::{Digest, Sha256};

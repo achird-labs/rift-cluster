@@ -3,10 +3,10 @@
 | | |
 |---|---|
 | **Status** | v1 — design draft for review |
-| **Tracking issue** | [achird-labs/rift-enterprise#150](https://github.com/achird-labs/rift-enterprise/issues/150) (console, M6a) · [#151](https://github.com/achird-labs/rift-enterprise/issues/151) (MCP, M6b) |
-| **Canonical location** | `rift-enterprise:docs/rfc/RFC-006-web-console-and-mcp.md` |
+| **Tracking issue** | [achird-labs/rift-cluster#150](https://github.com/achird-labs/rift-cluster/issues/150) (console, M6a) · [#151](https://github.com/achird-labs/rift-cluster/issues/151) (MCP, M6b) |
+| **Canonical location** | `rift-cluster:docs/rfc/RFC-006-web-console-and-mcp.md` |
 | **Depends on** | **RFC-002** (principals, roles, API keys — the console's auth substrate); **ADR-001 / #14** (the control plane every write lands in). References, without depending on for v1: RFC-003 (parity umbrella, sibling in review), RFC-004 (spec-driven mocking), RFC-005 (data sources & state), `docs/architecture/07-verification-plane.md`, `docs/architecture/13-front-door-and-sources.md` |
-| **Ground truth** | verified at `rift-enterprise@5b98fef`, `vendor/rift@v0.16.0-4-g97757f0` |
+| **Ground truth** | verified at `rift-cluster@5b98fef`, `vendor/rift@v0.16.0-4-g97757f0` |
 | **Author** | Mohsen Zainalpour |
 | **Date** | 2026-07-26 |
 
@@ -14,8 +14,8 @@
 
 ## 1. Summary
 
-Rift EE is administered today by curl, SDKs, and a terminal UI that ships with
-the OSS engine. That is the right *foundation* — everything is an API — but it
+RiftCluster is administered today by curl, SDKs, and a terminal UI that ships with
+the core engine. That is the right *foundation* — everything is an API — but it
 is not the whole product. WireMock Cloud's most visible surfaces (verified
 2026-07-26 against their public product pages) are a web stub editor with a
 matcher UI, a live request log with match diagnostics, org/RBAC admin screens,
@@ -24,10 +24,10 @@ update mocks directly.
 
 This RFC adds both, as **clients of the existing admin API**:
 
-1. **A web console** — a React/TypeScript SPA embedded in the `rift-ee-server`
+1. **A web console** — a React/TypeScript SPA embedded in the `rift-cluster-server`
    binary at build time and served at `/console` from the admin front. No node
    process at runtime, no CDN, works air-gapped.
-2. **An MCP server** — `rift-ee-server mcp`, a stdio MCP endpoint wrapping the
+2. **An MCP server** — `rift-cluster-server mcp`, a stdio MCP endpoint wrapping the
    clustered admin API with a scoped API key, so an agent's imposter writes go
    through the same park/replay/If-Match write path as everyone else's.
 
@@ -43,9 +43,9 @@ restated in §3.
 Checked at `5b98fef`, not assumed:
 
 - **There is no UI.** The EE binary serves the admin front
-  (`crates/rift-ee-server/src/admin_front.rs`), the cluster operator surface
-  (`crates/rift-ee-server/src/cluster_api.rs`), and probes
-  (`crates/rift-ee-server/src/probes.rs`). No route serves HTML. The only
+  (`crates/rift-cluster-server/src/admin_front.rs`), the cluster operator surface
+  (`crates/rift-cluster-server/src/cluster_api.rs`), and probes
+  (`crates/rift-cluster-server/src/probes.rs`). No route serves HTML. The only
   interactive surface in the workspace is upstream's terminal UI
   (`vendor/rift/crates/rift-tui`) — useful precedent (§4), but SSH-only,
   single-node, and invisible to a browser.
@@ -85,7 +85,7 @@ Checked at `5b98fef`, not assumed:
 Three rules, in priority order:
 
 1. **The binary is the deployment.** The console is static assets compiled
-   into `rift-ee-server`; the MCP server is a subcommand of it. A customer who
+   into `rift-cluster-server`; the MCP server is a subcommand of it. A customer who
    has the binary has the whole product. No node runtime, no separate web
    service, no CDN fetch — the SPA's CSP can be `default-src 'self'` because
    nothing legitimate ever leaves the origin (§9.1).
@@ -292,19 +292,19 @@ front, so console work needs no Rust rebuild at all; the generated client
 
 ### 8.1 Shape: a subcommand, not a second binary
 
-**`rift-ee-server mcp` speaking stdio.** Rejected alternative: a standalone
+**`rift-cluster-server mcp` speaking stdio.** Rejected alternative: a standalone
 `rift-mcp` crate/binary — a second artifact to version, sign, and distribute,
 for zero capability gain, against a CLI that is a flat clap parser today
-(`EeCli`, `crates/rift-ee-server/src/cli.rs:165-173`) where an optional
+(`EeCli`, `crates/rift-cluster-server/src/cli.rs:165-173`) where an optional
 subcommand is a purely additive change. The MCP process is a **client** of
 the admin front over HTTP — it holds no node state, embeds no engine, and can
 run on a laptop against a remote fleet:
 
 ```
-rift-ee-server mcp --url https://fleet.example:2525 --api-key-file ~/.rift/agent.key
+rift-cluster-server mcp --url https://fleet.example:2525 --api-key-file ~/.rift/agent.key
 ```
 
-Implementation lives in `crates/rift-ee-server/src/mcp/`, on the official
+Implementation lives in `crates/rift-cluster-server/src/mcp/`, on the official
 Rust MCP SDK — **rmcp** (crate name and version to-verify at implementation;
 pinned in the slice-M1 PR). stdio transport only in v1: it is what every
 coding agent launches today, it inherits the parent process's environment for

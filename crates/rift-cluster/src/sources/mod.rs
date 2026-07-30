@@ -42,9 +42,9 @@
 //! header-injection seam, so a credentialed HTTPS fetch needs a new provider
 //! rather than a hook here.
 //!
-//! Upstream's [`rift_ee::seams::ImposterSource::fetch`] is handed a [`SourceRef`], which carries
+//! Upstream's [`rift_cluster_base::seams::ImposterSource::fetch`] is handed a [`SourceRef`], which carries
 //! a URI and nothing else — while `auth_ref` lives *beside* the URI on the
-//! record. [`CredentialedSource`] is the enterprise-side seam that closes that
+//! record. [`CredentialedSource`] is the cluster-side seam that closes that
 //! gap: a provider that needs a credential is handed the ref's *name*, and
 //! resolves it through [`auth::CredentialResolver`] at fetch time. The
 //! alternatives were all worse in the same way — smuggling the name into the URI
@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use rift_ee::seams::{FetchedImposters, ImposterConfig, SourceRef, SourceRegistry};
+use rift_cluster_base::seams::{FetchedImposters, ImposterConfig, SourceRef, SourceRegistry};
 use uuid::Uuid;
 
 use crate::control::{
@@ -138,7 +138,7 @@ pub enum PullError {
 /// unlikely.
 pub trait CredentialedSource: Send + Sync {
     /// The schemes this provider claims, same contract as
-    /// [`rift_ee::seams::ImposterSource::schemes`].
+    /// [`rift_cluster_base::seams::ImposterSource::schemes`].
     fn schemes(&self) -> &'static [&'static str];
 
     /// Fetch `r`, authenticating with the credential `auth_ref` names.
@@ -157,12 +157,12 @@ pub trait CredentialedSource: Send + Sync {
 }
 
 /// Every provider a node can fetch through: upstream's scheme registry plus the
-/// enterprise providers that take a credential.
+/// cluster providers that take a credential.
 ///
 /// Two maps rather than one because the two traits are disjoint by design (see
 /// [`CredentialedSource`]). A scheme claimed by both is refused at build time,
 /// for the same reason upstream refuses a doubly-claimed scheme: resolving it
-/// by declaration order would let an enterprise provider silently shadow a
+/// by declaration order would let a cluster provider silently shadow a
 /// built-in, or vice versa, and the operator would find out from behaviour.
 #[derive(Default)]
 pub struct SourceProviders {
@@ -222,7 +222,7 @@ impl SourceProviders {
     /// Whether `scheme`'s provider consumes a credential at all.
     ///
     /// Only the credentialed map can ever answer yes: an upstream
-    /// [`rift_ee::seams::ImposterSource`] has no `auth_ref` parameter to give
+    /// [`rift_cluster_base::seams::ImposterSource`] has no `auth_ref` parameter to give
     /// it, so a scheme served only there is anonymous by construction. This is
     /// what lets [`SourcePuller::uses_credential`] refuse an `auth_ref` that a
     /// scheme could never use, instead of silently dropping it.
@@ -820,7 +820,7 @@ pub fn routes(base: Router, puller: Arc<SourcePuller>) -> Router {
 ///
 /// `SourceProviders::fetch` only ever hands `auth_ref` to a scheme in the
 /// credentialed map; a scheme served only through the upstream
-/// [`rift_ee::seams::ImposterSource`] path has no seam to receive it at all.
+/// [`rift_cluster_base::seams::ImposterSource`] path has no seam to receive it at all.
 /// Before this check, `POST /admin/sources` with `{ uri: "https://…",
 /// authRef: "tok" }` was accepted and then fetched **anonymously forever** —
 /// silently, since nothing about the write or a subsequent pull ever fails.

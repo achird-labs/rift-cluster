@@ -44,7 +44,7 @@ jobs:
       # perfectly type-correct and still break behaviour. The real gate is the
       # chaos tier on the resulting PR (#93); this one just fails faster and
       # keeps a broken bump from opening a PR at all.
-      - name: Verify enterprise workspace against new upstream
+      - name: Verify cluster workspace against new upstream
         run: |
           set -euo pipefail
           cargo clippy --workspace --all-targets -- -D warnings

@@ -21,7 +21,7 @@
 #
 # ## Why there are four containers
 #
-# `source-origin` is the config server: a fourth `rift-ee-server`, run
+# `source-origin` is the config server: a fourth `rift-cluster-server`, run
 # **un-clustered**, whose imposter's response body *is* the config document the
 # fleet fetches (`sources-demo.origin.json`). Using rift for it means the demo
 # needs no second image, and — the part that makes the demo work — changing what
@@ -86,7 +86,7 @@ x-node: &node
   stop_grace_period: 15s
   restart: unless-stopped
   healthcheck: &probe
-    test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
+    test: ["CMD", "rift-cluster-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
     interval: 5s
     timeout: 3s
     retries: 5
@@ -111,7 +111,7 @@ services:
     ports:
       - "16525:2525"   # admin API -- where the served document is changed
     healthcheck:
-      test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2525/imposters"]
+      test: ["CMD", "rift-cluster-server", "healthcheck", "--url", "http://127.0.0.1:2525/imposters"]
       interval: 5s
       timeout: 3s
       retries: 5

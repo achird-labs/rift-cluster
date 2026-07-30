@@ -85,7 +85,7 @@ pub const NODES: [Node; 3] = [
 
 /// The compose project's `rift` network, as Docker names it (`<project>_<net>`).
 /// Partitioning detaches a node from this one and leaves `mgmt` attached.
-const RIFT_NETWORK: &str = "rift-ee-cluster_rift";
+const RIFT_NETWORK: &str = "rift-cluster_rift";
 
 /// Toxiproxy's API port, published by the chaos overlay.
 const TOXIPROXY_PORT: u16 = 48474;
@@ -525,7 +525,7 @@ fn wait_stack_gone() {
                 "ps",
                 "-aq",
                 "--filter",
-                "label=com.docker.compose.project=rift-ee-cluster",
+                "label=com.docker.compose.project=rift-cluster",
             ])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().is_empty())
@@ -720,7 +720,7 @@ pub async fn put_imposter_config(
 /// refusal indistinguishable from any other refusal.
 ///
 /// Takes a `serde_json::Value` rather than a `RouteTable`, matching every
-/// other write helper in this module: `Cargo.toml` pulls in no `rift_ee` /
+/// other write helper in this module: `Cargo.toml` pulls in no `rift_cluster_base` /
 /// `rift_http_proxy` types on purpose — this crate drives real processes over
 /// plain HTTP, so a route table is built as JSON at the call site, the same
 /// as an imposter config via [`put_imposter_config`].
@@ -960,7 +960,7 @@ pub const SOURCES_CLUSTER_HOST_PORTS: [u16; 3] = [14790, 24790, 34790];
 
 /// The counting origin's admin API, as `sources.overlay.yml` publishes it.
 ///
-/// The origin is a fourth `rift-ee-server`, run **un-clustered**, whose imposter
+/// The origin is a fourth `rift-cluster-server`, run **un-clustered**, whose imposter
 /// serves the very config documents the fleet fetches. Its Mountebank-compatible
 /// admin API therefore hands the harness an exact fetch counter for free:
 /// `GET /imposters/:port` reports `numberOfRequests`. That is what turns
@@ -1089,7 +1089,7 @@ pub fn exec_probe(container: &str, url: &str) -> bool {
         .args([
             "exec",
             container,
-            "rift-ee-server",
+            "rift-cluster-server",
             "healthcheck",
             "--url",
             url,

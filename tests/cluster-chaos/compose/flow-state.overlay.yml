@@ -33,7 +33,7 @@
 # `MB_ALLOW_INJECTION` is also scoped here, and that placement is the point.
 # Flow state is only reachable from a *script*, and upstream gates scripts
 # behind `--allowInjection` — which the shipped topology deliberately leaves
-# off, so a config that smuggles code in is refused (the enterprise write path
+# off, so a config that smuggles code in is refused (the cluster write path
 # has its own test for that gate failing closed). Turning it on in the base file
 # to satisfy one scenario would switch it on for the whole chaos tier and for
 # anyone reading that file as the reference deployment. Here it is on for the

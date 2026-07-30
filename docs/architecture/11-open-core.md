@@ -1,18 +1,18 @@
 # Chapter 11 — The Open-Core Boundary
 
-Rift-EE is layered on an unmodified, Apache-2.0 Rift. That sentence is a
+RiftCluster is layered on an unmodified, Apache-2.0 Rift. That sentence is a
 product commitment, an engineering discipline, and a build-system invariant —
 this chapter covers all three.
 
-## The shape: seams upstream, brains enterprise
+## The shape: seams upstream, brains cluster
 
 The open-source engine knows nothing about clusters. It exposes **generic
 extension seams** — traits with `Local` default implementations that preserve
-single-node behavior byte-for-byte — and the enterprise crates supply
+single-node behavior byte-for-byte — and the cluster crates supply
 cluster-aware implementations. All eight seams are merged upstream
 (`achird-labs/rift#311–#318`); Phase 0 of the program is *complete*:
 
-| Seam (upstream issue) | Upstream trait | Enterprise implementation |
+| Seam (upstream issue) | Upstream trait | Cluster implementation |
 |---|---|---|
 | #311 | `FlowStore::compare_and_set` (+`CasOutcome`) | atomic scenario transitions — also fixed an OSS race |
 | #312 | `FlowStoreProvider` | per-imposter `ClusteredFlowStore` injection |
@@ -20,12 +20,12 @@ cluster-aware implementations. All eight seams are merged upstream
 | #314 | `RequestJournal` (+ cursor reads #603) | sharded CRDT journal, vector cursors |
 | #315 | `ProxyRecordingStore` (claim/release) | owner claim state machine — also fixed a stuck-pending OSS bug |
 | #316 | `apply_config` + `ImposterEvent` + `stub_key` + `move_stub` | incremental reconcile as the Raft apply step |
-| #317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` | `rift-ee-server` composes instead of forking `main.rs` |
-| #318 | `BackendUnavailable` + `annotate()` + `ResponseDecorator` | every `Rift-Cluster-*` header, without OSS handlers knowing what a cluster is |
+| #317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` | `rift-cluster-server` composes instead of forking `main.rs` |
+| #318 | `BackendUnavailable` + `annotate()` + `ResponseDecorator` | every `Rift-Cluster-*` header, without core handlers knowing what a cluster is |
 
-The pattern in #318 deserves a sentence: enterprise backends *annotate* the
+The pattern in #318 deserves a sentence: cluster backends *annotate* the
 request task-locally ("degraded: kv-adopt", "revision: 421"), and an
-enterprise decorator translates annotations into response headers. The OSS
+cluster decorator translates annotations into response headers. The OSS
 handlers never learn cluster vocabulary — which is what keeps the seams
 honestly generic and upstreamable.
 
@@ -44,9 +44,9 @@ flowchart BT
         HP[rift-http-proxy]
         TY[rift-types]
     end
-    EE["rift-ee — the facade<br/>re-exports crates + rift_ee::seams"]
+    EE["rift-cluster-base — the facade<br/>re-exports crates + rift_cluster_base::seams"]
     CL["rift-cluster<br/>Raft, ring, RPC, stores, reconciler"]
-    SV["rift-ee-server (binary)<br/>CLI superset, composition"]
+    SV["rift-cluster-server (binary)<br/>CLI superset, composition"]
 
     MC --> EE
     HP --> EE
@@ -58,11 +58,11 @@ flowchart BT
     style EE fill:#fff3cd,stroke:#b8860b
 ```
 
-**`rift-ee` is the single doorway.** It alone carries path dependencies into
-the submodule; `rift-cluster` and `rift-ee-server` depend on `rift-ee` and
+**`rift-cluster-base` is the single doorway.** It alone carries path dependencies into
+the submodule; `rift-cluster` and `rift-cluster-server` depend on `rift-cluster-base` and
 nothing vendored. The consequence: reaching around the facade *fails to
 resolve* — the boundary is enforced by Cargo, not by review vigilance. A
-compile-time test in `rift-ee` (`seams_resolve`) names every re-exported seam,
+compile-time test in `rift-cluster-base` (`seams_resolve`) names every re-exported seam,
 so an upstream rename breaks loudly at the facade with a one-line fix, instead
 of surfacing as a confusing error deep in cluster code.
 
@@ -71,7 +71,7 @@ of surfacing as a confusing error deep in cluster code.
 upstream's internal construction *wholesale*, so `compose::cluster_manager`
 hand-mirrors it. A rename breaks the build, but an upstream **addition** — a
 new `with_*` inside the `None` arm — does not: the clustered path just silently
-stops getting it, at a pin bump, in a file nobody here edited. `rift-ee-server`'s
+stops getting it, at a pin bump, in a file nobody here edited. `rift-cluster-server`'s
 `manager_parity` test compares the set of builder calls at the two construction
 sites and fails naming the one that diverged (issue #30). When it fires during a
 bump, mirror the call into `cluster_manager` or record it in that test's
@@ -88,7 +88,7 @@ without its binary-only allocator default, with `redis-backend` / `javascript`
 
 `vendor/rift` is pinned to an exact commit; CI builds against the pin, and a
 daily job proposes bumps as reviewable PRs. Core changes are **never made
-here** — the flow for "enterprise feature needs a core capability" is: patch
+here** — the flow for "cluster feature needs a core capability" is: patch
 inside `vendor/rift` → `scripts/upstream-pr.sh` opens the PR against
 `achird-labs/rift` → merge upstream → `scripts/sync-upstream.sh` bumps the
 pin → build the cluster feature. The friction is the point: every generic
@@ -96,9 +96,9 @@ capability lands where every Rift user gets it, and this repo holds only what is
 genuinely cluster-specific. Both repos are Apache-2.0, so the boundary is about
 where code *belongs*, not about what is withheld.
 
-## What is enterprise, and why it holds
+## What is cluster, and why it holds
 
-Everything in `rift-cluster` and `rift-ee-server`: the Raft control plane and
+Everything in `rift-cluster` and `rift-cluster-server`: the Raft control plane and
 its storage, the ownership ring and fencing, HMAC RPC, the flow-state durable
 tier, the sharded journal and vector cursors, the proxyOnce owner machine, the
 Redis-strict backends, tenancy/RBAC/audit, `/_cluster/*`, the chaos harness
@@ -112,5 +112,5 @@ is genuinely hard to reproduce is the *system*: zero-dependency
 self-clustering with a durable, linearizable control plane; correctness under
 partition with an honest, tested degradation contract; cluster-merged
 verification; fleet operations. That is a product, not a patch — and pricing
-follows the product, with the OSS single node remaining genuinely excellent so
+follows the product, with the core single node remaining genuinely excellent so
 the funnel stays honest.

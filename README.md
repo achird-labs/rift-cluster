@@ -1,4 +1,4 @@
-# Rift Cluster
+# RiftCluster
 
 **Apache-2.0.** Distributed clustering for [Rift](https://github.com/achird-labs/rift) —
 an embedded Raft control plane, HRW flow-state ownership, and a server binary that
@@ -17,17 +17,17 @@ repositories are Apache-2.0 and nothing here is withheld from the core.
 > version and date attached to every number.
 
 ```
-rift-enterprise/
-├── Cargo.toml              # workspace: enterprise crates; vendor/rift excluded
-├── vendor/rift/            # git submodule → achird-labs/rift (read-only core)
+rift-cluster/
+├── Cargo.toml                  # workspace: cluster crates; vendor/rift excluded
+├── vendor/rift/                # git submodule → achird-labs/rift (read-only core)
 ├── crates/
-│   ├── rift-ee/            # enterprise facade: OSS crates + extension seams
-│   ├── rift-cluster/       # distributed clustering (control plane, membership)
-│   └── rift-ee-server/     # the enterprise binary: OSS server + cluster backends
+│   ├── rift-cluster-base/      # facade: core crates + the upstream extension seams
+│   ├── rift-cluster/           # distributed clustering (control plane, membership)
+│   └── rift-cluster-server/    # the binary: core server + cluster backends
 ├── deploy/
-│   ├── Dockerfile          # the rift-ee-server image
-│   ├── compose/            # a real 3-node cluster, with a verify script
-│   └── k8s/                # StatefulSet + Services + probes
+│   ├── Dockerfile              # the rift-cluster-server image
+│   ├── compose/                # a real 3-node cluster, with a verify script
+│   └── k8s/                    # StatefulSet + Services + probes
 ├── scripts/
 │   ├── sync-upstream.sh    # bump vendor/rift to upstream master
 │   └── upstream-pr.sh      # open a cross-repo PR against public Rift
@@ -39,16 +39,16 @@ rift-enterprise/
 ## Quick start
 
 ```sh
-git clone --recurse-submodules git@github.com:achird-labs/rift-enterprise.git
-cd rift-enterprise
+git clone --recurse-submodules git@github.com:achird-labs/rift-cluster.git
+cd rift-cluster
 cargo check --workspace
 ```
 
-Run the enterprise server — identical to the open-source `rift` without
+Run the cluster server — identical to the open-source `rift` without
 `--cluster`, a cluster node with it:
 
 ```sh
-cargo run -p rift-ee-server -- --port 2525 --datadir ./data
+cargo run -p rift-cluster-server -- --port 2525 --datadir ./data
 ```
 
 Or run a real 3-node cluster:
@@ -57,7 +57,7 @@ Or run a real 3-node cluster:
 deploy/compose/verify.sh   # builds, starts 3 nodes, asserts they form one cluster
 ```
 
-See [`docs/rift-ee-server.md`](docs/rift-ee-server.md) for its flags, startup
+See [`docs/rift-cluster-server.md`](docs/rift-cluster-server.md) for its flags, startup
 guards, probes and the `/_cluster/*` operator surface,
 [`deploy/README.md`](deploy/README.md) for containers and Kubernetes, and
 [`docs/dev-workflow.md`](docs/dev-workflow.md) for syncing the core, adding
@@ -65,12 +65,12 @@ features, and the cross-repo PR flow.
 
 ## Crate layout
 
-The vendored core publishes its engine as **`rift-mock-core`** and its server
-layer as **`rift-http-proxy`**. Enterprise crates never depend on either
-directly: `rift-ee` re-exports both, along with the upstream extension seams
-(`rift_ee::seams`) that enterprise backends implement. Depending only on
-`rift-ee` is what keeps the open-core boundary checkable by Cargo rather than by
-convention.
+The vendored core publishes its engine as **`rift-mock-core`** and its server layer
+as **`rift-http-proxy`**. Cluster crates never depend on either directly:
+`rift-cluster-base` re-exports both, along with the upstream extension seams
+(`rift_cluster_base::seams`) that cluster backends implement. Depending only on
+`rift-cluster-base` is what keeps that boundary checkable by Cargo rather than by
+convention — it is a dependency-hygiene rule, not a licence one.
 
 ## Licensing
 

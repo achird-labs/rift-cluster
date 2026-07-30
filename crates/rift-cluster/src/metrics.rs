@@ -784,7 +784,7 @@ mod tests {
     }
 
     /// Issue #9: the config-sync families reach the global registry (the one
-    /// the OSS `/metrics` endpoint serves), and the resampled gauges converge
+    /// the core `/metrics` endpoint serves), and the resampled gauges converge
     /// to the sampled truth rather than accumulating drift.
     #[test]
     fn config_sync_families_reach_the_registry() {
