@@ -184,7 +184,21 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
                     }
                     None => serde_json::Value::Null,
                 };
-                reported.push(serde_json::json!({ "port": port, "config": config }));
+                // `bind_failure` is what makes this endpoint the per-`(port, node)` view RFC-001
+                // §7.4.6 promises. Bind status is a node-local observation — it cannot ride the
+                // deterministic raft apply — so it is reported by each node about itself, here and
+                // in `rift_cluster_bind_failures`, rather than replicated. Absent (`null`) is the
+                // healthy answer; present means the node holds the config and serves the imposter
+                // in-process but never bound its port.
+                //
+                // Sourced from `bind_failure`, not the general `apply_failures` map, so a parse or
+                // stub-patch failure is never mislabelled as bind divergence — see
+                // `RedbStateMachine::bind_failure`.
+                reported.push(serde_json::json!({
+                    "port": port,
+                    "config": config,
+                    "bind_failure": node.bind_failure(port),
+                }));
             }
             Ok(serde_json::json!({ "imposters": reported }))
         }),

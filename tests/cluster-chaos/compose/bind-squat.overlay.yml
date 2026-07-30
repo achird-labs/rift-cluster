@@ -1,0 +1,80 @@
+# Overlay: squat rift-2's imposter port from OUTSIDE rift-2 entirely, inside
+# its own network namespace only -- the container-tier fixture for
+# `c19_front_door_routes_around_bind_divergence` (issue #143, RFC-001
+# §7.4.6).
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/front-door.overlay.yml \
+#                    -f tests/cluster-chaos/compose/bind-squat.overlay.yml up
+#
+# `Cluster::up_with_overlays(&["front-door.overlay.yml", "bind-squat.overlay.yml"])`
+# does this. Front door too, not just this overlay: the scenario's dividend is
+# dispatch through rift-2's own `--front-door` listener, which only exists
+# under that overlay.
+#
+# `crates/rift-ee-server/tests/bind_divergence.rs` already proves the
+# in-process half of the #143 dividend, with the squat as a plain listener
+# inside that test's own process. This overlay is the same collision for
+# real: a process outside rift-2 holds the port before rift-2's own
+# `ImposterManager` ever tries to bind it, the way an unrelated deployment on
+# the same host would.
+#
+# `network_mode: "service:rift-2"`, not a published host port and not its own
+# address on the shared `rift` network: the squatter has to occupy the port
+# *inside rift-2's own network namespace*, because that namespace's bind is
+# the only one under test. Giving it a separate address would let it hold the
+# port somewhere rift-2 never binds, and the scenario would pass without
+# exercising anything -- the same failure mode the in-process test's own doc
+# comment calls out for loopback-vs-wildcard squats on macOS. rift-1 and
+# rift-3 never share a namespace with the squatter, so their binds are
+# untouched, which is what lets the scenario also prove that a node whose
+# bind succeeded keeps serving normally rather than only that the squatted
+# one degrades.
+#
+# The shipped rift image is `debian:bookworm-slim` with only the rift binary
+# -- no `nc`, no shell utilities to squat a port with -- so the squatter
+# brings its own: `alpine/socat`, pinned by digest for the same reason
+# `toxiproxy` and `envoy` are in the chaos overlay: a new public image is a
+# new supply-chain surface to review and rotate, so it is pinned rather than
+# left floating on a tag.
+#
+# Ordering, made provable rather than assumed. `network_mode: "service:rift-2"`
+# means the squatter needs rift-2's network namespace to attach to, which only
+# exists once rift-2's own container has started -- so the dependency can only
+# run rift-2 -> squatter here; rift-2 waiting on the squatter's health would be
+# a cycle. The squatter's own healthcheck (a real connect to the port it just
+# bound) closes the loop from the other side: `c19_front_door_routes_around_
+# bind_divergence` polls this container's health over `docker inspect` and
+# does not write the imposter config until it reports healthy, so the squat is
+# confirmed held -- not merely scheduled -- before the write that depends on
+# it.
+#
+# Container-side port only, never published to the host: publishing a new
+# port would either land inside Linux's ephemeral source-port range or force
+# a choice that dodges it, dragging in the `net.ipv4.ip_local_reserved_ports`
+# reservation step and the `ci_reserves_every_published_port_that_linux_could_
+# hand_out` guard test for a port nothing outside the fleet needs to reach --
+# every assertion in the scenario goes through the front door or the metrics
+# port, never this one directly. 6520 continues the imposter-port numbering
+# this file's other scenarios use (C17/C18 sit at 6500-6512, C20-C23 at
+# 6610-6640); nothing else in this tier binds it.
+
+services:
+  bind-squat:
+    image: alpine/socat@sha256:f134cb7ebb983f971f5deb44e92bc62c1385b0a3b525393f32dd0722acc30315
+    container_name: bind-squat
+    network_mode: "service:rift-2"
+    depends_on:
+      rift-2:
+        condition: service_started
+    # `fork` so it accepts more than one connection; `reuseaddr` so a rerun of
+    # the stack does not trip over a socket still draining from the last one.
+    # The second address is a sink -- nothing in this scenario expects a reply
+    # from the squatter itself, only that the port is held.
+    command: ["-d", "-d", "TCP-LISTEN:6520,fork,reuseaddr", "/dev/null"]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "6520"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s

@@ -1251,6 +1251,12 @@ fn cluster_manager(
         })
         .with_accept_runtimes(accept_runtimes)
         .with_response_decorator(Arc::new(ClusterDecorator))
+        // RFC-001 §7.4.6 (issue #143): an imposter exists cluster-wide regardless of whether any
+        // one node could bind its port, so a node that loses the port to an unrelated process must
+        // still serve it in-process rather than 404 an imposter the cluster considers to exist.
+        // Cluster-only, like everything else in this function — the `--cluster`-off path never
+        // reaches it, so the OSS all-or-nothing create is untouched.
+        .with_serve_unbound(true)
         .with_no_match_interceptor(pull_on_miss)
         // Every imposter on a cluster node gets the clustered flow store,
         // configured or not: scenario state on a process-local store behind a

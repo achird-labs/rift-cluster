@@ -59,6 +59,14 @@ const ENTERPRISE_ADDITIONS: &[&str] = &[
     // #120). Unconditional under --cluster by design: a process-local store is
     // wrong for every imposter there, not just the configured ones.
     "with_flow_store_provider",
+    // An imposter exists cluster-wide regardless of whether any one node could
+    // bind its port, so a node that loses the port to an unrelated process
+    // registers the imposter anyway and serves it in-process rather than 404ing
+    // something the cluster holds (RFC-001 §7.4.6, issue #143). Clustered only:
+    // upstream's direct-create contract stays all-or-nothing, and the flag does
+    // not change it even here — it applies to the apply/reconcile path, which is
+    // the only way an imposter reaches a clustered node's engine.
+    "with_serve_unbound",
 ];
 
 /// Upstream builder calls the clustered path deliberately declines to mirror.

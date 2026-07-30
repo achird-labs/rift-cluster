@@ -63,7 +63,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use rift_cluster::audit_export::ExportStatus;
 use rift_cluster::control::Role;
 use rift_cluster::control::{self, ControlOp, ControlRequest, StubEdit, StubEditScript};
-use rift_cluster::decorate::{HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS};
+use rift_cluster::decorate::{
+    HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS,
+};
 use rift_cluster::{ControlOutcome, ControlResponse, NodeError, RaftNode, TenantId};
 use rift_ee::seams::{
     ErrorKind, ImposterConfig, RiftScriptConfig, RouteTable, SCOPE_HEADER, ScriptBaseDir, Stub,
@@ -586,7 +588,15 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                 // this, every proxied request for a principal not *also*
                 // bound to `default` would clear this gate and then be
                 // refused a second time at the loopback for the wrong reason.
-                Ok((tenant, ..)) => return proxy(state, req, Some(&tenant)).await,
+                Ok((tenant, ..)) => {
+                    // Read the marker's inputs before `state` and `req` move into `proxy`.
+                    let degraded = local_bind_failure(&state, &target.params);
+                    let mut response = proxy(state, req, Some(&tenant)).await;
+                    if let Some(reason) = degraded {
+                        set_header(&mut response, HEADER_BIND_FAILURES, &reason);
+                    }
+                    return response;
+                }
                 Err(response) => return response,
             }
         }
@@ -860,6 +870,44 @@ fn requested_tenant(req: &Request<Incoming>) -> TenantId {
 /// forwarding it untouched — see the removal below for why: it is the same
 /// confused-deputy hazard `set_scope_header` closes for the `Some` case,
 /// just reached by a different caller.
+/// `<port>=<reason>` when this node could not realize the addressed imposter's port, else `None`
+/// (issue #143).
+///
+/// This is what makes a `200` from a bind-diverged node honest. The imposter is in the local port
+/// map and answers every in-process route, so the read genuinely succeeds — but on *this* node it
+/// is reachable only through the front door and the gateway, never on its own port, and nothing in
+/// the OSS-shaped response body says so. The body stays OSS-shaped deliberately (the U-8 seam is
+/// headers-only), so the divergence is reported as a header.
+///
+/// Absent when the port is healthy: a marker on every read would be noise, not a signal.
+fn local_bind_failure(state: &FrontState, params: &[(&'static str, String)]) -> Option<String> {
+    // Domain-optional parse: most admin routes carry no `port` param at all, and one that is not a
+    // `u16` is not an imposter port. Either way the answer is "no marker", and the marker is a
+    // diagnostic header — never the status or the body — so its absence cannot turn a refusal into
+    // an acceptance. The read itself is authorized and served upstream regardless of this function.
+    let port: u16 = params
+        .iter()
+        .find(|(name, _)| *name == "port")
+        .and_then(|(_, value)| value.parse().ok())?;
+    let Some(node) = state.node.upgrade() else {
+        // Loud rather than quiet: everywhere else in this file a dead node handle is an explicit
+        // 503, and this is the one place it would instead mean "no marker" — i.e. a possibly
+        // degraded node answering 200 with nothing saying so. The read itself is already served, so
+        // failing it now would be worse; a warning is what keeps the omission traceable.
+        tracing::warn!(
+            port,
+            "cluster node handle is gone; cannot report whether this port is bind-diverged"
+        );
+        return None;
+    };
+    // `bind_failure`, NOT `apply_failures`: only a port the engine holds but never bound is serving
+    // in-process, which is what this header asserts. The general failure map also carries parse,
+    // enable and stub-patch failures, and for those the imposter is not in the map at all — marking
+    // such a read as bind divergence would point an operator at the wrong cause entirely.
+    let reason = node.bind_failure(port)?;
+    Some(format!("{port}={reason}"))
+}
+
 async fn proxy(
     state: Arc<FrontState>,
     req: Request<Incoming>,

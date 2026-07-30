@@ -28,9 +28,9 @@
 #
 # Imposter data ports are deliberately NOT published here: the front door
 # dispatches to them in-process (`dispatch_to_port` against the local
-# `ImposterManager`, never a socket — see RFC-001 §7.4.6's corrected note and
-# issue #143), so every assertion goes through the front-door port and never
-# touches an imposter port directly.
+# `ImposterManager`, never a socket — including on a node whose own explicit
+# bind failed, per RFC-001 §7.4.6 and issue #143 — so every assertion goes
+# through the front-door port and never touches an imposter port directly.
 
 services:
   rift-1:

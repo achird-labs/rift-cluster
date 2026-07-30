@@ -956,15 +956,24 @@ control-plane object**, exactly like the imposter config set.
   — routes have no per-record port to qualify it with, so there is no
   `If-Match` support for them either) and `Rift-Cluster-Op-Id`, and follows
   the same `--cluster-write-barrier` semantics as every other mutating route.
-- **Bind-divergence dividend (§7.4.6): designed, not built (#143).** The front
-  door dispatches into the manager in-process (`dispatch_to_port`), so *if* a
-  node's own bind failure left an entry in the imposter map, dispatch would
-  reach it without touching a socket. It does not: `ImposterManager::create_imposter`
-  binds first and returns `Err(BindError)` **before** the imposter is ever
-  inserted into the port table, so a node whose bind failed has no map entry
-  at all, and the front door 404s on that node exactly like the gateway does.
-  Checked at #132's implementation time — this bullet previously claimed the
-  dividend as built; it is not. See RFC-001 §7.4.6's corrected note and #143.
+- **Bind-divergence dividend (§7.4.6): built (#143).** The front door dispatches
+  into the manager in-process (`dispatch_to_port`), so a node whose own bind
+  failure left an entry in the imposter map reaches it without touching a
+  socket. Under `--cluster`, `cluster_manager` sets
+  `ImposterManager::with_serve_unbound(true)`: an apply-path create whose
+  explicit port hits `Err(BindError)` no longer drops the imposter — it
+  registers it with no listener, reported under `ApplyReport::failed` (never
+  `created`) and cleared by the next apply once the port frees up (rebind
+  healing). A port-addressed admin read of that imposter — `GET
+  /imposters/:port` through the clustered front — answers its normal `200`
+  plus `rift-cluster-bind-failures: <port>=<reason>`; the response body stays
+  OSS-shaped, so the divergence is a header only. Two things stay
+  all-or-nothing regardless of the flag: `create_imposter` (the direct,
+  non-apply path) and any bind failure that isn't a plain `BindError` on an
+  explicit port (`PortInUse`, or an auto-assigned port — which `--cluster`
+  refuses outright at `400` rather than minting one). Checked at #132's
+  implementation time, this bullet previously said the dividend was designed
+  but not built; #143 built it. See RFC-001 §7.4.6.
 
 With `--cluster` off, none of this exists: `--front-door` behaves exactly as
 it does in the open-source binary, which is what the `parity` CI job checks.

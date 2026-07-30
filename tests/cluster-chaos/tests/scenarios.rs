@@ -1452,9 +1452,12 @@ async fn c6_loss_and_jitter_do_not_flap_or_lose_writes() {
     }
 
     for node in &NODES {
+        // A scrape failure is not evidence of zero. `unwrap_or(0.0)` under an `== 0.0` assertion
+        // makes an unreachable node — crashed, partitioned — read as a clean pass, which is the
+        // one direction this check must never fail in.
         let pending = metric(node.metrics, "rift_cluster_intents_pending")
             .await
-            .unwrap_or(0.0);
+            .unwrap_or_else(|e| panic!("{}: metrics endpoint did not answer: {e}", node.name));
         assert_eq!(pending, 0.0, "{} still has parked intents", node.name);
     }
     drop(cluster);
@@ -1633,9 +1636,11 @@ async fn test_reconcile_preserves_state() {
     );
 
     for node in &NODES {
+        // Same reason as the `intents_pending` check above: a node whose `/metrics` cannot be read
+        // must fail this assertion, not satisfy it by defaulting to the value being asserted.
         let failures = metric(node.metrics, r#"rift_cluster_bind_failures{port="0"}"#)
             .await
-            .unwrap_or(0.0);
+            .unwrap_or_else(|e| panic!("{}: metrics endpoint did not answer: {e}", node.name));
         assert_eq!(failures, 0.0, "{} reported a bind failure", node.name);
     }
     drop(cluster);
@@ -2208,11 +2213,9 @@ async fn c15_flow_state_survives_a_full_cluster_restart() {
 }
 
 // ---------------------------------------------------------------------------
-// C17/C18: the front door's route table, end to end (#132, closing #19's
-// cluster-level acceptance list). C19 (the §7.4.6 bind-divergence dividend)
-// is deliberately not here — its premise does not hold against the code as
-// written (see RFC-001 §7.4.6's corrected note); it is filed as #143 instead
-// of asserting today's accidental behaviour as if it were a contract.
+// C17-C19: the front door's route table, and the imposter map it dispatches
+// through, end to end (#132/#143, closing #19's cluster-level acceptance
+// list).
 // ---------------------------------------------------------------------------
 
 /// C17's two imposters, each answering with a distinct body so a dispatched
@@ -2592,6 +2595,207 @@ async fn c18_routes_survive_a_full_cluster_restart() {
             node.name
         );
     }
+}
+
+/// The imposter port `bind-squat.overlay.yml` squats inside rift-2's network
+/// namespace only. Not published to the host -- see that overlay's header for
+/// why. 6520 continues the numbering C17/C18 (6500-6512) and C20-C23
+/// (6610-6640) already use in this file; nothing else in this tier binds it.
+const C19_IMPOSTER_PORT: u16 = 6520;
+
+/// Poll `docker inspect` until `name`'s healthcheck reports `healthy`, or bail
+/// at the deadline.
+///
+/// This is what makes the squat in `bind-squat.overlay.yml` provable rather
+/// than assumed. Compose cannot express "rift-2 waits on the squatter": the
+/// squatter needs rift-2's network namespace to attach to
+/// (`network_mode: "service:rift-2"`), which only exists once rift-2's own
+/// container has started, so the compose-graph dependency has to run
+/// rift-2 -> squatter, not the other way -- rift-2 waiting on the squatter
+/// would be a cycle. Gating the *test* on the squatter's own healthcheck (a
+/// real connect to the port it just bound) closes the loop from the other
+/// side: nothing here writes the imposter config until this returns, so the
+/// squat is confirmed held, not merely scheduled, before the write that
+/// depends on it.
+async fn wait_container_healthy(name: &str, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(output) = std::process::Command::new("docker")
+            .args(["inspect", "--format", "{{.State.Health.Status}}", name])
+            .output()
+            && output.status.success()
+            && String::from_utf8_lossy(&output.stdout).trim() == "healthy"
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("{name} never reported healthy within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// **C19: a node whose explicit bind fails still serves the imposter through
+/// its own front door -- the container-tier proof of the issue #143 /
+/// RFC-001 §7.4.6 dividend.**
+///
+/// `crates/rift-ee-server/tests/bind_divergence.rs` already proves the
+/// in-process half of this: there, the squat is a plain listener inside the
+/// test's own process. This is the same collision for real, across a real
+/// three-node stack: `bind-squat.overlay.yml` runs an `alpine/socat` sidecar
+/// *inside rift-2's network namespace* (`network_mode: "service:rift-2"`), so
+/// the port is held by a process outside rift-2 entirely, the way an
+/// unrelated deployment on the same host would hold it -- and only inside
+/// rift-2's namespace, so rift-1 and rift-3 bind the same port cleanly.
+///
+/// `wait_container_healthy` is what stops this from being a race that passes
+/// by luck: it blocks on the squatter's own healthcheck before the imposter
+/// write below, so the port is provably held before the write that depends on
+/// it rather than merely started first in the compose graph.
+///
+/// The write itself is the first assertion that matters: `201`, not the `404`
+/// a bind-failed node used to answer before #143, because every node
+/// constructs the imposter and claims the port in its map regardless of
+/// whether the local bind succeeded (`with_serve_unbound(true)`, set only by
+/// the enterprise cluster composition). `wait_converged` reads exactly that
+/// map (`GET /imposters`), so it converges fleet-wide despite the squat --
+/// convergence of the *config*, not of the bind.
+///
+/// The bind failure is still reported, not hidden: rift-2's own
+/// `rift_cluster_bind_failures` gauge for this port is checked before the
+/// dividend, so a scenario run against a node that silently stopped reporting
+/// degraded state would fail here rather than being masked by the dispatch
+/// passing anyway.
+///
+/// Two dispatch checks, not one, because divergence is the claim: rift-2 (the
+/// squatted node, `FRONT_DOOR_HOST_PORTS[1]`) must serve the imposter
+/// in-process despite never holding the socket, and rift-1
+/// (`FRONT_DOOR_HOST_PORTS[0]`, bind succeeded) must keep serving it
+/// normally. Only the first check would leave open the possibility that the
+/// whole stack degraded uniformly rather than diverged.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c19_front_door_routes_around_bind_divergence() {
+    let _cluster = Cluster::up_with_overlays(&["front-door.overlay.yml", "bind-squat.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+
+    wait_container_healthy("bind-squat", Duration::from_secs(60))
+        .await
+        .expect("the squatter holds rift-2's imposter port before the write below");
+
+    let (status, body) = put_imposter_config(
+        NODES[0].admin,
+        &serde_json::json!({
+            "port": C19_IMPOSTER_PORT,
+            "protocol": "http",
+            "stubs": [{
+                "responses": [{ "is": { "statusCode": 200, "body": "served-while-unbound" } }],
+            }],
+        }),
+    )
+    .await
+    .expect("admin write");
+    assert_eq!(
+        status, 201,
+        "the imposter must exist cluster-wide regardless of rift-2's local bind \
+         -- not the 404 a bind-failed node answered before #143: {body}"
+    );
+
+    wait_converged(u64::from(C19_IMPOSTER_PORT), CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("imposter {C19_IMPOSTER_PORT} did not converge despite the squat: {e}")
+        });
+
+    // Polled, not read once. `wait_converged` proves the *config* reached every node's map, which
+    // is a different event from the local apply having recorded its bind outcome, and this tier's
+    // single-shot timing assertions are its main flake source. A bounded poll asserts the same
+    // thing without pinning the order of two events nothing guarantees the order of.
+    //
+    // A scrape error is distinguished from a genuine `0`: collapsing both into `0.0` would let a
+    // fleet that never exposed the gauge at all fail with "did not report the bind failure", which
+    // sends the next reader looking in the wrong place.
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    let family = format!(r#"rift_cluster_bind_failures{{port="{C19_IMPOSTER_PORT}"}}"#);
+    loop {
+        let sample = metric(NODES[1].metrics, &family)
+            .await
+            .unwrap_or_else(|e| panic!("rift-2's metrics endpoint did not answer: {e}"));
+        if sample == 1.0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rift-2 never reported the bind failure the squat should have caused \
+             (last sample {sample})"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let (status, body) = put_routes(
+        NODES[0].admin,
+        &serde_json::json!({
+            "routes": [{
+                "id": "svc",
+                "match": { "path_prefix": "/svc" },
+                "target": { "port": C19_IMPOSTER_PORT },
+            }],
+        }),
+    )
+    .await
+    .expect("put routes");
+    assert_eq!(status, 200, "route write was refused: {body}");
+
+    // The dividend: rift-2's OWN front door -- the node whose bind failed --
+    // serves the imposter anyway, dispatched in-process.
+    let (dispatch_status, _headers, dispatch_body) =
+        get_data_plane_with(FRONT_DOOR_HOST_PORTS[1], "/svc/anything", &[])
+            .await
+            .expect("dispatch through rift-2's own front door");
+    assert_eq!(
+        dispatch_status, 200,
+        "rift-2 did not serve the imposter it could not bind"
+    );
+    assert_eq!(
+        dispatch_body, "served-while-unbound",
+        "rift-2 served the wrong body for the imposter it could not bind"
+    );
+
+    // The other in-process route §7.4.6 promises. The front door resolves a route table first;
+    // the gateway addresses the port directly. Both land in `get_imposter`, but they are distinct
+    // paths to it, so the front-door assertion above does not prove this one -- break the gateway
+    // lookup for an unbound imposter and only this check goes red.
+    let (gateway_status, _headers, gateway_body) = get_data_plane_with(
+        NODES[1].admin,
+        &format!("/__rift/{C19_IMPOSTER_PORT}/anything"),
+        &[],
+    )
+    .await
+    .expect("dispatch through rift-2's gateway prefix");
+    assert_eq!(
+        gateway_status, 200,
+        "rift-2's gateway route did not serve the imposter it could not bind"
+    );
+    assert_eq!(
+        gateway_body, "served-while-unbound",
+        "rift-2's gateway route served the wrong body"
+    );
+
+    // Divergence, not uniform breakage: rift-1's bind succeeded, and it must
+    // still serve the same imposter normally through its own front door.
+    let (healthy_status, _headers, healthy_body) =
+        get_data_plane_with(FRONT_DOOR_HOST_PORTS[0], "/svc/anything", &[])
+            .await
+            .expect("dispatch through rift-1's own front door");
+    assert_eq!(
+        healthy_status, 200,
+        "rift-1, whose bind succeeded, must still serve the imposter normally"
+    );
+    assert_eq!(
+        healthy_body, "served-while-unbound",
+        "rift-1 served the wrong body for the imposter"
+    );
 }
 
 // ---------------------------------------------------------------------------
