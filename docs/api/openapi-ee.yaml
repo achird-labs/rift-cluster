@@ -1,0 +1,2949 @@
+openapi: 3.1.0
+info:
+  title: Rift Cluster Admin API
+  version: 0.1.0
+  description: >
+    The admin surface of a clustered Rift node (`--cluster`), as served by the
+    admin front (`crates/rift-cluster-server/src/admin_front.rs`).
+
+    The front sits in front of the embedded upstream engine's own loopback
+    admin API. Every operation below carries `x-rift-origin`:
+
+    - `ee`: terminated by this cluster layer — turned into a `ControlOp`,
+      committed to the Raft log, and (for imposter/stub/route writes)
+      rendered by re-reading the just-applied state through the loopback
+      admin. Tenancy, audit, and `/front-door/routes` have no upstream
+      equivalent at all and terminate here in full, reads included.
+    - `upstream`: reverse-proxied byte-for-byte to the embedded engine's own
+      admin API after this front's authentication/authorization gate runs.
+
+    Concurrency and idempotency (see the module doc in `admin_front.rs`):
+    a single-imposter write may carry `If-Match` naming the revision it
+    expects (either the exact `Rift-Cluster-Revision` token or a bare
+    revision integer). Absent, a write is last-writer-wins. A stale or
+    mismatched `If-Match` answers `409`; a collection-wide mutation
+    (`PUT /imposters`, `DELETE /imposters`) cannot carry one and answers
+    `400` if it tries. `Idempotency-Key` mints a deterministic op id so a
+    retried request dedups to the original committed response rather than
+    re-applying.
+
+    Async writes: when the node runs with `--cluster-admin-async`, a
+    terminated mutation may answer `202 Accepted` with an op id instead of
+    the usual success code, and the write finishes in the background —
+    poll the op id rather than assuming the body reflects committed state.
+
+    Tenant isolation (RFC-002 §8.4): a request that names a resource
+    belonging to another tenant — a port, a route id, a tenant record the
+    caller holds no binding in — answers `404`, byte-identical to a
+    resource that genuinely does not exist. This is deliberate: a `403`
+    would let a caller enumerate which resources exist under tenants they
+    cannot see, just by noting which probes 403 instead of 404. A `403`
+    instead means the caller IS bound to the tenant named but its role
+    does not grant the action.
+
+    Availability: `503` is not limited to mutations — a node that is
+    shutting down answers `503` to every operation, including reads,
+    because authentication itself runs behind the same gate. A clustered
+    write additionally answers `503` when it cannot reach quorum, and
+    `504` when it cannot commit within its deadline (the write's outcome
+    is then unknown, not failed).
+
+    `/__rift/{port}/*` is served on the admin port too, as data-plane
+    gateway traffic proxied straight to the imposter on that port. It is
+    deliberately outside this contract and auth-exempt (RFC-002 §7), so
+    it is not documented here.
+servers:
+  - url: /
+security:
+  - apiKeyAuth: []
+tags:
+  - name: imposters
+    description: Imposter and stub CRUD (config-mutating routes terminate here; runtime-state reads/writes proxy to upstream).
+  - name: front-door
+    description: The clustered front door's own route table (issue #131) — no upstream equivalent.
+  - name: tenancy
+    description: RFC-002 §5 tenants, principals, and bindings — no upstream equivalent.
+  - name: audit
+    description: RFC-002 §9 audit stream and export sink — no upstream equivalent.
+  - name: meta
+    description: Identity and contract introspection.
+  - name: upstream-core
+    description: Proxied verbatim to the embedded engine's own admin API.
+
+paths:
+  # ---------------------------------------------------------------------
+  # ee: imposters (collection)
+  # ---------------------------------------------------------------------
+  /imposters:
+    post:
+      operationId: createImposter
+      summary: Create a clustered imposter
+      description: >
+        Terminates: commits a `PutImposter` op and answers `201` rendered
+        from re-reading the just-applied state. The port must be given
+        explicitly in the body — an auto-assigned port cannot replicate
+        across the fleet. May answer `202` with an op id under
+        `--cluster-admin-async`. Carries a port, so it honours `If-Match`
+        like any other single-imposter write.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Imposter'
+      responses:
+        '201':
+          description: Imposter created; body is the stored imposter.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the tenant named (`X-Rift-Tenant` or
+            default) — indistinguishable from that tenant not existing
+            (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    put:
+      operationId: replaceAllImposters
+      summary: Replace the caller's tenant's whole imposter set
+      description: >
+        Terminates: reconciles the tenant's configured imposters toward the
+        given set — upserts every listed imposter, then prunes whatever
+        this tenant owns that was left out (`{"imposters":[]}` deletes
+        everything). Destructive regardless of method, so this requires
+        `ImposterDelete`, not merely `ImposterWrite` — an Editor who may
+        write but not delete cannot reach it through this route. Cannot
+        carry `If-Match` (no single record to condition a whole-set replace
+        on); sending one answers `400`.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                imposters:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Imposter'
+      responses:
+        '200':
+          description: The reconciled set, re-read post-commit.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imposters:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the tenant named (`X-Rift-Tenant` or
+            default) — indistinguishable from that tenant not existing
+            (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    delete:
+      operationId: deleteAllImposters
+      summary: Delete the caller's tenant's whole imposter set
+      description: >
+        Terminates: commits a `DeleteAll` op for the authorized tenant and
+        answers with what was removed, captured before the delete commits.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: What was deleted.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imposters:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the tenant named (`X-Rift-Tenant` or
+            default) — indistinguishable from that tenant not existing
+            (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    get:
+      operationId: listImposters
+      summary: List imposters (upstream, filtered to the caller's owned ports)
+      description: >
+        Proxied to the embedded engine's own admin API, which now binds
+        every tenant's imposters in-process — this front filters the
+        response body down to ports the caller's tenant owns before
+        returning it, since the engine has no tenant concept of its own.
+        Runs the same tenant-binding gate as every other route, so an
+        unbound `X-Rift-Tenant` claim answers `404` (RFC-002 §8.4).
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The caller's tenant's imposters.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imposters:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Imposter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the tenant named — indistinguishable
+            from that tenant not existing (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------
+  # ee: single imposter delete / upstream: single imposter read
+  # ---------------------------------------------------------------------
+  /imposters/{port}:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    delete:
+      operationId: deleteImposter
+      summary: Delete one imposter
+      description: >
+        Terminates: mirrors upstream's own semantics — deleting an absent
+        imposter answers `404` and commits nothing (keeps the log free of
+        no-ops). A cross-tenant port answers the same indistinguishable
+        `404` (RFC-002 §8.4), not `403`, so a probe sweeping port numbers
+        cannot tell "someone else's" from "nobody's".
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The deleted imposter, as it was just before removal.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            No such imposter on this port for the caller's tenant — either
+            it genuinely does not exist, or it belongs to a different
+            tenant. The two are byte-identical by design (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    get:
+      operationId: getImposter
+      summary: Read one imposter (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The imposter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            No such imposter for this tenant — genuinely absent, or owned
+            by another tenant (RFC-002 §8.4's indistinguishable 404).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /imposters/{port}/enable:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    post:
+      operationId: enableImposter
+      summary: Enable a paused imposter
+      description: >
+        Terminates: commits a `SetEnabled(true)` op. Config-since-upstream
+        #817: a pause must survive restarts and converge fleet-wide, so
+        enable/disable is replicated state, not a local toggle. Carries a
+        port, so it honours `If-Match` like any other single-imposter
+        write.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Upstream's own canned message body, byte-identical.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Imposter enabled
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
+  /imposters/{port}/disable:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    post:
+      operationId: disableImposter
+      summary: Disable (pause) an imposter
+      description: >
+        Terminates: commits a `SetEnabled(false)` op. See `enableImposter`
+        for why this is replicated rather than local state, and for why
+        it honours `If-Match`.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Upstream's own canned message body, byte-identical.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Imposter disabled
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
+  # ---------------------------------------------------------------------
+  # ee: stub collection / upstream: stub reads
+  # ---------------------------------------------------------------------
+  /imposters/{port}/stubs:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    post:
+      operationId: addStub
+      summary: Append (or insert) one stub
+      description: >
+        Terminates: commits a `PatchStubs` `Add` edit and answers with the
+        re-read imposter. `index`, when given, inserts at that position
+        rather than appending. The one non-idempotent op in the stub set —
+        a replayed append would double the stub — which is why an
+        `Idempotency-Key` matters here more than on the other stub
+        mutations.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stub]
+              properties:
+                stub:
+                  $ref: '#/components/schemas/Stub'
+                index:
+                  type: integer
+                  minimum: 0
+                  description: Position to insert at; appends when omitted.
+      responses:
+        '200':
+          description: The imposter, re-read with the new stub applied.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    put:
+      operationId: replaceStubs
+      summary: Replace an imposter's whole stub list
+      description: >
+        Terminates: reads the stored config, replaces its `stubs`, and
+        commits the whole config as a `PutImposter` (there is no by-id
+        spelling for a whole-list replace in the op set).
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stubs]
+              properties:
+                stubs:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Stub'
+      responses:
+        '200':
+          description: The imposter, re-read with the new stub list.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    get:
+      operationId: listStubs
+      summary: List an imposter's stubs (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The stub list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stubs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Stub'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /imposters/{port}/stubs/{stubIndex}:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+      - name: stubIndex
+        in: path
+        required: true
+        description: Zero-based position of the stub in the imposter's stub list.
+        schema:
+          type: integer
+          minimum: 0
+    put:
+      operationId: replaceStubAt
+      summary: Replace the stub at an index
+      description: >
+        Terminates: index-addressed, so it commits as a full `PutImposter`
+        of the stored config with that one stub replaced. Answers `404`
+        if `stubIndex` is out of range.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Stub'
+      responses:
+        '200':
+          description: The imposter, re-read with the stub replaced.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter, no such stub index, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    delete:
+      operationId: deleteStubAt
+      summary: Delete the stub at an index
+      description: >
+        Terminates: index-addressed, commits as a full `PutImposter` with
+        that stub removed. Answers `404` if `stubIndex` is out of range.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The imposter, re-read with the stub removed.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter, no such stub index, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    get:
+      operationId: getStubAt
+      summary: Read the stub at an index (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The stub.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stub'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter, no such stub index, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /imposters/{port}/stubs/by-id/{stubId}:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+      - name: stubId
+        in: path
+        required: true
+        description: The stub's `id` field (Rift extension), stable across index-shifting edits.
+        schema:
+          type: string
+    put:
+      operationId: replaceStubById
+      summary: Replace a stub by its stable id
+      description: >
+        Terminates: commits a `PatchStubs` `ReplaceById` edit — unlike
+        index-addressed edits, this carries only the touched stub, not the
+        whole config, so it is unaffected by concurrent edits that shift
+        indices.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Stub'
+      responses:
+        '200':
+          description: The imposter, re-read with the stub replaced.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter, no such stub id, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    delete:
+      operationId: deleteStubById
+      summary: Delete a stub by its stable id
+      description: >
+        Terminates: commits a `PatchStubs` `DeleteById` edit. Unlike
+        `addStub`, a replayed request has the same effect as the first —
+        the id is either removed once or, on a retry after it is already
+        gone, the op fails with `404` — so it does not carry `addStub`'s
+        double-insert replay concern.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The imposter, re-read with the stub removed.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter, no such stub id, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    get:
+      operationId: getStubById
+      summary: Read a stub by its stable id (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The stub.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stub'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter, no such stub id, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------
+  # upstream: runtime state (saved requests, scenarios, spaces, verify)
+  # ---------------------------------------------------------------------
+  /imposters/{port}/savedRequests:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    get:
+      operationId: listSavedRequests
+      summary: List recorded requests for an imposter (upstream)
+      description: Node-local runtime state; not replicated (tracked by issue #16).
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Recorded requests.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      operationId: clearSavedRequests
+      summary: Clear recorded requests for an imposter (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Requests cleared.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /imposters/{port}/requests:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    get:
+      operationId: listRequests
+      summary: List matched requests for an imposter (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Matched requests.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    delete:
+      operationId: clearRequests
+      summary: Clear matched requests for an imposter (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Requests cleared.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /imposters/{port}/verify:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    post:
+      operationId: verifyImposter
+      summary: Run declared-expectation verification against recorded requests (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Verification result.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /imposters/{port}/savedProxyResponses:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    delete:
+      operationId: clearSavedProxyResponses
+      summary: Clear saved proxy responses for an imposter (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Cleared.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /imposters/{port}/scenarios:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    get:
+      operationId: listScenarios
+      summary: List scenario FSM state for an imposter (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Scenario states.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /imposters/{port}/scenarios/{scenarioName}/state:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+      - name: scenarioName
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      operationId: setScenarioState
+      summary: Set a scenario's FSM state (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: State set.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /imposters/{port}/scenarios/reset:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    post:
+      operationId: resetScenarios
+      summary: Reset every scenario's FSM state for an imposter (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Reset.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /imposters/{port}/spaces/{flowId}:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+      - $ref: '#/components/parameters/FlowId'
+    get:
+      operationId: getSpace
+      summary: Read one correlated-isolation space (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: The space.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      operationId: deleteSpace
+      summary: Tear down one correlated-isolation space (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Torn down.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /imposters/{port}/spaces/{flowId}/stubs:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+      - $ref: '#/components/parameters/FlowId'
+    get:
+      operationId: listSpaceStubs
+      summary: List stubs scoped to a space (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: The space's stubs.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stubs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Stub'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      operationId: addSpaceStub
+      summary: Add a stub scoped to a space (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Stub'
+      responses:
+        '200':
+          description: The stub added.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stub'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /admin/imposters/{port}/flow-state/{flowId}:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+      - $ref: '#/components/parameters/FlowId'
+    delete:
+      operationId: clearFlowState
+      summary: Clear all flow-state entries for a space (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Cleared.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/imposters/{port}/flow-state/{flowId}/{key}:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+      - $ref: '#/components/parameters/FlowId'
+      - name: key
+        in: path
+        required: true
+        description: The flow-state entry's key.
+        schema:
+          type: string
+    get:
+      operationId: getFlowStateEntry
+      summary: Read one flow-state entry (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: The entry's value.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      operationId: putFlowStateEntry
+      summary: Write one flow-state entry (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Written.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+    delete:
+      operationId: deleteFlowStateEntry
+      summary: Delete one flow-state entry (upstream)
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ---------------------------------------------------------------------
+  # ee: front door route table (issue #131) — no upstream equivalent
+  # ---------------------------------------------------------------------
+  /front-door/routes:
+    put:
+      operationId: putFrontDoorRoutes
+      summary: Replace the caller's tenant's front-door route table
+      description: >
+        Terminates: whole-table replace, deterministic and pre-validated
+        before commit, so the parsed table itself is what gets stored (no
+        post-commit re-read — there is no upstream `/front-door/routes` to
+        read from).
+      tags: [front-door]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RouteTable'
+      responses:
+        '200':
+          description: The stored table.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteTable'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the tenant named (`X-Rift-Tenant` or
+            default) — indistinguishable from that tenant not existing
+            (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    get:
+      operationId: getFrontDoorRoutes
+      summary: Read the caller's tenant's front-door route table
+      description: >
+        Terminates: this front door's only read path — a state-machine
+        read, not a mutation, so it never reaches the write classifier or
+        the proxy. There is no upstream `/front-door/routes` to fall back
+        on.
+      tags: [front-door]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The tenant's route table.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteTable'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the tenant named (`X-Rift-Tenant` or
+            default) — indistinguishable from that tenant not existing
+            (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /front-door/routes/{routeId}:
+    delete:
+      operationId: deleteFrontDoorRoute
+      summary: Delete one front-door route by id
+      description: >
+        Terminates: idempotent at the state-machine level, but the admin
+        surface still answers `404` for a route id that was never in the
+        caller's own tenant's table (captured before the delete commits,
+        the same shape as `deleteImposter`).
+      tags: [front-door]
+      x-rift-origin: ee
+      parameters:
+        - name: routeId
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The deleted route.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Route'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No route with that id in the caller's tenant's table.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
+  # ---------------------------------------------------------------------
+  # ee: tenancy surface (RFC-002 §5) — no upstream equivalent
+  # ---------------------------------------------------------------------
+  /admin/tenants:
+    post:
+      operationId: createTenant
+      summary: Create a tenant
+      description: >
+        Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — a
+        caller unbound at the fleet scope gets the RFC-002 §8.4 `404`, not
+        a `403`, so they cannot learn this route exists for them at all.
+      tags: [tenancy]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantWrite'
+      responses:
+        '201':
+          description: >
+            Tenant created; body is empty (`terminate_tenancy` renders no
+            body and omits `content-type` here — only principal creation
+            returns a body).
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: >
+            Caller is not bound to the fleet scope — indistinguishable
+            from a route that does not exist for this caller (RFC-002
+            §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    get:
+      operationId: listTenants
+      summary: List tenants
+      description: Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only).
+      tags: [tenancy]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: Every tenant.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Tenant'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Caller holds no fleet-scoped binding (RFC-002 §8.4 — not a 403).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/tenants/{tenantId}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      operationId: getTenant
+      summary: Read one tenant
+      description: >
+        Scoped to the path tenant and requires `ClusterAdmin`, so a
+        `TenantAdmin` of the named tenant is bound but insufficient —
+        `403`, not `404`.
+      tags: [tenancy]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: The tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the named tenant — indistinguishable
+            from the tenant not existing at all (RFC-002 §8.4). A `403`
+            means the caller IS bound but its role is insufficient.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      operationId: putTenant
+      summary: Create-or-replace a tenant by id
+      description: >
+        Terminates. The path id wins over any body id — the authorization
+        decision was made against the path, so honouring a disagreeing
+        body id would authorize one record and write another; a body `id`
+        that disagrees with the path answers `400`, it is not silently
+        ignored. Scoped to the path tenant and requires `ClusterAdmin`, so
+        a `TenantAdmin` of the named tenant is bound but insufficient —
+        `403`, not `404`.
+      tags: [tenancy]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantWrite'
+      responses:
+        '200':
+          description: >
+            Tenant updated; body is empty (`terminate_tenancy` renders no
+            body — only principal creation returns one).
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the named tenant — indistinguishable
+            from the tenant not existing at all (RFC-002 §8.4). A `403`
+            means the caller IS bound but its role is insufficient.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    delete:
+      operationId: deleteTenant
+      summary: Delete a tenant
+      tags: [tenancy]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Deleted; no body.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the named tenant — indistinguishable
+            from the tenant not existing at all (RFC-002 §8.4). A `403`
+            means the caller IS bound but its role is insufficient.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
+  /admin/tenants/{tenantId}/principals:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    post:
+      operationId: createPrincipal
+      summary: Mint a principal and bind it to this tenant
+      description: >
+        Terminates: mints an API key, hashes it, and returns the raw value
+        in this one response — the control plane stores only the argon2id
+        hash and a SHA-256-derived id, neither of which can reproduce it,
+        so there is nothing for a later `GET` to leak. `Idempotency-Key`
+        is refused (`400`) on this route: a retried request cannot
+        recover the original response's key, so pretending the retry is
+        safe would be dishonest.
+      tags: [tenancy]
+      x-rift-origin: ee
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrincipalCreate'
+      responses:
+        '201':
+          description: The minted principal, including its raw API key (shown once).
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedPrincipal'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the named tenant — indistinguishable
+            from the tenant not existing at all (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    get:
+      operationId: listPrincipals
+      summary: List principals bound to this tenant
+      tags: [tenancy]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: Principals bound to the tenant, with their role.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Principal'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the named tenant — indistinguishable
+            from the tenant not existing at all (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/tenants/{tenantId}/principals/{principalId}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+    put:
+      operationId: putPrincipal
+      summary: Update a principal's display name and disabled state
+      description: >
+        Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) —
+        principals are a fleet-global namespace, so a tenant admin
+        deleting or editing one could destroy a credential another tenant
+        relies on. Does not rotate the credential: a principal's id is
+        derived from its key, so a new key is a new principal, not an
+        update. `disabled` is required, not defaulted — an operator
+        renaming a principal must not accidentally un-revoke it.
+      tags: [tenancy]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrincipalUpdate'
+      responses:
+        '200':
+          description: >
+            Principal updated; body is empty (`terminate_tenancy` renders
+            no body — only principal creation returns one).
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such principal, or caller lacks fleet-scoped access (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    delete:
+      operationId: deletePrincipal
+      summary: Delete a principal
+      description: Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — see `putPrincipal`.
+      tags: [tenancy]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Deleted; no body.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such principal, or caller lacks fleet-scoped access (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
+  /admin/tenants/{tenantId}/bindings/{principalId}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+    put:
+      operationId: putBinding
+      summary: Bind a principal to a role in this tenant
+      description: >
+        Terminates. Tenant-scoped (`TenantManage` / TenantAdmin+) inside
+        an ordinary tenant, but `ClusterAdmin` / FleetAdmin-only when the
+        path names the fleet scope (`*`) — a binding there is a grant of
+        fleet privilege, and granting fleet privilege requires fleet
+        privilege regardless of the route shape.
+      tags: [tenancy]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Binding'
+      responses:
+        '200':
+          description: >
+            Binding stored; body is empty (`terminate_tenancy` renders no
+            body — only principal creation returns one).
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such tenant/principal, or caller lacks the required binding (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    delete:
+      operationId: deleteBinding
+      summary: Remove a principal's binding to this tenant
+      description: >
+        Terminates. Same tenant-vs-fleet authorization split as `putBinding`.
+      tags: [tenancy]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Removed; no body.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such tenant/principal, or caller lacks the required binding (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
+  # ---------------------------------------------------------------------
+  # ee: audit (RFC-002 §9) — no upstream equivalent
+  # ---------------------------------------------------------------------
+  /admin/audit:
+    get:
+      operationId: getAudit
+      summary: Read the audit journal
+      description: >
+        Terminates. Answers a **bare JSON array** of audit rows, not an
+        envelope. `since` and `limit` are pure pagination: an unparseable
+        or absent value takes its default rather than refusing (domain-
+        optional parse, not a swallow — both parameters have a safe
+        default and there is no failure worth hiding behind a 400). A
+        `FleetAdmin` sees the whole fleet's rows; every other caller sees
+        exactly the tenant they were authorized as, filtered server-side
+        so the rows returned and the authorization decision that allowed
+        them can never disagree.
+      tags: [audit]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: since
+          in: query
+          description: >
+            Journal cursor (a `revision`/log-index value): return rows
+            applied at or after this point. Defaults to `0` (the start of
+            the journal). An unparseable value is treated as absent rather
+            than rejected.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          description: >
+            Maximum rows to return. Defaults to 500 and is clamped to a
+            hard ceiling of 5000 — the audit table is a journal, so an
+            unbounded read would be an unbounded response, and any tenant
+            admin can reach this route.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5000
+            default: 500
+      responses:
+        '200':
+          description: Audit rows, constraints applied server-side (bare array, not an envelope).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditRow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/audit/sink:
+    get:
+      operationId: getAuditSink
+      summary: Read the fleet's declared audit export sink
+      description: >
+        Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — a
+        `TenantAdmin` trusted to read their own tenant's audit rows is not
+        thereby trusted to see where the whole fleet's rows ship to. Export
+        status is included only on the leader (only it runs the exporter);
+        a follower reports the sink with no status attached rather than a
+        fabricated all-zero one.
+      tags: [audit]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: The declared sink, plus this node's export status when it has one.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditSink'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No sink is declared, or caller lacks fleet-scoped access (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      operationId: putAuditSink
+      summary: Declare or replace the fleet's audit export sink
+      description: >
+        Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only). The
+        sink's own `revision` is what a re-declared sink resumes exporting
+        from.
+      tags: [audit]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditSinkWrite'
+      responses:
+        '200':
+          description: >
+            Sink stored; body is empty (`terminate_tenancy` renders no
+            body — only principal creation returns one).
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Caller lacks fleet-scoped access (RFC-002 §8.4 — not a 403).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    delete:
+      operationId: deleteAuditSink
+      summary: Stop exporting the audit stream (keeps the checkpoint)
+      description: >
+        Terminates. Fleet-scoped. The stored checkpoint (`revision`)
+        survives this delete — a later `putAuditSink` resumes from it
+        rather than re-shipping the whole journal.
+      tags: [audit]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Export stopped; no body.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Caller lacks fleet-scoped access (RFC-002 §8.4 — not a 403).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
+  # ---------------------------------------------------------------------
+  # ee: identity / contract introspection
+  # ---------------------------------------------------------------------
+  /admin/whoami:
+    get:
+      operationId: getWhoAmI
+      summary: The caller's own resolved identity and tenant bindings
+      description: >
+        Terminates. The one admin route with no action to authorize — it
+        reports the caller's own identity and nothing else, so there is
+        nothing beyond authentication to check. `authorizationDisabled:
+        true` with a `null` principal means the fleet defines no
+        principals and no API key (the open-admin-plane bypass), reported
+        honestly rather than made to look like a normal identity.
+      tags: [meta]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: The caller's identity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WhoAmI'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /openapi.json:
+    get:
+      operationId: getOpenApiContract
+      summary: This hand-authored OpenAPI contract, served as JSON
+      description: >
+        Terminates. Authenticated but actionless, the same posture as
+        `getWhoAmI` — the document describes the shape of the whole admin
+        surface, so serving it unauthenticated would hand a scanner a map
+        of every tenancy and audit route for free. Carries no tenant data,
+        so any authenticated principal reads the same bytes.
+      tags: [meta]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: This contract, as JSON.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  # ---------------------------------------------------------------------
+  # upstream: process-level / core admin surface
+  # ---------------------------------------------------------------------
+  /:
+    get:
+      operationId: getRoot
+      summary: Core admin root (upstream)
+      description: >
+        Upstream classifies this as `SYSTEM_READ`, which this front maps
+        to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered
+        node. Unauthenticated answers `401`; a caller bound to some
+        tenant but not FleetAdmin answers `403`; a caller with no
+        fleet-scope binding at all answers `404` (RFC-002 §8.4) —
+        operators used to this route being open on a standalone node
+        should expect all three on a `--cluster` node.
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Upstream's own root response.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller holds no fleet-scoped binding — indistinguishable from
+            the route not existing for them (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      operationId: getHealth
+      summary: Process health (upstream)
+      description: >
+        Upstream classifies this as `SYSTEM_READ`, which this front maps
+        to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered
+        node. Unauthenticated answers `401`; a caller bound to some
+        tenant but not FleetAdmin answers `403`; a caller with no
+        fleet-scope binding at all answers `404` (RFC-002 §8.4).
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller holds no fleet-scoped binding — indistinguishable from
+            the route not existing for them (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /config:
+    get:
+      operationId: getConfig
+      summary: The engine's effective startup configuration (upstream)
+      description: >
+        Upstream classifies this as `SYSTEM_READ`, which this front maps
+        to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered
+        node. A caller bound to some tenant but not FleetAdmin answers
+        `403`; a caller with no fleet-scope binding at all answers `404`
+        (RFC-002 §8.4).
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Effective configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller holds no fleet-scoped binding — indistinguishable from
+            the route not existing for them (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /logs:
+    get:
+      operationId: getLogs
+      summary: In-process log buffer (upstream)
+      description: >
+        Upstream classifies this as `SYSTEM_READ`, which this front maps
+        to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered
+        node. A caller bound to some tenant but not FleetAdmin answers
+        `403`; a caller with no fleet-scope binding at all answers `404`
+        (RFC-002 §8.4).
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Log entries.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller holds no fleet-scoped binding — indistinguishable from
+            the route not existing for them (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus-format process metrics (upstream)
+      description: >
+        Upstream classifies this as `SYSTEM_READ`, which this front maps
+        to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered
+        node. A caller bound to some tenant but not FleetAdmin answers
+        `403`; a caller with no fleet-scope binding at all answers `404`
+        (RFC-002 §8.4).
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Metrics in Prometheus exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller holds no fleet-scoped binding — indistinguishable from
+            the route not existing for them (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/reload:
+    post:
+      operationId: reloadConfig
+      summary: Reload configuration from disk (upstream)
+      description: >
+        Upstream classifies this as `SYSTEM_WRITE`, which this front maps
+        to `Action::ClusterAdmin` — **FleetAdmin only**, on a clustered
+        node. A caller bound to some tenant but not FleetAdmin answers
+        `403`; a caller with no fleet-scope binding at all answers `404`
+        (RFC-002 §8.4).
+      tags: [upstream-core]
+      x-rift-origin: upstream
+      responses:
+        '200':
+          description: Reloaded.
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller holds no fleet-scoped binding — indistinguishable from
+            the route not existing for them (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: >
+        The admin API key (or a minted principal's API key), sent as the
+        entire, raw `Authorization` header value — there is no `Bearer `
+        prefix, and none is stripped server-side (the credential is hashed
+        verbatim, see `crates/rift-cluster-server/src/principal.rs`). A
+        client that sends `Authorization: Bearer <key>` is sending the
+        wrong credential and will be answered `401`. Maps to a synthetic
+        or resolved principal checked by this front's own RBAC gate
+        against every request, terminated or proxied.
+
+  parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: >
+        Optimistic-concurrency precondition for a single-imposter write:
+        either the exact token from a prior response's Rift-Cluster-Revision
+        header (default:<port>@<revision>) or a bare revision integer.
+        Absent, the write is last-writer-wins. A stale or mismatched value
+        answers 409; sending it on a collection-wide mutation (which has
+        no single record to condition on) answers 400.
+      schema:
+        type: string
+        example: 'default:4545@17'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >
+        Client-chosen retry key for a mutating request. Mints a
+        deterministic op id (a v5 derivation when the value is not itself
+        a UUID) so a retried request with the same key dedups to the
+        original committed response instead of re-applying. Explicitly
+        refused with 400 on principal creation — not silently ignored:
+        the key and principal id are minted per request before any op id
+        exists, so a replayed request would commit nothing yet still
+        answer 201 with a freshly minted key that was never stored. A
+        client that sent the header believes its retry is safe, so the
+        request is rejected rather than left to go on believing it. A
+        keyed retry against an op that committed a `409` (revision
+        conflict) dedups to that same `409` — the key does not make the
+        conflict retryable. A client that wants to proceed after a `409`
+        must rebase against the current state and retry with a *fresh*
+        Idempotency-Key, not the one that produced the conflict.
+      schema:
+        type: string
+        example: 8f14e45f-ceea-467e-bd3a-fce2f5c3f1e0
+    TenantHeader:
+      name: X-Rift-Tenant
+      in: header
+      required: false
+      description: >
+        Selects which of the caller's existing tenant bindings this
+        request acts under; it never grants a binding the caller does not
+        already hold. Absent, requests act as the default tenant. Ignored
+        on tenancy routes, where the path segment names the tenant being
+        administered instead.
+      schema:
+        type: string
+        example: acme
+    Port:
+      name: port
+      in: path
+      required: true
+      description: The imposter's port number.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 65535
+    TenantId:
+      name: tenantId
+      in: path
+      required: true
+      description: The tenant record's id.
+      schema:
+        type: string
+    PrincipalId:
+      name: principalId
+      in: path
+      required: true
+      description: A principal's id (derived from its credential, e.g. key:<sha256-prefix>).
+      schema:
+        type: string
+    FlowId:
+      name: flowId
+      in: path
+      required: true
+      description: A correlated-isolation space's flow id.
+      schema:
+        type: string
+
+  headers:
+    RiftClusterRevision:
+      description: >
+        The committed log revision this response reflects. For a
+        tenancy write it is <tenant>@<revision>, using the real tenant
+        id. For an imposter/stub write the tenant segment is NOT the
+        caller's real tenant — the code hardcodes the literal string
+        `default`, so a write authorized as tenant `acme` still emits
+        `default:<port>@<revision>`. Treat the whole token as opaque:
+        feed it back verbatim as If-Match on a later write to the same
+        record rather than constructing one from this template — a
+        constructed value that gets the tenant segment wrong answers
+        `400`.
+      schema:
+        type: string
+        example: 'default:4545@17'
+    RiftClusterOpId:
+      description: >
+        The op id a write committed (or parked) under. Present only on a
+        terminated write's SUCCESS response (`200`/`201`/`202`/`204`) —
+        a refusal (`refusal_response`, e.g. `400`/`404`/`409`) sets no
+        headers at all, so those responses carry no op id. For a
+        single-op mutation this is the same id the client's
+        Idempotency-Key deterministically derives; a multi-op mutation
+        (e.g. a batch `PUT /imposters`) instead carries a per-index
+        derived id on each success, while its `202` parked path carries
+        the base id — the "same id Idempotency-Key derives" equivalence
+        holds only for single-op writes.
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadData:
+      description: Malformed or semantically invalid request (e.g. missing required port, If-Match on a collection route).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid credential.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: >
+        Authenticated, but the caller's role does not grant the action
+        within a tenant they ARE bound to (distinct from the RFC-002 §8.4
+        404 used for cross-tenant/unbound-tenant probes).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Unexpected server-side failure.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RevisionConflict:
+      description: If-Match named a revision that no longer matches the stored record.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: Request body exceeded the configured maximum size.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: >
+        No quorum to commit this write against, or the node is shutting
+        down. The shutdown case is not specific to writes — it can also
+        be answered by a read, since authentication itself runs behind
+        the same gate (see the top-level description).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    WriteTimeout:
+      description: >
+        The write did not commit within its deadline; its outcome is
+        unknown at this node — it may still commit. Poll the op id (if
+        one was returned) or retry with the same Idempotency-Key rather
+        than assuming the write failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    AcceptedParked:
+      description: >
+        Accepted under --cluster-admin-async: the write was durably parked
+        and is committing in the background. Poll the returned op id
+        rather than assuming this response's absence of a body reflects
+        the final state.
+      headers:
+        Rift-Cluster-Op-Id:
+          $ref: '#/components/headers/RiftClusterOpId'
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              opId:
+                type: string
+                format: uuid
+              opIds:
+                type: array
+                items:
+                  type: string
+                  format: uuid
+                description: Per-op ids for a multi-op mutation (e.g. a batch PUT /imposters).
+
+  schemas:
+    Error:
+      type: object
+      required: [errors]
+      properties:
+        errors:
+          type: array
+          items:
+            type: object
+            required: [code, type, message]
+            properties:
+              code:
+                type: string
+                description: A status-derived code (frozen for compatibility; not always the numeric status).
+              type:
+                type: string
+                description: Stable symbolic error slug — new consumers should read this field.
+              message:
+                type: string
+
+    Imposter:
+      type: object
+      description: >
+        An imposter's stored configuration (upstream ImposterConfig,
+        Mountebank-compatible plus Rift extensions). Non-exhaustive.
+      properties:
+        port:
+          type: integer
+        host:
+          type: string
+        protocol:
+          type: string
+          example: http
+        name:
+          type: string
+        recordRequests:
+          type: boolean
+          default: false
+        enabled:
+          type: boolean
+          default: true
+        stubs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Stub'
+      additionalProperties: true
+
+    Stub:
+      type: object
+      description: One request-matching rule and its response(s). Non-exhaustive.
+      properties:
+        id:
+          type: string
+          description: Stable id (Rift extension); addressable via the by-id routes.
+        scenarioName:
+          type: string
+        requiredScenarioState:
+          type: string
+        newScenarioState:
+          type: string
+        space:
+          type: string
+          description: Correlated-isolation scope; absent means globally eligible.
+        routePattern:
+          type: string
+          example: '/users/:id'
+        predicates:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        responses:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      additionalProperties: true
+
+    RouteTable:
+      type: object
+      properties:
+        routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Route'
+
+    Route:
+      type: object
+      required: [id, target]
+      properties:
+        id:
+          type: string
+          description: Unique and stable; how the admin API addresses one route.
+        priority:
+          type: integer
+          default: 0
+          description: Higher wins; ties fall through to specificity.
+        match:
+          type: object
+          properties:
+            host:
+              type: string
+              description: Exact or one-leading-wildcard-label host match.
+            pathPrefix:
+              type: string
+            headers:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  value:
+                    type: string
+            method:
+              type: string
+        target:
+          type: object
+          required: [port]
+          properties:
+            port:
+              type: integer
+            stripPrefix:
+              type: boolean
+              default: false
+            setHost:
+              type: string
+        enabled:
+          type: boolean
+          default: true
+
+    TenantWrite:
+      type: object
+      required: [id, displayName]
+      description: >
+        `id` is required by this schema because `POST /admin/tenants`
+        requires it (`400` otherwise). On `PUT /admin/tenants/{tenantId}`
+        the path segment is authoritative, but a body `id` that disagrees
+        with it is NOT silently ignored — it answers `400`, since the
+        authorization decision was made against the path and honouring a
+        disagreeing body id would authorize one record and write another.
+      properties:
+        id:
+          type: string
+          description: >
+            Required on create (`POST`). On `PUT`, must either be omitted
+            or match the path `tenantId` exactly — a mismatch is a `400`,
+            not a silent override.
+        displayName:
+          type: string
+        quotas:
+          $ref: '#/components/schemas/Quotas'
+        journalRetentionSecs:
+          type: integer
+          format: int64
+          default: 0
+          description: Seconds the request-journal shards keep this tenant's data; 0 = unlimited.
+
+    Tenant:
+      allOf:
+        - $ref: '#/components/schemas/TenantWrite'
+        - type: object
+          properties:
+            createdAtSecs:
+              type: integer
+              format: int64
+            deleted:
+              type: boolean
+
+    Quotas:
+      type: object
+      properties:
+        maxImposters:
+          type: integer
+          default: 1000
+        maxStubsPerImposter:
+          type: integer
+          default: 1000
+        maxFlowEntries:
+          type: integer
+          format: int64
+
+    Role:
+      type: string
+      description: >
+        A strict superset ladder: viewer subset of operator subset of
+        editor subset of tenant-admin subset of fleet-admin. Only
+        fleet-admin may hold a binding on the fleet scope (*).
+      enum: [viewer, operator, editor, tenant-admin, fleet-admin]
+
+    PrincipalCreate:
+      type: object
+      required: [displayName, role]
+      properties:
+        displayName:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+
+    PrincipalUpdate:
+      type: object
+      required: [displayName, disabled]
+      properties:
+        displayName:
+          type: string
+        disabled:
+          type: boolean
+          description: Required, not defaulted — an omitted field must not silently un-revoke a principal.
+
+    Principal:
+      type: object
+      description: A principal as read back. Never carries credential material.
+      required: [id, displayName, auth, disabled]
+      properties:
+        id:
+          type: string
+        displayName:
+          type: string
+        auth:
+          type: string
+          enum: [apiKey, oidc, mtlsSan]
+          description: The kind of credential; never any part of its value.
+        disabled:
+          type: boolean
+        role:
+          $ref: '#/components/schemas/Role'
+
+    IssuedPrincipal:
+      type: object
+      description: The one-time response to principal creation. apiKey appears nowhere else.
+      required: [id, displayName, role, tenant, apiKey]
+      properties:
+        id:
+          type: string
+        displayName:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        tenant:
+          type: string
+        apiKey:
+          type: string
+          description: Shown once. Not stored anywhere in recoverable form.
+
+    Binding:
+      type: object
+      required: [role]
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
+
+    AuditRow:
+      type: object
+      required: [tsSecs, tenant, action, resource, opId, revision, outcome]
+      properties:
+        tsSecs:
+          type: integer
+          format: int64
+          description: The applying entry's replicated clock — identical on every replica.
+        principal:
+          type: string
+          nullable: true
+          description: Who issued the op; null for an unattributed (open-admin-plane) submission.
+        tenant:
+          type: string
+          description: The tenant the op acted on. Never null — every op names exactly one.
+        action:
+          type: string
+          description: The RFC-002 §4.1 action slug (matches the authorization decision's own action string).
+        resource:
+          type: string
+          description: What was acted on — a port, an id, or "*" for a whole-scope op.
+        opId:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+          description: The applying log index.
+        outcome:
+          type: object
+          description: Either {"Applied":null} or {"Failed":{"reason":"..."}}.
+          additionalProperties: true
+
+    AuditSinkWrite:
+      type: object
+      required: [uri]
+      properties:
+        uri:
+          type: string
+        authRef:
+          type: string
+          description: Name of a credential the fleet already holds; never a raw credential.
+        batchMaxRows:
+          type: integer
+          description: Omitted takes the server default, not zero (which would ship nothing forever).
+
+    AuditSink:
+      allOf:
+        - $ref: '#/components/schemas/AuditSinkWrite'
+        - type: object
+          required: [batchMaxRows, revision]
+          properties:
+            batchMaxRows:
+              type: integer
+            revision:
+              type: integer
+              format: int64
+              description: The revision of the AuditSinkPut that produced this record.
+            exportStatus:
+              type: object
+              description: Present only on the leader (only it runs the exporter).
+              properties:
+                running:
+                  type: boolean
+                lastError:
+                  type: string
+                  nullable: true
+                shippedRows:
+                  type: integer
+                  format: int64
+                consecutiveFailures:
+                  type: integer
+
+    WhoAmI:
+      type: object
+      required: [bindings, authorizationDisabled]
+      properties:
+        principalId:
+          type: string
+          nullable: true
+          description: Null under the open-admin-plane bypass (no principals configured, no API key).
+        bindings:
+          type: array
+          items:
+            type: object
+            properties:
+              tenant:
+                type: string
+              role:
+                $ref: '#/components/schemas/Role'
+        authorizationDisabled:
+          type: boolean
+          description: True when the fleet enforces nothing at all (distinct from an authenticated principal with zero bindings).

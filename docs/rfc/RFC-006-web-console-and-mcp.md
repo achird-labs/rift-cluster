@@ -107,7 +107,7 @@ adds no header logic of its own beyond sending the selection.
 
 | Screen | Backend | Availability |
 |---|---|---|
-| **Imposters** — list, per-imposter detail, enable/disable | `GET/POST/DELETE /imposters*` (terminated routes, `admin_front.rs:348-398`; reads proxied to the engine) | v1 |
+| **Imposters** — list, per-imposter detail, enable/disable | `GET/POST/DELETE /imposters*` (terminated routes — `classify()` at `admin_front.rs:435`, the `Terminated` enum at `:351`; reads proxied to the engine) | v1 |
 | **Stub editor** — form ⟷ raw JSON, monaco, lint-on-save | stub CRUD incl. by-id routes (`admin_front.rs:378-395`); lint via `rift-lint` in-browser (§4.1) | v1 |
 | **Request log** — recorded requests, match diagnostics | v1: `GET /imposters/:port/requests` per node, labelled **per-node view**; converges to the doc-07 merged journal when the verification plane ships, same screen, no redesign | v1 (degraded) |
 | **Cluster** — members, leader, ring epoch, readiness, pending ops | §5.2's admin-port fleet reads (projection of `cluster_api.rs:63-191`) | v1 |
@@ -153,7 +153,7 @@ API feature per rule 2.
 The EE admin API gets a **committed, hand-authored** OpenAPI 3.1 document at
 `docs/api/openapi-ee.yaml`, served by the binary at `GET /openapi.json`.
 Hand-authored because the front's router is hand-rolled hyper
-(`classify()`, `admin_front.rs:348-398`), not a framework with derive-based
+(`classify()`, `crates/rift-cluster-server/src/admin_front.rs:435`), not a framework with derive-based
 schema extraction — annotation tooling (utoipa et al.) assumes axum/actix
 shapes we do not have. The schema is kept honest mechanically, not by
 discipline: a golden test enumerates `classify()`'s route table plus the §5.2
@@ -276,7 +276,7 @@ The sharpest build-system decision in this RFC, so it gets its options table:
   reload during console development without a rebuild. (Crate version pinned
   at implementation; to-verify.)
 
-Serving: the front's `handle()` (`admin_front.rs:400-412`) gains a
+Serving: the front's `handle()` (`crates/rift-cluster-server/src/admin_front.rs:525`) gains a
 `GET /console` / `GET /console/*` arm ahead of `classify()` — static assets
 with content-type by extension, SPA-fallback to `index.html` for pathless
 routes, `Cache-Control: max-age=31536000, immutable` for hashed assets and

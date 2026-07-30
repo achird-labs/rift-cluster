@@ -48,6 +48,16 @@ thiserror = "1.0"
 tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The published OpenAPI contract is authored as YAML and served as JSON (issue #184). Pinned to the
+# same version rift-http-proxy and rift-mock-core already depend on, so the workspace resolves one
+# copy and embedding the contract adds no new supply-chain surface.
+serde_yaml = "0.9"
+# Test-only (issue #184). `EnumDiscriminants` + `EnumIter` make the route-parity gate's variant
+# coverage compiler-complete: without it, adding a `Terminated` variant forces a `contract_route`
+# arm but NOT an entry in the representative list the parity test actually compares, so a new route
+# could ship undocumented with every test green. Never a runtime dependency — the derives are
+# `cfg_attr(test, ...)` and strum is a dev-dependency only.
+strum = { version = "0.26", features = ["derive"] }
 # Control-op identity (ADR-001 §4.1): `op_id` for idempotency/dedup across the
 # Raft log. v4 minted by the accepting node when the client sends none.
 uuid = { version = "1", features = ["v4", "v5", "serde"] }

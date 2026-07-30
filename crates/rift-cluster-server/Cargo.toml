@@ -35,6 +35,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 serde.workspace = true
 serde_json.workspace = true
+# Already a direct dependency of the vendored upstream crates, so the contract embed adds no
+# new supply-chain surface — only a parser this crate can reach.
+serde_yaml.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
@@ -49,6 +52,10 @@ xxhash-rust.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 tempfile = "3"
+# Enumerates `Terminated`'s variants so the route-parity gate can prove its representative list
+# covers every one (issue #184). Dev-only: the derives are `cfg_attr(test, ...)`, so nothing here
+# reaches the shipped binary.
+strum.workspace = true
 # Drives the composed admin API / probe listeners over real HTTP, the way an
 # operator, a load balancer and the upstream integration suites all do.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
