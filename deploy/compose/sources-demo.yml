@@ -5,7 +5,7 @@
 # See ../README.md's "Imposter sources demo" section for the walkthrough and
 # expected output.
 #
-# The shape it exists to show is the one a Mimeo-style deployment already has:
+# The shape it exists to show is the one a central-registry deployment already has:
 # **one environment variable** names where the mocks come from, every node in
 # the fleet ends up serving them, and rolling the fleet onto new content later
 # is **one call**, not a redeploy.

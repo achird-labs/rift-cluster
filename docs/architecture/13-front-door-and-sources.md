@@ -71,7 +71,7 @@ flowchart TB
         H["https: — raw URL, ETag-aware<br/>(upstream built-in)"]
         G["git+https: — repo#ref:path<br/>(enterprise)"]
         S3["s3:// — bucket/key<br/>(enterprise)"]
-        R["registry:// — service-ids<br/>(enterprise, Mimeo-Central pattern)"]
+        R["registry:// — service-ids<br/>(enterprise, central-registry pattern)"]
     end
 
     providers --> PULL
