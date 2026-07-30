@@ -4129,7 +4129,10 @@ mod tests {
     use openraft::{
         CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder, StorageError,
     };
-    use redb::{ReadableDatabase, ReadableTable};
+    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+
+    use super::{SESSION_KEY_ROW, SM_PRINCIPALS_TABLE, SM_SESSION_KEY_TABLE};
+    use crate::control::hash_api_key;
     use rift_cluster_base::seams::{
         CompiledRoutes, ImposterConfig, ImposterManager, Route, RouteMatch, RouteTable, RouteTarget,
     };
@@ -7352,6 +7355,96 @@ mod tests {
         assert_eq!(follower.audit_checkpoint().expect("read checkpoint"), 0);
         assert_eq!(follower.audit_gc_watermark().expect("read watermark"), 0);
         assert_eq!(follower.session_key().expect("read session key"), None);
+    }
+
+    /// Overwrite a one-row table's value with something that is not JSON, simulating on-disk
+    /// corruption or a forward-incompatible record written by a newer binary.
+    fn corrupt_row(sm: &RedbStateMachine, table: TableDefinition<&str, &str>, key: &str) {
+        let write = sm.db.begin_write().expect("write txn");
+        {
+            let mut t = write.open_table(table).expect("open table");
+            t.insert(key, "{ this is not a record }")
+                .expect("overwrite row");
+        }
+        write.commit().expect("commit");
+    }
+
+    /// A corrupt session-key row is an **error**, never `None`.
+    ///
+    /// The distinction is the whole point. `None` means "no console login has ever minted a key",
+    /// which `ensure_session_key` answers by minting a fresh one — so if corruption read back as
+    /// `None`, the next login would quietly mint a *second* key, invalidating every outstanding
+    /// session fleet-wide, and the node would look perfectly healthy while doing it. An error
+    /// surfaces as a 500 on the paths that need the key and leaves the record alone.
+    #[tokio::test]
+    async fn a_corrupt_session_key_row_is_an_error_not_an_absent_key() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            request_at(
+                1,
+                1_000,
+                ControlOp::SessionKeyPut {
+                    tenant: TenantId::new(FLEET_SCOPE),
+                    key: "42".repeat(32),
+                },
+            ),
+        )
+        .await;
+        assert!(sm.session_key().expect("read").is_some(), "key was minted");
+
+        corrupt_row(&sm, SM_SESSION_KEY_TABLE, SESSION_KEY_ROW);
+
+        assert!(
+            sm.session_key().is_err(),
+            "a corrupt session-key row read back as an absent key — the next login would mint a \
+             second key and silently invalidate every live session"
+        );
+    }
+
+    /// A corrupt principal row is an **error**, never `None`.
+    ///
+    /// `None` means "no such principal", which every authentication path treats as "this credential
+    /// resolves to nobody" — and on a fleet with no `--api-key` and no principals, `should_bypass`
+    /// turns that into an *open admin plane*. So a corrupt row reading back as `None` would convert
+    /// disk corruption into an authorization bypass. It must fail closed instead.
+    #[tokio::test]
+    async fn a_corrupt_principal_row_is_an_error_not_an_absent_principal() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let principal = Principal {
+            id: PrincipalId::new("p-corrupt"),
+            display_name: "corrupt".to_owned(),
+            auth: AuthSource::ApiKey {
+                hash: hash_api_key("some-key"),
+            },
+            disabled: false,
+        };
+        apply_one(
+            &mut sm,
+            1,
+            request_at(
+                1,
+                1_000,
+                ControlOp::PrincipalPut {
+                    tenant: TenantId::default(),
+                    principal,
+                },
+            ),
+        )
+        .await;
+        assert!(
+            sm.principal("p-corrupt").expect("read").is_some(),
+            "principal was stored"
+        );
+
+        corrupt_row(&sm, SM_PRINCIPALS_TABLE, "p-corrupt");
+
+        assert!(
+            sm.principal("p-corrupt").is_err(),
+            "a corrupt principal row read back as an absent principal — on a fleet with no \
+             --api-key that is an open admin plane, not a 401"
+        );
     }
 
     /// RFC-006 §5.3, issue #185: the session-signing key must travel through a snapshot install
