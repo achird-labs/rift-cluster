@@ -1,4 +1,4 @@
-# A real 3-node Rift Enterprise cluster, for local development and for the
+# A real 3-node RiftCluster cluster, for local development and for the
 # container-based chaos work that needs more than the in-process harness.
 #
 #     docker compose -f deploy/compose/docker-compose.yml up --build
@@ -11,7 +11,7 @@
 # nodes 2 and 3 join through it. That asymmetry is a bootstrap property, not a
 # role: once joined, every node is an equal member and any of them can lead.
 
-name: rift-ee-cluster
+name: rift-cluster
 
 # Static addresses, because `--cluster-advertise` takes a socket address and not
 # a DNS name: it is what peers are told to dial, and it is stored in the
@@ -75,7 +75,7 @@ services:
       - "12526:2526"   # probes
       - "19090:9090"   # metrics
     healthcheck: &probe
-      test: ["CMD", "rift-ee-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
+      test: ["CMD", "rift-cluster-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
       interval: 5s
       timeout: 3s
       retries: 5

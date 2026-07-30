@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Open an upstream PR against the public Rift repo for a core change that an
-# enterprise feature depends on. Run this from the enterprise repo root; it
+# cluster feature depends on. Run this from the cluster repo root; it
 # operates inside the vendor/rift submodule.
 #
 #   scripts/upstream-pr.sh <branch> "<PR title>"
@@ -29,7 +29,7 @@ gh pr create --repo "$upstream_repo" --base master --head "$branch" --title "$ti
 cat <<EOF
 
 Upstream PR opened against $upstream_repo.
-Once it merges, bump the submodule in the enterprise repo:
+Once it merges, bump the submodule in the cluster repo:
 
     scripts/sync-upstream.sh
 EOF

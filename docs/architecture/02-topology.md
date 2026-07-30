@@ -66,7 +66,7 @@ flowchart TB
     T2 --> LB
     CI --> LB
 
-    subgraph Fleet["rift-ee-server fleet (active-active; every node binds every imposter)"]
+    subgraph Fleet["rift-cluster-server fleet (active-active; every node binds every imposter)"]
         A["Node A<br/>data ports + gateway + admin"]
         B["Node B<br/>data ports + gateway + admin"]
         C["Node C<br/>data ports + gateway + admin"]

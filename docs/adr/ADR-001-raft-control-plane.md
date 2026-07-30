@@ -5,7 +5,7 @@
 | **Status** | Accepted (2026-07-21) |
 | **Deciders** | Mohsen Zainalpour |
 | **Supersedes** | RFC-001 v2 decisions D-1 (no consensus layer) and D-2 (chitchat gossip); rewrites §7.1, §7.2, §7.4 |
-| **Tracking** | [rift-enterprise#14](https://github.com/achird-labs/rift-enterprise/issues/14); implementation across [#6](https://github.com/achird-labs/rift-enterprise/issues/6), [#7](https://github.com/achird-labs/rift-enterprise/issues/7), [#9](https://github.com/achird-labs/rift-enterprise/issues/9) |
+| **Tracking** | [rift-cluster#14](https://github.com/achird-labs/rift-cluster/issues/14); implementation across [#6](https://github.com/achird-labs/rift-cluster/issues/6), [#7](https://github.com/achird-labs/rift-cluster/issues/7), [#9](https://github.com/achird-labs/rift-cluster/issues/9) |
 | **Depends on** | `openraft` 0.9.x, `redb` 4.x (both verified 2026-07-21) |
 
 ## Context
@@ -136,7 +136,7 @@ at the owner, not assumed at the caller.
   gap on its own merits, but reintroduces exactly the mandatory external service
   the product exists to avoid (server + datastore, sometimes + Elasticsearch), and
   none has an embeddable Rust form. Worth revisiting only as an *optional*
-  enterprise integration for customers already running one (the D-12 pattern:
+  cluster integration for customers already running one (the D-12 pattern:
   zero-dependency by default, external system by choice).
 - **Raft for flow state too.** A quorum write per scenario transition at
   20–40k RPS is unacceptable. Flow state stays single-writer HRW + WAL; D-8
@@ -159,10 +159,10 @@ table schema, the deterministic-and-infallible apply-loop contract, the
 read-after-write barrier mechanism, op-id dedup, the membership lifecycle, the
 `m_idx` fencing rule, the rift-cluster module layout, and the re-scope of #6–#9 —
 lives on the tracking issue,
-[rift-enterprise#14](https://github.com/achird-labs/rift-enterprise/issues/14),
+[rift-cluster#14](https://github.com/achird-labs/rift-cluster/issues/14),
 and is reflected throughout the [architecture guide](../architecture/README.md)
 (chapters 3–9). The transport substrate this builds on
-([#8](https://github.com/achird-labs/rift-enterprise/issues/8)) is already merged.
+([#8](https://github.com/achird-labs/rift-cluster/issues/8)) is already merged.
 
 **First gate — the spike.** Before the full #6/#9 build-out, a minimal 3-node
 `openraft`-over-`redb` prototype must prove the two risks that cannot be

@@ -12,7 +12,7 @@
 # dispatch through rift-2's own `--front-door` listener, which only exists
 # under that overlay.
 #
-# `crates/rift-ee-server/tests/bind_divergence.rs` already proves the
+# `crates/rift-cluster-server/tests/bind_divergence.rs` already proves the
 # in-process half of the #143 dividend, with the squat as a plain listener
 # inside that test's own process. This overlay is the same collision for
 # real: a process outside rift-2 holds the port before rift-2's own

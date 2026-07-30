@@ -64,7 +64,7 @@ const C14_STORM_WRITES: u16 = 100;
 /// cannot resolve a three-second bound at all; reading a quantity coarser than
 /// the bound is the mistake #94 fixed in C6. `GET /_cluster/members` *does*
 /// serve openraft's live metrics, but it rides the **cluster port** behind the
-/// HMAC credential (docs/rift-ee-server.md, "These ride the cluster port"), so
+/// HMAC credential (docs/rift-cluster-server.md, "These ride the cluster port"), so
 /// the harness cannot reach it. A write is what is left, and it is also what a
 /// client actually experiences.
 ///
@@ -2647,7 +2647,7 @@ async fn wait_container_healthy(name: &str, timeout: Duration) -> anyhow::Result
 /// its own front door -- the container-tier proof of the issue #143 /
 /// RFC-001 §7.4.6 dividend.**
 ///
-/// `crates/rift-ee-server/tests/bind_divergence.rs` already proves the
+/// `crates/rift-cluster-server/tests/bind_divergence.rs` already proves the
 /// in-process half of this: there, the squat is a plain listener inside the
 /// test's own process. This is the same collision for real, across a real
 /// three-node stack: `bind-squat.overlay.yml` runs an `alpine/socat` sidecar
@@ -2665,7 +2665,7 @@ async fn wait_container_healthy(name: &str, timeout: Duration) -> anyhow::Result
 /// a bind-failed node used to answer before #143, because every node
 /// constructs the imposter and claims the port in its map regardless of
 /// whether the local bind succeeded (`with_serve_unbound(true)`, set only by
-/// the enterprise cluster composition). `wait_converged` reads exactly that
+/// the cluster cluster composition). `wait_converged` reads exactly that
 /// map (`GET /imposters`), so it converges fleet-wide despite the squat --
 /// convergence of the *config*, not of the bind.
 ///
@@ -2816,7 +2816,7 @@ async fn c19_front_door_routes_around_bind_divergence() {
 // publishes each node's cluster port (where `/admin/sources*` lives) and adds
 // the counting origin the fleet fetches from.
 //
-// The origin is a fourth `rift-ee-server`, un-clustered, whose imposter's
+// The origin is a fourth `rift-cluster-server`, un-clustered, whose imposter's
 // response body *is* the config document. That is what makes "fetched once
 // fleet-wide" an equality against `numberOfRequests` — a first-class admin-API
 // value — rather than a log scrape. See the overlay's header for why it is a
@@ -3580,7 +3580,7 @@ const C23_PORT: u16 = 6640;
 ///
 /// **Only the `overwrite` arm runs here, deliberately.** `on_drift` has three
 /// arms and all three are already covered in-process, over real HTTP, by #134's
-/// suite in `crates/rift-ee-server/tests/sources.rs`
+/// suite in `crates/rift-cluster-server/tests/sources.rs`
 /// (`a_skipped_pull_does_not_short_circuit_the_pull_that_resolves_it` for
 /// `skip`, and the state machine's own `drifted_source_fails_when_asked` for
 /// `fail`). What containers add is process death and the operator-facing

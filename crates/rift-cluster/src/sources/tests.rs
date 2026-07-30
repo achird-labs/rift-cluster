@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rift_ee::seams::{
+use rift_cluster_base::seams::{
     FetchedImposters, ImposterConfig, ImposterSource, SourceMeta, SourceRef, SourceRegistry,
 };
 
@@ -191,7 +191,7 @@ fn bootstrap_ids_distinguish_uris_that_slugify_alike() {
 
 /// A [`SourceProviders`] wired the way production is: one upstream,
 /// non-credentialed scheme (`counting`, standing in for `file:`/a bespoke
-/// embedder provider), and the two real HTTP-based enterprise providers this
+/// embedder provider), and the two real HTTP-based cluster providers this
 /// crate ships (`s3:`, `registry:`) registered as credentialed. Real
 /// `S3Source`/`RegistrySource` rather than a hand-rolled `CredentialedSource`
 /// stub, so `check_credential_use`'s refusal is proven against the actual

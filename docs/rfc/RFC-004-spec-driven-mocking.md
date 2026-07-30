@@ -3,10 +3,10 @@
 | | |
 |---|---|
 | **Status** | v1 — design draft for review |
-| **Tracking issue** | [achird-labs/rift-enterprise#148](https://github.com/achird-labs/rift-enterprise/issues/148) (milestone M4) |
-| **Canonical location** | `rift-enterprise:docs/rfc/RFC-004-spec-driven-mocking.md` |
+| **Tracking issue** | [achird-labs/rift-cluster#148](https://github.com/achird-labs/rift-cluster/issues/148) (milestone M4) |
+| **Canonical location** | `rift-cluster:docs/rfc/RFC-004-spec-driven-mocking.md` |
 | **Depends on** | **ADR-001** (Raft control plane) — spec records live in its state machine; **RFC-002** (#17) — tenancy scoping and the closed Action set this RFC extends; **#20 / U-12** (`ImposterSource` SPI, Ch. 13) — for the `openapi+…:` source kinds only, and only that part blocks on it |
-| **Ground truth** | verified at `rift-enterprise@5b98fef`, `vendor/rift@v0.16.0-4-g97757f0` |
+| **Ground truth** | verified at `rift-cluster@5b98fef`, `vendor/rift@v0.16.0-4-g97757f0` |
 | **Author** | Mohsen Zainalpour |
 | **Date** | 2026-07-26 |
 
@@ -79,7 +79,7 @@ Checked at `5b98fef` / `v0.16.0-4-g97757f0`, not assumed:
   be built from existing seams; hence U-13.
 - **The write path this RFC rides is already there.** The clustered admin
   front terminates config-mutating routes into `ControlOp`s and proxies the
-  rest (`crates/rift-ee-server/src/admin_front.rs:1–48`); `ControlOp` is the
+  rest (`crates/rift-cluster-server/src/admin_front.rs:1–48`); `ControlOp` is the
   closed op set with deterministic pre-apply `validate`
   (`crates/rift-cluster/src/control.rs:89–147`, `:225`); the state machine
   stores config JSON per `(tenant, port)` in `sm_configs`
@@ -109,17 +109,17 @@ default), and v1 parses OpenAPI 3.0.x only (§7).
 
 ### 3.1 The importer is a pure compiler
 
-New crate `crates/rift-ee-spec`. Input: an OpenAPI 3.0 document (JSON or
+New crate `crates/rift-cluster-spec`. Input: an OpenAPI 3.0 document (JSON or
 YAML). Output: **canonical imposter JSON** (`serde_json::Value`) plus a
 typed operation index used for validation and diffing.
 
-It deliberately has **no dependency on `rift-ee` or anything vendored** —
+It deliberately has **no dependency on `rift-cluster-base` or anything vendored** —
 not even `rift-types`. The alternative (emitting a typed `ImposterConfig`)
-was checked and rejected: the facade rule says enterprise crates reach the
-core only through `rift-ee` (`crates/rift-ee/src/lib.rs:1–9`), so the "typed
-output" option really means a `rift-ee` dependency, which drags the whole
+was checked and rejected: the facade rule says cluster crates reach the
+core only through `rift-cluster-base` (`crates/rift-cluster-base/src/lib.rs:1–9`), so the "typed
+output" option really means a `rift-cluster-base` dependency, which drags the whole
 engine into what should be a text-to-text function. Instead the compiler
-emits the same JSON a client would `PUT`, and `rift-ee-server` parses it
+emits the same JSON a client would `PUT`, and `rift-cluster-server` parses it
 through the **same admission gate as any other write** — the
 `ImposterConfig` deserialize plus `control::validate` that every terminated
 write already passes (`admin_front.rs`, `control.rs:225–252`). Type safety
@@ -127,7 +127,7 @@ is enforced where it is load-bearing (admission), and the compiler stays a
 pure, golden-file-testable function of `(spec bytes, options)`.
 
 ```rust
-// crates/rift-ee-spec — public surface (sketch)
+// crates/rift-cluster-spec — public surface (sketch)
 pub struct SpecDigest([u8; 32]);            // sha256 of the canonical spec bytes
 pub struct OperationId(String);             // operationId, or synthesized METHOD+path
 
@@ -215,7 +215,7 @@ admission checks already exist (`control.rs:239–246`); the compiler's id
 scheme is collision-free by construction within one spec.
 
 **Admin-time stub validation** (the "every stub validated" half of parity):
-`rift-ee-spec` also exposes `validate_stub_response(op, status, body) ->
+`rift-cluster-spec` also exposes `validate_stub_response(op, status, body) ->
 Vec<Violation>` — run at import over the compiler's own output (a
 self-check that fails compilation rather than deploying an inconsistency),
 and at edit time: a config-mutating write to an imposter with a bound spec
@@ -249,7 +249,7 @@ this RFC adds two schemes:
 
 - `openapi+https://…` — raw URL, ETag-aware, like the upstream `https:`
   built-in but compiling instead of parsing imposter JSON;
-- `openapi+git://repo#ref:path` — riding the enterprise `git+https:`
+- `openapi+git://repo#ref:path` — riding the cluster `git+https:`
   provider; Git-integrated spec sync is then #20's poll/pull machinery, not
   new machinery.
 
@@ -313,7 +313,7 @@ validation is a visible, per-imposter decision.
 
 #### Soft (observe) — zero engine change, requests only
 
-An EE-side validator task, composed in `rift-ee-server`, subscribes
+An EE-side validator task, composed in `rift-cluster-server`, subscribes
 **in-process** to the engine's `AdminEventBus`
 (`manager.event_bus()`, `events.rs:117–128`) — the same bus the SSE
 handler consumes (`rift-http-proxy/src/admin_api/handlers/events.rs`), with
@@ -354,7 +354,7 @@ the single serve-loop funnel where the decorator already sits
 
 - `hard`: a request violation answers `400` (a response violation `502`)
   with the standard typed error envelope (`ErrorKind` /
-  `error_response_typed`, re-exported at `crates/rift-ee/src/lib.rs:90`),
+  `error_response_typed`, re-exported at `crates/rift-cluster-base/src/lib.rs:90`),
   the violation list in the body, and header
   `x-rift-spec-violation: request|response`. Violations are also recorded
   exactly as in soft mode.
@@ -421,9 +421,9 @@ unchanged digest is refused as a no-op at the accepting node (mirroring
 #20's digest-changed gate) so retries and unchanged Git polls cost zero log
 growth.
 
-The imposter record (`StoredImposter`, `store.rs:122`) gains enterprise-side
+The imposter record (`StoredImposter`, `store.rs:122`) gains cluster-side
 fields `provenance: Option<{spec_id, digest}>` and `drifted: bool` — stored
-on the control-plane record only, invisible to the OSS config schema,
+on the control-plane record only, invisible to the core config schema,
 exactly like RFC-002's `tenant` (§3.2 there; same open-core rule,
 `11-open-core.md`).
 
@@ -662,11 +662,11 @@ S5 is the upstream PR; S8 gates on #20.
 
 | Slice | Contents | Exit criteria |
 |---|---|---|
-| **S1** `feat(spec): rift-ee-spec — OpenAPI 3.0 compiler to imposter JSON` | pure crate; path/method/param compilation, response synthesis, deterministic ids and seeds; golden-file + property tests (regex escaping, ordering, seed stability) | same spec bytes → byte-identical imposter JSON across runs; goldens cover petstore + a template-heavy spec |
+| **S1** `feat(spec): rift-cluster-spec — OpenAPI 3.0 compiler to imposter JSON` | pure crate; path/method/param compilation, response synthesis, deterministic ids and seeds; golden-file + property tests (regex escaping, ordering, seed stability) | same spec bytes → byte-identical imposter JSON across runs; goldens cover petstore + a template-heavy spec |
 | **S2** `feat(spec): spec records on the control plane + /specs surface` | `SpecPut/SpecDelete/SpecBind` + tables + 4 MiB guard + digest no-op; `/specs` CRUD, `compile`, `deploy` terminated in the front | deploy → imposter serves on every node after 2xx; unchanged re-`PUT` grows the log by zero entries; tag-stability test extended |
 | **S3** `feat(spec): drift diff + re-import policy` | §3.5 classifier, `overwrite\|skip\|fail`, `drifted` flag, `GET /specs/:id/drift` | hand-added stub survives `overwrite`; hand-edited `spec:` stub is reported, not silently clobbered; `fail` refuses with the report |
 | **S4** `feat(spec): soft validation — bus consumer + violations read` | in-process validator, `jsonschema` cache, per-node violations table, merged `validationFailures` read with `since=` cursor, `ValidationPolicySet` (`off`/`soft` only) | an off-contract request on a `soft` imposter yields exactly one violation row, joinable to its journal index; `off` imposters measure zero overhead |
-| **S5** `feat(spec): U-13 exchange inspector — upstream PR + pin bump` | upstream: trait, provider, two hook points, inert default; here: seam re-export in `rift-ee::seams`, `seams_resolve` extended | upstream suites green with no inspector installed; parity gate (#37/#139) unchanged |
+| **S5** `feat(spec): U-13 exchange inspector — upstream PR + pin bump` | upstream: trait, provider, two hook points, inert default; here: seam re-export in `rift-cluster-base::seams`, `seams_resolve` extended | upstream suites green with no inspector installed; parity gate (#37/#139) unchanged |
 | **S6** `feat(spec): hard + hard-spec-compliant enforcement` | EE inspector implementation, `hard`/`hard-spec-compliant` modes, Accept negotiation, RBAC actions wired per §4.3 | request + response violations rejected with declared shapes; policy flip visible fleet-wide at barrier; internal-defect path proceeds loudly (counter asserted) |
 | **S7** `test(cluster): C19/C20 — spec state converges and survives restart` | C19: deploy + policy flip converge on every node and survive full-cluster restart (the C17/C18 pattern from `5b98fef`); C20: hard-mode rejection identical through any node under round-robin while a follower restarts | both scenarios green in the chaos tier |
 | **S8** `feat(spec): openapi+https/git source kinds` — **blocked on #20/U-12** | the two schemes as `ImposterSource` providers; drift policy inherited | Git spec bump → one pull op → fleet converges; unchanged poll = zero log growth |

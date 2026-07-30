@@ -10,12 +10,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-# `rift-ee` is deliberately the ONLY path into the open-source core: it
+# `rift-cluster-base` is deliberately the ONLY path into the open-source core: it
 # re-exports both the crates and the extension seams. Adding a direct
 # rift-mock-core / rift-types / rift-http-proxy dependency here would let
 # cluster code reach around the facade, so the fence is this dependency list
 # rather than a lint.
-rift-ee = { path = "../rift-ee" }
+rift-cluster-base = { path = "../rift-cluster-base" }
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true

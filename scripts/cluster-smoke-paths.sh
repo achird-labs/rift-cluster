@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Decide whether a change set warrants running a path-gated CI job.
 # Two callers today: `cluster-smoke` (the container chaos tier) and `parity`
-# (issue #37 — the upstream behavioural suites run against `rift-ee-server`),
+# (issue #37 — the upstream behavioural suites run against `rift-cluster-server`),
 # both in .github/workflows/ci.yml. `--job` selects which watched set decides;
 # it defaults to `cluster-smoke` so every call site that predates the parity
 # job — and the `run=true`/`run=false` contract those sites read — is
@@ -37,13 +37,13 @@ set -euo pipefail
 
 # Directories whose contents can plausibly break a cluster.
 #
-# `crates/rift-ee/` is here for the same reason as `vendor/rift`, not as a
+# `crates/rift-cluster-base/` is here for the same reason as `vendor/rift`, not as a
 # generic "first-party crate" entry: both watched crates declare it the ONLY
 # path into the open-source core (see the fence comment in each of their
 # Cargo.tomls), so it is the facade every engine change reaches the cluster
 # through. Watching the submodule but not the seam that re-exports it would
 # leave the same hole one layer up.
-CLUSTER_SMOKE_PREFIXES='^(crates/rift-cluster/|crates/rift-ee/|crates/rift-ee-server/|deploy/|tests/cluster-chaos/|vendor/rift/)'
+CLUSTER_SMOKE_PREFIXES='^(crates/rift-cluster/|crates/rift-cluster-base/|crates/rift-cluster-server/|deploy/|tests/cluster-chaos/|vendor/rift/)'
 
 # Whole paths, matched in full.
 #
@@ -52,7 +52,7 @@ CLUSTER_SMOKE_PREFIXES='^(crates/rift-cluster/|crates/rift-ee/|crates/rift-ee-se
 #
 # `Cargo.lock` is here for the same reason as the submodule pointer: a
 # dependency change can alter engine behaviour without touching a single
-# enterprise source file, which is this same blind spot in a different shape.
+# cluster source file, which is this same blind spot in a different shape.
 # The workspace root lockfile is the only one that resolves the graph, so this
 # is deliberately root-only — a `Cargo.lock` deeper in the tree is not it.
 #
@@ -92,7 +92,7 @@ CLUSTER_SMOKE_PREFIXES='^(crates/rift-cluster/|crates/rift-ee/|crates/rift-ee-se
 CLUSTER_SMOKE_EXACT='vendor/rift|Cargo\.lock|scripts/chaos-quarantine\.sh|scripts/cluster-smoke-paths\.sh'
 
 # The `parity` job (issue #37): the upstream process-spawning suites, run
-# against `rift-ee-server` with `--cluster` off. Its watched set is narrower
+# against `rift-cluster-server` with `--cluster` off. Its watched set is narrower
 # and different in kind from `cluster-smoke`'s — it is not "can this break a
 # cluster", it is "can this break byte-for-byte parity with the open-source
 # server" — so it is its own table rather than folded into the one above:
@@ -102,7 +102,7 @@ CLUSTER_SMOKE_EXACT='vendor/rift|Cargo\.lock|scripts/chaos-quarantine\.sh|script
 #     exactly the change class `sync-upstream.yml` produces unattended. Same
 #     bare-path form as the cluster-smoke case, same reason (#93): a submodule
 #     pointer bump has no trailing slash in `git diff --name-only`.
-#   * `crates/rift-ee-server/` — the composition layer under test: CLI parse,
+#   * `crates/rift-cluster-server/` — the composition layer under test: CLI parse,
 #     `ServerBuilder` wiring, bootstrap. This is the code the parity job exists
 #     to catch drifting from upstream's own guarantees.
 #   * `Cargo.lock` (root only, same reasoning as cluster-smoke's case) — a
@@ -110,12 +110,12 @@ CLUSTER_SMOKE_EXACT='vendor/rift|Cargo\.lock|scripts/chaos-quarantine\.sh|script
 #   * `.github/` — the workflow that builds and runs this job is itself part of
 #     what "parity is verified, not asserted" depends on; a change there can
 #     silently stop the suites from running or from testing the right binary.
-#     Deliberately broader than cluster-smoke's stance on `.github/` (which
+#     Deliberately broader tha cluster-smoke's stance on `.github/` (which
 #     excludes it to avoid taxing every unrelated CI tweak): parity's own job
 #     definition living in that directory is exactly the kind of edit this
 #     watched set exists to catch, and the wall-clock cost here is one release
 #     build plus four suites, not a multi-minute container tier.
-PARITY_PREFIXES='^(crates/rift-ee-server/|\.github/)'
+PARITY_PREFIXES='^(crates/rift-cluster-server/|\.github/)'
 PARITY_EXACT='vendor/rift|Cargo\.lock'
 
 # Resolves `--job NAME` to the prefix/exact pair `decide` matches against, into
@@ -226,14 +226,14 @@ self_test() {
 # issue #93: `vendor/rift` IS the mock engine, so this must run the tier.
 true|cluster-smoke|vendor/rift
 # A vendor bump also rewrites the lockfile, and a dependency change alone can
-# alter engine behaviour with no enterprise source touched.
+# alter engine behaviour with no cluster source touched.
 true|cluster-smoke|Cargo.lock
 true|cluster-smoke|vendor/rift Cargo.lock
 # Files inside the submodule, should upstream ever be worked on in-tree.
 true|cluster-smoke|vendor/rift/crates/rift-mock-core/src/imposter/manager.rs
 # The four originally-watched directories.
 true|cluster-smoke|crates/rift-cluster/src/lib.rs
-true|cluster-smoke|crates/rift-ee-server/src/main.rs
+true|cluster-smoke|crates/rift-cluster-server/src/main.rs
 true|cluster-smoke|deploy/compose/docker-compose.yml
 true|cluster-smoke|tests/cluster-chaos/src/lib.rs
 # One watched path is enough, however much unwatched noise rides along.
@@ -255,7 +255,7 @@ false|cluster-smoke|README.md
 false|cluster-smoke|docs/rfc/RFC-001-self-clustering-rift.md docs/adr/ADR-001-raft-control-plane.md
 # The seam crate: a `vendor/rift` bump reaches the cluster through it, so
 # excluding it would leave the #93 hole one layer up.
-true|cluster-smoke|crates/rift-ee/src/lib.rs
+true|cluster-smoke|crates/rift-cluster-base/src/lib.rs
 # Nothing changed at all.
 false|cluster-smoke|
 # A lockfile-named file that is not THE lockfile.
@@ -286,10 +286,10 @@ true|parity|vendor/rift
 false|parity|vendor/rift-other
 false|parity|vendor/rift-other/src/lib.rs
 # The composition layer under test.
-true|parity|crates/rift-ee-server/src/main.rs
-true|parity|crates/rift-ee-server/tests/passthrough.rs
+true|parity|crates/rift-cluster-server/src/main.rs
+true|parity|crates/rift-cluster-server/tests/passthrough.rs
 # The prefix boundary: a similarly-named sibling crate is not it.
-false|parity|crates/rift-ee-server-old/src/lib.rs
+false|parity|crates/rift-cluster-server-old/src/lib.rs
 # Root lockfile, same reasoning as cluster-smoke's case.
 true|parity|Cargo.lock
 false|parity|crates/foo/Cargo.lock
@@ -303,7 +303,7 @@ false|parity|crates/rift-cluster/src/lib.rs
 # A docs-only change cannot affect either the binary or the suites that
 # exercise it.
 false|parity|README.md
-false|parity|docs/rift-ee-server.md
+false|parity|docs/rift-cluster-server.md
 # Nothing changed at all.
 false|parity|
 CASES

@@ -14,7 +14,7 @@ on log output.
 | `test_cold_start` + `test_uninitialized_fleet_never_ready` | admin-API / Prometheus metric assertions |
 | `test_leader_failover` | `test_graceful_leave` (needs graceful demote-then-remove) |
 
-The deferred column needs the `rift-ee-server` binary (issue #10) and the HTTP
+The deferred column needs the `rift-cluster-server` binary (issue #10) and the HTTP
 config/metrics surface (issue #9); it lands in a follow-up under #11 once those
 exist. This file is the harness those scenarios will reuse the shape of.
 

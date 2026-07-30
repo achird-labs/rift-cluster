@@ -6,7 +6,7 @@
 //! join, replicate, kill, and restart a cluster. It is deliberately *in-process*:
 //! it covers the Phase-1 exit tests that need only nodes and a network, and NOT
 //! the container-based chaos suite (Envoy + toxiproxy partitions, admin-API /
-//! Prometheus assertions), which depends on the `rift-ee-server` binary (#10) and
+//! Prometheus assertions), which depends on the `rift-cluster-server` binary (#10) and
 //! the HTTP config/metrics surface (#9) and lands when those exist. See
 //! `tests/README.md` for the split and how to add a scenario.
 
@@ -1047,21 +1047,21 @@ async fn test_rejoin_after_leave_with_retained_state_dir() {
 /// criterion is an assertion rather than an argument.
 struct CountingSource {
     fetches: Arc<std::sync::atomic::AtomicUsize>,
-    body: std::sync::Mutex<Vec<rift_ee::seams::ImposterConfig>>,
+    body: std::sync::Mutex<Vec<rift_cluster_base::seams::ImposterConfig>>,
     version: std::sync::Mutex<String>,
 }
 
-impl rift_ee::seams::ImposterSource for CountingSource {
+impl rift_cluster_base::seams::ImposterSource for CountingSource {
     fn schemes(&self) -> &'static [&'static str] {
         &["counting"]
     }
 
     fn fetch<'a>(
         &'a self,
-        _r: &'a rift_ee::seams::SourceRef,
+        _r: &'a rift_cluster_base::seams::SourceRef,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = anyhow::Result<rift_ee::seams::FetchedImposters>>
+            dyn std::future::Future<Output = anyhow::Result<rift_cluster_base::seams::FetchedImposters>>
                 + Send
                 + 'a,
         >,
@@ -1069,11 +1069,11 @@ impl rift_ee::seams::ImposterSource for CountingSource {
         Box::pin(async move {
             self.fetches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(rift_ee::seams::FetchedImposters {
+            Ok(rift_cluster_base::seams::FetchedImposters {
                 configs: self.body.lock().expect("body lock").clone(),
                 intercept: None,
                 routes: None,
-                meta: rift_ee::seams::SourceMeta {
+                meta: rift_cluster_base::seams::SourceMeta {
                     version: Some(self.version.lock().expect("version lock").clone()),
                     fetched_at: std::time::SystemTime::now(),
                 },
@@ -1083,7 +1083,7 @@ impl rift_ee::seams::ImposterSource for CountingSource {
     }
 }
 
-fn source_config(port: u16, name: &str) -> rift_ee::seams::ImposterConfig {
+fn source_config(port: u16, name: &str) -> rift_cluster_base::seams::ImposterConfig {
     serde_json::from_value(serde_json::json!({
         "port": port,
         "protocol": "http",
@@ -1110,9 +1110,9 @@ async fn source_pull_fetches_exactly_once_and_converges_the_fleet() {
         body: std::sync::Mutex::new(vec![source_config(9401, "from-source-v1")]),
         version: std::sync::Mutex::new("v1".to_owned()),
     });
-    let mut registry = rift_ee::seams::SourceRegistry::new();
+    let mut registry = rift_cluster_base::seams::SourceRegistry::new();
     registry
-        .register(Arc::clone(&source) as Arc<dyn rift_ee::seams::ImposterSource>)
+        .register(Arc::clone(&source) as Arc<dyn rift_cluster_base::seams::ImposterSource>)
         .expect("register the counting source");
     let puller = rift_cluster::SourcePuller::new(registry);
     // Bound to the leader here; the write path forwards from any node, so which
@@ -1207,7 +1207,7 @@ async fn a_credential_bearing_source_uri_never_reaches_the_log() {
     assert!(cluster.wait_for_leader(LEADER_DEADLINE).await.is_some());
 
     let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut registry = rift_ee::seams::SourceRegistry::new();
+    let mut registry = rift_cluster_base::seams::SourceRegistry::new();
     registry
         .register(Arc::new(CountingSource {
             fetches: Arc::clone(&fetches),
@@ -1278,9 +1278,9 @@ async fn start_scheduler(
     Arc<rift_cluster::PollStatus>,
     tokio::task::JoinHandle<()>,
 ) {
-    let mut registry = rift_ee::seams::SourceRegistry::new();
+    let mut registry = rift_cluster_base::seams::SourceRegistry::new();
     registry
-        .register(Arc::clone(source) as Arc<dyn rift_ee::seams::ImposterSource>)
+        .register(Arc::clone(source) as Arc<dyn rift_cluster_base::seams::ImposterSource>)
         .expect("register the counting source");
     let puller = Arc::new(rift_cluster::SourcePuller::new(registry));
     puller.bind(node).expect("bind the puller");
@@ -1436,7 +1436,7 @@ async fn polling_unchanged_content_never_grows_the_log() {
 /// A credentialed provider that counts fetches — the same shape as
 /// `CountingSource` above, but registered through
 /// `SourceProviders::register_credentialed` / `CredentialedSource`, the
-/// enterprise seam issue #136 adds. `ImposterSource::fetch` has no `auth_ref`
+/// cluster seam issue #136 adds. `ImposterSource::fetch` has no `auth_ref`
 /// to give it, so exercising the digest short circuit through *this* trait is
 /// what proves it fires on the path the real `git+https:`/`s3:`/`registry:`
 /// providers actually use, not merely on the upstream-only path
@@ -1444,7 +1444,7 @@ async fn polling_unchanged_content_never_grows_the_log() {
 /// covers.
 struct CountingCredentialedSource {
     fetches: Arc<std::sync::atomic::AtomicUsize>,
-    body: std::sync::Mutex<Vec<rift_ee::seams::ImposterConfig>>,
+    body: std::sync::Mutex<Vec<rift_cluster_base::seams::ImposterConfig>>,
     version: std::sync::Mutex<String>,
 }
 
@@ -1455,11 +1455,11 @@ impl rift_cluster::sources::CredentialedSource for CountingCredentialedSource {
 
     fn fetch_with_auth<'a>(
         &'a self,
-        _r: &'a rift_ee::seams::SourceRef,
+        _r: &'a rift_cluster_base::seams::SourceRef,
         _auth_ref: Option<&'a str>,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = anyhow::Result<rift_ee::seams::FetchedImposters>>
+            dyn std::future::Future<Output = anyhow::Result<rift_cluster_base::seams::FetchedImposters>>
                 + Send
                 + 'a,
         >,
@@ -1467,11 +1467,11 @@ impl rift_cluster::sources::CredentialedSource for CountingCredentialedSource {
         Box::pin(async move {
             self.fetches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(rift_ee::seams::FetchedImposters {
+            Ok(rift_cluster_base::seams::FetchedImposters {
                 configs: self.body.lock().expect("body lock").clone(),
                 intercept: None,
                 routes: None,
-                meta: rift_ee::seams::SourceMeta {
+                meta: rift_cluster_base::seams::SourceMeta {
                     version: Some(self.version.lock().expect("version lock").clone()),
                     fetched_at: std::time::SystemTime::now(),
                 },
@@ -1501,7 +1501,7 @@ async fn a_credentialed_source_short_circuits_on_unchanged_content() {
         version: std::sync::Mutex::new("v1".to_owned()),
     });
     let mut providers =
-        rift_cluster::sources::SourceProviders::new(rift_ee::seams::SourceRegistry::new());
+        rift_cluster::sources::SourceProviders::new(rift_cluster_base::seams::SourceRegistry::new());
     providers
         .register_credentialed(source as Arc<dyn rift_cluster::sources::CredentialedSource>)
         .expect("register the credentialed counting source");

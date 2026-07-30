@@ -1,4 +1,4 @@
-# Rift Enterprise as a Kubernetes StatefulSet.
+# RiftCluster as a Kubernetes StatefulSet.
 #
 #     kubectl apply -f deploy/k8s/statefulset.yaml
 #
@@ -13,7 +13,7 @@ kind: Service
 metadata:
   name: rift-cluster
   labels:
-    app: rift-ee-server
+    app: rift-cluster-server
 spec:
   # Headless: peers resolve this name to the pod IPs directly. It is what
   # --cluster-seeds points at, and it is why `publishNotReadyAddresses` below
@@ -24,7 +24,7 @@ spec:
   # so a Service that hid not-ready pods would deadlock the whole cluster.
   publishNotReadyAddresses: true
   selector:
-    app: rift-ee-server
+    app: rift-cluster-server
   ports:
     - name: cluster
       port: 4790
@@ -38,10 +38,10 @@ kind: Service
 metadata:
   name: rift
   labels:
-    app: rift-ee-server
+    app: rift-cluster-server
 spec:
   selector:
-    app: rift-ee-server
+    app: rift-cluster-server
   ports:
     - name: admin
       port: 2525
@@ -64,18 +64,18 @@ kind: StatefulSet
 metadata:
   name: rift
   labels:
-    app: rift-ee-server
+    app: rift-cluster-server
 spec:
   serviceName: rift-cluster
   replicas: 3
   podManagementPolicy: Parallel
   selector:
     matchLabels:
-      app: rift-ee-server
+      app: rift-cluster-server
   template:
     metadata:
       labels:
-        app: rift-ee-server
+        app: rift-cluster-server
     spec:
       # ---------------------------------------------------------------------
       # THE RULE THIS MANIFEST EXISTS TO ENCODE.
@@ -96,8 +96,8 @@ spec:
         runAsUser: 10001
         fsGroup: 10001
       containers:
-        - name: rift-ee-server
-          image: rift-ee-server:latest
+        - name: rift-cluster-server
+          image: rift-cluster-server:latest
           imagePullPolicy: IfNotPresent
           # A StatefulSet template is uniform, but the founding node is not:
           # ordinal 0 must BOOTSTRAP the cluster, and every other ordinal must
@@ -115,7 +115,7 @@ spec:
                 export RIFT_CLUSTER_ALLOW_SOLO=true
                 unset RIFT_CLUSTER_SEEDS
               fi
-              exec rift-ee-server
+              exec rift-cluster-server
           ports:
             - name: admin
               containerPort: 2525

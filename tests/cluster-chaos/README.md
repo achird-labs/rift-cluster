@@ -1,6 +1,6 @@
 # Container-tier chaos harness
 
-Real `rift-ee-server` processes, in containers, killed and restarted for real.
+Real `rift-cluster-server` processes, in containers, killed and restarted for real.
 
 ```sh
 cargo test -p cluster-chaos -- --ignored --test-threads=1
@@ -17,7 +17,7 @@ lock, so forgetting the flag costs time rather than correctness.
 
 | | in-process (`crates/rift-cluster/tests/cluster.rs`) | container (here) |
 |---|---|---|
-| What runs | real `RaftNode`s over localhost TCP | real `rift-ee-server` processes |
+| What runs | real `RaftNode`s over localhost TCP | real `rift-cluster-server` processes |
 | Covers | consensus, membership, convergence | **process death**, signals, cold start, the admin API as an operator reaches it |
 | Speed | seconds, runs in PR CI | minutes, needs Docker |
 | Land new scenarios here first | ✅ | only when it genuinely needs a process |
@@ -146,7 +146,7 @@ docker compose -f deploy/compose/docker-compose.yml \
 | rift-1/2/3 cluster port | 14790 / 24790 / 34790 | `/admin/sources*` rides the **cluster port**, not the admin API — a source is a control-plane object authenticated with the cluster credential |
 | `source-origin` admin API | 46525 | where the fetch counter is read, and where the served document is changed mid-scenario |
 
-**The counting server is a fourth `rift-ee-server`, not a new image.** C20's
+**The counting server is a fourth `rift-cluster-server`, not a new image.** C20's
 claim is that a pull fetches the source *exactly once fleet-wide*, and asserting
 that needs something that counts requests exactly. So the origin is a rift node
 run **un-clustered**, whose imposter's response body *is* the config document
@@ -480,7 +480,7 @@ green — it does not touch a restart, so this is confirmation the mutation is
 specific to the cold-start path, not a duplicate of C17's.
 
 `c19_front_door_routes_around_bind_divergence` runs the same collision
-`crates/rift-ee-server/tests/bind_divergence.rs` already proves in-process,
+`crates/rift-cluster-server/tests/bind_divergence.rs` already proves in-process,
 across a real three-node stack instead: `bind-squat.overlay.yml` runs an
 `alpine/socat` sidecar inside **rift-2's own network namespace**
 (`network_mode: "service:rift-2"`), so an imposter's port is held by a
@@ -562,7 +562,7 @@ property is enforced, not a gap to paper over.
 **C23 runs only the `overwrite` arm.** `on_drift` has three, and all three are
 already covered in process over real HTTP by #134's suite —
 `a_skipped_pull_does_not_short_circuit_the_pull_that_resolves_it` in
-`crates/rift-ee-server/tests/sources.rs` for `skip`, and the state machine's own
+`crates/rift-cluster-server/tests/sources.rs` for `skip`, and the state machine's own
 `drifted_source_fails_when_asked` for `fail`. What containers add is process
 death and the operator-facing surface, neither of which differs between the arms,
 so triplicating a ~40 s scenario would buy a third copy of the same evidence.

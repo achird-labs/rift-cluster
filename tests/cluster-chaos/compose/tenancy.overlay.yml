@@ -22,7 +22,7 @@
 #
 # Note what this does NOT do: `compose.rs` clears `cli.oss.api_key` after
 # capturing it, so upstream's own raw-compare gate is not installed on top of
-# the enterprise authorizer. That matters for C24, whose whole claim is about
+# the cluster authorizer. That matters for C24, whose whole claim is about
 # which verdict the *EE* authorizer returns — a second upstream gate in front of
 # it would short-circuit the 403-vs-404 distinction being asserted.
 #

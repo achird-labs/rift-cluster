@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rift-ee",
+    "crates/rift-cluster-base",
     "crates/rift-cluster",
-    "crates/rift-ee-server",
+    "crates/rift-cluster-server",
     # Container-tier chaos scenarios (issue #11). A workspace member so it is
     # type-checked and linted with everything else; the scenarios themselves are
     # `#[ignore]`d because they need a container runtime, so a plain `cargo test`
@@ -20,7 +20,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Mohsen Zainalpour <zainalpour@gmail.com>"]
-repository = "https://github.com/achird-labs/rift-enterprise"
+repository = "https://github.com/achird-labs/rift-cluster"
 rust-version = "1.92"
 
 [workspace.dependencies]
@@ -30,7 +30,7 @@ rust-version = "1.92"
 rift-types = { path = "vendor/rift/crates/rift-types" }
 rift-mock-core = { path = "vendor/rift/crates/rift-mock-core" }
 # The server layer (ServerBuilder, metrics server, gateway dispatch) that the
-# enterprise binary composes instead of forking `main.rs`. Taken without the
+# cluster binary composes instead of forking `main.rs`. Taken without the
 # binary-only `mimalloc` default; the feature list mirrors rift-mock-core's
 # defaults so both views of the core agree (upstream's feature-propagation
 # invariant — a feature default-on in the core reaches nothing through a
@@ -41,7 +41,7 @@ rift-http-proxy = { path = "vendor/rift/crates/rift-http-proxy", default-feature
     "quamina-matching",
 ] }
 
-# Shared third-party deps for enterprise crates.
+# Shared third-party deps for cluster crates.
 tokio = { version = "1.41", features = ["full"] }
 anyhow = "1.0"
 thiserror = "1.0"
@@ -71,7 +71,7 @@ tokio-util = "0.7"
 # Cluster RPC authentication (RFC-001 §11.2): keyed MAC over each request.
 # Pinned to the same line the vendored upstream uses (`vendor/rift/Cargo.toml`),
 # features included: a second `reqwest` configuration would pull a second TLS
-# backend into the binary. The enterprise source providers (#136) need their own
+# backend into the binary. The cluster source providers (#136) need their own
 # client because upstream's `HttpSource` has no header-injection seam.
 reqwest = { version = "0.12", default-features = false, features = [
     "json",

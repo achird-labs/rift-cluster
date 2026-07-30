@@ -45,7 +45,7 @@ not previously tell which imposter a `flow_id` belonged to. Now the id says.
 
 Scope is per-imposter and not a cluster-wide setting, because it is a property
 of what an imposter's contexts *mean* — the same reason `readConsistency` is
-per-imposter. See `docs/rift-ee-server.md` for the knob, the behaviour change it
+per-imposter. See `docs/rift-cluster-server.md` for the knob, the behaviour change it
 represents, and the upgrade note (old ids are orphaned, TTL-bounded, with no
 dual-read path).
 
@@ -178,7 +178,7 @@ would be torn state), both counted in metrics.
 
 For customers whose requirements exceed AP-with-bounded-windows — strict
 sequencing, exactly-once proxy recording, zero adoption staleness — the same
-seams accept **Redis-backed implementations** (enterprise, Phases 4–5): the
+seams accept **Redis-backed implementations** (cluster, Phases 4–5): the
 external store becomes the single writer and the windows above collapse to
 Redis's own guarantees. Zero-dependency by default, external store by choice;
 the trait boundary makes the swap invisible to imposter configs.

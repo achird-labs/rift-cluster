@@ -8,7 +8,7 @@
 //! that can differ per node (port binds, listener state) lives in the engine
 //! drive *after* apply, never here.
 
-use rift_ee::seams::{ImposterConfig, RouteTable, Stub};
+use rift_cluster_base::seams::{ImposterConfig, RouteTable, Stub};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -413,14 +413,14 @@ pub enum ControlOp {
         tenant: TenantId,
     },
     /// Pause/resume serving on a port, applied in place — never a wholesale
-    /// replace (upstream #817 semantics; enterprise #15).
+    /// replace (upstream #817 semantics; cluster #15).
     SetEnabled {
         tenant: TenantId,
         port: u16,
         enabled: bool,
     },
     /// Whole-table replace of the front door's route table (issue #19 / U-11,
-    /// enterprise #131). Never a partial merge: [`RouteTable::validate`]
+    /// cluster #131). Never a partial merge: [`RouteTable::validate`]
     /// checks the table as a unit (ambiguity is a property of the whole set),
     /// so admission must see — and apply must store — the whole thing.
     PutRoutes {
@@ -774,7 +774,7 @@ pub enum StubEdit {
 /// and — the part that is easy to misread as a bug — neither are the
 /// *reads-that-mutate* served over the **proxy** path (`ScenarioReset`,
 /// `SavedRequestsClear`, `FlowStateClear`). Those are forwarded to the loopback
-/// OSS admin and never become a [`ControlOp`], so a log-derived projection
+/// core admin and never become a [`ControlOp`], so a log-derived projection
 /// cannot see them. Auditing them means putting them on consensus; recording
 /// them at the front door instead would produce per-node rows that can disagree
 /// with the log, which is the one thing this design refuses.
@@ -1476,7 +1476,7 @@ fn require_credential_free_uri(uri: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Per-scheme URI *shape* checks for the enterprise providers (#136), so a URI
+/// Per-scheme URI *shape* checks for the cluster providers (#136), so a URI
 /// that no provider could ever fetch is refused at admission with a 400 instead
 /// of being committed and then failing every pull forever.
 ///
@@ -2238,7 +2238,7 @@ mod tests {
 
     // -- validate: PutRoutes / DeleteRoute -------------------------------------
 
-    use rift_ee::seams::{Route, RouteMatch, RouteTarget};
+    use rift_cluster_base::seams::{Route, RouteMatch, RouteTarget};
 
     fn route(id: &str, port: u16) -> Route {
         Route {

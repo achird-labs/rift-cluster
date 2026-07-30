@@ -3,7 +3,7 @@
 Two capabilities lifted from studying how teams actually wrap mock servers in
 production (the Mimemo/Solo pattern: nginx hiding Mountebank behind one port,
 and an `IMPOSTERS` variable pulling mock definitions from a registry, GitHub,
-or disk). Rift-EE absorbs both into the product so the wrapper layer — its
+or disk). RiftCluster absorbs both into the product so the wrapper layer — its
 proxy, its glue scripts, its config drift — stops existing. Tracked as issues
 #19 (front door, upstream seam U-11) and #20 (sources, upstream seam U-12).
 
@@ -69,9 +69,9 @@ flowchart TB
     subgraph providers["ImposterSource providers (scheme-dispatched)"]
         F["file: — local file/dir<br/>(upstream built-in)"]
         H["https: — raw URL, ETag-aware<br/>(upstream built-in)"]
-        G["git+https: — repo#ref:path<br/>(enterprise)"]
-        S3["s3:// — bucket/key<br/>(enterprise)"]
-        R["registry:// — service-ids<br/>(enterprise, central-registry pattern)"]
+        G["git+https: — repo#ref:path<br/>(cluster)"]
+        S3["s3:// — bucket/key<br/>(cluster)"]
+        R["registry:// — service-ids<br/>(cluster, central-registry pattern)"]
     end
 
     providers --> PULL
@@ -99,7 +99,7 @@ re-pull clobber, made declared and observable.
 barrier makes a pull fleet-visible at its 2xx". It does not, and the
 distinction matters to anyone scripting against this path.
 `--cluster-write-barrier` is a property of the **admin front**
-(`crates/rift-ee-server/src/admin_front.rs`), while `POST /admin/sources/:id/pull`
+(`crates/rift-cluster-server/src/admin_front.rs`), while `POST /admin/sources/:id/pull`
 rides the **cluster port**: `SourcePuller::pull` submits the op and then awaits
 only *this* node's local apply (#99), so its 2xx means "committed, and the node
 you asked has it". The fleet follows within a replication round, which is what
@@ -123,7 +123,7 @@ Slack archaeology session.
 ## What this buys, concretely
 
 The Mimemo/Solo deployment — nginx + a Node management service + Mountebank +
-glue for GitHub/registry pulls, per environment — collapses to `rift-ee-server`
+glue for GitHub/registry pulls, per environment — collapses to `rift-cluster-server`
 with a route table and two source records. Same single exposed port, same
 pull-from-anywhere ergonomics, plus everything the wrapper never had: fleet
 HA, replicated routes and configs with read-after-write semantics, drift

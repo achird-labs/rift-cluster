@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | **Status** | v3.2 (re-grounded at v0.15.0; control plane decided by ADR-001) — implementation-ready |
-| **Tracking issue** | [achird-labs/rift-enterprise#1](https://github.com/achird-labs/rift-enterprise/issues/1) |
-| **Canonical location** | `rift-enterprise:docs/rfc/RFC-001-self-clustering-rift.md` |
+| **Tracking issue** | [achird-labs/rift-cluster#1](https://github.com/achird-labs/rift-cluster/issues/1) |
+| **Canonical location** | `rift-cluster:docs/rfc/RFC-001-self-clustering-rift.md` |
 | **Ground truth** | All code citations resolve against `vendor/rift` @ `aaa6042` (v0.15.0). `imposter/core.rs` was split upstream into the `imposter/core/{mod,matching,lifecycle,recording,responses,proxy}.rs` module tree and the crate renamed `rift-core` → `rift-mock-core`; line-number citations below are approximate against v0.15.0. |
 | **Author** | Mohsen Zainalpour |
 | **Date** | 2026-07-01 (v3: 2026-07-21; v3.1: 2026-07-22; v3.2: 2026-07-23) |
@@ -133,7 +133,7 @@ issues — an implementer reading only the RFC would have built the wrong thing.
 - **Phase 0 is complete.** All eight upstream seams shipped as `achird-labs/rift#311–#318`
   (v0.14.0); Appendix B is now a *filed-and-merged* mapping, not a to-file list. The Phase-0
   kill gate is discharged. The transport substrate (internal RPC + sync/async bridge, #8) is
-  merged (`rift-enterprise#21`).
+  merged (`rift-cluster#21`).
 - **Re-grounded at v0.15.0.** Crate rename and module split applied throughout (see Ground
   truth). Two new upstream facts folded in: the per-core runtime topology (RFC-712) is
   incompatible with the sync bridge and is **rejected at startup** (D-14); the error envelope
@@ -149,9 +149,9 @@ issues — an implementer reading only the RFC would have built the wrong thing.
 **Changelog v1 → v2**
 
 - Corrected three factual claims: hot-reload is *not* atomic (§3.4); Redis `set_ttl` is a
-  logging no-op (§3.2); tracking issue is rift-enterprise#1, not rift#301.
+  logging no-op (§3.2); tracking issue is rift-cluster#1, not rift#301.
 - Added the missing cornerstone: an **OSS seam plan** (§8, Appendix A/B) — v1 named a trait
-  family but no injection path exists in rift today; without upstream seams the enterprise
+  family but no injection path exists in rift today; without upstream seams the cluster
   repo cannot plug in clustered backends at all.
 - Replaced "config-sync via existing atomic hot-reload" (which would reset all cluster state
   on every change) with **owner-serialized writes + digest gossip + anti-entropy fetch +
@@ -160,7 +160,7 @@ issues — an implementer reading only the RFC would have built the wrong thing.
   decision table (§7.6), sync/async bridge (§7.7), stable stub identity & sequence keys
   (§8.3), port-bind divergence (§7.4.6), CRDT types & GC (§7.5), rolling upgrade / version
   skew (§11.4), chaos verification (§12), kill criteria (§13.3).
-- Added enterprise composition: `rift-ee-server` binary and crate layout (§9).
+- Added cluster composition: `rift-cluster-server` binary and crate layout (§9).
 
 **Changelog v2 review cycle 1** (5-reviewer adversarial pass; blockers fixed)
 
@@ -240,7 +240,7 @@ exactly-once semantics** (Appendix C D-12).
 
 This is a **split-repo feature**: a small set of *generic* extension seams goes upstream to
 Rift (Appendix A); everything cluster-aware lives in this repo (`rift-cluster`,
-`rift-ee-server`). Phased so the high-value, low-risk slice (membership + config-sync) ships
+`rift-cluster-server`). Phased so the high-value, low-risk slice (membership + config-sync) ships
 first and each later phase is gated on demonstrated demand.
 
 > **Note (2026-07-30):** this RFC was written under an open-core model and its
@@ -290,7 +290,7 @@ RPS, so raw throughput is rarely the driver — four goals justify a cluster:
   partition rejects control-plane writes rather than diverging (ADR-001).
 - **Not unbounded scale.** Design target 3–9 **voters**, documented ceiling 16 nodes (extra
   nodes join as non-voting learners).
-- **No enterprise concepts upstream.** The OSS surface stays generic (gate B3).
+- **No cluster concepts upstream.** The OSS surface stays generic (gate B3).
 - **No owner-affinity guarantee at the LB.** Header-hash affinity gives stickiness, not
   owner co-location (§6.2); the design budgets one LAN RPC per stateful op.
 - **No intercept mode, injection gate, or TUI in cluster mode** (v3). These are single-node
@@ -395,9 +395,9 @@ it with incremental reconciliation.
 - **rift-mock-core is an embeddable, CLI-free library** (issue #203); `rift-http-proxy` is
   lib+bin, re-exporting `admin_api` and `config_loader`, so the admin API
   (`AdminApiServer::new(addr, manager, api_key)`, `admin_api/server.rs:27`) is reusable
-  from an enterprise binary. Caveat: the metrics server and the bootstrap composition
+  from a cluster binary. Caveat: the metrics server and the bootstrap composition
   (`run_mountebank_mode`, `rift-http-proxy/src/main.rs:277,304`) are **bin-private** —
-  U-7 moves them into the lib so the enterprise binary composes instead of forking.
+  U-7 moves them into the lib so the cluster binary composes instead of forking.
 
 ## 4. Central design tension (and resolution)
 
@@ -433,7 +433,7 @@ it away.
    [port-based fallback: L4 range proxy over a statically declared port set]
    ┌────┴───────────────────────────────────────────┐
    ▼                   ▼                    ▼
- Node A              Node B               Node C   (rift-ee-server)
+ Node A              Node B               Node C   (rift-cluster-server)
  - data plane: binds ALL imposter ports; in-process stub matching (unchanged OSS code)
  - gossip layer ⇆ SWIM membership + small KV (config digests, bind status, clear
    generations, journal watermarks) ⇆
@@ -447,7 +447,7 @@ it away.
 
 Every node runs identical roles (no leader). The OSS engine (`rift-mock-core`) is unmodified at
 runtime; cluster behavior enters exclusively through the seams of Appendix A, implemented
-by `rift-cluster` and wired by `rift-ee-server` (§9).
+by `rift-cluster` and wired by `rift-cluster-server` (§9).
 
 ## 6. Isolation model ↔ LB topology
 
@@ -518,7 +518,7 @@ freshly minted port is addressable immediately with zero LB reconfiguration. Por
 flow-id stay orthogonal. **On Kubernetes this mode is effectively mandatory** (§11.5).
 The plain gateway listener is upstreamed as part of U-7 (it is a generic single-node
 convenience — promotion of #212; decision D-11); the cluster-aware parts (bind-failure
-fallback dispatch, §7.4.6) stay enterprise.
+fallback dispatch, §7.4.6) stay cluster.
 
 ## 7. Cluster runtime design
 
@@ -566,7 +566,7 @@ fallback dispatch, §7.4.6) stay enterprise.
     (`config-sync,flow-state,sequencing,journal,proxy`; default: all shipped phases).
     This is the per-phase rollback switch (§10). **Not accepted yet**: flow state
     (#120) ships on for every `--cluster` node, and the binary refuses flags that
-    gate nothing (see `rift-ee-server.md` §What lands later).
+    gate nothing (see `rift-cluster-server.md` §What lands later).
   - `--cluster-state-dir <path>` — persisted desired-state (default `<datadir>/_cluster`,
     or a mandatory explicit path when no datadir).
 - **Timing defaults:** gossip interval 1 s; phi-accrual failure detection target: node
@@ -807,7 +807,7 @@ Connection pooling per peer.
 > an apply-path create whose explicit port failed to bind registered in the map anyway (§7.4.6),
 > so the original claim now holds in the scope #143 actually built — a node whose own bind failed
 > still reaches the imposter through the front door and the gateway alike, in-process, with no
-> socket involved. See `docs/rift-ee-server.md` ("The clustered front door") for the
+> socket involved. See `docs/rift-cluster-server.md` ("The clustered front door") for the
 > operator-facing contract.
 
 **Design rules (v2, superseded mechanism): gossip carries pointers, not payloads; writes are
@@ -870,7 +870,7 @@ revision.
 - Every node persists the **replicated desired-state** — configs (bodies), `(g, revision)`
   per port, tombstones, clear generations, its own incarnation — to
   `--cluster-state-dir`, updated write-through on reconcile. This subsumes the datadir
-  role in cluster mode (the OSS `--datadir` write-through stays enabled for
+  role in cluster mode (the core `--datadir` write-through stays enabled for
   single-node-compatible snapshots but is not the replication source of truth).
 - **Cold start (full-cluster restart):** nodes load persisted state, join, and merge by
   `(g, revision, origin)`; the highest persisted revision per port wins; persisted
@@ -902,13 +902,13 @@ binds can fail on some nodes (port taken by an unrelated process). Built (#143):
 
 - **The imposter is registered cluster-wide regardless of a local bind failure.**
   `ImposterManager::with_serve_unbound(true)` — set for the cluster manager only
-  (`cluster_manager`, `crates/rift-ee-server/src/compose.rs`; the `--cluster`-off path
+  (`cluster_manager`, `crates/rift-cluster-server/src/compose.rs`; the `--cluster`-off path
   never reaches it) — changes the **apply-path** create (`apply_config` →
   `create_for_apply`, and the wholesale-replace path) so a socket-level
   `ImposterError::BindError` on an **explicit** port no longer aborts the create: the
   imposter is constructed and claims the port in the map with no listener, instead of
   being dropped. Every in-process route resolves through `manager.get_imposter(port)` —
-  the gateway's `dispatch_to_port` and, in the enterprise build, the front door alike —
+  the gateway's `dispatch_to_port` and, in the cluster build, the front door alike —
   so an unbound imposter still answers on that node; only traffic addressed directly to
   the bound socket is lost, which is the part the squatter already took.
   `Imposter::is_bound()` reports the state. Two paths stay all-or-nothing on purpose:
@@ -958,13 +958,13 @@ binds can fail on some nodes (port taken by an unrelated process). Built (#143):
   imposter is genuinely in the local map and the read genuinely succeeds. The response
   carries `rift-cluster-bind-failures: <port>=<reason>` when this node could not realize
   that port's bind, and no header at all for a healthy port. The response **body** stays
-  OSS-shaped on purpose — the U-8 decoration seam is deliberately headers-only, so a
+  core-shaped on purpose — the U-8 decoration seam is deliberately headers-only, so a
   client wanting the detail follows the header rather than a body shape no OSS client can
   parse.
 - **Auto-assigned ports are refused outright under `--cluster`**, not minted per-node: an
   auto-assigned port cannot replicate (every node's local 49152–65535 scan would pick a
   different one), so the admin front rejects a clustered imposter create or whole-set
-  replace with no explicit `port` at `400` (`crates/rift-ee-server/src/admin_front.rs`)
+  replace with no explicit `port` at `400` (`crates/rift-cluster-server/src/admin_front.rs`)
   rather than minting one that could diverge. Every clustered imposter therefore has an
   explicit, fixed port for its lifetime — there is no re-mint-on-bind-failure case to
   reason about. In L4/port-based mode, per-port LB health checks must still be configured
@@ -1177,7 +1177,7 @@ whose owner is on that side.
 | Config read | Local (converged) | Local (possibly stale; convergence gauge exposes lag) | Same |
 
 Client-visible contract: degraded/partial responses always carry a `Rift-Cluster-*` header
-(via the U-8 decoration seam — the OSS handlers themselves stay cluster-ignorant), and
+(via the U-8 decoration seam — the core handlers themselves stay cluster-ignorant), and
 every degraded op increments `rift_cluster_degraded_ops_total{feature}` — test harnesses
 can assert zero degraded ops for strict runs.
 
@@ -1224,7 +1224,7 @@ for gate B). Summary:
 
 ### 8.1 Trait family (upstream, generic; `rift-mock-core` unless noted)
 
-| Trait / seam (crate::module) | Supersedes | Cluster impl (enterprise) |
+| Trait / seam (crate::module) | Supersedes | Cluster impl (cluster) |
 |---|---|---|
 | `FlowStore` + `compare_and_set` (`extensions::flow_state`) | itself | `ClusteredFlowStore` (owner-serialized, successor-replicated) |
 | `FlowStoreProvider` (`extensions::flow_state`) | private `create_flow_store` match (`imposter/core.rs:152`) | provider returning clustered stores |
@@ -1232,7 +1232,7 @@ for gate B). Summary:
 | `RequestJournal` (`imposter::journal`) | `RwLock<Vec<RecordedRequest>>` + count `AtomicU64` | `ClusteredJournal` (sharded G-log) |
 | `ProxyRecordingStore` (`recording::store`) | concrete `RecordingStore` | `ClusteredProxyStore` (owner state machine); `RedisProxyStore` |
 | `ImposterEventListener` + `apply_config` + `move_stub` + `stub_key` (`imposter::manager`, `imposter`) | `reload()` for sync purposes | config publisher + reconciler |
-| Embeddable server pieces (`rift-http-proxy`): bootstrap builder, metrics server, gateway dispatch | bin-private `main.rs` | `rift-ee-server` composition |
+| Embeddable server pieces (`rift-http-proxy`): bootstrap builder, metrics server, gateway dispatch | bin-private `main.rs` | `rift-cluster-server` composition |
 | `ResponseDecorator` + `BackendUnavailable` (`extensions::decorate`) | — (new) | stamps `Rift-Cluster-*` headers/warnings |
 
 Design rules for the upstream surface (gate B3): names, doc comments, and config keys are
@@ -1244,7 +1244,7 @@ in the trait's own module; `Local` remains the default so OSS behavior is unchan
 **Monetization boundary (deliberate):** OSS gets the traits + `Local` impls + the existing
 `RedisFlowStore` (including its U-1 CAS — withholding an atomicity fix from an existing
 OSS backend would be bad-faith open-core). **Redis implementations of the *new* traits
-(sequencer/journal/proxy) and all gossip/fleet machinery are enterprise** (`rift-cluster`).
+(sequencer/journal/proxy) and all gossip/fleet machinery are cluster** (`rift-cluster`).
 The honest consequence and the actual moat are recorded in Appendix C D-6: OSS + shared
 Redis can DIY scenario/flow-KV multi-instance correctness; what stays commercial is
 zero-dependency clustering, config-sync/membership/HA, cluster-merged verification, and
@@ -1272,7 +1272,7 @@ fleet operations.
   follow the task across `.await`s and threads, and the sync bridge call runs inside the
   same task, so the carrier works; annotations from script-pool threads are best-effort
   and documented as such). This is how revision headers, bind-warning headers, and
-  degraded/partial flags are emitted without the OSS handlers knowing about clusters.
+  degraded/partial flags are emitted without the core handlers knowing about clusters.
 - Sequencer plumbing note: cursor call sites (`StubState::get_next_response/peek_response`
   and their callers in `core.rs`/`handler.rs`) need `flow scope` and precomputed
   `repeats: &[u32]` threaded through ~8 signatures — acknowledged in U-3's PR scope, not
@@ -1286,7 +1286,7 @@ fleet operations.
   The `~` prefix keeps generated keys disjoint from user-supplied ids. Deterministic
   across nodes because it derives only from replicated config bytes. Upstreamed as
   `rift_mock_core::imposter::stub_key(&Stub, occurrence)` (U-6 needs it for keyless-stub
-  diffing; enterprise reuses it — one definition).
+  diffing; cluster reuses it — one definition).
 - **Sequence key** (cursor identity): `SequenceKey { port, slot, stub_key, scope }` where
   `scope = stub.space.clone().unwrap_or_default()` — **per-stub, not per-flow** (an
   unscoped stub matched by many flows shares one cursor, exactly today's semantics) —
@@ -1314,12 +1314,12 @@ fleet operations.
   `(port, RequestSignature)` — port-scoped because `RequestSignature` itself is port-less
   and only per-imposter store instances disambiguate it today.
 
-## 9. Enterprise composition (`rift-enterprise` repo)
+## 9. Cluster composition (`rift-cluster` repo)
 
 ```
 crates/
-  rift-ee            # facade (exists): re-exports rift_mock_core/rift_types AND the seam traits;
-                     #   rift-cluster/rift-ee-server import ONLY rift-ee — enforced
+  rift-cluster-base            # facade (exists): re-exports rift_mock_core/rift_types AND the seam traits;
+                     #   rift-cluster/rift-cluster-server import ONLY rift-cluster-base — enforced
                      #   structurally: their Cargo.tomls drop the direct rift-mock-core/
                      #   rift-types deps they carry today (Cargo, not lints, is the fence)
   rift-cluster       # all cluster logic
@@ -1333,7 +1333,7 @@ crates/
     src/crdt/        #   sharded G-log + watermarks, G-counters, clear generations
     src/decorate.rs  #   ResponseDecorator impl stamping Rift-Cluster-* (via U-8)
     src/admin.rs     #   /_cluster/* observability endpoints (§11.1)
-  rift-ee-server     # binary (new): clap CLI = OSS flags + --cluster* superset; composes
+  rift-cluster-server     # binary (new): clap CLI = OSS flags + --cluster* superset; composes
                      #   the U-7 bootstrap builder with providers/backends from
                      #   rift-cluster; runs OSS AdminApiServer + metrics server (from U-7)
                      #   + cluster admin routes on the cluster port; --gateway-port
@@ -1342,13 +1342,13 @@ crates/
 
 Consumption mechanics (per `docs/dev-workflow.md`): each upstream seam PR (Appendix A)
 merges to `achird-labs/rift` first → `vendor/rift` submodule bump → the corresponding
-enterprise phase unblocks. Workspace mechanics: add `rift-http-proxy` to
+cluster phase unblocks. Workspace mechanics: add `rift-http-proxy` to
 `[workspace.dependencies]` as a path dep (missing today); `rift-mock-core` is consumed with its
 default features; feature unification with `rift-http-proxy`'s `default-features = false`
 core dep is verified by the existing CI `cargo check --workspace`.
 
-Single-node/OSS users are unaffected: without `--cluster`, `rift-ee-server` wires the same
-`Local` impls the OSS binary uses; the OSS `rift` binary never links `rift-cluster` at all.
+Single-node/OSS users are unaffected: without `--cluster`, `rift-cluster-server` wires the same
+`Local` impls the core binary uses; the core `rift` binary never links `rift-cluster` at all.
 
 ## 10. Phased plan
 
@@ -1362,7 +1362,7 @@ Phase 1 is not blocked by seams it doesn't need.
 |---|---|---|---|---|
 | **0a — enabling seams** ✅ **DONE** | U-6 (#316), U-7 (#317), U-8 (#318) — **merged upstream v0.14.0** | — | OSS suite green; `matcher_bench` within 2 % of pre-seam baseline | Additive, default-off |
 | **0b — backend seams** ✅ **DONE** | U-1…U-5 (#311–#315) — **merged upstream v0.14.0** | — | Same bars per PR | Same |
-| **1 — Membership + config-sync** (v3: **Raft**, ADR-001) | `--cluster*` CLI; Raft membership incl. graceful leave; `ControlOp` config writes + read-after-write barrier + durable intent log + op-id dedup (replaces the v2 gossip mechanism); redb log/vote/snapshot + cold start; `/_cluster/{members,config,health,imposters,ops}`; `/readyz`. Transport substrate (#8) merged. | 0a ✅ | 3-node harness: `POST /imposters` on A visible & serving on B/C ≤ 5 s (`test_config_sync_converges`); kill B mid-run → A/C unaffected, B rejoin converges (`test_node_rejoin`); sibling-port config change preserves scenario state (`test_reconcile_preserves_state`); stub reorder converges order-correct (`test_reconcile_reorder`); unreachable seeds ⇒ never Ready (`test_no_seeds_not_ready`); full-cluster cold restart restores config incl. tombstones (`test_cold_start`); SIGTERM leave under load → zero data-plane errors on survivors AND zero lost acknowledged writes (`test_graceful_leave`). Chaos: C4, C5, C6, C7, **C14, C15**. SDK conformance suite (upstream epic achird-labs/rift#458) green against a clustered fleet — an SDK must not be able to tell a 3-node fleet from a single node, which is R1 as a client sees it; `--cluster`-off parity of the full OSS suite tracked as #37. | `--cluster` off → OSS single node. **Truth scope:** a de-clustered node serves the full fleet config only if it ran with `--datadir` (the OSS write-through) — with `--configfile`-only deployments, export a snapshot from `--cluster-state-dir` first. Rollback is per-fleet: mixed on/off nodes behind one LB diverge immediately |
+| **1 — Membership + config-sync** (v3: **Raft**, ADR-001) | `--cluster*` CLI; Raft membership incl. graceful leave; `ControlOp` config writes + read-after-write barrier + durable intent log + op-id dedup (replaces the v2 gossip mechanism); redb log/vote/snapshot + cold start; `/_cluster/{members,config,health,imposters,ops}`; `/readyz`. Transport substrate (#8) merged. | 0a ✅ | 3-node harness: `POST /imposters` on A visible & serving on B/C ≤ 5 s (`test_config_sync_converges`); kill B mid-run → A/C unaffected, B rejoin converges (`test_node_rejoin`); sibling-port config change preserves scenario state (`test_reconcile_preserves_state`); stub reorder converges order-correct (`test_reconcile_reorder`); unreachable seeds ⇒ never Ready (`test_no_seeds_not_ready`); full-cluster cold restart restores config incl. tombstones (`test_cold_start`); SIGTERM leave under load → zero data-plane errors on survivors AND zero lost acknowledged writes (`test_graceful_leave`). Chaos: C4, C5, C6, C7, **C14, C15**. SDK conformance suite (upstream epic achird-labs/rift#458) green against a clustered fleet — an SDK must not be able to tell a 3-node fleet from a single node, which is R1 as a client sees it; `--cluster`-off parity of the full OSS suite tracked as #37. | `--cluster` off → OSS single node. **Truth scope:** a de-clustered node serves the full fleet config only if it ran with `--datadir` (the core write-through) — with `--configfile`-only deployments, export a snapshot from `--cluster-state-dir` first. Rollback is per-fleet: mixed on/off nodes behind one LB diverge immediately |
 | **2 — Scenario/flow state** | `ClusteredFlowStore`: owner-serialized reads (match gate) + CAS, successor replication, adoption; `/_cluster/kv/{flow_id}`; stuck-scenario & split-brain runbooks | U-1, U-2 (+0a) | multi-step scenario round-robin across 3 nodes at 10 ms pacing: transitions linear per flow, zero illegal transitions, zero lost updates over 10 k iterations (`test_scenario_cluster_linear`); owner kill mid-scenario → adopt within 1 replication round or flagged reset, never an illegal transition (`test_scenario_handoff`). Chaos: C1, C8, C9, C12, C13 | `--cluster` off → local stores. (#120 shipped the store always-on under `--cluster` — a `--cluster-features` opt-out would reintroduce the per-imposter split-brain it exists to remove) |
 | **3 — Recorded-request verification** | `ClusteredJournal`: sharded log, watermarks, pull-on-read, generation clears; count G-counter | U-4 (+0a); **U-13** for the vector-cursor/streaming form (§7.5.1) | spray N (< shard-cap) requests across 3 nodes → `GET .../requests` on each node returns exactly N (`test_journal_merge_exact`); `DELETE savedRequests` clears cluster-wide ≤ 5 s incl. concurrent appends, clock-skew-immune (`test_journal_clear`); `numberOfRequests` = N on every node (`test_count_merge`); incremental reads with the returned vector cursor concatenate, **within one clear generation**, to exactly a full read of that generation — no duplicate, no gap — with `Rift-Cluster-Cursor-Reset` exactly once across a clear and `Rift-Cluster-Partial` for a node unreachable mid-sequence (`test_journal_cursor_merge`, §7.5.1; needs seam U-13) | `--cluster-features` without `journal` → local Vec |
 | **4 — Response sequencing (strict = Redis first)** | `RedisSequencer` (strict, requires `--cluster-redis <url>`); `ClusteredSequencer` (gossip-native, experimental flag) | U-3 (+0a); **named customer request on file for gossip-native strict** | Redis mode: cyclic stub sprayed across nodes → global sequence no dup/skip incl. during single-node kill (`test_sequence_redis_strict`); gossip mode: no dup/skip while membership stable, documented reset on handoff (`test_sequence_no_dup_no_skip`, `test_sequence_handoff_reset`). Chaos: C2, C13 | feature flag off → per-node cursors (today's behavior) |
@@ -1566,9 +1566,9 @@ health checks in L4 mode (§6.1).
 
 ## 12. Verification & chaos plan
 
-Harness: `rift-enterprise` repo, **two tiers** (#11). *In-process* (`crates/rift-cluster`
+Harness: `rift-cluster` repo, **two tiers** (#11). *In-process* (`crates/rift-cluster`
 tests) drives real `RaftNode`s over localhost TCP — fast, deterministic, runs in PR CI.
-*Container* (`tests/cluster-chaos/`) runs 3× `rift-ee-server` containers behind an Envoy
+*Container* (`tests/cluster-chaos/`) runs 3× `rift-cluster-server` containers behind an Envoy
 front with **toxiproxy between the nodes** — the only tier that can test real process
 death, partitions, and the admin write path end to end. Every scenario asserts on the
 admin API + Prometheus metrics, **never** log output, and never on the frozen legacy
@@ -1610,10 +1610,10 @@ parallelized compose stacks); **nightly full** = 100 iterations across parallel 
 quarantined behind an issue, not deleted.
 
 Regression: entire existing `rift-mock-core`/`rift-http-proxy` test suite runs against
-`rift-ee-server` with `--cluster` **off** → byte-identical behavior (tracked as #37);
+`rift-cluster-server` with `--cluster` **off** → byte-identical behavior (tracked as #37);
 hot-path micro-benches (`matcher_bench`) within 2 %. The **SDK conformance suite**
 (upstream epic achird-labs/rift#458) runs against a clustered fleet as a Phase-1 exit
-criterion: an SDK cannot tell a clustered `rift-ee-server` from a single node, which is the
+criterion: an SDK cannot tell a clustered `rift-cluster-server` from a single node, which is the
 externally visible form of R1. Pipeline: `cargo fmt`, `cargo clippy -- -D warnings`,
 `cargo test` (both repos).
 
@@ -1632,7 +1632,7 @@ externally visible form of R1. Pipeline: `cargo fmt`, `cargo clippy -- -D warnin
 - **chitchat dependency risk:** MIT-licensed, maintained by Quickwit, but not designed as
   a stable public API; pinned + wrapped behind `rift-cluster::membership` so a swap to
   `foca` stays contained (Appendix C D-2).
-- **Upstream coupling:** enterprise velocity depends on OSS seam PRs (Phase 0). Mitigation:
+- **Upstream coupling:** cluster velocity depends on OSS seam PRs (Phase 0). Mitigation:
   seams are small, additive, independently useful (Appendix A), the repos share a
   maintainer today, and §13.3 puts a clock on it.
 
@@ -1646,8 +1646,8 @@ Decision table (any single row sufficing means: don't cluster):
 | Teams have disjoint imposter sets | Shard by port-range/DNS across independent nodes — zero new code |
 | Mocks live and die with a CI job | One Rift sidecar per app/test-runner |
 | Traffic for any one logical flow can be pinned to one node | **Sticky/affinity LB over independent nodes**: per-flow scenarios, cycling, and verification are then correct today with zero cluster code — the cluster only earns its keep when one flow's requests genuinely spray (serverless callers, many concurrent clients per flow) or fleet-wide verification/config is required |
-| You already run Redis and accept it as a dependency | Independent nodes + the OSS Redis flow-state backend cover shared scenario state; the enterprise Redis-strict sequencer/proxy backends (Phases 4–5) extend that without gossip |
-| No on-prem/perimeter constraint | Hosted mock SaaS (WireMock Cloud et al.) removes ops entirely; Rift-EE clustering targets customers whose mock env must sit inside their network (data residency, load-test network path) — validate this constraint with each design partner |
+| You already run Redis and accept it as a dependency | Independent nodes + the core Redis flow-state backend cover shared scenario state; the cluster Redis-strict sequencer/proxy backends (Phases 4–5) extend that without gossip |
+| No on-prem/perimeter constraint | Hosted mock SaaS (WireMock Cloud et al.) removes ops entirely; RiftCluster clustering targets customers whose mock env must sit inside their network (data residency, load-test network path) — validate this constraint with each design partner |
 
 Cluster when ≥ 2 of: >1-node sustained throughput; zero-downtime always-on SLO;
 cross-node flows; fleet-wide config + verification.
@@ -1910,13 +1910,13 @@ as 503-with-context rather than opaque 500s, and need a per-request annotation c
 response hook (op timing, build info, storage provenance) — all generic. *Compat:* no
 decorator, no custom backends → byte-identical responses.
 *(This seam is how all `Rift-Cluster-*` headers — degraded/partial flags, revision and
-bind-warning headers — are emitted: enterprise backends `annotate(...)`, the enterprise
-decorator translates annotations into `Rift-Cluster-*` headers. The OSS handlers never
+bind-warning headers — are emitted: cluster backends `annotate(...)`, the cluster
+decorator translates annotations into `Rift-Cluster-*` headers. The core handlers never
 learn cluster vocabulary.)*
 
-### Enterprise-only inventory (never upstreamed)
+### Cluster-only inventory (never upstreamed)
 
-Everything in `rift-cluster` and `rift-ee-server` (§9): chitchat integration and
+Everything in `rift-cluster` and `rift-cluster-server` (§9): chitchat integration and
 membership lifecycle, HRW ring/epochs/settle/generations, internal RPC + HMAC, flow-KV
 replication/adoption, config-owner serialization + persisted state dir + reconciler
 driver, journal shards/watermarks/generation clears, proxyOnce Pending/Recorded machine,
@@ -1933,14 +1933,14 @@ Redis impls of U-3/U-4/U-5, the `ResponseDecorator` impl, `/_cluster/*` endpoint
 > (`ResponseDecorator` + `BackendUnavailable`). Of the three later-phase seams, **U-11** (the
 > front-door route table, #19) and **U-12** (the `ImposterSource` provider trait, #20) have
 > since landed upstream — U-12 as `achird-labs/rift#852`, vendored by this repo's #133 — and
-> the enterprise halves are built on them: the replicated route table (#131) and sources as
+> the cluster halves are built on them: the replicated route table (#131) and sources as
 > control-plane objects (#134). **U-13** `RequestJournal::read_since` — the incremental-read
 > method the §7.5.1 vector cursor needs, which U-4 (#314, already merged) does not carry — is
 > still outstanding, so Phase 3's fleet-wide streaming form remains gated on it landing
 > upstream. RFC-002 adds **U-9** (admin authorizer) + **U-10** (principal on events). The
 > original drafts are retained below for provenance.
 
-Filed on `achird-labs/rift` (generic wording; no enterprise references). One
+Filed on `achird-labs/rift` (generic wording; no cluster references). One
 umbrella issue — *"Pluggable runtime-state backends & embeddable server (#203
 follow-up)"* — then one PR per seam:
 
@@ -1980,12 +1980,12 @@ follow-up)"* — then one PR per seam:
 | D-3 | HRW hashing, no vnodes | Consistent-hash rings with vnodes shine at N≫16 and weighted nodes; HRW is simpler, minimal churn on membership change, O(N) fine at our scale |
 | D-4 | Config bodies via content-addressed RPC fetch, not gossip | Gossiping full configs blows the SWIM payload budget and re-floods every round; digests converge fast and bodies transfer once per node |
 | D-5 | Two-level, order-aware reconcile (LCS edit script) on top of by-id/positional stub CRUD | Whole-imposter replace per change resets runtime state cluster-wide; set-diff (v2 draft 1) missed reorders and reordered keyless edits — order is match priority, so the edit script must be order-aware |
-| D-6 | Redis impls of the *new* traits are enterprise; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS. **Accepted erosion:** OSS + shared Redis can DIY multi-instance scenario/flow-KV correctness. **The moat is not "coordination"** — any Redis impl of these small traits is community-reproducible in days — it is zero-dependency clustering, config-sync/membership/HA, cluster-merged verification, and fleet operations | Withholding CAS from an existing OSS backend would be bad-faith open-core and raise more upstream suspicion than shipping it; pretending trait-impl code is the moat mis-prices the product |
+| D-6 | Redis impls of the *new* traits are cluster; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS. **Accepted erosion:** OSS + shared Redis can DIY multi-instance scenario/flow-KV correctness. **The moat is not "coordination"** — any Redis impl of these small traits is community-reproducible in days — it is zero-dependency clustering, config-sync/membership/HA, cluster-merged verification, and fleet operations | Withholding CAS from an existing OSS backend would be bad-faith open-core and raise more upstream suspicion than shipping it; pretending trait-impl code is the moat mis-prices the product |
 | D-7 | Manager-scoped store via provider resolves the construction-time caveat | Per-imposter stores kept for OSS compat; a provider returning a shared store is strictly more flexible |
 | D-8 | Sequence cursors reset on ownership change | Replicating cursors puts a network write on the hottest stateful path; a documented reset matches test-run-scoped data |
-| D-9 | Sync traits + enterprise-side bridge runtime (std mpsc park, sized semaphore) | Async-ifying `FlowStore` ripples into Lua/JS engines and every call site — huge OSS churn benefiting only clustering |
+| D-9 | Sync traits + cluster-side bridge runtime (std mpsc park, sized semaphore) | Async-ifying `FlowStore` ripples into Lua/JS engines and every call site — huge OSS churn benefiting only clustering |
 | D-10 | Degraded reads reject by default (except sequencing = local); shipped per-imposter as `readConsistency` (#120), not as the `--cluster-degraded-mode` flag first sketched | Silent local fallback for CAS/proxyOnce converts partitions into wrong test results — the one thing a verification tool must never do; sequencing degrades by default because blocking all cyclic responses during a blip is worse than a possible duplicate index, and it's flagged |
-| D-11 | Plain gateway listener upstreams with U-7 (promotion of #212); only cluster-aware dispatch (bind-failure fallback) stays enterprise | Keeping a generic single-node convenience enterprise-only has bad optics, zero moat (community can promote #212 trivially), and weakens U-7's story |
+| D-11 | Plain gateway listener upstreams with U-7 (promotion of #212); only cluster-aware dispatch (bind-failure fallback) stays cluster | Keeping a generic single-node convenience cluster-only has bad optics, zero moat (community can promote #212 trivially), and weakens U-7's story |
 | D-12 | Strict sequencing/proxyOnce ship **Redis-backed first**; gossip-native single-writer versions are demand-gated experimental follow-ons | Gossip-exact semantics are the hardest engineering in the RFC aimed at the least-demanded guarantee; the trait seams make the backend invisible to customers; target customers already operate Redis. The zero-dependency premise stays intact for Phases 1–3 (membership, config-sync, scenario state, verification) |
 | D-13 | LB header affinity treated as stickiness only; owner co-location is NOT assumed (one LAN RPC per stateful op is the budget) | v1/v2-draft claimed "receiving node is usually the owner" — false: LBs hash onto their own ring. A future sticky-owner lease (first-touch ownership) could align them but is a separate design with its own fencing story; recorded as future work, not assumed |
 | D-14 | `--cluster` + `--runtime per-core` rejected at startup; `--cluster` + intercept mode likewise | Upstream RFC-712's per-core topology runs single-threaded pinned worker runtimes; the §7.7 sync bridge parks caller threads, and a per-core worker has only one thread to park, so a single owner outage would stall every connection pinned to it. Enforced in the #8 config guard. |

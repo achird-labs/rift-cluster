@@ -1203,7 +1203,7 @@ impl ClusteredFlowStore {
     }
 }
 
-impl rift_ee::seams::FlowStore for ClusteredFlowStore {
+impl rift_cluster_base::seams::FlowStore for ClusteredFlowStore {
     fn get(&self, flow_id: &str, key: &str) -> anyhow::Result<Option<Value>> {
         // Scoped above the consistency branch, not inside one: the namespace is
         // a property of the imposter, not of which copy answers the read.
@@ -1282,7 +1282,7 @@ impl rift_ee::seams::FlowStore for ClusteredFlowStore {
         key: &str,
         expected: Option<&Value>,
         new: Value,
-    ) -> anyhow::Result<rift_ee::seams::CasOutcome> {
+    ) -> anyhow::Result<rift_cluster_base::seams::CasOutcome> {
         let reply = self.write(
             flow_id,
             key,
@@ -1293,9 +1293,9 @@ impl rift_ee::seams::FlowStore for ClusteredFlowStore {
         )?;
         match Self::applied(reply)? {
             WriteReply::CasConflict { current } => {
-                Ok(rift_ee::seams::CasOutcome::Conflict(current))
+                Ok(rift_cluster_base::seams::CasOutcome::Conflict(current))
             }
-            _ => Ok(rift_ee::seams::CasOutcome::Applied),
+            _ => Ok(rift_cluster_base::seams::CasOutcome::Applied),
         }
     }
 }
@@ -1315,11 +1315,11 @@ impl ClusteredFlowStoreProvider {
     }
 }
 
-impl rift_ee::seams::FlowStoreProvider for ClusteredFlowStoreProvider {
+impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider {
     fn provide(
         &self,
-        config: &rift_ee::seams::ImposterConfig,
-    ) -> Option<Arc<dyn rift_ee::seams::FlowStore>> {
+        config: &rift_cluster_base::seams::ImposterConfig,
+    ) -> Option<Arc<dyn rift_cluster_base::seams::FlowStore>> {
         // `validate` refuses bad values pre-commit, so an Err here means a
         // config written by a different (newer) build reached this node.
         // Defaults + a loud log beat both a panic on the apply path and a

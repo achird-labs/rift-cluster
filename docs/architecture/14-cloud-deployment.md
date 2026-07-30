@@ -5,7 +5,7 @@ onto AWS specifically — the platform the Mimemo/Solo lineage runs on — and
 states which cloud properties the design cares about. The portable summary:
 **the cluster needs stable-ish peer addressing, a real disk per voter, one
 routable data port, and a private network for the cluster port.** Any platform
-providing those four runs Rift-EE well; the sections below are those four
+providing those four runs RiftCluster well; the sections below are those four
 requirements dressed in AWS clothes.
 
 ## Reference deployment: EKS
@@ -69,7 +69,7 @@ AWS-specific decisions and why:
 
 The Solo lineage runs on Fargate, so this path matters. It works — Service
 Discovery (Cloud Map) provides the seed DNS, one task definition maps to
-`rift-ee-server`, and an internal NLB fronts the service — but **Fargate
+`rift-cluster-server`, and an internal NLB fronts the service — but **Fargate
 ephemeral storage is not a durable state dir.** Options, in order of
 preference:
 

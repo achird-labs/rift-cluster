@@ -126,13 +126,13 @@ open-source admin API must stay tenancy-ignorant:
 
 Both seams have **landed upstream** and are in the current pin — U-9 as
 `rift-mock-core::extensions::authz`, U-10 as `EventContext` on the listener
-signature. Both are re-exported through `rift_ee::seams` (issue #160).
+signature. Both are re-exported through `rift_cluster_base::seams` (issue #160).
 
 - **U-9, `AdminAuthorizer`**: a trait consulted after route parsing with
   `(credential, action, port, space, scope, params)`, returning
   allow-with-principal or deny. Installing nothing changes nothing: with no
   authorizer registered the api-key comparison decides alone, exactly as before.
-  The enterprise implementation resolves principal → bindings → role → action.
+  The cluster implementation resolves principal → bindings → role → action.
   Generic OSS justification: embedders fronting Rift with their own identity
   currently have to reverse-proxy and re-parse routes to get any authorization
   at all.
@@ -266,14 +266,14 @@ retained, queryable audit table. One stream, not a bolted-on second system.
 ### What T2 ships — enforcement, and its two deliberate over-restrictions
 
 Slice T2 (issue #161) turns the model into a boundary. The closed 19-action set
-and the `Role → Action` table live in `rift-ee-server`'s `authz` module as a
+and the `Role → Action` table live in `rift-cluster-server`'s `authz` module as a
 **pure** evaluator — no I/O, no HTTP — so the whole matrix is unit-testable
 without a cluster. Bindings are read fresh from the local state machine on every
 request; there is **no authorization cache**, ever (§8.5), because a per-node TTL
 would reintroduce exactly the revocation window consensus is being paid for.
 
 **One evaluator, but authorization happens at the front, for every request.**
-The design in the issue put the enterprise check on terminated routes and left
+The design in the issue put the cluster check on terminated routes and left
 proxied ones to the U-9 hook. That cannot satisfy §8.4: upstream's
 `AuthzDecision` is `Allow`/`Deny` only and `Deny` renders **403
 unconditionally**, so a cross-tenant probe on a proxied route would answer 403
@@ -475,7 +475,7 @@ tried to do what and was refused* is the half of an audit log that matters most.
 **Reads are not audited in v1** (RFC-002 §9, on log volume). One consequence is
 worth stating plainly rather than discovering later: the reads-that-mutate served
 over the **proxy** path — `ScenarioReset`, `SavedRequestsClear`, `FlowStateClear`
-— are forwarded to the loopback OSS admin and never become a `ControlOp`, so a
+— are forwarded to the loopback core admin and never become a `ControlOp`, so a
 log-derived projection cannot see them. RFC-002 §9 asks for a `ScenarioReset`
 row; producing one would mean recording at the front door, i.e. a second,
 per-node audit path that can disagree with the log — the one thing this design

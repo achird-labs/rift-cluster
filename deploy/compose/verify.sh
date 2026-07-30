@@ -101,10 +101,10 @@ echo "PASS: admin API live on 3/3"
 # The image must identify itself, including which engine is inside it — the
 # whole point of plumbing the pin through the build.
 echo "--- asserting the image reports its identity ---"
-banner="$("${COMPOSE[@]}" exec -T rift-1 rift-ee-server --version)"
+banner="$("${COMPOSE[@]}" exec -T rift-1 rift-cluster-server --version)"
 echo "$banner"
 case "$banner" in
-  *"enterprise"*) ;;
+  *"cluster"*) ;;
   *) echo "FAIL: --version does not name the edition"; exit 1 ;;
 esac
 if [ "$RIFT_UPSTREAM_VERSION" != "unknown" ]; then

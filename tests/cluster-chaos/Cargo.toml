@@ -1,6 +1,6 @@
 [package]
 name = "cluster-chaos"
-description = "Container-tier chaos harness: real rift-ee-server processes, killed and restarted for real."
+description = "Container-tier chaos harness: real rift-cluster-server processes, killed and restarted for real."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ tokio.workspace = true
 
 # The ONE first-party dependency, and only for its cluster-port client (#137).
 #
-# Everything else this harness drives is plain HTTP, which is why no `rift_ee` /
+# Everything else this harness drives is plain HTTP, which is why no `rift_cluster_base` /
 # `rift_http_proxy` types appear anywhere in it: an imposter config, a route
 # table and a source declaration are all built as JSON at the call site, the way
 # an operator's `curl` would. The cluster port is the exception — it is

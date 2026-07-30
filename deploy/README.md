@@ -1,10 +1,10 @@
-# Deploying Rift Enterprise
+# Deploying RiftCluster
 
 Five artifacts, in increasing order of how much they promise:
 
 | Path | What it is | Verified how |
 |---|---|---|
-| `Dockerfile` | The `rift-ee-server` image | Built and run by `compose/verify.sh` |
+| `Dockerfile` | The `rift-cluster-server` image | Built and run by `compose/verify.sh` |
 | `compose/docker-compose.yml` | A real 3-node cluster for local work | Stood up and asserted by `compose/verify.sh` |
 | `compose/front-door-demo.yml` | The "no nginx" front-door demo (one node, two virtual services) | Stood up by hand — see below |
 | `compose/sources-demo.yml` | The imposter-sources demo (three nodes + a config server) | Stood up by hand — see below; the properties it shows are asserted by chaos scenarios C20–C23 |
@@ -45,7 +45,7 @@ nothing to do with the code.
 Rift's front door (`--front-door`, issue #19 / U-11) resolves a request by
 `Host` header (or path) and dispatches it to the matching imposter, in
 process. `compose/front-door-demo.yml` is the smallest thing that shows this
-replacing a reverse-proxy sidecar: one `rift-ee-server`, one exposed port, two
+replacing a reverse-proxy sidecar: one `rift-cluster-server`, one exposed port, two
 virtual services.
 
 ```sh
@@ -92,7 +92,7 @@ whole organisation shares, some are baked in beside the app. Under `--cluster`
 the flag is sugar for declaring **pinned sources**, so both go through the
 replicated log and reach every node.
 
-`source-origin` is the config server: a fourth `rift-ee-server`, run
+`source-origin` is the config server: a fourth `rift-cluster-server`, run
 un-clustered, whose imposter's response body *is* the config document. That is
 why the demo needs no second image — and it is what makes the second half work,
 since changing what the fleet should be serving becomes an ordinary admin-API
@@ -179,7 +179,7 @@ pull*, not of a fleet's lifetime.)
 A second pull with nothing changed writes no log entry at all and answers
 `"unchanged": true` — which is what makes a `tracking` source (re-fetched on
 `pollSecs`, by the **leader only**) affordable at a 30-second cadence. See
-`docs/rift-ee-server.md`'s "Imposter sources" section for the full surface:
+`docs/rift-cluster-server.md`'s "Imposter sources" section for the full surface:
 tracking mode, drift, `onDrift`, provenance, and the credentialed providers.
 
 Tear it down the same way as the other demos:
@@ -243,13 +243,13 @@ would either break joining or route traffic at nodes that have not converged.
 ## Images and the upstream pin
 
 `--version` reports which open-source Rift is embedded, e.g.
-`rift-ee-server 0.1.0 (enterprise, rift v0.15.0)`. A build context has no git
+`rift-cluster-server 0.1.0 (cluster, rift v0.15.0)`. A build context has no git
 history, so pass the pin in:
 
 ```sh
 docker build -f deploy/Dockerfile \
   --build-arg RIFT_UPSTREAM_VERSION="$(git -C vendor/rift describe --tags --always)" \
-  -t rift-ee-server .
+  -t rift-cluster-server .
 ```
 
 Omit it and the banner reads `rift unknown` — unhelpful, but never a *wrong*

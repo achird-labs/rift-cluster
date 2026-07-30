@@ -1,4 +1,4 @@
-//! Gate tests for the enterprise source providers (issue #136).
+//! Gate tests for the cluster source providers (issue #136).
 //!
 //! Every provider is exercised against a **local fixture** — a temp git repo, a
 //! stub HTTP server standing in for S3, a stub registry — so the suite makes no
@@ -20,7 +20,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rift_ee::seams::SourceRef;
+use rift_cluster_base::seams::SourceRef;
 
 use super::auth::{AuthError, Credential, CredentialResolver};
 use super::git::GitSource;
@@ -256,7 +256,7 @@ async fn fetch(
     provider: &dyn CredentialedSource,
     uri: &str,
     auth_ref: Option<&str>,
-) -> anyhow::Result<rift_ee::seams::FetchedImposters> {
+) -> anyhow::Result<rift_cluster_base::seams::FetchedImposters> {
     let source_ref = SourceRef::new(uri);
     provider.fetch_with_auth(&source_ref, auth_ref).await
 }
@@ -998,7 +998,7 @@ async fn registry_errors_never_echo_the_token() {
 /// provider registered there would fetch anonymously forever.
 #[test]
 fn a_scheme_may_not_be_claimed_by_both_registries() {
-    let mut providers = SourceProviders::new(rift_ee::seams::SourceRegistry::new());
+    let mut providers = SourceProviders::new(rift_cluster_base::seams::SourceRegistry::new());
     providers
         .register_credentialed(Arc::new(
             S3Source::new(
@@ -1027,9 +1027,9 @@ fn a_scheme_may_not_be_claimed_by_both_registries() {
 
 #[test]
 fn schemes_lists_both_registries() {
-    let mut upstream = rift_ee::seams::SourceRegistry::new();
+    let mut upstream = rift_cluster_base::seams::SourceRegistry::new();
     upstream
-        .register(Arc::new(rift_ee::seams::FileSource::new(false)))
+        .register(Arc::new(rift_cluster_base::seams::FileSource::new(false)))
         .expect("register file");
     let mut providers = SourceProviders::new(upstream);
     providers

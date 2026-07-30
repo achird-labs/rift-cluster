@@ -14,7 +14,7 @@
 //! error rules exist to prevent, and a typo'd `"durabillity": "sync"` costing an
 //! imposter its durability silently would be exactly that.
 
-use rift_ee::seams::ImposterConfig;
+use rift_cluster_base::seams::ImposterConfig;
 
 use super::shard::Durability;
 
@@ -190,7 +190,7 @@ impl FlowConfig {
     /// error channel (it returns `Option`), so by the time the provider sees a
     /// config it must already be valid.
     ///
-    /// [`FlowStoreProvider::provide`]: rift_ee::seams::FlowStoreProvider::provide
+    /// [`FlowStoreProvider::provide`]: rift_cluster_base::seams::FlowStoreProvider::provide
     ///
     /// # Errors
     ///
