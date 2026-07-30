@@ -78,7 +78,7 @@ docker compose -f deploy/compose/front-door-demo.yml down -v
 ## Imposter sources demo
 
 Mocks that live somewhere else. `compose/sources-demo.yml` is the smallest thing
-that shows the shape a Mimeo-style deployment already has: **one environment
+that shows the shape a central-registry deployment already has: **one environment
 variable** says where the mocks come from, every node in the fleet serves them,
 and rolling the fleet onto new content later is **one call** rather than a
 redeploy.
