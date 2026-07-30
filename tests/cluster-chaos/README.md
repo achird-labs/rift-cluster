@@ -178,6 +178,59 @@ rather than re-implementing that framing, with `max_retries: 0` — the default
 client retries three times, and a retried `POST .../pull` fetches again, which
 would quietly turn C20's `== 1` into whatever the transport happened to do.
 
+### Why the snapshot round trip needed a knob
+
+`build_snapshot` / `install_snapshot` name openraft's wire path for catching a
+lagging follower up wholesale rather than entry-by-entry. Three scenarios'
+issues each named it as a mutation target — C18 ("rides the snapshot"), C22
+("`sm_sources` omitted from the snapshot"), C26 ("the `audit` table omitted
+from `SnapshotPayload`") — and each, applied and measured against this tier's
+plain full-fleet restart, **survived**. Not because the scenarios were weak:
+openraft's default `snapshot_policy` (`LogsSinceLast(5000)`,
+`crates/rift-cluster/src/raft/node.rs`) never triggers on the few dozen
+entries a chaos stack commits, and `stop`/`start` on every node restores each
+one from its own redb, which needs nothing from a peer. `install_snapshot`
+exists to catch up a peer that is missing log entries the leader no longer
+has — nothing in a synchronized full-fleet restart is ever in that state.
+
+`RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES=10` is the knob that closes the gap (issue
+#183): it sets `snapshot_policy = LogsSinceLast(10)` **and**
+`max_in_snapshot_log_to_keep = 0` (`NodeConfig::snapshot_log_entries`) — both
+are required together, and why is pinned by two unit tests next to the field in
+`raft/node.rs` rather than re-derived here. A testability knob, not operator
+tuning: `None`, the only value any shipped configuration produces, leaves
+openraft's defaults untouched.
+
+**It lives in its own `snapshot-install.overlay.yml`, stacked only by C26 — not
+in `chaos.overlay.yml`.** That distinction was learned the expensive way. The
+knob purges the log the moment a snapshot covers it, so it changes how *any*
+lagging node catches up; `chaos.overlay.yml` backs `Cluster::up_with_chaos()`,
+which most of this tier uses, so setting it there applied it everywhere. C4 (a
+healed partition replaying parked writes), C6 (a lossy link) and C7 (a joining
+node reconciling) all went red — each is *about* a node falling behind and
+catching up, and each suddenly needed a snapshot install where it had been
+replaying the log. A knob that changes the catch-up mechanism belongs only on
+the scenario whose subject is catch-up-by-snapshot.
+
+A full-fleet restart still cannot exercise the wire path even with the knob on,
+which is why C26 also grew a lag-behind phase: it stops one follower, commits
+past the window so the leader snapshots and purges, then restarts it, leaving
+the leader no way to catch it up but `install_snapshot`. That the RPC really
+fired is asserted from `rift_cluster_snapshots_installed_total` rather than
+inferred — without it the scenario would prove only that a snapshot install
+*should* have been needed, and would stay green if a regression quietly restored
+catch-up-by-log.
+
+`c26_audit_chain_survives_a_full_cluster_restart` is the one scenario built on
+top of it: it stops one follower, commits more than 10 entries through the
+other two so the leader snapshots and purges what the follower would need,
+then restarts it — forcing a real `install_snapshot` rather than assuming the
+config alone proves the wire path ran. See its doc comment for the mechanism
+and for what the container tier can and cannot observe about `install_snapshot`
+directly. C18 and C22 still run the plain full-fleet restart, so their named
+snapshot mutants still survive here for the reason above — the round trip for
+routes and sources is gated in process instead, as their own entries below say.
+
 ### Why partitions are not toxiproxy
 
 Toxiproxy is used for C6 and *not* for C4, for two independent reasons:
@@ -402,12 +455,9 @@ the first and still 404 every request if the rebuild is skipped, which is
 exactly what mutation-proving this scenario found:
 
 **Correction to the issue's premise.** The issue named `build_snapshot` /
-`install_snapshot` as C18's mutation target ("rides the snapshot"). Measured
-against this exact restart: it does not. `stop`/`start` keeps every node's own
-state directory intact and none of the three falls behind the log, so openraft
-never calls `install_snapshot` on any of them — that RPC exists to bring a
-*lagging* peer's state machine up to date over the wire, which nothing here
-is. Durability across this restart runs through `RaftNode::reconcile_engine`'s
+`install_snapshot` as C18's mutation target ("rides the snapshot"); measured,
+it survives here for the reason "Why the snapshot round trip needed a knob"
+above gives. Durability across this restart runs through `RaftNode::reconcile_engine`'s
 post-join re-derivation from `sm_routes` instead (`crates/rift-cluster/src/raft/store.rs`,
 called from the readiness reconciler `compose.rs` spawns to satisfy
 `GATE_RECONCILED`) — the real cold-start projection, and the same one
@@ -499,13 +549,9 @@ independent second opinion: only the leader increments it, so the sum counts eac
 poll once and must equal what the origin served.
 
 **Correction to C22's named mutation.** The issue names "`sm_sources` omitted
-from the snapshot". Applied and measured, that mutant **survives** — and not
-because the scenario is weak. openraft's snapshot policy here is the default
-`LogEntries(5000)` (`crates/rift-cluster/src/raft/node.rs` builds
-`Config { .. ..Default::default() }`), and a chaos stack commits a few dozen
-entries, so no snapshot is ever built and `stop`/`start` restores from each
-node's own redb rather than over the wire. This is the same correction C18
-already carries for `install_snapshot`. The snapshot round trip **is** gated, in
+from the snapshot"; applied and measured, that mutant **survives** here for
+the reason "Why the snapshot round trip needed a knob" gives above — not
+because the scenario is weak. The snapshot round trip **is** gated, in
 process, by `provenance_is_reported_and_survives_snapshot_restore` in
 `crates/rift-cluster/src/raft/store.rs`, which drives `build_snapshot` /
 `install_snapshot` directly. What C22 exercises is the restart path, and the
@@ -578,18 +624,20 @@ performs. The data-plane assertion is strengthened to also send a bogus
 `authorization` header, proving the data plane has no authentication to fail
 rather than merely none presented.
 
-**Correction to C26's named mutation.** The issue names "the `audit` table omitted
-from `SnapshotPayload`", and requires C26 to exercise "the snapshot-install path,
-not only restart-and-replay". Applied and measured, that mutant **survives here**,
-for the reason this README already records twice for C18 and C22: the default
-`LogEntries(5000)` policy means a chaos stack never builds a snapshot, so
-`stop`/`start` restores from each node's own redb. The snapshot round trip is
-gated in process by `audit_rows_survive_a_snapshot_build_and_install` and
-`the_audit_export_sink_checkpoint_and_gc_watermark_survive_a_snapshot_install` in
-`crates/rift-cluster/src/raft/store.rs`, which drive `build_snapshot` /
-`install_snapshot` directly. What C26 adds is process death, and the mutant that
-kills it is the one in the table. Recorded rather than papered over: a mutant that
-survives is evidence about *where* a property is enforced.
+**C26 closes the gap the other two record.** The issue named "the `audit`
+table omitted from `SnapshotPayload`" as its mutation target and asked for
+"the snapshot-install path, not only restart-and-replay" — see "Why the
+snapshot round trip needed a knob" above for why the plain full-fleet restart
+this scenario used to run could never supply that. It now runs two phases: one
+that deliberately lags a follower past `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES` and
+restarts it, forcing a real `install_snapshot`, and the original full-fleet
+restart, kept because it separately guards "clearing `sm_audit` whenever the
+store is opened" — a different bug on the ordinary cold-start path that the
+snapshot phase does not touch. Both mutant stories, and what the container
+tier can and cannot observe about `install_snapshot` actually running (there
+is no metric for it, and this file's own house rule — assertions read the
+admin API and Prometheus metrics, never log output — rules out a log line),
+are recorded in the scenario's own doc comment rather than repeated here.
 
 **`GET /admin/whoami` is not a revocation probe, and neither is it a binding
 probe.** It classifies no action (§4.3's `None` case), so it answers `200` to

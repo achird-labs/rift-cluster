@@ -3777,6 +3777,10 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         let data = snapshot.into_inner();
         let payload: SnapshotPayload = serde_json::from_slice(&data)
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        // Counted here — after the payload parses, before it is applied — so the metric means "a
+        // peer's snapshot really arrived and was readable", which is what a scenario asserting the
+        // wire path needs to distinguish from catch-up-by-replication (issue #183).
+        crate::metrics::snapshot_installed();
 
         let stored = StoredSnapshot {
             meta: meta.clone(),

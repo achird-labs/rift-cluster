@@ -73,6 +73,9 @@ async fn spawn(
         routes: Router::new(),
         engine: None,
         audit_retention_secs,
+        // These in-process tests drive `build_snapshot`/`install_snapshot` directly, so they need
+        // no help provoking one; the knob exists for the container tier, which cannot (issue #183).
+        snapshot_log_entries: None,
     };
     // No retry-on-lock-contention: `RaftNode::shutdown` now waits for the Raft
     // core to release its storage handles before returning (#41), so a restart on

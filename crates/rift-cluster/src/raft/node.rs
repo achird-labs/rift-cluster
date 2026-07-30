@@ -19,7 +19,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use openraft::error::{ClientWriteError, InitializeError, RaftError};
 use openraft::metrics::WaitError;
-use openraft::{BasicNode, Config, Raft, ServerState};
+use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
 use rift_ee::seams::{CompiledRoutes, ImposterConfig, ImposterManager, RouteTable};
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
@@ -116,6 +116,21 @@ pub struct NodeConfig {
     /// prevent. Node configuration rather than replicated state because it is
     /// an operator's storage budget, not a tenant's policy.
     pub audit_retention_secs: u64,
+    /// Snapshot aggressively and purge immediately, so a lagging node must be caught up by a real
+    /// `install_snapshot` over the wire rather than by log replication (issue #183).
+    ///
+    /// **A testability knob, not an operator tuning parameter.** `None` — the default, and the only
+    /// value any shipped configuration produces — leaves openraft's defaults untouched. `Some(n)`
+    /// sets `snapshot_policy` to `LogsSinceLast(n)` **and** `max_in_snapshot_log_to_keep` to `0`.
+    ///
+    /// Both, because either alone does nothing. A low snapshot policy makes snapshots get *built*;
+    /// it does not make a follower need one. openraft sends a snapshot only when the entries a
+    /// follower is missing have been **purged**, and purging is governed by
+    /// `max_in_snapshot_log_to_keep` (default 1000) — so with a low policy and the default keep, a
+    /// node that missed a few dozen entries still catches up by ordinary replication and the wire
+    /// path stays unexercised. That is exactly the trap this knob exists to remove: three chaos
+    /// scenarios independently discovered it and each wrote the same correction into the README.
+    pub snapshot_log_entries: Option<u64>,
 }
 
 // Hand-written so the shared secret never lands in a log line — matching the
@@ -268,6 +283,32 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
+    /// The openraft `Config` this node runs with.
+    ///
+    /// Extracted from `start` so the default is assertable without a cluster: see
+    /// `raft_config_default_leaves_the_snapshot_knobs_untouched`. `snapshot_log_entries` is
+    /// [`NodeConfig::snapshot_log_entries`] — `None` must leave openraft's own defaults in place,
+    /// which is the property that test pins.
+    fn raft_config(snapshot_log_entries: Option<u64>) -> Result<Config, NodeError> {
+        let mut config = Config {
+            cluster_name: "rift-control-plane".to_owned(),
+            election_timeout_min: 150,
+            election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
+            heartbeat_interval: 50,
+            ..Default::default()
+        };
+        if let Some(entries) = snapshot_log_entries {
+            config.snapshot_policy = SnapshotPolicy::LogsSinceLast(entries);
+            // Purge as soon as a snapshot covers the entries. Without this the snapshot exists but
+            // the log a follower needs is still there, so it catches up by replication and
+            // `install_snapshot` never runs — see the field's doc.
+            config.max_in_snapshot_log_to_keep = 0;
+        }
+        config
+            .validate()
+            .map_err(|e| NodeError::Init(e.to_string()))
+    }
+
     /// Open storage, bind the cluster server, and start the Raft runtime. This
     /// does not form or join a cluster; call [`RaftNode::cluster_init`] to
     /// bootstrap a new one or [`RaftNode::join_via`] to attach to an existing one.
@@ -308,17 +349,7 @@ impl RaftNode {
         let state_machine = state_machine.with_audit_retention_secs(config.audit_retention_secs);
         let sm_reader = state_machine.clone();
 
-        let raft_config = Arc::new(
-            Config {
-                cluster_name: "rift-control-plane".to_owned(),
-                election_timeout_min: 150,
-                election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
-                heartbeat_interval: 50,
-                ..Default::default()
-            }
-            .validate()
-            .map_err(|e| NodeError::Init(e.to_string()))?,
-        );
+        let raft_config = Arc::new(Self::raft_config(config.snapshot_log_entries)?);
 
         // The handlers need the Raft, which needs the bound server address, which
         // needs the handlers — so the router reads the node through a slot filled
@@ -1545,6 +1576,7 @@ mod tests {
             routes: Router::new(),
             engine: None,
             audit_retention_secs: crate::raft::store::DEFAULT_AUDIT_RETENTION_SECS,
+            snapshot_log_entries: None,
         }
     }
 
@@ -2877,6 +2909,45 @@ mod tests {
             messages.lock().expect("lock").is_empty(),
             "a shut-down node must drop silently: {:?}",
             messages.lock().expect("lock")
+        );
+    }
+
+    /// Issue #183 AC1: with no knob set, the openraft config is byte-identical to what it was
+    /// before the knob existed.
+    ///
+    /// Asserted against openraft's **own** defaults rather than against literals, so the test keeps
+    /// meaning across an openraft bump: if a future version changes either default, this still says
+    /// "we did not override it", which is the actual claim. A shipped fleet only ever takes this
+    /// path — `snapshot_log_entries` is set by nothing but the chaos overlay.
+    #[test]
+    fn raft_config_default_leaves_the_snapshot_knobs_untouched() {
+        let defaults = Config::default();
+        let ours = RaftNode::raft_config(None).expect("default config validates");
+        assert_eq!(
+            format!("{:?}", ours.snapshot_policy),
+            format!("{:?}", defaults.snapshot_policy),
+            "the default must not change the snapshot policy"
+        );
+        assert_eq!(
+            ours.max_in_snapshot_log_to_keep, defaults.max_in_snapshot_log_to_keep,
+            "the default must not change log purging"
+        );
+    }
+
+    /// …and the knob sets **both** halves. Setting only the policy is the trap issue #183 exists to
+    /// remove: snapshots would be built but no follower would ever need one over the wire, because
+    /// the log it is missing would still be there to replicate.
+    #[test]
+    fn the_snapshot_knob_sets_the_policy_and_purges_immediately() {
+        let ours = RaftNode::raft_config(Some(10)).expect("config validates");
+        assert!(
+            matches!(ours.snapshot_policy, SnapshotPolicy::LogsSinceLast(10)),
+            "policy was {:?}",
+            ours.snapshot_policy
+        );
+        assert_eq!(
+            ours.max_in_snapshot_log_to_keep, 0,
+            "a snapshot policy without immediate purge never forces install_snapshot"
         );
     }
 }
