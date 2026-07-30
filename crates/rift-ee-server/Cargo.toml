@@ -1,6 +1,6 @@
 [package]
 name = "rift-ee-server"
-description = "The Rift Enterprise server binary: the open-source server composed with cluster backends."
+description = "The Rift cluster server binary: the Rift server composed with cluster backends."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

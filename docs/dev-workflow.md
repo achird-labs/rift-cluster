@@ -1,18 +1,20 @@
 # Development workflow
 
-`rift-enterprise` is the private, proprietary superset of the open-source
-[Rift](https://github.com/achird-labs/rift). It follows an **open-core** model:
+This repo is the clustering superset of
+[Rift](https://github.com/achird-labs/rift). **Both are Apache-2.0** — the split
+is a build boundary, not a licence one:
 
-- The open-source core is vendored, read-only, as a git submodule at
-  `vendor/rift`, pinned to a specific upstream commit.
-- Enterprise-only crates live under `crates/` (e.g. `rift-ee`, `rift-cluster`)
-  and depend on the core crates via path dependencies into `vendor/rift`.
-- The enterprise workspace **excludes** `vendor/rift` (it is its own workspace),
-  so `cargo` treats the core crates as ordinary path dependencies.
+- The Rift core is vendored, read-only, as a git submodule at `vendor/rift`,
+  pinned to a specific upstream commit.
+- Cluster crates live under `crates/` (e.g. `rift-ee`, `rift-cluster`) and depend
+  on the core crates via path dependencies into `vendor/rift`.
+- This workspace **excludes** `vendor/rift` (it is its own workspace), so `cargo`
+  treats the core crates as ordinary path dependencies.
 
 Because `vendor/rift` is read-only from this repo's perspective, **you cannot
 change core behavior here** — core changes must go upstream first. That boundary
-is the point: it keeps proprietary and open-source code cleanly separated.
+is the point: it keeps generic capability in the core, where every Rift user gets
+it, rather than accumulating here.
 
 ## First checkout
 
@@ -79,9 +81,9 @@ GitHub has no single PR that spans two repos, so split the work:
 4. Now build the enterprise feature on top of the new core capability and open a
    normal PR in this repo.
 
-Keep the upstream PR limited to genuinely open-source-appropriate changes
-(extension points, bug fixes, generic capabilities). Proprietary logic stays in
-`crates/` here.
+Keep the upstream PR limited to changes that belong in the core (extension
+points, bug fixes, generic capabilities). Cluster-specific logic stays in
+`crates/` here — a placement decision, not a licence one.
 
 ## CI
 

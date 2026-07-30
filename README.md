@@ -1,11 +1,20 @@
-# Rift Enterprise
+# Rift Cluster
 
-Private, proprietary **enterprise edition** of [Rift](https://github.com/achird-labs/rift)
-— the home of the distributed Rift and other commercial features.
+**Apache-2.0.** Distributed clustering for [Rift](https://github.com/achird-labs/rift) —
+an embedded Raft control plane, HRW flow-state ownership, and a server binary that
+composes them with the Rift core.
 
-This repository is **open-core**: the open-source Rift is vendored read-only as a
-git submodule under [`vendor/rift`](vendor/rift), and enterprise-only crates are
-layered on top under [`crates/`](crates).
+The Rift core is vendored read-only as a git submodule under
+[`vendor/rift`](vendor/rift), and the cluster crates are layered on top under
+[`crates/`](crates). **The split is a build boundary, not a licence one** — both
+repositories are Apache-2.0 and nothing here is withheld from the core.
+
+> **Status: Phase 1.** What ships is the control plane, flow-state ownership,
+> snapshot transfer and the durability modes. Later phases in `docs/` are design,
+> not documentation of running code — and any performance figure in them is a
+> design envelope rather than a measurement. Rift's measured benchmarks live in
+> the [core repo](https://github.com/achird-labs/rift), with the harness, host,
+> version and date attached to every number.
 
 ```
 rift-enterprise/
@@ -65,5 +74,9 @@ convention.
 
 ## Licensing
 
-Enterprise code in this repo is proprietary — see [`LICENSE`](LICENSE). The
-vendored core under `vendor/rift` remains Apache-2.0.
+**Apache-2.0** — see [`LICENSE`](LICENSE). The vendored core under `vendor/rift`
+is Apache-2.0 too, so the whole tree is under one licence.
+
+This repo previously carried a commercial licence as the proprietary half of an
+open-core split. That split is closed: there is no paid edition, no withheld
+feature set, and no plan for either.

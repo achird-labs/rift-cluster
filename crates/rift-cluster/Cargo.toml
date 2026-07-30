@@ -1,6 +1,6 @@
 [package]
 name = "rift-cluster"
-description = "Distributed clustering for Rift Enterprise: control-plane sync, membership, and sharded imposters."
+description = "Distributed clustering for Rift: control-plane sync, membership, and sharded imposters."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
