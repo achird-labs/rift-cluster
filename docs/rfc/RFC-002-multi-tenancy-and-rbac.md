@@ -563,11 +563,14 @@ to ask, settled in the same place:
 4. **What a stale minority node does with an authorization read** — it serves
    from its own applied state rather than refusing, and what is pinned instead is
    that the first request after a heal is refused (`c25_key_revocation_survives_a_partition`).
-5. **Tenanted resource state is stored but not served** — authorization can
-   correctly allow an action in a tenant whose resources this slice cannot bind
-   into the local engine, so the request is refused with §8.4's indistinguishable
-   404. That makes §7's "no data-plane change" and §8.4's anti-oracle rule
-   interact in a way worth reading before assuming a cross-tenant 404 is a bug.
+5. **Tenanted resource state was stored but not served — resolved (issue #182).**
+   The read/sync paths now bind the union of every tenant's resources into the
+   local engine, sound because ports are fleet-unique across tenants (§3.2); a
+   single ownership gate at the authorization choke point refuses a request
+   whose addressed port belongs to a different tenant, with the *same*
+   §8.4 indistinguishable 404 the old blanket guard answered. §7's "no
+   data-plane change" still holds — the gate governs administration of a port,
+   not traffic through it.
 
 ---
 

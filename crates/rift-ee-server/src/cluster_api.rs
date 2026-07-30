@@ -131,19 +131,39 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
         "/_cluster/config",
         json_handler(move || {
             let node = config.node()?;
-            let ports = node.configured_ports().map_err(handler_error)?;
+            // issue #182: resource reads went tenant-aware, and `configured_ports`
+            // now answers fleet-wide — `(tenant, port)` per row instead of a bare
+            // port list. This endpoint is deliberately fleet-wide (design section
+            // E): it is what an operator diffs across nodes to see whether the
+            // fleet has converged, and "converged" now has to mean "on the same
+            // tenant's config at that port", not just "the same port". Emitting
+            // `{tenant, port}` rows keeps that honest instead of flattening the
+            // tenant back out.
+            let ports: Vec<serde_json::Value> = node
+                .configured_ports()
+                .map_err(handler_error)?
+                .into_iter()
+                .map(|(tenant, port)| {
+                    serde_json::json!({
+                        "tenant": tenant,
+                        "port": port,
+                    })
+                })
+                .collect();
             // Provenance (issue #134): which imposters a source owns, and at
             // which version. Reported here rather than only under
             // `/admin/sources` because this is the endpoint an operator
             // compares across nodes to see whether the fleet has converged —
             // and "converged on the same configs from the same source version"
-            // is the question a source-driven fleet actually asks.
+            // is the question a source-driven fleet actually asks. Tenant-qualified
+            // for the same reason `ports` above is (issue #182).
             let provenance: Vec<serde_json::Value> = node
                 .config_provenance()
                 .map_err(handler_error)?
                 .into_iter()
-                .map(|(port, source)| {
+                .map(|(tenant, port, source)| {
                     serde_json::json!({
+                        "tenant": tenant,
                         "port": port,
                         "sourceId": source.id,
                         "version": source.version,
@@ -162,10 +182,16 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
         "/_cluster/imposters",
         json_handler(move || {
             let node = imposters.node()?;
+            // issue #182: `configured_ports` now hands back `(tenant, port)` pairs
+            // fleet-wide, so the owning tenant for each port is already in hand —
+            // no need for a second `owning_tenant` lookup (and its documented
+            // non-O(1) cost) per port.
             let ports = node.configured_ports().map_err(handler_error)?;
             let mut reported = Vec::with_capacity(ports.len());
-            for port in ports {
-                let body = node.get_imposter(port).map_err(handler_error)?;
+            for (tenant, port) in ports {
+                let body = node
+                    .get_imposter(tenant.as_str(), port)
+                    .map_err(handler_error)?;
                 // A committed body that will not parse is corruption, not an
                 // absent imposter: report it as such rather than hiding the port.
                 let config = match body {
@@ -195,6 +221,7 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
                 // stub-patch failure is never mislabelled as bind divergence — see
                 // `RedbStateMachine::bind_failure`.
                 reported.push(serde_json::json!({
+                    "tenant": tenant,
                     "port": port,
                     "config": config,
                     "bind_failure": node.bind_failure(port),

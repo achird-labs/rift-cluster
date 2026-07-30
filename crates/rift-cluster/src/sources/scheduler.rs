@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use crate::control::DEFAULT_TENANT;
 use crate::raft::RaftNode;
 
 use super::SourcePuller;
@@ -190,7 +191,7 @@ impl SourceScheduler {
         let node = self.node.upgrade()?;
         let puller = self.puller.upgrade()?;
 
-        let desired: BTreeMap<String, u64> = match node.sources() {
+        let desired: BTreeMap<String, u64> = match node.sources(DEFAULT_TENANT) {
             Ok(sources) => sources
                 .into_iter()
                 .filter_map(|source| {

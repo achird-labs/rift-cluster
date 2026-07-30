@@ -1109,12 +1109,12 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
-    /// Read the committed imposter-config JSON for the default tenant's `port`
-    /// from the applied state machine. Answers from local durable state — it
-    /// does not require leadership.
-    pub fn get_imposter(&self, port: u16) -> Result<Option<String>, NodeError> {
+    /// Read the committed imposter-config JSON for `tenant`'s `port` from the
+    /// applied state machine. Answers from local durable state — it does not
+    /// require leadership.
+    pub fn get_imposter(&self, tenant: &str, port: u16) -> Result<Option<String>, NodeError> {
         self.sm_reader
-            .read_config(port)
+            .read_config(tenant, port)
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
@@ -1138,22 +1138,25 @@ impl RaftNode {
         self.sm_reader.bind_failure(port)
     }
 
-    /// Every port this node has a committed config for, ascending. Like
-    /// [`Self::get_imposter`], this answers from applied local state.
-    pub fn configured_ports(&self) -> Result<Vec<u16>, NodeError> {
+    /// `(tenant, port)` for every port this node has a committed config for,
+    /// fleet-wide, ascending. Like [`Self::get_imposter`], this answers from
+    /// applied local state. Fleet-wide and not tenant-scoped on purpose — it
+    /// backs the operator surface `GET /_cluster/config`, not a tenant-facing
+    /// read.
+    pub fn configured_ports(&self) -> Result<Vec<(TenantId, u16)>, NodeError> {
         self.sm_reader
             .configured_ports()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
-    /// The default tenant's front-door route table, as currently applied.
-    /// Like [`Self::configured_ports`], this answers from local durable state
-    /// — it does not require leadership. Issue #131: upstream has no `GET
+    /// `tenant`'s front-door route table, as currently applied. Like
+    /// [`Self::get_imposter`], this answers from local durable state — it
+    /// does not require leadership. Issue #131: upstream has no `GET
     /// /front-door/routes` for the clustered admin front to proxy to, so this
     /// is the only read path.
-    pub fn route_table(&self) -> Result<RouteTable, NodeError> {
+    pub fn route_table(&self, tenant: &str) -> Result<RouteTable, NodeError> {
         self.sm_reader
-            .route_table()
+            .route_table(tenant)
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
@@ -1204,27 +1207,39 @@ impl RaftNode {
         self.raft.metrics().borrow().state == ServerState::Leader
     }
 
-    /// Every imposter source the default tenant has declared, id-ascending
-    /// (issue #134). Like [`Self::configured_ports`], this answers from local
-    /// applied state and needs no leadership — which is what lets any node
-    /// serve `GET /admin/sources`.
-    pub fn sources(&self) -> Result<Vec<SourceRecord>, NodeError> {
+    /// Every imposter source `tenant` has declared, id-ascending (issue #134).
+    /// Like [`Self::get_imposter`], this answers from local applied state and
+    /// needs no leadership — which is what lets any node serve
+    /// `GET /admin/sources`.
+    pub fn sources(&self, tenant: &str) -> Result<Vec<SourceRecord>, NodeError> {
         self.sm_reader
-            .sources()
+            .sources(tenant)
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
-    /// One source by id, or `None` when the default tenant has no such source.
-    pub fn source(&self, id: &str) -> Result<Option<SourceRecord>, NodeError> {
+    /// One source by id, or `None` when `tenant` has no such source.
+    pub fn source(&self, tenant: &str, id: &str) -> Result<Option<SourceRecord>, NodeError> {
         self.sm_reader
-            .source(id)
+            .source(tenant, id)
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
-    /// `(port, provenance)` for every source-owned config, ascending by port.
-    pub fn config_provenance(&self) -> Result<Vec<(u16, SourceProvenance)>, NodeError> {
+    /// `(tenant, port, provenance)` for every source-owned config fleet-wide,
+    /// ascending by tenant then port. Fleet-wide and not tenant-scoped on
+    /// purpose, like [`Self::configured_ports`]: this backs the same
+    /// operator surface, not a tenant-facing one.
+    pub fn config_provenance(&self) -> Result<Vec<(TenantId, u16, SourceProvenance)>, NodeError> {
         self.sm_reader
             .config_provenance()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The tenant that owns `port`'s applied config, or `None` if no tenant
+    /// has one. **Not O(1)** — see [`RedbStateMachine::owning_tenant`] for
+    /// the real cost.
+    pub fn owning_tenant(&self, port: u16) -> Result<Option<TenantId>, NodeError> {
+        self.sm_reader
+            .owning_tenant(port)
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
@@ -1515,6 +1530,7 @@ impl Drop for RaftNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::DEFAULT_TENANT;
     use tempfile::TempDir;
 
     const SECRET: &str = "cluster-test-secret";
@@ -1573,7 +1589,7 @@ mod tests {
     async fn wait_config(node: &RaftNode, port: u16, want: &str) -> bool {
         for _ in 0..50 {
             let named = node
-                .get_imposter(port)
+                .get_imposter(DEFAULT_TENANT, port)
                 .unwrap()
                 .and_then(|body| name_of(&body));
             if named.as_deref() == Some(want) {
@@ -1608,7 +1624,7 @@ mod tests {
         assert!(status.is_leader, "sole voter must self-elect: {status:?}");
         assert_eq!(status.current_leader, Some(1));
         assert_eq!(status.voters, vec![1]);
-        assert_eq!(node.get_imposter(9999).unwrap(), None);
+        assert_eq!(node.get_imposter(DEFAULT_TENANT, 9999).unwrap(), None);
         node.shutdown().await.expect("shutdown");
     }
 
@@ -1761,7 +1777,9 @@ mod tests {
                 .expect("write")
                 .revision;
             assert_eq!(
-                node.get_imposter(8080).unwrap().and_then(|b| name_of(&b)),
+                node.get_imposter(DEFAULT_TENANT, 8080)
+                    .unwrap()
+                    .and_then(|b| name_of(&b)),
                 Some("durable-body".to_owned())
             );
             node.shutdown().await.expect("shutdown");
@@ -1770,7 +1788,9 @@ mod tests {
 
         let node = RaftNode::start(config_in(&dir, 1)).await.expect("restart");
         assert_eq!(
-            node.get_imposter(8080).unwrap().and_then(|b| name_of(&b)),
+            node.get_imposter(DEFAULT_TENANT, 8080)
+                .unwrap()
+                .and_then(|b| name_of(&b)),
             Some("durable-body".to_owned()),
             "config must survive a full restart (R3)"
         );

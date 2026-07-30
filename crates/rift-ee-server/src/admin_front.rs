@@ -380,16 +380,36 @@ enum Terminated {
 /// against the header would let a `TenantAdmin` of `a` administer `b` by
 /// sending one header — the confused-deputy shape RFC-002 §8.1 exists to
 /// close, reached through the one surface where the header is not the subject.
-/// Whether this build can serve `kind` for a tenant other than `default`.
+/// The imposter port this request addresses, if it addresses exactly one.
 ///
-/// True for the tenancy surface only. Its reads (`RaftNode::tenant`,
-/// `tenant_principals`, `principal_bindings`, `audit_since`) all take the tenant
-/// as an argument and honour it. Everything else — imposters, stubs, routes — is
-/// stored per tenant but read back through default-only paths, so serving a
-/// non-default tenant there would hand back the *default* tenant's data. See the
-/// guard in [`authorize_action`]'s `Allow` arm.
-fn serves_any_tenant(kind: &Terminated) -> bool {
-    matches!(kind, Terminated::Tenancy(_))
+/// Feeds the ownership gate in [`authorize_action`]'s `Allow` arm (issue #182). `None` means there
+/// is no single port to check ownership of, which is the right answer for three different reasons:
+///
+/// - **`Create`** — the port is in the body, not the route, and the imposter does not exist yet.
+///   A create that collides with another tenant's port is refused by the state machine's own
+///   `port_claimed_by_another_tenant` check, which is where fleet-unique ports (RFC-002 §3.2) are
+///   actually enforced.
+/// - **Set-level imposter ops** (`ReplaceAllImposters`, `DeleteAllImposters`) — these act on the
+///   caller's own tenant's set, which `build_mutation` already scopes by the resolved tenant.
+/// - **Routes and the tenancy surface** — not port-addressed at all, and both are read through
+///   tenant-arg paths that honour the tenant.
+fn addressed_port(kind: &Terminated) -> Option<u16> {
+    match kind {
+        Terminated::DeleteImposter(port)
+        | Terminated::AddStub(port)
+        | Terminated::ReplaceStubs(port)
+        | Terminated::ReplaceStubAt(port, _)
+        | Terminated::DeleteStubAt(port, _)
+        | Terminated::ReplaceStubById(port, _)
+        | Terminated::DeleteStubById(port, _)
+        | Terminated::SetEnabled(port, _) => Some(*port),
+        Terminated::Create
+        | Terminated::ReplaceAllImposters
+        | Terminated::DeleteAllImposters
+        | Terminated::PutRoutes
+        | Terminated::DeleteRoute(_)
+        | Terminated::Tenancy(_) => None,
+    }
 }
 
 fn scope_for(kind: &Terminated) -> Option<TenantId> {
@@ -520,8 +540,9 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     // never reaches `classify` (write-only) or `proxy` (there is no upstream
     // `/front-door/routes` to proxy to — U-11's admin CRUD was deferred).
     if req.method() == Method::GET && path == "/front-door/routes" {
-        return match authorize_action(&state, &req, Action::ImposterRead, None, false) {
-            Ok(..) => read_routes(&state, &req).await,
+        // No port: the route table is read per tenant, not per imposter.
+        return match authorize_action(&state, &req, Action::ImposterRead, None, None) {
+            Ok((tenant, ..)) => read_routes(&state, &req, &tenant).await,
             Err(response) => response,
         };
     }
@@ -552,7 +573,7 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
             &req,
             action_for(&kind),
             scope.as_ref(),
-            serves_any_tenant(&kind),
+            addressed_port(&kind),
         ) {
             Ok((tenant, principal_id, bindings)) => {
                 terminate(state, req, kind, tenant, principal_id, bindings).await
@@ -579,7 +600,11 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                 target.space.is_some(),
                 target.params.iter().any(|(name, _)| *name == "scenario"),
             );
-            match authorize_action(&state, &req, action, None, false) {
+            // The port upstream's own classifier parsed out of the path. This is what makes the
+            // ownership gate cover the *proxied* reads — the ones that go verbatim to a local
+            // engine now binding every tenant's imposters, and so the ones where a missing check
+            // would be a live cross-tenant read.
+            match authorize_action(&state, &req, action, None, port_param(&target.params)) {
                 // The tenant this front just decided rides along as
                 // upstream's own `x-rift-scope` header, so `EeAuthorizer` —
                 // the loopback's independent defence-in-depth check — sees
@@ -591,7 +616,26 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                 Ok((tenant, ..)) => {
                     // Read the marker's inputs before `state` and `req` move into `proxy`.
                     let degraded = local_bind_failure(&state, &target.params);
+                    // The imposter *list* is the one proxied read the ownership gate above cannot
+                    // cover: it names no port, so there is nothing to check ownership of — and the
+                    // engine it proxies to now binds every tenant's imposters, so the verbatim
+                    // response would hand the caller the whole fleet's. Filtering the one response
+                    // body is done rather than terminating the read and fanning out per port: it
+                    // is far less machinery, and it leaves the streaming routes (SSE) untouched,
+                    // which buffering in `proxy` itself would not.
+                    let list_read = req.method() == Method::GET && is_imposter_listing(&path);
+                    let owned = if list_read {
+                        match tenant_owned_ports(&state, &tenant) {
+                            Ok(ports) => Some(ports),
+                            Err(response) => return response,
+                        }
+                    } else {
+                        None
+                    };
                     let mut response = proxy(state, req, Some(&tenant)).await;
+                    if let Some(owned) = owned {
+                        response = filter_imposter_list(response, &owned).await;
+                    }
                     if let Some(reason) = degraded {
                         set_header(&mut response, HEADER_BIND_FAILURES, &reason);
                     }
@@ -609,12 +653,17 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     proxy(state, req, None).await
 }
 
-/// `GET /front-door/routes`: the current default-tenant route table, read
-/// straight from the state machine. This is the front door's *only* read
-/// path (issue #131) — upstream never shipped a `GET` to proxy to, so unlike
-/// every other read in this module, there is no loopback re-read to fall
-/// back on.
-async fn read_routes(state: &Arc<FrontState>, _req: &Request<Incoming>) -> Response<FrontBody> {
+/// `GET /front-door/routes`: `tenant`'s current route table, read straight from the state machine.
+/// This is the front door's *only* read path (issue #131) — upstream never shipped a `GET` to proxy
+/// to, so unlike every other read in this module, there is no loopback re-read to fall back on.
+///
+/// Tenant-addressed as of issue #182: each tenant reads its own table, where it previously read the
+/// default tenant's whatever it was bound to.
+async fn read_routes(
+    state: &Arc<FrontState>,
+    _req: &Request<Incoming>,
+    tenant: &TenantId,
+) -> Response<FrontBody> {
     let Some(node) = state.node.upgrade() else {
         return typed_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -622,7 +671,7 @@ async fn read_routes(state: &Arc<FrontState>, _req: &Request<Incoming>) -> Respo
             "cluster node is shutting down",
         );
     };
-    match node.route_table() {
+    match node.route_table(tenant.as_str()) {
         Ok(table) => match serde_json::to_vec(&table) {
             Ok(body) => buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
                 .unwrap_or_else(|response| response),
@@ -670,12 +719,10 @@ fn authorize_action(
     req: &Request<Incoming>,
     action: Action,
     scope: Option<&TenantId>,
-    // Whether this route can actually *serve* a non-default tenant; see
-    // `serves_any_tenant` and the fail-closed guard in the `Allow` arm below.
-    // Separate from `scope` on purpose: a tenancy-surface route may legitimately
-    // name no tenant of its own (`GET /admin/audit` takes it from the header),
-    // and inferring "not tenant-aware" from "no scope" would 404 it.
-    serves_any_tenant: bool,
+    // The single imposter port this request addresses, if any — see `addressed_port`. Feeds the
+    // ownership gate in the `Allow` arm below. Separate from `scope` on purpose: `scope` is which
+    // *tenant record* the route names, this is which *resource* it touches.
+    addressed_port: Option<u16>,
 ) -> Result<Authorized, Response<FrontBody>> {
     let resolved = authenticate(state, req)?;
     let Some(resolved) = resolved else {
@@ -703,56 +750,61 @@ fn authorize_action(
 
     match authz::decide(&resolved.bindings, action, &requested) {
         Decision::Allow { tenant } => {
-            // Fail closed (issue #161, blockers B2/B3). `decide` just said
-            // this principal genuinely holds `action` in `tenant` — that part
-            // is correct — but correct authorization is not the same thing as
-            // this build being able to *serve* the request. #159 (T1) made
-            // the state machine *store* config and route data keyed by
-            // tenant, but it did not make serving tenant-aware:
-            // `desired_configs` and `desired_routes`
-            // (`rift_cluster::raft::store`) still `continue` past anything
-            // other than `DEFAULT_TENANT` when binding the local engine, and
-            // `RaftNode::route_table` is documented as the default tenant's
-            // table only — "storing is not serving in this slice"
-            // (`rift_cluster::control::validate`'s doc). Serve a read or a
-            // mutation for any other tenant here and a correctly-authorized
-            // principal gets back, or writes into, the *`default`* tenant's
-            // data instead of its own: a documented scope limit turned into a
-            // cross-tenant bypass, which is exactly the shape this guard
-            // exists to close.
+            // Ownership gate (issue #182). `decide` has confirmed this principal holds `action` in
+            // `tenant`; what it cannot know is whether the *resource* being addressed belongs to
+            // that tenant. Ports are fleet-unique across tenants (RFC-002 §3.2), so a port names
+            // exactly one imposter fleet-wide and a caller can address another tenant's imposter
+            // simply by knowing its number.
             //
-            // One guard, here, in the single choke point every admin request
-            // passes through (terminated, proxied, and the front door's own
-            // read) — a per-route check is how one route gets missed. It
-            // answers with the identical §8.4 indistinguishable 404 a
-            // cross-tenant probe gets below, so a caller cannot tell "you
-            // hold no binding here" from "you are bound here, but this build
-            // cannot serve it" — both are, from the outside, "not available
-            // to you". Lift this the moment the read/sync paths (configs,
-            // routes) become tenant-aware; B1's tenant-threading through
-            // every terminated op (below and in `build_mutation`) is already
-            // done so that day does not also require re-plumbing the ops —
-            // defence in depth for a guard that, today, makes it unreachable.
+            // This replaces issue #161's fail-closed guard, which refused every non-default tenant
+            // outright because the read/sync paths were default-only — storing was not serving.
+            // Those paths are tenant-aware as of this change, so the blanket refusal is gone; what
+            // remains necessary is this narrower check. **The gate had to land before the guard was
+            // removed, not after**: for the window between them the bypass would be real.
             //
-            // Exempt for the tenancy surface (`serves_any_tenant` — see that
-            // function). The guard is about **resource** state:
-            // `sm_configs`/`sm_routes`/`sm_sources` are stored per tenant but
-            // read back through default-only paths. The tenancy tables are not
-            // like that — `RaftNode::tenant`, `tenant_principals`,
-            // `principal_bindings` and `audit_since` all take the tenant as an
-            // argument and honour it, so there is no `default` fallback for them
-            // to land in. Keeping the guard over them would 404 the entire
-            // surface for exactly the tenants it exists to administer, which is
-            // not caution, just a broken feature.
+            // Here, in the one choke point every admin request passes through — terminated,
+            // proxied, and the front door's own read — for the same reason the old guard was: a
+            // per-route check is how one route gets missed, and the proxied reads are the dangerous
+            // ones. They go verbatim to a local engine that now binds *every* tenant's imposters,
+            // so without this an authorized `acme` caller could read `beta`'s imposter by port.
             //
-            // This asks the route directly rather than inferring it from
-            // `scope.is_none()`. The two coincided until `GET /admin/audit`,
-            // which *is* tenancy-surface and *does* take its tenant from the
-            // caller's header — under the old inference it 404'd every tenant
-            // admin reading their own audit stream, and did so from a guard
-            // whose stated subject is config data it never touches.
-            if tenant != TenantId::default() && !serves_any_tenant {
-                return Err(tenant_boundary_not_found());
+            // Refuses unless the port is owned by *this* tenant — so "owned by someone else" and
+            // "owned by nobody" answer identically. Letting an unowned port fall through to
+            // upstream would look harmless (nobody's data is behind it) but is a cross-tenant
+            // **existence oracle**: upstream's own 404 names the port ("No imposter exists on port
+            // N") while this gate's says only "Not Found", so sweeping the range would map exactly
+            // which ports other tenants hold. §8.4's property is that a probe cannot tell "not
+            // yours" from "not there", and two different 404 bodies tell it.
+            //
+            // The cost is that a caller reading a genuinely absent port in their *own* tenant now
+            // gets the terse body instead of upstream's descriptive one. That is the right trade:
+            // the descriptive message is a convenience, indistinguishability is a contract.
+            //
+            // Creates are unaffected — `Terminated::Create` is not port-addressed, so it never
+            // reaches here; a cross-tenant port collision is refused by the state machine's own
+            // `port_claimed_by_another_tenant` check, which is where fleet-uniqueness is enforced.
+            //
+            // The refusal is §8.4's indistinguishable 404, identical to `NotBoundToTenant` below.
+            //
+            // This applies to `default` symmetrically. Before this change `default` saw everything
+            // because everything *was* default's; now a `default` Editor no longer sees `acme`'s
+            // imposters. That is a behaviour change, and it is the correct one.
+            if let Some(port) = addressed_port {
+                let owner = state
+                    .node
+                    .upgrade()
+                    .ok_or_else(|| {
+                        typed_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            ErrorKind::Unavailable,
+                            "cluster node is shutting down",
+                        )
+                    })?
+                    .owning_tenant(port)
+                    .map_err(|e| internal(&e.to_string()))?;
+                if owner != Some(tenant.clone()) {
+                    return Err(tenant_boundary_not_found());
+                }
             }
             Ok((tenant, Some(resolved.principal_id), resolved.bindings))
         }
@@ -880,15 +932,113 @@ fn requested_tenant(req: &Request<Incoming>) -> TenantId {
 /// headers-only), so the divergence is reported as a header.
 ///
 /// Absent when the port is healthy: a marker on every read would be noise, not a signal.
-fn local_bind_failure(state: &FrontState, params: &[(&'static str, String)]) -> Option<String> {
-    // Domain-optional parse: most admin routes carry no `port` param at all, and one that is not a
-    // `u16` is not an imposter port. Either way the answer is "no marker", and the marker is a
-    // diagnostic header — never the status or the body — so its absence cannot turn a refusal into
-    // an acceptance. The read itself is authorized and served upstream regardless of this function.
-    let port: u16 = params
+/// The imposter port upstream's classifier parsed out of a proxied route, if it named one.
+///
+/// Domain-optional parse: most admin routes carry no `port` param at all. When one is present it
+/// was rendered from a `u16` by `AuthzTarget::with_port`, so the round trip cannot realistically
+/// fail — but a `None` here is safe either way, because both callers treat "no port" as "nothing
+/// port-specific to do": the ownership gate has no resource to check, and the bind-failure marker
+/// has no imposter to describe.
+fn port_param(params: &[(&'static str, String)]) -> Option<u16> {
+    params
         .iter()
         .find(|(name, _)| *name == "port")
-        .and_then(|(_, value)| value.parse().ok())?;
+        .and_then(|(_, value)| value.parse().ok())
+}
+
+/// Every port `tenant` owns a committed config for, on this node's applied state.
+#[allow(clippy::result_large_err)]
+fn tenant_owned_ports(
+    state: &FrontState,
+    tenant: &TenantId,
+) -> Result<std::collections::BTreeSet<u16>, Response<FrontBody>> {
+    let Some(node) = state.node.upgrade() else {
+        return Err(typed_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Unavailable,
+            "cluster node is shutting down",
+        ));
+    };
+    Ok(node
+        .configured_ports()
+        .map_err(|e| internal(&e.to_string()))?
+        .into_iter()
+        .filter(|(owner, _)| owner == tenant)
+        .map(|(_, port)| port)
+        .collect())
+}
+
+/// Narrow a proxied imposter listing to `owned`.
+///
+/// Upstream answers with the whole engine, which since issue #182 binds every tenant's imposters —
+/// so without this an authorized caller would read the fleet's imposters rather than their own.
+/// Applied to `default` too: it no longer sees other tenants' imposters, which is the intended
+/// behaviour change.
+///
+/// **Fails closed.** If the body cannot be read or is not the shape we expect, the listing is
+/// refused rather than forwarded: passing through a body we could not filter is precisely the
+/// cross-tenant leak this exists to close, and a broken listing is a far better outcome than a
+/// silently over-broad one.
+async fn filter_imposter_list(
+    response: Response<FrontBody>,
+    owned: &std::collections::BTreeSet<u16>,
+) -> Response<FrontBody> {
+    let (parts, body) = response.into_parts();
+    // Only a success body is a listing; an error body has no imposters to leak and is passed
+    // through so upstream's own error rendering survives.
+    if !parts.status.is_success() {
+        return Response::from_parts(parts, body);
+    }
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => return internal(&format!("reading the imposter listing to filter it: {e}")),
+    };
+    match narrow_imposter_listing(&bytes, owned) {
+        Ok(body) => buffered_response(parts.status, Bytes::from(body), json_content_type())
+            .unwrap_or_else(|response| response),
+        Err(e) => internal(&e),
+    }
+}
+
+/// Whether `path` addresses the imposter *collection*, whose body lists every imposter the local
+/// engine holds — and which, since this issue made the engine bind every tenant, spans the fleet.
+///
+/// Named once so the proxied read and the post-mutation re-read cannot disagree about which paths
+/// need narrowing. Them disagreeing is exactly how one of the two shipped unfiltered.
+fn is_imposter_listing(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    matches!(path, "/imposters" | "/admin/imposters")
+}
+
+/// Drop every entry from an imposter listing whose port `owned` does not contain.
+///
+/// The one implementation behind both narrowing sites. `Err` is a message the caller renders as a
+/// 500 — **never** a fallback to the unfiltered body, because forwarding a listing that could not
+/// be filtered is precisely the leak this exists to close.
+fn narrow_imposter_listing(
+    bytes: &[u8],
+    owned: &std::collections::BTreeSet<u16>,
+) -> Result<Vec<u8>, String> {
+    let mut doc: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| "the imposter listing was not JSON, so it could not be filtered by tenant")?;
+    let imposters = doc
+        .get_mut("imposters")
+        .and_then(|v| v.as_array_mut())
+        .ok_or("the imposter listing had no `imposters` array, so it could not be filtered")?;
+    // An entry whose port will not parse is dropped, not kept: this filter is an authorization
+    // boundary, and a classifier that cannot classify must treat the input as the dangerous class.
+    imposters.retain(|entry| {
+        entry
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .is_some_and(|port| owned.contains(&port))
+    });
+    serde_json::to_vec(&doc).map_err(|e| format!("re-encoding the filtered imposter listing: {e}"))
+}
+
+fn local_bind_failure(state: &FrontState, params: &[(&'static str, String)]) -> Option<String> {
+    let port: u16 = port_param(params)?;
     let Some(node) = state.node.upgrade() else {
         // Loud rather than quiet: everywhere else in this file a dead node handle is an explicit
         // 503, and this is the one place it would instead mean "no marker" — i.e. a possibly
@@ -1700,20 +1850,17 @@ async fn build_mutation(
                     tenant: tenant.clone(),
                 });
             } else {
-                // Known limitation, not introduced here: `configured_ports`
-                // still answers for the `default` tenant only (T1's
-                // documented scope — "storing is not serving in this
-                // slice", `control::validate`'s doc). For `tenant !=
-                // default` this prune step under-discovers leftovers; scoping
-                // its own ops to `tenant` (rather than leaving them at
-                // `default`) is still the right call — it keeps every op this
-                // mutation emits attributed to the one tenant it authorized
-                // against, instead of quietly mixing two.
+                // The limitation this arm used to carry is gone (issue #182): `configured_ports`
+                // no longer answers for `default` only, so the prune no longer under-discovers
+                // leftovers for a non-default tenant. It is now fleet-wide and tenant-tagged, so
+                // filter to the tenant this mutation authorized against — pruning another tenant's
+                // ports from a wholesale replace of *this* tenant's set would be a cross-tenant
+                // delete, which is precisely what the ownership gate exists to prevent elsewhere.
                 let existing = node
                     .configured_ports()
                     .map_err(|e| internal(&e.to_string()))?;
-                for port in existing {
-                    if !keep.contains(&port) {
+                for (owner, port) in existing {
+                    if owner == *tenant && !keep.contains(&port) {
                         ops.push(ControlOp::DeleteImposter {
                             tenant: tenant.clone(),
                             port,
@@ -1801,13 +1948,13 @@ async fn build_mutation(
         }
         Terminated::ReplaceStubs(port) => {
             let replace: ReplaceStubsBody = parse(body)?;
-            let mut config = stored_config(node, port)?;
+            let mut config = stored_config(node, tenant, port)?;
             config.stubs = replace.stubs;
             Ok(put_config_mutation(tenant, port, config))
         }
         Terminated::ReplaceStubAt(port, index) => {
             let stub: Stub = parse(body)?;
-            let mut config = stored_config(node, port)?;
+            let mut config = stored_config(node, tenant, port)?;
             if index >= config.stubs.len() {
                 return Err(stub_index_missing(index));
             }
@@ -1815,7 +1962,7 @@ async fn build_mutation(
             Ok(put_config_mutation(tenant, port, config))
         }
         Terminated::DeleteStubAt(port, index) => {
-            let mut config = stored_config(node, port)?;
+            let mut config = stored_config(node, tenant, port)?;
             if index >= config.stubs.len() {
                 return Err(stub_index_missing(index));
             }
@@ -1903,7 +2050,12 @@ async fn build_mutation(
             // `DeleteImposter`'s pre-delete fetch, just read from the state
             // machine directly since there is no loopback endpoint to fetch
             // from.
-            let table = node.route_table().map_err(|e| internal(&e.to_string()))?;
+            // `tenant`'s table, not the default one (issue #182): a delete must 404 against the
+            // set the caller can actually see, or a route id that exists only in another tenant
+            // would read as present here.
+            let table = node
+                .route_table(tenant.as_str())
+                .map_err(|e| internal(&e.to_string()))?;
             let Some(route) = table.routes.iter().find(|r| r.id == id) else {
                 return Err(typed_error(
                     StatusCode::NOT_FOUND,
@@ -1960,13 +2112,22 @@ fn put_config_mutation(tenant: &TenantId, port: u16, config: ImposterConfig) -> 
     }
 }
 
-/// The committed config for `port` from the local applied state, parsed.
+/// The committed config for `tenant`'s `port` from the local applied state, parsed.
+///
+/// Tenant-addressed as of issue #182. The ownership gate in `authorize_action` has already refused
+/// a port owned by another tenant, so in practice this reads the caller's own record — but it takes
+/// the tenant rather than trusting that, because a read that silently fell back to `default` is the
+/// exact failure the gate exists to prevent, and defence in depth here costs one argument.
 // The Err IS the client response (the early-return channel this module
 // uses everywhere); boxing it would just move the bytes to every call site.
 #[allow(clippy::result_large_err)]
-fn stored_config(node: &Arc<RaftNode>, port: u16) -> Result<ImposterConfig, Response<FrontBody>> {
+fn stored_config(
+    node: &Arc<RaftNode>,
+    tenant: &TenantId,
+    port: u16,
+) -> Result<ImposterConfig, Response<FrontBody>> {
     let stored = node
-        .get_imposter(port)
+        .get_imposter(tenant.as_str(), port)
         .map_err(|e| internal(&e.to_string()))?;
     let Some(stored) = stored else {
         return Err(typed_error(
@@ -2130,6 +2291,7 @@ fn front_script_base(scripts_dir: Option<&Path>) -> ScriptBaseDir {
 #[allow(clippy::result_large_err)]
 fn stored_script_registry(
     node: &Arc<RaftNode>,
+    tenant: &TenantId,
     port: u16,
 ) -> Result<HashMap<String, RiftScriptConfig>, Response<FrontBody>> {
     // An absent imposter is the domain-optional empty registry: an unknown ref
@@ -2137,7 +2299,7 @@ fn stored_script_registry(
     // storage or parse failure is a real fault and must not masquerade as
     // "unknown script ref" — it propagates as 500, same as stored_config.
     let Some(stored) = node
-        .get_imposter(port)
+        .get_imposter(tenant.as_str(), port)
         .map_err(|e| internal(&e.to_string()))?
     else {
         return Ok(HashMap::new());
@@ -2168,7 +2330,11 @@ fn resolve_op_scripts(
             };
             typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &message)
         }),
-        ControlOp::PatchStubs { port, edit, .. } => {
+        // The op already carries the tenant it was built for (#161 B1), so the script registry is
+        // read from that tenant's imposter rather than re-deriving it or falling back to `default`.
+        ControlOp::PatchStubs {
+            tenant, port, edit, ..
+        } => {
             let needs_registry = edit
                 .0
                 .iter()
@@ -2176,7 +2342,7 @@ fn resolve_op_scripts(
             if !needs_registry {
                 return Ok(());
             }
-            let registry = stored_script_registry(node, *port)?;
+            let registry = stored_script_registry(node, tenant, *port)?;
             for step in &mut edit.0 {
                 if let StubEdit::Add { stub, .. } | StubEdit::ReplaceById { stub, .. } = step {
                     resolve_stub_scripts(std::slice::from_mut(stub), &registry, base).map_err(
@@ -2310,6 +2476,24 @@ async fn fetch(
         .await
         .map_err(|e| internal(&format!("render read: {e}")))?
         .to_bytes();
+
+    // Narrow a collection re-read to the tenant this mutation was authorized as. `PUT /imposters`
+    // and `DELETE /imposters` both answer with this body — a wholesale replace renders the set
+    // afterwards, a delete-all captures it beforehand as "what was removed" — and upstream builds
+    // it from an engine that now binds every tenant. Without this, either op hands an Editor of one
+    // tenant the whole fleet's imposters, including (with `?replayable=true`) their stubs. The
+    // `SCOPE_HEADER` sent above is an authorization signal for the loopback's own gate; it does not
+    // filter a body, and `ImposterManager` has no tenant concept to filter by.
+    //
+    // Done here rather than at the two call sites so a third one cannot reintroduce the leak.
+    if status.is_success()
+        && is_imposter_listing(path)
+        && let Some(tenant) = scope
+    {
+        let owned = tenant_owned_ports(state, tenant)?;
+        let narrowed = narrow_imposter_listing(&body, &owned).map_err(|e| internal(&e))?;
+        return Ok((status, content_type, Bytes::from(narrowed)));
+    }
     Ok((status, content_type, body))
 }
 

@@ -67,7 +67,9 @@ nothing binds it and no operator surface reports it. T1's exit criterion —
 *no observable change* — holds because the admin HTTP front constructs
 `TenantId::default()` at every call site, so nothing reachable over the API can
 create such a row; only a direct `RiftNode::submit` can, which is how the tests
-exercise the cascade and the fleet-wide port rule.
+exercise the cascade and the fleet-wide port rule. *(Resolved by issue #182 —
+the read and sync paths named above are tenant-aware now, and "storing is not
+serving" no longer holds; see "RFC-002 §11 open questions, settled here", Q5.)*
 
 One consequence to carry into the slice that makes serving tenant-aware:
 because ports are fleet-unique across tenants, a config stored for tenant A
@@ -304,13 +306,16 @@ without a redesign:
    the same indistinguishable 404 a cross-tenant probe gets, in a single guard at
    the one choke point every admin request passes through. The terminated ops
    already thread the decided tenant through, so lifting this guard when serving
-   becomes tenant-aware does not also require re-plumbing them.
+   becomes tenant-aware does not also require re-plumbing them. *(Resolved by
+   issue #182 — see Q5 below: the read paths are tenant-aware, this guard is
+   gone, and the same choke point now hosts a narrower ownership check instead.)*
 
-The second is the honest statement of where multi-tenancy actually stands: the
-records exist and are enforced against, but until the read and sync paths are
-tenant-aware, `default` is the only tenant that can be served. **That work must
-land the read paths and this guard's removal in the same change** — separating
-them is what produced the bypass in the first place.
+The second was, at the time, the honest statement of where multi-tenancy stood:
+the records existed and were enforced against, but until the read and sync
+paths were tenant-aware, `default` was the only tenant that could be served.
+**That work had to land the read paths and this guard's removal in the same
+change** — separating them is what would have produced the bypass described
+above — and issue #182 is that change; see Q5.
 
 **Legacy migration.** The `--api-key` maps to a synthetic principal
 (`legacy:api-key`, which cannot collide with a real `key:<fingerprint>` id) bound
@@ -400,23 +405,34 @@ of a password hash and it fails silently in both directions. Raising it later
 does not invalidate existing keys: the PHC string records the parameters each
 hash was produced with, and verification reads them from there.
 
-**The T2 default-tenant guard does not apply here.** T2 refuses any decided
-tenant other than `default`, because resource *serving* is still default-only.
-That reasoning is about `sm_configs`/`sm_routes`/`sm_sources`, which are stored
-per tenant but read back through default-only paths. The tenancy tables are not
-like that — `tenant`, `tenant_principals` and `principal_bindings` all take the
-tenant as an argument and honour it — so keeping the guard over them would 404
-the entire surface for exactly the tenants it exists to administer. The
-exemption is scoped to the tenancy surface, so a new action outside it stays
-subject to the guard until someone states otherwise.
+**The T2 default-tenant guard did not apply here, and issue #182 has since
+removed it entirely.** T2 refused any decided tenant other than `default`,
+because resource *serving* was still default-only — a restriction about
+`sm_configs`/`sm_routes`/`sm_sources`, stored per tenant but read back through
+default-only paths. The tenancy tables were never like that — `tenant`,
+`tenant_principals` and `principal_bindings` all take the tenant as an argument
+and honour it — so keeping the guard over them would have 404'd the entire
+surface for exactly the tenants it exists to administer, and T2/T3 carved out
+an exemption for it.
 
   T3 originally keyed that exemption on "routes that name their own tenant"
   (`scope.is_some()`), which coincided with "tenancy surface" until T4 added
   `GET /admin/audit` — a tenancy route whose path names no tenant, because the
   caller's `X-Rift-Tenant` names it. Under the old inference it 404'd every
   tenant admin reading their own audit stream, from a guard whose stated subject
-  is config data the audit read never touches. The exemption now asks the route
-  directly (`serves_any_tenant`), which is what it always meant.
+  is config data the audit read never touches. T3/T4 fixed it by asking the
+  route directly (`serves_any_tenant`), which is what the exemption always meant.
+
+  Issue #182 (see Q5) replaced the guard itself with the narrower ownership
+  gate, so `serves_any_tenant` and the exemption it backed are gone rather than
+  superseded: the gate keys on the single port a request addresses
+  (`addressed_port`), and the tenancy surface's routes never address one — they
+  are read through tenant-arg paths, not a port — so there is nothing for the
+  gate to check and no exemption left to carve out. The history above is kept
+  because it is the reason `addressed_port` returns `None` for
+  `Terminated::Tenancy(_)` rather than `Some` of something: getting that
+  classification wrong the same way T3 first did would reopen the same bug from
+  the other direction.
 
 **No verification cache.** RFC-002 §11 raised caching
 `hash(credential) → principal_id` to avoid an argon2id verify per request. T3
@@ -552,29 +568,90 @@ very first request through the previously-minority node after the heal must be
 refused, and the convergence window is measured and bounded. Any TTL cache over
 authorization data breaks exactly that, which is why it is C25's named mutant.
 
-**Q5 — tenanted resource state is stored but not served, and the boundary is a
-404.** Also surfaced by #165. `authorize_action` can decide correctly that a
-principal holds an action in tenant `acme` and still refuse the request, because
-`desired_configs` / `desired_routes` bind only the default tenant's data into the
-local engine: serving it would hand a correctly-authorized caller the **default**
-tenant's resources. The guard (#161, blockers B2/B3) therefore answers §8.4's
-indistinguishable 404 for every non-tenancy route whose decided tenant is not
-`default`.
+**Q5 — resolved (issue #182): tenanted resource state is now served, gated on
+port ownership at one choke point rather than refused wholesale.** The gap this
+entry originally recorded — `desired_configs`/`desired_routes` bound only
+`default`'s data into the local engine, so `authorize_action` answered every
+non-default decision with §8.4's indistinguishable 404 regardless of what the
+principal actually held — is closed. `read_config`, `route_table`, `sources`,
+and `source` (and the `RaftNode` wrappers around them) are tenant-addressed
+now, and `desired_configs` syncs the **union of every tenant's** configs into
+the engine rather than filtering to `default`. That union is sound only because
+**ports are fleet-unique across tenants** (RFC-002 §3.2): a port names exactly
+one imposter fleet-wide, so one shared `ImposterManager` can hold every
+tenant's imposters with no collision between, say, `acme`'s `19031` and
+`globex`'s `19031` — because there is no such pair.
 
-Two consequences worth stating plainly, because both are easy to misread as bugs:
+**`desired_routes` is deliberately NOT unioned, and the asymmetry is the point.**
+Imposters can share one engine because each request *names the resource it
+wants* — a port, which resolves to exactly one owner. Front-door routes have no
+such discriminator: the front door is a single listener and an arriving
+data-plane request carries no tenant identity, because RFC-002 §7 keeps that
+plane open and anonymous. A unioned route table would therefore be one shared
+*matching* namespace that every tenant writes into — and since an empty match is
+a legal catch-all and `priority` is an unbounded `i32`, any principal holding
+`imposter.write` in any tenant could publish `{"match": {}, "priority":
+i32::MAX}` and capture **100% of front-door traffic fleet-wide**. Constraining
+the route's `target.port` to ports the writing tenant owns does not fix it: the
+shadowing lives in the match, not the target. So routes stay `default`-only
+until the front door has a tenant dimension to route on (a host mapping, a
+listener per tenant, or an explicit per-tenant prefix). Tenanted routes are
+still stored, and `route_table(tenant)` reads them back per tenant so a tenant
+sees what it wrote; they are simply not compiled into the shared front door.
+That is a real remaining limit of this slice, recorded here rather than left to
+be discovered.
 
-- **No imposter can be created or read in a non-default tenant by anyone**,
-  fleet admin included. The tenancy surface itself (`/admin/tenants/...`,
-  `/admin/audit`) *is* tenant-aware and is exempt.
-- **The refusal is deliberately identical** to "you hold no binding here" and to
-  "no such resource". `rbac.rs`'s
-  `cross_tenant_probes_are_indistinguishable_from_probes_of_nothing` pins that in
-  process and C27 pins it against a real fleet. Making them distinguishable would
-  turn the surface into an oracle for other tenants' ports.
+Serving every tenant into one engine reopens the door the old guard was built
+to close: an authorized `acme` caller could address `beta`'s port and read it,
+simply by knowing the number. The replacement is narrower than the guard it
+retired — an **ownership gate** in `authorize_action`'s `Allow` arm, the single
+place every admin request passes through (terminated, proxied, and the front
+door's own reads), refusing only when the addressed port is owned by a tenant
+other than the one the caller was decided into. It sits at that one choke
+point rather than per-route deliberately: a per-route check is how one route
+gets missed, and the proxied reads — forwarded verbatim to a local engine that
+now binds every tenant's imposters — are the dangerous ones. Creates are
+unaffected: they are not port-addressed, and the state machine's own
+`port_claimed_by_another_tenant` is where fleet-uniqueness is actually enforced.
 
-When the read/sync paths become tenant-aware, this 404 becomes a `200` and both
-tests must be updated deliberately — they are the record that the limit was a
-decision, not an oversight.
+**§8.4's indistinguishable 404 survives the replacement — but only because the
+gate refuses an *unowned* port too.** The obvious design lets an unowned port
+fall through to upstream, on the reasoning that there is no tenant behind it to
+protect. That is wrong, and subtly: upstream's own 404 names the port ("No
+imposter exists on port N") while the gate's says only "Not Found", so the two
+bodies differ and sweeping the range maps exactly which ports other tenants
+hold. The gate therefore refuses unless the port is owned by *this* tenant, so
+"owned by someone else" and "owned by nobody" are one answer, matching
+`NotBoundToTenant`. The cost is that a caller reading a genuinely absent port in
+their own tenant gets the terse body instead of upstream's descriptive one — the
+right trade, since the descriptive message is a convenience and
+indistinguishability is a contract.
+
+**Collection reads are narrowed too, at `fetch` rather than per route.**
+`GET /imposters` is not the only body that lists every imposter: `PUT /imposters`
+renders the collection after the replace, and `DELETE /imposters` captures it
+beforehand as "what was removed". All three go through the same loopback read, so
+the narrowing lives there — a per-call-site filter is how two of the three
+shipped unfiltered in the first draft of this change. It **fails closed**: a body
+that cannot be read or parsed is refused, not forwarded, and an entry whose port
+will not parse is dropped rather than kept, because a classifier that cannot
+classify must treat its input as the dangerous class.
+
+This applies to `default` symmetrically, and it is worth stating plainly
+because it is easy to misread as a regression rather than the fix: before this
+change `default` saw every imposter because every imposter *was* `default`'s;
+now a `default` Editor no longer sees `acme`'s. That narrowing is the correct
+behaviour, not a side effect of it.
+
+**The data plane is unchanged.** RFC-002 §7 keeps it open — an imposter
+answers traffic regardless of which tenant owns it. The ownership gate governs
+*administration* of a port, not traffic through it, and nothing above touches
+that boundary.
+
+**Remaining scope limit.** The source-pull path
+(`crates/rift-cluster/src/sources/`) still operates on `TenantId::default()`
+explicitly; making source configuration itself tenant-aware was out of scope
+for #182 and is not implied by anything above.
 
 ### What the export sink ships, and what it will not promise (issue #164)
 
