@@ -358,16 +358,15 @@ own durability and repairs never persist at all, so the three modes mean the
 same thing fleet-wide; with the fix in place the mutation fails on
 `resumed at 1`, as it always should have.
 
-`c17_routes_converge` and `c18_routes_survive_a_full_cluster_restart` (#132)
-close #19's cluster-level acceptance list for the front door (#131): the
-route table is a replicated control-plane object exactly like the imposter
-config set, so it gets the same two container-tier proofs C15/C16 already
-gave imposter configs — a write's barrier contract, and survival of a real
-restart. A third planned scenario, `c19_front_door_routes_around_bind_divergence`
-(the §7.4.6 "bind-divergence dividend"), is **not** here: its premise does not
-hold against the code as written — see RFC-001 §7.4.6's corrected note and
-issue #143 — so it was descoped rather than written to assert an accidental
-404 as if it were a contract.
+`c17_routes_converge`, `c18_routes_survive_a_full_cluster_restart` (#132) and
+`c19_front_door_routes_around_bind_divergence` (#143) close #19's
+cluster-level acceptance list for the front door (#131): the route table is a
+replicated control-plane object exactly like the imposter config set, so it
+gets the same two container-tier proofs C15/C16 already gave imposter
+configs — a write's barrier contract, and survival of a real restart — plus a
+third the config set never needed until #143 gave it one: a node whose own
+bind failed still routes to the imposter it could not bind, dispatched
+in-process rather than through the socket that lost the race.
 
 Both need every node's own `--front-door` listener reachable from the host —
 see "The front-door overlay" above — because there is no `/front-door/resolve`
@@ -429,6 +428,38 @@ still passed — the stored table survived the restart; only the in-memory
 compiled table failed to come back.) The same mutant leaves `c17_routes_converge`
 green — it does not touch a restart, so this is confirmation the mutation is
 specific to the cold-start path, not a duplicate of C17's.
+
+`c19_front_door_routes_around_bind_divergence` runs the same collision
+`crates/rift-ee-server/tests/bind_divergence.rs` already proves in-process,
+across a real three-node stack instead: `bind-squat.overlay.yml` runs an
+`alpine/socat` sidecar inside **rift-2's own network namespace**
+(`network_mode: "service:rift-2"`), so an imposter's port is held by a
+process outside rift-2 entirely before rift-2's own `ImposterManager` ever
+tries to bind it — the way an unrelated deployment on the same host would
+hold it. rift-1 and rift-3 share no namespace with the squatter, so their
+binds are untouched.
+
+The squat has to provably precede the imposter write or this is a race that
+passes by luck. Compose cannot express "rift-2 waits on the squatter": the
+squatter needs rift-2's network namespace to attach to, which only exists
+once rift-2's own container has started, so the dependency can only run
+rift-2 → squatter. The scenario closes the loop from the other side: it polls
+the squatter's own healthcheck over `docker inspect` and does not write the
+imposter config until it reports healthy, so the port is confirmed held —
+not merely scheduled to be — before the write that depends on it.
+
+Four checks, in order. The write itself returns `201`, not the `404` a
+bind-failed node answered before #143, because every node now constructs the
+imposter and claims the port in its map regardless of the local bind outcome.
+`wait_converged` — reading `GET /imposters`, the map, not the socket —
+converges fleet-wide despite the squat: convergence of the config, not of the
+bind. rift-2's own `rift_cluster_bind_failures{port="6520"}` gauge reads `1`,
+because serving unbound is not the same as pretending to be healthy. And
+finally the dividend: a route to the squatted port dispatches `2xx` with the
+imposter's body through **rift-2's own front door** — the node whose bind
+failed. A last check against rift-1's front door, whose bind succeeded, is
+what makes this a proof of divergence rather than of a stack that is
+uniformly broken.
 
 ## C20–C23: imposter sources
 

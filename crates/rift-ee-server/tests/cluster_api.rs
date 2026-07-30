@@ -103,6 +103,15 @@ async fn config_and_imposters_report_committed_state() {
         imposters["imposters"][0]["config"]["protocol"], "http",
         "the committed body is reported as JSON, not an escaped string"
     );
+    // `null`, not absent: the per-`(port, node)` bind status (RFC-001 §7.4.6, issue #143) is
+    // reported for every port so an operator can tell "this node realized it" from "this node
+    // does not report on it at all". Populated is covered by `bind_divergence.rs`, which needs a
+    // real engine losing a real port; this fixture runs with `engine: None`.
+    assert_eq!(
+        imposters["imposters"][0]["bind_failure"],
+        serde_json::Value::Null,
+        "a port with no local engine failure reports a null bind_failure"
+    );
 }
 
 #[tokio::test]

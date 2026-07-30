@@ -793,13 +793,18 @@ Connection pooling per peer.
 > deterministically, and `revision` is the same Raft log index. What differs from the imposter
 > config plane is the post-apply projection: instead of driving `ImposterManager::apply_config`,
 > a committed route write recompiles a `CompiledRoutes` and hot-swaps it into the front door's
-> `ArcSwap`. **Correction (checked at #132's implementation time):** this paragraph previously
-> claimed the front door gets §7.4.6's bind-divergence dividend "for free" — that a node whose own
-> bind failed still reaches the imposter through the front door because dispatch is in-process.
-> It does not: a failed bind never inserts an entry into the imposter map (see §7.4.6's own
-> corrected note), so in-process dispatch finds nothing there either, and the front door 404s on
-> that node exactly like the gateway does. Tracked as #143. See `docs/rift-ee-server.md` ("The
-> clustered front door") for the operator-facing contract.
+> `ArcSwap`. **Now built (#143), after an interim correction.** This paragraph originally claimed
+> the front door gets §7.4.6's bind-divergence dividend "for free" — that a node whose own bind
+> failed still reaches the imposter through the front door because dispatch is in-process. A
+> correction checked at #132's implementation time walked that back: at the time, a failed bind
+> never inserted an entry into the imposter map, so in-process dispatch found nothing there
+> either, and the front door 404'd on that node exactly like the gateway did. #143 closed the gap
+> the correction described: under `--cluster`, `ImposterManager::with_serve_unbound(true)` keeps
+> an apply-path create whose explicit port failed to bind registered in the map anyway (§7.4.6),
+> so the original claim now holds in the scope #143 actually built — a node whose own bind failed
+> still reaches the imposter through the front door and the gateway alike, in-process, with no
+> socket involved. See `docs/rift-ee-server.md` ("The clustered front door") for the
+> operator-facing contract.
 
 **Design rules (v2, superseded mechanism): gossip carries pointers, not payloads; writes are
 serialized at a per-port owner** (v1's accept-anywhere LWW destroyed concurrent stub mutations —
@@ -888,35 +893,79 @@ revision.
 
 #### 7.4.6 Port-bind divergence
 
-Every node binds every imposter port; binds can fail on some nodes (port taken by an
-unrelated process). Semantics:
+Every node applies the same committed config and therefore binds every imposter port;
+binds can fail on some nodes (port taken by an unrelated process). Built (#143):
 
-- Bind status is gossiped per `(port, node)`: `bind/<port>/<node> → Bound | Failed(reason)`.
-- The imposter **exists cluster-wide regardless**; nodes that failed to bind still serve it
-  via the gateway listener (§6.3) if enabled, and still participate as owners for its keys.
-  > ⚠️ **The "still serve it" half is designed, not built (checked at #132's implementation
-  > time; tracked as #143).** `ImposterManager::create_imposter`
-  > (`vendor/rift/crates/rift-mock-core/src/imposter/manager.rs`) binds the listener *first*
-  > and returns `Err(ImposterError::BindError)` **before** the `Imposter` is constructed or
-  > inserted into the port table. A node whose bind fails therefore has no map entry for that
-  > port at all — `dispatch_to_port` (and, downstream of it, the front door's own in-process
-  > dispatch, per §7.4's front-door extension above) resolves through `manager.get_imposter(port)`
-  > and answers `404` on that node, gateway or front door alike. The *observability* half is
-  > real: `rift_cluster_bind_failures{port}`, the `cluster.bind_failures` annotation, and
-  > `record_report` (`crates/rift-cluster/src/raft/store.rs`) track a bind failure carefully,
-  > including the deleted-port case. It is only the serving half — a node routing around its
-  > own failed bind — that does not exist yet. Do not write a test asserting today's `404` as
-  > if it were the contract; #143 is where the serving half gets designed and built.
-- Admin `POST /imposters` returns `201` with a `Rift-Cluster-Warnings` **header** listing
-  nodes that failed to bind (best-effort within a 2 s wait; late failures visible via
-  `GET /_cluster/imposters`). A header — not a body field — because the U-8 decoration
-  seam is deliberately headers-only; clients wanting detail follow the header to
-  `/_cluster/imposters`.
-- **Auto-assigned ports:** minted by the config owner during `config/write` (its local
-  49152–65535 scan); the minted port is fixed in the replicated config — other nodes do
-  *not* re-mint on bind failure (port is identity). In L4/port-based mode, per-port LB
-  health checks must be configured so traffic avoids nodes with a failed bind (§6.1).
-  Operators running clusters should prefer explicit ports or the gateway mode; documented.
+- **The imposter is registered cluster-wide regardless of a local bind failure.**
+  `ImposterManager::with_serve_unbound(true)` — set for the cluster manager only
+  (`cluster_manager`, `crates/rift-ee-server/src/compose.rs`; the `--cluster`-off path
+  never reaches it) — changes the **apply-path** create (`apply_config` →
+  `create_for_apply`, and the wholesale-replace path) so a socket-level
+  `ImposterError::BindError` on an **explicit** port no longer aborts the create: the
+  imposter is constructed and claims the port in the map with no listener, instead of
+  being dropped. Every in-process route resolves through `manager.get_imposter(port)` —
+  the gateway's `dispatch_to_port` and, in the enterprise build, the front door alike —
+  so an unbound imposter still answers on that node; only traffic addressed directly to
+  the bound socket is lost, which is the part the squatter already took.
+  `Imposter::is_bound()` reports the state. Two paths stay all-or-nothing on purpose:
+  `create_imposter` (the direct, non-apply path — `Err` there means "does not exist" to
+  every existing caller, whatever the flag says), and any bind failure that isn't a plain
+  `BindError` on an explicit port (`PortInUse` is a map-level conflict, and an
+  auto-assigned port minted from a failed bind has no identity to register a failure
+  under).
+- **Rebind healing.** The port is reported under `ApplyReport::failed`, never `created`,
+  so an embedder's degraded-state tracking keeps working off the field it already reads.
+  The *next* `apply_config` sees the entry is unbound and re-attempts the listener bind
+  before anything else; on success it reports the port under `created`, which clears the
+  failure. This isn't optional polish — before #143 a failed bind left no map entry at
+  all, so every apply naturally retried it; with an entry now present, an unchanged
+  config would otherwise look "already applied" and the node would stay degraded forever
+  even after the port freed up.
+- **Bind status is node-local, not replicated.** Each node tracks its own bind outcomes
+  in `apply_failures()` (`crates/rift-cluster/src/raft/store.rs`); there is no gossiped
+  or Raft-logged `bind/<port>/<node> → Bound | Failed(reason)` view, and this was struck
+  from the design at #143's implementation time, not merely deferred. Three reasons: (1)
+  there is no gossip layer left to carry it — the §7.1/§7.4 gossip control plane above is
+  superseded by ADR-001 v3's Raft log; (2) a bind outcome is a *per-node observation about
+  that node's own socket*, and writing it into the replicated state machine would break
+  the deterministic-apply invariant every other entry in that log depends on (two nodes
+  applying the identical committed entry must reach identical state, and "did my socket
+  bind" is not a function of the entry); and (3) it has no consumer — every reader of bind
+  status (the gauge, the read-side header, and an operator polling `GET
+  /_cluster/imposters`, all below) already reads it from the node that owns the
+  observation, never from a peer's replicated view of it. A future reader should not
+  "restore" this as a missing feature.
+- **Observability, per node:** `rift_cluster_bind_failures{port}` (gauge, resampled after
+  every engine drive so healing clears it), the `cluster.bind_failures` annotation, and
+  `record_report` (`crates/rift-cluster/src/raft/store.rs`) track a bind failure
+  carefully, including the deleted-port case.
+- **Write path — local-node warning only.** Admin `POST /imposters` (and other imposter
+  writes) still commits and answers `201`/`200`; if *this* node's own engine failed to
+  realize the committed config, the response carries `Rift-Cluster-Warnings:
+  local-engine=<reason>` (pre-existing mechanism, unchanged by #143 — it already keyed
+  off `ApplyReport::failed`). **Not built:** a fleet-wide warning listing *other* nodes
+  that failed to bind. That would need `AppliedReply` to carry each peer's bind status
+  back to the accepting node, which does not exist today; only the local node's own
+  failure is visible on a write. Per-`(port, node)` visibility across the fleet comes from
+  each node's own operator surface (the gauge above, and `GET /_cluster/imposters`), not
+  from one node's write response.
+- **Read path.** A port-addressed proxied admin read on a diverged node —
+  `GET /imposters/:port` through the clustered front — answers its normal `200`: the
+  imposter is genuinely in the local map and the read genuinely succeeds. The response
+  carries `rift-cluster-bind-failures: <port>=<reason>` when this node could not realize
+  that port's bind, and no header at all for a healthy port. The response **body** stays
+  OSS-shaped on purpose — the U-8 decoration seam is deliberately headers-only, so a
+  client wanting the detail follows the header rather than a body shape no OSS client can
+  parse.
+- **Auto-assigned ports are refused outright under `--cluster`**, not minted per-node: an
+  auto-assigned port cannot replicate (every node's local 49152–65535 scan would pick a
+  different one), so the admin front rejects a clustered imposter create or whole-set
+  replace with no explicit `port` at `400` (`crates/rift-ee-server/src/admin_front.rs`)
+  rather than minting one that could diverge. Every clustered imposter therefore has an
+  explicit, fixed port for its lifetime — there is no re-mint-on-bind-failure case to
+  reason about. In L4/port-based mode, per-port LB health checks must still be configured
+  so traffic avoids nodes with a failed bind (§6.1) — serving in-process does not make the
+  bound socket itself reachable again.
 
 ### 7.5 Mergeable state (journal, counters) & clears
 

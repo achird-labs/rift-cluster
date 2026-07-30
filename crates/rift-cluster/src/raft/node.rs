@@ -1126,6 +1126,18 @@ impl RaftNode {
         self.sm_reader.apply_failures()
     }
 
+    /// Why the local engine serves `port` in-process only, because it could not bind that port
+    /// (RFC-001 §7.4.6, issue #143). `None` when the port is healthy or this node does not serve it.
+    ///
+    /// Use this — not [`Self::apply_failures`] — for anything that *claims* bind divergence. See
+    /// [`RedbStateMachine::bind_failure`] for why the general failure map is the wrong source: it
+    /// cannot distinguish a failed bind from an unreadable cert or a rejected stub patch, and those
+    /// leave the node serving nothing for that port rather than serving it in-process.
+    #[must_use]
+    pub fn bind_failure(&self, port: u16) -> Option<String> {
+        self.sm_reader.bind_failure(port)
+    }
+
     /// Every port this node has a committed config for, ascending. Like
     /// [`Self::get_imposter`], this answers from applied local state.
     pub fn configured_ports(&self) -> Result<Vec<u16>, NodeError> {

@@ -1336,6 +1336,29 @@ impl RedbStateMachine {
         self.apply_failures.lock().clone()
     }
 
+    /// Why the local engine is serving `port` **in-process only** — it holds the imposter but never
+    /// bound its port (RFC-001 §7.4.6, issue #143). `None` when the port is healthy, when this node
+    /// is not serving it at all, or when there is no local engine.
+    ///
+    /// Narrower than [`Self::apply_failures`] on purpose, and the distinction is the whole point.
+    /// That map records *every* kind of engine-side failure — a stored record that will not parse,
+    /// a refused `SetEnabled`, a rejected stub patch, an unreadable TLS cert — and stringifies the
+    /// error, discarding which kind it was. Reporting any of those as a bind failure would tell an
+    /// operator "this node is still serving it in-process", which for every one of those cases is
+    /// false: the imposter is not in the map at all, and the read they are looking at is a 404.
+    /// So the engine's own [`Imposter::is_bound`] is the authority here, not the failure string.
+    #[must_use]
+    pub fn bind_failure(&self, port: u16) -> Option<String> {
+        let engine = self.engine.as_ref()?;
+        if engine
+            .get_imposter(port)
+            .is_ok_and(|imposter| !imposter.is_bound())
+        {
+            return self.apply_failures.lock().get(&port).cloned();
+        }
+        None
+    }
+
     /// Durably park an accepted intent (issue #9 R4). Runs with `Immediate`
     /// durability because this write IS the acceptance boundary: once the
     /// client hears anything other than a hard error, the op must survive a

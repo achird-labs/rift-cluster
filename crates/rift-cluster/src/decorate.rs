@@ -27,6 +27,10 @@ pub const NOTE_WARNINGS: &str = "cluster.warnings";
 /// The node that owned the key this request was serialized through.
 pub const NOTE_OWNER: &str = "cluster.owner";
 
+/// Ports whose committed config this node's engine could not realize — today, a port bind that
+/// lost to an unrelated process (issue #143).
+pub const NOTE_BIND_FAILURES: &str = "cluster.bind_failures";
+
 /// Header names the admin write path sets directly on responses it builds
 /// itself (issue #9): the front terminates mutating routes outside the OSS
 /// handler pipeline, so no annotation scope exists there — but the names stay
@@ -36,6 +40,13 @@ pub const HEADER_REVISION: &str = "rift-cluster-revision";
 pub const HEADER_OP_ID: &str = "rift-cluster-op-id";
 /// Non-fatal write warnings, e.g. `unapplied=<node,…>` on a barrier timeout.
 pub const HEADER_WARNINGS: &str = "rift-cluster-warnings";
+/// This node is serving the addressed imposter in-process only, because it could not bind that
+/// imposter's port (issue #143).
+///
+/// Set directly by the front for the same reason as the three above, and with more force: the
+/// affected reads are *proxied*, and the OSS admin phase decorates with `req_port: None`, so no
+/// annotation scope downstream can know which imposter the response is about.
+pub const HEADER_BIND_FAILURES: &str = "rift-cluster-bind-failures";
 
 /// Translates `cluster.*` annotations into `Rift-Cluster-*` response headers.
 #[derive(Debug, Clone, Default)]
@@ -165,6 +176,25 @@ mod tests {
         assert_eq!(
             header_name_for("cluster.bind_failures").as_deref(),
             Some("rift-cluster-bind-failures")
+        );
+    }
+
+    // The front sets this header itself (the read it marks is proxied, and the admin phase
+    // decorates with no port), so the constant and the annotation must not be able to drift
+    // apart — a client cannot tell a renamed header from an absent one.
+    #[test]
+    fn the_directly_set_header_names_match_their_annotations() {
+        assert_eq!(
+            header_name_for(NOTE_BIND_FAILURES).as_deref(),
+            Some(HEADER_BIND_FAILURES)
+        );
+        assert_eq!(
+            header_name_for(NOTE_REVISION).as_deref(),
+            Some(HEADER_REVISION)
+        );
+        assert_eq!(
+            header_name_for(NOTE_WARNINGS).as_deref(),
+            Some(HEADER_WARNINGS)
         );
     }
 
