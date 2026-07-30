@@ -750,6 +750,37 @@ async fn a_delayed_put_cannot_resurrect_a_deleted_key() {
             .expect("delete");
     }
 
+    // Wait for the tombstone to actually reach the replica before injecting anything.
+    //
+    // `set`/`delete` return once the **owner's** write is durable; the push to the replica is
+    // asynchronous and neither call awaits it. Without this wait the test races that push, and it
+    // loses often enough to be a recurring CI failure on unrelated branches: the replica is still
+    // holding the seed at v1, the injected v1 `Put` ties rather than loses, and the assertion below
+    // reports the *seed* (a non-zero `expires_at`, unlike the injected entry's `0`) as a
+    // resurrection that never happened.
+    //
+    // `get_versioned` rather than `get`, because `get` hides tombstones — it answers `None` both
+    // for "the delete arrived" and for "nothing ever arrived", and proceeding on the second would
+    // let the injected `Put` land on an empty replica and genuinely resurrect the key. Waiting for
+    // `deleted: true` is the only state that means what this test needs it to mean.
+    let deadline = Instant::now() + CONVERGE;
+    loop {
+        if replica
+            .shard
+            .get_versioned(&stored("flow-rz"), "k")
+            .is_some_and(|entry| entry.deleted)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the delete's tombstone never replicated to {}; the stale-Put injection below would \
+             have been testing an empty replica rather than a tombstoned one",
+            replica.node.id()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     // The delayed v1 push, replayed at the replica after the delete: exactly
     // what a slow network delivers. It must lose to the tombstone.
     let stale_put = serde_json::json!({
