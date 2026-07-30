@@ -2570,7 +2570,6 @@ dependencies = [
  "hyper-util",
  "prometheus",
  "rand 0.8.6",
- "redb",
  "reqwest",
  "rift-cluster",
  "rift-cluster-base",

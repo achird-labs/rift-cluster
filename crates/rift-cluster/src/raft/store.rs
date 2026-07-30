@@ -7359,6 +7359,17 @@ mod tests {
 
     /// Overwrite a one-row table's value with something that is not JSON, simulating on-disk
     /// corruption or a forward-incompatible record written by a newer binary.
+    ///
+    /// These assertions stop at the accessor on purpose. An end-to-end version — corrupt the file,
+    /// restart the node, assert the admin front answers `500` — was written and **withdrawn**: a
+    /// restarted node rebuilds its state before serving, so the corruption is gone by the time the
+    /// first request arrives, and the test passed locally while failing in CI. A test that
+    /// green-lights a security invariant only on some machines is worse than none, because the
+    /// failures read as flakes. Making it deterministic would need log surgery invasive enough to
+    /// stop resembling the scenario it models.
+    ///
+    /// The accessor is the linchpin regardless: every caller reaches `should_bypass` only after an
+    /// `Ok(None)`, so an `Err` here cannot become an authorization decision anywhere upstream.
     fn corrupt_row(sm: &RedbStateMachine, table: TableDefinition<&str, &str>, key: &str) {
         let write = sm.db.begin_write().expect("write txn");
         {

@@ -57,9 +57,6 @@ xxhash-rust.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 tempfile = "3"
-# Corrupts a committed row directly on disk so the admin front's fail-closed behaviour can be
-# asserted end to end rather than only at the storage accessor (issue #185 follow-up). Dev-only.
-redb.workspace = true
 # Enumerates `Terminated`'s variants so the route-parity gate can prove its representative list
 # covers every one (issue #184). Dev-only: the derives are `cfg_attr(test, ...)`, so nothing here
 # reaches the shipped binary.
