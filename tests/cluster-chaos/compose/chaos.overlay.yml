@@ -106,6 +106,13 @@ services:
       # `SocketAddr`-typed advertise because it is an IP literal -- this overlay
       # deliberately does not depend on hostname advertise (#68).
       RIFT_CLUSTER_ADVERTISE: "172.28.7.100:4791"
+      # Snapshot aggressively and purge immediately (issue #183): a lagging
+      # node then has no choice but to be caught up by a real `install_snapshot`
+      # over the wire rather than by ordinary log replication. A testability
+      # knob, not operator tuning -- see `NodeConfig::snapshot_log_entries`
+      # (crates/rift-cluster/src/raft/node.rs) for why both halves (a low
+      # policy *and* purging on top of it) are required together.
+      RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES: "10"
 
   rift-2:
     <<: *chaos-node
@@ -117,6 +124,8 @@ services:
     environment:
       RIFT_CLUSTER_ADVERTISE: "172.28.7.100:4792"
       RIFT_CLUSTER_SEEDS: "172.28.7.100:4791"
+      # See rift-1: a testability knob, not operator tuning.
+      RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES: "10"
 
   rift-3:
     <<: *chaos-node
@@ -128,3 +137,5 @@ services:
     environment:
       RIFT_CLUSTER_ADVERTISE: "172.28.7.100:4793"
       RIFT_CLUSTER_SEEDS: "172.28.7.100:4791"
+      # See rift-1: a testability knob, not operator tuning.
+      RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES: "10"

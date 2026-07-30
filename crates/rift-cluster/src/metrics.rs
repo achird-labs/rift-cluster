@@ -119,6 +119,20 @@ lazy_static! {
     )
     .expect("rift_cluster_dedup_hits_total registers once");
 
+    /// `rift_cluster_snapshots_installed_total` — snapshots this node received from a peer and
+    /// applied, i.e. times it was caught up over the wire rather than by log replication.
+    ///
+    /// Exists because it was otherwise **unobservable** (issue #183): nothing on the operator
+    /// surface distinguished "this node caught up by snapshot install" from "by replication", so a
+    /// chaos scenario could only assert the *precondition* for a snapshot install and would stay
+    /// green if a regression quietly restored catch-up-by-log — silently evaporating the mutant
+    /// coverage the scenario exists to provide.
+    static ref SNAPSHOTS_INSTALLED: IntCounter = register_int_counter!(
+        "rift_cluster_snapshots_installed_total",
+        "Snapshots received from a peer and applied to this node's state machine"
+    )
+    .expect("rift_cluster_snapshots_installed_total registers once");
+
     /// `rift_cluster_audit_export_shipped_total` — audit rows accepted by the
     /// sink (issue #164). At-least-once, so this can exceed the number of rows
     /// derived: a leader that dies between shipping and checkpointing re-ships
@@ -370,6 +384,11 @@ pub fn intents_pending_sampled(depth: usize) {
 
 pub(crate) fn dedup_hit() {
     DEDUP_HITS.inc();
+}
+
+/// A peer's snapshot was applied to this node's state machine (issue #183).
+pub(crate) fn snapshot_installed() {
+    SNAPSHOTS_INSTALLED.inc();
 }
 
 pub(crate) fn audit_export_shipped(rows: usize) {

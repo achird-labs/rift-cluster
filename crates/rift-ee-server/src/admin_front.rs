@@ -2794,6 +2794,7 @@ mod tests {
             routes: rift_cluster::Router::new(),
             engine: None,
             audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
+            snapshot_log_entries: None,
         };
         let node = RaftNode::start(config).await.expect("node starts");
         (Arc::new(node), dir)

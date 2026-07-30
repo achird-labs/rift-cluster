@@ -4227,30 +4227,70 @@ async fn c25_probe(admin: u16, key: &str) -> (u16, serde_json::Value) {
     .unwrap_or_else(|e| panic!("principal list on :{admin}: {e}"))
 }
 
-/// C26 — the audit chain survives a full-fleet stop/start: rows intact,
-/// complete, and identically ordered on every node.
+/// How long C26's lagging node gets to catch up over `install_snapshot` once
+/// it answers again. Generous relative to `CONVERGE_TIMEOUT`: a snapshot
+/// transfer plus a full table-by-table apply is more work than the ordinary
+/// per-write convergence that bound is sized for.
+const SNAPSHOT_CATCHUP_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// C26 — the audit chain survives a full-fleet stop/start, and survives a
+/// single lagging node's catch-up over a real `install_snapshot`.
 ///
-/// **Restart, not snapshot install, and that is measured rather than assumed.**
-/// openraft here runs the default `LogEntries(5000)` policy and a chaos stack
-/// commits a few dozen entries, so no snapshot is ever built and `stop`/`start`
-/// restores from each node's own redb. This README already carries the same
-/// correction for C18 and C22. The snapshot round trip is gated in process by
-/// `audit_rows_survive_a_snapshot_build_and_install` and
-/// `the_audit_export_sink_checkpoint_and_gc_watermark_survive_a_snapshot_install`
-/// in `crates/rift-cluster/src/raft/store.rs`, which drive `build_snapshot` /
-/// `install_snapshot` directly. What this scenario adds is process death.
+/// Two phases, because they guard two different regressions this scenario has
+/// caught before, in different code paths:
 ///
-/// *Mutant:* the `audit` table omitted from `SnapshotPayload` — the #134/#137
-/// lesson — goes red in those in-process tests, not here, for the reason above.
-/// The mutant that kills *this* scenario is audit rows held in memory rather
-/// than in redb.
+/// **Phase 1 — force the wire path.** A full-cluster restart alone never
+/// exercises `install_snapshot`: every node restores from its own redb and
+/// needs nothing from a peer, which is why this scenario's mutation target
+/// (the issue's "`audit` table omitted from `SnapshotPayload`") used to
+/// survive here — the same correction the README used to carry three times
+/// over, once each for C18/C22/C26, now consolidated into one explanation
+/// there. `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES=10` (`chaos.overlay.yml`) is what
+/// makes a lagging node unable to avoid the wire path: this phase stops one
+/// follower, commits more than 10 entries through the other two (each an
+/// `imposter.write`, so the audit chain keeps growing), and restarts it. With
+/// `snapshot_policy = LogsSinceLast(10)` and `max_in_snapshot_log_to_keep = 0`
+/// (`NodeConfig::snapshot_log_entries`, `crates/rift-cluster/src/raft/node.rs`,
+/// pinned there by two unit tests), the leader purges the entries the
+/// follower missed as soon as it snapshots, so the only way back is a real
+/// `install_snapshot` — a real socket, real serialize/deserialize of
+/// `SnapshotPayload`. The post-restart convergence check is what goes red if
+/// the audit table is dropped from it.
+///
+/// *The evidence that this is what actually happened is second-order, not
+/// direct, and that gap is deliberate rather than missed.* This tier has no
+/// admin-API or Prometheus signal that fires specifically on
+/// `install_snapshot` — checked, not assumed: `crates/rift-cluster/src/metrics.rs`
+/// has no such family, `/_cluster/members` reports only `last_applied`, and
+/// this file's own house rule (top of module) rules out a log line for it
+/// even if one exists upstream in openraft. So instead of observing the RPC,
+/// this phase asserts its *precondition*, from data the harness already reads:
+/// the live nodes' own last committed revision, taken after the extra writes,
+/// is checked to be more than 10 past the lagging node's revision from the
+/// moment it stopped — which is exactly what `LogsSinceLast(10)` +
+/// `max_in_snapshot_log_to_keep = 0` need to have already purged the entries
+/// it is missing (that arithmetic is what the two unit tests above pin). A
+/// regression that broke only the purge, leaving ordinary replication to
+/// quietly cover for it, would not trip this assertion. Closing that
+/// remaining gap needs a counter on `RedbStateMachine::install_snapshot`
+/// itself, which is a `crates/` change out of scope for this worktree.
+///
+/// **Phase 2 — the full-fleet restart, kept rather than replaced.** Its own
+/// mutant story is a different bug in a different place: "clearing `sm_audit`
+/// whenever the store is opened" — the ordinary cold-start path, no snapshot
+/// involved at all — went red only here, at `node rift-1 lost or reordered
+/// audit rows across the restart`. Phase 1's install-snapshot path does not
+/// subsume it: a node that never restarted a second time never re-opens its
+/// store from cold, which is exactly the path that mutant lives on. Every
+/// node's `(revision, action, resource)` projection must still be
+/// byte-identical to its own pre-restart one and to every other node's.
 #[tokio::test]
 #[ignore = "needs a container runtime"]
 async fn c26_audit_chain_survives_a_full_cluster_restart() {
-    let cluster = Cluster::up_with_overlays(&["tenancy.overlay.yml"])
+    let cluster = Cluster::up_with_overlays(&["chaos.overlay.yml", "tenancy.overlay.yml"])
         .await
         .expect("fleet comes up");
-    wait_single_leader(CONVERGE_TIMEOUT)
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
         .await
         .expect("a leader settles");
 
@@ -4290,16 +4330,165 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
             .expect("converged");
     }
 
-    let before = c26_audit_on_every_node(TENANCY_FLEET_KEY).await;
+    let baseline = c26_audit_on_every_node(TENANCY_FLEET_KEY).await;
     assert!(
-        before[0].len() >= NODES.len(),
+        baseline[0].len() >= NODES.len(),
         "the session must have produced rows to lose: {:?}",
-        before[0].len()
+        baseline[0].len()
     );
+    for (i, rows) in baseline.iter().enumerate() {
+        assert_eq!(
+            rows, &baseline[0],
+            "before any restart, node {} already disagrees with {}",
+            NODES[i].name, NODES[0].name
+        );
+    }
+
+    // ---- Phase 1: a real install_snapshot ----------------------------------
+
+    let lagging_idx = NODES
+        .iter()
+        .enumerate()
+        .find(|(i, _)| *i != leader)
+        .map(|(i, _)| i)
+        .expect("a non-leader");
+    let lagging = &NODES[lagging_idx];
+    let live: Vec<_> = NODES.iter().filter(|n| n.name != lagging.name).collect();
+    assert_eq!(live.len(), 2, "exactly two nodes stay up under the lag");
+
+    // The lagging node's own last committed revision at the instant it stops
+    // -- captured from `baseline`, read moments earlier while all three still
+    // agreed, so nothing commits between the read and the stop below.
+    let lagging_revision_at_stop = baseline[lagging_idx]
+        .iter()
+        .map(|(revision, _, _)| *revision)
+        .max()
+        .expect("baseline has rows");
+
+    cluster
+        .stop(lagging.name)
+        .expect("SIGTERM the lagging node");
+
+    // n, matching RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES (chaos.overlay.yml) and the
+    // LogsSinceLast(n) policy it drives (NodeConfig::snapshot_log_entries).
+    const SNAPSHOT_LOG_ENTRIES: u64 = 10;
+    // More than n committed while it's down. n alone would already guarantee
+    // at least one full LogsSinceLast(n) window closes entirely after it
+    // stopped (worst case, the window was freshly opened and needs exactly n
+    // more entries); this is comfortably past that floor.
+    const ENTRIES_WHILE_DOWN: usize = 15;
+    for i in 0..ENTRIES_WHILE_DOWN {
+        let via = live[i % live.len()];
+        let (status, body) = admin_with_key(
+            via.admin,
+            "PUT",
+            "/imposters/6520/stubs",
+            Some(&serde_json::json!({
+                "stubs": [{ "responses": [{ "is": { "statusCode": 200, "body": format!("audited-{i}") } }] }]
+            })),
+            Some(TENANCY_FLEET_KEY),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("write {i} while {} is down: {e}", lagging.name));
+        assert!(
+            (200..300).contains(&status),
+            "write {i} via {}: {status} {body}",
+            via.name
+        );
+    }
+
+    // The two live nodes must still agree with each other -- otherwise the
+    // "more than n past the lagging node" check below would be comparing
+    // against a number that is not actually the fleet's.
+    let live_rows_0 = c26_audit_rows(live[0].admin, live[0].name, TENANCY_FLEET_KEY).await;
+    let live_rows_1 = c26_audit_rows(live[1].admin, live[1].name, TENANCY_FLEET_KEY).await;
+    assert_eq!(
+        live_rows_1, live_rows_0,
+        "the two live nodes must agree with each other while the third is down"
+    );
+    let live_revision_after_lag_writes = live_rows_0
+        .iter()
+        .map(|(revision, _, _)| *revision)
+        .max()
+        .expect("the extra writes produced rows");
+
+    // The precondition `install_snapshot` needs: see the doc comment above for
+    // why this is the strongest evidence available at this tier without a new
+    // metric or a log line.
+    assert!(
+        live_revision_after_lag_writes > lagging_revision_at_stop + SNAPSHOT_LOG_ENTRIES,
+        "the lag must clear a full LogsSinceLast({SNAPSHOT_LOG_ENTRIES}) window: live revision \
+         {live_revision_after_lag_writes}, {} stopped at revision \
+         {lagging_revision_at_stop}",
+        lagging.name
+    );
+
+    cluster
+        .start(lagging.name)
+        .expect("restart the lagging node");
+    wait_admin_reachable_with_key(
+        lagging.admin,
+        Duration::from_secs(120),
+        Some(TENANCY_FLEET_KEY),
+    )
+    .await
+    .expect("the restarted node answers again");
+
+    // Polled with a deadline, never slept-and-hoped: catch-up over
+    // install_snapshot has no gauge of its own to wait on, so this polls the
+    // one surface that only reaches parity once it has actually happened.
+    let deadline = std::time::Instant::now() + SNAPSHOT_CATCHUP_TIMEOUT;
+    let caught_up = loop {
+        let rows = c26_audit_rows(lagging.admin, lagging.name, TENANCY_FLEET_KEY).await;
+        if rows == live_rows_0 {
+            break rows;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "{} never caught up to the live nodes' audit chain within \
+                 {SNAPSHOT_CATCHUP_TIMEOUT:?}: got {} rows, wanted {}",
+                lagging.name,
+                rows.len(),
+                live_rows_0.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    // (preferred evidence) — this is what goes red if a table is dropped from
+    // `SnapshotPayload`: the lagging node comes back missing that table's rows.
+    assert_eq!(
+        caught_up, live_rows_0,
+        "{} must converge to byte-identical audit rows after install_snapshot",
+        lagging.name
+    );
+
+    // …and it really was `install_snapshot`, not replication that happened to work.
+    //
+    // Without this the scenario proves only the *precondition*: the fleet advanced far enough that
+    // a snapshot install *should* have been required. A regression that broke only the purge —
+    // leaving the log the lagging node needs still present — would let it catch up by ordinary
+    // replication, converge to the same rows, and pass. The whole point of this scenario is that
+    // the wire path is exercised, so the wire path is what is asserted.
+    //
+    // `rift_cluster_snapshots_installed_total` is a plain `IntCounter` registered at startup, so it
+    // is always published and an absent family is a genuine scrape failure rather than a zero.
+    let installed = metric(lagging.metrics, "rift_cluster_snapshots_installed_total")
+        .await
+        .unwrap_or_else(|e| panic!("{}'s metrics endpoint did not answer: {e}", lagging.name));
+    assert!(
+        installed >= 1.0,
+        "{} converged, but never installed a snapshot ({installed}) — it caught up by log \
+         replication, so this scenario is no longer exercising the wire path it exists for",
+        lagging.name
+    );
+
+    // ---- Phase 2: the full-fleet restart ------------------------------------
+
+    let before = c26_audit_on_every_node(TENANCY_FLEET_KEY).await;
     for (i, rows) in before.iter().enumerate() {
         assert_eq!(
             rows, &before[0],
-            "before the restart, node {} already disagrees with {}",
+            "before the full-fleet restart, node {} already disagrees with {}",
             NODES[i].name, NODES[0].name
         );
     }
@@ -4323,57 +4512,60 @@ async fn c26_audit_chain_survives_a_full_cluster_restart() {
     for (i, rows) in after.iter().enumerate() {
         assert_eq!(
             rows, &before[i],
-            "node {} lost or reordered audit rows across the restart",
+            "node {} lost or reordered audit rows across the full-fleet restart",
             NODES[i].name
         );
     }
     for (i, rows) in after.iter().enumerate() {
         assert_eq!(
             rows, &after[0],
-            "after the restart, node {} disagrees with {}",
+            "after the full-fleet restart, node {} disagrees with {}",
             NODES[i].name, NODES[0].name
         );
     }
 }
 
-/// `(revision, action, resource)` per row, per node — the ordered projection
-/// C26 compares. Full rows would drag in per-read fields; this is the part that
-/// must be identical everywhere.
+/// `(revision, action, resource)` for one node's audit projection — the
+/// ordered projection C26 compares. Full rows would drag in per-read fields;
+/// this is the part that must be identical everywhere.
+async fn c26_audit_rows(admin: u16, name: &str, key: &str) -> Vec<(u64, String, String)> {
+    let (status, body) = admin_with_key(
+        admin,
+        "GET",
+        "/admin/audit?since=0&limit=1000",
+        None,
+        Some(key),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("audit read on {name}: {e}"));
+    assert_eq!(status, 200, "audit read on {name}: {body}");
+    // `GET /admin/audit` answers a bare JSON array, not a `{"rows": [...]}`
+    // envelope. Asserted rather than defaulted: an empty projection here would
+    // make "every node agrees" trivially true and the whole scenario vacuous,
+    // so a shape this does not recognise must stop the test.
+    body.as_array()
+        .unwrap_or_else(|| panic!("audit on {name} is not an array: {body}"))
+        .iter()
+        .map(|r| {
+            let revision = r["revision"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("row without a revision on {name}: {r}"));
+            let action = r["action"]
+                .as_str()
+                .unwrap_or_else(|| panic!("row without an action on {name}: {r}"));
+            let resource = r["resource"]
+                .as_str()
+                .unwrap_or_else(|| panic!("row without a resource on {name}: {r}"));
+            (revision, action.to_owned(), resource.to_owned())
+        })
+        .collect()
+}
+
+/// `(revision, action, resource)` per row, per node — see [`c26_audit_rows`].
 async fn c26_audit_on_every_node(key: &str) -> Vec<Vec<(u64, String, String)>> {
     let mut out = Vec::new();
     for node in &NODES {
-        let (status, body) = admin_with_key(
-            node.admin,
-            "GET",
-            "/admin/audit?since=0&limit=1000",
-            None,
-            Some(key),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("audit read on {}: {e}", node.name));
-        assert_eq!(status, 200, "audit read on {}: {body}", node.name);
-        // `GET /admin/audit` answers a bare JSON array, not a `{"rows": [...]}`
-        // envelope. Asserted rather than defaulted: an empty projection here
-        // would make "every node agrees" trivially true and the whole scenario
-        // vacuous, so a shape this does not recognise must stop the test.
-        let rows = body
-            .as_array()
-            .unwrap_or_else(|| panic!("audit on {} is not an array: {body}", node.name))
-            .iter()
-            .map(|r| {
-                let revision = r["revision"]
-                    .as_u64()
-                    .unwrap_or_else(|| panic!("row without a revision on {}: {r}", node.name));
-                let action = r["action"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("row without an action on {}: {r}", node.name));
-                let resource = r["resource"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("row without a resource on {}: {r}", node.name));
-                (revision, action.to_owned(), resource.to_owned())
-            })
-            .collect();
-        out.push(rows);
+        out.push(c26_audit_rows(node.admin, node.name, key).await);
     }
     out
 }

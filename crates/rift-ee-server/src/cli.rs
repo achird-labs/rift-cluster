@@ -102,6 +102,25 @@ pub struct ClusterArgs {
     )]
     pub cluster_audit_retention: u64,
 
+    /// Snapshot every N log entries and purge immediately, forcing a lagging node to be caught up
+    /// by a real `install_snapshot` over the wire (issue #183).
+    ///
+    /// **Hidden, and deliberately not documented for operators.** It exists so the container chaos
+    /// tier can exercise the snapshot wire path at all: a chaos stack commits a few dozen entries,
+    /// which under the shipped defaults never triggers a snapshot, so `install_snapshot` was
+    /// unreachable there and three scenarios each had to write the same correction explaining why
+    /// their snapshot mutant could not fire. RFC-001 states no requirement for tuning this, and a
+    /// fleet that sets it is trading away log retention for nothing.
+    ///
+    /// Unset (the default) leaves openraft's defaults exactly as they were.
+    #[arg(
+        long,
+        value_name = "N",
+        hide = true,
+        env = "RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES"
+    )]
+    pub cluster_snapshot_log_entries: Option<u64>,
+
     /// Address for the unauthenticated /readyz and /healthz probes
     #[arg(
         long,
