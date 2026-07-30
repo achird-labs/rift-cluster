@@ -1,12 +1,14 @@
-//! Rift Enterprise Edition.
+//! Rift cluster facade.
 //!
-//! This crate is the entry point for proprietary functionality that builds on
-//! top of the open-source Rift (vendored under `vendor/rift`). The open-source
-//! crates are re-exported here so enterprise code depends on a single facade
-//! rather than reaching into the submodule directly — the other enterprise
-//! crates take `rift-ee` as their only path into the core, and Cargo (not a
-//! lint) is what enforces that: they carry no direct `rift-mock-core` /
-//! `rift-types` / `rift-http-proxy` dependency.
+//! This crate is the entry point for the clustering layer that builds on top of
+//! the Rift core (vendored under `vendor/rift`). The core crates are re-exported
+//! here so cluster code depends on a single facade rather than reaching into the
+//! submodule directly — the other cluster crates take `rift-ee` as their only
+//! path into the core, and Cargo (not a lint) is what enforces that: they carry
+//! no direct `rift-mock-core` / `rift-types` / `rift-http-proxy` dependency.
+//!
+//! Licensed under Apache-2.0, the same as the core. The facade exists for
+//! dependency hygiene, not for a licence boundary — there no longer is one.
 
 pub use rift_http_proxy;
 pub use rift_mock_core;

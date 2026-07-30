@@ -1,6 +1,6 @@
 [package]
 name = "rift-ee"
-description = "Rift Enterprise Edition — proprietary extensions layered on the open-source Rift core."
+description = "Rift cluster facade — re-exports the Rift core crates and its extension seams for the clustering layer."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

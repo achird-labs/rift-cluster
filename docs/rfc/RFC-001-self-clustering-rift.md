@@ -238,11 +238,15 @@ exactly-once semantics** (Appendix C D-12).
 > those sections are retained for the parts that survive (the ownership *contract*, the
 > partition table, seam usage).
 
-This is an **open-core feature**: a small set of *generic* extension seams goes upstream to
-Apache-2.0 Rift (Appendix A); everything cluster-aware lives in the proprietary
-`rift-enterprise` repo (`rift-cluster`, `rift-ee-server`). Phased so the high-value,
-low-risk slice (membership + config-sync) ships first and each later phase is gated on
-demonstrated demand.
+This is a **split-repo feature**: a small set of *generic* extension seams goes upstream to
+Rift (Appendix A); everything cluster-aware lives in this repo (`rift-cluster`,
+`rift-ee-server`). Phased so the high-value, low-risk slice (membership + config-sync) ships
+first and each later phase is gated on demonstrated demand.
+
+> **Note (2026-07-30):** this RFC was written under an open-core model and its
+> framing reflects that. **Both repos are now Apache-2.0** — the split is a build
+> boundary about where code belongs, not a licence boundary. The technical design
+> below is unaffected.
 
 ## 1.1 Requirements (R1–R4)
 
@@ -1318,7 +1322,7 @@ crates/
                      #   rift-cluster/rift-ee-server import ONLY rift-ee — enforced
                      #   structurally: their Cargo.tomls drop the direct rift-mock-core/
                      #   rift-types deps they carry today (Cargo, not lints, is the fence)
-  rift-cluster       # all cluster logic (proprietary)
+  rift-cluster       # all cluster logic
     src/membership/  #   chitchat wrapper (DNS re-resolving seeds, Leaving state), identity
     src/ring.rs      #   HRW, epochs, settle delay, generations, owner cache
     src/rpc/         #   hyper server+client, HMAC auth, endpoints (§7.3), fast-fail

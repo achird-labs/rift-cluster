@@ -91,9 +91,10 @@ daily job proposes bumps as reviewable PRs. Core changes are **never made
 here** — the flow for "enterprise feature needs a core capability" is: patch
 inside `vendor/rift` → `scripts/upstream-pr.sh` opens the PR against
 `achird-labs/rift` → merge upstream → `scripts/sync-upstream.sh` bumps the
-pin → build the enterprise feature. The friction is the point: every
-generic capability lands where the community gets it, and the enterprise repo
-holds only what is genuinely proprietary.
+pin → build the cluster feature. The friction is the point: every generic
+capability lands where every Rift user gets it, and this repo holds only what is
+genuinely cluster-specific. Both repos are Apache-2.0, so the boundary is about
+where code *belongs*, not about what is withheld.
 
 ## What is enterprise, and why it holds
 
