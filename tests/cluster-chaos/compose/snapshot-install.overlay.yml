@@ -1,0 +1,46 @@
+# Overlay: snapshot aggressively and purge immediately, so a node that falls behind can only be
+# caught up by a real `install_snapshot` over the wire (issue #183).
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/chaos.overlay.yml \
+#                    -f tests/cluster-chaos/compose/tenancy.overlay.yml \
+#                    -f tests/cluster-chaos/compose/snapshot-install.overlay.yml up
+#
+# `Cluster::up_with_overlays(&["chaos.overlay.yml", "tenancy.overlay.yml",
+# "snapshot-install.overlay.yml"])` does this. Only C26 stacks it.
+#
+# **Its own overlay, not a line in `chaos.overlay.yml`, and that is the whole point of this file.**
+# The issue's design said to set it in the shared chaos overlay. That was tried and CI proved it
+# wrong: `chaos.overlay.yml` backs `Cluster::up_with_chaos()`, which C4, C6, C7 and most of the tier
+# use, so the knob applied to all of them. `max_in_snapshot_log_to_keep: 0` purges the log the
+# instant a snapshot covers it, so scenarios whose whole subject is a node falling behind and
+# catching up -- a healed partition replaying parked writes (C4), a lossy link (C6), a joining node
+# reconciling (C7) -- suddenly needed snapshot installs where they had been replaying the log. All
+# three went red. The knob changes how catch-up *happens*, so it belongs only on the scenario that
+# is about catch-up-by-snapshot, and nowhere else.
+#
+# `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES` maps to the hidden `--cluster-snapshot-log-entries`, which
+# sets **both** openraft's `snapshot_policy` and `max_in_snapshot_log_to_keep: 0`. Both are needed:
+# a low policy alone makes snapshots get built but never makes a follower *need* one, because
+# openraft ships a snapshot only once the entries the follower is missing have been purged. See
+# `NodeConfig::snapshot_log_entries` (crates/rift-cluster/src/raft/node.rs).
+#
+# It is a testability knob and is deliberately hidden from `--help` and undocumented for operators:
+# RFC-001 states no requirement for tuning it, and a fleet that sets it trades away log retention
+# for nothing.
+#
+# `10` is comfortably below the number of entries C26 commits while its follower is stopped, so the
+# leader has certainly snapshotted and purged by the time that node returns.
+
+services:
+  rift-1:
+    environment:
+      RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES: "10"
+
+  rift-2:
+    environment:
+      RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES: "10"
+
+  rift-3:
+    environment:
+      RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES: "10"

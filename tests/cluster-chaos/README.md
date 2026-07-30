@@ -193,14 +193,33 @@ one from its own redb, which needs nothing from a peer. `install_snapshot`
 exists to catch up a peer that is missing log entries the leader no longer
 has — nothing in a synchronized full-fleet restart is ever in that state.
 
-`RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES=10` (every rift node's `environment` in
-`chaos.overlay.yml`) is the knob that closes the gap (issue #183): it sets
-`snapshot_policy = LogsSinceLast(10)` **and** `max_in_snapshot_log_to_keep = 0`
-(`NodeConfig::snapshot_log_entries`) — both are required together, and why is
-pinned by two unit tests next to the field in `raft/node.rs` rather than
-re-derived here. A testability knob, not operator tuning: `None`, the only
-value any shipped configuration produces, leaves openraft's defaults
-untouched.
+`RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES=10` is the knob that closes the gap (issue
+#183): it sets `snapshot_policy = LogsSinceLast(10)` **and**
+`max_in_snapshot_log_to_keep = 0` (`NodeConfig::snapshot_log_entries`) — both
+are required together, and why is pinned by two unit tests next to the field in
+`raft/node.rs` rather than re-derived here. A testability knob, not operator
+tuning: `None`, the only value any shipped configuration produces, leaves
+openraft's defaults untouched.
+
+**It lives in its own `snapshot-install.overlay.yml`, stacked only by C26 — not
+in `chaos.overlay.yml`.** That distinction was learned the expensive way. The
+knob purges the log the moment a snapshot covers it, so it changes how *any*
+lagging node catches up; `chaos.overlay.yml` backs `Cluster::up_with_chaos()`,
+which most of this tier uses, so setting it there applied it everywhere. C4 (a
+healed partition replaying parked writes), C6 (a lossy link) and C7 (a joining
+node reconciling) all went red — each is *about* a node falling behind and
+catching up, and each suddenly needed a snapshot install where it had been
+replaying the log. A knob that changes the catch-up mechanism belongs only on
+the scenario whose subject is catch-up-by-snapshot.
+
+A full-fleet restart still cannot exercise the wire path even with the knob on,
+which is why C26 also grew a lag-behind phase: it stops one follower, commits
+past the window so the leader snapshots and purges, then restarts it, leaving
+the leader no way to catch it up but `install_snapshot`. That the RPC really
+fired is asserted from `rift_cluster_snapshots_installed_total` rather than
+inferred — without it the scenario would prove only that a snapshot install
+*should* have been needed, and would stay green if a regression quietly restored
+catch-up-by-log.
 
 `c26_audit_chain_survives_a_full_cluster_restart` is the one scenario built on
 top of it: it stops one follower, commits more than 10 entries through the

@@ -4287,9 +4287,16 @@ const SNAPSHOT_CATCHUP_TIMEOUT: Duration = Duration::from_secs(90);
 #[tokio::test]
 #[ignore = "needs a container runtime"]
 async fn c26_audit_chain_survives_a_full_cluster_restart() {
-    let cluster = Cluster::up_with_overlays(&["chaos.overlay.yml", "tenancy.overlay.yml"])
-        .await
-        .expect("fleet comes up");
+    let cluster = Cluster::up_with_overlays(&[
+        "chaos.overlay.yml",
+        "tenancy.overlay.yml",
+        // Only this scenario stacks the snapshot knob. It purges the log as soon as a snapshot
+        // covers it, which changes how *every* lagging node catches up — putting it in the shared
+        // `chaos.overlay.yml` turned C4, C6 and C7 red. See that overlay's header.
+        "snapshot-install.overlay.yml",
+    ])
+    .await
+    .expect("fleet comes up");
     let leader = wait_single_leader(CONVERGE_TIMEOUT)
         .await
         .expect("a leader settles");
