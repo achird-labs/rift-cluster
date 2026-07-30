@@ -742,6 +742,84 @@ plus application auth; probe endpoints (`/readyz`, `/healthz`) are
 deliberately unauthenticated and stateless-safe, because kubelets and LBs
 don't hold credentials.
 
+## Console sessions and the fleet projection (issue #185, RFC-006 §5.2–§5.3)
+
+### `/_fleet/*` is `ClusterAdmin` — RFC-006 §12 Q3, settled
+
+The console cannot hold the cluster-port credential, so the admin port terminates a **read-only
+projection** of the operator surface: `GET /_fleet/members`, `/_fleet/health`, `/_fleet/ops/:id`.
+`/_cluster/*` on the cluster port is unchanged, and node-vs-node comparison still means asking each
+node directly.
+
+RFC-006 §12 Q3 left open whether `/_fleet/health` is in-tenant-`Viewer`-visible (tenant-filtered) or
+`ClusterAdmin`-only, noting that "topology is infrastructure, not tenant data — but 'which nodes
+exist' may itself be sensitive in some shops." **Settled: `ClusterAdmin`.** Three reasons:
+
+1. **It must not be a privilege *reduction*.** `/_cluster/*` rides the cluster port behind the HMAC
+   secret today — strictly more privileged than any tenant role. Projecting it onto the admin port
+   at a lower tier would use a convenience feature to widen access to infrastructure state, which is
+   the same shape of mistake as the `/events` decision above.
+2. **Consistency with the mapping that already exists.** `principal::map_action` routes
+   `SYSTEM_READ` — `/config`, `/metrics`, `/logs` — to `Action::ClusterAdmin`. `/_fleet/*` is that
+   category exactly: fleet-level, no per-tenant meaning. Anything lower would make `/_fleet/health`
+   *more* visible than `/config`, which reports strictly less.
+3. **Node identities and ring topology are infrastructure inventory**, which is the RFC's own worry.
+
+`Action::ClusterAdmin` is FleetAdmin-only by construction (`authz::decide`), so this means fleet
+admins exclusively — checked deliberately rather than inherited.
+
+**Consequence for the request-log screen (#189), recorded so it is not discovered late:** a
+non-FleetAdmin cannot learn the node count, so that screen shows the unqualified "this is one node's
+view" label rather than "N of M nodes". The unqualified label is still honest, which is the actual
+requirement; the count is an enhancement available to fleet admins.
+
+Unlike `/events`, this is **not** a fail-closed placeholder awaiting a capability. A tenant-filtered
+fleet view is not deferred work — there is nothing per-tenant in a ring to filter.
+
+### The session-signing key is a secret in the replicated log, deliberately
+
+A browser cannot hold the long-lived API key, so `POST /session` exchanges it once for an
+HMAC-signed cookie (`HttpOnly`, `Secure`, `SameSite=Strict`, 8-hour `Max-Age`). The key that signs
+it is a fleet-wide control-plane record, so **every node verifies from its own applied state and a
+login is not a Raft write** — only the first mint and any rotation are.
+
+That record carries an actual secret into the replicated log, which `SourcePut` and `AuditSinkPut`
+both refuse to do. The distinction is what the secret means *outside* the fleet:
+
+- those ops carry the **name** of an operator credential for a third-party system (a bucket, a
+  webhook); replicating one would spread power that exists somewhere else, so only a reference
+  travels;
+- this key is **fleet-internal and meaningless anywhere else**, and cannot be stored hashed the way
+  a principal's API key is (§3.2, argon2id), because verifying an HMAC requires the key itself — a
+  digest would make the cookie unverifiable by anyone, including us.
+
+It therefore sits inside the same trust boundary as the state directory, which already holds every
+principal's argon2 record and all committed config. Deriving it from the cluster secret instead was
+considered and rejected: that secret is optional (`--cluster-unauthenticated`), so an unauthenticated
+fleet would have nothing to derive from.
+
+**Rotation is the containment, and it is structural.** Every token carries the key record's
+`revision`; verification refuses a token whose revision is not the current one, so writing a new key
+invalidates every outstanding session at once without sweeping a table.
+
+### What the cookie does and does not prove
+
+The cookie proves **authentication only**. Every request still resolves the principal's bindings
+from local applied state, so disabling a principal or deleting a binding cuts a live session with
+§3.1 semantics — the same as for a bearer. **There is deliberately no cache over session →
+bindings**: that is the named mutant `c25_key_revocation_survives_a_partition` exists to catch, and
+adding one would reintroduce exactly the window that test closes.
+
+CSRF is `SameSite=Strict` plus a required `X-Rift-CSRF` header on cookie-authenticated mutations.
+**Bearer-authenticated requests are exempt**, because a bearer cannot be attached by a victim's
+browser — which is the entire attack.
+
+Known and accepted limits (RFC-006 §10): **no per-session server-side revocation in v1** — the
+bounds are TTL, key rotation and principal disable, and there is no session table. No OIDC/SSO in
+v1; when `AuthSource::Oidc` arrives it mints the same cookie. `POST /session` is the one moment the
+long-lived key transits the page, so it is held in component state only, never persisted, and
+dropped after the exchange.
+
 ## Explicit non-goals
 
 Recorded so the boundary cannot be oversold: no per-principal data-plane

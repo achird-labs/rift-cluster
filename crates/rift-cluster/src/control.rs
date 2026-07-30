@@ -596,7 +596,51 @@ pub enum ControlOp {
         tenant: TenantId,
         revision: u64,
     },
+    /// Mint or rotate the fleet's session-signing key (RFC-006 §5.3, issue #185).
+    ///
+    /// One key, fleet-wide, so every node verifies a console session cookie from its own applied
+    /// state without asking a peer — which is what makes a login *not* a Raft write. Only minting
+    /// and rotating are; the steady state is pure local verification.
+    ///
+    /// **This op deliberately carries a secret into the replicated log, which
+    /// [`ControlOp::SourcePut`] and [`ControlOp::AuditSinkPut`] both refuse to do.** The
+    /// distinction is what the secret means outside the fleet:
+    ///
+    /// - Those ops carry the *name* of an operator credential for a third-party system (an S3
+    ///   bucket, a webhook). Replicating one would spread a credential that has power somewhere
+    ///   else, so `validate` refuses it and only a reference travels.
+    /// - This key is fleet-internal and meaningless anywhere else. It cannot be stored hashed the
+    ///   way a principal's API key is (`argon2id`, RFC-002 §3.2), because verifying an HMAC needs
+    ///   the key itself, not a one-way digest of it — a hash would make the cookie unverifiable by
+    ///   anyone, including us.
+    ///
+    /// So it sits inside the same trust boundary as the state directory, which already holds every
+    /// principal's argon2 record and all committed config. Rotation is the containment: writing a
+    /// new key invalidates every outstanding session at once. Recorded in
+    /// `docs/architecture/08-tenancy-security.md`.
+    SessionKeyPut {
+        tenant: TenantId,
+        /// 32 random bytes, hex-encoded. Hex rather than raw so the op stays printable in a log
+        /// dump and survives JSON without a base64 alphabet decision.
+        key: String,
+    },
 }
+
+/// The fleet's session-signing key, as applied state (issue #185).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionKey {
+    /// Hex-encoded HMAC-SHA256 key.
+    pub key: String,
+    /// The revision of the [`ControlOp::SessionKeyPut`] that produced this record. Bound into every
+    /// token, so a rotation invalidates outstanding cookies by construction rather than by sweeping
+    /// a table: a cookie minted under revision N stops verifying the moment N+1 is applied.
+    pub revision: u64,
+}
+
+/// Bytes in a session-signing key. 32 is HMAC-SHA256's block-optimal size — longer buys nothing,
+/// shorter weakens it.
+pub const SESSION_KEY_BYTES: usize = 32;
 
 /// The fleet's audit export sink, as applied state (#164).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -838,7 +882,8 @@ impl ControlOp {
             | ControlOp::BindingDelete { tenant, .. }
             | ControlOp::AuditSinkPut { tenant, .. }
             | ControlOp::AuditSinkDelete { tenant }
-            | ControlOp::AuditCheckpointPut { tenant, .. } => tenant,
+            | ControlOp::AuditCheckpointPut { tenant, .. }
+            | ControlOp::SessionKeyPut { tenant, .. } => tenant,
         }
     }
 
@@ -884,6 +929,10 @@ impl ControlOp {
             // is named the same thing here as the action that gates the
             // endpoint (`authz::Action::ClusterAdmin`).
             ControlOp::AuditSinkPut { .. } | ControlOp::AuditSinkDelete { .. } => "cluster.admin",
+            // Minting or rotating the session key is a fleet-scoped security event, and rotation is
+            // how every console session is revoked at once — precisely the kind of act an auditor
+            // reading an incident timeline needs to see.
+            ControlOp::SessionKeyPut { .. } => "cluster.admin",
         })
     }
 
@@ -918,7 +967,10 @@ impl ControlOp {
             // audited) but must still answer, so it answers the same way.
             ControlOp::AuditSinkPut { .. }
             | ControlOp::AuditSinkDelete { .. }
-            | ControlOp::AuditCheckpointPut { .. } => AUDIT_RESOURCE_ALL.to_owned(),
+            | ControlOp::AuditCheckpointPut { .. }
+            // One key, fleet-wide: it addresses the whole scope, not a named object. The key itself
+            // must never reach an audit row.
+            | ControlOp::SessionKeyPut { .. } => AUDIT_RESOURCE_ALL.to_owned(),
         }
     }
 }
@@ -1277,7 +1329,44 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
         ControlOp::AuditSinkDelete { tenant } | ControlOp::AuditCheckpointPut { tenant, .. } => {
             require_fleet_scope(tenant)
         }
+        ControlOp::SessionKeyPut { tenant, key } => {
+            require_fleet_scope(tenant)?;
+            // Checked at admission rather than trusted from the caller: a short or malformed key
+            // would still verify its own tokens, so the weakness would be silent — every session
+            // would work, and only the security property would be gone.
+            let decoded =
+                hex_decode(key).ok_or_else(|| "session key must be hex-encoded".to_owned())?;
+            if decoded.len() != SESSION_KEY_BYTES {
+                return Err(format!(
+                    "session key must be exactly {SESSION_KEY_BYTES} bytes, got {}",
+                    decoded.len()
+                ));
+            }
+            Ok(())
+        }
     }
+}
+
+/// Decode a lowercase-or-uppercase hex string, or `None` if it is not hex.
+///
+/// Hand-rolled to keep a dependency out of the control plane for one 64-character string; the
+/// alternative is a crate on the Raft admission path for something this small.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    // The alphabet is checked explicitly rather than left to `from_str_radix`, which accepts a
+    // leading sign: `u8::from_str_radix("+0", 16)` is `Ok(0)`, so `"+0"` repeated 32 times is 64
+    // characters that decode to 32 zero bytes and would sail through as a valid key. That is
+    // exactly the silent weakness this validation exists to prevent — an all-zero key still signs
+    // and verifies its own tokens perfectly, so nothing would ever look wrong.
+    if !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 /// The audit-export ops address one fleet-wide sink, so the fleet scope is the
@@ -1729,7 +1818,9 @@ pub(crate) fn precondition_target(op: &ControlOp) -> Option<(&TenantId, u16)> {
         // The audit-export ops address the fleet's sink, not an imposter record.
         | ControlOp::AuditSinkPut { .. }
         | ControlOp::AuditSinkDelete { .. }
-        | ControlOp::AuditCheckpointPut { .. } => None,
+        | ControlOp::AuditCheckpointPut { .. }
+        // The session key addresses the fleet, not an imposter record.
+        | ControlOp::SessionKeyPut { .. } => None,
     }
 }
 
