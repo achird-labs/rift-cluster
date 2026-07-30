@@ -66,7 +66,11 @@ const TENANTS_PREFIX: &str = "/admin/tenants/";
 /// One classified tenancy route. Carries the tenant it addresses so that
 /// [`Route::scope`] and [`Route::action`] can both be answered without
 /// re-parsing the path — the second parse is where the two would drift.
+/// The test-only `EnumDiscriminants` derive backs the route-parity gate's variant-coverage check
+/// (issue #184) — see the note on [`crate::admin_front::Terminated`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumDiscriminants))]
+#[cfg_attr(test, strum_discriminants(derive(strum::EnumIter, Ord, PartialOrd)))]
 pub(crate) enum Route {
     /// `POST /admin/tenants`
     TenantCreate,

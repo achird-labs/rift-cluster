@@ -80,6 +80,7 @@ use uuid::Uuid;
 
 use crate::authz::{self, Action, Decision, Denial};
 use crate::cli::WriteBarrier;
+use crate::openapi;
 use crate::principal;
 use crate::tenancy;
 
@@ -346,8 +347,15 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
 }
 
 /// The config-mutating routes the front terminates. Everything else proxies.
+///
+/// The test-only `EnumDiscriminants` derive exists for the route-parity gate (issue #184): it lets
+/// `openapi::parity` prove its representative list covers every variant. Without it the compiler
+/// forces a `contract_route` arm for a new variant but not an entry in the list the parity test
+/// actually compares, so a new route could ship undocumented with every test still green.
 #[derive(Debug)]
-enum Terminated {
+#[cfg_attr(test, derive(strum::EnumDiscriminants))]
+#[cfg_attr(test, strum_discriminants(derive(strum::EnumIter, Ord, PartialOrd)))]
+pub(crate) enum Terminated {
     Create,
     ReplaceAllImposters,
     DeleteAllImposters,
@@ -431,7 +439,7 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
     }
 }
 
-fn classify(method: &Method, path: &str, query: Option<&str>) -> Option<Terminated> {
+pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Option<Terminated> {
     // The tenancy surface first: it is EE-only and terminates in full, so it
     // must never fall through to the imposter classifiers or the proxy.
     if let Some(route) = tenancy::classify(method, path, query) {
@@ -561,6 +569,29 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                         .unwrap_or_else(|response| response)
                 }
                 Err(e) => internal(&e),
+            },
+            Err(response) => response,
+        };
+    }
+
+    // `GET /openapi.json` publishes the hand-authored contract (RFC-006 §5.1, issue #184).
+    //
+    // Authenticated but **actionless**, the same posture as `/admin/whoami` above: the document
+    // describes the shape of the admin surface, so serving it to an unauthenticated scanner would
+    // hand out a map of every tenancy and audit route for free. It carries no tenant data, so it
+    // needs no action and no tenant resolution either — any authenticated principal reads the same
+    // bytes.
+    if req.method() == Method::GET && path == "/openapi.json" {
+        return match authenticate(&state, &req) {
+            Ok(_) => match openapi::contract_json() {
+                Ok(body) => {
+                    buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
+                        .unwrap_or_else(|response| response)
+                }
+                // A contract that will not parse is a broken build, and `500` is the honest answer.
+                // Answering `200` with `{}` would publish a lie to a generated client and surface
+                // as a mystery in *its* codegen rather than here.
+                Err(e) => internal(e),
             },
             Err(response) => response,
         };
