@@ -3106,3 +3106,121 @@ async fn a_datadir_loads_no_imposters_under_cluster() {
 
     server.shutdown().await;
 }
+
+/// C5 (#188): the editor's whole `If-Match` story starts from a read.
+///
+/// The write responses have always carried `Rift-Cluster-Revision`, but an editor that has not
+/// written yet holds nothing — its first save would be last-writer-wins, and the two-tabs exit
+/// criterion would be unimplementable. So the proxied single-imposter read answers the same token
+/// the write path would accept, from the same applied state the precondition is checked against.
+#[tokio::test]
+async fn the_imposter_read_hands_the_editor_its_if_match_token() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&json!({
+            "port": port,
+            "protocol": "http",
+            "stubs": [{
+                "id": "edit-me",
+                "responses": [{ "is": { "statusCode": 200, "body": "v1" } }],
+            }],
+        }))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(response.status().as_u16(), 201);
+
+    // The read answers the token, in exactly the shape the write path accepts.
+    let response = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get imposter");
+    assert_eq!(response.status().as_u16(), 200);
+    let token = response
+        .headers()
+        .get("rift-cluster-revision")
+        .expect("the single-imposter read must answer a revision to condition on")
+        .to_str()
+        .expect("header is ascii")
+        .to_owned();
+    assert!(
+        token.starts_with(&format!("default:{port}@")),
+        "ported token, same grammar as the write path emits: {token}"
+    );
+
+    // A by-id write conditioned on the read's token applies.
+    let response = client
+        .put(format!(
+            "http://{admin}/imposters/{port}/stubs/by-id/edit-me"
+        ))
+        .header("if-match", &token)
+        .json(&json!({
+            "id": "edit-me",
+            "responses": [{ "is": { "statusCode": 200, "body": "v2" } }],
+        }))
+        .send()
+        .await
+        .expect("conditioned by-id edit");
+    assert_eq!(response.status().as_u16(), 200, "fresh token applies");
+
+    // The read's token advances with the table it describes.
+    let response = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get imposter again");
+    let after = response
+        .headers()
+        .get("rift-cluster-revision")
+        .expect("revision header after the write")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    assert_ne!(
+        token, after,
+        "a committed write must advance the read's token"
+    );
+
+    // The stale token is refused and the winning edit stays won — the lost update this closes.
+    let response = client
+        .put(format!(
+            "http://{admin}/imposters/{port}/stubs/by-id/edit-me"
+        ))
+        .header("if-match", &token)
+        .json(&json!({
+            "id": "edit-me",
+            "responses": [{ "is": { "statusCode": 200, "body": "late-writer" } }],
+        }))
+        .send()
+        .await
+        .expect("stale by-id edit");
+    assert_eq!(response.status().as_u16(), 409);
+    let read: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        read["stubs"][0]["responses"][0]["is"]["body"], "v2",
+        "{read}"
+    );
+
+    // Reads of things that are not the single-imposter route stay undecorated — the token names
+    // one conditionable record, and a listing names none.
+    let response = reqwest::get(format!("http://{admin}/imposters"))
+        .await
+        .expect("get listing");
+    assert!(
+        response.headers().get("rift-cluster-revision").is_none(),
+        "the listing must not answer a token no write could accept"
+    );
+
+    server.shutdown().await;
+}

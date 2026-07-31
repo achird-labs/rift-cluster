@@ -4,3 +4,12 @@ node_modules/
 # cannot hide in a review diff.
 dist/
 *.tsbuildinfo
+
+# The wasm lint artifact (RFC-006 C5, #188), built into `public/lint/` by the release lane. Ignored
+# for the same reason `dist/` is: a committed build output can drift from the source that produced
+# it, and the drift hides in a review diff. `public/lint/README.md` stays tracked and explains it.
+public/lint/*
+!public/lint/README.md
+
+# The bundle-offline gate builds here so it cannot clobber a `pnpm build` result someone is using.
+dist-scan/

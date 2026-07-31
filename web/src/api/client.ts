@@ -29,8 +29,40 @@ export const CSRF_HEADER = "X-Rift-CSRF";
  */
 export const TENANT_HEADER = "X-Rift-Tenant";
 
-/** Per-call context the schema cannot express. Currently just the tenant the screen is showing. */
-export type RequestOptions = { tenant?: string | null | undefined };
+/**
+ * The optimistic-concurrency token the fleet stamps on a single-imposter read, and takes back as
+ * `If-Match` on the write (contract: `default:<port>@<revision>`).
+ *
+ * Reading it is the whole point of `apiGetWithRevision`: a stub write sent without it is
+ * last-writer-wins, which is the lost-update bug stated as a default.
+ */
+export const REVISION_HEADER = "Rift-Cluster-Revision";
+
+/** Per-call context the schema cannot express: the tenant in view, and the write's precondition. */
+export type RequestOptions = {
+  tenant?: string | null | undefined;
+  /**
+   * Sent as `If-Match`. Omit it and the write is unconditional — so callers that hold a token pass
+   * it, and callers that do not hold one refuse to write rather than sending nothing.
+   */
+  ifMatch?: string | null | undefined;
+};
+
+/**
+ * A body the caller has already serialized, sent verbatim.
+ *
+ * The raw-JSON stub editor saves the operator's own text. Handing that text to `JSON.stringify` as
+ * a string would send a JSON *string*; parsing and re-stringifying it would reorder keys and drop
+ * their whitespace, producing a stored stub that differs from what they typed in ways they never
+ * asked for. This is the only way to say "these exact bytes are the body".
+ */
+export class RawJsonBody {
+  readonly text: string;
+
+  constructor(text: string) {
+    this.text = text;
+  }
+}
 
 /** An admin response that was not 2xx, carrying enough to render a useful message. */
 export class ApiError extends Error {
@@ -113,6 +145,10 @@ async function request(
   if (tenant !== undefined && tenant !== null && tenant !== "") {
     headers[TENANT_HEADER] = tenant;
   }
+  const ifMatch = options?.ifMatch;
+  if (ifMatch !== undefined && ifMatch !== null && ifMatch !== "") {
+    headers["If-Match"] = ifMatch;
+  }
 
   const response = await fetch(path, {
     method,
@@ -120,7 +156,9 @@ async function request(
     // The session is an HttpOnly cookie (RFC-006 §5.3) — no script can read it, so it can only be
     // sent by asking the browser to attach it.
     credentials: "same-origin",
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    ...(body === undefined
+      ? {}
+      : { body: body instanceof RawJsonBody ? body.text : JSON.stringify(body) }),
   });
 
   const text = await response.text();
@@ -158,6 +196,32 @@ export function apiGet<T = unknown>(
   options?: RequestOptions,
 ): Promise<T> {
   return request("GET", path, undefined, options).then(({ body }) => body as T);
+}
+
+/** A read plus the optimistic-concurrency token the matching write has to quote back. */
+export type RevisionedRead<T> = {
+  data: T;
+  /** From the `Rift-Cluster-Revision` response header; `null` when the response carried none. */
+  revision: string | null;
+};
+
+/**
+ * `apiGet`, plus the revision the response was stamped with.
+ *
+ * Beside `apiGet` rather than folded into it: every existing caller wants the body and nothing else,
+ * and widening that return type would make ninety call sites pay for a token three of them use.
+ * Only the reads that feed a conditioned write need this — today, the single-imposter read whose
+ * revision becomes the stub editor's `If-Match`.
+ *
+ * A `null` revision is a real answer, not a default to paper over: it means this response carried no
+ * token, and a caller holding `null` has nothing to condition a write on.
+ */
+export async function apiGetWithRevision<T = unknown>(
+  path: ApiPath | (string & {}),
+  options?: RequestOptions,
+): Promise<RevisionedRead<T>> {
+  const { response, body } = await request("GET", path, undefined, options);
+  return { data: body as T, revision: response.headers.get(REVISION_HEADER) };
 }
 
 /**

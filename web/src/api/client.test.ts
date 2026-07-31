@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, CSRF_HEADER, TENANT_HEADER, apiGet, apiSend } from "./client.ts";
+import {
+  ApiError,
+  CSRF_HEADER,
+  REVISION_HEADER,
+  RawJsonBody,
+  TENANT_HEADER,
+  apiGet,
+  apiGetWithRevision,
+  apiSend,
+} from "./client.ts";
 
 function mockFetch(response: Response): ReturnType<typeof vi.fn> {
   const fetchMock = vi.fn().mockResolvedValue(response);
@@ -156,5 +165,58 @@ describe("a malformed 202 body still finds an op id to follow", () => {
       kind: "parked",
       opIds: ["55555555-5555-4555-8555-555555555555"],
     });
+  });
+});
+
+describe("reading the revision the write will be conditioned on", () => {
+  it("hands back the Rift-Cluster-Revision header beside the body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ port: 4545 }), {
+          status: 200,
+          headers: { [REVISION_HEADER]: "default:4545@17" },
+        }),
+      ),
+    );
+    const read = await apiGetWithRevision<{ port: number }>("/imposters/4545");
+    expect(read).toEqual({ data: { port: 4545 }, revision: "default:4545@17" });
+  });
+
+  it("reports a missing header as null rather than inventing a token", async () => {
+    // An unconditioned write is the lost-update bug. The caller has to be able to tell "I have no
+    // token" from "I have one", so absence is a value here and the editor refuses to save on it.
+    mockFetch(json({ port: 4545 }));
+    expect((await apiGetWithRevision("/imposters/4545")).revision).toBeNull();
+  });
+
+  it("still throws on a non-2xx, exactly as apiGet does", async () => {
+    mockFetch(json({ message: "gone" }, 404));
+    await expect(apiGetWithRevision("/imposters/4545")).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe("conditioning a write on a revision", () => {
+  it("sends If-Match when the caller supplies a token", () => {
+    const fetchMock = mockFetch(json({ port: 4545 }));
+    void apiSend("PUT", "/imposters/4545/stubs/by-id/s-1", {}, { ifMatch: "default:4545@17" });
+    expect(headersOf(fetchMock)["If-Match"]).toBe("default:4545@17");
+  });
+
+  it("omits If-Match entirely when there is no token", () => {
+    const fetchMock = mockFetch(json({ port: 4545 }));
+    void apiSend("PUT", "/imposters/4545/stubs/by-id/s-1", {});
+    expect("If-Match" in headersOf(fetchMock)).toBe(false);
+  });
+
+  it("sends a raw body byte for byte instead of reserializing it", async () => {
+    // The raw-JSON editor saves the operator's own text. Round-tripping it through
+    // `JSON.parse`/`JSON.stringify` would reorder keys and drop their formatting — a diff against
+    // the stored stub that the operator never made.
+    const fetchMock = mockFetch(json({ port: 4545 }));
+    const text = '{\n  "id": "s-1",\n  "space": "a"\n}';
+    await apiSend("PUT", "/imposters/4545/stubs/by-id/s-1", new RawJsonBody(text));
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).body).toBe(text);
+    expect(headersOf(fetchMock)["Content-Type"]).toBe("application/json");
   });
 });

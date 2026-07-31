@@ -1206,6 +1206,15 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// The stored revision of `tenant`'s imposter on `port`, or `None` when
+    /// applied state holds no such record — the read half of the
+    /// single-imposter `If-Match` contract (C5, issue #188).
+    pub fn imposter_revision(&self, tenant: &str, port: u16) -> Result<Option<u64>, NodeError> {
+        self.sm_reader
+            .imposter_revision(tenant, port)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// Block until this node's leadership differs from `was_leader`, or until
     /// `timeout` elapses; return its leadership as of the moment this returns.
     ///

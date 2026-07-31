@@ -1054,6 +1054,44 @@ impl RedbStateMachine {
         Ok((RouteTable { routes }, revision))
     }
 
+    /// The stored revision of one imposter, or `None` when the applied state
+    /// holds no record for `(tenant, port)`.
+    ///
+    /// This is the read half of the single-imposter `If-Match` contract (C5,
+    /// issue #188): the front stamps it onto the proxied imposter read so an
+    /// editor holds a conditionable token *before* its first write. It reads
+    /// the same `sm_configs` row `check_expected_revision` compares against —
+    /// a token minted anywhere else could disagree with the precondition that
+    /// will judge it.
+    ///
+    /// A record that will not parse reads as `None` rather than an error: the
+    /// read itself (served by the engine) still succeeds, and answering it
+    /// with no token merely leaves that imposter unconditionable — the same
+    /// posture `stored_imposter` takes for provenance.
+    #[allow(clippy::result_large_err)]
+    pub fn imposter_revision(&self, tenant: &str, port: u16) -> StorageResult<Option<u64>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let Some(guard) = table
+            .get((tenant, port))
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<StoredImposter>(guard.value()) {
+            Ok(stored) => Ok(Some(stored.revision)),
+            Err(e) => {
+                tracing::error!(tenant, port, error = %e, "corrupt stored imposter; read carries no revision token");
+                Ok(None)
+            }
+        }
+    }
+
     /// Every declared source for `tenant`, id-ascending (issue #134).
     ///
     /// Like [`Self::read_config`], this answers from local applied state with no

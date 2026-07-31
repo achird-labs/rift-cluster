@@ -22,6 +22,22 @@ export const lifecyclePath = (port: number, enabled: boolean): string =>
   `/imposters/${port}/${enabled ? "enable" : "disable"}`;
 export const requestsPath = (port: number): string => `/imposters/${port}/requests`;
 
+/** The stub collection. `POST` here appends a stub; it takes `If-Match` like the by-id writes do. */
+export const stubsPath = (port: number): string => `/imposters/${port}/stubs`;
+
+/**
+ * One stub, addressed by its stable id — the **only** way this console writes a stub.
+ *
+ * The contract also publishes `/imposters/{port}/stubs/{stubIndex}`, and it is deliberately not
+ * built here. An index is a position, not an address: a concurrent edit that inserts or removes a
+ * stub shifts every index after it, so an index-addressed write racing that edit silently replaces
+ * a *different* stub — with a `200` and no way to notice. The by-id routes commit a `PatchStubs`
+ * edit carrying only the touched stub, so they are unaffected. `contract-traceability.test.ts`
+ * asserts no index-addressed stub route appears anywhere in `web/src`.
+ */
+export const stubByIdPath = (port: number, stubId: string): string =>
+  `/imposters/${port}/stubs/by-id/${encodeURIComponent(stubId)}`;
+
 /**
  * The poll target for a write that answered `202` (parked). Fleet-scoped, so a caller without
  * fleet-admin sees a 404 here whatever the write actually did — see `features/writes/commit.ts`.

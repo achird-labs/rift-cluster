@@ -777,6 +777,32 @@ mod tests {
             .unwrap_or_else(|| panic!("dangling parameter $ref {reference}"))
     }
 
+    /// C5 (#188): the single-imposter read is where an editor gets its `If-Match` token, so the
+    /// contract must say the header is there — a client generated without it has no typed way to
+    /// reach the one value the whole conditional-write flow starts from.
+    #[test]
+    fn the_single_imposter_read_declares_the_revision_header() {
+        let doc = parsed();
+        let headers = doc
+            .get("paths")
+            .and_then(|p| p.get("/imposters/{port}"))
+            .and_then(|p| p.get("get"))
+            .and_then(|g| g.get("responses"))
+            .and_then(|r| r.get("200"))
+            .and_then(|r| r.get("headers"))
+            .and_then(serde_json::Value::as_object)
+            .expect("getImposter 200 declares response headers");
+        let reference = headers
+            .get("Rift-Cluster-Revision")
+            .and_then(|h| h.get("$ref"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(
+            reference,
+            Some("#/components/headers/RiftClusterRevision"),
+            "the read's token must be the same component the write responses declare"
+        );
+    }
+
     fn journal_read_200<'a>(doc: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
         doc.get("paths")
             .and_then(|p| p.get(path))

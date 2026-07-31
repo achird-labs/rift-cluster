@@ -1,0 +1,36 @@
+# `rift-lint` compiled to wasm for the web console's advisory lint pane (RFC-006 §12 Q1, #188).
+#
+# **Its own workspace, on purpose.** The root workspace lists its members explicitly and has no
+# `default-members` mechanism, so there is no way to be a member and be skipped by a plain
+# `cargo build --workspace`. Being a member would put `wasm-bindgen` into every CI lane's
+# dependency graph and — worse — make `cargo build --workspace --all-targets` try to link a
+# `cdylib` that only means anything on `wasm32-unknown-unknown`. So the root manifest `exclude`s
+# this directory and this manifest opens an empty `[workspace]` of its own. Nothing about the
+# cluster build sees it; it is built by one step in the release lane and nowhere else.
+[workspace]
+
+[package]
+name = "rift-lint-wasm"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+# `cdylib` is what `wasm-bindgen` needs; there is no reason for anything Rust-side to link this.
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+serde_json = "1.0"
+# `default-features = false` drops the `cli` feature, and with it `clap` — the one part of the
+# tree that has no business in a browser. The `javascript` feature (boa_engine) stays off too;
+# `validator.rs` already has a no-op fallback for it, which is what made RFC-006 §12 Q1's answer
+# "yes" rather than "only if the JS validator is stubbed out".
+rift-lint = { path = "../../vendor/rift/crates/rift-lint", default-features = false }
+
+[profile.release]
+# The artifact is embedded in the console bundle and shipped to a browser; size is the axis that
+# matters, not the last few percent of lint throughput.
+opt-level = "s"
+lto = true

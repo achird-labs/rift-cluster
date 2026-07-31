@@ -48,9 +48,10 @@ describe("imposter detail", () => {
     expect(screen.getByTestId("detail-stubs").textContent).toBe("2");
   });
 
-  it("lists stubs read-only, and never invents an id for one that has none", async () => {
-    // C5 (#188) turns these rows into an editor. Until then a stub without a Rift id is shown as
-    // having none rather than being labelled by its position, which is not an address.
+  it("lists stubs, and never invents an id for one that has none", async () => {
+    // A stub without a Rift id is shown as having none rather than being labelled by its position,
+    // which is not an address — C5 (#188) is why that distinction now has teeth: the write controls
+    // are offered per id, and a stub without one gets them inert (see `stub-editor.test.tsx`).
     stubFetch({ "/imposters/4545": { json: IMPOSTER } });
     renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
 
@@ -59,6 +60,13 @@ describe("imposter detail", () => {
     expect(screen.getByTestId("stub-row-0").textContent).toContain("/users/:id");
     expect(screen.getByTestId("stub-row-1").textContent).toContain("—");
     expect(screen.getByTestId("stub-row-1").textContent).toContain("checkout");
+  });
+
+  it("offers a viewer no write control at all", async () => {
+    stubFetch({ "/imposters/4545": { json: IMPOSTER } });
+    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("viewer") });
+
+    await screen.findByTestId("stub-row-0");
     expect(screen.queryByRole("button")).toBeNull();
   });
 

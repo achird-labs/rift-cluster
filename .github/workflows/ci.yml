@@ -31,6 +31,17 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # The wasm lint crate is workspace-excluded so no default lane needs the wasm target — which
+      # would also mean nothing notices it breaking until a release builds it. Exercise it here:
+      # host tests pin the linting contract, the target check pins the ABI compile.
+      - name: Lint-wasm crate (host tests)
+        run: cargo test --manifest-path crates/rift-lint-wasm/Cargo.toml
+
+      - name: Lint-wasm crate (wasm target check)
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --manifest-path crates/rift-lint-wasm/Cargo.toml --target wasm32-unknown-unknown
+
       # Guards one invariant the compiler cannot: exactly one copy of
       # `prometheus` in the tree. Two copies means two global registries, and
       # cluster metrics that silently never reach /metrics.
