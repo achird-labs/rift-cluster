@@ -176,6 +176,127 @@ describe("attacker-influenced payloads (RFC-006 §9.1)", () => {
   });
 });
 
+describe("why did this request not match (#208)", () => {
+  // The question the screen exists to answer. Until the engine recorded an outcome per journal
+  // entry it could not be answered here at all: the per-stub detail lived only on the
+  // `X-Rift-Debug` response path, which is a different request judged against whatever the stubs
+  // have since become.
+  it("names every stub that was tried and the predicate that rejected it", async () => {
+    const unmatched = recorded({
+      matchOutcome: {
+        matched: false,
+        tried: [
+          { stubIndex: 0, stubId: "payments", why: { reason: "failedPredicate", predicateIndex: 1 } },
+          { stubIndex: 1, why: { reason: "skippedScenarioState" } },
+        ],
+        triedOmitted: 3,
+      },
+    });
+    stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [unmatched] } });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
+    await userEvent.setup().click(screen.getByTestId("request-open"));
+
+    const diagnostics = await screen.findByTestId("request-diagnostics");
+    expect(diagnostics.textContent).toContain('stub "payments"');
+    expect(diagnostics.textContent).toContain("predicate 1 did not match");
+    expect(diagnostics.textContent).toContain("stub #1");
+    expect(diagnostics.textContent).toContain("scenario state did not match");
+    // A silently truncated list would make "these are the stubs that were tried" false with
+    // nothing on screen to say so.
+    expect(diagnostics.textContent).toContain("3 more");
+  });
+
+  it("names the stub that served a matched request", async () => {
+    stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: {
+        json: [recorded({ matchOutcome: { matched: true, stubIndex: 2, stubId: "payments" } })],
+      },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
+    await userEvent.setup().click(screen.getByTestId("request-open"));
+
+    const diagnostics = await screen.findByTestId("request-diagnostics");
+    expect(diagnostics.textContent).toMatch(/matched/i);
+    expect(diagnostics.textContent).toContain('stub "payments"');
+  });
+
+  // The schema states this in bold: absence means *no outcome was recorded* — an entry from an
+  // engine predating the field, an `X-Rift-Debug` request, or a matcher error — never "did not
+  // match". Rendering it as a miss would tell an operator their stub was rejected when nothing
+  // ever judged it.
+  it("says nothing was recorded rather than claiming the request did not match", async () => {
+    stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
+    await userEvent.setup().click(screen.getByTestId("request-open"));
+
+    const diagnostics = await screen.findByTestId("request-diagnostics");
+    expect(diagnostics.textContent).toMatch(/no match diagnostics recorded/i);
+    expect(diagnostics.textContent).not.toMatch(/did not match/i);
+    expect(diagnostics.textContent).not.toMatch(/nothing matched/i);
+  });
+
+  // A shape the console cannot read is not an entry with no outcome: one says the node answered
+  // with something wrong, the other says nothing was recorded.
+  it("calls an outcome it cannot read unreadable rather than absent", async () => {
+    stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: "yes" } })] },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
+    await userEvent.setup().click(screen.getByTestId("request-open"));
+
+    const diagnostics = await screen.findByTestId("request-diagnostics");
+    expect(diagnostics.textContent).toMatch(/unreadable/i);
+    expect(diagnostics.textContent).not.toMatch(/no match diagnostics recorded/i);
+  });
+
+  // A stub id is operator-authored and reaches this screen through the journal, so it belongs to
+  // the same attacker-influenced surface as the path and the body (RFC-006 §9.1).
+  it("renders a script tag in a stub id as text", async () => {
+    stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: {
+        json: [
+          recorded({
+            matchOutcome: {
+              matched: false,
+              tried: [
+                {
+                  stubIndex: 0,
+                  stubId: "<script>alert('stub')</script>",
+                  why: { reason: "<img src=x onerror=\"alert(1)\">" },
+                },
+              ],
+            },
+          }),
+        ],
+      },
+    });
+    const { container } = renderInApp(<RequestLog port={PORT} />, {
+      whoami: whoamiWith("fleet-admin"),
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
+    await userEvent.setup().click(screen.getByTestId("request-open"));
+    await screen.findByTestId("request-diagnostics");
+
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("img")).toBeNull();
+    // Escaping that also hides the evidence is not a fix — the operator still needs to read the id.
+    expect(container.textContent).toContain("<script>alert('stub')</script>");
+    expect(container.textContent).toContain('<img src=x onerror="alert(1)">');
+  });
+});
+
 describe("the header shapes the engine actually emits", () => {
   // `multi_value_headers::serialize` emits a scalar for one value and an array only for many, and
   // its deserializer tolerates JSON numbers because real recordings carry `"Content-Length": 124`.

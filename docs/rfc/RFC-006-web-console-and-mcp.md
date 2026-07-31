@@ -547,15 +547,35 @@ C1–C3 are strictly ordered; C4+ and M1+ parallelize.
    framing directly; the tool layer above it is transport-agnostic either way.
    Verify at M1.
 6. **Match diagnostics are not on the request-log endpoint.** *Raised by C6
-   (#189).* `GET /imposters/:port/requests` serves `RecordedRequest`
+   (#189). **Resolved by #208**, engine-side and console-side.* As raised: `GET
+   /imposters/:port/requests` served `RecordedRequest`
    (`rift-mock-core/src/imposter/types.rs`) — method, path, query, headers,
    body, timestamp — and no match information. The per-stub "which predicate
-   rejected this" detail lives in `DebugResponse`/`DebugMatchResult`, which is
+   rejected this" detail lived in `DebugResponse`/`DebugMatchResult`, which is
    the `X-Rift-Debug` per-request path, not the journal. So "why did my system
-   under test get a 404" — the reason an operator opens this screen — cannot be
-   answered from the journal today. Per §3 rule 2 this is an **API feature**,
-   not a UI scrape: C6 ships without the diagnostics panel rather than
+   under test get a 404" — the reason an operator opens this screen — could not
+   be answered from the journal. Per §3 rule 2 that made it an **API feature**,
+   not a UI scrape: C6 shipped without the diagnostics panel rather than
    reconstructing it client-side from data the endpoint does not carry.
+
+   The engine now records a `MatchOutcome` on each journal entry at request
+   time — from the matcher's own visit order, because a post-hoc re-evaluation
+   would judge against whatever the stubs have since become — and the contract
+   carries it as `MatchOutcome`/`TriedStub`/`TriedWhy` on `RecordedRequest`.
+   `tried` lists only the candidates the matcher **visited**, capped at 25 with
+   the remainder counted in `triedOmitted` rather than silently truncated;
+   index-pruned stubs are never visited and are never listed, so the list means
+   "what was tried" and nothing more.
+
+   Console-side the panel is `web/src/features/requests/diagnostics.ts` (pure
+   presenter) rendered by the request log's expanded row. Two sentences that
+   look alike stay distinct there, and both are tested: an **absent** outcome is
+   "no diagnostics recorded" — an entry from an older engine, an `X-Rift-Debug`
+   request, or a matcher error — and never "did not match"; an outcome in a
+   shape the console cannot read is "unreadable", which says the node answered
+   with something wrong rather than that nothing was recorded. An unrecognised
+   `reason` is shown as the engine spelled it rather than dropped, so a newer
+   gate cannot make the panel under-report what was tried.
 7. **The front-door route table has no read-side precondition.** *Raised by C6
    (#189). **Closed server-side by #210.*** As raised: `If-Match` was
    restricted to single-imposter operations (`admin_front.rs`) and `GET

@@ -4,6 +4,8 @@ import { ApiError } from "../api/client.ts";
 import type { FleetReadState } from "../app/fleetView.ts";
 import { useFleetView, useImposters, useRequestLog } from "../app/queries.ts";
 import { Ident, Truncated } from "../components/primitives.tsx";
+import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
+import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
 import { coverageFor, describeCoverage, headerValues, page } from "../features/requests/source.ts";
 
@@ -203,9 +205,112 @@ function Row({ request }: { request: RecordedRequest }): ReactNode {
                 </dd>
               </div>
             </dl>
+            <Diagnostics outcome={request.matchOutcome} />
           </td>
         </tr>
       ) : null}
+    </>
+  );
+}
+
+/**
+ * Why this request was served by the stub it was — or by nothing (#208).
+ *
+ * The reason an operator opens this screen. Every sentence comes from `describeOutcome`, which is
+ * also where the two distinctions that make the panel honest are enforced: an absent outcome is
+ * *not* a failed match, and an unreadable one is *not* an absent one.
+ */
+function Diagnostics({ outcome }: { outcome: MatchOutcome | undefined }): ReactNode {
+  const view = describeOutcome(outcome);
+  return (
+    <section className="diagnostics" data-testid="request-diagnostics">
+      <h3>Match</h3>
+      <Verdict view={view} />
+      {view.kind === "matched" || view.kind === "unmatched" ? (
+        <TriedList view={view} />
+      ) : null}
+    </section>
+  );
+}
+
+function Verdict({ view }: { view: OutcomeView }): ReactNode {
+  switch (view.kind) {
+    case "none":
+      /*
+       * Deliberately never the words "did not match". The schema says absence means *no outcome
+       * was recorded*, and the three causes named here are all of them — so the sentence states
+       * the absence and the hint states what can cause it, rather than inventing a verdict for an
+       * entry nothing judged.
+       */
+      return (
+        <p className="muted" data-testid="request-diagnostics-none">
+          No match diagnostics recorded for this request. Nothing here says which stubs were
+          considered: an entry recorded by an engine older than this field, a request that took the{" "}
+          <code>X-Rift-Debug</code> path, and a matcher error all arrive without an outcome.
+        </p>
+      );
+    case "unreadable":
+      // A different sentence from "none" on purpose: this one says the node answered with
+      // something wrong, which is a fault to chase rather than a routine gap.
+      return (
+        <p className="warn-text" data-testid="request-diagnostics-unreadable" role="status">
+          Match diagnostics unreadable — this node recorded an outcome in a shape this console does
+          not recognise. Nothing here says whether the request matched.
+        </p>
+      );
+    case "matched":
+      return <p data-testid="request-diagnostics-verdict">Matched: served by {view.label}.</p>;
+    case "unmatched":
+      return (
+        <p data-testid="request-diagnostics-verdict">
+          Nothing matched this request.
+          {view.tried.length === 0
+            ? " No candidate was visited — every stub was ruled out before it was evaluated."
+            : null}
+        </p>
+      );
+  }
+}
+
+/**
+ * The candidates the matcher actually visited, in visit order.
+ *
+ * On a miss these are the stubs that were tried and why each fell out. On a hit they are the ones
+ * passed over *before* the winner — which is how an operator sees that the stub they expected to
+ * serve the request was visited and rejected, rather than never reached.
+ */
+function TriedList({
+  view,
+}: {
+  view: Extract<OutcomeView, { kind: "matched" | "unmatched" }>;
+}): ReactNode {
+  if (view.tried.length === 0 && view.omitted === 0) return null;
+  return (
+    <>
+      {view.tried.length === 0 ? null : (
+        <>
+          <p className="muted">
+            {view.kind === "matched" ? "Passed over before the winner:" : "Candidates tried:"}
+          </p>
+          <ul className="plain" data-testid="request-tried">
+            {view.tried.map((tried, index) => (
+              // Keyed by position: this list is a visit order, and two candidates can carry the
+              // same label when neither stub declares an id.
+              <li key={`${index}`}>
+                {tried.label} — {tried.why}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {view.omitted === 0 ? null : (
+        // The engine caps `tried` and counts the rest. Dropping the count would make "these are
+        // the stubs that were tried" false with nothing on screen to say so.
+        <p className="muted" data-testid="request-tried-omitted">
+          {view.omitted} more {view.omitted === 1 ? "candidate was" : "candidates were"} visited and
+          are not shown.
+        </p>
+      )}
     </>
   );
 }

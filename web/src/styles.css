@@ -449,3 +449,35 @@ button[disabled] {
   max-height: 16rem;
   overflow: auto;
 }
+
+/* --- match diagnostics (#208) ------------------------------------------ */
+
+/*
+ * The panel the request log exists for: why this request was served by the stub it was, or by
+ * nothing. It sits inside an expanded row, so it is separated by a rule rather than by a card —
+ * a boxed panel inside a table row reads as a second table.
+ */
+.diagnostics {
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
+  max-width: 60rem;
+}
+
+.diagnostics h3 {
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 0 0 0.5rem;
+}
+
+.diagnostics p {
+  margin: 0 0 0.5rem;
+}
+
+/* One visited candidate per line, at the density the rest of an expanded row uses. */
+.diagnostics ul {
+  margin: 0 0 0.5rem;
+  padding-left: 1.25rem;
+  font-size: 0.875rem;
+}

@@ -912,6 +912,30 @@ mod tests {
              is the only value the engine can emit"
         );
 
+        // The diagnostics the request log answers "why did this 404" from (#208). Optional — an
+        // entry without an outcome predates the field or never had one recorded — but the chain
+        // must stay declared: matchOutcome -> MatchOutcome -> TriedStub -> TriedWhy, or the
+        // generated client loses the panel's whole type.
+        assert_eq!(
+            properties
+                .get("matchOutcome")
+                .and_then(|m| m.get("$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/MatchOutcome"),
+            "matchOutcome must reference the shared component"
+        );
+        // Optionality needs no separate assertion: the exact-set equality on `required` above
+        // already refuses a future edit that promotes it.
+        for component in ["MatchOutcome", "TriedStub", "TriedWhy"] {
+            assert!(
+                doc.get("components")
+                    .and_then(|c| c.get("schemas"))
+                    .and_then(|s| s.get(component))
+                    .is_some(),
+                "components.schemas.{component} is missing"
+            );
+        }
+
         // The bare-string case is the one a naive `array of string` schema gets wrong, and it is
         // also the common case — every single-valued header takes it.
         let header_values = properties
