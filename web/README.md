@@ -78,6 +78,25 @@ Six modules carry the decisions worth knowing before changing anything:
   journal in one body. Closing that needs the server's `?since=` cursor and
   `x-rift-next-index` header, which is the same seam #147 D widens, so paging is
   expressed as a `Cursor` rather than an array slice inlined in the screen.
+- **`features/requests/diagnostics.ts`** — why a recorded request was served by
+  the stub it was, or by nothing (#208). A pure presenter: `describeOutcome`
+  turns the journal's `matchOutcome` into sentences and `RequestLog.tsx` only
+  places them.
+
+  Three states that look alike stay apart. An **absent** outcome is "no
+  diagnostics recorded" — an entry from an engine predating the field, an
+  `X-Rift-Debug` request, or a matcher error — and never "did not match", which
+  would tell an operator their stub was rejected when nothing judged it. An
+  outcome in a shape the console cannot read is **unreadable**, which says the
+  node answered with something wrong rather than that nothing was recorded. And
+  an unrecognised `reason` from a newer engine is shown as the engine spelled it
+  rather than dropped, because dropping it would under-report what was tried —
+  the one claim the panel makes.
+
+  Typed from the contract and validated anyway: `apiGet` asserts response shapes
+  rather than checking them, and this one is recorded from whatever called the
+  mock, so every unexpected shape lands on `unreadable` instead of throwing
+  inside the screen an operator opened to diagnose something else.
 - **`features/routes/order.ts`** — `effectiveOrder` and `validateTable`, ported
   from `vendor/rift/.../front_door/route_table.rs`. Ported rather than fetched
   because there is no endpoint that answers either question about a draft that

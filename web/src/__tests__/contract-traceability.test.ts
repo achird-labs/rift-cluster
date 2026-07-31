@@ -106,6 +106,23 @@ describe("every displayed field is traceable to the contract", () => {
     expect(declares("RecordedRequest", "_mode")).toBe(true);
   });
 
+  it("declares the match-diagnostics fields the request log renders (#208)", () => {
+    // The panel reads four fields off a schema'd component rather than off the index signature. If
+    // the contract ever regenerated without them, `describeOutcome` would keep compiling — its
+    // input is validated at runtime, not by `tsc` — and every entry would render as "no match
+    // diagnostics recorded", which is the one sentence this feature exists to stop being a lie.
+    expect(declares("RecordedRequest", "matchOutcome")).toBe(true);
+    for (const field of ["matched", "stubIndex", "stubId", "tried", "triedOmitted"]) {
+      expect([field, declares("MatchOutcome", field)]).toEqual([field, true]);
+    }
+    for (const field of ["stubIndex", "stubId", "why"]) {
+      expect([field, declares("TriedStub", field)]).toEqual([field, true]);
+    }
+    for (const field of ["reason", "predicateIndex"]) {
+      expect([field, declares("TriedWhy", field)]).toEqual([field, true]);
+    }
+  });
+
   it("renders no field the prototype invented but the contract does not carry", () => {
     // `numberOfRequests` drove the prototype's one chart. It is not a declared `Imposter` property —
     // it would arrive only through the index signature — so C4 does not render it. This test is the

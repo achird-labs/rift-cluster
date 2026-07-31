@@ -1005,6 +1005,37 @@ export interface components {
              * @description RFC 3339, as produced by the engine's `Utc::now().to_rfc3339()`.
              */
             timestamp: string;
+            matchOutcome?: components["schemas"]["MatchOutcome"];
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description Why this request was served by the stub it was — or by nothing (upstream rift#909, issue #208). Recorded at request time from the matcher's own visit order; a post-hoc re-evaluation would judge against whatever the stubs have since become. **Absent means no outcome was recorded** (an entry from an engine predating the field, an `X-Rift-Debug` request, or a matcher error) — never "did not match". */
+        MatchOutcome: {
+            matched: boolean;
+            /** @description Position of the winning stub in the imposter's stub list; absent when nothing matched. */
+            stubIndex?: number;
+            /** @description The winning stub's `id`, when it declares one. */
+            stubId?: string;
+            /** @description The candidates the matcher actually visited and did not serve, in visit order. Index-pruned stubs are never visited and never listed — this is what was *tried*, which is the honest answer. Capped; see `triedOmitted`. */
+            tried?: components["schemas"]["TriedStub"][];
+            /** @description Candidates visited past the cap (25) and therefore not named in `tried`. Counted rather than silently truncated. Absent means zero. */
+            triedOmitted?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        TriedStub: {
+            stubIndex: number;
+            stubId?: string;
+            why: components["schemas"]["TriedWhy"];
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description Why a visited candidate did not win. Adjacently tagged so every variant is one flat object under the same `reason` key — `{"reason":"skippedSpace"}`, `{"reason":"skippedScenarioState"}`, or `{"reason":"failedPredicate","predicateIndex":1}`. `predicateIndex` is the position in the stub's own `predicates` array of the first predicate that rejected the request; a consumer renders the predicate itself from the stub config rather than the journal carrying a copy. */
+        TriedWhy: {
+            /** @enum {string} */
+            reason: "skippedSpace" | "skippedScenarioState" | "failedPredicate";
+            /** @description Present only when `reason` is `failedPredicate`. */
+            predicateIndex?: number;
         } & {
             [key: string]: unknown;
         };
