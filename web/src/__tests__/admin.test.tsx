@@ -317,6 +317,40 @@ describe("principals: disable is not a soft delete", () => {
   });
 });
 
+describe("ids a URL path cannot address", () => {
+  // `#` and `?` truncate the path, so `alice#bob` addresses `alice` — and if a principal `alice`
+  // exists in the tenant, "Delete alice#bob" would silently delete the wrong record. The server
+  // matches raw paths by design, so encoding is not available as a fix; refusing to offer the
+  // action is.
+  it("offers no write control for a principal whose id would truncate the path", async () => {
+    stubFetch({
+      [ACME_PRINCIPALS]: {
+        json: [
+          { id: "alice", displayName: "alice", auth: "apiKey", disabled: false, role: "viewer" },
+          {
+            id: "alice#bob",
+            displayName: "hashed",
+            auth: "oidc",
+            disabled: false,
+            role: "viewer",
+          },
+        ],
+      },
+      [TENANTS]: { json: TENANT_ROWS },
+    });
+    renderInApp(<Admin tab="principals" tenant="acme" />, {
+      whoami: whoamiWith("fleet-admin", ["acme"]),
+      tenant: "acme",
+    });
+    await waitFor(() => expect(screen.getAllByTestId("principal-row").length).toBe(2));
+
+    expect(screen.getByTestId("principal-unaddressable")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /delete hashed/i })).toBeNull();
+    // The addressable one is unaffected.
+    expect(screen.getByRole("button", { name: /delete alice/i })).toBeTruthy();
+  });
+});
+
 describe("bindings", () => {
   it("does not offer fleet-admin in a tenant's role picker", async () => {
     stubFetch({ [ACME_PRINCIPALS]: { json: PRINCIPAL_ROWS }, [TENANTS]: { json: TENANT_ROWS } });
@@ -450,14 +484,17 @@ describe("audit viewer", () => {
     expect(screen.getByTestId("audit-row-2").textContent).toContain("quota exceeded");
   });
 
-  it("pages with since taken from the highest revision seen", async () => {
+  it("pages with since one past the highest revision, because since is inclusive", async () => {
     const calls: string[] = [];
+    // A FULL first page — a short page is the end of the journal and correctly retires the pager,
+    // so a two-row fixture could never exercise paging at all.
+    const firstPage = Array.from({ length: 100 }, (_, i) => auditRow(i + 1));
     vi.stubGlobal(
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
         const path = typeof input === "string" ? input : input.toString();
         calls.push(path);
-        const body = path.includes("since=0") ? [auditRow(1), auditRow(4)] : [auditRow(9)];
+        const body = path.includes("since=0") ? firstPage : [auditRow(200)];
         return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
       }),
     );
@@ -465,12 +502,25 @@ describe("audit viewer", () => {
       whoami: whoamiWith("tenant-admin", ["acme"]),
       tenant: "acme",
     });
-    await waitFor(() => expect(screen.getAllByTestId("audit-row").length).toBe(2));
+    await waitFor(() => expect(screen.getAllByTestId("audit-row").length).toBe(100));
 
-    // `since` is inclusive, so the cursor is one past the page's highest revision (4) — asking for
-    // `since=4` would re-serve that row.
+    // Highest revision on the page is 100, so the next request must ask for 101 — `since=100` would
+    // re-serve the row the page ended on.
     await userEvent.setup().click(screen.getByTestId("audit-next"));
-    await waitFor(() => expect(calls.some((p) => p.includes("since=5"))).toBe(true));
+    await waitFor(() => expect(calls.some((p) => p.includes("since=101"))).toBe(true));
+  });
+
+  // Gating on the cursor alone left this live forever: clicking past the end rendered an empty
+  // table under a header, which reads as "the trail stops here".
+  it("retires the pager on a short final page", async () => {
+    stubFetch({ [AUDIT]: { json: [auditRow(1), auditRow(2)] } });
+    renderInApp(<Admin tab="audit" tenant="acme" />, {
+      whoami: whoamiWith("tenant-admin", ["acme"]),
+      tenant: "acme",
+    });
+
+    await waitFor(() => expect(screen.getAllByTestId("audit-row").length).toBe(2));
+    expect((screen.getByTestId("audit-next") as HTMLButtonElement).disabled).toBe(true);
   });
 
   // `resource` and `principal` are attacker-influenceable — a port or id an attacker chose.
@@ -499,6 +549,24 @@ describe("audit viewer", () => {
 });
 
 describe("visibility is whoami-driven, but is never the guard (RFC-006 §3 rule 3)", () => {
+  // `TenantList` is fleet-scoped `ClusterAdmin`, so this read is a permanent 404 for a tenant-admin.
+  // Asking anyway turned their Administration landing into a red error refreshing every 5s — the
+  // failure the `cluster.admin` capability was added to prevent, one layer up from the buttons.
+  it("does not ask for the fleet-scoped tenant list as a tenant-admin", async () => {
+    const { calls } = stubFetch({
+      [TENANTS]: { json: TENANT_ROWS },
+      [ACME_PRINCIPALS]: { json: PRINCIPAL_ROWS },
+    });
+    renderInApp(<Admin tab="tenants" tenant={null} />, {
+      whoami: whoamiWith("tenant-admin", ["acme"]),
+      tenant: "acme",
+    });
+
+    await screen.findByTestId("admin-screen");
+    expect(calls).not.toContain(TENANTS);
+    expect(screen.queryByRole("button", { name: /create tenant/i })).toBeNull();
+  });
+
   it("offers a viewer no tenant-management controls", async () => {
     stubFetch({ [TENANTS]: { json: TENANT_ROWS }, [ACME_PRINCIPALS]: { json: PRINCIPAL_ROWS } });
     renderInApp(<Admin tab="tenants" tenant="acme" />, {

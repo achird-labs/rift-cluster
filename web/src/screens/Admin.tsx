@@ -1,6 +1,7 @@
 import { type FormEvent, type ReactNode, useState } from "react";
 
 import { ApiError } from "../api/client.ts";
+import { isAddressablePrincipalId } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
 import type { AdminTab } from "../app/routing.ts";
 import { toHash } from "../app/routing.ts";
@@ -17,10 +18,11 @@ import {
   useSaveTenant,
   useTenantProbe,
   useTenants,
+  AUDIT_PAGE_SIZE,
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { ErrorNote, Ident, Status, UNKNOWN } from "../components/primitives.tsx";
-import { failureReason, isApplied, nextSince } from "../features/admin/audit.ts";
+import { failureReason, hasMorePages, isApplied, nextSince } from "../features/admin/audit.ts";
 import { KEY_NOT_SHOWN_AGAIN } from "../features/admin/key.ts";
 import { assignableRoles } from "../features/admin/roles.ts";
 
@@ -157,7 +159,9 @@ function TenantsTab(): ReactNode {
   // fleet-admin — `tenant.manage` would draw a tenant-admin a list and a create button that
   // answer 404 and 400 respectively, every time.
   const mayManage = can("cluster.admin");
-  const tenants = useTenants();
+  // `TenantList` is fleet-scoped `ClusterAdmin`, so for anyone below fleet-admin this read is a
+  // permanent 404 — asking anyway makes their Administration landing a red error on a 5s loop.
+  const tenants = useTenants({ enabled: mayManage });
   const save = useSaveTenant();
   const del = useDeleteTenant();
   const create = useCreateTenant();
@@ -320,18 +324,27 @@ function TenantEditRow({
     const bad = fields.filter(([, raw]) => parseWholeNumber(raw) === null).map(([label]) => label);
     setInvalid(bad);
     if (bad.length > 0) return;
+    const parsed = fields.map(([, raw]) => parseWholeNumber(raw) ?? 0) as [
+      number,
+      number,
+      number,
+      number,
+    ];
 
     onSave({
       id: tenant.id,
       displayName,
       // `journalRetentionSecs` sits on the tenant, never inside `quotas` (RFC-002 §11 Q2) — the
       // two are edited by the same form but sent as siblings, not nested.
+      // Parsed values, not re-parsed with a `?? 0` fallback: that fallback is the exact coercion
+      // `parseWholeNumber` exists to prevent, and it would come back silently if the guard above
+      // were ever refactored away.
       quotas: {
-        maxImposters: parseWholeNumber(maxImposters) ?? 0,
-        maxStubsPerImposter: parseWholeNumber(maxStubsPerImposter) ?? 0,
-        maxFlowEntries: parseWholeNumber(maxFlowEntries) ?? 0,
+        maxImposters: parsed[0],
+        maxStubsPerImposter: parsed[1],
+        maxFlowEntries: parsed[2],
       },
-      journalRetentionSecs: parseWholeNumber(retention) ?? 0,
+      journalRetentionSecs: parsed[3],
     });
   };
 
@@ -626,6 +639,7 @@ function PrincipalRow({
   onToggle: () => void;
   onDelete: () => void;
 }): ReactNode {
+  const addressable = isAddressablePrincipalId(principal.id);
   return (
     <div className="row" data-testid="principal-row">
       <span data-testid={`principal-${principal.id}`}>
@@ -637,14 +651,27 @@ function PrincipalRow({
         )}
       </span>
       {mayManage ? (
-        <>
-          <button type="button" disabled={busy} onClick={onToggle}>
-            {principal.disabled ? "Enable" : "Disable"} {principal.displayName}
-          </button>
-          <button type="button" disabled={busy} onClick={onDelete}>
-            Delete {principal.displayName}
-          </button>
-        </>
+        addressable ? (
+          <>
+            <button type="button" disabled={busy} onClick={onToggle}>
+              {principal.disabled ? "Enable" : "Disable"} {principal.displayName}
+            </button>
+            <button type="button" disabled={busy} onClick={onDelete}>
+              Delete {principal.displayName}
+            </button>
+          </>
+        ) : (
+          /*
+           * Not merely disabled — unreachable. The server matches the raw path, so an id carrying
+           * `#` or `?` would address a *different* principal (`alice#bob` → `alice`) and quietly
+           * act on the wrong record. Saying so is the only honest option: the console cannot
+           * encode its way out, and silently offering the button would be a destructive misfire.
+           */
+          <span className="muted" data-testid="principal-unaddressable">
+            This id cannot be addressed in a URL path, so it cannot be changed from the console. Use
+            the admin API directly.
+          </span>
+        )
       ) : null}
     </div>
   );
@@ -791,7 +818,11 @@ function AuditTab({ tenant }: { tenant: string | null }): ReactNode {
             <button
               type="button"
               data-testid="audit-next"
-              disabled={cursor === null}
+              // A page shorter than the limit is the end of the journal. Gating on the cursor alone
+              // left this live forever: clicking it then asked for a range past the end and rendered
+              // an empty table under a header, which reads as "the trail stops here" — the one thing
+              // an audit viewer must never imply.
+              disabled={cursor === null || !hasMorePages(rows.data ?? [], AUDIT_PAGE_SIZE)}
               onClick={() => {
                 if (cursor !== null) setSince(cursor);
               }}
