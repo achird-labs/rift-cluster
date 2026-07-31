@@ -236,6 +236,9 @@ async fn the_role_action_matrix_holds_through_terminated_and_proxied_routes() {
     .await;
     op_id += 1;
 
+    // The second flag covers both `SavedRequestsClear` and `LifecycleToggle`: `role_allows` grants
+    // them at the same rung (Operator adds both), so one column stating "Operator and above" is
+    // the table's shape rather than a coincidence two columns would obscure.
     let cases = [
         (Role::Viewer, false, false),
         (Role::Operator, false, true),
@@ -244,7 +247,7 @@ async fn the_role_action_matrix_holds_through_terminated_and_proxied_routes() {
         (Role::FleetAdmin, true, true),
     ];
 
-    for (role, create_allowed, clear_allowed) in cases {
+    for (role, create_allowed, operator_allowed) in cases {
         let label = format!("matrix-{role:?}");
         let raw_key = seed_bound_principal(node, &mut op_id, &label, "default", role).await;
 
@@ -276,9 +279,35 @@ async fn the_role_action_matrix_holds_through_terminated_and_proxied_routes() {
         let seen = Seen::of(response).await;
         assert_eq!(
             seen.status,
-            if clear_allowed { 200 } else { 403 },
+            if operator_allowed { 200 } else { 403 },
             "{role:?} proxied clear (SavedRequestsClear): {seen}"
         );
+
+        // Terminated: POST /imposters/:port/{disable,enable} — `Action::LifecycleToggle`.
+        //
+        // The web console's only mutation (RFC-006 §4, #187), and the reason this arm exists
+        // rather than being assumed from the two above: the console hides the enable/disable
+        // control from a Viewer, and RFC-006 §3 rule 3 says that hiding is UX while the API is
+        // the boundary. Nothing asserted the boundary half for *this* action until now — the
+        // matrix covered `ImposterWrite` and `SavedRequestsClear`, and the tests that do call
+        // these routes run open-admin with no principal at all.
+        //
+        // Toggled off and back on within one iteration so the imposter is left enabled for the
+        // next role's probes; for a refused role both calls are 403 and nothing changes.
+        for (verb, allowed) in [("disable", operator_allowed), ("enable", operator_allowed)] {
+            let response = client
+                .post(format!("http://{admin}/imposters/{probe_port}/{verb}"))
+                .header("authorization", &raw_key)
+                .send()
+                .await
+                .expect("toggle imposter lifecycle");
+            let seen = Seen::of(response).await;
+            assert_eq!(
+                seen.status,
+                if allowed { 200 } else { 403 },
+                "{role:?} terminated {verb} (LifecycleToggle): {seen}"
+            );
+        }
     }
 
     server.shutdown().await;

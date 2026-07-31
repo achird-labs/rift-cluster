@@ -1,0 +1,243 @@
+/** @vitest-environment jsdom */
+import { screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { CSRF_HEADER, TENANT_HEADER } from "../api/client.ts";
+import { IMPOSTER_COLUMNS } from "../app/contract.ts";
+import { Imposters } from "../screens/Imposters.tsx";
+import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+
+const TWO = {
+  imposters: [
+    { port: 4545, protocol: "http", name: "billing", recordRequests: true, enabled: true, stubs: [{}, {}] },
+    { port: 4546, protocol: "https", name: "shipping", recordRequests: false, enabled: false, stubs: [] },
+  ],
+};
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("imposter list", () => {
+  it("renders only fields the Imposter schema declares", async () => {
+    stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+
+    expect(await screen.findByText("billing")).toBeTruthy();
+    expect(screen.getByText("4545")).toBeTruthy();
+    expect(screen.getByText("shipping")).toBeTruthy();
+    expect(screen.getAllByText("https").length).toBeGreaterThan(0);
+  });
+
+  it("says whose view this is, and does not claim the tenant is empty", async () => {
+    // A console that says "no imposters" is asserting a fleet-wide fact from one node's answer.
+    stubFetch({ "/imposters": { json: { imposters: [] } }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+
+    const empty = await screen.findByTestId("imposters-empty");
+    expect(empty.textContent).toMatch(/this node/i);
+    expect(empty.textContent).not.toMatch(/^No imposters\.?$/);
+  });
+
+  it("warns that an empty list cannot be confirmed when this node is degraded", async () => {
+    stubFetch({
+      "/imposters": { json: { imposters: [] } },
+      "/_fleet/members": { json: { node_id: 1, is_leader: false, current_leader: null, last_applied: 5, voters: [1, 2, 3] } },
+      "/_fleet/health": { json: { ready: true, state: "ready", pending_gates: [], isolated: true, ring: { m_idx: 3, members: [1, 2, 3] } } },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+
+    const empty = await screen.findByTestId("imposters-empty");
+    await waitFor(() => expect(empty.textContent).toMatch(/cannot confirm/i));
+  });
+
+  it("says the empty list is unqualified when the fleet reading itself failed", async () => {
+    // A FleetAdmin whose `/_fleet/*` read 500s has lost the signal that would say whether an empty
+    // list can be trusted. Folding that into "nothing to report" would present the gap as a clean
+    // reading — the same mistake as saying "no imposters" from a degraded node.
+    stubFetch({
+      "/imposters": { json: { imposters: [] } },
+      "/_fleet/members": { status: 500, json: { message: "boom" } },
+      "/_fleet/health": { status: 500, json: { message: "boom" } },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+
+    const empty = await screen.findByTestId("imposters-empty");
+    // Longer than the default: a 500 earns one retry under the shared policy, so the caveat only
+    // appears once that backoff has elapsed. Waiting it out is the point — a shorter window would
+    // pass by observing the *pending* state rather than the failed one.
+    await waitFor(() => expect(empty.textContent).toMatch(/cannot confirm/i), { timeout: 5_000 });
+    expect((await screen.findByTestId("imposters-scope-label")).textContent).toMatch(
+      /could not be obtained/i,
+    );
+  });
+
+  it("does not caveat the list for a principal who never had the fleet scope", async () => {
+    // The other side of the same distinction: a viewer is *refused* the projection, which is not
+    // evidence of anything. A permanent warning here is one operators would learn to ignore.
+    stubFetch({ "/imposters": { json: { imposters: [] } } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+
+    const empty = await screen.findByTestId("imposters-empty");
+    expect(empty.textContent).not.toMatch(/cannot confirm/i);
+    expect((await screen.findByTestId("imposters-scope-label")).textContent).not.toMatch(
+      /could not be obtained/i,
+    );
+  });
+});
+
+describe("lifecycle toggle (the one mutation in C4)", () => {
+  it("posts to the lifecycle route with the CSRF header and refetches the list", async () => {
+    const { calls } = stubFetch({
+      "/imposters": { json: TWO },
+      "/imposters/4545/disable": { json: { message: "disabled" } },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    await screen.findByText("billing");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /disable billing/i }));
+
+    await waitFor(() => expect(calls).toContain("/imposters/4545/disable"));
+    const call = (globalThis.fetch as unknown as { mock: { calls: [string, RequestInit][] } }).mock.calls.find(
+      ([path]) => path === "/imposters/4545/disable",
+    );
+    expect(call?.[1]?.method).toBe("POST");
+    expect((call?.[1]?.headers as Record<string, string>)[CSRF_HEADER]).toBe("1");
+
+    // The list must re-read after the write, or the row keeps showing the pre-toggle state until
+    // the next poll tick — which is the "reflects it within one poll interval" criterion.
+    await waitFor(() => expect(calls.filter((p) => p === "/imposters").length).toBeGreaterThan(1));
+  });
+
+  it("enables a disabled imposter through the enable route", async () => {
+    const { calls } = stubFetch({
+      "/imposters": { json: TWO },
+      "/imposters/4546/enable": { json: { message: "enabled" } },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    await screen.findByText("shipping");
+
+    await userEvent.setup().click(screen.getByRole("button", { name: /enable shipping/i }));
+    await waitFor(() => expect(calls).toContain("/imposters/4546/enable"));
+  });
+
+  it("carries the tenant in view on both the read and the write", async () => {
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/imposters/4545/disable": { json: { message: "disabled" } },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("operator", ["acme", "globex"]), tenant: "globex", tenants: ["acme", "globex"] });
+    await screen.findByText("billing");
+    await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
+
+    const mock = globalThis.fetch as unknown as { mock: { calls: [string, RequestInit][] } };
+    await waitFor(() => {
+      const write = mock.mock.calls.find(([path]) => path === "/imposters/4545/disable");
+      expect((write?.[1]?.headers as Record<string, string>)[TENANT_HEADER]).toBe("globex");
+    });
+    const read = mock.mock.calls.find(([path]) => path === "/imposters");
+    expect((read?.[1]?.headers as Record<string, string>)[TENANT_HEADER]).toBe("globex");
+  });
+
+  it("surfaces a refused toggle instead of leaving the row looking changed", async () => {
+    // The API is the boundary (RFC-006 §3 rule 3). When it refuses, the screen must say so rather
+    // than optimistically render the toggle as applied.
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/imposters/4545/disable": { status: 403, json: { message: "forbidden" } },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    await screen.findByText("billing");
+    await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/403/);
+  });
+});
+
+describe("RBAC-correct visibility", () => {
+  it("shows a viewer no lifecycle affordance at all", async () => {
+    stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    await screen.findByText("billing");
+
+    expect(screen.queryByRole("button", { name: /disable/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /enable/i })).toBeNull();
+  });
+
+  it("shows an operator the lifecycle affordance", async () => {
+    stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    await screen.findByText("billing");
+
+    expect(screen.getByRole("button", { name: /disable billing/i })).toBeTruthy();
+  });
+});
+
+describe("every rendered cell comes from the declared column table", () => {
+  it("renders exactly the declared columns, in order, and no others", async () => {
+    // The compile-time half of RFC-006 §11 lives in `contract.ts` (`keyof` the schema type with its
+    // index signature stripped). It is bypassable: a screen can cast and hand-write a `<td>` for a
+    // field the contract never declared, and the type system never sees it. This asserts against
+    // the rendered DOM instead, so an extra column is a failure wherever it was added.
+    stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    await screen.findByText("billing");
+
+    const headers = [...screen.getAllByRole("columnheader")].map((cell) => cell.textContent?.trim());
+    expect(headers).toEqual(IMPOSTER_COLUMNS.map((column) => column.label));
+
+    // A viewer gets no lifecycle column, so the cell count is exactly the declared columns.
+    const cells = within(screen.getByTestId("imposter-row-4545")).getAllByRole("cell");
+    expect(cells.length).toBe(IMPOSTER_COLUMNS.length);
+  });
+
+  it("adds exactly one column for the lifecycle control, and only for a role that holds it", async () => {
+    stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    await screen.findByText("billing");
+
+    const cells = within(screen.getByTestId("imposter-row-4545")).getAllByRole("cell");
+    expect(cells.length).toBe(IMPOSTER_COLUMNS.length + 1);
+  });
+});
+
+describe("dense tables (200 imposters, 40-character names, narrow window)", () => {
+  it("truncates a long name for display but keeps the whole value reachable", async () => {
+    const long = "checkout-service-integration-sandbox-eu-1";
+    stubFetch({
+      "/imposters": { json: { imposters: [{ port: 4545, protocol: "http", name: long, recordRequests: false, enabled: true }] } },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+
+    const cell = await screen.findByTestId("imposter-name-4545");
+    expect(cell.textContent!.length).toBeLessThan(long.length);
+    expect(cell.getAttribute("title")).toBe(long);
+  });
+
+  it("renders 200 rows without dropping any", async () => {
+    const many = Array.from({ length: 200 }, (_, i) => ({
+      port: 4000 + i,
+      protocol: "http",
+      name: `imposter-${i}`,
+      recordRequests: false,
+      enabled: true,
+    }));
+    stubFetch({ "/imposters": { json: { imposters: many } }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+
+    await screen.findByText("4000");
+    expect(screen.getAllByTestId(/^imposter-row-/).length).toBe(200);
+  });
+});

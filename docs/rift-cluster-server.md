@@ -1404,7 +1404,7 @@ takeovers visible (`unreachable` is the label worth alerting on), and
 `rift_cluster_flow_repairs_total` counts anti-entropy merges that actually fixed
 something — steady non-zero means pushes are being missed.
 
-## The web console (`--features console`, #186)
+## The web console (`--features console`, #186, #187)
 
 The binary can serve an embedded web console at `GET /console` — a single-page
 app built from `web/` and compiled into the executable. It is behind a **cargo
@@ -1463,6 +1463,66 @@ The TypeScript client is **generated** from `docs/api/openapi-ee.yaml`
 (`pnpm run generate:client`) and committed, so `web/` builds without the binary
 present. CI regenerates it and fails on any difference, which is what keeps the
 contract, the client and the server from drifting apart silently.
+
+### What the console shows, and what it refuses to claim (#187)
+
+C4 ships the app shell, a read-only imposter list and detail with
+enable/disable, and the cluster view. Four behaviours are worth knowing as an
+operator, because each is a deliberate refusal to round a fact off:
+
+- **Everything on screen is one node's answer.** `/imposters` is served by
+  whichever node the browser reached, and `/_fleet/*` is that node reporting on
+  itself. The screens say so rather than presenting either as fleet-wide. There
+  is no client-side fan-out and merge: that would reinvent the verification
+  plane without its cursors or gap repair, producing a merged view with no way
+  to know what it missed (#147 is where the merged journal actually lands).
+- **An empty list is not the same claim as an empty tenant.** When the answering
+  node is degraded — not ready, draining, isolated, leaderless, or **evicted
+  from the voter set** — the empty state says the tenant *cannot be confirmed*
+  empty and names why. An imposter the node has not applied would not appear.
+  The same caveat appears when the console holds the fleet scope but the
+  `/_fleet/*` read itself failed: that is a *lost* signal, and reporting it as
+  "nothing to report" would present the gap as a clean reading.
+
+  Eviction is the one worth knowing about, because it has no other tell. A node
+  removed from the effective membership while still running is not draining, is
+  not isolated (`is_isolated` is false for any node that can see a leader), and
+  its readiness gates stay satisfied — so it reports itself perfectly healthy
+  while owning no part of the ring and receiving no further replication.
+- **Unknown renders as `—`, never `0`.** `current_leader: null` means this node
+  knows of no leader; showing `0` would name node 0.
+- **A refusal from `/_fleet/*` is reported as insufficient scope, not a missing
+  page.** Both statuses mean the same thing here: the route authorizes
+  `Action::ClusterAdmin` with no tenant scope, so a principal bound to the
+  tenant but lacking the role gets **403**, while an unbound one gets the
+  RFC-002 §8.4 **404**. The console treats them alike, because the alternative
+  is telling an operator their fleet has no cluster.
+
+The tenant switcher sends `X-Rift-Tenant` and nothing else — RFC-002 §8.1's
+rules apply unchanged, and the header selects among bindings the principal
+already holds. It is hidden entirely for a single-tenant principal. A
+`FleetAdmin` binds only to the fleet scope `*`, so its switcher list comes from
+`GET /admin/tenants`, which is fleet-scoped and therefore readable by exactly
+that principal; if that call fails the console says so rather than letting the
+switcher quietly disappear, which would read as a fleet with one tenant.
+
+The console always opens **in a tenant it actually sends**. An unselected
+tenant would mean no `X-Rift-Tenant` — which lands in `default` — while the
+switcher displayed the first tenant in its list, so every read would be
+labelled with a tenant it never asked for; for a principal not bound to
+`default` those reads all 404 while the console claims otherwise. It therefore
+opens on the remembered tenant, else `default` when the principal is bound
+there, else the first it holds.
+
+Screens whose backend or slice has not shipped — request log (#189), scenarios
+(#149), sources (#20), specs (#148), administration (#190) — appear as greyed
+nav entries carrying their issue number. A visible roadmap, not a 404 and not an
+omission.
+
+Reads poll every 5 seconds while the tab is visible and **stop while it is
+hidden** (RFC-006 §6). SSE is deferred to v2 and will carry cache invalidation
+only. A 4xx is never retried: it is a decision the fleet has already made, and
+re-asking only doubles the audited denials.
 
 ## What lands later
 

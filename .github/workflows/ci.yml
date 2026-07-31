@@ -396,6 +396,13 @@ jobs:
       - name: Typecheck
         run: pnpm run typecheck
 
+      # RFC-006 §9.1's first XSS defense: `dangerouslySetInnerHTML` banned by lint. One rule, not a
+      # recommended set — a security gate buried in style nits is a gate reviewers learn to skim.
+      # `contract-traceability.test.ts` asserts the same thing, so dropping this step alone does not
+      # silently un-ban it.
+      - name: Lint
+        run: pnpm run lint
+
       - name: Test
         run: pnpm run test
 
