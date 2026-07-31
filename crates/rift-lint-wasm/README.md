@@ -1,6 +1,6 @@
 # `rift-lint`, compiled to wasm
 
-This directory is where the console's advisory lint pane looks for its linter
+This crate's build artifact lands in `web/public/lint/` — that directory is where the console's advisory lint pane looks for its linter
 (`web/src/features/stubs/lint.ts` imports `/console/lint/rift_lint_wasm.js`).
 
 **It is empty in a checkout, and that is not a bug.** The artifact is built by
