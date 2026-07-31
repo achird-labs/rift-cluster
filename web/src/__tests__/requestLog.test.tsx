@@ -198,16 +198,34 @@ describe("the header shapes the engine actually emits", () => {
     expect(container.textContent).toContain("content-length: 124");
   });
 
+  // The mode token is `binary`, not `base64` — `ResponseMode` serializes lowercase variant names
+  // and the *encoding* it implies is base64. This fixture asserted `base64` and the screen compared
+  // against `base64`, so the two agreed with each other and disagreed with the engine: the label
+  // could never render, and the test that existed to prove it did still passed (#212).
   it("labels a base64 body rather than showing it as text", async () => {
     stubFetch({
       ...THREE_NODE,
-      [REQUESTS]: { json: [recorded({ body: "3q2+7w==", _mode: "base64" })] },
+      [REQUESTS]: { json: [recorded({ body: "3q2+7w==", _mode: "binary" })] },
     });
     renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
 
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
     await userEvent.setup().click(screen.getByTestId("request-open"));
     expect((await screen.findByTestId("request-detail")).textContent).toContain("Body (base64)");
+  });
+
+  it("leaves a text body unlabelled, which is how absence of _mode reads", async () => {
+    // Guards the guard: if the label were unconditional the test above would pass for the wrong
+    // reason. A text body omits `_mode` entirely rather than sending "text".
+    stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: { json: [recorded({ body: "hello" })] },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
+    await userEvent.setup().click(screen.getByTestId("request-open"));
+    expect((await screen.findByTestId("request-detail")).textContent).not.toContain("(base64)");
   });
 });
 

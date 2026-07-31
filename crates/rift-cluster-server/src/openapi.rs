@@ -755,6 +755,332 @@ mod tests {
         }
     }
 
+    /// Resolve a parameter that may be a `$ref` into `#/components/parameters/*`.
+    ///
+    /// The contract is asserted as raw parsed YAML — nothing resolves `$ref` for us. A test that
+    /// reads `name`/`in` straight off the entry sees neither on a `$ref`d parameter and concludes
+    /// the operation declares nothing, which is a false failure. Resolving here also means a
+    /// dangling `$ref` fails loudly instead of silently reading as "no such parameter".
+    fn resolve_parameter<'a>(
+        doc: &'a serde_json::Value,
+        param: &'a serde_json::Value,
+    ) -> &'a serde_json::Value {
+        let Some(reference) = param.get("$ref").and_then(serde_json::Value::as_str) else {
+            return param;
+        };
+        let name = reference
+            .strip_prefix("#/components/parameters/")
+            .unwrap_or_else(|| panic!("unsupported parameter $ref {reference}"));
+        doc.get("components")
+            .and_then(|c| c.get("parameters"))
+            .and_then(|p| p.get(name))
+            .unwrap_or_else(|| panic!("dangling parameter $ref {reference}"))
+    }
+
+    fn journal_read_200<'a>(doc: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+        doc.get("paths")
+            .and_then(|p| p.get(path))
+            .and_then(|p| p.get("get"))
+            .and_then(|g| g.get("responses"))
+            .and_then(|r| r.get("200"))
+            .unwrap_or_else(|| panic!("{path} GET has no 200 response"))
+    }
+
+    /// The two journal reads answer a **bare array**, and the contract has to say so.
+    ///
+    /// Declaring the body as a bare `type: object` is not merely imprecise: `openapi-typescript`
+    /// renders it as `Record<string, never>`, so the console gets no usable type and hand-writes
+    /// the shape instead — which is the traceability gap RFC-006 §11 exists to prevent. A route
+    /// whose declared body shape disagrees with the server is worse than an undocumented one,
+    /// because a generated client compiles against it and fails at runtime.
+    ///
+    /// Both paths are asserted because `router.rs` maps `["savedRequests"] | ["requests"]` to the
+    /// same `ImposterRoute::SavedRequests` — they are one handler behind two spellings, so a
+    /// contract that describes them differently is describing the same bytes two ways.
+    #[test]
+    fn recorded_request_journal_reads_declare_the_array_they_return() {
+        let doc = parsed();
+
+        for path in [
+            "/imposters/{port}/requests",
+            "/imposters/{port}/savedRequests",
+        ] {
+            let schema = journal_read_200(doc, path)
+                .get("content")
+                .and_then(|c| c.get("application/json"))
+                .and_then(|c| c.get("schema"))
+                .unwrap_or_else(|| panic!("{path} 200 declares no JSON schema"));
+
+            assert_eq!(
+                schema.get("type").and_then(serde_json::Value::as_str),
+                Some("array"),
+                "{path} answers a bare JSON array of RecordedRequest; the contract declares \
+                 {schema:?}"
+            );
+            assert_eq!(
+                schema
+                    .get("items")
+                    .and_then(|i| i.get("$ref"))
+                    .and_then(serde_json::Value::as_str),
+                Some("#/components/schemas/RecordedRequest"),
+                "{path} items must reference the shared RecordedRequest schema"
+            );
+        }
+    }
+
+    /// The schema has to match what `serde` actually emits, not what the Rust struct looks like.
+    ///
+    /// Three of these fields are traps. `_mode` keeps its underscore (an explicit `rename` that
+    /// overrides `rename_all = "camelCase"`) and is skipped entirely for a text body, so `"binary"`
+    /// is the only value that ever reaches the wire — a schema declaring `text` would describe a
+    /// response the engine cannot produce. A single-valued header serializes as a **bare string**,
+    /// not a one-element array. And `body`/`_mode` are `skip_serializing_if`, so they are the only
+    /// two optional fields.
+    #[test]
+    fn recorded_request_schema_matches_the_engine_serialization() {
+        let doc = parsed();
+        let schema = doc
+            .get("components")
+            .and_then(|c| c.get("schemas"))
+            .and_then(|s| s.get("RecordedRequest"))
+            .expect("components.schemas.RecordedRequest is missing");
+
+        let required: BTreeSet<&str> = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("RecordedRequest declares no required fields")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(
+            required,
+            BTreeSet::from([
+                "requestFrom",
+                "method",
+                "path",
+                "query",
+                "headers",
+                "timestamp"
+            ]),
+            "required must be exactly the fields serde always emits — `body` and `_mode` carry \
+             skip_serializing_if and must stay optional"
+        );
+
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("RecordedRequest declares no properties");
+
+        let mode_values: Vec<&str> = properties
+            .get("_mode")
+            .and_then(|m| m.get("enum"))
+            .and_then(serde_json::Value::as_array)
+            .expect("_mode must be declared with the enum of values that reach the wire")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(
+            mode_values,
+            vec!["binary"],
+            "a text body omits `_mode` entirely (skip_serializing_if = is_text_mode), so `binary` \
+             is the only value the engine can emit"
+        );
+
+        // The bare-string case is the one a naive `array of string` schema gets wrong, and it is
+        // also the common case — every single-valued header takes it.
+        let header_values = properties
+            .get("headers")
+            .and_then(|h| h.get("additionalProperties"))
+            .expect("headers must declare its value shape");
+        let alternatives = header_values
+            .get("oneOf")
+            .or_else(|| header_values.get("anyOf"))
+            .and_then(serde_json::Value::as_array)
+            .expect("a header value is either a bare string or an array of strings");
+        let shapes: BTreeSet<&str> = alternatives
+            .iter()
+            .filter_map(|a| a.get("type"))
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(
+            shapes,
+            BTreeSet::from(["array", "string"]),
+            "multi_value_headers::serialize emits a scalar for one value and an array for many"
+        );
+    }
+
+    /// The cursor headers are the endpoint's pagination contract, and their **presence** is the
+    /// protocol: `x-rift-next-index` is absent on a degraded read, and `x-rift-truncated` appears
+    /// only when it is true, so an SDK probes for the header rather than parsing a value. That is
+    /// exactly the kind of semantics a bare mention in prose loses, so this asserts a real
+    /// component description and a reference from the response that emits it.
+    #[test]
+    fn the_journal_cursor_headers_are_declared_where_they_are_emitted() {
+        let doc = parsed();
+        let components = doc
+            .get("components")
+            .and_then(|c| c.get("headers"))
+            .and_then(serde_json::Value::as_object)
+            .expect("components.headers");
+
+        for component in ["XRiftNextIndex", "XRiftTruncated"] {
+            let description = components
+                .get(component)
+                .unwrap_or_else(|| panic!("components.headers.{component} is missing"))
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                description.len() > 40,
+                "components.headers.{component} needs a real description of when it is emitted, \
+                 got {description:?}"
+            );
+        }
+
+        for path in [
+            "/imposters/{port}/requests",
+            "/imposters/{port}/savedRequests",
+        ] {
+            let declared = journal_read_200(doc, path)
+                .get("headers")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{path} 200 declares no response headers"));
+            // Asserting the `$ref`, not merely the key: an inline header schema at the response
+            // site would satisfy a presence check while quietly diverging from the component whose
+            // description carries the presence semantics — which is the only place they are stated.
+            for (header, component) in [
+                ("x-rift-next-index", "XRiftNextIndex"),
+                ("x-rift-truncated", "XRiftTruncated"),
+            ] {
+                let reference = declared
+                    .get(header)
+                    .unwrap_or_else(|| {
+                        panic!("{path} emits {header} but its 200 does not declare it")
+                    })
+                    .get("$ref")
+                    .and_then(serde_json::Value::as_str);
+                assert_eq!(
+                    reference,
+                    Some(format!("#/components/headers/{component}").as_str()),
+                    "{path}'s {header} must reference the shared component, not restate it inline"
+                );
+            }
+        }
+    }
+
+    /// The clear side of the same two paths, which is the same defect one method over.
+    ///
+    /// `handle_clear_requests` parses `match` — and **only** `match`, never `since`, so a clear
+    /// cannot be given a cursor — then delegates to `handle_get`, which is why a successful clear
+    /// answers the imposter rather than an empty object. A bad clause is a 400 and a missing
+    /// imposter a 404, both of which the alias spelling used to leave undeclared while its twin
+    /// declared them.
+    #[test]
+    fn the_journal_clears_declare_what_they_accept_and_answer() {
+        let doc = parsed();
+
+        for path in [
+            "/imposters/{port}/requests",
+            "/imposters/{port}/savedRequests",
+        ] {
+            let delete = doc
+                .get("paths")
+                .and_then(|p| p.get(path))
+                .and_then(|p| p.get("delete"))
+                .unwrap_or_else(|| panic!("{path} DELETE"));
+
+            let query: BTreeSet<&str> = delete
+                .get("parameters")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("{path} DELETE declares no parameters"))
+                .iter()
+                .map(|p| resolve_parameter(doc, p))
+                .filter(|p| p.get("in").and_then(serde_json::Value::as_str) == Some("query"))
+                .filter_map(|p| p.get("name"))
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            assert_eq!(
+                query,
+                BTreeSet::from(["match"]),
+                "{path} DELETE narrows by `match` and takes no cursor"
+            );
+
+            let responses = delete
+                .get("responses")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{path} DELETE responses"));
+            for status in ["400", "401", "403", "404"] {
+                assert!(
+                    responses.contains_key(status),
+                    "{path} DELETE can answer {status} but does not declare it"
+                );
+            }
+        }
+    }
+
+    /// `since` and `match` are the only two query parameters `request_filter.rs` parses, and both
+    /// change the response. An undeclared parameter is invisible to a generated client, so the
+    /// cursor work has nothing to call.
+    ///
+    /// Asserted on both spellings for the same reason as the body shape: one handler, two paths.
+    /// Declaring the parameters on only one of them would document the same route two ways.
+    #[test]
+    fn the_journal_reads_declare_the_query_parameters_the_engine_parses() {
+        let doc = parsed();
+
+        for path in [
+            "/imposters/{port}/requests",
+            "/imposters/{port}/savedRequests",
+        ] {
+            let get = doc
+                .get("paths")
+                .and_then(|p| p.get(path))
+                .and_then(|p| p.get("get"))
+                .unwrap_or_else(|| panic!("{path} GET"));
+
+            let query: BTreeSet<&str> = get
+                .get("parameters")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("{path} declares no parameters"))
+                .iter()
+                .map(|p| resolve_parameter(doc, p))
+                .filter(|p| p.get("in").and_then(serde_json::Value::as_str) == Some("query"))
+                .filter_map(|p| p.get("name"))
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            assert_eq!(
+                query,
+                BTreeSet::from(["since", "match"]),
+                "{path}: request_filter.rs parses exactly `since` and `match`"
+            );
+
+            // An unparseable `since` or an unsupported `match` clause answers 400, and both reads
+            // sit behind the same authorization gate that answers 401/403/404.
+            let responses = get
+                .get("responses")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{path} responses"));
+            for status in ["400", "401", "403", "404"] {
+                let response = responses.get(status).unwrap_or_else(|| {
+                    panic!("{path} can answer {status} but does not declare it")
+                });
+                // Presence alone would be satisfied by an empty `{}`, which tells a generated client
+                // nothing about the body it will actually receive. Every one of these carries an
+                // `Error` payload, whether by component reference or inline schema.
+                let describes_a_body = response.get("$ref").is_some()
+                    || response
+                        .get("content")
+                        .and_then(|c| c.get("application/json"))
+                        .and_then(|c| c.get("schema"))
+                        .is_some();
+                assert!(
+                    describes_a_body,
+                    "{path}'s {status} declares no body — an empty response object documents nothing"
+                );
+            }
+        }
+    }
+
     /// The gate's strongest layer, closed.
     ///
     /// `contract_route`'s exhaustive match forces a new `Terminated` variant to be *given* a path,

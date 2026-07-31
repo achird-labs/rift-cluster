@@ -194,8 +194,10 @@ function Row({ request }: { request: RecordedRequest }): ReactNode {
               </div>
               <div className="fact">
                 {/* A base64 body rendered unlabelled reads as corrupted text rather than as the
-                    binary payload it is (`ResponseMode`, `types.rs`). */}
-                <dt>{request._mode === "base64" ? "Body (base64)" : "Body"}</dt>
+                    binary payload it is. The mode token is `binary` and the encoding it implies is
+                    base64 — `ResponseMode` serializes lowercase, and a text body omits the field
+                    entirely, so `binary` is the only value that ever arrives. */}
+                <dt>{request._mode === "binary" ? "Body (base64)" : "Body"}</dt>
                 <dd>
                   <pre>{request.body ?? "(no body)"}</pre>
                 </dd>

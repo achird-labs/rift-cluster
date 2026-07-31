@@ -206,12 +206,17 @@ export interface paths {
         };
         /**
          * List recorded requests for an imposter (upstream)
-         * @description Node-local runtime state; not replicated (tracked by issue
+         * @description Answers a **bare JSON array** of recorded requests, oldest first — not an envelope. Cursor metadata rides in the `x-rift-next-index` and `x-rift-truncated` response headers instead of the body, which is what keeps the array readable by clients written before cursoring existed.
+         *     `/imposters/{port}/requests` is an alias for this route: upstream `router.rs` maps both spellings to the same handler, so the two operations describe identical bytes and are kept identical here.
+         *     Node-local runtime state; not replicated (tracked by issue #16).
          */
         get: operations["listSavedRequests"];
         put?: never;
         post?: never;
-        /** Clear recorded requests for an imposter (upstream) */
+        /**
+         * Clear recorded requests for an imposter (upstream)
+         * @description Clears the journal and answers the imposter's current state. Accepts `match` — and only `match`, not `since` — so a clear can be narrowed to the entries a filter selects; with no clause the whole journal is dropped. Aliased as `DELETE /imposters/{port}/requests`.
+         */
         delete: operations["clearSavedRequests"];
         options?: never;
         head?: never;
@@ -228,11 +233,18 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List matched requests for an imposter (upstream) */
+        /**
+         * List matched requests for an imposter (upstream)
+         * @description The alias spelling of `GET /imposters/{port}/savedRequests` — upstream `router.rs` maps `["requests"]` and `["savedRequests"]` to the same handler, so this answers the identical body and headers. Declared in full rather than by reference because a generated client reads each operation independently.
+         *     Answers a **bare JSON array** of recorded requests, oldest first — not an envelope. Cursor metadata rides in the `x-rift-next-index` and `x-rift-truncated` response headers instead of the body.
+         */
         get: operations["listRequests"];
         put?: never;
         post?: never;
-        /** Clear matched requests for an imposter (upstream) */
+        /**
+         * Clear matched requests for an imposter (upstream)
+         * @description The alias spelling of `DELETE /imposters/{port}/savedRequests` — the same handler, so the same parameters, body and status codes.
+         */
         delete: operations["clearRequests"];
         options?: never;
         head?: never;
@@ -956,6 +968,43 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /**
+         * @description One request an imposter recorded, exactly as the engine serializes it (upstream `rift-mock-core::imposter::types::RecordedRequest`). Non-exhaustive.
+         *     Three fields do not follow the obvious Rust-to-JSON mapping, and each one has bitten a client. `_mode` keeps its leading underscore — an explicit serde rename that overrides the struct's camelCase rule — and is omitted entirely for a text body, so `binary` is the only value that ever reaches the wire. `body` is absent when the request carried none. And a `headers` value is a **bare string** when the header carried a single value, an array only when it carried several; a key whose value list is empty is dropped rather than emitted as `[]`.
+         */
+        RecordedRequest: {
+            /**
+             * @description The client address the request arrived from.
+             * @example 127.0.0.1:54321
+             */
+            requestFrom: string;
+            /** @example GET */
+            method: string;
+            /** @example /users/42 */
+            path: string;
+            /** @description Decoded query parameters. Always present; an empty object when the request had none. */
+            query: {
+                [key: string]: string;
+            };
+            /** @description Request headers. A single-valued header is a bare string, not a one-element array (upstream `multi_value_headers::serialize`). On the way in the engine additionally tolerates JSON numbers and booleans for Mountebank compatibility, but it always serializes strings back out. */
+            headers: {
+                [key: string]: string | string[];
+            };
+            /** @description The request body, absent when there was none. Base64-encoded when `_mode` is `binary`; UTF-8 text otherwise. */
+            body?: string;
+            /**
+             * @description Present only when `body` is base64-encoded binary (upstream issue #636). A text body omits this field, which is why `text` never appears on the wire even though it is the underlying default — absence means text.
+             * @enum {string}
+             */
+            _mode?: "binary";
+            /**
+             * Format: date-time
+             * @description RFC 3339, as produced by the engine's `Utc::now().to_rfc3339()`.
+             */
+            timestamp: string;
+        } & {
+            [key: string]: unknown;
+        };
         RouteTable: {
             routes?: components["schemas"]["Route"][];
         };
@@ -1291,6 +1340,16 @@ export interface components {
         OpId: string;
         /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
         CsrfHeader: string;
+        /** @description Journal cursor: return only entries recorded at or after this index, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained. Unlike the audit journal's forgiving `since`, an unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic. */
+        JournalSince: number;
+        /**
+         * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
+         * @example [
+         *       "method=POST",
+         *       "header:Content-Type=application/json"
+         *     ]
+         */
+        JournalMatch: string[];
     };
     requestBodies: never;
     headers: {
@@ -1298,6 +1357,10 @@ export interface components {
         RiftClusterRevision: string;
         /** @description The op id a write committed (or parked) under. Present only on a terminated write's SUCCESS response (`200`/`201`/`202`/`204`) — a refusal (`refusal_response`, e.g. `400`/`404`/`409`) sets no headers at all, so those responses carry no op id. For a single-op mutation this is the same id the client's Idempotency-Key deterministically derives; a multi-op mutation (e.g. a batch `PUT /imposters`) instead carries a per-index derived id on each success, while its `202` parked path carries the base id — the "same id Idempotency-Key derives" equivalence holds only for single-op writes. */
         RiftClusterOpId: string;
+        /** @description The journal index to send as `since` on the next read to continue exactly where this response stopped. Emitted only by a backend with stable indices, and only on a complete cursor read — a degraded partial read omits it. Its **presence is the protocol**: a client probes for this header to discover whether cursoring is supported at all, rather than assuming a default and paging against a backend that cannot honour it (issue #603). */
+        XRiftNextIndex: number;
+        /** @description Present, with the value `true`, when retention evicted entries the caller's `since` cursor had not yet read — the gap is unrecoverable and the client has silently missed requests. Emitted **only** when that is the case: there is no `false` form, so a client tests for the header's presence and never parses its value. */
+        XRiftTruncated: true;
     };
     pathItems: never;
 }
@@ -2142,7 +2205,18 @@ export interface operations {
     };
     listSavedRequests: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Journal cursor: return only entries recorded at or after this index, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained. Unlike the audit journal's forgiving `since`, an unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic. */
+                since?: components["parameters"]["JournalSince"];
+                /**
+                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
+                 * @example [
+                 *       "method=POST",
+                 *       "header:Content-Type=application/json"
+                 *     ]
+                 */
+                match?: components["parameters"]["JournalMatch"];
+            };
             header?: never;
             path: {
                 /** @description The imposter's port number. */
@@ -2152,15 +2226,18 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Recorded requests. */
+            /** @description Recorded requests, oldest first (bare array, not an envelope). */
             200: {
                 headers: {
+                    "x-rift-next-index": components["headers"]["XRiftNextIndex"];
+                    "x-rift-truncated": components["headers"]["XRiftTruncated"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["RecordedRequest"][];
                 };
             };
+            400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             /** @description No such imposter for this tenant, or owned by another tenant. */
@@ -2176,7 +2253,16 @@ export interface operations {
     };
     clearSavedRequests: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
+                 * @example [
+                 *       "method=POST",
+                 *       "header:Content-Type=application/json"
+                 *     ]
+                 */
+                match?: components["parameters"]["JournalMatch"];
+            };
             header?: never;
             path: {
                 /** @description The imposter's port number. */
@@ -2186,15 +2272,16 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Requests cleared. */
+            /** @description Requests cleared; answers the imposter as it now stands. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["Imposter"];
                 };
             };
+            400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             /** @description No such imposter for this tenant, or owned by another tenant. */
@@ -2210,7 +2297,18 @@ export interface operations {
     };
     listRequests: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Journal cursor: return only entries recorded at or after this index, as previously reported by this endpoint's x-rift-next-index response header. Absent means a baseline read of everything still retained. Unlike the audit journal's forgiving `since`, an unparseable value here answers 400 rather than taking a default — a cursor that silently restarted at zero would re-deliver the whole journal as if it were new traffic. */
+                since?: components["parameters"]["JournalSince"];
+                /**
+                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
+                 * @example [
+                 *       "method=POST",
+                 *       "header:Content-Type=application/json"
+                 *     ]
+                 */
+                match?: components["parameters"]["JournalMatch"];
+            };
             header?: never;
             path: {
                 /** @description The imposter's port number. */
@@ -2220,21 +2318,43 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Matched requests. */
+            /** @description Matched requests, oldest first (bare array, not an envelope). */
             200: {
+                headers: {
+                    "x-rift-next-index": components["headers"]["XRiftNextIndex"];
+                    "x-rift-truncated": components["headers"]["XRiftTruncated"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordedRequest"][];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No such imposter for this tenant, or owned by another tenant. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["Error"];
                 };
             };
-            401: components["responses"]["Unauthorized"];
         };
     };
     clearRequests: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
+                 * @example [
+                 *       "method=POST",
+                 *       "header:Content-Type=application/json"
+                 *     ]
+                 */
+                match?: components["parameters"]["JournalMatch"];
+            };
             header?: never;
             path: {
                 /** @description The imposter's port number. */
@@ -2244,16 +2364,27 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Requests cleared. */
+            /** @description Requests cleared; answers the imposter as it now stands. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["Imposter"];
                 };
             };
+            400: components["responses"]["BadData"];
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No such imposter for this tenant, or owned by another tenant. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     verifyImposter: {
