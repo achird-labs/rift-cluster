@@ -1497,11 +1497,11 @@ paths:
       x-rift-origin: ee
       parameters:
         - name: routeId
-        - $ref: '#/components/parameters/CsrfHeader'
           in: path
           required: true
           schema:
             type: string
+        - $ref: '#/components/parameters/CsrfHeader'
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -2996,8 +2996,13 @@ components:
             host:
               type: string
               description: Exact or one-leading-wildcard-label host match.
-            pathPrefix:
+            path_prefix:
               type: string
+              description: >
+                Segment-aligned prefix. Snake_case on purpose: `RouteMatch`
+                (`front_door/route_table.rs`) carries no `serde(rename_all)`,
+                so this is the field name the fleet actually serves and
+                accepts. Unlike most schemas here it is not camelCase.
             headers:
               type: array
               items:
@@ -3015,11 +3020,15 @@ components:
           properties:
             port:
               type: integer
-            stripPrefix:
+            strip_prefix:
               type: boolean
               default: false
-            setHost:
+              description: >
+                Snake_case on purpose — `RouteTarget` carries no
+                `serde(rename_all)`. See `match.path_prefix`.
+            set_host:
               type: string
+              description: Snake_case on purpose — see `match.path_prefix`.
         enabled:
           type: boolean
           default: true

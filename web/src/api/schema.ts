@@ -970,7 +970,8 @@ export interface components {
             match?: {
                 /** @description Exact or one-leading-wildcard-label host match. */
                 host?: string;
-                pathPrefix?: string;
+                /** @description Segment-aligned prefix. Snake_case on purpose: `RouteMatch` (`front_door/route_table.rs`) carries no `serde(rename_all)`, so this is the field name the fleet actually serves and accepts. Unlike most schemas here it is not camelCase. */
+                path_prefix?: string;
                 headers?: {
                     name?: string;
                     value?: string;
@@ -979,9 +980,13 @@ export interface components {
             };
             target: {
                 port: number;
-                /** @default false */
-                stripPrefix: boolean;
-                setHost?: string;
+                /**
+                 * @description Snake_case on purpose — `RouteTarget` carries no `serde(rename_all)`. See `match.path_prefix`.
+                 * @default false
+                 */
+                strip_prefix: boolean;
+                /** @description Snake_case on purpose — see `match.path_prefix`. */
+                set_host?: string;
             };
             /** @default true */
             enabled: boolean;
@@ -2823,7 +2828,9 @@ export interface operations {
                 /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
             };
-            path?: never;
+            path: {
+                routeId: string;
+            };
             cookie?: never;
         };
         requestBody?: never;

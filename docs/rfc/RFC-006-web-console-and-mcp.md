@@ -502,6 +502,27 @@ C1–C3 are strictly ordered; C4+ and M1+ parallelize.
    release-grade at M1 time, the fallback is implementing the (small) stdio
    framing directly; the tool layer above it is transport-agnostic either way.
    Verify at M1.
+6. **Match diagnostics are not on the request-log endpoint.** *Raised by C6
+   (#189).* `GET /imposters/:port/requests` serves `RecordedRequest`
+   (`rift-mock-core/src/imposter/types.rs`) — method, path, query, headers,
+   body, timestamp — and no match information. The per-stub "which predicate
+   rejected this" detail lives in `DebugResponse`/`DebugMatchResult`, which is
+   the `X-Rift-Debug` per-request path, not the journal. So "why did my system
+   under test get a 404" — the reason an operator opens this screen — cannot be
+   answered from the journal today. Per §3 rule 2 this is an **API feature**,
+   not a UI scrape: C6 ships without the diagnostics panel rather than
+   reconstructing it client-side from data the endpoint does not carry.
+7. **The front-door route table has no read-side precondition.** *Raised by C6
+   (#189).* `If-Match` is restricted to single-imposter operations
+   (`admin_front.rs`), and `GET /front-door/routes` returns no
+   `Rift-Cluster-Revision` — the header is declared on the `PUT`/`DELETE`
+   responses only. The editor therefore re-reads and compares content before a
+   whole-table `PUT`, which **narrows** the lost-update window without closing
+   it: a write committing between that re-read and the `PUT` is still lost, and
+   nothing client-side can prevent it. Closing it needs a server-side
+   precondition on this route (a revision on the `GET` plus a conditional
+   `PUT`). Until then the single-route `DELETE` is the safe operation and the
+   editor says so.
 
 ---
 

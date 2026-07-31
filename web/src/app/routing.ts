@@ -4,7 +4,10 @@ import { useEffect, useState } from "react";
 export type Route =
   | { screen: "imposters" }
   | { screen: "imposter"; port: number }
-  | { screen: "cluster" };
+  | { screen: "cluster" }
+  /** `port: null` is "no imposter chosen yet", which the screen answers with a picker. */
+  | { screen: "requests"; port: number | null }
+  | { screen: "routes" };
 
 const IMPOSTERS: Route = { screen: "imposters" };
 
@@ -24,6 +27,11 @@ export function parseHash(hash: string): Route {
     return port === null ? IMPOSTERS : { screen: "imposter", port };
   }
   if (head === "cluster" && tail === undefined) return { screen: "cluster" };
+  if (head === "requests") {
+    if (tail === undefined) return { screen: "requests", port: null };
+    return { screen: "requests", port: parsePort(tail) };
+  }
+  if (head === "routes" && tail === undefined) return { screen: "routes" };
 
   // An unknown hash is a stale bookmark, not an error: the nav already says which screens are
   // unbuilt, so a 404 page would be a second, worse answer to a question already answered.
@@ -45,6 +53,10 @@ export function toHash(route: Route): string {
       return `#/imposters/${route.port}`;
     case "cluster":
       return "#/cluster";
+    case "requests":
+      return route.port === null ? "#/requests" : `#/requests/${route.port}`;
+    case "routes":
+      return "#/routes";
   }
 }
 

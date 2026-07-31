@@ -3,6 +3,8 @@ import type { ReactNode } from "react";
 import { Fleet } from "../screens/Fleet.tsx";
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
 import { Imposters } from "../screens/Imposters.tsx";
+import { RequestLog } from "../screens/RequestLog.tsx";
+import { RouteTableScreen } from "../screens/Routes.tsx";
 import { ISSUE_URL, NAV } from "./nav.ts";
 import { useSession } from "./session.tsx";
 import { type Route, toHash, useRoute } from "./routing.ts";
@@ -35,6 +37,10 @@ function Screen({ route }: { route: Route }): ReactNode {
       return <ImposterDetail port={route.port} />;
     case "cluster":
       return <Fleet />;
+    case "requests":
+      return <RequestLog port={route.port} />;
+    case "routes":
+      return <RouteTableScreen />;
   }
 }
 
