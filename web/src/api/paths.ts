@@ -46,5 +46,27 @@ export const principalPath = (tenantId: string, principalId: string): string =>
   `${principalsPath(tenantId)}/${principalId}`;
 export const bindingPath = (tenantId: string, principalId: string): string =>
   `${tenantPath(tenantId)}/bindings/${principalId}`;
+
+/**
+ * Can this principal id be addressed in a URL path at all?
+ *
+ * The server matches the raw path, so the id cannot be encoded — and that leaves ids the console
+ * simply cannot target. `require_principal_id` permits any non-control string up to 256 bytes
+ * (deliberately wide, to hold an OIDC `subject`), so ids arrive here that a URL will mangle:
+ *
+ * - `#` and `?` **silently truncate** the path — `alice#bob` addresses `alice`, so "Delete
+ *   alice#bob" would delete a *different, existing* principal with no error to correlate. This is
+ *   the case that makes the check load-bearing rather than cosmetic.
+ * - `/` adds a segment, so `classify` stops matching and the request falls through to a 404.
+ * - whitespace and non-ASCII get encoded by the URL parser and then match nothing.
+ *
+ * Everything else in the RFC 3986 `pchar` set — including the `:` every minted id carries — is safe
+ * unencoded. Callers use this to render a write control inert with a stated reason rather than
+ * offering an action that would hit the wrong record.
+ */
+const PATH_SAFE_ID = /^[A-Za-z0-9\-._~:@!$&'()*+,;=%]+$/;
+
+export const isAddressablePrincipalId = (principalId: string): boolean =>
+  PATH_SAFE_ID.test(principalId);
 export const auditPath = (since: number, limit: number): string =>
   `${API_PATHS.audit}?since=${since}&limit=${limit}`;

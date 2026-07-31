@@ -232,10 +232,17 @@ const ADMIN_TENANTS_KEY = ["admin-tenants"];
 const adminTenantKey = (tenantId: string): unknown[] => ["admin-tenant", tenantId];
 const adminPrincipalsKey = (tenantId: string): unknown[] => ["admin-principals", tenantId];
 
-export function useTenants(): UseQueryResult<Tenant[]> {
+/**
+ * `enabled` is the caller's decision because `TenantList` is `Action::ClusterAdmin` scoped to the
+ * **fleet**, not to the caller's tenant. A tenant-admin holds no `*` binding, so this read is a
+ * permanent 404 for them — asking anyway turns their Administration landing into a red error every
+ * five seconds, which is the failure the `cluster.admin` capability was introduced to stop.
+ */
+export function useTenants(options: { enabled?: boolean } = {}): UseQueryResult<Tenant[]> {
   return useQuery({
     queryKey: ADMIN_TENANTS_KEY,
     queryFn: () => apiGet<Tenant[]>(API_PATHS.tenants),
+    enabled: options.enabled ?? true,
     ...POLLED,
   });
 }
@@ -299,12 +306,6 @@ export function usePrincipals(tenantId: string): UseQueryResult<Principal[]> {
   });
 }
 
-/**
- * Mint a principal. The raw `apiKey` in the response is the one and only time it exists outside an
- * argon2id hash — it must reach the caller's `mutate(...)` callback and nowhere else. This hook's
- * own `onSuccess` only ever touches `stripApiKey(issued)`, so the query cache this component shares
- * with the rest of the console never sees the raw value, regardless of what the caller does with it.
- */
 /**
  * Mint a principal, handing the raw key to the caller **out of band**.
  *
@@ -397,11 +398,14 @@ export function useDeleteBinding(): UseMutationResult<
  * screen advances it with `nextSince` once a page has rendered, and that decision does not belong
  * inside the hook that reads one page.
  */
+/** The page size the audit viewer asks for. Exported so the pager can tell a short page from a full one. */
+export const AUDIT_PAGE_SIZE = 100;
+
 export function useAuditRows(tenant: string | null, since: number): UseQueryResult<AuditRow[]> {
   return useQuery({
     queryKey: ["admin-audit", tenant, since],
     queryFn: async () =>
-      auditPage(readAuditRows(await apiGet<unknown>(auditPath(since, 100), { tenant }))),
+      auditPage(readAuditRows(await apiGet<unknown>(auditPath(since, AUDIT_PAGE_SIZE), { tenant }))),
     ...POLLED,
   });
 }

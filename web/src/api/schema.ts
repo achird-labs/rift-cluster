@@ -1009,13 +1009,17 @@ export interface components {
             createdAtSecs?: number;
             deleted?: boolean;
         };
+        /** @description All three fields are required when `quotas` is present. `Quotas` carries no `serde(default)` on the struct or on any field, so a present-but-partial object fails deserialization with `missing field` and answers `400` — only an entirely absent `quotas` is defaulted (`TenantBody.quotas` is `serde(default)`). */
         Quotas: {
             /** @default 1000 */
             maxImposters: number;
             /** @default 1000 */
             maxStubsPerImposter: number;
-            /** Format: int64 */
-            maxFlowEntries?: number;
+            /**
+             * Format: int64
+             * @default 100000
+             */
+            maxFlowEntries: number;
         };
         /**
          * @description A strict superset ladder: viewer subset of operator subset of editor subset of tenant-admin subset of fleet-admin. Only fleet-admin may hold a binding on the fleet scope (*).
