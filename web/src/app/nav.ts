@@ -47,11 +47,20 @@ export const NAV: readonly NavEntry[] = [
     requires: "fleet.read",
   },
   {
-    kind: "planned",
+    kind: "live",
     id: "requests",
     label: "Request log",
-    issue: 189,
-    note: "Per-node request log, labelled with the node in scope.",
+    route: { screen: "requests", port: null },
+    requires: "imposter.read",
+  },
+  {
+    kind: "live",
+    id: "routes",
+    label: "Front-door routes",
+    route: { screen: "routes" },
+    // The table is read with `Action::ImposterRead`; writing it needs `imposter.write`, which the
+    // screen gates per control rather than hiding the whole screen from an operator who may read it.
+    requires: "imposter.read",
   },
   {
     kind: "planned",

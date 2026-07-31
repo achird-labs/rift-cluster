@@ -12,9 +12,13 @@ export const API_PATHS = {
   fleetMembers: "/_fleet/members",
   fleetHealth: "/_fleet/health",
   session: "/session",
+  frontDoorRoutes: "/front-door/routes",
 } as const satisfies Record<string, ApiPath>;
 
 /** Path builders for the templated routes, so a port is interpolated in exactly one place. */
 export const imposterPath = (port: number): string => `/imposters/${port}`;
 export const lifecyclePath = (port: number, enabled: boolean): string =>
   `/imposters/${port}/${enabled ? "enable" : "disable"}`;
+export const requestsPath = (port: number): string => `/imposters/${port}/requests`;
+export const frontDoorRoutePath = (routeId: string): string =>
+  `/front-door/routes/${encodeURIComponent(routeId)}`;

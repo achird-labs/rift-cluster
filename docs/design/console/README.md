@@ -84,9 +84,16 @@ The editor validates before the write, mirroring `RouteTable::validate` / `Route
 
 | Error | Condition |
 |---|---|
-| `StripWithoutPrefix` | `stripPrefix` set with no `pathPrefix` to strip |
+| `StripWithoutPrefix` | `strip_prefix` set with no `path_prefix` to strip |
 | `MalformedHost` | more than one wildcard, or only a leading `*.` |
 | `AmbiguousMatch` | two **enabled** routes that can both win at the same priority |
+
+> **Route fields are snake_case.** `Route`, `RouteMatch` and `RouteTarget`
+> (`front_door/route_table.rs`) carry no `serde(rename_all)`, so the wire is `path_prefix`,
+> `strip_prefix`, `set_host` — unlike almost everything else in this admin API. The prototype in
+> this directory still shows the camelCase spellings; it predates the correction (#189) and is kept
+> as-is because it is a design artifact, not a client. `docs/api/openapi-ee.yaml` is authoritative,
+> and it was itself wrong here until #189 — when in doubt, read the Rust struct.
 
 Pre-flight matters because the server refuses the **whole table** rather than repairing part of it —
 and because `PUT /front-door/routes` replaces everything while `DELETE /front-door/routes/:id` removes

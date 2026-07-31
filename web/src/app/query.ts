@@ -23,6 +23,19 @@ export const POLLED = {
 } as const;
 
 /**
+ * RFC-006 §6: the request log refetches faster than everything else, because it is the screen
+ * someone watches while re-running a test — five seconds is long enough to make them wonder whether
+ * the call arrived at all, which is the exact question the screen exists to answer.
+ */
+export const REQUEST_POLL_INTERVAL_MS = 2_000;
+
+/** Same hidden-tab pause as `POLLED`; only the cadence differs. */
+export const POLLED_REQUESTS = {
+  refetchInterval: REQUEST_POLL_INTERVAL_MS,
+  refetchIntervalInBackground: false,
+} as const;
+
+/**
  * Retry a flaky hop; never re-ask a question the fleet has already answered.
  *
  * A 4xx from the admin front is a decision, not a hiccup — 401 means the session lapsed, 403 that

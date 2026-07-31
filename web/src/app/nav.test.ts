@@ -4,17 +4,17 @@ import { ISSUE_URL, NAV, liveEntries, plannedEntries } from "./nav.ts";
 import { toHash } from "./routing.ts";
 
 describe("nav model", () => {
-  it("ships the three screens C4 actually built as live entries", () => {
-    expect(liveEntries().map((e) => e.id)).toEqual(["imposters", "cluster"]);
+  it("ships the screens C4 and C6 actually built as live entries", () => {
+    // C6 (#189) turns `requests` live and adds the front-door route editor beside it.
+    expect(liveEntries().map((e) => e.id)).toEqual(["imposters", "cluster", "requests", "routes"]);
   });
 
   it("renders every unshipped screen as a planned entry rather than omitting it", () => {
     // RFC-006 §4: "a visible roadmap, not a 404". The issue names scenarios (#149), sources (#20)
-    // and specs (#148) explicitly; request log (#189) and administration (#190) are sliced but not
-    // built here, and hiding them would misreport the console as finished.
+    // and specs (#148) explicitly; administration (#190) is sliced but not built here, and hiding
+    // it would misreport the console as finished.
     const planned = Object.fromEntries(plannedEntries().map((e) => [e.id, e.issue]));
     expect(planned).toEqual({
-      requests: 189,
       scenarios: 149,
       sources: 20,
       specs: 148,

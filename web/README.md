@@ -13,11 +13,12 @@ enable/disable, and the cluster/fleet view. C5–C7 (#188–#190) follow.
 ```
 src/api/       schema.ts (generated, committed) · client.ts (the only fetch) · paths.ts
 src/app/       Shell · session · rbac · nav · routing · queries · contract · fleetView
-src/screens/   Login · Imposters · ImposterDetail · Fleet
+src/screens/   Login · Imposters · ImposterDetail · Fleet · RequestLog · Routes
+src/features/  requests/source.ts (the #147 seam) · routes/order.ts (front-door ordering)
 src/components/primitives (Status, Truncated, Ident, ErrorNote)
 ```
 
-Four modules carry the decisions worth knowing before changing anything:
+Six modules carry the decisions worth knowing before changing anything:
 
 - **`app/contract.ts`** — the single declaration of *which* schema fields any
   screen renders. Keys are typed as `keyof` the generated schema type with its
@@ -53,7 +54,55 @@ Four modules carry the decisions worth knowing before changing anything:
 - **`app/query.ts`** — the polling contract (RFC-006 §6). 5s, and
   `refetchIntervalInBackground: false` so a forgotten tab stops asking. That one
   is verified by counting fetches across a real `visibilitychange`, not by
-  asserting the option is set.
+  asserting the option is set. The request log overrides the cadence only
+  (`REQUEST_POLL_INTERVAL_MS`, 2s) — it is the screen someone watches while
+  re-running a test — and keeps the same hidden-tab pause.
+- **`features/requests/source.ts`** — the request log's data source, and **the
+  convergence seam for #147 H**. The screen renders only through `Coverage` and
+  `Page`; today's implementation reads one node's journal and says so. When the
+  merged journal (#147 B) and cursors (#147 D) land, slice H implements the same
+  shapes with `{ kind: "fleet" }`, the per-node banner disappears on its own, and
+  no presentation code changes.
+
+  Two distinctions here are load-bearing rather than stylistic. `unrepresented:
+  null` means **could not be determined**, never zero — `/_fleet/*` is
+  fleet-scoped, so most principals cannot learn how many nodes exist, and
+  reporting "0 others" to them would assert something nothing supports. And
+  `LogState` keeps *unknown* apart from *empty*: a node that could not answer has
+  an unknown journal, and rendering it as an empty table tells an operator their
+  system under test never called the mock.
+
+  v1 pages client-side. That bounds the DOM, which is what a busy imposter
+  threatens; it does **not** bound the response — the node still serves its whole
+  journal in one body. Closing that needs the server's `?since=` cursor and
+  `x-rift-next-index` header, which is the same seam #147 D widens, so paging is
+  expressed as a `Cursor` rather than an array slice inlined in the screen.
+- **`features/routes/order.ts`** — `effectiveOrder` and `validateTable`, ported
+  from `vendor/rift/.../front_door/route_table.rs`. Ported rather than fetched
+  because there is no endpoint that answers either question about a draft that
+  does not exist on the server yet: the editor has to show evaluation order while
+  the operator is still typing, and say why a table will be refused *before*
+  sending it. The server stays the authority — everything here is advisory, and
+  when the two disagree the screen shows the fleet's own words.
+
+  The mirror must not be *stricter* than the server or it blocks a table the
+  fleet would accept. Two ways that bit already: `hyper::Method` takes any valid
+  HTTP token, so `PURGE` is legal and only a malformed token is refused; and the
+  server compares `headers: Vec<HeaderMatch>` with a derived `PartialEq`, which
+  is **order-sensitive**, so sorting the clauses before comparing reported an
+  `AmbiguousMatch` the fleet would never raise.
+
+  **The route schema is snake_case, and it is the one place in this contract
+  that is.** `Route`, `RouteMatch` and `RouteTarget`
+  (`front_door/route_table.rs`) carry no `serde(rename_all)`, so the wire is
+  `path_prefix`, `strip_prefix`, `set_host` — as
+  `crates/rift-cluster-server/tests/front_door.rs` has always asserted. The
+  hand-authored contract declared them camelCase, and this slice was the first
+  code to depend on it; the symptom was not a type error but a screen that
+  silently read `undefined` for every path prefix, so it ranked routes in an
+  order the front door does not use and called two distinct routes ambiguous.
+  Corrected in `openapi-ee.yaml` — if you add a front-door field, check the Rust
+  struct rather than assuming the house camelCase.
 
 ## Testing
 
