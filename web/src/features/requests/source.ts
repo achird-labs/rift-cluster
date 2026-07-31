@@ -1,3 +1,4 @@
+import type { components } from "../../api/schema.ts";
 import type { FleetReadState } from "../../app/fleetView.ts";
 
 /**
@@ -103,28 +104,26 @@ export function page<T>(rows: readonly T[], cursor: Cursor): Page<T> {
  * One recorded request as the engine serves it
  * (`rift-mock-core/src/imposter/types.rs::RecordedRequest`).
  *
- * Hand-written rather than taken from `schema.ts` because the contract declares this response as an
- * untyped `object` — see the API-gap note in the PR. Every field is optional on read: this is
- * attacker-adjacent data from an untyped endpoint, and a missing field must render as absent rather
- * than crash the screen an operator opened to diagnose something else.
+ * Derived from the contract rather than hand-written, so the field list has one source. The
+ * bare-string-vs-array shape of a header value and the `_mode` spelling are documented on the
+ * schema itself, which is now the one place they are stated.
+ *
+ * What this does **not** buy is compiler rejection of an invented field. The schema is
+ * `additionalProperties: true` (the engine's shape is non-exhaustive and #208 will add to it), so
+ * the generated type ends in `& { [key: string]: unknown }` and that index signature survives
+ * `Partial` — `request.invented` still compiles, exactly as `contract-traceability.test.ts` already
+ * observes of `Imposter.numberOfRequests`. The field list is pinned by the `declares(...)` test in
+ * that file, not by `tsc`. Worth stating plainly, because the hand-written type this replaced was a
+ * closed literal and *did* reject invented reads: on that one axis the derivation is looser, and
+ * the traceability test is what pays for it.
+ *
+ * `Partial` is the deliberate part, and it is not a hedge against the schema being wrong — the six
+ * required fields really are always emitted. It is that the type is an *assertion*, not a
+ * validation: `apiGet` does not check the body against the schema, this is attacker-influenced data,
+ * and a node running an older engine can answer with a field missing. Absent must render as absent
+ * rather than crash the screen an operator opened to diagnose something else.
  */
-export type RecordedRequest = {
-  requestFrom?: string;
-  method?: string;
-  path?: string;
-  query?: Record<string, string>;
-  /**
-   * A single-valued header is a **bare string**, not a one-element array — see
-   * `multi_value_headers::serialize` in `rift-mock-core/src/imposter/types.rs`, which emits the
-   * scalar for `[single]` and an array only for `many`. Its deserializer also tolerates JSON
-   * numbers and booleans, because real recorded imposters carry `"Content-Length": 124`.
-   */
-  headers?: Record<string, unknown>;
-  body?: string;
-  /** `"base64"` when `body` is an encoded binary payload (`ResponseMode`); absent means text. */
-  _mode?: string;
-  timestamp?: string;
-};
+export type RecordedRequest = Partial<components["schemas"]["RecordedRequest"]>;
 
 /**
  * One header's values, whatever shape the wire used.

@@ -947,16 +947,38 @@ paths:
     get:
       operationId: listSavedRequests
       summary: List recorded requests for an imposter (upstream)
-      description: Node-local runtime state; not replicated (tracked by issue #16).
+      description: >
+        Answers a **bare JSON array** of recorded requests, oldest first — not
+        an envelope. Cursor metadata rides in the `x-rift-next-index` and
+        `x-rift-truncated` response headers instead of the body, which is what
+        keeps the array readable by clients written before cursoring existed.
+
+        `/imposters/{port}/requests` is an alias for this route: upstream
+        `router.rs` maps both spellings to the same handler, so the two
+        operations describe identical bytes and are kept identical here.
+
+        Node-local runtime state; not replicated (tracked by issue #16).
       tags: [upstream-core]
       x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/JournalSince'
+        - $ref: '#/components/parameters/JournalMatch'
       responses:
         '200':
-          description: Recorded requests.
+          description: Recorded requests, oldest first (bare array, not an envelope).
+          headers:
+            x-rift-next-index:
+              $ref: '#/components/headers/XRiftNextIndex'
+            x-rift-truncated:
+              $ref: '#/components/headers/XRiftTruncated'
           content:
             application/json:
               schema:
-                type: object
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordedRequest'
+        '400':
+          $ref: '#/components/responses/BadData'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -970,15 +992,24 @@ paths:
     delete:
       operationId: clearSavedRequests
       summary: Clear recorded requests for an imposter (upstream)
+      description: >
+        Clears the journal and answers the imposter's current state. Accepts
+        `match` — and only `match`, not `since` — so a clear can be narrowed
+        to the entries a filter selects; with no clause the whole journal is
+        dropped. Aliased as `DELETE /imposters/{port}/requests`.
       tags: [upstream-core]
       x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/JournalMatch'
       responses:
         '200':
-          description: Requests cleared.
+          description: Requests cleared; answers the imposter as it now stands.
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/Imposter'
+        '400':
+          $ref: '#/components/responses/BadData'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -996,31 +1027,76 @@ paths:
     get:
       operationId: listRequests
       summary: List matched requests for an imposter (upstream)
+      description: >
+        The alias spelling of `GET /imposters/{port}/savedRequests` — upstream
+        `router.rs` maps `["requests"]` and `["savedRequests"]` to the same
+        handler, so this answers the identical body and headers. Declared in
+        full rather than by reference because a generated client reads each
+        operation independently.
+
+        Answers a **bare JSON array** of recorded requests, oldest first — not
+        an envelope. Cursor metadata rides in the `x-rift-next-index` and
+        `x-rift-truncated` response headers instead of the body.
       tags: [upstream-core]
       x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/JournalSince'
+        - $ref: '#/components/parameters/JournalMatch'
       responses:
         '200':
-          description: Matched requests.
+          description: Matched requests, oldest first (bare array, not an envelope).
+          headers:
+            x-rift-next-index:
+              $ref: '#/components/headers/XRiftNextIndex'
+            x-rift-truncated:
+              $ref: '#/components/headers/XRiftTruncated'
           content:
             application/json:
               schema:
-                type: object
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordedRequest'
+        '400':
+          $ref: '#/components/responses/BadData'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     delete:
       operationId: clearRequests
       summary: Clear matched requests for an imposter (upstream)
+      description: >
+        The alias spelling of `DELETE /imposters/{port}/savedRequests` — the
+        same handler, so the same parameters, body and status codes.
       tags: [upstream-core]
       x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/JournalMatch'
       responses:
         '200':
-          description: Requests cleared.
+          description: Requests cleared; answers the imposter as it now stands.
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/Imposter'
+        '400':
+          $ref: '#/components/responses/BadData'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such imposter for this tenant, or owned by another tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /imposters/{port}/verify:
     parameters:
@@ -2771,6 +2847,40 @@ components:
       schema:
         type: string
         example: '1'
+    JournalSince:
+      name: since
+      in: query
+      required: false
+      description: >
+        Journal cursor: return only entries recorded at or after this index,
+        as previously reported by this endpoint's x-rift-next-index response
+        header. Absent means a baseline read of everything still retained.
+        Unlike the audit journal's forgiving `since`, an unparseable value
+        here answers 400 rather than taking a default — a cursor that
+        silently restarted at zero would re-deliver the whole journal as if
+        it were new traffic.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    JournalMatch:
+      name: match
+      in: query
+      required: false
+      style: form
+      explode: true
+      description: >
+        Repeatable filter clause; every clause supplied must match (AND).
+        The grammar is closed — `method=<Verb>`, `path=<Path>`,
+        `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside
+        it answers 400 rather than being ignored, because a filter that
+        silently degraded to "match everything" would cross-contaminate
+        correlated scenarios.
+      schema:
+        type: array
+        items:
+          type: string
+      example: ['method=POST', 'header:Content-Type=application/json']
 
   headers:
     RiftClusterRevision:
@@ -2803,6 +2913,29 @@ components:
       schema:
         type: string
         format: uuid
+    XRiftNextIndex:
+      description: >
+        The journal index to send as `since` on the next read to continue
+        exactly where this response stopped. Emitted only by a backend with
+        stable indices, and only on a complete cursor read — a degraded
+        partial read omits it. Its **presence is the protocol**: a client
+        probes for this header to discover whether cursoring is supported at
+        all, rather than assuming a default and paging against a backend that
+        cannot honour it (issue #603).
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    XRiftTruncated:
+      description: >
+        Present, with the value `true`, when retention evicted entries the
+        caller's `since` cursor had not yet read — the gap is unrecoverable
+        and the client has silently missed requests. Emitted **only** when
+        that is the case: there is no `false` form, so a client tests for the
+        header's presence and never parses its value.
+      schema:
+        type: boolean
+        enum: [true]
 
   responses:
     BadData:
@@ -2969,6 +3102,73 @@ components:
           items:
             type: object
             additionalProperties: true
+      additionalProperties: true
+
+    RecordedRequest:
+      type: object
+      description: >
+        One request an imposter recorded, exactly as the engine serializes it
+        (upstream `rift-mock-core::imposter::types::RecordedRequest`).
+        Non-exhaustive.
+
+        Three fields do not follow the obvious Rust-to-JSON mapping, and each
+        one has bitten a client. `_mode` keeps its leading underscore — an
+        explicit serde rename that overrides the struct's camelCase rule — and
+        is omitted entirely for a text body, so `binary` is the only value that
+        ever reaches the wire. `body` is absent when the request carried none.
+        And a `headers` value is a **bare string** when the header carried a
+        single value, an array only when it carried several; a key whose value
+        list is empty is dropped rather than emitted as `[]`.
+      required: [requestFrom, method, path, query, headers, timestamp]
+      properties:
+        requestFrom:
+          type: string
+          description: The client address the request arrived from.
+          example: '127.0.0.1:54321'
+        method:
+          type: string
+          example: GET
+        path:
+          type: string
+          example: /users/42
+        query:
+          type: object
+          additionalProperties:
+            type: string
+          description: >
+            Decoded query parameters. Always present; an empty object when the
+            request had none.
+        headers:
+          type: object
+          description: >
+            Request headers. A single-valued header is a bare string, not a
+            one-element array (upstream `multi_value_headers::serialize`). On
+            the way in the engine additionally tolerates JSON numbers and
+            booleans for Mountebank compatibility, but it always serializes
+            strings back out.
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: array
+                items:
+                  type: string
+        body:
+          type: string
+          description: >
+            The request body, absent when there was none. Base64-encoded when
+            `_mode` is `binary`; UTF-8 text otherwise.
+        _mode:
+          type: string
+          enum: [binary]
+          description: >
+            Present only when `body` is base64-encoded binary (upstream issue
+            #636). A text body omits this field, which is why `text` never
+            appears on the wire even though it is the underlying default —
+            absence means text.
+        timestamp:
+          type: string
+          format: date-time
+          description: RFC 3339, as produced by the engine's `Utc::now().to_rfc3339()`.
       additionalProperties: true
 
     RouteTable:

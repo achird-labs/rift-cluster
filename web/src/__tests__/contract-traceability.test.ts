@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { API_PATHS, imposterPath, lifecyclePath } from "../api/paths.ts";
+import { API_PATHS, imposterPath, lifecyclePath, requestsPath } from "../api/paths.ts";
 import { FLEET_HEALTH_FIELDS, FLEET_MEMBER_FIELDS, IMPOSTER_COLUMNS } from "../app/contract.ts";
 
 const SRC = new URL("..", import.meta.url).pathname;
@@ -77,6 +77,19 @@ describe("every displayed field is traceable to the contract", () => {
     }
   });
 
+  it("declares the recorded-request fields the request log renders", () => {
+    // The request log used to hand-write this shape, because the contract declared the response as
+    // an untyped `object` and the generated client gave it nothing to import (#212). Deriving the
+    // type only helps if the contract keeps carrying the fields — a regression to `type: object`
+    // would leave `Partial<RecordedRequest>` as an empty type that still compiles everywhere.
+    for (const field of ["requestFrom", "method", "path", "query", "headers", "timestamp"]) {
+      expect([field, declares("RecordedRequest", field)]).toEqual([field, true]);
+    }
+    // The two the engine omits rather than nulls, which is why they are optional on the wire.
+    expect(declares("RecordedRequest", "body")).toBe(true);
+    expect(declares("RecordedRequest", "_mode")).toBe(true);
+  });
+
   it("renders no field the prototype invented but the contract does not carry", () => {
     // `numberOfRequests` drove the prototype's one chart. It is not a declared `Imposter` property —
     // it would arrive only through the index signature — so C4 does not render it. This test is the
@@ -100,7 +113,12 @@ describe("the client is the only door to the network", () => {
     // `API_PATHS` is typed as `ApiPath`, so for those this is belt-and-braces on the compiler. The
     // builders are where it earns its keep: they return `string`, so nothing but this checks that
     // the port is interpolated into a route the contract actually declares.
-    const built = [imposterPath(4545), lifecyclePath(4545, true), lifecyclePath(4545, false)];
+    const built = [
+      imposterPath(4545),
+      lifecyclePath(4545, true),
+      lifecyclePath(4545, false),
+      requestsPath(4545),
+    ];
     for (const path of [...Object.values(API_PATHS), ...built]) {
       const template = path.replace(/\/\d+(?=\/|$)/, "/{port}");
       expect([path, CONTRACT.includes(`"${template}": {`)]).toEqual([path, true]);
