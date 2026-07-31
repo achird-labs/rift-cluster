@@ -803,6 +803,78 @@ mod tests {
         );
     }
 
+    /// The gate #216 closes. A schema that says `type: object` and nothing else tells a generated
+    /// client nothing — `openapi-typescript` renders it `Record<string, never>` — and 19 of them
+    /// rode through the route-parity era precisely because nothing looked at schema *shape*. A
+    /// shapeless schema here is one whose map carries no shape signal at all: no `properties`, no
+    /// `items`, no `$ref`, and no `additionalProperties` — the last because
+    /// `{type: object, additionalProperties: true}` is a *declared decision* that a body is
+    /// free-form, which is a different thing from never having decided.
+    #[test]
+    fn no_operation_ships_a_shapeless_object_schema() {
+        let doc = parsed();
+        let mut offenders = Vec::new();
+
+        let shapeless = |schema: &serde_json::Value| -> bool {
+            let Some(map) = schema.as_object() else {
+                return false;
+            };
+            map.get("type").and_then(serde_json::Value::as_str) == Some("object")
+                && !map.contains_key("properties")
+                && !map.contains_key("additionalProperties")
+                && !map.contains_key("$ref")
+                && !map.contains_key("items")
+                && !map.contains_key("oneOf")
+                && !map.contains_key("anyOf")
+                && !map.contains_key("allOf")
+        };
+
+        let mut check = |path: &str, op: &str, where_: &str, media: &serde_json::Value| {
+            if let Some(schema) = media.get("schema")
+                && shapeless(schema)
+            {
+                offenders.push(format!("{op} {path} ({where_})"));
+            }
+        };
+
+        let paths = doc
+            .get("paths")
+            .and_then(serde_json::Value::as_object)
+            .expect("paths");
+        for (path, item) in paths {
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            for (method, op) in item {
+                let Some(op) = op.as_object() else { continue };
+                if let Some(body) = op
+                    .get("requestBody")
+                    .and_then(|b| b.get("content"))
+                    .and_then(|c| c.get("application/json"))
+                {
+                    check(path, method, "requestBody", body);
+                }
+                if let Some(responses) = op.get("responses").and_then(serde_json::Value::as_object)
+                {
+                    for (status, response) in responses {
+                        if let Some(media) = response
+                            .get("content")
+                            .and_then(|c| c.get("application/json"))
+                        {
+                            check(path, method, &format!("response {status}"), media);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "shapeless `type: object` schemas — declare the real shape, or make free-form explicit              with `additionalProperties: true` and a description saying why:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     fn journal_read_200<'a>(doc: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
         doc.get("paths")
             .and_then(|p| p.get(path))

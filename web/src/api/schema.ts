@@ -266,7 +266,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Run declared-expectation verification against recorded requests (upstream) */
+        /**
+         * Run declared-expectation verification against recorded requests (upstream)
+         * @description Counts — and optionally returns — the recorded requests matching a predicate set, so an SDK's `verify(match, times(n))` defers to the engine's own matcher instead of shipping the whole journal over the wire and re-evaluating predicates client-side. Every field of the body is optional, but the body itself is not: the handler parses the bytes it collected, so `{}` is the empty verification and a wholly absent body answers `400`.
+         */
         post: operations["verifyImposter"];
         delete?: never;
         options?: never;
@@ -287,7 +290,10 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Clear saved proxy responses for an imposter (upstream) */
+        /**
+         * Clear saved proxy responses for an imposter (upstream)
+         * @description Having cleared the saved proxy responses, the handler delegates to the single-imposter read and answers *its* body — so the response is an `Imposter`, not a receipt for the deletion, exactly as `clearRequests` behaves.
+         */
         delete: operations["clearSavedProxyResponses"];
         options?: never;
         head?: never;
@@ -304,7 +310,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List scenario FSM state for an imposter (upstream) */
+        /**
+         * List scenario FSM state for an imposter (upstream)
+         * @description Scenario state is per correlated-isolation space, so the answer always names the `flowId` it was read under — the one the `flowId` query parameter selected, or the imposter's own default when it was omitted.
+         */
         get: operations["listScenarios"];
         put?: never;
         post?: never;
@@ -326,7 +335,10 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Set a scenario's FSM state (upstream) */
+        /**
+         * Set a scenario's FSM state (upstream)
+         * @description Writes one scenario's state within one space. `flowId` selects the space; omitted, the write lands on the imposter's default flow, so a caller that means to steer one correlated scenario should always send it. Keys beyond the two named here are ignored rather than refused.
+         */
         put: operations["setScenarioState"];
         post?: never;
         delete?: never;
@@ -347,7 +359,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Reset every scenario's FSM state for an imposter (upstream) */
+        /**
+         * Reset every scenario's FSM state for an imposter (upstream)
+         * @description Resets every scenario, but only within **one** space — the `flowId` sent, or the imposter's default flow. Never a global reset across flows.
+         */
         post: operations["resetScenarios"];
         delete?: never;
         options?: never;
@@ -367,7 +382,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Read one correlated-isolation space (upstream) */
+        /**
+         * Read one correlated-isolation space (upstream)
+         * @description The whole of one space in a single read: its scoped stubs, every scenario's state within it, and how many recorded requests resolved to it.
+         */
         get: operations["getSpace"];
         put?: never;
         post?: never;
@@ -416,7 +434,10 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Clear all flow-state entries for a space (upstream) */
+        /**
+         * Clear all flow-state entries for a space (upstream)
+         * @description Idempotent: clearing a flow that holds nothing (or was never written) still answers `200`. The `404` is about the imposter, never about the flow.
+         */
         delete: operations["clearFlowState"];
         options?: never;
         head?: never;
@@ -1265,6 +1286,128 @@ export interface components {
             /** @description The admin API key, or a minted principal's API key — the same credential `apiKeyAuth` accepts as a bearer, exchanged here once for a session cookie instead of sent on every request. */
             apiKey: string;
         };
+        /** @description A Mountebank-shaped hypermedia link: an object carrying `href` and nothing else. Named as a component because the upstream system routes (`getRoot`, `getLogs`) emit the same one-key object in several places and a client should get one type for all of them. */
+        Link: {
+            /** @description Absolute where the handler knows its own base URL (`getRoot`), path-relative where it does not (`getLogs`). Treat it as a URL reference to resolve, not as a guaranteed absolute URL. */
+            href: string;
+        };
+        /** @description One scenario's FSM state within one space. Scenario state is always per-flow, so an entry is only meaningful next to the `flowId` (or `space`) its enclosing response names. */
+        ScenarioEntry: {
+            /** @description The scenario name, as stubs declare it in `scenarioName`. */
+            name: string;
+            /** @description Its current state in this flow — the imposter's initial state until something moves it. */
+            state: string;
+        };
+        /** @description One flow-state key/value pair, echoed identically by the read and the write (`getFlowStateEntry`, `putFlowStateEntry`) — one component because the two bodies are the same object, and letting them drift apart in the contract would invent a difference the handler does not have. */
+        FlowStateEntry: {
+            /** @description The space the entry belongs to (the path segment, echoed). */
+            flowId: string;
+            key: string;
+            /** @description The stored value: **any** JSON — object, array, string, number, boolean or `null`. Deliberately left unconstrained rather than declared `type: object`, because flow state is a scratchpad for correlated scenarios and a scalar is as valid as a document. */
+            value: unknown;
+        };
+        /** @description The `POST /imposters/{port}/verify` request body. Every field is optional — `{}` verifies with no predicates, which counts everything in scope — but the body itself must be present and must be JSON. */
+        VerifyOptions: {
+            /** @description Predicate clauses, AND'd together, in the same grammar a stub's `predicates` use — the engine evaluates them with the one true matcher rather than a verification-only reimplementation. An `inject` clause needs `--allowInjection`, or the request answers `400`. */
+            predicates?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Scope the count to one space. Absent, every recorded request is in scope. */
+            flowId?: string;
+            /**
+             * @description Return the matching requests themselves, not just the count.
+             * @default false
+             */
+            includeRequests: boolean;
+            /**
+             * @description Return the best-scoring non-match with the clauses it failed, for diff rendering.
+             * @default false
+             */
+            includeClosest: boolean;
+        };
+        /** @description A verification result (upstream `rift-mock-core`'s `VerifyOutcome`, issue #494). `requests` and `closest` are `skip_serializing_if` fields: each is absent unless the corresponding option asked for it, so neither is `required` here. */
+        VerifyOutcome: {
+            /** @description Recorded requests in scope satisfying every predicate. */
+            matched: number;
+            /** @description Recorded requests in scope, matched or not — the denominator for `matched`. */
+            total: number;
+            /** @description The matching requests. Present only when `includeRequests` was set. */
+            requests?: components["schemas"]["RecordedRequest"][];
+            /** @description Present only when `includeClosest` was set **and** a non-matching request existed to be closest — a verification where everything in scope matched carries no `closest`. */
+            closest?: components["schemas"]["ClosestMatch"];
+        };
+        /** @description The non-matching request that satisfied the most predicate clauses, with the clauses it failed. */
+        ClosestMatch: {
+            request: components["schemas"]["RecordedRequest"];
+            failedPredicates: components["schemas"]["FailedPredicate"][];
+        };
+        /** @description One predicate the closest request failed, paired with what the request actually carried for the fields that predicate references — the raw material for a readable diff. */
+        FailedPredicate: {
+            /** @description The clause, echoed in the same shape it was sent. */
+            predicate: {
+                [key: string]: unknown;
+            };
+            /** @description What the request actually held for the fields the clause names. Any JSON — a string for a scalar field, an object for `headers` or `query`, `null` where the request carried nothing — so it is left unconstrained rather than pinned to one type. */
+            actual: unknown;
+        };
+        /** @description The engine's effective startup configuration (`GET /config`, Mountebank-compatible). Fully enumerable: the handler builds one fixed document, and every key below is always present. */
+        NodeConfig: {
+            /** @description The engine crate's version. */
+            version: string;
+            /** @description The build's git commit, stamped at compile time. **Null** — not absent — on a build where the stamp was not set (an `option_env!`, so a plain `cargo build` yields null). */
+            commit: string | null;
+            /** @description The Mountebank-shaped options block; existing Mountebank clients parse this object. */
+            options: {
+                /** @description The port the admin plane actually bound, not the default it would have used. */
+                port: number;
+                allowInjection: boolean;
+                /** @description Whether `--local-only` was set — the flag itself, not "did the admin plane happen to bind loopback". A bind-derived value would overstate isolation on a node whose imposter ports are still on every interface. */
+                localOnly: boolean;
+                /** @description Always the single-element list `["*"]`. `--ip-whitelist` is accepted and **never enforced**, so every address may connect; echoing the supplied list here would re-create exactly the false assurance that reporting `*` exists to avoid. Do not render this as an active allow-list. */
+                ipWhitelist: string[];
+            };
+            /** @description The capability list a client feature-detects on: the serve options this engine understands. Its *contents* are deliberately not enumerated here — the whole point is that a client tests for membership rather than assuming a fixed set, and an absent field means an engine too old to report capabilities at all. */
+            serveOptions: string[];
+            /** @description Mountebank's process block, kept shape-compatible so its clients keep parsing. Several members are honest placeholders rather than measurements. */
+            process: {
+                /**
+                 * @description Always this literal — there is no Node runtime; the key exists only for Mountebank shape-compatibility.
+                 * @enum {string}
+                 */
+                nodeVersion: "N/A (Rust)";
+                /** @example aarch64 */
+                architecture: string;
+                /** @example macos */
+                platform: string;
+                /** @description Always `0` — a Mountebank-shaped placeholder, not a measurement. Do not chart it. */
+                rss: number;
+                /** @description Always `0`; see `rss`. */
+                heapTotal: number;
+                /** @description Always `0`; see `rss`. */
+                heapUsed: number;
+                /** @description Always `0`; see `rss` — process uptime is not tracked here. */
+                uptime: number;
+                /** @description The process working directory; the empty string when it cannot be read. */
+                cwd: string;
+            };
+        };
+        /** @description The result of `POST /admin/reload`. Only `message` is guaranteed: a node with no configured config source answers a message alone ("nothing to reload") and no counters, while a node that reconciled answers the message plus the four counts. `warnings` is additive and appears only when there is something to warn about. */
+        ReloadOutcome: {
+            /** @description Human-readable outcome — what was reloaded, or why nothing was. */
+            message: string;
+            /** @description Imposters created by this reload. Absent when no config source is configured. */
+            created?: number;
+            /** @description Imposters replaced wholesale. Absent when no config source is configured. */
+            replaced?: number;
+            /** @description Imposters whose stubs were patched in place, keeping runtime state (recorded requests, scenario state, response cyclers). Absent when no config source is configured. */
+            stubPatched?: number;
+            /** @description Imposters removed. Absent when no config source is configured. */
+            deleted?: number;
+            /** @description Non-fatal notes about the reload — e.g. that a boot-only `intercept` block in the source was deliberately not re-applied. Absent entirely when empty, never `[]`. */
+            warnings?: string[];
+        } & {
+            [key: string]: unknown;
+        };
     };
     responses: {
         /** @description Malformed or semantically invalid request (e.g. missing required port, If-Match on a collection route). */
@@ -1372,6 +1515,8 @@ export interface components {
         PrincipalId: string;
         /** @description A correlated-isolation space's flow id. */
         FlowId: string;
+        /** @description A correlated-isolation space's flow id, selected by query string rather than path. Absent, the imposter resolves its own default flow and the response says which one it used. A separate component from `FlowId` on purpose: that one is `in: path` and required, and the two locations are not interchangeable. */
+        FlowIdQuery: string;
         /** @description An op id, as minted for a terminated write (`Rift-Cluster-Op-Id`) or an `AcceptedParked` `202`'s body. A malformed id names no op the same way an unknown one does — both answer `404`, not `400`, so a probe cannot tell "badly formed" from "never existed". */
         OpId: string;
         /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
@@ -2434,7 +2579,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VerifyOptions"];
+            };
+        };
         responses: {
             /** @description Verification result. */
             200: {
@@ -2442,7 +2591,16 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["VerifyOutcome"];
+                };
+            };
+            /** @description Unparseable body, an `inject` predicate sent while `--allowInjection` is off (the same gate the stub doors apply), or an `inject` predicate that failed while evaluating. The last is a `400` and not a `500` on purpose — the script that failed is the caller's. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2470,13 +2628,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Cleared. */
+            /** @description Cleared; answers the imposter as it now stands. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["Imposter"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2494,7 +2652,10 @@ export interface operations {
     };
     listScenarios: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description A correlated-isolation space's flow id, selected by query string rather than path. Absent, the imposter resolves its own default flow and the response says which one it used. A separate component from `FlowId` on purpose: that one is `in: path` and required, and the two locations are not interchangeable. */
+                flowId?: components["parameters"]["FlowIdQuery"];
+            };
             header?: never;
             path: {
                 /** @description The imposter's port number. */
@@ -2504,13 +2665,17 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Scenario states. */
+            /** @description Scenario states, for the flow named in the body. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        /** @description The flow the states were read under; echoed so a caller that sent none learns the default. */
+                        flowId: string;
+                        scenarios: components["schemas"]["ScenarioEntry"][];
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2539,17 +2704,28 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": Record<string, never>;
+                "application/json": {
+                    /** @description The state to move the scenario to. Absent answers `400` ("missing required field", naming `state`). */
+                    state: string;
+                    /** @description Which space's slice of the scenario to write. Absent means the imposter's default flow. */
+                    flowId?: string;
+                };
             };
         };
         responses: {
-            /** @description State set. */
+            /** @description State set; the write echoed back as it was applied. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        /** @description The flow actually written — the resolved default when the request sent none. */
+                        flowId: string;
+                        /** @description The scenario named in the path. */
+                        name: string;
+                        state: string;
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2576,15 +2752,31 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description Optional. An entirely empty body is accepted and resets the imposter's default flow; a non-empty body that is not JSON answers `400` rather than being ignored. */
+        requestBody?: {
+            content: {
+                "application/json": {
+                    /** @description Which space to reset. Absent means the imposter's default flow. */
+                    flowId?: string;
+                };
+            };
+        };
         responses: {
-            /** @description Reset. */
+            /** @description Reset, for the flow named in the body. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        /** @description The flow actually reset — the resolved default when the request named none. */
+                        flowId: string;
+                        /**
+                         * @description Always `true`: the handler only reaches this body after every scenario was cleared, and any failure answers an error status instead. Pinned to the literal so a client does not write a branch for a `false` that cannot arrive.
+                         * @enum {boolean}
+                         */
+                        reset: true;
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2620,7 +2812,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        /** @description The flow id this space is keyed by (the path segment, echoed). */
+                        space: string;
+                        /** @description The stubs scoped to this space, as raw `Stub` objects — no `_links` envelope, unlike the imposter reads. */
+                        stubs: components["schemas"]["Stub"][];
+                        scenarios: components["schemas"]["ScenarioEntry"][];
+                        /** @description Recorded requests whose resolved flow id is this space. */
+                        numberOfRequests: number;
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2656,7 +2856,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        /** @description The flow id torn down (the path segment, echoed). */
+                        space: string;
+                        /**
+                         * @description Always `true`: this body is only built after the teardown succeeded, and a failure answers an error status instead. Pinned to the literal so no client writes a branch for a `false` that cannot arrive.
+                         * @enum {boolean}
+                         */
+                        tornDown: true;
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2771,7 +2979,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        /** @description The flow cleared (the path segment, echoed). */
+                        flowId: string;
+                        /**
+                         * @description Always `true`: the body is built only on success, and because the clear is idempotent even an empty flow reaches it. Pinned to the literal so no client branches on a `false` that cannot arrive.
+                         * @enum {boolean}
+                         */
+                        cleared: true;
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2809,7 +3025,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["FlowStateEntry"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2841,17 +3057,20 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": Record<string, never>;
+                "application/json": {
+                    /** @description The value to store — any JSON, including `null`. The handler tests for the key's *presence*, so an explicit `"value": null` stores null, while omitting the key answers `400` ("missing required field: value"). Keys beyond `value` are ignored. */
+                    value: unknown;
+                };
             };
         };
         responses: {
-            /** @description Written. */
+            /** @description Written; the stored entry echoed back. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["FlowStateEntry"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2890,7 +3109,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        flowId: string;
+                        key: string;
+                        /**
+                         * @description Always `true`: the body is built only after the delete succeeded, and a failure answers an error status instead. Pinned to the literal so no client branches on a `false` that cannot arrive.
+                         * @enum {boolean}
+                         */
+                        deleted: true;
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -3697,7 +3924,9 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -3867,13 +4096,19 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Upstream's own root response. */
+            /** @description Upstream's own root response: a Mountebank-shaped discovery document and nothing else — three links, no node identity, no version. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        _links: {
+                            imposters: components["schemas"]["Link"];
+                            config: components["schemas"]["Link"];
+                            logs: components["schemas"]["Link"];
+                        };
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -3904,7 +4139,13 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        /**
+                         * @description Always the literal `ok`. This is a liveness probe with no dependency checks behind it — the handler builds one constant body, so an unhealthy node fails to answer at all rather than answering some other status here.
+                         * @enum {string}
+                         */
+                        status: "ok";
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -3935,7 +4176,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["NodeConfig"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -3953,7 +4194,12 @@ export interface operations {
     };
     getLogs: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description First log index to return. Defaults to `0`. An unparseable value is **silently defaulted**, not refused — the handler parses with a fallback and never answers `400` for this parameter. Harmless only because the window it selects is advisory today (see the `200`); treat it as a hint, not a guarantee. */
+                startIndex?: number;
+                /** @description Last log index to return. Defaults to `100`. Silently defaulted on an unparseable value, exactly as `startIndex` is. */
+                endIndex?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -3966,7 +4212,14 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        /** @description **Always empty today.** The endpoint exists for Mountebank compatibility, but no in-process log buffer is wired to it, so the handler emits a literal `[]` whatever the index window says. Element shape is left unconstrained rather than invented: nothing has ever been served here, so any properties declared would be a guess. */
+                        logs: unknown[];
+                        _links: {
+                            /** @description Echoes the resolved window — `/logs?startIndex=…&endIndex=…` — with the defaults filled in, which is the only way to see what a silently-defaulted parameter became. */
+                            self: components["schemas"]["Link"];
+                        };
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -4028,7 +4281,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["ReloadOutcome"];
                 };
             };
             401: components["responses"]["Unauthorized"];

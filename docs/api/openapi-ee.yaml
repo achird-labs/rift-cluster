@@ -1115,15 +1115,40 @@ paths:
     post:
       operationId: verifyImposter
       summary: Run declared-expectation verification against recorded requests (upstream)
+      description: >
+        Counts — and optionally returns — the recorded requests matching a
+        predicate set, so an SDK's `verify(match, times(n))` defers to the
+        engine's own matcher instead of shipping the whole journal over the
+        wire and re-evaluating predicates client-side. Every field of the
+        body is optional, but the body itself is not: the handler parses the
+        bytes it collected, so `{}` is the empty verification and a wholly
+        absent body answers `400`.
       tags: [upstream-core]
       x-rift-origin: upstream
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyOptions'
       responses:
         '200':
           description: Verification result.
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/VerifyOutcome'
+        '400':
+          description: >
+            Unparseable body, an `inject` predicate sent while
+            `--allowInjection` is off (the same gate the stub doors apply),
+            or an `inject` predicate that failed while evaluating. The last
+            is a `400` and not a `500` on purpose — the script that failed
+            is the caller's.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1141,15 +1166,20 @@ paths:
     delete:
       operationId: clearSavedProxyResponses
       summary: Clear saved proxy responses for an imposter (upstream)
+      description: >
+        Having cleared the saved proxy responses, the handler delegates to
+        the single-imposter read and answers *its* body — so the response is
+        an `Imposter`, not a receipt for the deletion, exactly as
+        `clearRequests` behaves.
       tags: [upstream-core]
       x-rift-origin: upstream
       responses:
         '200':
-          description: Cleared.
+          description: Cleared; answers the imposter as it now stands.
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/Imposter'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1167,15 +1197,31 @@ paths:
     get:
       operationId: listScenarios
       summary: List scenario FSM state for an imposter (upstream)
+      description: >
+        Scenario state is per correlated-isolation space, so the answer
+        always names the `flowId` it was read under — the one the `flowId`
+        query parameter selected, or the imposter's own default when it was
+        omitted.
       tags: [upstream-core]
       x-rift-origin: upstream
+      parameters:
+        - $ref: '#/components/parameters/FlowIdQuery'
       responses:
         '200':
-          description: Scenario states.
+          description: Scenario states, for the flow named in the body.
           content:
             application/json:
               schema:
                 type: object
+                required: [flowId, scenarios]
+                properties:
+                  flowId:
+                    type: string
+                    description: The flow the states were read under; echoed so a caller that sent none learns the default.
+                  scenarios:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ScenarioEntry'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1198,6 +1244,11 @@ paths:
     put:
       operationId: setScenarioState
       summary: Set a scenario's FSM state (upstream)
+      description: >
+        Writes one scenario's state within one space. `flowId` selects the
+        space; omitted, the write lands on the imposter's default flow, so a
+        caller that means to steer one correlated scenario should always send
+        it. Keys beyond the two named here are ignored rather than refused.
       tags: [upstream-core]
       x-rift-origin: upstream
       requestBody:
@@ -1206,13 +1257,33 @@ paths:
           application/json:
             schema:
               type: object
+              required: [state]
+              properties:
+                state:
+                  type: string
+                  description: >
+                    The state to move the scenario to. Absent answers `400`
+                    ("missing required field", naming `state`).
+                flowId:
+                  type: string
+                  description: Which space's slice of the scenario to write. Absent means the imposter's default flow.
       responses:
         '200':
-          description: State set.
+          description: State set; the write echoed back as it was applied.
           content:
             application/json:
               schema:
                 type: object
+                required: [flowId, name, state]
+                properties:
+                  flowId:
+                    type: string
+                    description: The flow actually written — the resolved default when the request sent none.
+                  name:
+                    type: string
+                    description: The scenario named in the path.
+                  state:
+                    type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1232,15 +1303,46 @@ paths:
     post:
       operationId: resetScenarios
       summary: Reset every scenario's FSM state for an imposter (upstream)
+      description: >
+        Resets every scenario, but only within **one** space — the `flowId`
+        sent, or the imposter's default flow. Never a global reset across
+        flows.
       tags: [upstream-core]
       x-rift-origin: upstream
+      requestBody:
+        required: false
+        description: >
+          Optional. An entirely empty body is accepted and resets the
+          imposter's default flow; a non-empty body that is not JSON answers
+          `400` rather than being ignored.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                flowId:
+                  type: string
+                  description: Which space to reset. Absent means the imposter's default flow.
       responses:
         '200':
-          description: Reset.
+          description: Reset, for the flow named in the body.
           content:
             application/json:
               schema:
                 type: object
+                required: [flowId, reset]
+                properties:
+                  flowId:
+                    type: string
+                    description: The flow actually reset — the resolved default when the request named none.
+                  reset:
+                    type: boolean
+                    enum: [true]
+                    description: >
+                      Always `true`: the handler only reaches this body after
+                      every scenario was cleared, and any failure answers an
+                      error status instead. Pinned to the literal so a client
+                      does not write a branch for a `false` that cannot arrive.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1259,6 +1361,10 @@ paths:
     get:
       operationId: getSpace
       summary: Read one correlated-isolation space (upstream)
+      description: >
+        The whole of one space in a single read: its scoped stubs, every
+        scenario's state within it, and how many recorded requests resolved
+        to it.
       tags: [upstream-core]
       x-rift-origin: upstream
       responses:
@@ -1268,6 +1374,25 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [space, stubs, scenarios, numberOfRequests]
+                properties:
+                  space:
+                    type: string
+                    description: The flow id this space is keyed by (the path segment, echoed).
+                  stubs:
+                    type: array
+                    description: >
+                      The stubs scoped to this space, as raw `Stub` objects —
+                      no `_links` envelope, unlike the imposter reads.
+                    items:
+                      $ref: '#/components/schemas/Stub'
+                  scenarios:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ScenarioEntry'
+                  numberOfRequests:
+                    type: integer
+                    description: Recorded requests whose resolved flow id is this space.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1290,6 +1415,19 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [space, tornDown]
+                properties:
+                  space:
+                    type: string
+                    description: The flow id torn down (the path segment, echoed).
+                  tornDown:
+                    type: boolean
+                    enum: [true]
+                    description: >
+                      Always `true`: this body is only built after the
+                      teardown succeeded, and a failure answers an error
+                      status instead. Pinned to the literal so no client
+                      writes a branch for a `false` that cannot arrive.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1370,6 +1508,10 @@ paths:
     delete:
       operationId: clearFlowState
       summary: Clear all flow-state entries for a space (upstream)
+      description: >
+        Idempotent: clearing a flow that holds nothing (or was never
+        written) still answers `200`. The `404` is about the imposter, never
+        about the flow.
       tags: [upstream-core]
       x-rift-origin: upstream
       responses:
@@ -1379,6 +1521,19 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [flowId, cleared]
+                properties:
+                  flowId:
+                    type: string
+                    description: The flow cleared (the path segment, echoed).
+                  cleared:
+                    type: boolean
+                    enum: [true]
+                    description: >
+                      Always `true`: the body is built only on success, and
+                      because the clear is idempotent even an empty flow
+                      reaches it. Pinned to the literal so no client branches
+                      on a `false` that cannot arrive.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1411,7 +1566,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FlowStateEntry'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1433,13 +1588,22 @@ paths:
           application/json:
             schema:
               type: object
+              required: [value]
+              properties:
+                value:
+                  description: >
+                    The value to store — any JSON, including `null`. The
+                    handler tests for the key's *presence*, so an explicit
+                    `"value": null` stores null, while omitting the key
+                    answers `400` ("missing required field: value"). Keys
+                    beyond `value` are ignored.
       responses:
         '200':
-          description: Written.
+          description: Written; the stored entry echoed back.
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FlowStateEntry'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1464,6 +1628,20 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [flowId, key, deleted]
+                properties:
+                  flowId:
+                    type: string
+                  key:
+                    type: string
+                  deleted:
+                    type: boolean
+                    enum: [true]
+                    description: >
+                      Always `true`: the body is built only after the delete
+                      succeeded, and a failure answers an error status
+                      instead. Pinned to the literal so no client branches on
+                      a `false` that cannot arrive.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2332,6 +2510,16 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: true
+                description: >
+                  Free-form by design, and the one place in this document
+                  where that is not a gap: the body is an arbitrary OpenAPI
+                  3.1 document — this very document, served as JSON. Pinning
+                  its properties here would mean restating the OpenAPI
+                  meta-schema inside an OpenAPI document, and the restatement
+                  would rot the moment the spec version moved. Consumers
+                  should parse it with an OpenAPI parser, not a generated
+                  type.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -2566,11 +2754,26 @@ paths:
       x-rift-origin: upstream
       responses:
         '200':
-          description: Upstream's own root response.
+          description: >
+            Upstream's own root response: a Mountebank-shaped discovery
+            document and nothing else — three links, no node identity, no
+            version.
           content:
             application/json:
               schema:
                 type: object
+                required: [_links]
+                properties:
+                  _links:
+                    type: object
+                    required: [imposters, config, logs]
+                    properties:
+                      imposters:
+                        $ref: '#/components/schemas/Link'
+                      config:
+                        $ref: '#/components/schemas/Link'
+                      logs:
+                        $ref: '#/components/schemas/Link'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2603,6 +2806,16 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                    description: >
+                      Always the literal `ok`. This is a liveness probe with
+                      no dependency checks behind it — the handler builds one
+                      constant body, so an unhealthy node fails to answer at
+                      all rather than answering some other status here.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2634,7 +2847,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/NodeConfig'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2660,6 +2873,30 @@ paths:
         (RFC-002 §8.4).
       tags: [upstream-core]
       x-rift-origin: upstream
+      parameters:
+        - name: startIndex
+          in: query
+          required: false
+          description: >
+            First log index to return. Defaults to `0`. An unparseable value
+            is **silently defaulted**, not refused — the handler parses with
+            a fallback and never answers `400` for this parameter. Harmless
+            only because the window it selects is advisory today (see the
+            `200`); treat it as a hint, not a guarantee.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: endIndex
+          in: query
+          required: false
+          description: >
+            Last log index to return. Defaults to `100`. Silently defaulted
+            on an unparseable value, exactly as `startIndex` is.
+          schema:
+            type: integer
+            minimum: 0
+            default: 100
       responses:
         '200':
           description: Log entries.
@@ -2667,6 +2904,31 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [logs, _links]
+                properties:
+                  logs:
+                    type: array
+                    description: >
+                      **Always empty today.** The endpoint exists for
+                      Mountebank compatibility, but no in-process log buffer
+                      is wired to it, so the handler emits a literal `[]`
+                      whatever the index window says. Element shape is left
+                      unconstrained rather than invented: nothing has ever
+                      been served here, so any properties declared would be
+                      a guess.
+                    items: {}
+                  _links:
+                    type: object
+                    required: [self]
+                    properties:
+                      self:
+                        allOf:
+                          - $ref: '#/components/schemas/Link'
+                        description: >
+                          Echoes the resolved window —
+                          `/logs?startIndex=…&endIndex=…` — with the defaults
+                          filled in, which is the only way to see what a
+                          silently-defaulted parameter became.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2730,7 +2992,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/ReloadOutcome'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2864,6 +3126,18 @@ components:
       in: path
       required: true
       description: A correlated-isolation space's flow id.
+      schema:
+        type: string
+    FlowIdQuery:
+      name: flowId
+      in: query
+      required: false
+      description: >
+        A correlated-isolation space's flow id, selected by query string
+        rather than path. Absent, the imposter resolves its own default flow
+        and the response says which one it used. A separate component from
+        `FlowId` on purpose: that one is `in: path` and required, and the two
+        locations are not interchangeable.
       schema:
         type: string
     OpId:
@@ -3707,3 +3981,272 @@ components:
             The admin API key, or a minted principal's API key — the same
             credential `apiKeyAuth` accepts as a bearer, exchanged here
             once for a session cookie instead of sent on every request.
+
+    Link:
+      type: object
+      description: >
+        A Mountebank-shaped hypermedia link: an object carrying `href` and
+        nothing else. Named as a component because the upstream system
+        routes (`getRoot`, `getLogs`) emit the same one-key object in
+        several places and a client should get one type for all of them.
+      required: [href]
+      properties:
+        href:
+          type: string
+          description: >
+            Absolute where the handler knows its own base URL (`getRoot`),
+            path-relative where it does not (`getLogs`). Treat it as a URL
+            reference to resolve, not as a guaranteed absolute URL.
+
+    ScenarioEntry:
+      type: object
+      description: >
+        One scenario's FSM state within one space. Scenario state is always
+        per-flow, so an entry is only meaningful next to the `flowId` (or
+        `space`) its enclosing response names.
+      required: [name, state]
+      properties:
+        name:
+          type: string
+          description: The scenario name, as stubs declare it in `scenarioName`.
+        state:
+          type: string
+          description: Its current state in this flow — the imposter's initial state until something moves it.
+
+    FlowStateEntry:
+      type: object
+      description: >
+        One flow-state key/value pair, echoed identically by the read and
+        the write (`getFlowStateEntry`, `putFlowStateEntry`) — one component
+        because the two bodies are the same object, and letting them drift
+        apart in the contract would invent a difference the handler does not
+        have.
+      required: [flowId, key, value]
+      properties:
+        flowId:
+          type: string
+          description: The space the entry belongs to (the path segment, echoed).
+        key:
+          type: string
+        value:
+          description: >
+            The stored value: **any** JSON — object, array, string, number,
+            boolean or `null`. Deliberately left unconstrained rather than
+            declared `type: object`, because flow state is a scratchpad for
+            correlated scenarios and a scalar is as valid as a document.
+
+    VerifyOptions:
+      type: object
+      description: >
+        The `POST /imposters/{port}/verify` request body. Every field is
+        optional — `{}` verifies with no predicates, which counts everything
+        in scope — but the body itself must be present and must be JSON.
+      properties:
+        predicates:
+          type: array
+          description: >
+            Predicate clauses, AND'd together, in the same grammar a stub's
+            `predicates` use — the engine evaluates them with the one true
+            matcher rather than a verification-only reimplementation. An
+            `inject` clause needs `--allowInjection`, or the request answers
+            `400`.
+          items:
+            type: object
+            additionalProperties: true
+        flowId:
+          type: string
+          description: Scope the count to one space. Absent, every recorded request is in scope.
+        includeRequests:
+          type: boolean
+          default: false
+          description: Return the matching requests themselves, not just the count.
+        includeClosest:
+          type: boolean
+          default: false
+          description: Return the best-scoring non-match with the clauses it failed, for diff rendering.
+
+    VerifyOutcome:
+      type: object
+      description: >
+        A verification result (upstream `rift-mock-core`'s `VerifyOutcome`,
+        issue #494). `requests` and `closest` are `skip_serializing_if`
+        fields: each is absent unless the corresponding option asked for it,
+        so neither is `required` here.
+      required: [matched, total]
+      properties:
+        matched:
+          type: integer
+          description: Recorded requests in scope satisfying every predicate.
+        total:
+          type: integer
+          description: Recorded requests in scope, matched or not — the denominator for `matched`.
+        requests:
+          type: array
+          description: The matching requests. Present only when `includeRequests` was set.
+          items:
+            $ref: '#/components/schemas/RecordedRequest'
+        closest:
+          allOf:
+            - $ref: '#/components/schemas/ClosestMatch'
+          description: >
+            Present only when `includeClosest` was set **and** a non-matching
+            request existed to be closest — a verification where everything
+            in scope matched carries no `closest`.
+
+    ClosestMatch:
+      type: object
+      description: The non-matching request that satisfied the most predicate clauses, with the clauses it failed.
+      required: [request, failedPredicates]
+      properties:
+        request:
+          $ref: '#/components/schemas/RecordedRequest'
+        failedPredicates:
+          type: array
+          items:
+            $ref: '#/components/schemas/FailedPredicate'
+
+    FailedPredicate:
+      type: object
+      description: >
+        One predicate the closest request failed, paired with what the
+        request actually carried for the fields that predicate references —
+        the raw material for a readable diff.
+      required: [predicate, actual]
+      properties:
+        predicate:
+          type: object
+          description: The clause, echoed in the same shape it was sent.
+          additionalProperties: true
+        actual:
+          description: >
+            What the request actually held for the fields the clause names.
+            Any JSON — a string for a scalar field, an object for `headers`
+            or `query`, `null` where the request carried nothing — so it is
+            left unconstrained rather than pinned to one type.
+
+    NodeConfig:
+      type: object
+      description: >
+        The engine's effective startup configuration (`GET /config`,
+        Mountebank-compatible). Fully enumerable: the handler builds one
+        fixed document, and every key below is always present.
+      required: [version, commit, options, serveOptions, process]
+      properties:
+        version:
+          type: string
+          description: The engine crate's version.
+        commit:
+          type: string
+          nullable: true
+          description: >
+            The build's git commit, stamped at compile time. **Null** — not
+            absent — on a build where the stamp was not set (an
+            `option_env!`, so a plain `cargo build` yields null).
+        options:
+          type: object
+          description: The Mountebank-shaped options block; existing Mountebank clients parse this object.
+          required: [port, allowInjection, localOnly, ipWhitelist]
+          properties:
+            port:
+              type: integer
+              description: The port the admin plane actually bound, not the default it would have used.
+            allowInjection:
+              type: boolean
+            localOnly:
+              type: boolean
+              description: >
+                Whether `--local-only` was set — the flag itself, not
+                "did the admin plane happen to bind loopback". A
+                bind-derived value would overstate isolation on a node whose
+                imposter ports are still on every interface.
+            ipWhitelist:
+              type: array
+              description: >
+                Always the single-element list `["*"]`. `--ip-whitelist` is
+                accepted and **never enforced**, so every address may
+                connect; echoing the supplied list here would re-create
+                exactly the false assurance that reporting `*` exists to
+                avoid. Do not render this as an active allow-list.
+              items:
+                type: string
+        serveOptions:
+          type: array
+          description: >
+            The capability list a client feature-detects on: the serve
+            options this engine understands. Its *contents* are deliberately
+            not enumerated here — the whole point is that a client tests for
+            membership rather than assuming a fixed set, and an absent field
+            means an engine too old to report capabilities at all.
+          items:
+            type: string
+        process:
+          type: object
+          description: >
+            Mountebank's process block, kept shape-compatible so its clients
+            keep parsing. Several members are honest placeholders rather than
+            measurements.
+          required: [nodeVersion, architecture, platform, rss, heapTotal, heapUsed, uptime, cwd]
+          properties:
+            nodeVersion:
+              type: string
+              enum: ['N/A (Rust)']
+              description: Always this literal — there is no Node runtime; the key exists only for Mountebank shape-compatibility.
+            architecture:
+              type: string
+              example: aarch64
+            platform:
+              type: string
+              example: macos
+            rss:
+              type: integer
+              description: Always `0` — a Mountebank-shaped placeholder, not a measurement. Do not chart it.
+            heapTotal:
+              type: integer
+              description: Always `0`; see `rss`.
+            heapUsed:
+              type: integer
+              description: Always `0`; see `rss`.
+            uptime:
+              type: integer
+              description: Always `0`; see `rss` — process uptime is not tracked here.
+            cwd:
+              type: string
+              description: The process working directory; the empty string when it cannot be read.
+
+    ReloadOutcome:
+      type: object
+      description: >
+        The result of `POST /admin/reload`. Only `message` is guaranteed: a
+        node with no configured config source answers a message alone
+        ("nothing to reload") and no counters, while a node that reconciled
+        answers the message plus the four counts. `warnings` is additive and
+        appears only when there is something to warn about.
+      required: [message]
+      properties:
+        message:
+          type: string
+          description: Human-readable outcome — what was reloaded, or why nothing was.
+        created:
+          type: integer
+          description: Imposters created by this reload. Absent when no config source is configured.
+        replaced:
+          type: integer
+          description: Imposters replaced wholesale. Absent when no config source is configured.
+        stubPatched:
+          type: integer
+          description: >
+            Imposters whose stubs were patched in place, keeping runtime
+            state (recorded requests, scenario state, response cyclers).
+            Absent when no config source is configured.
+        deleted:
+          type: integer
+          description: Imposters removed. Absent when no config source is configured.
+        warnings:
+          type: array
+          description: >
+            Non-fatal notes about the reload — e.g. that a boot-only
+            `intercept` block in the source was deliberately not re-applied.
+            Absent entirely when empty, never `[]`.
+          items:
+            type: string
+      additionalProperties: true
