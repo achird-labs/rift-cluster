@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rift Console</title>
+    <!--
+      No <link> to a font or icon CDN and no inline <script> anywhere in this file, deliberately:
+      the console is served under `default-src 'self'; script-src 'self'` (RFC-006 §9.1), which
+      blocks both. Enforced by
+      tests/console.rs::the_served_page_has_no_external_subresource_and_no_inline_script,
+      so a future edit fails CI rather than the browser.
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

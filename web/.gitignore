@@ -1,0 +1,6 @@
+node_modules/
+# The whole point of RFC-006 §7 option D: `dist/` is built by the release lane and embedded from
+# there, never committed. Option B (committing it) was rejected precisely so `web/src`↔`dist` drift
+# cannot hide in a review diff.
+dist/
+*.tsbuildinfo

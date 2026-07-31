@@ -99,6 +99,13 @@ base64 = "0.22"
 # no std API for it. Unix-only, and already in the tree via tokio.
 libc = "0.2"
 
+# The web console's built assets, embedded into the binary behind the default-off `console` feature
+# (RFC-006 §7 option D, issue #186). Chosen over `include_dir` for one behaviour: in a debug build it
+# reads from disk at runtime, so `cargo run --features console` picks up a `pnpm build` without a
+# Rust rebuild. Pinned because a missing-folder *compile* error is load-bearing here — it is what
+# stops a release from silently shipping consoleless — and that is derive-macro behaviour, not API.
+rust-embed = "8.12"
+
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"

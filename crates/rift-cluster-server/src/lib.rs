@@ -27,6 +27,10 @@ pub mod bootstrap;
 pub mod cli;
 pub mod cluster_api;
 pub mod compose;
+// The embedded web console (RFC-006 §7, issue #186). Behind the default-off `console` feature, so
+// with it off this module — and its compile-time dependency on a built `web/dist/` — does not exist.
+#[cfg(feature = "console")]
+mod console;
 pub mod fleet;
 pub mod openapi;
 pub mod principal;

@@ -1,0 +1,66 @@
+/*
+ * Build-time CSS only (RFC-006 §7). Runtime CSS-in-JS injects a <style> element, which the console's
+ * CSP blocks via `default-src 'self'` with no `style-src` escape — see the issue's design-stack note.
+ *
+ * System font stack rather than a webfont: `default-src 'self'` blocks a CDN font, and self-hosting
+ * one is weight the scaffold does not need.
+ */
+:root {
+  --bg: #0f1115;
+  --fg: #e6e8ee;
+  --muted: #9aa3b2;
+  --err: #ff6b6b;
+  --panel: #171a21;
+  color-scheme: dark light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  line-height: 1.5;
+}
+
+.shell {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+
+.tagline {
+  margin: 0 0 2rem;
+  color: var(--muted);
+}
+
+h2 {
+  font-size: 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.whoami {
+  background: var(--panel);
+  padding: 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+}
+
+.err {
+  color: var(--err);
+}

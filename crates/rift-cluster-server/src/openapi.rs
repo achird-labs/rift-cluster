@@ -31,11 +31,23 @@
 //!   needs a human;
 //! - a **new read served directly from `handle`** — it never reaches `classify`, so it would be
 //!   absent from [`HANDLE_DIRECT_ROUTES`] *and* from the contract, and the parity comparison would
-//!   stay green comparing two sets that are each missing it. RFC-006 §7's planned `GET /console`
-//!   arm is exactly this shape. The *declared* half of that list is pinned by probing the live
-//!   surface over HTTP (`tests/openapi.rs::every_direct_route_is_actually_served`), which is the
-//!   only mechanism that catches a route being declared-but-unserved; catching the reverse —
-//!   served-but-undeclared — remains a human step.
+//!   stay green comparing two sets that are each missing it. The *declared* half of that list is
+//!   pinned by probing the live surface over HTTP
+//!   (`tests/openapi.rs::every_direct_route_is_actually_served`), which is the only mechanism that
+//!   catches a route being declared-but-unserved; catching the reverse — served-but-undeclared —
+//!   remains a human step.
+//!
+//! **`GET /console` (C3, issue #186) is that shape, and is deliberately in neither list.** The
+//! prediction above was right about the mechanism and wrong about the conclusion for this route:
+//! the console serves the SPA's static assets, not an API operation. There is nothing for a
+//! generated client to call, no request or response schema to publish, and no `x-rift-origin` that
+//! would be true of it. Adding it would also break the probe: `every_direct_route_is_actually_served`
+//! runs against a binary built **without** `--features console`, where `/console` correctly 404s.
+//!
+//! What stands in for the contract here is a pair of mutually exclusive integration tests, which
+//! together pin the route in both directions more tightly than a contract entry would:
+//! `tests/console_off.rs` asserts it is *not* served with the feature off (the parity invariant),
+//! and `tests/console.rs` asserts it *is*, with the right headers, when the feature is on.
 
 use std::sync::OnceLock;
 

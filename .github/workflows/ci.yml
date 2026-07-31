@@ -56,6 +56,13 @@ jobs:
       - name: Empty-run guard
         run: scripts/assert-scenarios-ran.sh --self-test
 
+      # The console embed must stay off the default build graph (RFC-006 §7, issue #186). Deliberately
+      # in THIS job — the one that cannot be skipped and that runs plain `cargo build`/`cargo test` —
+      # because the invariant it guards is precisely that those two commands never need node. No node
+      # is installed for this step, and none is needed: it reads the manifest and `cargo tree`.
+      - name: Console stays off the default build graph
+        run: scripts/check-console-hermetic.sh
+
   # No openraft in `rift-cluster`'s public API — an acceptance criterion of
   # issue #6 that the compiler cannot check. Why it matters, and why the check
   # has no exemptions, is documented in the script itself; this job only
@@ -329,3 +336,94 @@ jobs:
             --test corpus_replay \
             -- --include-ignored --test-threads=1 \
             | "$ASSERT_SCENARIOS_RAN" --assert 51
+
+  # The web console's own toolchain (RFC-006 §7, issue #186). Node lives HERE and nowhere else: the
+  # `build` job above must keep passing on a runner with no node at all, which is the invariant
+  # `check-console-hermetic.sh` asserts from inside it.
+  #
+  # Deliberately not path-filtered. The drift gate below has to run whenever *either* side moves —
+  # `web/` or `docs/api/openapi-ee.yaml` — and this repo has already learned twice (#93, #117) that a
+  # filter which is wrong fails open into skipping, i.e. into a green check that verified nothing.
+  # The whole job is well under a minute; a filter would cost more in risk than it saves in time.
+  console-web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      # `submodules: recursive` is required: the console *serving* tests at the end of this job build
+      # `rift-cluster-server`, which path-depends on the vendored `vendor/rift` crates. Nothing under
+      # `web/` needs them, but the cargo step does, and without this the job fails to resolve
+      # `rift-http-proxy` rather than failing on anything to do with the console.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Pinned to the same version `web/package.json` declares in `packageManager`. pnpm is not
+      # preinstalled on the runner and corepack is no longer bundled with modern Node, so it is
+      # installed explicitly rather than assumed.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      # `--frozen-lockfile` is what makes this reproducible: it fails rather than silently resolving
+      # a newer version when the lockfile and package.json disagree.
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # The drift gate (issue #186's acceptance criterion). The generated client is committed so
+      # `web/` builds without the binary present; that only stays honest if regenerating it here is a
+      # no-op. `--exit-code` turns any difference into a failed check.
+      - name: The committed client matches the contract
+        run: |
+          set -euo pipefail
+          # `git diff` reports nothing for an UNTRACKED file, so a forgotten `git add` would make the
+          # check below green having compared the generated client against nothing at all. Assert it
+          # is tracked first — the same failure-open shape #93 and #117 were about.
+          git ls-files --error-unmatch src/api/schema.ts > /dev/null
+          pnpm run generate:client
+          if ! git diff --exit-code -- src/api/schema.ts; then
+            echo "::error::web/src/api/schema.ts is stale. Run 'pnpm run generate:client' in web/ and commit the result." >&2
+            exit 1
+          fi
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test
+        run: pnpm run test
+
+      # Proves `web/dist` can actually be produced — which is what the release lane's
+      # `cargo build --features console` depends on. A console that only builds on someone's laptop
+      # would otherwise surface for the first time during a release.
+      - name: Build
+        run: pnpm run build
+
+      # The Rust half of the console, exercised on every PR.
+      #
+      # This job is where it belongs and the `build` job is where it does not. `tests/console.rs` and
+      # `console.rs`'s unit tests are `cfg(feature = "console")`, so they need a real `web/dist` —
+      # which only exists here, after the step above. Without this the only lane that ever runs them
+      # is `release.yml`, and a PR that stripped the CSP header, broke the SPA fallback, or removed
+      # the empty-bundle guard would merge green and surface at the next tag.
+      #
+      # It does not weaken the hermeticity invariant: that invariant is about the *default* build,
+      # and `check-console-hermetic.sh` continues to assert it from inside the node-free `build` job.
+      # Enabling the feature inherently requires the bundle — that is the whole design.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      # Explicitly the workspace root, overriding this job's `web` default — cargo must run against
+      # the Rust workspace, not inside the JS package.
+      - name: Console serving tests
+        working-directory: ${{ github.workspace }}
+        run: cargo test -p rift-cluster-server --features console --lib --test console

@@ -20,6 +20,14 @@ path = "src/lib.rs"
 name = "rift-cluster-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# The embedded web console (RFC-006 §7, issue #186). **Off by default and it must stay off**: with
+# it on, `rust-embed` requires `web/dist/` to exist at compile time, so turning it on by default
+# would make every `cargo build` in the tree depend on a `pnpm build` having run first. Only the
+# release lane enables it. `scripts/check-console-hermetic.sh` fails CI if that ever changes.
+console = ["dep:rust-embed"]
+
 [dependencies]
 # Same fence as rift-cluster: `rift-cluster-base` is the only path into the open-source
 # core, so this crate carries no direct rift-mock-core / rift-http-proxy dep.
@@ -53,6 +61,9 @@ base64.workspace = true
 # Same fixed hash the ring uses: a node id derived from a name must be identical
 # on every node and across versions, which the std hasher does not promise.
 xxhash-rust.workspace = true
+# Optional, and reachable only through the `console` feature above — this is what keeps the embed
+# (and its compile-time dependency on `web/dist/`) entirely off the default build graph.
+rust-embed = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true
