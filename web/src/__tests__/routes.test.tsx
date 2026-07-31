@@ -318,3 +318,79 @@ describe("read-only principals", () => {
     expect(screen.queryByRole("button", { name: /delete alpha/i })).toBeNull();
   });
 });
+
+describe("a parked table write must not be undone by the next poll (#211)", () => {
+  /*
+   * The sequence this guards, which is a data-loss path and not merely a display glitch:
+   *
+   *   1. the PUT is parked (202) and this principal cannot read `/_fleet/ops/*`, so the outcome is
+   *      `unobservable`;
+   *   2. if the screen treated that as saved it would advance `base` to the draft, leaving the
+   *      editor clean;
+   *   3. the invalidation refetch then returns the table as it was BEFORE the parked write, and
+   *      adopt-when-clean would pull it into both `draft` and `base`;
+   *   4. the operator's edits vanish, and the next save would send that stale table with a matching
+   *      base — sailing through the concurrency re-read and undoing the parked write on landing.
+   */
+  function stubParkedPut(): Call[] {
+    const calls: Call[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+        calls.push({ method, path, body });
+        if (path.startsWith("/_fleet/ops/")) {
+          // Fleet-scoped; an ordinary editor gets 404 whatever the write actually did.
+          return Promise.resolve(new Response("", { status: 404 }));
+        }
+        if (method === "PUT") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ opId: "op-parked" }), { status: 202 }),
+          );
+        }
+        // The table never changes: the parked write has not committed.
+        return Promise.resolve(new Response(JSON.stringify(TABLE), { status: 200 }));
+      }),
+    );
+    return calls;
+  }
+
+  it("keeps the operator's edit on screen and says the write is unconfirmed", async () => {
+    const calls = stubParkedPut();
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+
+    await userEvent.setup().click(screen.getByRole("button", { name: /disable alpha/i }));
+    await userEvent.setup().click(screen.getByRole("button", { name: /save table/i }));
+
+    const note = await screen.findByTestId("write-unconfirmed");
+    expect(note.textContent).toContain("Accepted, not yet confirmed");
+
+    // The refetch has returned the pre-write table by now. The edit must still be on screen.
+    await waitFor(() => expect(calls.filter((c) => c.method === "GET").length).toBeGreaterThan(1));
+    expect(screen.getByRole("button", { name: /enable alpha/i })).toBeDefined();
+  });
+
+  it("does not let a second save send the pre-write table back", async () => {
+    const calls = stubParkedPut();
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+
+    await userEvent.setup().click(screen.getByRole("button", { name: /disable alpha/i }));
+    await userEvent.setup().click(screen.getByRole("button", { name: /save table/i }));
+    await screen.findByTestId("write-unconfirmed");
+    await waitFor(() => expect(calls.filter((c) => c.method === "GET").length).toBeGreaterThan(1));
+
+    await userEvent.setup().click(screen.getByRole("button", { name: /save table/i }));
+    await waitFor(() => expect(calls.filter((c) => c.method === "PUT").length).toBe(2));
+
+    // Every PUT must still carry the operator's intent. A PUT re-enabling alpha would be the
+    // parked write being undone.
+    for (const put of calls.filter((c) => c.method === "PUT")) {
+      const routes = (put.body as { routes: { id: string; enabled: boolean }[] }).routes;
+      expect(routes.find((r) => r.id === "alpha")?.enabled).toBe(false);
+    }
+  });
+});

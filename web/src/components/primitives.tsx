@@ -68,6 +68,24 @@ export function ErrorNote({ error, context }: { error: unknown; context?: string
   );
 }
 
+/**
+ * A write the fleet accepted but this session could not watch land.
+ *
+ * Deliberately `role="status"` and not `role="alert"`: nothing is wrong. The write was durably
+ * parked and is committing; following it to completion needs fleet-admin scope, and `403`/`404` from
+ * the op-status projection is what most principals get whatever the write did. Saying "saved" here
+ * would be the bug this note exists to replace, and saying "failed" would be the same overclaim
+ * pointing the other way.
+ */
+export function UnconfirmedNote({ reason }: { reason: string }): ReactNode {
+  return (
+    <p className="degraded" role="status" data-testid="write-unconfirmed">
+      <strong>Accepted, not yet confirmed.</strong> {reason}. Re-read this screen in a moment to see
+      where it landed.
+    </p>
+  );
+}
+
 export function describe(error: unknown): string {
   if (error instanceof ApiError) {
     switch (error.status) {

@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { API_PATHS, imposterPath, lifecyclePath, requestsPath } from "../api/paths.ts";
+import { API_PATHS, fleetOpPath, imposterPath, lifecyclePath, requestsPath } from "../api/paths.ts";
 import { FLEET_HEALTH_FIELDS, FLEET_MEMBER_FIELDS, IMPOSTER_COLUMNS } from "../app/contract.ts";
 
 const SRC = new URL("..", import.meta.url).pathname;
@@ -123,6 +123,23 @@ describe("the client is the only door to the network", () => {
       const template = path.replace(/\/\d+(?=\/|$)/, "/{port}");
       expect([path, CONTRACT.includes(`"${template}": {`)]).toEqual([path, true]);
     }
+  });
+});
+
+describe("the op-status poll target is a published route", () => {
+  it("builds a path the contract declares", () => {
+    // `fleetOpPath` interpolates a uuid, not a number, so the numeric normalisation the test above
+    // uses cannot reach it — it needs its own check or the one route #211 added would be the only
+    // builder not covered by §11's "no field sourced from a UI-only endpoint".
+    const built = fleetOpPath("11111111-1111-4111-8111-111111111111");
+    expect(built.startsWith("/_fleet/ops/")).toBe(true);
+    expect(CONTRACT.includes('"/_fleet/ops/{opId}": {')).toBe(true);
+  });
+
+  it("percent-encodes the op id rather than splicing it in raw", () => {
+    // A malformed id must reach the server as one path segment and 404, not silently address a
+    // different route.
+    expect(fleetOpPath("a/b")).toBe("/_fleet/ops/a%2Fb");
   });
 });
 

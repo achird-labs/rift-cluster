@@ -74,3 +74,87 @@ describe("error surfacing", () => {
     expect(CSRF_HEADER in headersOf(fetchMock)).toBe(false);
   });
 });
+
+describe("a parked write is not an applied write (#211)", () => {
+  /*
+   * `202 AcceptedParked` means the write is durably parked and still committing. The console used
+   * to see every 2xx as the same thing, so it told the operator "saved" for a write that had not
+   * landed yet — and never polled the op id the response hands back for exactly that purpose.
+   */
+  it("reports a 202 as parked, carrying the op id from the body", async () => {
+    mockFetch(json({ opId: "11111111-1111-4111-8111-111111111111" }, 202));
+    const result = await apiSend("POST", "/imposters/4545/disable");
+    expect(result).toEqual({
+      kind: "parked",
+      opIds: ["11111111-1111-4111-8111-111111111111"],
+    });
+  });
+
+  it("prefers the derived opIds of a multi-op mutation over the base id", async () => {
+    // `admin_front.rs:1916-1918`: a multi-op mutation parks only the derived ids, never the base.
+    // A client polling the bare base of a batch PUT /imposters would 404 forever.
+    mockFetch(
+      json(
+        {
+          opId: "00000000-0000-4000-8000-000000000000",
+          opIds: [
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+          ],
+        },
+        202,
+      ),
+    );
+    const result = await apiSend("PUT", "/imposters");
+    expect(result).toEqual({
+      kind: "parked",
+      opIds: [
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+      ],
+    });
+  });
+
+  it("falls back to the Rift-Cluster-Op-Id header when the 202 carries no body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("", {
+          status: 202,
+          headers: { "Rift-Cluster-Op-Id": "44444444-4444-4444-8444-444444444444" },
+        }),
+      ),
+    );
+    const result = await apiSend("DELETE", "/front-door/routes/edge");
+    expect(result).toEqual({
+      kind: "parked",
+      opIds: ["44444444-4444-4444-8444-444444444444"],
+    });
+  });
+
+  it("still reports an ordinary committed write as applied, with its body", async () => {
+    mockFetch(json({ routes: [] }));
+    const result = await apiSend("PUT", "/front-door/routes", { routes: [] });
+    expect(result).toEqual({ kind: "applied", data: { routes: [] } });
+  });
+
+  it("treats an empty 204 as applied, not as parked", async () => {
+    // `null`, not `""` — the Response constructor rejects any body on a 204.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
+    const result = await apiSend("DELETE", "/admin/tenants/acme");
+    expect(result).toEqual({ kind: "applied", data: null });
+  });
+});
+
+describe("a malformed 202 body still finds an op id to follow", () => {
+  it("falls back to opId when opIds carries nothing usable", async () => {
+    // A contract violation, but one worth surviving: returning `[]` here would report the write as
+    // unobservable while the base id sitting right beside it was perfectly pollable.
+    mockFetch(json({ opIds: [42, null], opId: "55555555-5555-4555-8555-555555555555" }, 202));
+    const result = await apiSend("POST", "/imposters/4545/enable");
+    expect(result).toEqual({
+      kind: "parked",
+      opIds: ["55555555-5555-4555-8555-555555555555"],
+    });
+  });
+});

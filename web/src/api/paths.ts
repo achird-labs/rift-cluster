@@ -21,6 +21,13 @@ export const imposterPath = (port: number): string => `/imposters/${port}`;
 export const lifecyclePath = (port: number, enabled: boolean): string =>
   `/imposters/${port}/${enabled ? "enable" : "disable"}`;
 export const requestsPath = (port: number): string => `/imposters/${port}/requests`;
+
+/**
+ * The poll target for a write that answered `202` (parked). Fleet-scoped, so a caller without
+ * fleet-admin sees a 404 here whatever the write actually did — see `features/writes/commit.ts`.
+ */
+export const fleetOpPath = (opId: string): string =>
+  `/_fleet/ops/${encodeURIComponent(opId)}`;
 export const frontDoorRoutePath = (routeId: string): string =>
   `/front-door/routes/${encodeURIComponent(routeId)}`;
 
