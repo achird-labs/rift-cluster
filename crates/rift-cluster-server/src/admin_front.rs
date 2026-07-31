@@ -84,6 +84,8 @@ use uuid::Uuid;
 
 use crate::authz::{self, Action, Decision, Denial};
 use crate::cli::WriteBarrier;
+#[cfg(feature = "console")]
+use crate::console;
 use crate::fleet;
 use crate::openapi;
 use crate::principal;
@@ -555,6 +557,18 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     // gating it.
     if path.starts_with("/__rift/") {
         return proxy(state, req, None).await;
+    }
+
+    // `GET /console` / `GET /console/*` (RFC-006 §7, issue #186): the embedded SPA, served from
+    // `web/dist` behind the default-off `console` feature. Ahead of `classify` because it is not a
+    // config route at all, and unauthenticated because the shell *is* the login UI (§5.3) — see
+    // `console`'s module doc for why that is safe and what enforces it.
+    //
+    // With the feature off this arm does not exist, so `/console` proxies upstream and 404s exactly
+    // as it did before C3; `tests/console_off.rs` asserts that on every ordinary CI run.
+    #[cfg(feature = "console")]
+    if console::matches(&path) {
+        return console::serve(req.method(), &path);
     }
 
     // `POST /session` / `DELETE /session` (RFC-006 §5.3, issue #185): minting and clearing a

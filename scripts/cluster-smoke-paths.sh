@@ -253,6 +253,14 @@ false|cluster-smoke|crates/foo/Cargo.lock
 # Prose changes cannot break a cluster.
 false|cluster-smoke|README.md
 false|cluster-smoke|docs/rfc/RFC-001-self-clustering-rift.md docs/adr/ADR-001-raft-control-plane.md
+# The web console's sources (#186). A CSS or component edit cannot affect a cluster, and the console
+# is not even compiled into the binary unless `--features console` is on — which no CI lane here
+# enables. Pinned in both directions: the tier must not start running on every console commit (it
+# costs minutes and would train people to ignore it), and `web/` must not become a way to change the
+# serving code without the tier noticing — the Rust half of the console lives under `crates/`, which
+# the cases above already cover.
+false|cluster-smoke|web/src/App.tsx
+false|cluster-smoke|web/package.json web/pnpm-lock.yaml
 # The seam crate: a `vendor/rift` bump reaches the cluster through it, so
 # excluding it would leave the #93 hole one layer up.
 true|cluster-smoke|crates/rift-cluster-base/src/lib.rs
@@ -304,6 +312,10 @@ false|parity|crates/rift-cluster/src/lib.rs
 # exercise it.
 false|parity|README.md
 false|parity|docs/rift-cluster-server.md
+# The console's own sources (#186) reach no part of the composition parity measures: the console is
+# behind a feature no parity lane enables, so with it off there is not even an arm in the front's
+# `handle` for these files to affect.
+false|parity|web/src/App.tsx
 # Nothing changed at all.
 false|parity|
 CASES

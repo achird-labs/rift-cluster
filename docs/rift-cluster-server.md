@@ -1404,6 +1404,66 @@ takeovers visible (`unreachable` is the label worth alerting on), and
 `rift_cluster_flow_repairs_total` counts anti-entropy merges that actually fixed
 something — steady non-zero means pushes are being missed.
 
+## The web console (`--features console`, #186)
+
+The binary can serve an embedded web console at `GET /console` — a single-page
+app built from `web/` and compiled into the executable. It is behind a **cargo
+feature that is off by default**, and the default has to stay that way:
+
+```sh
+# Every ordinary build. No node required, no console in the binary, and
+# /console proxies upstream and 404s exactly as it did before.
+cargo build
+
+# The release build that carries the console. `pnpm build` FIRST — the assets
+# are embedded at compile time, so cargo cannot produce them for you.
+cd web && pnpm install --frozen-lockfile && pnpm build && cd ..
+cargo build --release --features console
+```
+
+Enabling the feature without a built `web/dist/` is a **compile error**, by
+design: a release that silently shipped without its console would be discovered
+by users rather than by CI (RFC-006 §7). One caveat worth knowing, because it
+bit during implementation — `rust-embed` is a derive macro, and a derive macro
+cannot declare `cargo:rerun-if-changed`. Cargo therefore has no dependency edge
+from the crate to `web/dist/`: rebuilding after changing the bundle **without**
+recompiling the crate leaves the old assets embedded. The release lane covers
+this by asserting the finished binary contains the current build's content-hashed
+asset name (`scripts/check-console-embed.sh embedded`); if you are iterating
+locally, use a debug build, where `rust-embed` reads from disk instead.
+
+Serving is read-only and **unauthenticated**, deliberately: the console shell is
+the login UI (RFC-006 §5.3), so requiring a credential to fetch the page that
+collects one is a closed loop. The bundle holds no secrets, and every API call it
+then makes goes through the same authorization chokepoint as any other client.
+Every response — including the 404 and the 405 — carries
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'
+```
+
+which is enforceable precisely because everything is embedded: no CDN, no remote
+fonts, no inline scripts. Hashed assets under `/console/assets/` are served
+`max-age=31536000, immutable`; `index.html` is `no-cache`, so an upgrade is never
+served a shell pointing at the previous build's assets.
+
+### Working on the console
+
+`pnpm dev` in `web/` runs Vite with every admin path proxied to a real node, so
+console work needs no Rust rebuild at all:
+
+```sh
+cd web
+pnpm install
+pnpm dev                                  # proxies to http://127.0.0.1:2525
+RIFT_ADMIN_URL=http://localhost:12525 pnpm dev   # ...or the compose stack's node 1
+```
+
+The TypeScript client is **generated** from `docs/api/openapi-ee.yaml`
+(`pnpm run generate:client`) and committed, so `web/` builds without the binary
+present. CI regenerates it and fails on any difference, which is what keeps the
+contract, the client and the server from drifting apart silently.
+
 ## What lands later
 
 One flag from the Phase-1 plan is deliberately **not** accepted yet, because

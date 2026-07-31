@@ -1,0 +1,69 @@
+name: Release
+
+# The console-bearing build (RFC-006 §7 option D, issue #186).
+#
+# A lane of its own, not a job in `ci.yml`, because it is the ONLY place `--features console` is
+# ever enabled. That feature makes `web/dist/` a compile-time requirement, so enabling it anywhere on
+# the PR path would make every ordinary build depend on a `pnpm build` having run first — which is
+# exactly the hermeticity RFC-006 §7 rejected options A and B to avoid.
+#
+# Manual and tag-triggered only. There is no publish step yet: this lane's job today is to prove the
+# release artifact can be built and is correct. Whoever adds distribution adds it here.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  console-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Order matters and is the whole point of the lane: the bundle must exist before cargo runs,
+      # because `rust-embed` resolves `web/dist/` at compile time.
+      - name: Build the console bundle
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      # Checked BEFORE the real build, while a failure is still cheap and unambiguous: with the
+      # bundle moved aside, `--features console` must not compile. This is the guard that stops a
+      # release silently shipping consoleless, so it is verified on the lane that would ship it
+      # rather than assumed from rust-embed's documented behaviour.
+      - name: A console build without the bundle must fail to compile
+        run: scripts/check-console-embed.sh missing-dist
+
+      - name: Build the release binary with the console
+        run: cargo build -p rift-cluster-server --release --features console
+
+      # "Air-gapped" as something demonstrated rather than read off the CSP. In a *debug* build
+      # rust-embed reads assets from disk by design (the reason it was chosen over include_dir), so
+      # only the release artifact can show the bytes are actually inside the binary.
+      - name: The binary really embeds the bundle
+        run: scripts/check-console-embed.sh embedded target/release/rift-cluster-server
+
+      # `--release` is not incidental: it is the only profile in which rust-embed embeds rather than
+      # reading from disk, so this is the console served the way an operator will get it.
+      - name: Console serving tests against the embedded assets
+        run: cargo test -p rift-cluster-server --release --features console --lib --test console

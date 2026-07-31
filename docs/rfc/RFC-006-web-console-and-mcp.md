@@ -167,9 +167,11 @@ cluster headers (`Rift-Cluster-Revision`, op id, warnings —
 semantics, which until now live only in code comments.
 
 The console's TypeScript client is **generated** from this schema
-(`openapi-typescript` + a thin fetch wrapper; exact tool pinned in `web/`,
-version to-verify) in CI, and the generated output is committed so `web/`
-builds without the binary present. The MCP server's tool input schemas derive
+(`openapi-typescript`, **pinned at `7.13.0` in `web/package.json` by C3 (#186)**,
+plus a thin fetch wrapper at `web/src/api/client.ts`) and the generated output is
+committed so `web/` builds without the binary present. CI regenerates it and
+fails on any diff (`console-web` job), so "committed" cannot quietly become
+"stale". The MCP server's tool input schemas derive
 from the same document (§8.2). One contract, three consumers — drift between
 them becomes a CI failure.
 
@@ -273,8 +275,29 @@ The sharpest build-system decision in this RFC, so it gets its options table:
   error — a release cannot silently ship consoleless.
 - `rust-embed` over `include_dir` for one reason: its debug-mode
   loads-from-disk behavior gives `cargo run --features console` live asset
-  reload during console development without a rebuild. (Crate version pinned
-  at implementation; to-verify.)
+  reload during console development without a rebuild. **Pinned at `8.12`
+  (C3, #186).**
+
+**One thing C3 found that this section assumed away.** `rust-embed` is a derive
+macro, and a derive macro cannot emit `cargo:rerun-if-changed` — only a build
+script can. So cargo holds **no dependency edge** from the crate to `web/dist/`.
+Two consequences, both real and neither visible in a green build:
+
+- The missing-folder compile error only fires on a *fresh* compile of the crate.
+  With a warm target directory, deleting `web/dist` and rebuilding succeeds,
+  reusing the cached artifact. `scripts/check-console-embed.sh missing-dist`
+  therefore `cargo clean -p`s first — without that it was passing while testing
+  nothing, which is how it was found.
+- A release lane with a restored build cache could embed a **stale** bundle. The
+  guard is to assert the finished binary contains *this* build's content-hashed
+  asset filename (`scripts/check-console-embed.sh embedded`), which a stale
+  artifact cannot satisfy.
+
+Adding a `build.rs` that emits `rerun-if-changed=web/dist` would close both at
+the source and is not option A — it invokes no toolchain, it only declares a
+dependency. It was not done in C3 because the two checks above already cover the
+lane that ships, and a build script is a permanent cost on every build in the
+tree for a case only the release lane meets.
 
 Serving: the front's `handle()` (`crates/rift-cluster-server/src/admin_front.rs:525`) gains a
 `GET /console` / `GET /console/*` arm ahead of `classify()` — static assets
