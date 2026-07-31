@@ -28,6 +28,10 @@ const EXPECTED: Record<Capability, Role[]> = {
   "tenant.manage": ["tenant-admin", "fleet-admin"],
   "audit.read": ["tenant-admin", "fleet-admin"],
   "fleet.read": ["fleet-admin"],
+  // `Action::ClusterAdmin`. Deliberately not `tenant-admin`: the whole `/admin/tenants` CRUD and
+  // `PrincipalPut`/`PrincipalDelete` sit behind it, which is why it has to be separable from
+  // `tenant.manage` rather than folded into it.
+  "cluster.admin": ["fleet-admin"],
 };
 
 describe("roleAllows mirrors authz.rs::role_allows", () => {

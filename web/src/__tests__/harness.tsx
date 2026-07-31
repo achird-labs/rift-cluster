@@ -1,4 +1,5 @@
 import { QueryClientProvider } from "@tanstack/react-query";
+import type { QueryClient } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, vi } from "vitest";
@@ -59,11 +60,17 @@ export function whoamiWith(role: Role, tenants: string[] = ["acme"]): WhoAmI {
  */
 export function renderInApp(
   ui: ReactElement,
-  options: { whoami: WhoAmI; tenant?: string | null; tenants?: string[] } = {
+  options: {
+    whoami: WhoAmI;
+    tenant?: string | null;
+    tenants?: string[];
+    /** Pass one in to inspect the caches afterwards; otherwise the real production client is used. */
+    client?: QueryClient;
+  } = {
     whoami: whoamiWith("fleet-admin"),
   },
 ): ReturnType<typeof render> {
-  const client = createQueryClient();
+  const client = options.client ?? createQueryClient();
   const tenants = options.tenants ?? [];
   // Defaults to a tenant the principal is actually bound to, because that is what `App` resolves to
   // and what the operator sees. Defaulting to `null` would model a session with no selection, which

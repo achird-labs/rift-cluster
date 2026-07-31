@@ -1076,9 +1076,11 @@ export interface components {
              * @description The applying log index.
              */
             revision: number;
-            /** @description Either {"Applied":null} or {"Failed":{"reason":"..."}}. */
-            outcome: {
-                [key: string]: unknown;
+            /** @description `ControlOutcome`, externally tagged and **snake_case** — `Applied` is a unit variant, so it is the bare string `"applied"`, NOT an object. A refusal is `{"failed": {"reason": "..."}}`. A refusal is a *committed* outcome: the op is in the log and deduped like any other, it just changed nothing. */
+            outcome: "applied" | {
+                failed: {
+                    reason: string;
+                };
             };
         };
         AuditSinkWrite: {

@@ -13,8 +13,9 @@ enable/disable, and the cluster/fleet view. C5–C7 (#188–#190) follow.
 ```
 src/api/       schema.ts (generated, committed) · client.ts (the only fetch) · paths.ts
 src/app/       Shell · session · rbac · nav · routing · queries · contract · fleetView
-src/screens/   Login · Imposters · ImposterDetail · Fleet · RequestLog · Routes
+src/screens/   Login · Imposters · ImposterDetail · Fleet · RequestLog · Routes · Admin
 src/features/  requests/source.ts (the #147 seam) · routes/order.ts (front-door ordering)
+               admin/{roles,audit,key}.ts (RFC-002 admin plane)
 src/components/primitives (Status, Truncated, Ident, ErrorNote)
 ```
 
@@ -91,6 +92,42 @@ Six modules carry the decisions worth knowing before changing anything:
   server compares `headers: Vec<HeaderMatch>` with a derived `PartialEq`, which
   is **order-sensitive**, so sorting the clauses before comparing reported an
   `AmbiguousMatch` the fleet would never raise.
+
+- **`features/admin/*`** — the RFC-002 admin plane, where the failure mode is
+  *softening* rather than crashing, so three rules are encoded rather than left
+  to reviewers:
+
+  **A minted key exists for one moment.** `POST …/principals` returns `apiKey` in
+  its `201` and the fleet keeps only an argon2id hash. `useCreatePrincipal` hands
+  the raw key to the caller **out of band** and resolves to the *stripped*
+  record, so it never enters React Query at all. Sanitising in `onSuccess` is not
+  enough — `useMutation` keeps its own copy of the resolved value in the
+  MutationCache, which `setQueryData` cannot reach and which stays readable from
+  the client (and Devtools) for `gcTime`. There is no reveal-later affordance
+  because there is nothing to reveal.
+
+  **A 404 must stay a 404** (RFC-002 §8.4). A cross-tenant probe is
+  byte-identical to a probe of nothing, so the not-found branch renders the
+  whole screen — no header, no tab nav — because anything else would have to
+  encode the tenant to stay useful. The copy contains no "access"/"permission"/
+  "forbidden"/"denied", which is the vocabulary a 404 exists to deny. A genuine
+  `403` (bound to the tenant, insufficient role) is a *different, honest* fact and
+  keeps its own branch — `rbac.rs::in_tenant_insufficient_role_is_403_not_404`
+  pins that distinction server-side, and collapsing it here would hide an
+  actionable answer.
+
+  **`cluster.admin` is separate from `tenant.manage`.** The tenancy routes split
+  across the two: listing and minting principals are `TenantManage`, but the whole
+  `/admin/tenants` CRUD *and* `PrincipalPut`/`PrincipalDelete` are `ClusterAdmin`.
+  Gating everything on `tenant.manage` drew a tenant-admin buttons that answer 403
+  or 404 every time. `CAPABILITY_MATRIX` is *derived* from `rbac.ts::roleAllows`
+  rather than transcribed again — two copies of a security table drift.
+
+  Two wire facts that cost a debugging cycle each if assumed: **`outcome` is the
+  bare lowercase string `"applied"`**, never `{"Applied": null}` (`ControlOutcome`
+  is `snake_case` with a unit variant); and **principal ids go in the path raw**,
+  because ids are `key:<sha256-hex>` and the server matches the unnormalised path
+  — percent-encoding the colon makes every revocation a 404.
 
   **The route schema is snake_case, and it is the one place in this contract
   that is.** `Route`, `RouteMatch` and `RouteTarget`

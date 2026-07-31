@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 
+import { Admin } from "../screens/Admin.tsx";
 import { Fleet } from "../screens/Fleet.tsx";
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
 import { Imposters } from "../screens/Imposters.tsx";
@@ -41,6 +42,8 @@ function Screen({ route }: { route: Route }): ReactNode {
       return <RequestLog port={route.port} />;
     case "routes":
       return <RouteTableScreen />;
+    case "admin":
+      return <Admin tab={route.tab} tenant={route.tenant} />;
   }
 }
 

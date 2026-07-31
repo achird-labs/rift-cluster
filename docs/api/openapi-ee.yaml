@@ -3073,6 +3073,13 @@ components:
 
     Quotas:
       type: object
+      description: >
+        All three fields are required when `quotas` is present. `Quotas` carries
+        no `serde(default)` on the struct or on any field, so a present-but-partial
+        object fails deserialization with `missing field` and answers `400` — only
+        an entirely absent `quotas` is defaulted (`TenantBody.quotas` is
+        `serde(default)`).
+      required: [maxImposters, maxStubsPerImposter, maxFlowEntries]
       properties:
         maxImposters:
           type: integer
@@ -3083,6 +3090,7 @@ components:
         maxFlowEntries:
           type: integer
           format: int64
+          default: 100000
 
     Role:
       type: string
@@ -3182,9 +3190,24 @@ components:
           format: int64
           description: The applying log index.
         outcome:
-          type: object
-          description: Either {"Applied":null} or {"Failed":{"reason":"..."}}.
-          additionalProperties: true
+          description: >
+            `ControlOutcome`, externally tagged and **snake_case** — `Applied` is a
+            unit variant, so it is the bare string `"applied"`, NOT an object.
+            A refusal is `{"failed": {"reason": "..."}}`. A refusal is a
+            *committed* outcome: the op is in the log and deduped like any other,
+            it just changed nothing.
+          oneOf:
+            - type: string
+              enum: [applied]
+            - type: object
+              required: [failed]
+              properties:
+                failed:
+                  type: object
+                  required: [reason]
+                  properties:
+                    reason:
+                      type: string
 
     AuditSinkWrite:
       type: object
