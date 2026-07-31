@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { UseMutationResult, UseQueryResult } from "@tanstack/react-query";
 
 import { apiGet, apiSend } from "../api/client.ts";
+import { type CommitOutcome, applied, settle } from "../features/writes/commit.ts";
 import {
   API_PATHS,
   auditPath,
@@ -92,16 +93,31 @@ export function useFleetView(
   });
 }
 
+/**
+ * Enable or disable an imposter, resolving only once the write has actually landed.
+ *
+ * The `mutationFn` awaits the commit rather than the acknowledgement, which is what makes
+ * `isPending` mean "committing" instead of "sent". Under `--cluster-admin-async` this route answers
+ * `202` the moment the write is parked, and the console used to render that as done.
+ *
+ * A `failed` commit rejects, so the existing `ErrorNote` renders the fleet's own reason. An
+ * `unobservable` one resolves — the write was accepted and this session simply cannot watch it —
+ * and the screen says so rather than claiming either outcome.
+ */
 export function useLifecycleToggle(): UseMutationResult<
-  unknown,
+  CommitOutcome,
   Error,
   { port: number; enable: boolean }
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ port, enable }) =>
-      apiSend("POST", lifecyclePath(port, enable), undefined, { tenant }),
+    mutationFn: async ({ port, enable }) => {
+      const sent = await apiSend("POST", lifecyclePath(port, enable), undefined, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
     // Re-read rather than patch the cache: `SetEnabled` is a replicated op, so what the fleet
     // actually applied is the only thing worth showing. This is also what makes the list reflect
     // the change immediately instead of at the next poll tick.
@@ -173,7 +189,7 @@ export class RouteTableConflict extends Error {
  * server-side precondition on this route (filed as a follow-up).
  */
 export function usePutRoutes(): UseMutationResult<
-  unknown,
+  { stored: RouteTable | null; outcome: CommitOutcome },
   Error,
   { draft: Route[]; base: Route[] }
 > {
@@ -187,7 +203,21 @@ export function usePutRoutes(): UseMutationResult<
       if (JSON.stringify(current) !== JSON.stringify(base)) {
         throw new RouteTableConflict(current);
       }
-      return apiSend<RouteTable>("PUT", API_PATHS.frontDoorRoutes, { routes: draft }, { tenant });
+      const sent = await apiSend<RouteTable>(
+        "PUT",
+        API_PATHS.frontDoorRoutes,
+        { routes: draft },
+        { tenant },
+      );
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      /*
+       * A parked write has no body to adopt — the `202` carries op ids, not the stored table — so
+       * `stored` is null there and the cache is left to the invalidation refetch. Seeding it from
+       * the draft instead would paint the table as saved on the strength of a write we have not
+       * confirmed, which is the whole bug.
+       */
+      return { stored: sent.kind === "applied" ? sent.data : null, outcome };
     },
     /*
      * Adopt the stored table the `PUT` returns straight into the cache.
@@ -198,9 +228,10 @@ export function usePutRoutes(): UseMutationResult<
      * undone — and stays that way if the refetch fails — is exactly the kind of quiet lie this
      * console is being careful about elsewhere.
      */
-    onSuccess: (stored) => client.setQueryData(key(["front-door-routes"], tenant), () =>
-      normalizeTable(stored as RouteTable),
-    ),
+    onSuccess: ({ stored }) => {
+      if (stored === null) return;
+      client.setQueryData(key(["front-door-routes"], tenant), () => normalizeTable(stored));
+    },
     onSettled: () => client.invalidateQueries({ queryKey: ["front-door-routes"] }),
   });
 }
@@ -211,12 +242,16 @@ export function usePutRoutes(): UseMutationResult<
  * Preferred over a whole-table `PUT` whenever a single removal is what the operator meant: it
  * cannot take an unrelated concurrent edit down with it.
  */
-export function useDeleteRoute(): UseMutationResult<unknown, Error, { routeId: string }> {
+export function useDeleteRoute(): UseMutationResult<CommitOutcome, Error, { routeId: string }> {
   const { tenant } = useSession();
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ routeId }) =>
-      apiSend("DELETE", frontDoorRoutePath(routeId), undefined, { tenant }),
+    mutationFn: async ({ routeId }) => {
+      const sent = await apiSend("DELETE", frontDoorRoutePath(routeId), undefined, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
     onSettled: () => client.invalidateQueries({ queryKey: ["front-door-routes"] }),
   });
 }
@@ -270,7 +305,7 @@ export function useTenantProbe(
 export function useCreateTenant(): UseMutationResult<unknown, Error, TenantWrite> {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (body) => apiSend("POST", API_PATHS.tenants, body),
+    mutationFn: async (body) => applied(await apiSend("POST", API_PATHS.tenants, body)),
     onSettled: () => client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY }),
   });
 }
@@ -282,7 +317,7 @@ export function useSaveTenant(): UseMutationResult<
 > {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ tenantId, body }) => apiSend("PUT", tenantPath(tenantId), body),
+    mutationFn: async ({ tenantId, body }) => applied(await apiSend("PUT", tenantPath(tenantId), body)),
     onSettled: (_data, _error, vars) => {
       client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY });
       client.invalidateQueries({ queryKey: adminTenantKey(vars.tenantId) });
@@ -293,7 +328,7 @@ export function useSaveTenant(): UseMutationResult<
 export function useDeleteTenant(): UseMutationResult<unknown, Error, { tenantId: string }> {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ tenantId }) => apiSend("DELETE", tenantPath(tenantId)),
+    mutationFn: async ({ tenantId }) => applied(await apiSend("DELETE", tenantPath(tenantId))),
     onSettled: () => client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY }),
   });
 }
@@ -323,7 +358,7 @@ export function useCreatePrincipal(
   const client = useQueryClient();
   return useMutation({
     mutationFn: async (body) => {
-      const issued = await apiSend<IssuedPrincipal>("POST", principalsPath(tenantId), body);
+      const issued = applied(await apiSend<IssuedPrincipal>("POST", principalsPath(tenantId), body));
       onIssued(issued);
       return stripApiKey(issued);
     },
@@ -345,7 +380,7 @@ export function useSavePrincipal(): UseMutationResult<
   const client = useQueryClient();
   return useMutation({
     mutationFn: ({ tenantId, principalId, body }) =>
-      apiSend("PUT", principalPath(tenantId, principalId), body),
+      apiSend("PUT", principalPath(tenantId, principalId), body).then(applied),
     onSettled: (_data, _error, vars) =>
       client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
   });
@@ -359,7 +394,7 @@ export function useDeletePrincipal(): UseMutationResult<
   const client = useQueryClient();
   return useMutation({
     mutationFn: ({ tenantId, principalId }) =>
-      apiSend("DELETE", principalPath(tenantId, principalId)),
+      apiSend("DELETE", principalPath(tenantId, principalId)).then(applied),
     onSettled: (_data, _error, vars) =>
       client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
   });
@@ -373,7 +408,7 @@ export function usePutBinding(): UseMutationResult<
   const client = useQueryClient();
   return useMutation({
     mutationFn: ({ tenantId, principalId, role }) =>
-      apiSend("PUT", bindingPath(tenantId, principalId), { role }),
+      apiSend("PUT", bindingPath(tenantId, principalId), { role }).then(applied),
     onSettled: (_data, _error, vars) =>
       client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
   });
@@ -387,7 +422,7 @@ export function useDeleteBinding(): UseMutationResult<
   const client = useQueryClient();
   return useMutation({
     mutationFn: ({ tenantId, principalId }) =>
-      apiSend("DELETE", bindingPath(tenantId, principalId)),
+      apiSend("DELETE", bindingPath(tenantId, principalId)).then(applied),
     onSettled: (_data, _error, vars) =>
       client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
   });

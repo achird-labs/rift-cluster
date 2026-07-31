@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 
 import { ApiError, apiSend } from "../api/client.ts";
+import { applied } from "../features/writes/commit.ts";
 import { API_PATHS } from "../api/paths.ts";
 import { describe } from "../components/primitives.tsx";
 
@@ -23,7 +24,7 @@ export function Login({ onAuthenticated }: { onAuthenticated: () => void }): Rea
     setBusy(true);
     setError(null);
     try {
-      await apiSend("POST", API_PATHS.session, { apiKey });
+      applied(await apiSend("POST", API_PATHS.session, { apiKey }));
       setApiKey("");
       onAuthenticated();
     } catch (cause) {

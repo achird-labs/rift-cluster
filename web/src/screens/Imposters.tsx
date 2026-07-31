@@ -8,7 +8,7 @@ import { useFleetView, useImposters, useLifecycleToggle } from "../app/queries.t
 import { useSession } from "../app/session.tsx";
 import { toHash } from "../app/routing.ts";
 import { ImposterField } from "../components/imposterFields.tsx";
-import { ErrorNote, Ident, Truncated, UNKNOWN } from "../components/primitives.tsx";
+import { ErrorNote, Ident, Truncated, UNKNOWN, UnconfirmedNote } from "../components/primitives.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
 
@@ -36,7 +36,8 @@ export function Imposters(): ReactNode {
       </header>
 
       {imposters.isError ? <ErrorNote error={imposters.error} context="Could not list imposters" /> : null}
-      {toggle.isError ? <ErrorNote error={toggle.error} context="The fleet refused that change" /> : null}
+      {toggle.isError ? <ErrorNote error={toggle.error} context="That change did not take effect" /> : null}
+      {toggle.data?.kind === "unobservable" ? <UnconfirmedNote reason={toggle.data.reason} /> : null}
 
       {imposters.isPending ? <p className="muted">Reading…</p> : null}
 

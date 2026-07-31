@@ -3,7 +3,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { ApiError } from "../api/client.ts";
 import { RouteTableConflict, useDeleteRoute, usePutRoutes, useRouteTable } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { ErrorNote, Ident, Status } from "../components/primitives.tsx";
+import { ErrorNote, Ident, Status, UnconfirmedNote } from "../components/primitives.tsx";
 import type { Route } from "../features/routes/order.ts";
 import { effectiveOrder, orderReason, validateTable } from "../features/routes/order.ts";
 
@@ -47,17 +47,32 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
   const draftKey = JSON.stringify(draft);
   const baseKey = JSON.stringify(base);
 
+  /**
+   * Is there a write out there we sent but could not watch land?
+   *
+   * While this holds, a poll of the table is not evidence of anything: it may predate the parked
+   * write, and adopting it would present the pre-write table as current.
+   */
+  const unconfirmed = put.data?.outcome.kind === "unobservable";
+
   /*
    * Adopt a newly polled table only while the draft is clean. Overwriting a dirty draft with a poll
    * result would discard edits the operator is in the middle of making; keeping the stale base
    * instead is what lets the save-time re-read detect the concurrent change and offer a rebase.
+   *
+   * Suspended entirely while a write is unconfirmed. A parked `PUT` has not committed, so the very
+   * next poll returns the table as it was *before* it — and adopting that would not merely show a
+   * stale table, it would move `base` to it. The next save would then send
+   * `{draft: stale, base: stale}`, sail through the optimistic-concurrency re-read, and undo the
+   * in-flight write the moment it landed.
    */
   useEffect(() => {
+    if (unconfirmed) return;
     if (draftKey === baseKey && loadedKey !== baseKey) {
       setDraft(loaded);
       setBase(loaded);
     }
-  }, [loaded, loadedKey, draftKey, baseKey]);
+  }, [loaded, loadedKey, draftKey, baseKey, unconfirmed]);
 
   const dirty = draftKey !== baseKey;
   const errors = validateTable(draft);
@@ -80,7 +95,15 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
         onError: (error) => {
           if (error instanceof RouteTableConflict) setConflict(error.current);
         },
-        onSuccess: () => setBase(draft),
+        /*
+         * Advance the base only on a write we watched commit. `unobservable` means the fleet took
+         * it and we could not follow it, so treating the draft as the new baseline would call a
+         * write saved on no evidence — and would leave the editor clean, ready to adopt the
+         * pre-write table on the next poll.
+         */
+        onSuccess: ({ outcome }) => {
+          if (outcome.kind === "applied") setBase(draft);
+        },
       },
     );
   };
@@ -94,6 +117,10 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
 
   return (
     <>
+      {put.data?.outcome.kind === "unobservable" ? (
+        <UnconfirmedNote reason={put.data.outcome.reason} />
+      ) : null}
+      {remove.data?.kind === "unobservable" ? <UnconfirmedNote reason={remove.data.reason} /> : null}
       {conflict !== null ? (
         <div className="degraded" data-testid="route-conflict" role="alert">
           <strong>The route table changed while you were editing.</strong> Your edits have not been

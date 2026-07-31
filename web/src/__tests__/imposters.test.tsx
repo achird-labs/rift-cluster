@@ -241,3 +241,71 @@ describe("dense tables (200 imposters, 40-character names, narrow window)", () =
     expect(screen.getAllByTestId(/^imposter-row-/).length).toBe(200);
   });
 });
+describe("a parked write is not reported as saved (#211)", () => {
+  /*
+   * Under `--cluster-admin-async` the lifecycle routes answer `202` the moment the write is parked,
+   * before it has committed. The console used to render that identically to a `200`, so the row
+   * settled and the operator was told the change had landed while it was still in flight.
+   */
+  it("follows the op id a 202 hands back instead of settling immediately", async () => {
+    const { calls } = stubFetch({
+      "/imposters": { json: TWO },
+      "/imposters/4545/disable": { json: { opId: "op-7" }, status: 202 },
+      "/_fleet/ops/op-7": { json: { state: "applied", revision: 12 } },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    await screen.findByText("billing");
+
+    await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
+
+    await waitFor(() => expect(calls).toContain("/_fleet/ops/op-7"));
+    // Applied is the ordinary outcome, so there is nothing to caveat on screen.
+    await waitFor(() => expect(screen.queryByTestId("write-unconfirmed")).toBeNull());
+  });
+
+  it("surfaces the fleet's own reason when the parked write is refused", async () => {
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/imposters/4545/disable": { json: { opId: "op-8" }, status: 202 },
+      "/_fleet/ops/op-8": {
+        json: { state: "failed", revision: 3, detail: "port claimed by another tenant" },
+      },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    await screen.findByText("billing");
+
+    await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("port claimed by another tenant");
+  });
+
+  it("says accepted-not-confirmed when this principal cannot read the op status", async () => {
+    /*
+     * The case that makes the three-valued outcome load-bearing. `/_fleet/ops/*` is fleet-scoped and
+     * answers 404 to everyone else, so an ordinary operator's write is accepted, almost certainly
+     * commits, and simply cannot be watched. Rendering that as failure would be the filed bug
+     * inverted — an outcome asserted without observing it.
+     */
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/imposters/4545/disable": { json: { opId: "op-9" }, status: 202 },
+      "/_fleet/ops/op-9": { status: 404 },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
+    await screen.findByText("billing");
+
+    await userEvent.setup().click(screen.getByRole("button", { name: /disable billing/i }));
+
+    const note = await screen.findByTestId("write-unconfirmed");
+    expect(note.textContent).toContain("Accepted, not yet confirmed");
+    // Not an error: nothing was refused, and role=alert would say otherwise to a screen reader.
+    expect(note.getAttribute("role")).toBe("status");
+  });
+});

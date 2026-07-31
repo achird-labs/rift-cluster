@@ -49,12 +49,59 @@ export class ApiError extends Error {
 
 type Mutation = "POST" | "PUT" | "DELETE" | "PATCH";
 
+/**
+ * The header a terminated write's success response carries its op id in
+ * (`decorate.rs::HEADER_OP_ID`). Only read as a fallback: the `202` body carries the ids too, and
+ * for a multi-op mutation the body's `opIds` are the *only* pollable ones.
+ */
+export const OP_ID_HEADER = "Rift-Cluster-Op-Id";
+
+/**
+ * What a mutation actually did — the distinction a bare `2xx` throws away.
+ *
+ * `202 AcceptedParked` means the write was durably parked and is **still committing**; the contract
+ * says in as many words to "poll the returned op id rather than assuming this response's absence of
+ * a body reflects the final state". Returning it as a plain value is how the console came to report
+ * a committing write as saved, so the two outcomes are separate constructors and every caller has
+ * to say which one it is handling.
+ */
+export type SendResult<T> =
+  | { kind: "applied"; data: T }
+  | { kind: "parked"; opIds: readonly string[] };
+
+/** The op ids a `202` body carries, preferring the derived ids of a multi-op mutation. */
+function parkedOpIds(body: unknown, response: Response): string[] {
+  const payload = (body ?? {}) as { opId?: unknown; opIds?: unknown };
+  /*
+   * `opIds` first, and not merely as a nicety: `admin_front.rs` parks only the *derived* ids of a
+   * multi-op mutation and never the base, so a client polling the bare `opId` of a batch
+   * `PUT /imposters` would 404 forever.
+   *
+   * Filter before testing for emptiness, not after. Testing the raw array and returning the
+   * filtered one means a malformed `opIds` (entries that are not strings — a contract violation,
+   * but one worth surviving) yields `[]` and skips the `opId` and header fallbacks that might each
+   * still hold a usable id.
+   */
+  const derived = Array.isArray(payload.opIds)
+    ? payload.opIds.filter((id): id is string => typeof id === "string")
+    : [];
+  if (derived.length > 0) return derived;
+  if (typeof payload.opId === "string") return [payload.opId];
+  /*
+   * Best-effort last resort. The header carries the *base* id, which a multi-op mutation never
+   * parks — polling it would 404 and settle as unobservable rather than wrong. Unreachable against
+   * the current server, which always sends a body with the ids on the async path.
+   */
+  const header = response.headers.get(OP_ID_HEADER);
+  return header === null ? [] : [header];
+}
+
 async function request(
   method: "GET" | Mutation,
   path: string,
   body?: unknown,
   options?: RequestOptions,
-): Promise<unknown> {
+): Promise<{ response: Response; body: unknown }> {
   const headers: Record<string, string> = {};
   if (method !== "GET") {
     headers[CSRF_HEADER] = "1";
@@ -81,13 +128,13 @@ async function request(
     throw new ApiError(response.status, text);
   }
   if (text.length === 0) {
-    return null;
+    return { response, body: null };
   }
   // A 2xx whose body will not parse is a broken contract, not an empty result: surfacing it as
   // `null` here is exactly the swallow that shows up later as a blank screen with no server-side
   // trace to correlate.
   try {
-    return JSON.parse(text) as unknown;
+    return { response, body: JSON.parse(text) as unknown };
   } catch (cause) {
     throw new ApiError(
       response.status,
@@ -110,14 +157,27 @@ export function apiGet<T = unknown>(
   path: ApiPath | (string & {}),
   options?: RequestOptions,
 ): Promise<T> {
-  return request("GET", path, undefined, options) as Promise<T>;
+  return request("GET", path, undefined, options).then(({ body }) => body as T);
 }
 
+/**
+ * Send a mutation, reporting **whether it actually landed**.
+ *
+ * The `SendResult` is deliberately not unwrapped here. Only 14 of the admin routes can answer
+ * `202`, so most callers know a park is impossible — but "most" is the problem: when the return
+ * type was a bare `T`, the three that *can* park read exactly like the seven that cannot, and all
+ * ten reported success on a write still in flight. Making the caller name the case is what stops
+ * the next mutation from inheriting that. Use `applied()` to assert a route cannot park.
+ */
 export function apiSend<T = unknown>(
   method: Mutation,
   path: ApiPath | (string & {}),
   body?: unknown,
   options?: RequestOptions,
-): Promise<T> {
-  return request(method, path, body, options) as Promise<T>;
+): Promise<SendResult<T>> {
+  return request(method, path, body, options).then(({ response, body: parsed }) =>
+    response.status === 202
+      ? { kind: "parked", opIds: parkedOpIds(parsed, response) }
+      : { kind: "applied", data: parsed as T },
+  );
 }
