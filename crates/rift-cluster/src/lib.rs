@@ -37,8 +37,9 @@ pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use control::{
     AUDIT_RESOURCE_ALL, AuditRow, AuditSink, ControlOp, ControlOutcome, ControlRequest,
     ControlResponse, DEFAULT_AUDIT_BATCH_MAX_ROWS, DEFAULT_TENANT, Digest, FLEET_SCOPE,
-    MAX_AUDIT_BATCH_MAX_ROWS, MAX_SOURCE_PAYLOAD_BYTES, OnDrift, SESSION_KEY_BYTES, SessionKey,
-    SourceMode, SourceProvenance, StubEdit, StubEditScript, TenantId,
+    MAX_AUDIT_BATCH_MAX_ROWS, MAX_SOURCE_PAYLOAD_BYTES, OnDrift, PreconditionTarget,
+    SESSION_KEY_BYTES, SessionKey, SourceMode, SourceProvenance, StubEdit, StubEditScript,
+    TenantId, precondition_target,
 };
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;

@@ -258,6 +258,211 @@ async fn delete_route_removes_it_and_404s_when_missing() {
     server.shutdown().await;
 }
 
+/// Issue #210 gate: the route table carries a revision a client can condition
+/// on, and a write that names a stale one is refused rather than silently
+/// replacing the whole table over the top of a concurrent edit.
+///
+/// The lost-update this pins is not hypothetical: `PUT /front-door/routes` is a
+/// whole-table replace, so two consoles that both read, edited and wrote leave
+/// only the second one's table behind with nothing reporting the loss.
+#[tokio::test]
+async fn a_stale_if_match_cannot_clobber_the_route_table() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    // The read path answers a revision, portless: a route table has no single
+    // record to qualify the token with, so the tenant segment stands alone.
+    let seen = Seen::of(
+        reqwest::get(format!("http://{admin}/front-door/routes"))
+            .await
+            .expect("get routes"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "{seen}");
+    let empty_revision = seen
+        .header("rift-cluster-revision")
+        .expect("GET must answer a revision to condition on")
+        .to_owned();
+    assert!(
+        empty_revision.starts_with("default@"),
+        "portless token: {empty_revision}"
+    );
+
+    // A write carrying the revision the read answered applies. A table nobody
+    // has ever written reads as revision 0, so this also pins that an absent
+    // row is 0 rather than a refusal.
+    let response = client
+        .put(format!("http://{admin}/front-door/routes"))
+        .header("if-match", &empty_revision)
+        .json(&one_route("first-writer", "/svc", port))
+        .send()
+        .await
+        .expect("conditioned put");
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 200, "{seen}");
+
+    // ...and the read's revision advances with it.
+    let seen = Seen::of(
+        reqwest::get(format!("http://{admin}/front-door/routes"))
+            .await
+            .expect("get routes"),
+    )
+    .await;
+    let after_write = seen
+        .header("rift-cluster-revision")
+        .expect("revision header")
+        .to_owned();
+    assert_ne!(
+        empty_revision, after_write,
+        "a committed write must advance the table's revision"
+    );
+
+    // The stale token is refused with the same 409 shape a single-imposter
+    // conflict uses — not a 400, and not a silent unconditional replace.
+    let response = client
+        .put(format!("http://{admin}/front-door/routes"))
+        .header("if-match", &empty_revision)
+        .json(&one_route("late-writer", "/late", port))
+        .send()
+        .await
+        .expect("stale conditioned put");
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 409, "{seen}");
+    let body = seen.json();
+    assert_eq!(body["errors"][0]["type"], "resource conflict", "{seen}");
+    assert!(
+        body["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("revision conflict"),
+        "{seen}"
+    );
+
+    // The point of the whole feature: the refused write changed nothing.
+    let table: serde_json::Value = reqwest::get(format!("http://{admin}/front-door/routes"))
+        .await
+        .expect("get routes")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        table["routes"][0]["id"], "first-writer",
+        "a refused precondition must not have replaced the table: {table}"
+    );
+    assert_eq!(table["routes"].as_array().map(Vec::len), Some(1), "{table}");
+
+    // A token this front cannot evaluate is still a 400, not a pass.
+    let response = client
+        .put(format!("http://{admin}/front-door/routes"))
+        .header("if-match", "*")
+        .json(&one_route("wildcard", "/w", port))
+        .send()
+        .await
+        .expect("malformed conditioned put");
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 400, "{seen}");
+    assert_eq!(seen.json()["errors"][0]["type"], "bad data", "{seen}");
+
+    server.shutdown().await;
+}
+
+/// Issue #210 gate: a single-route delete mutates the table, so it must
+/// invalidate every outstanding precondition against it — otherwise a client
+/// that read before the delete could still replace the table wholesale after.
+#[tokio::test]
+async fn deleting_a_route_advances_the_table_revision() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    client
+        .put(format!("http://{admin}/front-door/routes"))
+        .json(&json!({
+            "routes": [
+                { "id": "a", "match": { "path_prefix": "/a" }, "target": { "port": port } },
+                { "id": "b", "match": { "path_prefix": "/b" }, "target": { "port": port } },
+            ],
+        }))
+        .send()
+        .await
+        .expect("put routes");
+
+    let seen = Seen::of(
+        reqwest::get(format!("http://{admin}/front-door/routes"))
+            .await
+            .expect("get routes"),
+    )
+    .await;
+    let before_delete = seen
+        .header("rift-cluster-revision")
+        .expect("revision header")
+        .to_owned();
+
+    let response = client
+        .delete(format!("http://{admin}/front-door/routes/b"))
+        .send()
+        .await
+        .expect("delete route");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let seen = Seen::of(
+        reqwest::get(format!("http://{admin}/front-door/routes"))
+            .await
+            .expect("get routes"),
+    )
+    .await;
+    let after_delete = seen
+        .header("rift-cluster-revision")
+        .expect("revision header")
+        .to_owned();
+    assert_ne!(
+        before_delete, after_delete,
+        "a delete mutates the table, so it must advance its revision"
+    );
+
+    // The token captured before the delete is now stale for a whole-table
+    // replace...
+    let response = client
+        .put(format!("http://{admin}/front-door/routes"))
+        .header("if-match", &before_delete)
+        .json(&one_route("c", "/c", port))
+        .send()
+        .await
+        .expect("stale conditioned put");
+    assert_eq!(response.status().as_u16(), 409);
+
+    // ...and for a second delete conditioned on it.
+    let response = client
+        .delete(format!("http://{admin}/front-door/routes/a"))
+        .header("if-match", &before_delete)
+        .send()
+        .await
+        .expect("stale conditioned delete");
+    assert_eq!(response.status().as_u16(), 409);
+
+    // A delete carrying the current token applies.
+    let response = client
+        .delete(format!("http://{admin}/front-door/routes/a"))
+        .header("if-match", &after_delete)
+        .send()
+        .await
+        .expect("conditioned delete");
+    assert_eq!(response.status().as_u16(), 200);
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn put_routes_rejects_an_invalid_table_as_a_typed_400() {
     let state = TempDir::new().expect("tempdir");

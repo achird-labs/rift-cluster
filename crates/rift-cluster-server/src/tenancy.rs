@@ -901,8 +901,9 @@ pub(crate) fn whoami_body(resolved: Option<&Resolved>) -> Result<Vec<u8>, String
 /// Mint a [`ControlRequest`] for a tenancy op.
 ///
 /// `expected_revision` is always `None`: preconditions are defined against
-/// `sm_configs` rows (see `control::precondition_target`), so there is nothing
-/// for a tenancy op to condition on.
+/// `sm_configs` rows and route-table revisions (see
+/// `control::precondition_target`), so there is nothing for a tenancy op to
+/// condition on.
 pub(crate) fn mint_request(
     op: ControlOp,
     principal: Option<String>,

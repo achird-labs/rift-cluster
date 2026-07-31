@@ -1475,13 +1475,17 @@ paths:
         Terminates: whole-table replace, deterministic and pre-validated
         before commit, so the parsed table itself is what gets stored (no
         post-commit re-read — there is no upstream `/front-door/routes` to
-        read from).
+        read from). Because it replaces the table wholesale, an unconditional
+        `PUT` silently discards any edit committed since the caller read —
+        send `If-Match` with the revision `getFrontDoorRoutes` answered to
+        make the replace conditional.
       tags: [front-door]
       x-rift-origin: ee
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CsrfHeader'
+        - $ref: '#/components/parameters/IfMatchRouteTable'
       requestBody:
         required: true
         content:
@@ -1517,6 +1521,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '500':
@@ -1532,7 +1538,9 @@ paths:
         Terminates: this front door's only read path — a state-machine
         read, not a mutation, so it never reaches the write classifier or
         the proxy. There is no upstream `/front-door/routes` to fall back
-        on.
+        on. The table and its `Rift-Cluster-Revision` are read in one
+        state-machine transaction, so the revision always describes exactly
+        the body returned with it.
       tags: [front-door]
       x-rift-origin: ee
       parameters:
@@ -1540,6 +1548,9 @@ paths:
       responses:
         '200':
           description: The tenant's route table.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
           content:
             application/json:
               schema:
@@ -1568,7 +1579,9 @@ paths:
         Terminates: idempotent at the state-machine level, but the admin
         surface still answers `404` for a route id that was never in the
         caller's own tenant's table (captured before the delete commits,
-        the same shape as `deleteImposter`).
+        the same shape as `deleteImposter`). A delete mutates the table, so
+        it advances the table's revision and invalidates any outstanding
+        `If-Match` against it.
       tags: [front-door]
       x-rift-origin: ee
       parameters:
@@ -1580,6 +1593,7 @@ paths:
         - $ref: '#/components/parameters/CsrfHeader'
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatchRouteTable'
       responses:
         '200':
           description: The deleted route.
@@ -1604,6 +1618,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -2744,10 +2760,35 @@ components:
         header (default:<port>@<revision>) or a bare revision integer.
         Absent, the write is last-writer-wins. A stale or mismatched value
         answers 409; sending it on a collection-wide mutation (which has
-        no single record to condition on) answers 400.
+        no single record to condition on) answers 400. The route-table
+        form is a separate parameter (IfMatchRouteTable) because its
+        grammar is portless — the two are not interchangeable, and sending
+        one where the other is expected answers 400.
       schema:
         type: string
         example: 'default:4545@17'
+    IfMatchRouteTable:
+      name: If-Match
+      in: header
+      required: false
+      description: >
+        Optimistic-concurrency precondition for a front-door route-table
+        write: the portless token default@<revision>, exactly as
+        getFrontDoorRoutes answers it in its Rift-Cluster-Revision header,
+        or a bare revision integer. Portless because the precondition is
+        against the tenant's route table as a whole, not any one route —
+        there is no port to name. A tenant whose table has never been
+        written is at revision 0, so conditioning on 0 is how a first
+        writer claims one. Both a whole-table PUT and a single-route
+        DELETE advance the revision, so either invalidates an outstanding
+        token. Absent, a PUT is a last-writer-wins whole-table replace and
+        will silently discard a concurrent edit. A stale value answers
+        409; a value this front cannot evaluate — a wildcard, a weak
+        validator, a comma list, the ported default:<port>@<revision>
+        form — answers 400.
+      schema:
+        type: string
+        example: 'default@17'
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -2890,7 +2931,10 @@ components:
         id. For an imposter/stub write the tenant segment is NOT the
         caller's real tenant — the code hardcodes the literal string
         `default`, so a write authorized as tenant `acme` still emits
-        `default:<port>@<revision>`. Treat the whole token as opaque:
+        `default:<port>@<revision>`. A front-door route-table read or
+        write emits the portless `default@<revision>` (same hardcoded
+        tenant segment); on a read it is the revision of the table in
+        that same response's body. Treat the whole token as opaque:
         feed it back verbatim as If-Match on a later write to the same
         record rather than constructing one from this template — a
         constructed value that gets the tenant segment wrong answers
@@ -2971,7 +3015,10 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     RevisionConflict:
-      description: If-Match named a revision that no longer matches the stored record.
+      description: >
+        If-Match named a revision that no longer matches the stored
+        record — a single imposter's, or a tenant's whole front-door route
+        table. The write committed nothing.
       content:
         application/json:
           schema:

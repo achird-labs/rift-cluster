@@ -513,16 +513,26 @@ C1–C3 are strictly ordered; C4+ and M1+ parallelize.
    not a UI scrape: C6 ships without the diagnostics panel rather than
    reconstructing it client-side from data the endpoint does not carry.
 7. **The front-door route table has no read-side precondition.** *Raised by C6
-   (#189).* `If-Match` is restricted to single-imposter operations
-   (`admin_front.rs`), and `GET /front-door/routes` returns no
-   `Rift-Cluster-Revision` — the header is declared on the `PUT`/`DELETE`
-   responses only. The editor therefore re-reads and compares content before a
-   whole-table `PUT`, which **narrows** the lost-update window without closing
-   it: a write committing between that re-read and the `PUT` is still lost, and
-   nothing client-side can prevent it. Closing it needs a server-side
-   precondition on this route (a revision on the `GET` plus a conditional
-   `PUT`). Until then the single-route `DELETE` is the safe operation and the
-   editor says so.
+   (#189). **Closed server-side by #210.*** As raised: `If-Match` was
+   restricted to single-imposter operations (`admin_front.rs`) and `GET
+   /front-door/routes` returned no `Rift-Cluster-Revision`, so the editor
+   re-read and compared content before a whole-table `PUT` — which **narrowed**
+   the lost-update window without closing it, because a write committing
+   between that re-read and the `PUT` was still lost and nothing client-side
+   could prevent it.
+
+   #210 supplies what closing it needs. The state machine keeps a per-tenant
+   route-table revision (`sm_routes_revision`, stamped at the applying log index
+   by both `PutRoutes` and `DeleteRoute`); `GET /front-door/routes` answers it
+   as the portless `Rift-Cluster-Revision: default@<revision>`, read in the same
+   transaction as the body; and both route mutations accept that token as
+   `If-Match`, refusing a stale one with the same `409` a single-imposter
+   conflict uses — evaluated inside `apply`, so it holds through a follower.
+   A tenant whose table was never written is revision `0`.
+
+   Remaining, and console-side only: the editor still re-reads and compares
+   rather than sending the token it was given. Until it adopts `If-Match`, the
+   single-route `DELETE` remains the safe operation for it.
 
 ---
 
