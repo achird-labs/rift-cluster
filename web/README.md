@@ -4,9 +4,79 @@ The single-page app the cluster binary serves at `GET /console`. Vite + React +
 TypeScript + TanStack Query, with a TypeScript client generated from the
 published OpenAPI contract.
 
-C3 (#186) delivers the **pipeline**, not the console: the shell here renders a
-placeholder and one reachability check. The screens arrive with C4–C7
-(#187–#190).
+C3 (#186) delivered the pipeline; **C4 (#187) delivers the first screens** — the
+app shell, the tenant switcher, a read-only imposter list and detail with
+enable/disable, and the cluster/fleet view. C5–C7 (#188–#190) follow.
+
+## Layout
+
+```
+src/api/       schema.ts (generated, committed) · client.ts (the only fetch) · paths.ts
+src/app/       Shell · session · rbac · nav · routing · queries · contract · fleetView
+src/screens/   Login · Imposters · ImposterDetail · Fleet
+src/components/primitives (Status, Truncated, Ident, ErrorNote)
+```
+
+Four modules carry the decisions worth knowing before changing anything:
+
+- **`app/contract.ts`** — the single declaration of *which* schema fields any
+  screen renders. Keys are typed as `keyof` the generated schema type with its
+  index signature stripped, so a field the contract does not publish fails
+  `tsc`. This is RFC-006 §11's "every displayed field is traceable to a schema'd
+  endpoint" made mechanical rather than aspirational. It is why the prototype's
+  `numberOfRequests` chart is **not** here: that value reaches the body only
+  through `Imposter`'s non-exhaustive index signature. Its home is the request
+  log (#189).
+- **`app/rbac.ts`** — a hand transcription of
+  `crates/rift-cluster-server/src/authz.rs::role_allows`, with a test that
+  mirrors the table. It decides which controls are *drawn*. RFC-006 §3 rule 3
+  still holds: hiding is UX, the API is the boundary, and a hidden button is
+  never the only thing preventing a call. Note `LifecycleToggle` is an
+  **Operator** grant — gating enable/disable on "is an editor" would hide a
+  control Operator is entitled to.
+- **`app/fleetView.ts`** — derives the degraded/partial label from `/_fleet/*`.
+  Three states, kept distinct: read it, never asked, asked and failed.
+  `not-asked` claims **neither** partial nor complete — the projection is
+  fleet-scoped, so most principals are simply refused it and treating that
+  absence as evidence would put a permanent warning on a healthy console. But
+  `unavailable` must not fold into it: a FleetAdmin whose read failed has *lost*
+  the signal, which is a different thing from never having been entitled to it.
+
+  Note what is deliberately **not** a degradation: `voters ⊄ ring.members`. Both
+  arrive from the same `membership_config.voter_ids()` — `members_body` sends it
+  directly, `health_body` sends `Ring::new` of it, which only sorts and dedups —
+  so within one snapshot they are the same set and the divergence is
+  unrepresentable. Comparing them across this view's two requests would report a
+  sub-second read skew as a persistent fleet degradation. What *is* checked, and
+  has no other tell, is `node_id ∉ voters`: a node evicted from the membership
+  while still running looks healthy by every other measure.
+- **`app/query.ts`** — the polling contract (RFC-006 §6). 5s, and
+  `refetchIntervalInBackground: false` so a forgotten tab stops asking. That one
+  is verified by counting fetches across a real `visibilitychange`, not by
+  asserting the option is set.
+
+## Testing
+
+`pnpm test` runs vitest. Node is the default environment; component tests opt
+into jsdom with a `/** @vitest-environment jsdom */` docblock — not the other
+way round, because under jsdom `import.meta.url` is an `http:` URL and the two
+tests that read repository files could not resolve them.
+
+`src/__tests__/harness.tsx` renders through the **real** `createQueryClient()`.
+A test-local client with polling and retries disabled would pass while the
+shipped configuration polled a hidden tab forever.
+
+## Lint
+
+```sh
+pnpm run lint
+```
+
+One rule, deliberately: `dangerouslySetInnerHTML` is banned in both its JSX and
+its property form (RFC-006 §9.1). A broad recommended-set config would bury a
+security gate among style nits reviewers learn to skim. CI runs this, and
+`contract-traceability.test.ts` asserts the same thing, so dropping the workflow
+step alone does not silently un-ban it.
 
 ## Dev loop
 

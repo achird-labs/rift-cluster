@@ -73,7 +73,17 @@ export default defineConfig({
     ),
   },
   test: {
+    // Node stays the default and the component tests opt into jsdom with a per-file
+    // `@vitest-environment` docblock. The other way round does not work: under jsdom
+    // `import.meta.url` is an `http:` URL, so the two tests that read repository files
+    // (this config's contract check, and the traceability scan) fail on `fileURLToPath`.
     environment: "node",
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    environmentOptions: {
+      // An explicit, non-opaque origin. jsdom's default document is `about:blank`, whose origin is
+      // opaque — and `localStorage` is unavailable on an opaque origin, so without this the tenant
+      // selection cannot be exercised at all.
+      jsdom: { url: "http://localhost/console/" },
+    },
   },
 });

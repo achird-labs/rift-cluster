@@ -1,8 +1,9 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 
 import { App } from "./App.tsx";
+import { createQueryClient } from "./app/query.ts";
 import "./styles.css";
 
 const root = document.getElementById("root");
@@ -12,20 +13,11 @@ if (!root) {
   throw new Error("#root is missing from the served document");
 }
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      // Admin state is edited by other operators and by the fleet itself, so a cached read is
-      // stale the moment it lands. C4 tunes this per screen; the default stays honest.
-      staleTime: 0,
-      retry: 1,
-    },
-  },
-});
-
+// The same factory the tests render through, so a polling or retry setting cannot be true of the
+// suite and false of the shipped bundle.
 createRoot(root).render(
   <StrictMode>
-    <QueryClientProvider client={queryClient}>
+    <QueryClientProvider client={createQueryClient()}>
       <App />
     </QueryClientProvider>
   </StrictMode>,

@@ -18,6 +18,20 @@ export type ApiPath = keyof paths;
  */
 export const CSRF_HEADER = "X-Rift-CSRF";
 
+/**
+ * RFC-002 §8.1's tenant selector. It **selects among the principal's existing bindings; it never
+ * grants one** — `admin_front.rs::requested_tenant` reads it and `authorize_action` only ever
+ * intersects it against bindings already loaded from applied state.
+ *
+ * Sent only when a tenant is actually in view. An empty value would be a claim of a tenant named
+ * `""`, which is a tenant the caller is not bound to and answers 404 (§8.4) — quite different from
+ * omitting the header, which means "my default tenant".
+ */
+export const TENANT_HEADER = "X-Rift-Tenant";
+
+/** Per-call context the schema cannot express. Currently just the tenant the screen is showing. */
+export type RequestOptions = { tenant?: string | null | undefined };
+
 /** An admin response that was not 2xx, carrying enough to render a useful message. */
 export class ApiError extends Error {
   readonly status: number;
@@ -39,6 +53,7 @@ async function request(
   method: "GET" | Mutation,
   path: string,
   body?: unknown,
+  options?: RequestOptions,
 ): Promise<unknown> {
   const headers: Record<string, string> = {};
   if (method !== "GET") {
@@ -46,6 +61,10 @@ async function request(
   }
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
+  }
+  const tenant = options?.tenant;
+  if (tenant !== undefined && tenant !== null && tenant !== "") {
+    headers[TENANT_HEADER] = tenant;
   }
 
   const response = await fetch(path, {
@@ -78,14 +97,27 @@ async function request(
   }
 }
 
-export function apiGet(path: ApiPath | (string & {})): Promise<unknown> {
-  return request("GET", path);
+/**
+ * `T` is an **assertion**, not a validation — nothing here checks the body against the schema.
+ *
+ * It defaults to `unknown` so an un-annotated call still forces the caller to narrow. Naming the
+ * generated contract type at the call site is the honest middle ground: the shape comes from the
+ * same document the server renders from, and the alternative (a cast at every call site) is the
+ * identical unsafety written more loudly. Runtime validation is a separate decision, and would
+ * belong here rather than in the screens.
+ */
+export function apiGet<T = unknown>(
+  path: ApiPath | (string & {}),
+  options?: RequestOptions,
+): Promise<T> {
+  return request("GET", path, undefined, options) as Promise<T>;
 }
 
-export function apiSend(
+export function apiSend<T = unknown>(
   method: Mutation,
   path: ApiPath | (string & {}),
   body?: unknown,
-): Promise<unknown> {
-  return request(method, path, body);
+  options?: RequestOptions,
+): Promise<T> {
+  return request(method, path, body, options) as Promise<T>;
 }
