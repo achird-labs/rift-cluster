@@ -1782,26 +1782,62 @@ fn validate_auth_source(auth: &AuthSource) -> Result<(), String> {
     }
 }
 
-/// The single-imposter `(tenant, port)` record `op` addresses, or `None` if
-/// `op` has no such target (a bulk op, or a reserved RFC-002 variant). Used by
-/// the state machine's expected-revision check (#46): a precondition can only
-/// ever hold against one stored record, so every op without a single target
-/// refuses a precondition deterministically rather than silently ignoring it.
-pub(crate) fn precondition_target(op: &ControlOp) -> Option<(&TenantId, u16)> {
+/// What stored record an `expected_revision` precondition holds against.
+///
+/// Two shapes, because the control plane has two things worth conditioning on
+/// and they are keyed differently: a single imposter row in `sm_configs`, and a
+/// tenant's front-door route table as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreconditionTarget<'a> {
+    /// The `sm_configs` row at `(tenant, port)`; its revision is the record's
+    /// own `StoredImposter::revision`.
+    Imposter(&'a TenantId, u16),
+    /// `tenant`'s whole route table (issue #210); its revision is the
+    /// `sm_routes_revision` row, absent meaning 0.
+    ///
+    /// Table-wide and not per-route on purpose: `PutRoutes` replaces the set as
+    /// a unit, so the only thing a client can meaningfully condition a replace
+    /// on is the state of the set it read. `DeleteRoute` stamps the same
+    /// revision — a delete mutates the table, so it must invalidate every
+    /// outstanding precondition against it, or a client that read before the
+    /// delete could replace the table wholesale after it and silently restore
+    /// the deleted route.
+    RouteTable(&'a TenantId),
+}
+
+/// The record `op`'s `expected_revision` addresses, or `None` if `op` has no
+/// such target (a bulk op, or a reserved RFC-002 variant). Used by the state
+/// machine's expected-revision check (#46, extended to route tables by #210): a
+/// precondition can only ever hold against one stored revision, so every op
+/// without a target refuses a precondition deterministically rather than
+/// silently ignoring it.
+///
+/// The match below is exhaustive with no wildcard arm, deliberately: a new
+/// `ControlOp` variant must fail to compile here until someone has decided
+/// whether it is conditionable. A `_ => None` would instead let it silently
+/// join the "preconditions do not apply" set, which is exactly how #210's
+/// lost-update shipped in the first place.
+#[must_use]
+pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget<'_>> {
     match op {
         // `config.port` is validated to be present before this ever matters,
         // but a `None` here must still yield `None`, not a bogus target.
-        ControlOp::PutImposter { tenant, config } => config.port.map(|port| (tenant, port)),
+        ControlOp::PutImposter { tenant, config } => config
+            .port
+            .map(|port| PreconditionTarget::Imposter(tenant, port)),
         ControlOp::PatchStubs { tenant, port, .. }
         | ControlOp::DeleteImposter { tenant, port }
-        | ControlOp::SetEnabled { tenant, port, .. } => Some((tenant, *port)),
+        | ControlOp::SetEnabled { tenant, port, .. } => {
+            Some(PreconditionTarget::Imposter(tenant, *port))
+        }
+        // Both route ops condition on — and stamp — the one per-tenant table
+        // revision. A per-route precondition would be a different feature and
+        // needs a single-route upsert op to hang off; #210 deliberately does
+        // not add one.
+        ControlOp::PutRoutes { tenant, .. } | ControlOp::DeleteRoute { tenant, .. } => {
+            Some(PreconditionTarget::RouteTable(tenant))
+        }
         ControlOp::DeleteAll { .. }
-        // No `expected_revision` support for routes (yet): `PutRoutes` is a
-        // whole-table replace with no single stored record to condition on,
-        // and a per-route precondition is future work if a single-route
-        // upsert op ever lands.
-        | ControlOp::PutRoutes { .. }
-        | ControlOp::DeleteRoute { .. }
         // A source op addresses a source, not an imposter: `expected_revision`
         // is defined against `sm_configs` rows, so there is no record here for
         // a precondition to hold against.

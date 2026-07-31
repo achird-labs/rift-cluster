@@ -1191,6 +1191,21 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// `tenant`'s route table together with the revision it is at (issue #210),
+    /// read as one consistent snapshot. This is what `GET /front-door/routes`
+    /// answers: the table, and the token a client feeds back as `If-Match` to
+    /// make its next write conditional on having read this exact table.
+    ///
+    /// A tenant whose table has never been written is at revision `0`.
+    ///
+    /// # Errors
+    /// Storage I/O, or a stored route that will not parse.
+    pub fn route_table_with_revision(&self, tenant: &str) -> Result<(RouteTable, u64), NodeError> {
+        self.sm_reader
+            .route_table_with_revision(tenant)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// Block until this node's leadership differs from `was_leader`, or until
     /// `timeout` elapses; return its leadership as of the moment this returns.
     ///

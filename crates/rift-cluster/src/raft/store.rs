@@ -77,8 +77,8 @@ use serde::{Deserialize, Serialize};
 use super::TypeConfig;
 use crate::control::{
     self, AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
-    FLEET_SCOPE, OnDrift, Principal, Quotas, Role, SessionKey, SourceMode, SourceProvenance,
-    StubEdit, StubEditScript, Tenant, TenantId,
+    FLEET_SCOPE, OnDrift, PreconditionTarget, Principal, Quotas, Role, SessionKey, SourceMode,
+    SourceProvenance, StubEdit, StubEditScript, Tenant, TenantId,
 };
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
@@ -93,6 +93,21 @@ const SM_CONFIGS_TABLE: TableDefinition<(&str, u16), &str> = TableDefinition::ne
 /// `DeleteRoute` is a single-key removal instead of a read-modify-write of
 /// the whole tenant's set.
 const SM_ROUTES_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_routes");
+/// `tenant -> revision`: the log index at which `tenant`'s route table was last
+/// mutated (issue #210). A missing row reads as `0`.
+///
+/// A separate table rather than a field on each `sm_routes` row, because the
+/// thing a client conditions a whole-table replace on is the *set*, not any one
+/// route — and a per-row copy would have no answer at all for a tenant whose
+/// last mutation was a delete that emptied the table.
+///
+/// `0` for "never written" is load-bearing in the safe direction: a tenant that
+/// has never had a route reads `0`, so a client that conditions on `0` and
+/// writes first wins, and every later stale token fails. It is never a value
+/// that makes a stale precondition pass, because a real mutation stamps a log
+/// index and log indices start above zero.
+const SM_ROUTES_REVISION_TABLE: TableDefinition<&str, u64> =
+    TableDefinition::new("sm_routes_revision");
 /// `(tenant, source id) -> StoredSource` (JSON): imposter sources as durable
 /// control-plane objects (issue #134). One row per source, like `sm_routes` —
 /// a delete is a single-key removal rather than a read-modify-write of a set.
@@ -360,6 +375,18 @@ struct SnapshotPayload {
     /// any.
     #[serde(default)]
     routes: Vec<(String, String, String)>,
+    /// `(tenant, revision)` rows of `sm_routes_revision` (issue #210).
+    ///
+    /// Defaulted for the same reason `routes` is, and the failure it prevents
+    /// is the one #210 exists to close: a node that installs a snapshot without
+    /// these rows reads every tenant's table as revision 0, so a client holding
+    /// a real token would be *refused* until the next write re-stamps it.
+    /// Annoying, and deliberately the safe direction — a pre-#210 snapshot
+    /// carries no revisions at all, and 0 fails every stale precondition rather
+    /// than passing one. The opposite default (inherit the last applied index)
+    /// would let a token minted before the join silently pass here.
+    #[serde(default)]
+    routes_revisions: Vec<(String, u64)>,
     /// `(tenant, source id, stored-source JSON)` rows of `sm_sources`. Defaulted
     /// for the same reason `routes` is: a snapshot built before issue #134 still
     /// installs cleanly, carrying no sources — the same as a fleet that declared
@@ -456,6 +483,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SNAPSHOT_TABLE).map_err(io)?;
         write_txn.open_table(SM_CONFIGS_TABLE).map_err(io)?;
         write_txn.open_table(SM_ROUTES_TABLE).map_err(io)?;
+        write_txn.open_table(SM_ROUTES_REVISION_TABLE).map_err(io)?;
         write_txn.open_table(SM_SOURCES_TABLE).map_err(io)?;
         write_txn.open_table(SM_TENANTS_TABLE).map_err(io)?;
         write_txn.open_table(SM_PRINCIPALS_TABLE).map_err(io)?;
@@ -973,10 +1001,31 @@ impl RedbStateMachine {
     /// calls straight through to this.
     #[allow(clippy::result_large_err)]
     pub fn route_table(&self, tenant: &str) -> StorageResult<RouteTable> {
+        Ok(self.route_table_with_revision(tenant)?.0)
+    }
+
+    /// `tenant`'s route table and the revision it is at, read in **one** redb
+    /// transaction (issue #210).
+    ///
+    /// One transaction is the whole point, not tidiness: two separate reads
+    /// could observe a table and a revision from either side of a concurrent
+    /// apply. Reading the table first and the revision second is the dangerous
+    /// order — the caller would hold a *newer* revision than the content it
+    /// saw, condition a whole-table replace on it, and silently drop the write
+    /// that landed in between. A single read transaction sees one consistent
+    /// snapshot and the question does not arise.
+    #[allow(clippy::result_large_err)]
+    pub fn route_table_with_revision(&self, tenant: &str) -> StorageResult<(RouteTable, u64)> {
         let read_txn = self
             .db
             .begin_read()
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let revision = read_txn
+            .open_table(SM_ROUTES_REVISION_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .get(tenant)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map_or(0, |v| v.value());
         let table = read_txn
             .open_table(SM_ROUTES_TABLE)
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -1002,7 +1051,7 @@ impl RedbStateMachine {
                 }
             }
         }
-        Ok(RouteTable { routes })
+        Ok((RouteTable { routes }, revision))
     }
 
     /// Every declared source for `tenant`, id-ascending (issue #134).
@@ -2064,34 +2113,59 @@ impl RedbStateMachine {
     #[allow(clippy::result_large_err)]
     fn check_expected_revision(
         configs: &Table<'_, (&'static str, u16), &'static str>,
+        routes_revision: &Table<'_, &'static str, u64>,
         op: &ControlOp,
         expected: u64,
     ) -> StorageResult<Result<(), String>> {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
-        let Some((tenant, port)) = control::precondition_target(op) else {
+        let Some(target) = control::precondition_target(op) else {
             return Ok(Err(
-                "revision conflict: expected-revision preconditions apply to single-imposter \
-                 operations only"
+                "revision conflict: expected-revision preconditions apply to single-imposter and \
+                 route-table operations only"
                     .to_owned(),
             ));
         };
-        match configs.get((tenant.as_str(), port)).map_err(io)? {
-            None => Ok(Err(format!(
-                "revision conflict: expected revision {expected} but no imposter on port {port}"
-            ))),
-            Some(guard) => match serde_json::from_str::<StoredImposter>(guard.value()) {
-                Ok(record) if record.revision == expected => Ok(Ok(())),
-                Ok(record) => Ok(Err(format!(
-                    "revision conflict: expected revision {expected}, stored revision {actual} \
-                     on port {port}",
-                    actual = record.revision
-                ))),
-                Err(e) => {
-                    tracing::error!(port, error = %e, "corrupt stored record");
-                    Ok(Err(format!("corrupt stored record for port {port}: {e}")))
+        match target {
+            PreconditionTarget::Imposter(tenant, port) => {
+                match configs.get((tenant.as_str(), port)).map_err(io)? {
+                    None => Ok(Err(format!(
+                        "revision conflict: expected revision {expected} but no imposter on port \
+                         {port}"
+                    ))),
+                    Some(guard) => match serde_json::from_str::<StoredImposter>(guard.value()) {
+                        Ok(record) if record.revision == expected => Ok(Ok(())),
+                        Ok(record) => Ok(Err(format!(
+                            "revision conflict: expected revision {expected}, stored revision \
+                             {actual} on port {port}",
+                            actual = record.revision
+                        ))),
+                        Err(e) => {
+                            tracing::error!(port, error = %e, "corrupt stored record");
+                            Ok(Err(format!("corrupt stored record for port {port}: {e}")))
+                        }
+                    },
                 }
-            },
+            }
+            // A tenant with no row has never had its table written: revision 0
+            // (issue #210). Absence is a real revision here, not a missing
+            // record — unlike the imposter arm above, where there is nothing to
+            // condition on at all — so it compares rather than refuses, and a
+            // client that conditions on 0 and writes first legitimately wins.
+            PreconditionTarget::RouteTable(tenant) => {
+                let actual = routes_revision
+                    .get(tenant.as_str())
+                    .map_err(io)?
+                    .map_or(0, |v| v.value());
+                if actual == expected {
+                    Ok(Ok(()))
+                } else {
+                    Ok(Err(format!(
+                        "revision conflict: expected revision {expected}, stored revision \
+                         {actual} for the route table"
+                    )))
+                }
+            }
         }
     }
 
@@ -2416,6 +2490,7 @@ impl RedbStateMachine {
     fn mutate_tables(
         configs: &mut Table<'_, (&'static str, u16), &'static str>,
         routes: &mut Table<'_, (&'static str, &'static str), &'static str>,
+        routes_revision: &mut Table<'_, &'static str, u64>,
         sources: &mut Table<'_, (&'static str, &'static str), &'static str>,
         tenants: &mut Table<'_, &'static str, &'static str>,
         principals: &mut Table<'_, &'static str, &'static str>,
@@ -2656,6 +2731,10 @@ impl RedbStateMachine {
                         .insert((tenant_str, route.id.as_str()), value.as_str())
                         .map_err(io)?;
                 }
+                // The applying log index, so the stamp is the same on every
+                // replica and is exactly the revision the front reports back to
+                // the client that caused it (issue #210).
+                routes_revision.insert(tenant_str, index).map_err(io)?;
                 Ok(Ok(vec![Self::sync_routes_action(routes)?]))
             }
             ControlOp::DeleteRoute { tenant, id } => {
@@ -2663,6 +2742,12 @@ impl RedbStateMachine {
                 // admin-surface 404 for a missing route (if the operator
                 // wants one) is the write path's concern, not apply's.
                 routes.remove((tenant.as_str(), id.as_str())).map_err(io)?;
+                // Stamped even when the remove found nothing: the revision is
+                // the table's, and this op *committed* against that table, so
+                // an outstanding precondition must not survive it (issue #210).
+                // Making the stamp conditional on the row's existence would
+                // make the revision depend on state the client cannot see.
+                routes_revision.insert(tenant.as_str(), index).map_err(io)?;
                 Ok(Ok(vec![Self::sync_routes_action(routes)?]))
             }
             ControlOp::SourcePut {
@@ -3360,6 +3445,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
         let (
             configs,
             routes,
+            routes_revisions,
             sources,
             tenants,
             principals,
@@ -3398,6 +3484,20 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
                 let (tenant, id) = key.value();
                 routes.push((tenant.to_owned(), id.to_owned(), value.value().to_owned()));
+            }
+            // Travels with the routes themselves (issue #210). Omitting it
+            // would not lose data, but it would silently reset every tenant's
+            // table to revision 0 on the joining node — see the field's doc.
+            let routes_revision_table = read_txn
+                .open_table(SM_ROUTES_REVISION_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut routes_revisions = Vec::new();
+            for item in routes_revision_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                routes_revisions.push((key.value().to_owned(), value.value()));
             }
             let sources_table = read_txn
                 .open_table(SM_SOURCES_TABLE)
@@ -3510,6 +3610,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             (
                 configs,
                 routes,
+                routes_revisions,
                 sources,
                 tenants,
                 principals,
@@ -3526,6 +3627,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
         let payload = SnapshotPayload {
             configs,
             routes,
+            routes_revisions,
             sources,
             tenants,
             principals,
@@ -3616,6 +3718,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut routes = write_txn
                 .open_table(SM_ROUTES_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut routes_revision = write_txn
+                .open_table(SM_ROUTES_REVISION_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut sources = write_txn
                 .open_table(SM_SOURCES_TABLE)
@@ -3714,6 +3819,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                             Ok(()) => match request.expected_revision {
                                 Some(expected) => match Self::check_expected_revision(
                                     &configs,
+                                    &routes_revision,
                                     &request.op,
                                     expected,
                                 )? {
@@ -3721,6 +3827,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     Ok(()) => Self::mutate_tables(
                                         &mut configs,
                                         &mut routes,
+                                        &mut routes_revision,
                                         &mut sources,
                                         &mut tenants,
                                         &mut principals,
@@ -3736,6 +3843,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                 None => Self::mutate_tables(
                                     &mut configs,
                                     &mut routes,
+                                    &mut routes_revision,
                                     &mut sources,
                                     &mut tenants,
                                     &mut principals,
@@ -3927,6 +4035,22 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                 Ok(table) => EngineAction::SyncRoutes(table),
                 Err((id, error)) => EngineAction::RefuseRoutesSync { id, error },
             };
+
+            // Cleared before repopulating, like every table above: a payload
+            // carrying no revision for a tenant means the fleet holds none, and
+            // leaving this node's stale row would let a token this node minted
+            // before the install keep passing against a table it no longer has.
+            let mut routes_revision_table = write_txn
+                .open_table(SM_ROUTES_REVISION_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            routes_revision_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (tenant, revision) in &payload.routes_revisions {
+                routes_revision_table
+                    .insert(tenant.as_str(), *revision)
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
 
             let mut sources_table = write_txn
                 .open_table(SM_SOURCES_TABLE)
@@ -6639,6 +6763,246 @@ mod tests {
         assert!(
             !follower_routes.load().is_empty(),
             "install_snapshot must also drive the attached routes handle"
+        );
+    }
+
+    // -- issue #210: the route table's revision precondition ------------------
+
+    fn delete_route(op_id: u128, id: &str) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::DeleteRoute {
+                tenant: TenantId::default(),
+                id: id.to_owned(),
+            },
+        )
+    }
+
+    fn routes_revision(sm: &RedbStateMachine, tenant: &str) -> u64 {
+        sm.route_table_with_revision(tenant)
+            .expect("read route table")
+            .1
+    }
+
+    fn route_ids(sm: &RedbStateMachine, tenant: &str) -> Vec<String> {
+        let mut ids: Vec<String> = sm
+            .route_table(tenant)
+            .expect("read")
+            .routes
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// #210 gate: a whole-table replace can be conditioned on the revision the
+    /// reader saw, and a stale one is refused inside apply — deterministically,
+    /// on every replica — instead of silently clobbering a concurrent edit.
+    #[tokio::test]
+    async fn route_table_preconditions_gate_apply_deterministically() {
+        let conditioned = |op_id: u128, expected: u64, op: ControlOp| ControlRequest {
+            expected_revision: Some(expected),
+            ..request(op_id, op)
+        };
+
+        let (_td, mut sm, _routes) = fresh_sm_with_routes().await;
+        let (_td2, mut sm2, _routes2) = fresh_sm_with_routes().await;
+
+        // A table nobody has written is revision 0, and conditioning on 0 is
+        // how a first writer wins the race to create one.
+        assert_eq!(routes_revision(&sm, DEFAULT_TENANT), 0);
+        for s in [&mut sm, &mut sm2] {
+            let response = s
+                .apply(vec![entry(
+                    1,
+                    conditioned(
+                        1,
+                        0,
+                        ControlOp::PutRoutes {
+                            tenant: TenantId::default(),
+                            table: RouteTable {
+                                routes: vec![test_route("a", 1)],
+                            },
+                        },
+                    ),
+                )])
+                .await
+                .expect("apply");
+            assert_eq!(response, vec![ControlResponse::applied(1)]);
+        }
+        assert_eq!(
+            routes_revision(&sm, DEFAULT_TENANT),
+            1,
+            "the stamp is the applying log index"
+        );
+
+        // A stale expectation refuses — same committed `Failed` on both
+        // replicas, and (the whole point) the table is untouched.
+        let refused = sm
+            .apply(vec![entry(
+                2,
+                conditioned(
+                    2,
+                    0,
+                    ControlOp::PutRoutes {
+                        tenant: TenantId::default(),
+                        table: RouteTable {
+                            routes: vec![test_route("clobber", 2)],
+                        },
+                    },
+                ),
+            )])
+            .await
+            .expect("apply");
+        let refused2 = sm2
+            .apply(vec![entry(
+                2,
+                conditioned(
+                    2,
+                    0,
+                    ControlOp::PutRoutes {
+                        tenant: TenantId::default(),
+                        table: RouteTable {
+                            routes: vec![test_route("clobber", 2)],
+                        },
+                    },
+                ),
+            )])
+            .await
+            .expect("apply");
+        assert_eq!(refused, refused2, "replicas must agree");
+        match &refused[0].outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(
+                    reason.starts_with("revision conflict"),
+                    "the front dispatches a 409 off this exact prefix: {reason}"
+                );
+                assert!(reason.contains("route table"), "{reason}");
+            }
+            other => panic!("expected a committed refusal, got {other:?}"),
+        }
+        assert_eq!(
+            route_ids(&sm, DEFAULT_TENANT),
+            vec!["a".to_owned()],
+            "a refused precondition must not have replaced the table"
+        );
+        assert_eq!(
+            routes_revision(&sm, DEFAULT_TENANT),
+            1,
+            "a refusal does not advance the revision either"
+        );
+
+        // A delete mutates the table, so it stamps too — an outstanding
+        // precondition must not survive one.
+        let applied = sm
+            .apply(vec![entry(3, conditioned(3, 1, delete_route(3, "a").op))])
+            .await
+            .expect("apply");
+        assert_eq!(applied, vec![ControlResponse::applied(3)]);
+        assert_eq!(routes_revision(&sm, DEFAULT_TENANT), 3);
+
+        // Even a delete that removed nothing: the op committed against the
+        // table, so the revision it leaves behind must reflect that.
+        sm.apply(vec![entry(4, delete_route(4, "never-existed"))])
+            .await
+            .expect("apply");
+        assert_eq!(
+            routes_revision(&sm, DEFAULT_TENANT),
+            4,
+            "an idempotent delete still committed against this table"
+        );
+
+        // Per tenant, not fleet-wide: writing one tenant's table must not
+        // invalidate another's outstanding precondition.
+        assert_eq!(routes_revision(&sm, "acme"), 0);
+        sm.apply(vec![entry(
+            5,
+            put_routes_in(5, "acme", vec![test_route("z", 3)]),
+        )])
+        .await
+        .expect("apply");
+        assert_eq!(routes_revision(&sm, "acme"), 5);
+        assert_eq!(
+            routes_revision(&sm, DEFAULT_TENANT),
+            4,
+            "another tenant's write must not touch this tenant's revision"
+        );
+    }
+
+    /// #210: the revision travels with the snapshot. A follower that joined by
+    /// snapshot install must refuse the same stale tokens the leader does —
+    /// otherwise routing a conditioned write to the fresh node is a way around
+    /// the precondition.
+    #[tokio::test]
+    async fn snapshot_round_trips_the_route_table_revision() {
+        let (_td, mut sm, _routes) = fresh_sm_with_routes().await;
+        sm.apply(vec![entry(1, put_routes(1, vec![test_route("a", 1)]))])
+            .await
+            .expect("apply");
+        sm.apply(vec![entry(
+            2,
+            put_routes_in(2, "acme", vec![test_route("z", 2)]),
+        )])
+        .await
+        .expect("apply");
+
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower, _follower_routes) = fresh_sm_with_routes().await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+
+        assert_eq!(routes_revision(&follower, DEFAULT_TENANT), 1);
+        assert_eq!(routes_revision(&follower, "acme"), 2);
+
+        // And it is a live precondition on the follower, not just a stored
+        // number: a stale token is refused there too.
+        let refused = follower
+            .apply(vec![entry(
+                3,
+                ControlRequest {
+                    expected_revision: Some(0),
+                    ..put_routes(3, vec![test_route("clobber", 9)])
+                },
+            )])
+            .await
+            .expect("apply");
+        assert!(
+            matches!(&refused[0].outcome, ControlOutcome::Failed { reason }
+                if reason.starts_with("revision conflict")),
+            "{refused:?}"
+        );
+    }
+
+    /// A snapshot built before #210 carries no revisions at all. It must still
+    /// install, and every tenant must read as revision 0 — which *fails* a
+    /// stale precondition rather than passing one. The dangerous alternative
+    /// (inheriting the last applied index) would let a token minted before the
+    /// join silently pass.
+    #[tokio::test]
+    async fn a_pre_route_revision_snapshot_installs_and_reads_zero() {
+        let (_td, sm, _routes) = fresh_sm_with_routes().await;
+        let legacy = json!({
+            "configs": [],
+            "routes": [["default", "a", "{}"]],
+            "dedup": [],
+            "last_applied_log": null,
+            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
+        });
+        let payload: super::SnapshotPayload =
+            serde_json::from_value(legacy).expect("a pre-#210 snapshot payload still decodes");
+        assert!(
+            payload.routes_revisions.is_empty(),
+            "the missing field defaults to no rows, not a parse failure"
+        );
+        assert_eq!(
+            routes_revision(&sm, DEFAULT_TENANT),
+            0,
+            "a table with no stored revision reads 0"
         );
     }
 

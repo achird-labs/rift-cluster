@@ -21,9 +21,16 @@
 //! the loopback admin (`GET /imposters/:port` after the barrier), so the body
 //! shape is upstream's own — no parallel projection code to drift.
 //!
-//! Concurrency (#46): a single-imposter write may carry an `If-Match` header
-//! naming the revision it expects — either the exact `Rift-Cluster-Revision`
-//! token (`default:<port>@<revision>`) or a bare revision integer. Absent, a
+//! Concurrency (#46, extended to route tables by #210): a single-imposter write
+//! may carry an `If-Match` header naming the revision it expects — either the
+//! exact `Rift-Cluster-Revision` token (`default:<port>@<revision>`) or a bare
+//! revision integer. A route-table write (`PUT /front-door/routes`, `DELETE
+//! /front-door/routes/{id}`) may carry the *portless* form
+//! (`default@<revision>`), which `GET /front-door/routes` answers so a client
+//! has something to condition on; a tenant whose table was never written reads
+//! as revision `0`. The route-table revision is per tenant, not per route: a
+//! `PUT` replaces the set as a unit and a `DELETE` stamps the same revision, so
+//! either invalidates an outstanding precondition. Absent, a
 //! write stays last-writer-wins (the pre-#46 default, unchanged): index-
 //! addressed and list-replace stub edits are a read-modify-write of this
 //! node's applied state committed as a full `PutImposter`, so two concurrent
@@ -63,7 +70,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngCore;
 use rift_cluster::audit_export::ExportStatus;
 use rift_cluster::control::Role;
-use rift_cluster::control::{self, ControlOp, ControlRequest, StubEdit, StubEditScript};
+use rift_cluster::control::{
+    self, ControlOp, ControlRequest, PreconditionTarget, StubEdit, StubEditScript,
+};
 use rift_cluster::decorate::{
     HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS,
 };
@@ -788,14 +797,30 @@ async fn read_routes(
             "cluster node is shutting down",
         );
     };
-    match node.route_table(tenant.as_str()) {
-        Ok(table) => match serde_json::to_vec(&table) {
-            Ok(body) => buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
-                .unwrap_or_else(|response| response),
-            Err(e) => internal(&e.to_string()),
-        },
-        Err(e) => internal(&e.to_string()),
-    }
+    // Table and revision together, from one state-machine snapshot (issue
+    // #210): the revision is what a client feeds back as `If-Match`, so it must
+    // describe the very bytes answered here and not a later table.
+    let (table, revision) = match node.route_table_with_revision(tenant.as_str()) {
+        Ok(pair) => pair,
+        Err(e) => return internal(&e.to_string()),
+    };
+    let body = match serde_json::to_vec(&table) {
+        Ok(body) => body,
+        Err(e) => return internal(&e.to_string()),
+    };
+    let mut response =
+        match buffered_response(StatusCode::OK, Bytes::from(body), json_content_type()) {
+            Ok(response) | Err(response) => response,
+        };
+    // The same token shape the write path emits for a portless mutation,
+    // hardcoded `default` tenant segment and all — a read whose token the write
+    // path would refuse is worse than no token at all.
+    set_header(
+        &mut response,
+        HEADER_REVISION,
+        &format!("{}@{revision}", TenantId::default()),
+    );
+    response
 }
 
 /// Authenticate the request and authorize `action` against it (RFC-002 §4.3,
@@ -1799,20 +1824,12 @@ async fn build_and_run(
         }
     }
 
-    // A precondition can only ever address one stored record: a collection-
-    // wide mutation (`mutation.port` is `None`) has no single record to
-    // condition on, so it is refused before anything is minted or parked.
+    // A precondition can only ever address a revision the state machine
+    // actually stores: a single imposter, or (issue #210) a tenant's route
+    // table. A mutation addressing neither is refused before anything is minted
+    // or parked.
     let expected_revision = match if_match {
-        Some(raw) => {
-            let Some(port) = mutation.port else {
-                return Err(typed_error(
-                    StatusCode::BAD_REQUEST,
-                    ErrorKind::BadData,
-                    "If-Match applies to single-imposter operations only",
-                ));
-            };
-            Some(parse_if_match(raw, port)?)
-        }
+        Some(raw) => Some(parse_if_match(raw, precondition_port(&mutation)?)?),
         None => None,
     };
 
@@ -2560,9 +2577,11 @@ async fn build_mutation(
                     tenant: tenant.clone(),
                     table,
                 }],
-                // No single stored record: a whole-table replace has no port
-                // to label the revision header with, and (as a consequence)
-                // no `If-Match` precondition either — see `precondition_target`.
+                // No single stored record: a whole-table replace has no port to
+                // label the revision header with, so it emits (and accepts) the
+                // portless `default@<revision>` token instead — conditioned on
+                // the tenant's route-table revision, not on any one route. See
+                // `control::precondition_target`.
                 port: None,
                 render: Render::Captured {
                     body: Bytes::from(body),
@@ -2695,22 +2714,65 @@ fn mint(
     }
 }
 
-/// Parse an `If-Match` header value against the [`HEADER_REVISION`] contract:
-/// the token this front itself emits (`default:<port>@<revision>`), a bare
-/// revision integer, or either wrapped in one pair of double quotes (a normal
-/// ETag convention some HTTP clients apply automatically). Anything else — a
-/// wildcard, a weak validator, a comma-separated list, a mismatched tenant or
-/// port — is refused: a precondition this front cannot evaluate must never
-/// silently pass as unconditional.
+/// The port an `If-Match` on `mutation` must name, or `None` when the mutation
+/// addresses a whole route table (issue #210) and so carries the portless
+/// token. `Err` when the mutation has no conditionable target at all — a
+/// collection-wide op such as `PUT`/`DELETE /imposters`, which stays a `400`.
+///
+/// The route-table case is decided by asking [`control::precondition_target`],
+/// the state machine's own definition, rather than re-listing the ops here: the
+/// front's `400` and apply's `409` must agree on what is conditionable, and two
+/// independently maintained lists is precisely how they drift apart.
 #[allow(clippy::result_large_err)]
-fn parse_if_match(raw: &str, port: u16) -> Result<u64, Response<FrontBody>> {
+fn precondition_port(mutation: &Mutation) -> Result<Option<u16>, Response<FrontBody>> {
+    if let Some(port) = mutation.port {
+        return Ok(Some(port));
+    }
+    let route_table = !mutation.ops.is_empty()
+        && mutation.ops.iter().all(|op| {
+            matches!(
+                control::precondition_target(op),
+                Some(PreconditionTarget::RouteTable(_))
+            )
+        });
+    if route_table {
+        Ok(None)
+    } else {
+        Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            "If-Match applies to single-imposter and route-table operations only",
+        ))
+    }
+}
+
+/// Parse an `If-Match` header value against the [`HEADER_REVISION`] contract:
+/// the token this front itself emits — `default:<port>@<revision>` for a single
+/// imposter, `default@<revision>` for a route table (issue #210) — a bare
+/// revision integer, or any of those wrapped in one pair of double quotes (a
+/// normal ETag convention some HTTP clients apply automatically). Anything else
+/// — a wildcard, a weak validator, a comma-separated list, a mismatched tenant
+/// or port — is refused: a precondition this front cannot evaluate must never
+/// silently pass as unconditional.
+///
+/// `expected_port` is the target's shape, from [`precondition_port`]. A ported
+/// token on a route-table write (or a portless one on an imposter write) is
+/// refused rather than coerced: the client conditioned on a *different* record
+/// than the one it is writing, and quietly accepting that would hand back the
+/// lost update the precondition exists to prevent.
+#[allow(clippy::result_large_err)]
+fn parse_if_match(raw: &str, expected_port: Option<u16>) -> Result<u64, Response<FrontBody>> {
     let bad = || {
+        let form = match expected_port {
+            Some(port) => format!("default:{port}@<revision>"),
+            None => "default@<revision>".to_owned(),
+        };
         typed_error(
             StatusCode::BAD_REQUEST,
             ErrorKind::BadData,
             &format!(
-                "If-Match must be the value from {HEADER_REVISION} (default:{port}@<revision>) \
-                 or a bare revision integer"
+                "If-Match must be the value from {HEADER_REVISION} ({form}) or a bare revision \
+                 integer"
             ),
         )
     };
@@ -2725,14 +2787,23 @@ fn parse_if_match(raw: &str, port: u16) -> Result<u64, Response<FrontBody>> {
         return Ok(revision);
     }
 
-    let (tenant_port, revision) = unquoted.split_once('@').ok_or_else(bad)?;
-    let (tenant, token_port) = tenant_port.split_once(':').ok_or_else(bad)?;
-    if tenant != TenantId::default().as_str() {
-        return Err(bad());
-    }
-    let token_port: u16 = token_port.parse().map_err(|_| bad())?;
-    if token_port != port {
-        return Err(bad());
+    let (addressed, revision) = unquoted.split_once('@').ok_or_else(bad)?;
+    match (addressed.split_once(':'), expected_port) {
+        (Some((tenant, token_port)), Some(port)) => {
+            if tenant != TenantId::default().as_str() {
+                return Err(bad());
+            }
+            if token_port.parse::<u16>().map_err(|_| bad())? != port {
+                return Err(bad());
+            }
+        }
+        (None, None) => {
+            if addressed != TenantId::default().as_str() {
+                return Err(bad());
+            }
+        }
+        // Token shape and target shape disagree.
+        (Some(_), None) | (None, Some(_)) => return Err(bad()),
     }
     revision.parse::<u64>().map_err(|_| bad())
 }
@@ -3557,12 +3628,15 @@ mod tests {
     }
     #[test]
     fn parse_if_match_accepts_the_emitted_token_and_bare_integers() {
-        assert_eq!(parse_if_match("default:4545@17", 4545).expect("token"), 17);
         assert_eq!(
-            parse_if_match("\"default:4545@17\"", 4545).expect("etag-quoted token"),
+            parse_if_match("default:4545@17", Some(4545)).expect("token"),
             17
         );
-        assert_eq!(parse_if_match("17", 4545).expect("bare revision"), 17);
+        assert_eq!(
+            parse_if_match("\"default:4545@17\"", Some(4545)).expect("etag-quoted token"),
+            17
+        );
+        assert_eq!(parse_if_match("17", Some(4545)).expect("bare revision"), 17);
     }
 
     #[test]
@@ -3576,8 +3650,58 @@ mod tests {
             "default:4545@17, default:4545@18",
             "",
         ] {
-            let refused = parse_if_match(bad, 4545);
+            let refused = parse_if_match(bad, Some(4545));
             let response = refused.expect_err(&format!("{bad:?} must be refused"));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    /// Issue #210: a route-table write conditions on the portless token `GET
+    /// /front-door/routes` answers.
+    #[test]
+    fn parse_if_match_accepts_the_portless_route_table_token() {
+        assert_eq!(parse_if_match("default@17", None).expect("token"), 17);
+        assert_eq!(
+            parse_if_match("\"default@17\"", None).expect("etag-quoted token"),
+            17
+        );
+        assert_eq!(
+            parse_if_match(" default@0 ", None).expect("a never-written table is revision 0"),
+            0
+        );
+        assert_eq!(parse_if_match("17", None).expect("bare revision"), 17);
+    }
+
+    /// The two token shapes are not interchangeable: a client that sends the
+    /// one for the *other* kind of record conditioned on something it is not
+    /// writing, and must be told so rather than have the token coerced.
+    #[test]
+    fn parse_if_match_refuses_a_token_whose_shape_does_not_match_the_target() {
+        for (bad, port) in [
+            // Ported token, route-table target.
+            ("default:4545@17", None),
+            // Portless token, single-imposter target.
+            ("default@17", Some(4545)),
+        ] {
+            let response =
+                parse_if_match(bad, port).expect_err(&format!("{bad:?} must be refused"));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_if_match_rejects_bad_portless_tokens() {
+        for bad in [
+            "*",
+            "W/\"default@17\"",
+            "other@17",
+            "default@seventeen",
+            "default@17, default@18",
+            "@17",
+            "",
+        ] {
+            let response =
+                parse_if_match(bad, None).expect_err(&format!("{bad:?} must be refused"));
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad:?}");
         }
     }
