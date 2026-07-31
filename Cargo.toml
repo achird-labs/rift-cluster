@@ -13,7 +13,14 @@ members = [
 ]
 # The vendored open-source Rift is its own workspace; keep it out of ours and
 # consume its crates purely as path dependencies (see [workspace.dependencies]).
-exclude = ["vendor/rift"]
+#
+# `crates/rift-lint-wasm` is excluded for a different reason (RFC-006 C5, issue
+# #188): it is a `cdylib` that only means anything on `wasm32-unknown-unknown`,
+# built by one step in the release lane. `members` here is an explicit list with
+# no `default-members` to opt out of, so membership would put `wasm-bindgen` in
+# every CI lane's graph and make `cargo build --workspace --all-targets` try to
+# link it for the host. It carries its own empty `[workspace]` instead.
+exclude = ["vendor/rift", "crates/rift-lint-wasm"]
 
 [workspace.package]
 version = "0.1.0"

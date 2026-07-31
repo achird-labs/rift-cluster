@@ -2,7 +2,14 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { API_PATHS, fleetOpPath, imposterPath, lifecyclePath, requestsPath } from "../api/paths.ts";
+import {
+  API_PATHS,
+  fleetOpPath,
+  imposterPath,
+  lifecyclePath,
+  requestsPath,
+  stubByIdPath,
+} from "../api/paths.ts";
 import { FLEET_HEALTH_FIELDS, FLEET_MEMBER_FIELDS, IMPOSTER_COLUMNS } from "../app/contract.ts";
 
 const SRC = new URL("..", import.meta.url).pathname;
@@ -31,6 +38,15 @@ function schemaBody(name: string): string {
 /** Does the schema declare `key` as a property — as opposed to admitting it via `[key: string]`? */
 function declares(name: string, key: string): boolean {
   return new RegExp(`^\\s{12}${key}\\??:`, "m").test(schemaBody(name));
+}
+
+/**
+ * Source with its comments blanked out, so a scan bans a construct without banning the sentence
+ * that explains why it is banned. Naive about `//` inside a string literal, which is fine for the
+ * one scan that uses it: a false *positive* fails loudly and is fixed, never waved through.
+ */
+function withoutComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
 function sourceFiles(dir: string): string[] {
@@ -123,6 +139,41 @@ describe("the client is the only door to the network", () => {
       const template = path.replace(/\/\d+(?=\/|$)/, "/{port}");
       expect([path, CONTRACT.includes(`"${template}": {`)]).toEqual([path, true]);
     }
+  });
+});
+
+describe("stubs are addressed by id and never by index (RFC-006 C5, AC9)", () => {
+  it("builds a by-id stub path the contract declares", () => {
+    const built = stubByIdPath(4545, "s-1");
+    expect(built).toBe("/imposters/4545/stubs/by-id/s-1");
+    expect(CONTRACT.includes('"/imposters/{port}/stubs/by-id/{stubId}": {')).toBe(true);
+  });
+
+  it("percent-encodes the stub id rather than splicing it in raw", () => {
+    // An id with a slash must reach the server as one segment and 404, not address a route the
+    // operator never asked for.
+    expect(stubByIdPath(4545, "a/b")).toBe("/imposters/4545/stubs/by-id/a%2Fb");
+  });
+
+  it("names an index-addressed stub route nowhere in the console's source", () => {
+    /*
+     * The contract publishes `/imposters/{port}/stubs/{stubIndex}` and this console must never use
+     * it. An index is a position: a concurrent edit that inserts or removes a stub shifts every
+     * index after it, so an index-addressed write racing that edit replaces a *different* stub and
+     * answers `200`. `If-Match` does not save it either — the revision would match, and the wrong
+     * stub would still be the one overwritten.
+     *
+     * `schema.ts` is exempt because it is the contract rendered as TypeScript, not a call site: it
+     * *declares* the route the rest of the source is forbidden to build.
+     */
+    const offenders = sourceFiles(SRC)
+      .filter((path) => !path.endsWith(join("api", "schema.ts")))
+      // Anchored on `/imposters/` so it matches a *route* and not the `features/stubs/` directory
+      // the editor's own modules live in. A bare `/stubs/` scan flags every import of them.
+      .filter((path) =>
+        /\/imposters\/[^\n"'`]*\/stubs\/(?!by-id\/)/.test(withoutComments(readFileSync(path, "utf8"))),
+      );
+    expect(offenders).toEqual([]);
   });
 });
 

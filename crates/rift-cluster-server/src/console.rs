@@ -46,8 +46,24 @@ pub(crate) const PREFIX: &str = "/console";
 
 /// The policy from RFC-006 §9.1, sent on **every** response this module produces — including the
 /// 404 and the 405, because a policy that is only on the happy path is not a policy.
-const CSP: &str =
-    "default-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'";
+///
+/// `style-src` carries `'unsafe-inline'` as of C5 (#188), and only `style-src`: monaco's standalone
+/// theme service styles the editor through two runtime `createElement('style')` calls, which the
+/// previous `default-src` fallback blocked — an editor that loads unthemed is shipped broken. The
+/// relaxation is scoped to styles; `script-src` stays `'self'` with no inline, which is the half of
+/// the policy that stops injected *code*. Inline styles' own risk (selector-based exfiltration)
+/// presupposes an attacker who can already inject markup — the layer React's escaping and the
+/// no-`dangerouslySetInnerHTML` tests close first — and the shell artifact itself is still asserted
+/// style-free by `tests/console.rs`, so the shipped bytes do not lean on this allowance.
+///
+/// `script-src` additionally carries `'wasm-unsafe-eval'`: browsers gate `WebAssembly` compilation
+/// behind it whenever a `script-src` directive is present, and without it the bundled `rift-lint`
+/// wasm fails to instantiate in exactly (and only) the shipped build — the one place the artifact
+/// exists — while the pane's graceful "lint unavailable" state would have hidden the loss forever.
+/// It permits wasm compilation alone, from bytes `default-src 'self'` already restricts to this
+/// origin; it is not `'unsafe-eval'` and enables no JS string evaluation.
+const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' \
+                   'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'";
 
 /// The SPA shell. Served for `/console`, `/console/`, and any client-side route below it.
 const SHELL: &str = "index.html";

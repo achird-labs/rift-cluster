@@ -39,8 +39,43 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The console's advisory lint pane (RFC-006 §12 Q1, issue #188): `rift-lint` compiled to wasm.
+      #
+      # Built HERE and nowhere else. `crates/rift-lint-wasm` is excluded from the root workspace
+      # precisely so no PR lane needs a wasm toolchain, and `web/` is written to work without the
+      # artifact — `lint.ts` resolves `"unavailable"` and the pane says the server still validates
+      # every save. So this step adds a capability to the release build; it does not gate it.
+      #
+      # Pinned, and installed from the release tarball rather than a third-party action: this puts
+      # a binary on a lane that produces a shipped artifact.
+      - name: Install wasm-pack (pinned)
+        run: |
+          set -euo pipefail
+          version=v0.13.1
+          asset="wasm-pack-${version}-x86_64-unknown-linux-musl"
+          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/${version}/${asset}.tar.gz" \
+            | sudo tar -xz --strip-components=1 -C /usr/local/bin "${asset}/wasm-pack"
+          wasm-pack --version
+
+      - name: Compile rift-lint to wasm for the console
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+          # `--out-dir` is relative to the crate. `web/public/` is copied verbatim into `dist/` and
+          # the console is served under `/console/`, so this lands at the URL `lint.ts` imports:
+          # `/console/lint/rift_lint_wasm.js`. `--no-pack` skips the npm package.json (and the
+          # `.gitignore` beside it) that nothing here consumes.
+          wasm-pack build crates/rift-lint-wasm \
+            --release --target web --no-pack \
+            --out-dir ../../web/public/lint --out-name rift_lint_wasm
+          # Fail loudly rather than shipping a console whose lint pane is permanently "unavailable"
+          # because the artifact was written somewhere else.
+          test -f web/public/lint/rift_lint_wasm.js
+          test -f web/public/lint/rift_lint_wasm_bg.wasm
+
       # Order matters and is the whole point of the lane: the bundle must exist before cargo runs,
-      # because `rust-embed` resolves `web/dist/` at compile time.
+      # because `rust-embed` resolves `web/dist/` at compile time. It must also come after the wasm
+      # step above, since `pnpm build` is what copies `web/public/` into `dist/`.
       - name: Build the console bundle
         working-directory: web
         run: |

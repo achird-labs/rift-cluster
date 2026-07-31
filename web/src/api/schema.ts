@@ -46,7 +46,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Read one imposter (upstream) */
+        /**
+         * Read one imposter (upstream)
+         * @description The body is upstream's own imposter detail, proxied verbatim. The `Rift-Cluster-Revision` header is the EE front's addition (C5): the exact `If-Match` token a conditional write on this imposter or its stubs will be judged against, read from the same applied record the precondition checks. Absent when the applied state holds no record to condition on. Only this single-imposter read carries it — the listing names no single conditionable record.
+         */
         get: operations["getImposter"];
         put?: never;
         post?: never;
@@ -1575,6 +1578,7 @@ export interface operations {
             /** @description The imposter. */
             200: {
                 headers: {
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     [name: string]: unknown;
                 };
                 content: {

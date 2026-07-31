@@ -395,9 +395,14 @@ recorded request payloads, imposter names. Defenses, in depth order: React's
 default escaping with `dangerouslySetInnerHTML` banned by lint; recorded
 payloads rendered as text in monaco/`<pre>`, never interpreted as HTML; and a
 strict CSP delivered on every console response —
-`default-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`
+`default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'`
 — which the all-embedded design makes *actually enforceable*: no CDN, no
-inline scripts, monaco bundled. Even a successful injection cannot read the
+inline scripts, monaco bundled. (Two C5 concessions, each scoped and named: `style-src` carries
+`'unsafe-inline'` for monaco's runtime theme service — the served shell is
+still asserted style-free by test — and `script-src` carries
+`'wasm-unsafe-eval'`, without which browsers refuse to instantiate the
+bundled `rift-lint` wasm at all. Neither permits inline or evaluated JS;
+`script-src 'self'` still bars both.) Even a successful injection cannot read the
 credential (HttpOnly cookie, §5.3) or exfiltrate to a foreign origin
 (`connect-src 'self'`); its blast radius is same-origin API calls for the
 life of the open tab — real, bounded, and audited as the victim principal.
@@ -481,15 +486,54 @@ C1–C3 are strictly ordered; C4+ and M1+ parallelize.
 
 ## 12. Open questions
 
-1. **Does `rift-lint` compile to `wasm32-unknown-unknown`?** The JS-syntax
-   validator is already feature-gated with a no-op fallback
-   (`validator.rs:53,86`), which removes the likely blocker, but the full
-   dependency tree is unverified. Decides whether C5 bundles wasm lint or
-   falls back to a dry-run lint endpoint added to the schema.
-2. **Form-view coverage.** Which predicate/behavior shapes get first-class
-   form controls versus raw-JSON-only? Proposal: the shapes `rift-tui`'s
-   dialogs already model, then demand-driven. Decide in C5 review with real
-   configs.
+1. **Does `rift-lint` compile to `wasm32-unknown-unknown`?** ***Resolved by C5
+   (#188): yes.*** As raised: the JS-syntax validator is feature-gated with a
+   no-op fallback (`validator.rs:53,86`), but the rest of the dependency tree
+   was unverified.
+
+   With default features off the tree is `serde`, `serde_json`, `regex` and
+   `thiserror` — no `clap` (the `cli` feature), no `boa_engine` (the
+   `javascript` feature), and nothing else that touches the filesystem or the
+   clock. `cargo check -p rift-lint-wasm --target wasm32-unknown-unknown`
+   passes. So **C5 bundles the wasm lint**, and the dry-run lint endpoint that
+   was the fallback is not needed and has not been added to the schema.
+
+   The crate is `crates/rift-lint-wasm`: one export, `lint_stub(&str) ->
+   String`, returning `LintIssue`'s own serialization as a JSON array string.
+   It is deliberately **not** a workspace member — the root manifest `exclude`s
+   it and it opens an empty `[workspace]` of its own — so no PR lane needs a
+   wasm toolchain and `cargo build --workspace --all-targets` never tries to
+   link a `cdylib` for the host. One step in `release.yml` builds it with a
+   pinned `wasm-pack` into `web/public/lint/`.
+
+   The pane stays **advisory** whatever the answer to this question was: the
+   server validates every save and its refusal is the authority. When the
+   artifact is absent — every dev checkout, every CI run, and any browser where
+   the module fails to load — `lint.ts` resolves `"unavailable"` and the pane
+   says so, rather than rendering an empty finding list that would read as a
+   clean bill of health from a linter that never ran.
+2. **Form-view coverage.** ***Resolved by C5 (#188), and re-openable by
+   adding a row to a table.*** Which predicate/behavior shapes get first-class
+   form controls versus raw-JSON-only?
+
+   Shipped set (`web/src/features/stubs/projection.ts`, `STUB_FIELDS`): the
+   stub's `id`; a **single** `equals` predicate over `method` and `path`; and a
+   **single** `is` response with `statusCode`, a `Content-Type` header and a
+   text `body`. Chosen because it is what an operator writes by hand in a
+   console. Everything else — scenarios, `space`, `behaviors`, proxy responses,
+   `matches`/`contains`/`deepEquals`, a second predicate, a second response — is
+   out, and lands in raw-JSON-only rather than being half-modelled.
+
+   The rule that makes a small set safe: **the form never silently drops a
+   key.** `project()` either understands the whole stub or refuses it, naming
+   every unmodelled key as a dotted path so the banner can say what the form
+   would have lost. There is no partly-populated form, because that is the shape
+   that saves six of a stub's eight keys. Raw-only mode edits and saves the
+   operator's own text, byte for byte.
+
+   Widening is data, not redesign: both directions of the projection are driven
+   by `STUB_FIELDS`, so a new field is a row in that table and neither
+   `project` nor `render` names a field. Demand-driven from here, as proposed.
 3. **Fleet-read authorization split** (§5.2): under RFC-002, is
    `/_fleet/health` in-tenant-`Viewer`-visible (tenant-filtered) or
    `ClusterAdmin`-only? Topology is infrastructure, not tenant data — but

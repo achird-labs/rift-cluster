@@ -742,6 +742,10 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                 Ok((tenant, ..)) => {
                     // Read the marker's inputs before `state` and `req` move into `proxy`.
                     let degraded = local_bind_failure(&state, &target.params);
+                    // Likewise the editor's token (C5, #188): the same applied state the write
+                    // path's precondition will check, read before the move for the same reason.
+                    let token =
+                        imposter_read_token(&state, req.method(), &path, &tenant, &target.params);
                     // The imposter *list* is the one proxied read the ownership gate above cannot
                     // cover: it names no port, so there is nothing to check ownership of — and the
                     // engine it proxies to now binds every tenant's imposters, so the verbatim
@@ -764,6 +768,9 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                     }
                     if let Some(reason) = degraded {
                         set_header(&mut response, HEADER_BIND_FAILURES, &reason);
+                    }
+                    if let Some(token) = token {
+                        set_header(&mut response, HEADER_REVISION, &token);
                     }
                     return response;
                 }
@@ -1542,6 +1549,54 @@ async fn filter_imposter_list(
 fn is_imposter_listing(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
     matches!(path, "/imposters" | "/admin/imposters")
+}
+
+/// The single-imposter read's `If-Match` token, or `None` when this read is not that route or the
+/// applied state holds no record to condition on (C5, issue #188).
+///
+/// Only `GET /imposters/{port}` is decorated. The listing names no single conditionable record; the
+/// sub-resource reads (`/requests`, `/stubs`, …) inherit their imposter's record but handing the
+/// same token out on five paths invites conditioning a write on a read of something else. One
+/// route, one token, same grammar the write path emits — a token this front's own `parse_if_match`
+/// would refuse is worse than none.
+///
+/// Absence over error throughout: the read itself is served by the engine and must not start
+/// failing because the token lookup could not run. A dead node handle here is the same
+/// degraded-but-serving case `local_bind_failure` documents.
+fn imposter_read_token(
+    state: &FrontState,
+    method: &Method,
+    path: &str,
+    tenant: &TenantId,
+    params: &[(&'static str, String)],
+) -> Option<String> {
+    if *method != Method::GET || !is_single_imposter_read(path) {
+        return None;
+    }
+    let port = port_param(params)?;
+    let node = state.node.upgrade()?;
+    let revision = node
+        .imposter_revision(tenant.as_str(), port)
+        // Absence-over-error is right (the read itself still serves; the console just disables
+        // conditional saves), but a storage failure must not vanish on the way to it — the corrupt
+        // -record case inside `imposter_revision` already logs at error level, and a redb read
+        // failure deserves the same trail rather than a silent None.
+        .inspect_err(|e| tracing::warn!(tenant = tenant.as_str(), port, error = %e, "imposter read serves without a revision token"))
+        .ok()
+        .flatten()?;
+    // The literal `default` tenant segment, matching the write path's emission at its single site —
+    // an intentionally shared quirk, not an oversight; see `RiftClusterRevision`'s contract note.
+    Some(format!("{}:{port}@{revision}", TenantId::default()))
+}
+
+/// Whether `path` is exactly the single-imposter read, `/imposters/{port}` — the one proxied read
+/// whose response carries a conditionable record's revision.
+fn is_single_imposter_read(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    let mut segments = path.trim_start_matches('/').split('/');
+    segments.next() == Some("imposters")
+        && segments.next().is_some_and(|p| p.parse::<u16>().is_ok())
+        && segments.next().is_none()
 }
 
 /// Drop every entry from an imposter listing whose port `owned` does not contain.

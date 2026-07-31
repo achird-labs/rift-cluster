@@ -1,15 +1,13 @@
-import { useQuery } from "@tanstack/react-query";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 
-import { apiGet } from "../api/client.ts";
-import { imposterPath } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
 import { IMPOSTER_COLUMNS, type ImposterColumn } from "../app/contract.ts";
-import { POLLED } from "../app/query.ts";
+import { useImposter } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { toHash } from "../app/routing.ts";
 import { ImposterField } from "../components/imposterFields.tsx";
 import { ErrorNote, Ident, UNKNOWN } from "../components/primitives.tsx";
+import { DeleteStubButton, StubEditor, type StubTarget } from "./StubEditor.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
 type Stub = components["schemas"]["Stub"];
@@ -24,16 +22,18 @@ const DETAIL_FIELDS: readonly Pick<ImposterColumn, "key" | "label">[] = [
 ];
 
 /**
- * One imposter, read-only. C5 (#188) turns the stub rows into an editor; until then this shows
- * what the contract declares about each stub and nothing more.
+ * One imposter, with its stubs editable by id (C5, #188).
+ *
+ * The read is `useImposter` rather than a bare `apiGet` for one reason: it also returns the
+ * `Rift-Cluster-Revision` the response was stamped with, and that token is the `If-Match` every
+ * write on this screen is conditioned on. A save sent without it is last-writer-wins, so the
+ * revision travels from this read into the editor and no further logic is allowed to invent one.
  */
 export function ImposterDetail({ port }: { port: number }): ReactNode {
-  const { tenant } = useSession();
-  const imposter = useQuery({
-    queryKey: ["imposter", port, { tenant }],
-    queryFn: () => apiGet<Imposter>(imposterPath(port), { tenant }),
-    ...POLLED,
-  });
+  const { can } = useSession();
+  const imposter = useImposter(port);
+  const [editing, setEditing] = useState<StubTarget | null>(null);
+  const mayWrite = can("imposter.write");
 
   return (
     <section className="screen">
@@ -55,19 +55,94 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
               <div key={field.key} className="fact">
                 <dt>{field.label}</dt>
                 <dd data-testid={`detail-${field.key}`}>
-                  <ImposterField imposter={imposter.data} field={field.key} />
+                  <ImposterField imposter={imposter.data.data} field={field.key} />
                 </dd>
               </div>
             ))}
           </dl>
-          <Stubs stubs={imposter.data.stubs} />
+          <Stubs
+            port={port}
+            imposter={imposter.data.data}
+            revision={imposter.data.revision}
+            mayWrite={mayWrite}
+            editing={editing}
+            onEdit={setEditing}
+          />
         </>
       ) : null}
     </section>
   );
 }
 
-function Stubs({ stubs }: { stubs: Stub[] | undefined }): ReactNode {
+function Stubs({
+  port,
+  imposter,
+  revision,
+  mayWrite,
+  editing,
+  onEdit,
+}: {
+  port: number;
+  imposter: Imposter;
+  revision: string | null;
+  mayWrite: boolean;
+  editing: StubTarget | null;
+  onEdit: (target: StubTarget | null) => void;
+}): ReactNode {
+  const stubs = imposter.stubs;
+  const editingStub =
+    editing?.kind === "existing" ? stubs?.find((stub) => stub.id === editing.stubId) : undefined;
+
+  return (
+    <>
+      {mayWrite ? (
+        <nav className="pager">
+          <button type="button" onClick={() => onEdit({ kind: "new" })}>
+            Add stub
+          </button>
+        </nav>
+      ) : null}
+
+      {editing !== null && (editing.kind === "new" || editingStub !== undefined) ? (
+        <StubEditor
+          /*
+           * Keyed by the target, not by the stub's content. The imposter is polled, so `original`
+           * changes underneath this panel on every tick — remounting on that would discard the
+           * operator's in-progress draft several times a minute.
+           */
+          key={editing.kind === "new" ? "new" : editing.stubId}
+          port={port}
+          target={editing}
+          original={editingStub ?? {}}
+          revision={revision}
+          onDone={() => onEdit(null)}
+        />
+      ) : null}
+
+      <StubTable
+        port={port}
+        stubs={stubs}
+        revision={revision}
+        mayWrite={mayWrite}
+        onEdit={onEdit}
+      />
+    </>
+  );
+}
+
+function StubTable({
+  port,
+  stubs,
+  revision,
+  mayWrite,
+  onEdit,
+}: {
+  port: number;
+  stubs: Stub[] | undefined;
+  revision: string | null;
+  mayWrite: boolean;
+  onEdit: (target: StubTarget) => void;
+}): ReactNode {
   if (stubs === undefined) {
     return <p className="muted">This response carried no stub list.</p>;
   }
@@ -84,6 +159,7 @@ function Stubs({ stubs }: { stubs: Stub[] | undefined }): ReactNode {
           <th>Scenario</th>
           <th className="numeric">Predicates</th>
           <th className="numeric">Responses</th>
+          {mayWrite ? <th>Actions</th> : null}
         </tr>
       </thead>
       <tbody>
@@ -107,9 +183,57 @@ function Stubs({ stubs }: { stubs: Stub[] | undefined }): ReactNode {
             <td className="numeric">
               <Ident>{stub.responses?.length ?? UNKNOWN}</Ident>
             </td>
+            {mayWrite ? (
+              <td>
+                <StubActions port={port} stub={stub} revision={revision} onEdit={onEdit} />
+              </td>
+            ) : null}
           </tr>
         ))}
       </tbody>
     </table>
+  );
+}
+
+/**
+ * The write controls for one stub.
+ *
+ * A stub with no `id` gets them inert, with the reason on screen. It is **not** given an
+ * index-addressed fallback: an index is a position, so an index-addressed write racing a concurrent
+ * insert or delete replaces a different stub and answers `200`. Refusing to offer the action is the
+ * only honest option — the fix is to give the stub an id, which is a change to the stub.
+ */
+function StubActions({
+  port,
+  stub,
+  revision,
+  onEdit,
+}: {
+  port: number;
+  stub: Stub;
+  revision: string | null;
+  onEdit: (target: StubTarget) => void;
+}): ReactNode {
+  const stubId = stub.id;
+  if (stubId === undefined) {
+    return (
+      <span data-testid="stub-not-addressable">
+        <button type="button" disabled>
+          Edit
+        </button>{" "}
+        <span className="muted">
+          This stub has no id, so there is no by-id address for it. Editing it by position could
+          overwrite a different stub if another editor inserts one first.
+        </span>
+      </span>
+    );
+  }
+  return (
+    <>
+      <button type="button" onClick={() => onEdit({ kind: "existing", stubId })}>
+        Edit {stubId}
+      </button>
+      <DeleteStubButton port={port} stubId={stubId} revision={revision} />
+    </>
   );
 }

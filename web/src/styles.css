@@ -342,3 +342,110 @@ button[disabled] {
   outline: 2px solid var(--fg);
   outline-offset: 1px;
 }
+
+/* --- stub editor (RFC-006 C5, #188) ------------------------------------ */
+
+.stub-editor {
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  padding: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+/*
+ * Form and JSON side by side while the stub is projectable, and the JSON alone when it is not.
+ * `minmax(0, …)` on both tracks rather than `1fr`: a long unbroken body line in the editor would
+ * otherwise force the grid wider than its container and scroll the whole page sideways.
+ */
+.stub-panes {
+  display: grid;
+  grid-template-columns: minmax(0, 20rem) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.stub-panes > :only-child {
+  grid-column: 1 / -1;
+}
+
+.stub-form {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.stub-form label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+}
+
+.stub-form input {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.25rem;
+  background: var(--panel);
+  color: inherit;
+}
+
+.code-editor {
+  min-height: 20rem;
+  border: 1px solid var(--line);
+  border-radius: 0.25rem;
+}
+
+/*
+ * The fallback is a real editor, not a placeholder: it is what an operator gets on a browser monaco
+ * will not run in, and it is the surface every test drives. It gets the same monospace treatment.
+ */
+.code-editor-fallback {
+  width: 100%;
+  min-height: 20rem;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.8125rem;
+  padding: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.25rem;
+  background: var(--panel);
+  color: inherit;
+  resize: vertical;
+}
+
+.stub-lint {
+  margin-top: 0.75rem;
+}
+
+.stub-lint ul {
+  margin: 0.5rem 0 0;
+  padding-left: 1.25rem;
+  font-size: 0.875rem;
+}
+
+/* Both sides of a conflict at once. Neither is authoritative — that is the operator's call. */
+.stub-diff {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: 1rem;
+  margin: 0.75rem 0;
+}
+
+.stub-diff h3 {
+  font-size: 0.8125rem;
+  margin: 0 0 0.25rem;
+}
+
+/*
+ * `pre` and nothing else, for RFC-006 §9.1: a stub body is attacker-influenced text. It scrolls
+ * inside its own box rather than wrapping, so a minified payload cannot stretch the page.
+ */
+.stub-diff pre,
+.stub-body pre {
+  margin: 0;
+  padding: 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 0.25rem;
+  font-size: 0.8125rem;
+  max-height: 16rem;
+  overflow: auto;
+}

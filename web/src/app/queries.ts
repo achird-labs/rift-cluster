@@ -1,17 +1,28 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { UseMutationResult, UseQueryResult } from "@tanstack/react-query";
 
-import { apiGet, apiSend } from "../api/client.ts";
+import {
+  ApiError,
+  type RawJsonBody,
+  type RevisionedRead,
+  type SendResult,
+  apiGet,
+  apiGetWithRevision,
+  apiSend,
+} from "../api/client.ts";
 import { type CommitOutcome, applied, settle } from "../features/writes/commit.ts";
 import {
   API_PATHS,
   auditPath,
   bindingPath,
   frontDoorRoutePath,
+  imposterPath,
   lifecyclePath,
   principalPath,
   principalsPath,
   requestsPath,
+  stubByIdPath,
+  stubsPath,
   tenantPath,
 } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
@@ -24,6 +35,7 @@ import { POLLED, POLLED_REQUESTS } from "./query.ts";
 import { useSession } from "./session.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
+type Stub = components["schemas"]["Stub"];
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
 type RouteTable = components["schemas"]["RouteTable"];
@@ -155,6 +167,124 @@ export function useRequestLog(port: number): UseQueryResult<LogState> {
     },
     ...POLLED_REQUESTS,
   });
+}
+
+/**
+ * One imposter, read **with** the revision the fleet stamped it at.
+ *
+ * The token is not a nicety: it is the `If-Match` every stub write on this screen is conditioned
+ * on, and without it a save is last-writer-wins. It travels with the body through the cache so a
+ * write always quotes the revision of the state the operator was actually looking at.
+ */
+export function useImposter(port: number): UseQueryResult<RevisionedRead<Imposter>> {
+  const { tenant } = useSession();
+  return useQuery({
+    queryKey: key(["imposter", port], tenant),
+    queryFn: () => apiGetWithRevision<Imposter>(imposterPath(port), { tenant }),
+    ...POLLED,
+  });
+}
+
+/**
+ * Raised when a stub write was refused because the imposter moved underneath the editor.
+ *
+ * Carries what it takes to *offer* a rebase and nothing that would perform one: the stub as it now
+ * is, and a fresh token. The operator's own edit stays where it already is — in the editor — because
+ * merging the two is a decision the console is not entitled to make. `theirs` is `null` when the
+ * stub is gone entirely, which is a different sentence on screen.
+ */
+export class StubConflict extends Error {
+  readonly theirs: Stub | null;
+  readonly revision: string | null;
+
+  constructor(theirs: Stub | null, revision: string | null) {
+    super("this imposter changed since the editor read it");
+    this.name = "StubConflict";
+    this.theirs = theirs;
+    this.revision = revision;
+  }
+}
+
+/** A stub write's variables. `revision` is the token the read handed over; never invented here. */
+export type StubWrite = {
+  port: number;
+  stubId: string;
+  /** Sent verbatim so the raw editor stores the operator's own bytes. Absent for a delete. */
+  body?: RawJsonBody;
+  revision: string | null;
+};
+
+/**
+ * Send a by-id stub write, turning the fleet's `409` into a rebase prompt.
+ *
+ * The re-read on conflict happens here rather than in the screen so that *every* caller of this
+ * hook gets the fresh token: retrying with the stale one would 409 again forever, and retrying with
+ * no token at all would win the race by discarding the other editor's work, which is the lost
+ * update wearing a different hat.
+ */
+function useStubWrite(
+  send: (write: StubWrite, tenant: string | null) => Promise<SendResult<unknown>>,
+): UseMutationResult<CommitOutcome, Error, StubWrite> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (write) => {
+      const conflict = async (): Promise<never> => {
+        const fresh = await apiGetWithRevision<Imposter>(imposterPath(write.port), { tenant });
+        const theirs = (fresh.data.stubs ?? []).find((stub) => stub.id === write.stubId) ?? null;
+        throw new StubConflict(theirs, fresh.revision);
+      };
+      try {
+        const outcome = await settle(await send(write, tenant), { tenant });
+        if (outcome.kind === "failed") {
+          /*
+           * Under `--cluster-admin-async` the precondition is judged inside apply, AFTER the 202 —
+           * so a stale token surfaces here as a failed commit whose detail carries the state
+           * machine's `"revision conflict"` prefix, not as a synchronous 409. Same refusal, same
+           * operator decision to make; it gets the same rebase prompt, not a raw error string.
+           */
+          if (outcome.detail.startsWith("revision conflict")) return conflict();
+          throw new Error(outcome.detail);
+        }
+        return outcome;
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 409) throw error;
+        return conflict();
+      }
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["imposter"] }),
+  });
+}
+
+export function usePutStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
+  return useStubWrite((write, tenant) =>
+    apiSend("PUT", stubByIdPath(write.port, write.stubId), write.body, {
+      tenant,
+      ifMatch: write.revision,
+    }),
+  );
+}
+
+export function useDeleteStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
+  return useStubWrite((write, tenant) =>
+    apiSend("DELETE", stubByIdPath(write.port, write.stubId), undefined, {
+      tenant,
+      ifMatch: write.revision,
+    }),
+  );
+}
+
+/**
+ * Append a stub.
+ *
+ * `POST` to the collection, not a `PUT` to an id: a by-id `PUT` answers `404` for an id that does
+ * not exist yet, so "add" genuinely is a different route rather than the same one with a new id.
+ * It carries the same `If-Match`, so appending cannot clobber a concurrent edit either.
+ */
+export function useAddStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
+  return useStubWrite((write, tenant) =>
+    apiSend("POST", stubsPath(write.port), write.body, { tenant, ifMatch: write.revision }),
+  );
 }
 
 export function useRouteTable(): UseQueryResult<Route[]> {

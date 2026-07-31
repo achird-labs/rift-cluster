@@ -1,4 +1,10 @@
 /target
+# `crates/rift-lint-wasm` is its own workspace (see the root Cargo.toml's `exclude`), so it builds
+# into its own `target/` that the anchored rule above does not reach. `pkg/` is wasm-pack's default
+# output; the release lane writes to `web/public/lint` instead, but a local `wasm-pack build` does
+# not.
+/crates/rift-lint-wasm/target
+/crates/rift-lint-wasm/pkg
 **/*.rs.bk
 Cargo.lock.orig
 .DS_Store

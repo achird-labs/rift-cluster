@@ -28,8 +28,9 @@ const SECRET: &str = "console-embed-secret";
 
 /// The exact policy RFC-006 §9.1 specifies. Byte-for-byte: this is a security control, and a test
 /// that only checked for the *presence* of a CSP header would pass against a permissive one.
-const EXPECTED_CSP: &str =
-    "default-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'";
+const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+                            style-src 'self' 'unsafe-inline'; connect-src 'self'; \
+                            frame-ancestors 'none'";
 
 fn cluster_cli(state: &TempDir) -> EeCli {
     EeCli::try_parse_from([
@@ -330,24 +331,19 @@ async fn the_served_page_has_no_external_subresource_and_no_inline_script() {
         );
     }
 
-    // The same rule for styles, and it is the one that decides the UI stack (RFC-006 §7's
-    // design-stack note). The CSP declares no `style-src`, so styles fall back to
-    // `default-src 'self'` with no `'unsafe-inline'` — which blocks both a `<style>` element and a
-    // `style=` attribute in the served markup. Runtime CSS-in-JS produces exactly that and would
-    // fail only in the embedded build; a build-time stylesheet, which is what this scaffold uses,
-    // produces neither.
-    //
-    // This is also what makes the animation-library question answerable rather than argued: any
-    // library that injects markup-level styles fails here the moment it is added.
+    // The same rule for styles — and since C5 the CSP no longer enforces it. `style-src` carries
+    // `'unsafe-inline'` for monaco's runtime theme service (see `console.rs`'s CSP doc), so an
+    // inline style in the shipped markup would now LOAD. That is precisely why this static check
+    // must stay: it is the remaining line that keeps the shell's own bytes style-free, where the
+    // policy used to be a second witness. Runtime CSS-in-JS in the app's own code would still land
+    // here at build time; monaco's two runtime `<style>` elements never appear in the artifact.
     if let Some(fragment) = markup.split("<style").nth(1) {
         let tag = fragment.split('>').next().unwrap_or_default();
-        panic!(
-            "inline <style{tag}> in the served shell — blocked by the CSP's default-src fallback"
-        );
+        panic!("inline <style{tag}> in the served shell — the artifact must stay style-free");
     }
     assert!(
         !markup.contains(" style=\""),
-        "inline style= attribute in the served shell — blocked by the CSP's default-src fallback"
+        "inline style= attribute in the served shell — the artifact must stay style-free"
     );
 
     // CSS is the other subresource-bearing text asset: a webfont or background image would appear
