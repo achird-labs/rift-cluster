@@ -30,7 +30,17 @@ export type Capability =
   | "imposter.write"
   | "tenant.manage"
   | "audit.read"
-  | "fleet.read";
+  | "fleet.read"
+  /**
+   * `Action::ClusterAdmin` — held by `fleet-admin` alone.
+   *
+   * Distinct from `tenant.manage`, which is where a tenant-admin stops. The tenancy routes split
+   * across the two: `PrincipalList`/`PrincipalCreate`/`BindingPut` are `TenantManage`, but the whole
+   * `/admin/tenants` CRUD *and* `PrincipalPut`/`PrincipalDelete` are `ClusterAdmin`. Without this
+   * capability the console can only gate on `tenant.manage` and ends up drawing a tenant-admin
+   * buttons that answer 403 or 404 every time — the exact thing this table exists to prevent.
+   */
+  | "cluster.admin";
 
 /**
  * A transcription of `crates/rift-cluster-server/src/authz.rs::role_allows`, kept in the same

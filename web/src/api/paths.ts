@@ -13,6 +13,7 @@ export const API_PATHS = {
   fleetHealth: "/_fleet/health",
   session: "/session",
   frontDoorRoutes: "/front-door/routes",
+  audit: "/admin/audit",
 } as const satisfies Record<string, ApiPath>;
 
 /** Path builders for the templated routes, so a port is interpolated in exactly one place. */
@@ -22,3 +23,28 @@ export const lifecyclePath = (port: number, enabled: boolean): string =>
 export const requestsPath = (port: number): string => `/imposters/${port}/requests`;
 export const frontDoorRoutePath = (routeId: string): string =>
   `/front-door/routes/${encodeURIComponent(routeId)}`;
+
+/**
+ * The admin plane addresses a tenant through the path, never `X-Rift-Tenant` — every
+ * `/admin/tenants/*` route below takes `tenantId` as a path segment, so these calls send no tenant
+ * header at all.
+ */
+export const tenantPath = (tenantId: string): string =>
+  `/admin/tenants/${encodeURIComponent(tenantId)}`;
+export const principalsPath = (tenantId: string): string => `${tenantPath(tenantId)}/principals`;
+
+/*
+ * The principal id goes in **raw**, deliberately — this is not a missing `encodeURIComponent`.
+ *
+ * `tenancy::classify` splits `req.uri().path()` as hyper delivers it, and hyper does not normalise
+ * (see the note in `console.rs`), so the server compares the percent-encoded text literally. Every
+ * console-minted principal is `key:<sha256-hex>` (`api_key_principal_id`), and encoding it to
+ * `key%3A…` matches no stored principal: disable, delete and every binding write answer 404/400.
+ * Tenant ids are safe to encode only because they are constrained to `[a-z0-9-]`.
+ */
+export const principalPath = (tenantId: string, principalId: string): string =>
+  `${principalsPath(tenantId)}/${principalId}`;
+export const bindingPath = (tenantId: string, principalId: string): string =>
+  `${tenantPath(tenantId)}/bindings/${principalId}`;
+export const auditPath = (since: number, limit: number): string =>
+  `${API_PATHS.audit}?since=${since}&limit=${limit}`;

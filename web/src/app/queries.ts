@@ -4,11 +4,18 @@ import type { UseMutationResult, UseQueryResult } from "@tanstack/react-query";
 import { apiGet, apiSend } from "../api/client.ts";
 import {
   API_PATHS,
+  auditPath,
+  bindingPath,
   frontDoorRoutePath,
   lifecyclePath,
+  principalPath,
+  principalsPath,
   requestsPath,
+  tenantPath,
 } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
+import { type AuditRow, auditPage, readAuditRows } from "../features/admin/audit.ts";
+import { stripApiKey } from "../features/admin/key.ts";
 import { type LogState, readLog } from "../features/requests/source.ts";
 import { type Route, normalizeTable } from "../features/routes/order.ts";
 import { type FleetView, fleetView } from "./fleetView.ts";
@@ -19,6 +26,13 @@ type Imposter = components["schemas"]["Imposter"];
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
 type RouteTable = components["schemas"]["RouteTable"];
+type Tenant = components["schemas"]["Tenant"];
+type TenantWrite = components["schemas"]["TenantWrite"];
+type Principal = components["schemas"]["Principal"];
+type PrincipalCreate = components["schemas"]["PrincipalCreate"];
+type PrincipalUpdate = components["schemas"]["PrincipalUpdate"];
+type IssuedPrincipal = components["schemas"]["IssuedPrincipal"];
+type Role = components["schemas"]["Role"];
 
 /**
  * The tenant is part of every query key, not just the request headers.
@@ -204,5 +218,190 @@ export function useDeleteRoute(): UseMutationResult<unknown, Error, { routeId: s
     mutationFn: ({ routeId }) =>
       apiSend("DELETE", frontDoorRoutePath(routeId), undefined, { tenant }),
     onSettled: () => client.invalidateQueries({ queryKey: ["front-door-routes"] }),
+  });
+}
+
+/**
+ * The admin plane (RFC-002). Every one of these routes addresses its tenant through the URL path,
+ * never `X-Rift-Tenant` — see `paths.ts` — so, unlike the hooks above, none of these pass `tenant`
+ * to `apiGet`/`apiSend`. `getAudit` is the one exception: it has no tenant path segment, so the
+ * header is how a non-fleet-admin's rows are scoped at all.
+ */
+
+const ADMIN_TENANTS_KEY = ["admin-tenants"];
+const adminTenantKey = (tenantId: string): unknown[] => ["admin-tenant", tenantId];
+const adminPrincipalsKey = (tenantId: string): unknown[] => ["admin-principals", tenantId];
+
+export function useTenants(): UseQueryResult<Tenant[]> {
+  return useQuery({
+    queryKey: ADMIN_TENANTS_KEY,
+    queryFn: () => apiGet<Tenant[]>(API_PATHS.tenants),
+    ...POLLED,
+  });
+}
+
+/**
+ * A pure existence-and-permission probe for one tenant (RFC-002 §8.4).
+ *
+ * The screen must never render anything from this query's data — only whether it errored, and with
+ * which status. The API's anti-oracle (a cross-tenant probe and a nonexistent tenant answer
+ * byte-identical `404`s) only holds if the console does not rebuild a distinguishing signal on top
+ * of it by rendering content that happens to differ between the two.
+ */
+export function useTenantProbe(
+  tenantId: string,
+  options: { enabled: boolean },
+): UseQueryResult<Tenant> {
+  return useQuery({
+    queryKey: adminTenantKey(tenantId),
+    queryFn: () => apiGet<Tenant>(tenantPath(tenantId)),
+    enabled: options.enabled,
+    ...POLLED,
+  });
+}
+
+export function useCreateTenant(): UseMutationResult<unknown, Error, TenantWrite> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (body) => apiSend("POST", API_PATHS.tenants, body),
+    onSettled: () => client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY }),
+  });
+}
+
+export function useSaveTenant(): UseMutationResult<
+  unknown,
+  Error,
+  { tenantId: string; body: TenantWrite }
+> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tenantId, body }) => apiSend("PUT", tenantPath(tenantId), body),
+    onSettled: (_data, _error, vars) => {
+      client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY });
+      client.invalidateQueries({ queryKey: adminTenantKey(vars.tenantId) });
+    },
+  });
+}
+
+export function useDeleteTenant(): UseMutationResult<unknown, Error, { tenantId: string }> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tenantId }) => apiSend("DELETE", tenantPath(tenantId)),
+    onSettled: () => client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY }),
+  });
+}
+
+export function usePrincipals(tenantId: string): UseQueryResult<Principal[]> {
+  return useQuery({
+    queryKey: adminPrincipalsKey(tenantId),
+    queryFn: () => apiGet<Principal[]>(principalsPath(tenantId)),
+    ...POLLED,
+  });
+}
+
+/**
+ * Mint a principal. The raw `apiKey` in the response is the one and only time it exists outside an
+ * argon2id hash — it must reach the caller's `mutate(...)` callback and nowhere else. This hook's
+ * own `onSuccess` only ever touches `stripApiKey(issued)`, so the query cache this component shares
+ * with the rest of the console never sees the raw value, regardless of what the caller does with it.
+ */
+/**
+ * Mint a principal, handing the raw key to the caller **out of band**.
+ *
+ * `onIssued` receives the one-time `apiKey`; the mutation itself resolves to the *stripped* record,
+ * so React Query never stores the key anywhere. Returning the full response and sanitising it in
+ * `onSuccess` is not enough: `useMutation` keeps its own copy of the resolved value in the
+ * MutationCache, where `setQueryData` cannot reach it, and it stays readable from the client (and
+ * React Query Devtools) for `gcTime` after the panel is dismissed. The key exists for one moment,
+ * and the only place it lives is the component state `onIssued` writes it into.
+ */
+export function useCreatePrincipal(
+  tenantId: string,
+  onIssued: (issued: IssuedPrincipal) => void,
+): UseMutationResult<Omit<IssuedPrincipal, "apiKey">, Error, PrincipalCreate> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body) => {
+      const issued = await apiSend<IssuedPrincipal>("POST", principalsPath(tenantId), body);
+      onIssued(issued);
+      return stripApiKey(issued);
+    },
+    onSuccess: (created) => {
+      client.setQueryData<Principal[]>(adminPrincipalsKey(tenantId), (existing) =>
+        existing === undefined
+          ? existing
+          : [...existing, { ...created, auth: "apiKey", disabled: false }],
+      );
+    },
+  });
+}
+
+export function useSavePrincipal(): UseMutationResult<
+  unknown,
+  Error,
+  { tenantId: string; principalId: string; body: PrincipalUpdate }
+> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tenantId, principalId, body }) =>
+      apiSend("PUT", principalPath(tenantId, principalId), body),
+    onSettled: (_data, _error, vars) =>
+      client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
+  });
+}
+
+export function useDeletePrincipal(): UseMutationResult<
+  unknown,
+  Error,
+  { tenantId: string; principalId: string }
+> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tenantId, principalId }) =>
+      apiSend("DELETE", principalPath(tenantId, principalId)),
+    onSettled: (_data, _error, vars) =>
+      client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
+  });
+}
+
+export function usePutBinding(): UseMutationResult<
+  unknown,
+  Error,
+  { tenantId: string; principalId: string; role: Role }
+> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tenantId, principalId, role }) =>
+      apiSend("PUT", bindingPath(tenantId, principalId), { role }),
+    onSettled: (_data, _error, vars) =>
+      client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
+  });
+}
+
+export function useDeleteBinding(): UseMutationResult<
+  unknown,
+  Error,
+  { tenantId: string; principalId: string }
+> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tenantId, principalId }) =>
+      apiSend("DELETE", bindingPath(tenantId, principalId)),
+    onSettled: (_data, _error, vars) =>
+      client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
+  });
+}
+
+/**
+ * `since` is caller-owned state (RFC-002 §8's cursor is client-driven), not derived here — the
+ * screen advances it with `nextSince` once a page has rendered, and that decision does not belong
+ * inside the hook that reads one page.
+ */
+export function useAuditRows(tenant: string | null, since: number): UseQueryResult<AuditRow[]> {
+  return useQuery({
+    queryKey: ["admin-audit", tenant, since],
+    queryFn: async () =>
+      auditPage(readAuditRows(await apiGet<unknown>(auditPath(since, 100), { tenant }))),
+    ...POLLED,
   });
 }

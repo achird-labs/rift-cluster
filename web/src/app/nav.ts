@@ -84,11 +84,14 @@ export const NAV: readonly NavEntry[] = [
     note: "OpenAPI import, drift and contract validation (RFC-004).",
   },
   {
-    kind: "planned",
+    kind: "live",
     id: "administration",
     label: "Administration",
-    issue: 190,
-    note: "Tenants, principals, roles, tokens and the audit viewer (RFC-002).",
+    route: { screen: "admin", tab: "tenants", tenant: null },
+    // Gates on the weakest admin capability, not `imposter.*`: viewer/operator/editor hold none of
+    // `CAPABILITY_MATRIX`'s admin capabilities, so the entry (and every control inside the screen)
+    // is invisible below tenant-admin, where `tenant.manage` and `audit.read` both start.
+    requires: "tenant.manage",
   },
 ];
 
