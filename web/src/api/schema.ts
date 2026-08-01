@@ -1217,6 +1217,8 @@ export interface components {
         WhoAmI: {
             /** @description Null under the open-admin-plane bypass (no principals configured, no API key). */
             principalId?: string | null;
+            /** @description The principal's own display name, for a client to render instead of `principalId`. Null for the two identities with no stored row to read it from: the open-admin-plane bypass, and the legacy `--api-key`'s synthetic principal (minted in code, never committed) — whose `principalId` is the already-readable `legacy:api-key`. A client falls back to `principalId` when this is null. It exists because `principalId` for a minted key is `key:<sha256-hex>`: not a credential, since the raw key cannot be recovered from it and argon2id is the actual boundary, but indistinguishable from one on screen. */
+            displayName?: string | null;
             bindings: {
                 tenant?: string;
                 role?: components["schemas"]["Role"];

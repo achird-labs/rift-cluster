@@ -86,18 +86,15 @@ function AdminTabs({ tab, tenant }: { tab: AdminTab; tenant: string | null }): R
   const tabs: AdminTab[] = ["tenants", "principals", "bindings", "audit"];
   return (
     <nav className="admin-tabs">
-      <ul>
-        {tabs.map((t) => (
-          <li key={t}>
-            <a
-              href={toHash({ screen: "admin", tab: t, tenant })}
-              aria-current={t === tab ? "page" : undefined}
-            >
-              {TAB_LABEL[t]}
-            </a>
-          </li>
-        ))}
-      </ul>
+      {tabs.map((t) => (
+        <a
+          key={t}
+          href={toHash({ screen: "admin", tab: t, tenant })}
+          aria-current={t === tab ? "page" : undefined}
+        >
+          {TAB_LABEL[t]}
+        </a>
+      ))}
     </nav>
   );
 }
@@ -182,7 +179,7 @@ function TenantsTab(): ReactNode {
             onSubmit={(body) => create.mutate(body, { onSuccess: () => setCreating(false) })}
           />
         ) : (
-          <button type="button" onClick={() => setCreating(true)}>
+          <button className="btn" type="button" onClick={() => setCreating(true)}>
             Create tenant
           </button>
         )
@@ -191,6 +188,8 @@ function TenantsTab(): ReactNode {
       {tenants.isPending ? <p className="muted">Reading…</p> : null}
 
       {tenants.isSuccess ? (
+        <section className="card">
+          <div className="scroll-x">
         <table className="dense">
           <thead>
             <tr>
@@ -224,6 +223,8 @@ function TenantsTab(): ReactNode {
             )}
           </tbody>
         </table>
+          </div>
+        </section>
       ) : null}
     </>
   );
@@ -254,10 +255,10 @@ function TenantRow({
       <td>{tenant.journalRetentionSecs === 0 ? "unlimited" : `${tenant.journalRetentionSecs}s`}</td>
       {mayManage ? (
         <td>
-          <button type="button" onClick={onEdit}>
+          <button className="btn" type="button" onClick={onEdit}>
             Edit {tenant.displayName}
           </button>
-          <button type="button" onClick={onDelete}>
+          <button className="btn" type="button" onClick={onDelete}>
             Delete {tenant.displayName}
           </button>
         </td>
@@ -393,8 +394,8 @@ function TenantEditRow({
               Not a whole number, so nothing was sent: {invalid.join(", ")}.
             </p>
           ) : null}
-          <button type="submit">Save tenant</button>
-          <button type="button" onClick={onCancel}>
+          <button className="btn primary" type="submit">Save tenant</button>
+          <button className="btn" type="button" onClick={onCancel}>
             Cancel
           </button>
         </form>
@@ -437,8 +438,8 @@ function CreateTenantForm({
         Display name
         <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
       </label>
-      <button type="submit">Create tenant</button>
-      <button type="button" onClick={onCancel}>
+      <button className="btn primary" type="submit">Create tenant</button>
+      <button className="btn" type="button" onClick={onCancel}>
         Cancel
       </button>
     </form>
@@ -498,7 +499,7 @@ function PrincipalsTab({ tenant }: { tenant: string }): ReactNode {
             }
           />
         ) : (
-          <button type="button" onClick={() => setCreating(true)}>
+          <button className="btn" type="button" onClick={() => setCreating(true)}>
             Create principal
           </button>
         )
@@ -556,19 +557,22 @@ function MintedKeyPanel({
 
   return (
     <div className="minted-key" data-testid="minted-key" role="alert">
+      <div className="kh">
+        <span aria-hidden="true">▲</span>
+        Shown once
+      </div>
       <p>
-        <strong>{issued.displayName}</strong> was minted for role {issued.role}.
+        <strong>{issued.displayName}</strong> was minted for role {issued.role}. {KEY_NOT_SHOWN_AGAIN}
       </p>
-      <p>{KEY_NOT_SHOWN_AGAIN}</p>
-      <p>
-        <Ident>{issued.apiKey}</Ident>
-      </p>
-      <button type="button" onClick={copy}>
-        Copy key
-      </button>
-      <button type="button" onClick={onDismiss}>
-        Dismiss
-      </button>
+      <code>{issued.apiKey}</code>
+      <div className="row">
+        <button className="btn primary sm" type="button" onClick={copy}>
+          Copy key
+        </button>
+        <button className="btn sm" type="button" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
       {copyFailed ? (
         <p className="error" data-testid="copy-failed">
           Could not reach the clipboard — select the key above and copy it manually before
@@ -619,7 +623,7 @@ function CreatePrincipalForm({
       <button type="submit" disabled={busy}>
         Mint
       </button>
-      <button type="button" onClick={onCancel}>
+      <button className="btn" type="button" onClick={onCancel}>
         Cancel
       </button>
     </form>
@@ -759,7 +763,7 @@ function BindingsTab({ tenant }: { tenant: string }): ReactNode {
               ))}
             </select>
           </label>
-          <button type="submit">Bind</button>
+          <button className="btn primary" type="submit">Bind</button>
         </form>
       ) : null}
     </>
@@ -785,7 +789,9 @@ function AuditTab({ tenant }: { tenant: string | null }): ReactNode {
       {rows.isPending ? <p className="muted">Reading…</p> : null}
       {rows.isSuccess ? (
         <>
-          <table className="dense">
+          <section className="card">
+          <div className="scroll-x">
+        <table className="dense">
             <thead>
               <tr>
                 <th>Revision</th>
@@ -814,8 +820,11 @@ function AuditTab({ tenant }: { tenant: string | null }): ReactNode {
               ))}
             </tbody>
           </table>
+          </div>
+        </section>
           <nav className="pager">
             <button
+              className="btn"
               type="button"
               data-testid="audit-next"
               // A page shorter than the limit is the end of the journal. Gating on the cursor alone

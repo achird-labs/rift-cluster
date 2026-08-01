@@ -3,7 +3,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { ApiError } from "../api/client.ts";
 import { RouteTableConflict, useDeleteRoute, usePutRoutes, useRouteTable } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { ErrorNote, Ident, Status, UnconfirmedNote } from "../components/primitives.tsx";
+import { Empty, ErrorNote, Ident, Status, UnconfirmedNote } from "../components/primitives.tsx";
 import type { Route } from "../features/routes/order.ts";
 import { effectiveOrder, orderReason, validateTable } from "../features/routes/order.ts";
 
@@ -122,17 +122,28 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
       ) : null}
       {remove.data?.kind === "unobservable" ? <UnconfirmedNote reason={remove.data.reason} /> : null}
       {conflict !== null ? (
-        <div className="degraded" data-testid="route-conflict" role="alert">
-          <strong>The route table changed while you were editing.</strong> Your edits have not been
-          sent, and the other change is still in place. Reapply your edits on top of the current
-          table, or discard them.
-          <p className="muted">
-            Now on the fleet: {conflict.map((route) => route.id).join(", ") || "(empty table)"}
-          </p>
-          <button type="button" onClick={() => reapply(conflict)}>
+        <div className="banner warn" data-testid="route-conflict" role="alert">
+          <span className="b-glyph" aria-hidden="true">
+            ▲
+          </span>
+          <div>
+            <strong>The route table changed while you were editing.</strong>
+            <p>
+              Your edits have not been sent, and the other change is still in place. Reapply your
+              edits on top of the current table, or discard them.
+            </p>
+            <p>
+              Now on the fleet:{" "}
+              <span className="ident">
+                {conflict.map((route) => route.id).join(", ") || "(empty table)"}
+              </span>
+            </p>
+            <div className="row">
+          <button className="btn sm" type="button" onClick={() => reapply(conflict)}>
             Reapply my edits
           </button>
           <button
+            className="btn sm"
             type="button"
             onClick={() => {
               setDraft(conflict);
@@ -142,17 +153,24 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
           >
             Discard my edits
           </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
       {errors.length > 0 ? (
-        <div className="error" data-testid="route-validation" role="alert">
+        <div className="banner crit" data-testid="route-validation" role="alert">
+          <span className="b-glyph" aria-hidden="true">
+            ■
+          </span>
+          <div>
           <strong>The fleet would refuse this table as a whole.</strong>
           <ul>
             {errors.map((error) => (
               <li key={`${error.kind}-${error.message}`}>{error.message}</li>
             ))}
           </ul>
+          </div>
         </div>
       ) : null}
 
@@ -171,10 +189,12 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
         </p>
       ) : null}
 
+      <section className="card">
+        <div className="scroll-x">
       <table className="dense">
         <thead>
           <tr>
-            <th>Rank</th>
+            <th style={{ width: "7ch" }}>Rank</th>
             <th>Id</th>
             <th>Match</th>
             <th>Target</th>
@@ -186,11 +206,19 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
           {rows.map((route) => (
             <tr key={route.id} data-testid="route-row">
               {/* A disabled route is excluded from dispatch, so it has no place in the chain. */}
-              <td data-testid="route-rank">{rank.get(route.id) ?? "—"}</td>
+              <td data-testid="route-rank">
+                <span className={route.enabled ? "order-rank" : "order-rank off"}>
+                  {rank.get(route.id) ?? "—"}
+                </span>
+              </td>
               <td data-testid="route-id">
                 <Ident>{route.id}</Ident>
               </td>
-              <td>{describeMatch(route)}</td>
+              <td>
+                <span className="match-clauses">
+                  <span className="clause">{describeMatch(route)}</span>
+                </span>
+              </td>
               <td>
                 <Ident>{route.target.port}</Ident>
                 {route.target.strip_prefix ? " · strips prefix" : ""}
@@ -199,6 +227,7 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
               {mayWrite ? (
                 <td>
                   <button
+                    className="btn sm"
                     type="button"
                     onClick={() =>
                       setDraft(
@@ -212,7 +241,11 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
                    * A single removal goes through DELETE rather than a whole-table PUT: it cannot
                    * take an unrelated concurrent edit down with it.
                    */}
-                  <button type="button" onClick={() => remove.mutate({ routeId: route.id })}>
+                  <button
+                    className="btn sm danger"
+                    type="button"
+                    onClick={() => remove.mutate({ routeId: route.id })}
+                  >
                     Delete {route.id}
                   </button>
                 </td>
@@ -221,17 +254,29 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
           ))}
         </tbody>
       </table>
+        </div>
+      </section>
 
-      {draft.length === 0 ? <p className="muted">This tenant has no front-door routes.</p> : null}
+      {draft.length === 0 ? (
+        <Empty
+          title="This tenant has no front-door routes"
+          body="Every request reaches its imposter by port until a route is added here."
+        />
+      ) : null}
 
       {mayWrite ? (
         <nav className="pager">
           {/* Disabled rather than silently no-op: `save()` returns early on a validation error, and
               a button that looks live but does nothing reads as a broken console. */}
-          <button type="button" onClick={save} disabled={put.isPending || errors.length > 0}>
+          <button
+            className="btn primary"
+            type="button"
+            onClick={save}
+            disabled={put.isPending || errors.length > 0}
+          >
             Save table
           </button>
-          <button type="button" onClick={() => setDraft(base)} disabled={!dirty}>
+          <button className="btn" type="button" onClick={() => setDraft(base)} disabled={!dirty}>
             Revert
           </button>
           {dirty ? <Status tone="warn" label="unsaved changes" /> : null}

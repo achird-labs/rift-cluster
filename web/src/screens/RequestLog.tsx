@@ -3,7 +3,7 @@ import { type ReactNode, useState } from "react";
 import { ApiError } from "../api/client.ts";
 import type { FleetReadState } from "../app/fleetView.ts";
 import { useFleetView, useImposters, useRequestLog } from "../app/queries.ts";
-import { Ident, Truncated } from "../components/primitives.tsx";
+import { Empty, Ident, Truncated } from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
@@ -41,18 +41,28 @@ function Log({ port }: { port: number }): ReactNode {
     <section className="screen">
       <header className="screen-head">
         <h1>Request log</h1>
-        {/*
-         * A permanent scope line, not a dismissible banner. Per-node is the fact this screen must
-         * keep in front of the reader: an operator uses it to decide whether their system under
-         * test called the mock, and one node's log answers that only for one node.
-         */}
-        <p className="scope-label" data-testid="request-scope-label" role="status">
-          {describeCoverage(coverage)}
-        </p>
         <p className="muted">
           Imposter <Ident>{port}</Ident>
         </p>
       </header>
+
+      {/*
+       * A permanent scope strip, not a dismissible banner — and deliberately the most prominent
+       * thing on the screen after the title. Per-node is the fact this screen must keep in front of
+       * the reader: an operator uses it to decide whether their system under test called the mock,
+       * and one node's log answers that only for one node. When the merged journal lands (#147) the
+       * label drops and this shape stays.
+       */}
+      <div className="scope" data-testid="request-scope-label" role="status">
+        <span className="eyebrow">Scope</span>
+        <span className="pill accent">
+          <span className="g" aria-hidden="true">
+            ◈
+          </span>
+          this node only
+        </span>
+        <span className="coverage">{describeCoverage(coverage)}</span>
+      </div>
 
       {log.isPending ? <p className="muted">Reading…</p> : null}
       {log.isSuccess ? (
@@ -78,18 +88,29 @@ function Rows({
      * could not answer.
      */
     return (
-      <p className="error" data-testid="request-log-unknown" role="alert">
-        <strong>This node&rsquo;s log is unknown, not empty.</strong> It could not be read, so
-        nothing here says whether requests arrived. {state.reason}
-      </p>
+      <div className="banner crit" data-testid="request-log-unknown" role="alert">
+        <span className="b-glyph" aria-hidden="true">
+          ■
+        </span>
+        <div>
+          <strong>This node&rsquo;s log is unknown, not empty.</strong>
+          <p>
+            It could not be read, so nothing here says whether requests arrived. {state.reason}
+          </p>
+        </div>
+      </div>
     );
   }
 
   if (state.rows.length === 0) {
+    // The reachable-and-genuinely-empty case, which is a different screen from the one above on
+    // purpose: this one is an answer, that one is the absence of an answer.
     return (
-      <p className="muted" data-testid="request-log-empty">
-        This node answered and has recorded no requests for this imposter.
-      </p>
+      <Empty
+        testId="request-log-empty"
+        title="No requests recorded for this imposter"
+        body="This node answered. Nothing has called the imposter since its log was last cleared."
+      />
     );
   }
 
@@ -106,42 +127,73 @@ function Rows({
 
   return (
     <>
-      <p className="muted" data-testid="request-total">
-        {first}–{last} of {view.total} on this node
-      </p>
-      <table className="dense">
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Method</th>
-            <th>Path</th>
-            <th>From</th>
-          </tr>
-        </thead>
-        <tbody>
-          {/*
-            Keyed on the *clamped* start, not the raw offset. Keying on `offset` would leave the
-            keys unchanged when a shrinking journal clamps `start`, so React would reuse the
-            components and an expanded row would re-render already-open against a different request.
-          */}
-          {view.rows.map((request, index) => (
-            <Row key={`${start + index}`} request={request} />
-          ))}
-        </tbody>
-      </table>
-      <nav className="pager">
-        <button
-          type="button"
-          disabled={start === 0}
-          onClick={() => onOffset(Math.max(0, start - PAGE_SIZE))}
-        >
-          Previous
-        </button>
-        <button type="button" disabled={!view.hasMore} onClick={() => onOffset(start + PAGE_SIZE)}>
-          Next
-        </button>
-      </nav>
+      <section className="card">
+        <div className="scroll-x">
+          <table className="dense">
+            <thead>
+              <tr>
+                <th style={{ width: "20ch" }}>Time</th>
+                <th style={{ width: "10ch" }}>Method</th>
+                <th>Path</th>
+                <th style={{ width: "18ch" }}>From</th>
+              </tr>
+            </thead>
+            <tbody>
+              {/*
+                Keyed on the *clamped* start, not the raw offset. Keying on `offset` would leave the
+                keys unchanged when a shrinking journal clamps `start`, so React would reuse the
+                components and an expanded row would re-render already-open against a different
+                request.
+              */}
+              {view.rows.map((request, index) => (
+                <Row key={`${start + index}`} request={request} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <nav className="pager">
+          <button
+            className="btn sm"
+            type="button"
+            disabled={start === 0}
+            onClick={() => onOffset(Math.max(0, start - PAGE_SIZE))}
+          >
+            Previous
+          </button>
+          <button
+            className="btn sm"
+            type="button"
+            disabled={!view.hasMore}
+            onClick={() => onOffset(start + PAGE_SIZE)}
+          >
+            Next
+          </button>
+          <span className="count" data-testid="request-total">
+            {first}–{last} of {view.total} on this node
+          </span>
+        </nav>
+      </section>
     </>
+  );
+}
+
+/**
+ * The HTTP verb as a badge.
+ *
+ * The class is derived from a **closed set**, never interpolated from the value: `method` is
+ * recorded from whatever called the mock, so `method-${request.method}` would put attacker-chosen
+ * text into a class attribute. An unrecognised verb simply gets the neutral badge and still renders
+ * its own text.
+ */
+const METHOD_TONES = new Set(["get", "post", "put", "patch", "delete", "head", "options"]);
+
+function Method({ method }: { method: string | undefined }): ReactNode {
+  if (method === undefined) return <span className="method">—</span>;
+  const tone = method.toLowerCase();
+  return (
+    <span className={METHOD_TONES.has(tone) ? `method ${tone}` : "method"}>
+      <Truncated value={method} max={7} />
+    </span>
   );
 }
 
@@ -157,9 +209,11 @@ function Row({ request }: { request: RecordedRequest }): ReactNode {
   const [open, setOpen] = useState(false);
   return (
     <>
-      <tr data-testid="request-row">
-        <td>{request.timestamp ?? "—"}</td>
-        <td>{request.method ?? "—"}</td>
+      <tr data-testid="request-row" className="clickable" aria-selected={open}>
+        <td className="ident">{request.timestamp ?? "—"}</td>
+        <td>
+          <Method method={request.method} />
+        </td>
         <td>
           <button
             type="button"
@@ -167,41 +221,43 @@ function Row({ request }: { request: RecordedRequest }): ReactNode {
             data-testid="request-open"
             onClick={() => setOpen(!open)}
           >
-            <Truncated value={request.path ?? "—"} max={60} />
+            <span className="path">{request.path ?? "—"}</span>
           </button>
         </td>
-        <td>{request.requestFrom ?? "—"}</td>
+        <td className="ident">
+          <Truncated value={request.requestFrom ?? "—"} max={16} />
+        </td>
       </tr>
       {open ? (
         <tr data-testid="request-detail">
           <td colSpan={4}>
-            <dl className="facts">
-              <div className="fact">
+            <dl className="detail">
+              <div className="kv">
                 <dt>Path</dt>
                 <dd>
-                  <pre>{request.path ?? "—"}</pre>
+                  <pre className="payload">{request.path ?? "—"}</pre>
                 </dd>
               </div>
-              <div className="fact">
+              <div className="kv">
                 <dt>Headers</dt>
                 <dd>
-                  <pre>{formatHeaders(request.headers)}</pre>
+                  <pre className="payload">{formatHeaders(request.headers)}</pre>
                 </dd>
               </div>
-              <div className="fact">
+              <div className="kv">
                 <dt>Query</dt>
                 <dd>
-                  <pre>{formatQuery(request.query)}</pre>
+                  <pre className="payload">{formatQuery(request.query)}</pre>
                 </dd>
               </div>
-              <div className="fact">
+              <div className="kv">
                 {/* A base64 body rendered unlabelled reads as corrupted text rather than as the
                     binary payload it is. The mode token is `binary` and the encoding it implies is
                     base64 — `ResponseMode` serializes lowercase, and a text body omits the field
                     entirely, so `binary` is the only value that ever arrives. */}
                 <dt>{request._mode === "binary" ? "Body (base64)" : "Body"}</dt>
                 <dd>
-                  <pre>{request.body ?? "(no body)"}</pre>
+                  <pre className="payload">{request.body ?? "(no body)"}</pre>
                 </dd>
               </div>
             </dl>
@@ -222,16 +278,32 @@ function Row({ request }: { request: RecordedRequest }): ReactNode {
  */
 function Diagnostics({ outcome }: { outcome: MatchOutcome | undefined }): ReactNode {
   const view = describeOutcome(outcome);
+  /*
+   * Four verdicts, three tones — and `none`/`unreadable` deliberately do NOT get the "unmatched"
+   * amber. Amber here would read as "nothing matched", which is a verdict; those two states are
+   * the *absence* of a verdict, and colouring them like one is exactly the laundering this panel
+   * exists to prevent.
+   */
+  const tone =
+    view.kind === "matched" ? "matched" : view.kind === "unmatched" ? "unmatched" : "no-verdict";
   return (
-    <section className="diagnostics" data-testid="request-diagnostics">
-      <h3>Match</h3>
+    <section className={`diag ${tone}`} data-testid="request-diagnostics">
+      <div className="dh">
+        <span aria-hidden="true">{DIAG_GLYPH[view.kind]}</span>
+        Match
+      </div>
       <Verdict view={view} />
-      {view.kind === "matched" || view.kind === "unmatched" ? (
-        <TriedList view={view} />
-      ) : null}
+      {view.kind === "matched" || view.kind === "unmatched" ? <TriedList view={view} /> : null}
     </section>
   );
 }
+
+const DIAG_GLYPH: Record<OutcomeView["kind"], string> = {
+  matched: "●",
+  unmatched: "▲",
+  none: "○",
+  unreadable: "○",
+};
 
 function Verdict({ view }: { view: OutcomeView }): ReactNode {
   switch (view.kind) {

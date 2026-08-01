@@ -8,7 +8,14 @@ import { useFleetView, useImposters, useLifecycleToggle } from "../app/queries.t
 import { useSession } from "../app/session.tsx";
 import { toHash } from "../app/routing.ts";
 import { ImposterField } from "../components/imposterFields.tsx";
-import { ErrorNote, Ident, Truncated, UNKNOWN, UnconfirmedNote } from "../components/primitives.tsx";
+import {
+  Card,
+  Empty,
+  ErrorNote,
+  Truncated,
+  UNKNOWN,
+  UnconfirmedNote,
+} from "../components/primitives.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
 
@@ -49,29 +56,36 @@ export function Imposters(): ReactNode {
       ) : null}
 
       {imposters.isSuccess && imposters.data.length > 0 ? (
-        <table className="dense">
-          <thead>
-            <tr>
-              {IMPOSTER_COLUMNS.map((column) => (
-                <th key={column.key} className={column.numeric ? "numeric" : undefined}>
-                  {column.label}
-                </th>
-              ))}
-              {mayToggle ? <th aria-label="Lifecycle" /> : null}
-            </tr>
-          </thead>
-          <tbody>
-            {imposters.data.map((imposter, index) => (
-              <Row
-                key={imposter.port ?? `unnamed-${index}`}
-                imposter={imposter}
-                mayToggle={mayToggle}
-                busy={toggle.isPending}
-                onToggle={(port, enable) => toggle.mutate({ port, enable })}
-              />
-            ))}
-          </tbody>
-        </table>
+        <Card
+          title={`${imposters.data.length} imposter${imposters.data.length === 1 ? "" : "s"}`}
+          bleed
+        >
+          <div className="scroll-x">
+            <table className="dense">
+              <thead>
+                <tr>
+                  {IMPOSTER_COLUMNS.map((column) => (
+                    <th key={column.key} className={column.numeric ? "numeric" : undefined}>
+                      {column.label}
+                    </th>
+                  ))}
+                  {mayToggle ? <th aria-label="Lifecycle" /> : null}
+                </tr>
+              </thead>
+              <tbody>
+                {imposters.data.map((imposter, index) => (
+                  <Row
+                    key={imposter.port ?? `unnamed-${index}`}
+                    imposter={imposter}
+                    mayToggle={mayToggle}
+                    busy={toggle.isPending}
+                    onToggle={(port, enable) => toggle.mutate({ port, enable })}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
       ) : null}
     </section>
   );
@@ -108,19 +122,28 @@ function EmptyState({
   reason: string | null;
 }): ReactNode {
   return (
-    <div className="empty" data-testid="imposters-empty">
-      <p>No imposters in this tenant, in this node&rsquo;s view.</p>
-      {uncertain ? (
-        <p className="warn-text">
-          This node cannot confirm the tenant is empty: {reason}. An imposter it has not applied
-          would not appear here.
-        </p>
-      ) : (
-        <p className="muted">
-          Create one with <Ident>POST /imposters</Ident>, or through the stub editor when it lands.
-        </p>
+    <Empty
+      testId="imposters-empty"
+      // The mark carries the distinction too: a settled empty reads as an empty set, an
+      // unconfirmed one as the warning glyph the rest of the console uses for degraded.
+      mark={uncertain ? "▲" : "○"}
+      title={
+        uncertain
+          ? "Cannot confirm this tenant is empty"
+          : "No imposters in this tenant, in this node’s view"
+      }
+      body={
+        uncertain ? (
+          <span className="warn-text">
+            {reason}. An imposter this node has not applied would not appear here.
+          </span>
+        ) : undefined
+      }
+    >
+      {uncertain ? null : (
+        <pre>POST /imposters</pre>
       )}
-    </div>
+    </Empty>
   );
 }
 
@@ -151,6 +174,7 @@ function Row({
               presentation — the admin front re-checks the same action on the call itself. */}
           {port === undefined ? null : (
             <button
+              className="btn sm"
               type="button"
               disabled={busy}
               onClick={() => onToggle(port, !imposter.enabled)}

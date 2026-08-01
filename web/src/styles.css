@@ -1,48 +1,101 @@
 /*
- * Build-time CSS only (RFC-006 §7). Runtime CSS-in-JS injects a <style> element, which the console's
- * CSP blocks via `default-src 'self'` with no `style-src` escape.
+ * The console's design system, ported from `docs/design/console/console-prototype.html`
+ * (RFC-006 scope A). The prototype's README calls its token block "a starting palette that has
+ * been contrast-validated, not a finished system" — this is that palette adopted as the system,
+ * because nothing else was ever specified and the screens had drifted onto an unrelated set of
+ * nine ad-hoc greys.
  *
- * System font stack rather than a webfont: `default-src 'self'` blocks a CDN font, and self-hosting
- * one is weight the console does not need.
+ * Build-time CSS only (RFC-006 §7). Runtime CSS-in-JS injects a <style> element, and while C5
+ * widened the policy to `style-src 'unsafe-inline'` for monaco's theme service, the shipped shell
+ * is still asserted style-free by `tests/console.rs` — so nothing here may lean on that allowance.
+ *
+ * System font stacks rather than a webfont: `default-src 'self'` blocks a CDN font and the binary
+ * ships air-gapped, so the console faces the same constraint the prototype did. Deliberately not
+ * Inter.
  *
  * Desktop only (RFC-006 §10). There is no mobile layout and none is planned — this is a fleet
  * operator's tool, and a narrow-window collapse would be a layout nobody uses pretending to be one
- * that is supported.
+ * that is supported. The one concession below is a rail that goes horizontal, so a narrow window
+ * is awkward rather than broken.
  */
+
+/* ── Tokens ─────────────────────────────────────────────────────────────────
+   Neutrals are biased cool blue-green toward the accent, not mid-grey.
+
+   Status colours are a RESERVED set, never reused as a chart series, and never
+   carry meaning alone: green↔red measures ΔE 5.8–7.2 apart under protanopia and
+   deuteranopia, a gap no hue choice closes inside a green/amber/red convention.
+   Glyph shape and the word carry the meaning; colour reinforces it. Every value
+   below clears 4.5:1 against its own surface in both themes — the first draft's
+   amber measured 2.24:1 on white, which is why light-mode amber is #8A5A00.
+
+   Light is the `:root` default and dark comes from the media query, which is the
+   way round the prototype has it. There is no `[data-theme]` override here: the
+   console ships no theme toggle, and a selector for a control that does not
+   exist is dead CSS that reads as a missing feature. */
 :root {
-  --bg: #0f1115;
-  --fg: #e6e8ee;
-  --muted: #9aa3b2;
-  --panel: #171a21;
-  --line: #262b35;
+  --ground: #f5f7fc;
+  --surface: #ffffff;
+  --surface-2: #edf1fa;
+  --surface-3: #dfe6f4;
+  --ink: #111a2e;
+  --ink-2: #414d69;
+  --ink-3: #5f6b87;
+  --line: #d6deee;
+  --line-2: #bcc7de;
+  --accent: #2f4cb0;
+  --accent-soft: #e7ecfb;
+  --good: #0b6b3a;
+  --good-soft: #e2f1e8;
+  --warn: #8a5a00;
+  --warn-soft: #f8eeda;
+  --crit: #b02418;
+  --crit-soft: #fae7e4;
+  --idle: #5f6b87;
+  --idle-soft: #eceff7;
+  --shadow:
+    0 1px 2px rgba(17, 26, 46, 0.07), 0 1px 1px rgba(17, 26, 46, 0.04);
 
   /*
-   * Status colours, contrast-validated rather than eyeballed: every one clears 4.5:1 against its
-   * own background. The first draft's amber measured 2.24:1 on white, which is why the light-mode
-   * value below is #8a5a00 rather than a brighter one.
-   *
-   * Colour is only ever the third encoding. Green↔red measures ΔE 5.8–7.2 apart under protanopia
-   * and deuteranopia — a gap no hue choice closes inside a green/amber/red convention — so the
-   * glyph shape and the word carry the meaning (see `Status` in components/primitives.tsx).
+   * Motion: the "subtle" tier only — 150–200ms, ease-out. An operator console watching a
+   * 12,000-row log has no motion budget beyond acknowledging a click.
    */
-  --ok: #35c26b;
-  --warn: #e0a021;
-  --bad: #ff6b6b;
-  --idle: #9aa3b2;
-  color-scheme: dark light;
+  --t-fast: 150ms;
+  --t-base: 200ms;
+  --ease: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+
+  --sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --mono:
+    ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  color-scheme: light dark;
 }
 
-@media (prefers-color-scheme: light) {
+@media (prefers-color-scheme: dark) {
   :root {
-    --bg: #ffffff;
-    --fg: #14181f;
-    --muted: #5b6470;
-    --panel: #f5f6f8;
-    --line: #dfe3e9;
-    --ok: #1a7f42;
-    --warn: #8a5a00;
-    --bad: #b32b2b;
-    --idle: #5b6470;
+    --ground: #0b1326;
+    --surface: #171f33;
+    --surface-2: #1e273d;
+    --surface-3: #273148;
+    --ink: #e6ecfa;
+    --ink-2: #a9b7d2;
+    --ink-3: #8394b3;
+    --line: #2a344c;
+    --line-2: #3a4664;
+    --accent: #adc6ff;
+    --accent-soft: #1b2743;
+    --good: #22c55e;
+    --good-soft: #102c1e;
+    --warn: #f0b849;
+    --warn-soft: #302512;
+    --crit: #ff8a7a;
+    --crit-soft: #35191a;
+    --idle: #8394b3;
+    --idle-soft: #1c2438;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
   }
 }
 
@@ -52,102 +105,44 @@
 
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  line-height: 1.5;
+  background: var(--ground);
+  color: var(--ink);
+  font: 400 14px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* Identifiers an operator pastes into curl: monospace, and tabular so columns of them line up. */
-.ident {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+code,
+.mono,
+.ident,
+.num {
+  font-family: var(--mono);
   font-variant-numeric: tabular-nums;
 }
 
-/* --- shell ------------------------------------------------------------- */
-
-.shell {
-  min-height: 100vh;
-}
-
-.topbar {
-  display: flex;
-  align-items: center;
-  gap: 1.5rem;
-  padding: 0.75rem 1.5rem;
-  border-bottom: 1px solid var(--line);
-  background: var(--panel);
-}
-
-.brand {
-  font-weight: 600;
-  letter-spacing: 0.04em;
-}
-
-.topbar .identity {
-  margin-left: auto;
-  color: var(--muted);
-  font-size: 0.875rem;
-}
-
-.tenant {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 0.875rem;
-  color: var(--muted);
-}
-
-.body {
-  display: grid;
-  grid-template-columns: 14rem minmax(0, 1fr);
-}
-
-nav {
-  border-right: 1px solid var(--line);
-  padding: 1rem 0;
-  min-height: calc(100vh - 3.25rem);
-}
-
-nav ul {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-nav li {
-  padding: 0.375rem 1.5rem;
-}
-
-nav a {
-  color: inherit;
-  text-decoration: none;
-}
-
-nav a[aria-current="page"] {
-  font-weight: 600;
-  text-decoration: underline;
+/* Section and field headings: the one place small-caps monospace is used as a label. */
+.eyebrow {
+  font: 600 10px/1 var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
 }
 
 /*
- * A screen RFC-006 §4 names but nothing has built yet. Greyed and non-interactive, with its issue
- * number as the one live link — a visible roadmap, not a 404 and not an omission.
- */
-nav li.planned {
-  color: var(--muted);
-  display: flex;
-  justify-content: space-between;
-  gap: 0.5rem;
-}
-
-nav li.planned a {
-  color: var(--muted);
-  font-size: 0.8125rem;
-  text-decoration: underline;
-}
-
-/*
- * Available to a screen reader, absent from the visual layout. The issue number reads as "#189" on
+ * Available to a screen reader, absent from the visual layout. An issue number reads as "#189" on
  * screen, where its position under a greyed label supplies the context; announced on its own it
  * would be a bare number, so the sentence is carried here instead.
  */
@@ -163,50 +158,342 @@ nav li.planned a {
   border: 0;
 }
 
-main {
-  padding: 1.5rem;
+/* ── App frame ─────────────────────────────────────────────────────────── */
+
+.app {
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.app-main {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
 }
 
-/* --- screens ----------------------------------------------------------- */
-
-.screen-head {
-  margin-bottom: 1.25rem;
+.rail {
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  padding: 18px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
 }
 
-h1 {
-  margin: 0 0 0.25rem;
-  font-size: 1.375rem;
+.brand {
+  padding: 0 18px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.brand b {
+  font: 700 16px/1 var(--sans);
+  letter-spacing: -0.01em;
+}
+
+.brand span {
+  font: 500 10px/1 var(--mono);
+  color: var(--ink-3);
+  letter-spacing: 0.06em;
+}
+
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.nav-group > .eyebrow {
+  padding: 0 18px 6px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 18px;
+  color: var(--ink-2);
+  text-decoration: none;
+  border-left: 2px solid transparent;
+  font-size: 13.5px;
+}
+
+.nav-item:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+.nav-item[aria-current="page"] {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/*
+ * A screen RFC-006 §4 names but nothing has built yet. Greyed and non-interactive, with its issue
+ * number as the one live link — a visible roadmap, not a 404 and not an omission.
+ */
+.nav-item.pending {
+  color: var(--ink-3);
+  cursor: default;
+}
+
+.nav-item.pending:hover {
+  background: none;
+  color: var(--ink-3);
+}
+
+.nav-item .issue {
+  margin-left: auto;
+  font: 500 10.5px/1 var(--mono);
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  padding: 2px 4px;
+  text-decoration: none;
+}
+
+.nav-item .issue:hover {
+  color: var(--ink);
+  border-color: var(--line-2);
+}
+
+.nav-item .glyph {
+  width: 14px;
+  text-align: center;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.nav-item[aria-current="page"] .glyph {
+  color: var(--accent);
+}
+
+/* ── Top bar ───────────────────────────────────────────────────────────── */
+
+.topbar {
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  padding: 11px 22px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 52px;
+}
+
+.tenant-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  padding: 5px 9px;
+  background: var(--surface);
+}
+
+.tenant-switch .eyebrow {
+  font-size: 9.5px;
+}
+
+.tenant-switch select {
+  font: 600 13px/1 var(--mono);
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  padding: 0;
+}
+
+.who {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: right;
+}
+
+.who .identity .id {
+  font: 600 12.5px/1.35 var(--sans);
+}
+
+.who .identity .role {
+  font: 500 10px/1 var(--mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+/* The open-admin-plane bypass is a fleet-wide fact, not an identity — it gets the warning tone. */
+.identity.unenforced {
+  font: 500 12px/1.35 var(--sans);
+  color: var(--warn);
+  max-width: 30ch;
+}
+
+.avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: grid;
+  place-items: center;
+  font: 700 11px/1 var(--mono);
+  border: 1px solid var(--accent);
+  flex: none;
+}
+
+.signout {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.signout-error {
+  font-size: 11.5px;
+  margin: 0;
+  max-width: 26ch;
+}
+
+main {
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+}
+
+/* ── Page heads ────────────────────────────────────────────────────────── */
+
+.screen-head,
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.screen-head h1,
+.page-head h1 {
+  margin: 0;
+  font: 600 21px/1.2 var(--sans);
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+
+.screen-head .spacer,
+.page-head .spacer {
+  margin-left: auto;
 }
 
 .scope-label,
 .muted {
-  color: var(--muted);
-  font-size: 0.875rem;
-  margin: 0.25rem 0;
+  color: var(--ink-2);
+  font-size: 13px;
+  margin: 0;
 }
 
 .error {
-  color: var(--bad);
+  color: var(--crit);
 }
 
 .warn-text {
   color: var(--warn);
 }
 
-.empty {
-  border: 1px dashed var(--line);
-  border-radius: 0.5rem;
-  padding: 1.5rem;
-  max-width: 44rem;
+/* ── Cards ─────────────────────────────────────────────────────────────── */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
 }
 
+.card-head {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.card-head h2 {
+  margin: 0;
+  font: 600 14px/1.3 var(--sans);
+}
+
+.card-head .spacer {
+  margin-left: auto;
+}
+
+.card-body {
+  padding: 14px;
+}
+
+.scroll-x {
+  overflow-x: auto;
+}
+
+/* ── Banners ───────────────────────────────────────────────────────────── */
+
+.banner,
 .degraded {
-  border-left: 3px solid var(--warn);
-  background: var(--panel);
-  padding: 0.75rem 1rem;
-  margin-bottom: 1.25rem;
-  max-width: 44rem;
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+  padding: 11px 13px;
+  border-radius: 4px;
+  border: 1px solid;
+  font-size: 13px;
+}
+
+.banner .b-glyph {
+  font: 700 12px/1.35 var(--mono);
+  flex: none;
+}
+
+.banner p,
+.degraded p {
+  margin: 3px 0 0;
+  color: var(--ink-2);
+}
+
+.banner.warn,
+.degraded {
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
+.banner.warn .b-glyph,
+.banner.warn strong,
+.degraded strong {
+  color: var(--warn);
+}
+
+.banner.crit {
+  background: var(--crit-soft);
+  border-color: var(--crit);
+}
+
+.banner.crit .b-glyph,
+.banner.crit strong {
+  color: var(--crit);
+}
+
+.banner.info {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.banner.info .b-glyph,
+.banner.info strong {
+  color: var(--accent);
 }
 
 .degraded ul {
@@ -214,45 +501,218 @@ h1 {
   padding-left: 1.25rem;
 }
 
-/* --- dense tables ------------------------------------------------------ */
+/* ── Stat tiles ────────────────────────────────────────────────────────────
+   No sparklines, on purpose: /_fleet/health and /_fleet/members are
+   point-in-time reads. A trend line would imply history the API does not have,
+   which is RFC-006 §3 rule 2 ("nothing UI-only") applied to charts. */
 
-/*
- * Sized for the real case: 200 imposters, 40-character names, a narrow window. `table-layout: fixed`
- * plus the truncation below is what stops one long name from setting the column width for the other
- * 199 rows.
- */
-table.dense {
+.tiles,
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(178px, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.tile,
+.fact {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 13px 14px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Severity stripe: state encoded in form, not only colour. */
+.tile.is-good::before,
+.tile.is-warn::before,
+.tile.is-crit::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+}
+
+.tile.is-good::before {
+  background: var(--good);
+}
+
+.tile.is-warn::before {
+  background: var(--warn);
+}
+
+.tile.is-crit::before {
+  background: var(--crit);
+}
+
+.tile .v {
+  font: 600 25px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.tile .v small {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink-3);
+  letter-spacing: 0;
+}
+
+/* A tile whose value is a pill or a list rather than one figure. */
+.tile .v-plain {
+  font: 500 13px/1.4 var(--mono);
+  word-break: break-word;
+}
+
+.tile .note,
+.fact dd .note {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.fact dt,
+.kv dt {
+  font: 600 10px/1 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.fact dd,
+.kv dd {
+  margin: 0;
+  font: 500 13px/1.4 var(--mono);
+  word-break: break-all;
+}
+
+.detail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+}
+
+.kv {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+/* ── Status: glyph SHAPE + colour + word (triple-encoded) ──────────────── */
+
+.status,
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: 600 11.5px/1 var(--sans);
+  padding: 4px 8px 4px 6px;
+  border-radius: 3px;
+  border: 1px solid;
+  white-space: nowrap;
+}
+
+.status .g,
+.pill .g {
+  font: 700 10px/1 var(--mono);
+}
+
+.status-ok,
+.pill.good {
+  color: var(--good);
+  background: var(--good-soft);
+  border-color: var(--good);
+}
+
+.status-warn,
+.pill.warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
+.status-bad,
+.pill.crit {
+  color: var(--crit);
+  background: var(--crit-soft);
+  border-color: var(--crit);
+}
+
+.status-idle,
+.pill.idle {
+  color: var(--ink-2);
+  background: var(--idle-soft);
+  border-color: var(--line-2);
+}
+
+.pill.accent {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+/* ── Tables ────────────────────────────────────────────────────────────────
+   Sized for the real case: 200 imposters, 40-character names, a narrow window.
+   `table-layout: fixed` plus the truncation below is what stops one long name
+   from setting the column width for the other 199 rows. */
+
+table.dense,
+.card table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.875rem;
+  font-size: 13px;
   table-layout: fixed;
 }
 
 table.dense th,
-table.dense td {
+.card table th {
   text-align: left;
-  padding: 0.375rem 0.75rem;
+  font: 600 10px/1 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 9px 14px;
   border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+
+table.dense td,
+.card table td {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
   overflow: hidden;
 }
 
-table.dense th {
-  color: var(--muted);
-  font-weight: 500;
-  font-size: 0.8125rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  position: sticky;
-  top: 0;
-  background: var(--bg);
+table.dense tbody tr:last-child td,
+.card table tbody tr:last-child td {
+  border-bottom: 0;
 }
 
-table.dense .numeric {
+table.dense tbody tr:hover,
+.card table tbody tr:hover {
+  background: var(--surface-2);
+}
+
+table.dense .numeric,
+td.r,
+th.r {
   text-align: right;
 }
 
-table.dense tr:hover td {
-  background: var(--panel);
+tbody tr[aria-selected="true"] {
+  background: var(--accent-soft);
+}
+
+tbody tr.clickable {
+  cursor: pointer;
 }
 
 .truncated {
@@ -264,73 +724,74 @@ table.dense tr:hover td {
   vertical-align: bottom;
 }
 
-/* --- facts ------------------------------------------------------------- */
-
-.facts {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
-  gap: 1rem;
-  margin: 0 0 1.5rem;
-  max-width: 60rem;
+.id-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
 
-.fact dt {
-  color: var(--muted);
-  font-size: 0.8125rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.fact dd {
-  margin: 0.25rem 0 0;
-}
-
-/* --- status ------------------------------------------------------------ */
-
-.status {
+.id-cell .name {
+  font: 500 13px/1.35 var(--sans);
+  max-width: 34ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.status-ok {
-  color: var(--ok);
-}
-.status-warn {
-  color: var(--warn);
-}
-.status-bad {
-  color: var(--bad);
-}
-.status-idle {
-  color: var(--idle);
+.id-cell .meta {
+  font: 500 11px/1 var(--mono);
+  color: var(--ink-3);
 }
 
-/* --- login ------------------------------------------------------------- */
+/* ── Controls ──────────────────────────────────────────────────────────── */
 
-.login {
-  max-width: 22rem;
-  margin: 12vh auto;
-  padding: 0 1.5rem;
-}
-
-.login form {
-  display: grid;
-  gap: 0.5rem;
-  margin: 1.5rem 0 1rem;
-}
-
+.btn,
+button.plain,
 input,
 select,
-button {
-  font: inherit;
-  color: inherit;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 0.25rem;
-  padding: 0.375rem 0.5rem;
+textarea {
+  font: 500 12.5px/1 var(--sans);
+  padding: 6px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: var(--surface);
+  color: var(--ink);
 }
 
-button {
+.btn,
+button.plain {
   cursor: pointer;
+}
+
+.btn:hover:not([disabled]),
+button.plain:hover:not([disabled]) {
+  background: var(--surface-2);
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.btn.primary:hover:not([disabled]) {
+  filter: brightness(1.08);
+}
+
+.btn.danger {
+  background: var(--crit);
+  border-color: var(--crit);
+  color: #fff;
+}
+
+.btn.danger:hover:not([disabled]) {
+  filter: brightness(1.08);
+}
+
+.btn.sm {
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 button[disabled] {
@@ -338,18 +799,370 @@ button[disabled] {
   opacity: 0.6;
 }
 
-:focus-visible {
-  outline: 2px solid var(--fg);
-  outline-offset: 1px;
+/* A control that reads as a link but is a button, so it keeps button semantics for the keyboard. */
+.linklike {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
 }
 
-/* --- stub editor (RFC-006 C5, #188) ------------------------------------ */
+.btn,
+.nav-item,
+.tabs button {
+  transition:
+    background var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease);
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.field label {
+  font: 600 10px/1 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.field input,
+.field select,
+.field textarea {
+  font: 500 13px/1.4 var(--mono);
+  padding: 7px 9px;
+  width: 100%;
+}
+
+.field textarea {
+  resize: vertical;
+  min-height: 72px;
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+/* ── Empty states ──────────────────────────────────────────────────────── */
+
+.empty {
+  padding: 40px 22px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.empty .mark {
+  font: 400 24px/1 var(--mono);
+  color: var(--line-2);
+}
+
+.empty h3 {
+  margin: 0;
+  font: 600 15px/1.3 var(--sans);
+}
+
+.empty p {
+  margin: 0;
+  max-width: 52ch;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+
+.empty pre {
+  margin: 6px 0 0;
+  padding: 9px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font: 500 12px/1.5 var(--mono);
+  color: var(--ink-2);
+  text-align: left;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.hint {
+  font-size: 12.5px;
+  color: var(--ink-3);
+  border-left: 2px solid var(--line-2);
+  padding-left: 10px;
+}
+
+/* ── Toolbar and pager ─────────────────────────────────────────────────── */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.toolbar .right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.pager .count {
+  font: 500 12px/1 var(--mono);
+  color: var(--ink-3);
+  margin-left: auto;
+}
+
+/* ── Request log (C6) ──────────────────────────────────────────────────────
+   The scope selector is deliberately prominent and permanently visible: this
+   data is per-node, and a console that lets you forget that is the failure mode
+   #189 exists to prevent. */
+
+.scope {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 11px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.scope .coverage {
+  margin-left: auto;
+  font: 500 12px/1.4 var(--sans);
+  color: var(--ink-2);
+}
+
+.scope .coverage b {
+  font-family: var(--mono);
+  font-weight: 650;
+  color: var(--ink);
+}
+
+.method {
+  font: 650 10.5px/1 var(--mono);
+  letter-spacing: 0.05em;
+  padding: 3px 5px;
+  border-radius: 2px;
+  border: 1px solid var(--line-2);
+  color: var(--ink-2);
+  background: var(--surface-2);
+}
+
+.method.post,
+.method.put,
+.method.patch {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.method.delete {
+  color: var(--crit);
+  border-color: var(--crit);
+  background: var(--crit-soft);
+}
+
+.path {
+  font: 500 12.5px/1 var(--mono);
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.status-code {
+  font: 650 12.5px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-code.s2 {
+  color: var(--good);
+}
+
+.status-code.s4 {
+  color: var(--warn);
+}
+
+.status-code.s5 {
+  color: var(--crit);
+}
+
+/*
+ * Recorded payloads are the most attacker-influenced surface in the console — whatever called the
+ * mock chose the path, headers and body. Always text in a <pre>, never interpreted as markup, and
+ * scrolling inside its own box so a minified payload cannot stretch the page.
+ */
+.payload,
+.stub-diff pre,
+.stub-body pre {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font: 500 12px/1.55 var(--mono);
+  color: var(--ink-2);
+  overflow-x: auto;
+  white-space: pre;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+/* ── Match diagnostics (#208) ──────────────────────────────────────────────
+   The panel the request log exists for: why this request was served by the stub
+   it was, or by nothing. */
+
+.diagnostics,
+.diag {
+  border: 1px solid;
+  border-radius: 3px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  max-width: 60rem;
+}
+
+.diagnostics,
+.diag.matched {
+  background: var(--good-soft);
+  border-color: var(--good);
+}
+
+.diag.unmatched {
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
+/*
+ * "No outcome recorded" and "outcome unreadable" are the *absence* of a verdict, not a verdict of
+ * no-match. Neutral on purpose: amber here would read as "nothing matched", which is the laundering
+ * of a gap into a finding that #208's panel exists to prevent.
+ */
+.diag.no-verdict {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+
+.diag.no-verdict .dh {
+  color: var(--ink-3);
+}
+
+.diagnostics h3,
+.diag .dh {
+  font: 650 11px/1 var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 0.5rem;
+  color: var(--good);
+}
+
+.diag.unmatched .dh {
+  color: var(--warn);
+}
+
+.diagnostics p {
+  margin: 0 0 0.5rem;
+}
+
+/* One visited candidate per line, at the density the rest of an expanded row uses. */
+.diagnostics ul,
+.diag ul {
+  margin: 8px 0 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--ink-2);
+}
+
+/* ── Front-door routes (C6) ────────────────────────────────────────────────
+   The list is ordered by RouteTable::effective_order — priority, then host rank,
+   then prefix length, then header count, then id — NOT by authoring order.
+   Showing authoring order would be showing something that decides nothing. */
+
+.order-rank {
+  font: 650 11px/1 var(--mono);
+  color: var(--ink-3);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  padding: 3px 5px;
+  min-width: 2.4ch;
+  display: inline-block;
+  text-align: center;
+}
+
+.order-rank.off {
+  opacity: 0.55;
+}
+
+.match-clauses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.clause {
+  font: 500 11px/1 var(--mono);
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  padding: 3px 5px;
+  color: var(--ink-2);
+  background: var(--surface);
+  white-space: nowrap;
+}
+
+.clause.any {
+  border-style: dashed;
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+/* ── Editors (C5) ──────────────────────────────────────────────────────── */
 
 .stub-editor {
+  background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 0.5rem;
-  padding: 1rem;
-  margin-bottom: 1.25rem;
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  padding: 14px;
 }
 
 /*
@@ -360,7 +1173,7 @@ button[disabled] {
 .stub-panes {
   display: grid;
   grid-template-columns: minmax(0, 20rem) minmax(0, 1fr);
-  gap: 1rem;
+  gap: 14px;
   align-items: start;
 }
 
@@ -370,114 +1183,285 @@ button[disabled] {
 
 .stub-form {
   display: grid;
-  gap: 0.5rem;
+  gap: 10px;
 }
 
 .stub-form label {
   display: grid;
-  gap: 0.25rem;
-  font-size: 0.875rem;
+  gap: 5px;
+  font: 600 10px/1 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
 }
 
 .stub-form input {
-  font: inherit;
-  padding: 0.35rem 0.5rem;
-  border: 1px solid var(--line);
-  border-radius: 0.25rem;
-  background: var(--panel);
-  color: inherit;
+  font: 500 13px/1.4 var(--mono);
+  padding: 7px 9px;
 }
 
 .code-editor {
   min-height: 20rem;
   border: 1px solid var(--line);
-  border-radius: 0.25rem;
+  border-radius: 3px;
 }
 
 /*
  * The fallback is a real editor, not a placeholder: it is what an operator gets on a browser monaco
- * will not run in, and it is the surface every test drives. It gets the same monospace treatment.
+ * will not run in, and it is the surface every test drives. Same monospace treatment.
  */
 .code-editor-fallback {
   width: 100%;
   min-height: 20rem;
-  font-family: var(--mono, ui-monospace, monospace);
-  font-size: 0.8125rem;
-  padding: 0.5rem;
+  font: 500 12px/1.6 var(--mono);
+  padding: 10px 12px;
   border: 1px solid var(--line);
-  border-radius: 0.25rem;
-  background: var(--panel);
-  color: inherit;
+  border-radius: 3px;
+  background: var(--surface-2);
+  color: var(--ink);
   resize: vertical;
 }
 
-.stub-lint {
-  margin-top: 0.75rem;
+.stub-lint,
+.lint {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  font-size: 12.5px;
+  padding: 8px 10px;
+  border-radius: 3px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  margin-top: 12px;
 }
 
-.stub-lint ul {
+.lint.warn {
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
+.stub-lint ul,
+.lint ul {
   margin: 0.5rem 0 0;
   padding-left: 1.25rem;
-  font-size: 0.875rem;
+  font-size: 12.5px;
 }
 
 /* Both sides of a conflict at once. Neither is authoritative — that is the operator's call. */
 .stub-diff {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
-  gap: 1rem;
-  margin: 0.75rem 0;
+  gap: 14px;
+  margin: 12px 0;
 }
 
 .stub-diff h3 {
-  font-size: 0.8125rem;
-  margin: 0 0 0.25rem;
-}
-
-/*
- * `pre` and nothing else, for RFC-006 §9.1: a stub body is attacker-influenced text. It scrolls
- * inside its own box rather than wrapping, so a minified payload cannot stretch the page.
- */
-.stub-diff pre,
-.stub-body pre {
-  margin: 0;
-  padding: 0.5rem;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 0.25rem;
-  font-size: 0.8125rem;
-  max-height: 16rem;
-  overflow: auto;
-}
-
-/* --- match diagnostics (#208) ------------------------------------------ */
-
-/*
- * The panel the request log exists for: why this request was served by the stub it was, or by
- * nothing. It sits inside an expanded row, so it is separated by a rule rather than by a card —
- * a boxed panel inside a table row reads as a second table.
- */
-.diagnostics {
-  border-top: 1px solid var(--line);
-  padding-top: 0.75rem;
-  max-width: 60rem;
-}
-
-.diagnostics h3 {
-  font-size: 0.8125rem;
+  font: 600 10px/1 var(--mono);
+  letter-spacing: 0.09em;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--muted);
-  margin: 0 0 0.5rem;
+  color: var(--ink-3);
+  margin: 0 0 6px;
 }
 
-.diagnostics p {
-  margin: 0 0 0.5rem;
+/* ── Administration (C7) ───────────────────────────────────────────────── */
+
+.tabs,
+.admin-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--line);
 }
 
-/* One visited candidate per line, at the density the rest of an expanded row uses. */
-.diagnostics ul {
-  margin: 0 0 0.5rem;
-  padding-left: 1.25rem;
-  font-size: 0.875rem;
+.tabs button,
+.admin-tabs button,
+.admin-tabs a {
+  font: 500 13px/1 var(--sans);
+  padding: 9px 13px;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.tabs button[aria-selected="true"],
+.admin-tabs [aria-selected="true"],
+.admin-tabs [aria-current="page"] {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tabs button:hover,
+.admin-tabs button:hover,
+.admin-tabs a:hover {
+  color: var(--ink);
+}
+
+/*
+ * A key is shown once. The fleet stores an argon2id hash, so there is nothing to reveal later and
+ * no reveal action is offered — one would teach operators to expect a feature that cannot exist.
+ */
+.minted-key,
+.key-once {
+  border: 1px solid var(--warn);
+  background: var(--warn-soft);
+  border-radius: 4px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.minted-key .kh,
+.key-once .kh {
+  font: 650 11px/1 var(--mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--warn);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.minted-key code,
+.key-once .kval {
+  font: 600 13px/1.5 var(--mono);
+  word-break: break-all;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 9px 11px;
+  display: block;
+}
+
+.role-matrix td:first-child {
+  font: 500 12.5px/1 var(--mono);
+}
+
+.role-matrix .yes {
+  color: var(--good);
+  font: 700 12px/1 var(--mono);
+}
+
+.role-matrix .no {
+  color: var(--ink-3);
+  font: 400 12px/1 var(--mono);
+}
+
+.role-matrix th:not(:first-child),
+.role-matrix td:not(:first-child) {
+  text-align: center;
+}
+
+/* ── Sign in (C2) ──────────────────────────────────────────────────────── */
+
+.login {
+  display: grid;
+  place-items: center;
+  padding: 12vh 22px;
+}
+
+.login form,
+.signin {
+  width: min(430px, 100%);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  box-shadow: var(--shadow);
+  padding: 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin: 0;
+}
+
+.login .mark {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.login .mark b {
+  font: 700 19px/1 var(--sans);
+}
+
+.login .mark span {
+  font: 500 10px/1 var(--mono);
+  color: var(--ink-3);
+  letter-spacing: 0.08em;
+}
+
+.login h1 {
+  margin: 0;
+  font: 600 16px/1.3 var(--sans);
+}
+
+.login .field {
+  gap: 5px;
+}
+
+.login label {
+  font: 600 10px/1 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  display: block;
+  margin-bottom: 5px;
+}
+
+.login input {
+  font: 500 13px/1.4 var(--mono);
+  padding: 8px 10px;
+  width: 100%;
+}
+
+.login p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+/* ── Rows and screens ──────────────────────────────────────────────────── */
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+}
+
+.rows,
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/*
+ * One concession to a narrow window, and it is not a mobile layout: the rail goes horizontal so a
+ * half-width window is awkward rather than unusable. RFC-006 §10 still stands — nothing below is
+ * designed for a phone.
+ */
+@media (max-width: 900px) {
+  .app {
+    grid-template-columns: 1fr;
+  }
+
+  .rail {
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    gap: 12px;
+    align-items: center;
+  }
 }

@@ -42,8 +42,119 @@ const GLYPH: Record<Tone, string> = { ok: "●", warn: "▲", bad: "■", idle: 
 export function Status({ tone, label }: { tone: Tone; label: string }): ReactNode {
   return (
     <span className={`status status-${tone}`}>
-      <span aria-hidden="true">{GLYPH[tone]}</span> {label}
+      <span className="g" aria-hidden="true">
+        {GLYPH[tone]}
+      </span>
+      {label}
     </span>
+  );
+}
+
+/**
+ * A titled panel. Every table and every grouped read on a screen sits in one, which is what makes
+ * the page read as sections rather than as one long scroll of rules.
+ *
+ * `bleed` drops the body padding for the case the design intends: a table meets the card edge, so
+ * its own cell padding is the only inset and the header row's background reaches the border.
+ */
+export function Card({
+  title,
+  actions,
+  bleed = false,
+  testId,
+  children,
+}: {
+  title?: ReactNode;
+  actions?: ReactNode;
+  bleed?: boolean;
+  testId?: string;
+  children: ReactNode;
+}): ReactNode {
+  return (
+    <section className="card" data-testid={testId}>
+      {title === undefined && actions === undefined ? null : (
+        <div className="card-head">
+          {typeof title === "string" ? <h2>{title}</h2> : title}
+          {actions === undefined ? null : <div className="spacer" />}
+          {actions}
+        </div>
+      )}
+      {bleed ? children : <div className="card-body">{children}</div>}
+    </section>
+  );
+}
+
+/**
+ * One measured value.
+ *
+ * `tone` draws the severity stripe down the left edge — state encoded in form, so the tile does not
+ * rely on its number's colour alone. `note` is where the caveat goes, and several of these screens
+ * have one that matters more than the number does.
+ */
+export function Tile({
+  label,
+  value,
+  unit,
+  note,
+  tone,
+  plain = false,
+  testId,
+}: {
+  label: string;
+  value: ReactNode;
+  unit?: string;
+  note?: ReactNode;
+  tone?: "good" | "warn" | "crit";
+  /**
+   * Render the value at body size rather than as a 25px figure.
+   *
+   * For a tile whose value is a status pill or a list of node ids rather than one number — a pill
+   * set in a 25px line looks like a rendering fault, and a comma-separated voter list at that size
+   * simply overflows.
+   */
+  plain?: boolean;
+  testId?: string;
+}): ReactNode {
+  return (
+    <div className={tone === undefined ? "tile" : `tile is-${tone}`} data-testid={testId}>
+      <div className="eyebrow">{label}</div>
+      <div className={plain ? "v-plain" : "v"}>
+        {value}
+        {unit === undefined ? null : <small> {unit}</small>}
+      </div>
+      {note === undefined ? null : <div className="note">{note}</div>}
+    </div>
+  );
+}
+
+/**
+ * Nothing to show — and *why* there is nothing, which is the half that matters.
+ *
+ * "No imposters" and "cannot confirm this tenant is empty" are different facts, and the screens
+ * that can tell them apart pass different `body` text here rather than sharing one message.
+ */
+export function Empty({
+  mark = "○",
+  title,
+  body,
+  children,
+  testId,
+}: {
+  mark?: string;
+  title: string;
+  body?: ReactNode;
+  children?: ReactNode;
+  testId?: string;
+}): ReactNode {
+  return (
+    <div className="empty" data-testid={testId}>
+      <div className="mark" aria-hidden="true">
+        {mark}
+      </div>
+      <h3>{title}</h3>
+      {body === undefined ? null : <p>{body}</p>}
+      {children}
+    </div>
   );
 }
 

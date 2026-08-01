@@ -280,7 +280,7 @@ GET/PUT/DELETE   /admin/tenants/:id                  FleetAdmin  (DELETE = tombs
 POST/GET         /admin/tenants/:id/principals       TenantAdmin
 PUT/DELETE       /admin/tenants/:id/principals/:pid  TenantAdmin
 PUT/DELETE       /admin/tenants/:id/bindings/:pid    TenantAdmin  body: {role}
-GET              /admin/whoami                       any authenticated principal → {principal, bindings}
+GET              /admin/whoami                       any authenticated principal → {principal, displayName, bindings}
 ```
 
 **API keys are shown once.** `POST .../principals` with `auth: {type: "apiKey"}`
@@ -298,6 +298,16 @@ reserved for "you are bound to this tenant but your role is insufficient". See
 `GET /admin/whoami` exists so a principal can discover its own scope without
 guessing. It is also the cheapest possible smoke test that authorization is wired
 at all.
+
+It carries the principal's `displayName` alongside its id, which is a presentation
+concern the API has to serve because nothing else can: for a minted key the id is
+`key:<sha256-hex>`, and a console with only that to render puts a key-shaped string
+in front of an operator on every screen. The fingerprint is not a credential — the
+raw key is unrecoverable from it and argon2id is the boundary (§8.2) — but it is
+indistinguishable from one on sight, and a UI that displays those teaches the wrong
+instinct about what is safe to paste into a ticket. `displayName` is `null` for the
+two identities with no stored row: the open-admin-plane bypass, and the legacy
+`--api-key`'s synthetic principal, whose id is the already-readable `legacy:api-key`.
 
 ## 6. Upstream seams
 

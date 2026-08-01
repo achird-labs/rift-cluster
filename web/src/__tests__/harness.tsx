@@ -38,7 +38,10 @@ export function stubFetch(routes: Record<string, Reply>): { calls: string[] } {
         return Promise.reject(new Error(`test stub has no reply for ${path}`));
       }
       const status = reply.status ?? 200;
-      const body = reply.json === undefined ? "" : JSON.stringify(reply.json);
+      // `null`, not `""`, for a bodyless reply: the Fetch spec forbids a body on 204/205/304, so
+      // `new Response("", { status: 204 })` throws a TypeError and the stub fails in a way that
+      // looks like the code under test rejecting. `response.text()` reads "" from either.
+      const body = reply.json === undefined ? null : JSON.stringify(reply.json);
       return Promise.resolve(new Response(body, { status }));
     }),
   );

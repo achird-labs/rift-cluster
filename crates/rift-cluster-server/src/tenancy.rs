@@ -510,6 +510,19 @@ struct Whoami {
     /// omitted, so an operator can tell "nobody is authenticated" from "the
     /// fleet is not enforcing anything at all".
     principal_id: Option<String>,
+    /// The principal's own `displayName`, when it has a stored record to carry one.
+    ///
+    /// `null` for the two identities that have no row to read it from: the open-admin-plane
+    /// bypass (no principal at all) and the legacy `--api-key`'s synthetic principal, which is
+    /// minted in code rather than committed. A client renders [`Self::principal_id`] in that
+    /// case — which for the legacy identity is already the readable `legacy:api-key`.
+    ///
+    /// This exists so a console can put a *name* in front of an operator. The alternative it
+    /// replaces was rendering `principal_id`, which for a minted key is `key:<sha256-hex>` —
+    /// not a credential (the raw key is unrecoverable from it, and argon2id is the actual
+    /// boundary), but indistinguishable from one on screen, which teaches the wrong instinct
+    /// about what is safe to share.
+    display_name: Option<String>,
     bindings: Vec<WhoamiBinding>,
     authorization_disabled: bool,
 }
@@ -875,10 +888,14 @@ pub(crate) enum TenancyError {
 /// honestly is the point — this route is also the cheapest possible check that
 /// authorization is wired at all, and a fleet enforcing nothing must not look
 /// the same as one enforcing something.
-pub(crate) fn whoami_body(resolved: Option<&Resolved>) -> Result<Vec<u8>, String> {
+pub(crate) fn whoami_body(
+    resolved: Option<&Resolved>,
+    display_name: Option<String>,
+) -> Result<Vec<u8>, String> {
     let view = match resolved {
         Some(resolved) => Whoami {
             principal_id: Some(resolved.principal_id.clone()),
+            display_name,
             bindings: resolved
                 .bindings
                 .iter()
@@ -891,6 +908,7 @@ pub(crate) fn whoami_body(resolved: Option<&Resolved>) -> Result<Vec<u8>, String
         },
         None => Whoami {
             principal_id: None,
+            display_name: None,
             bindings: Vec::new(),
             authorization_disabled: true,
         },
@@ -1153,7 +1171,7 @@ mod tests {
 
     #[test]
     fn whoami_distinguishes_an_unenforced_fleet_from_an_unbound_principal() {
-        let bypass = String::from_utf8(whoami_body(None).expect("serializes")).expect("utf8");
+        let bypass = String::from_utf8(whoami_body(None, None).expect("serializes")).expect("utf8");
         assert!(
             bypass.contains("\"authorizationDisabled\":true"),
             "{bypass}"
@@ -1164,10 +1182,30 @@ mod tests {
             principal_id: "key:abc".to_owned(),
             bindings: vec![(tenant("acme"), Role::Editor)],
         };
-        let bound =
-            String::from_utf8(whoami_body(Some(&resolved)).expect("serializes")).expect("utf8");
+        let bound = String::from_utf8(
+            whoami_body(Some(&resolved), Some("Demo Editor".to_owned())).expect("serializes"),
+        )
+        .expect("utf8");
         assert!(bound.contains("\"authorizationDisabled\":false"), "{bound}");
         assert!(bound.contains("\"role\":\"editor\""), "{bound}");
+        assert!(bound.contains("\"displayName\":\"Demo Editor\""), "{bound}");
+    }
+
+    /// The two identities with no stored row report `displayName: null` rather than inventing
+    /// one — and a client tells them apart by `authorizationDisabled`, not by the missing name.
+    #[test]
+    fn an_identity_with_no_stored_row_reports_a_null_display_name() {
+        let legacy = Resolved {
+            principal_id: "legacy:api-key".to_owned(),
+            bindings: vec![(tenant("default"), Role::TenantAdmin)],
+        };
+        let rendered =
+            String::from_utf8(whoami_body(Some(&legacy), None).expect("serializes")).expect("utf8");
+        assert!(rendered.contains("\"displayName\":null"), "{rendered}");
+        assert!(
+            rendered.contains("\"principalId\":\"legacy:api-key\""),
+            "the id stays readable, so a client has something to fall back to: {rendered}"
+        );
     }
 
     #[test]

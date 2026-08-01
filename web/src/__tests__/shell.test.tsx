@@ -46,7 +46,7 @@ describe("nav — a visible roadmap, not a 404", () => {
     stubFetch(QUIET);
     renderInApp(<Shell />, { whoami: whoamiWith("fleet-admin") });
 
-    await userEvent.setup().click(await screen.findByRole("link", { name: /^cluster$/i }));
+    await userEvent.setup().click(await screen.findByRole("link", { name: /cluster & fleet/i }));
     await waitFor(() => expect(window.location.hash).toBe("#/cluster"));
   });
 
