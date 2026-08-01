@@ -417,13 +417,28 @@ function NewImposter({
           </div>
         ) : null}
 
-        <label className="row">
+        {/*
+          Checked by default, which **diverges from the API**: the contract's `recordRequests`
+          defaults to `false`, so `POST /imposters` with the field omitted records nothing.
+          Console-created imposters are almost always created in order to be watched, and "why is
+          my request log empty" is the confusion that costs a debugging cycle — so the console
+          opts in and says so at the control rather than silently inheriting a default that makes
+          its own request log useless. The cost is stated because it is unbounded until retention
+          trims it.
+        */}
+        <label className="check">
           <input
             type="checkbox"
             checked={recordRequests}
             onChange={(event) => setRecordRequests(event.target.checked)}
           />
-          Record requests — needed for the request log to show anything
+          <span>
+            Record requests
+            <span className="note">
+              The request log shows nothing without this. Every request is held in memory until
+              retention trims it — turn it off for an imposter under load.
+            </span>
+          </span>
         </label>
 
         {invalid === null ? null : (

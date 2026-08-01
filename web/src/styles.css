@@ -746,9 +746,16 @@ tbody tr.clickable {
 
 /* ── Controls ──────────────────────────────────────────────────────────── */
 
+/*
+ * Text-entry controls only. Checkboxes and radios are excluded deliberately, and it is not a
+ * cosmetic exclusion: setting `background-color` on a checkbox suppresses the native checked
+ * indicator in WebKit and Blink and makes `accent-color` a no-op, so the control renders as an
+ * empty square that never visibly ticks. It looks like a missing feature rather than a broken
+ * style — which is exactly how it was reported.
+ */
 .btn,
 button.plain,
-input,
+input:not([type="checkbox"]):not([type="radio"]),
 select,
 textarea {
   font: 500 12.5px/1 var(--sans);
@@ -847,12 +854,31 @@ ul.plain,
     border-color var(--t-fast) var(--ease);
 }
 
-input[type="checkbox"] {
+/* Native appearance kept, tinted. No background or border here — see the rule above. */
+input[type="checkbox"],
+input[type="radio"] {
   accent-color: var(--accent);
   width: 15px;
   height: 15px;
   cursor: pointer;
-  padding: 0;
+  margin: 0;
+  flex: none;
+}
+
+/* A checkbox and its sentence, aligned on the first line rather than centred on a wrapped block. */
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.check .note {
+  display: block;
+  color: var(--ink-3);
+  font-size: 12px;
+  margin-top: 2px;
 }
 
 .field {
@@ -1212,6 +1238,26 @@ input[type="checkbox"] {
 .stub-form {
   display: grid;
   gap: 10px;
+}
+
+.presets {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* One line under an input, explaining a field whose label cannot carry the whole meaning. */
+.field-hint {
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--ink-3);
+}
+
+.stub-form textarea {
+  font: 500 12px/1.6 var(--mono);
+  resize: vertical;
+  min-height: 9rem;
 }
 
 .stub-form label {

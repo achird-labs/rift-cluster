@@ -413,9 +413,15 @@ function NewRoute({
             <input id="route-method" value={method} onChange={(e) => setMethod(e.target.value)} placeholder="GET" />
           </div>
         </div>
-        <label className="row">
+        <label className="check">
           <input type="checkbox" checked={stripPrefix} onChange={(e) => setStripPrefix(e.target.checked)} />
-          Strip the path prefix before forwarding — needs a path prefix above
+          <span>
+            Strip the path prefix before forwarding
+            <span className="note">
+              Needs a path prefix above — the fleet refuses the whole table otherwise
+              (<code>StripWithoutPrefix</code>).
+            </span>
+          </span>
         </label>
         {invalid === null ? null : (
           <p className="error" data-testid="new-route-invalid" role="alert">
