@@ -799,6 +799,34 @@ button[disabled] {
   opacity: 0.6;
 }
 
+/*
+ * Inline links inside a screen — a back-link, a table cell that navigates.
+ *
+ * Scoped to `main` and excluding the anchors that are already components (`.btn`, `.nav-item`, the
+ * tab bar, the issue chips): those carry their own treatment, and a blanket `a { }` would repaint
+ * the rail and every button-shaped link with link colour.
+ */
+main a:not(.btn):not(.nav-item):not(.issue),
+.admin-tabs a.plain-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+main a:not(.btn):not(.nav-item):not(.issue):hover {
+  text-decoration: underline;
+}
+
+/* A list carrying its own row semantics — visit order, candidate stubs — not bullets. */
+ul.plain,
+.rows > ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 /* A control that reads as a link but is a button, so it keeps button semantics for the keyboard. */
 .linklike {
   background: none;

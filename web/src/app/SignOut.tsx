@@ -31,14 +31,24 @@ export function SignOut(): ReactNode {
       // `applied` because this route cannot park: it is terminated by `admin_front` and is not a
       // Raft write, so a `202` would be a contract violation rather than a case to handle.
       applied(await apiSend("DELETE", API_PATHS.session));
+
       /*
-       * `clear()`, not `invalidateQueries()`. Invalidation refetches and leaves the previous
-       * principal's data readable while those requests are in flight — so the console would show
-       * one operator's imposters and tenants to whoever signs in next, for as long as the refetch
-       * takes. Clearing drops the cache outright; `whoami` then refetches, answers 401, and `App`
-       * renders the login screen.
+       * Two steps, and the order is the whole point.
+       *
+       * First drop every read *except* `whoami`, so the previous principal's imposters, tenants and
+       * audit rows are gone rather than merely stale — invalidation would leave them on screen for
+       * whoever signs in next, for as long as the refetches take.
+       *
+       * Then reset `whoami` specifically, which refetches it because `App` still has it mounted.
+       * That 401 is what moves the console to the login screen. A bare `clear()` does not do this:
+       * it removes the query while leaving the mounted observer holding its last successful result,
+       * so nothing refetches and the console keeps rendering the signed-out principal's shell. That
+       * bug shipped and was caught by hand, because the test asserted the cache had emptied instead
+       * of asserting the operator reached the login screen — `signout-redirect.test.tsx` now pins
+       * the behaviour rather than the mechanism.
        */
-      client.clear();
+      client.removeQueries({ predicate: (query) => query.queryKey[0] !== "whoami" });
+      await client.resetQueries({ queryKey: ["whoami"] });
     } catch (cause) {
       /*
        * Not a swallow, and specifically not a silent one: if the server refused to end the

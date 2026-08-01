@@ -25,22 +25,26 @@ describe("sign out", () => {
     expect(vi.mocked(fetch).mock.calls[0]?.[1]).toMatchObject({ method: "DELETE" });
   });
 
-  it("drops the previous principal's cached reads instead of refetching them", async () => {
+  it("removes the previous principal's cached reads rather than refetching them", async () => {
     /*
-     * `clear()`, not `invalidateQueries()`. Invalidation keeps the old data readable while the
-     * refetches are in flight, so one operator's imposters and tenants would stay on screen for
-     * whoever signs in next. This asserts the cache is *empty*, which invalidation would not make
-     * true.
+     * Removal, not invalidation. Invalidation keeps the old data readable while the refetches are in
+     * flight, so one operator's imposters and tenants would stay on screen for whoever signs in
+     * next.
+     *
+     * `whoami` is the deliberate exception and is reset instead, so the mounted observer refetches
+     * and its 401 moves the console to the login screen — see `signout-redirect.test.tsx`, which
+     * covers that end of it. This test owns the other end: everything that is not `whoami` is gone.
      */
     const client = new QueryClient();
     client.setQueryData(["imposters"], [{ port: 4545, name: "someone-elses" }]);
+    client.setQueryData(["tenants"], ["acme"]);
     stubFetch({ "/session": { status: 204 } });
     renderInApp(<SignOut />, { whoami: whoamiWith("editor"), client });
 
     await userEvent.setup().click(screen.getByTestId("sign-out"));
 
     await waitFor(() => expect(client.getQueryData(["imposters"])).toBeUndefined());
-    expect(client.getQueryCache().getAll()).toHaveLength(0);
+    expect(client.getQueryData(["tenants"])).toBeUndefined();
   });
 
   it("says so when the server refused, because the session is then still live", async () => {

@@ -3,7 +3,7 @@ import { type ReactNode, useState } from "react";
 import { ApiError } from "../api/client.ts";
 import type { FleetReadState } from "../app/fleetView.ts";
 import { useFleetView, useImposters, useRequestLog } from "../app/queries.ts";
-import { Empty, Ident, Truncated } from "../components/primitives.tsx";
+import { Card, Empty, Ident, Truncated } from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
@@ -415,15 +415,45 @@ function ImposterPicker(): ReactNode {
             : "Could not read the imposter list."}
         </p>
       ) : null}
-      <ul className="plain">
-        {(imposters.data ?? []).map((imposter) => (
-          <li key={imposter.port}>
-            <a href={`#/requests/${imposter.port}`}>
-              <Ident>{imposter.port}</Ident> {imposter.name ?? ""}
-            </a>
-          </li>
-        ))}
-      </ul>
+      {imposters.isPending ? <p className="muted">Reading…</p> : null}
+      {imposters.isSuccess && imposters.data.length === 0 ? (
+        <Empty
+          title="No imposters to read a log for"
+          body="The request log is per-imposter. Create one and its recorded requests appear here."
+        />
+      ) : null}
+      {imposters.isSuccess && imposters.data.length > 0 ? (
+        <Card title="Choose an imposter" bleed>
+          <div className="scroll-x">
+            <table className="dense">
+              <thead>
+                <tr>
+                  <th style={{ width: "12ch" }}>Port</th>
+                  <th>Name</th>
+                  <th style={{ width: "14ch" }} aria-label="Open" />
+                </tr>
+              </thead>
+              <tbody>
+                {imposters.data.map((imposter) => (
+                  <tr key={imposter.port}>
+                    <td>
+                      <span className="port">{imposter.port}</span>
+                    </td>
+                    <td>
+                      <Truncated value={imposter.name ?? "—"} />
+                    </td>
+                    <td>
+                      <a className="btn sm" href={`#/requests/${imposter.port}`}>
+                        Open log
+                      </a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      ) : null}
     </section>
   );
 }
