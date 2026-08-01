@@ -137,11 +137,24 @@ function EmptyState({
           <span className="warn-text">
             {reason}. An imposter this node has not applied would not appear here.
           </span>
-        ) : undefined
+        ) : (
+          // The console reads imposters and edits their stubs; it does not create them (RFC-006's
+          // slices scope C4 to read-only and C5 to the *stub* editor). Until a slice adds that,
+          // this is the only place the console says how — so it says it, rather than leaving an
+          // operator on an empty screen with no next step. The port is explicit because
+          // `createImposter` requires it: an auto-assigned port cannot replicate across the fleet.
+          <>
+            The console does not create imposters yet. Create one against the admin API and it
+            appears here.
+          </>
+        )
       }
     >
       {uncertain ? null : (
-        <pre>POST /imposters</pre>
+        <pre>{`curl -X POST $ADMIN/imposters \\
+  -H 'Authorization: <your key>' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"port":4545,"protocol":"http","stubs":[]}'`}</pre>
       )}
     </Empty>
   );
