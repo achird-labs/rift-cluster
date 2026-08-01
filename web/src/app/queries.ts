@@ -287,6 +287,81 @@ export function useAddStub(): UseMutationResult<CommitOutcome, Error, StubWrite>
   );
 }
 
+/**
+ * Create an imposter.
+ *
+ * The port is part of the body and never auto-assigned: `createImposter` requires it explicitly
+ * because an auto-assigned port cannot replicate across the fleet — the other nodes would each pick
+ * their own. So this is a form field, not a convenience the console can hide.
+ *
+ * No `If-Match`. The route accepts one, but a create has nothing to condition on: there is no prior
+ * revision of an imposter that does not exist. A port already in use comes back as the server's own
+ * refusal, which is the check that matters and the only one that sees the whole fleet.
+ */
+export function useCreateImposter(): UseMutationResult<CommitOutcome, Error, Imposter> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body) => {
+      const sent = await apiSend("POST", API_PATHS.imposters, body, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["imposters"] }),
+  });
+}
+
+/**
+ * Delete an imposter, and everything hanging off it.
+ *
+ * Authorized by `Action::ImposterDelete`, which is why the screen gates on `imposter.delete` rather
+ * than `imposter.write` even though the two are granted together today (see `rbac.ts`).
+ *
+ * Both caches are invalidated: the detail read is keyed by port, and leaving it would let a
+ * back-navigation render a deleted imposter from cache as though it still existed.
+ */
+export function useDeleteImposter(): UseMutationResult<CommitOutcome, Error, { port: number }> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port }) => {
+      const sent = await apiSend("DELETE", imposterPath(port), undefined, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: (_data, _error, { port }) => {
+      void client.invalidateQueries({ queryKey: ["imposters"] });
+      void client.removeQueries({ queryKey: ["imposter", port] });
+    },
+  });
+}
+
+/**
+ * Empty one imposter's recorded requests on this node.
+ *
+ * `Action::SavedRequestsClear` — an Operator-tier "disturb" action, not an Editor-tier "redefine"
+ * one, so the screen gates it on `imposter.lifecycle`. That grouping is `authz.rs`'s, not a guess:
+ * clearing a log changes no configuration.
+ *
+ * Per-node like the log itself. Clearing here empties what *this* node recorded; another node's log
+ * is untouched, which is the same scope caveat the screen already keeps in front of the reader.
+ */
+export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { port: number }> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port }) => {
+      const sent = await apiSend("DELETE", requestsPath(port), undefined, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["requests"] }),
+  });
+}
+
 export function useRouteTable(): UseQueryResult<Route[]> {
   const { tenant } = useSession();
   return useQuery({

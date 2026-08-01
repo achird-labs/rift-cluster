@@ -1,15 +1,22 @@
-import type { ReactNode } from "react";
+import { type FormEvent, type ReactNode, useState } from "react";
 
 import type { components } from "../api/schema.ts";
 import { IMPOSTER_COLUMNS } from "../app/contract.ts";
 import type { FleetReadState, FleetView } from "../app/fleetView.ts";
 import { viewConfidence } from "../app/fleetView.ts";
-import { useFleetView, useImposters, useLifecycleToggle } from "../app/queries.ts";
+import {
+  useCreateImposter,
+  useDeleteImposter,
+  useFleetView,
+  useImposters,
+  useLifecycleToggle,
+} from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { toHash } from "../app/routing.ts";
 import { ImposterField } from "../components/imposterFields.tsx";
 import {
   Card,
+  Confirm,
   Empty,
   ErrorNote,
   Truncated,
@@ -22,6 +29,10 @@ type Imposter = components["schemas"]["Imposter"];
 export function Imposters(): ReactNode {
   const { can } = useSession();
   const imposters = useImposters();
+  const create = useCreateImposter();
+  const remove = useDeleteImposter();
+  const [creating, setCreating] = useState(false);
+  const [confirming, setConfirming] = useState<Imposter | null>(null);
   // Only to qualify what the list shows. A principal without the fleet scope simply gets no
   // qualification — never a 404 error on a screen whose own read succeeded.
   const mayReadFleet = can("fleet.read");
@@ -30,6 +41,10 @@ export function Imposters(): ReactNode {
 
   const confidence = viewConfidence(fleetReadState(mayReadFleet, fleet));
   const mayToggle = can("imposter.lifecycle");
+  const mayCreate = can("imposter.write");
+  // `imposter.delete`, not `imposter.write`: they are separate actions server-side and granted from
+  // separate arms, so gating on the wrong one is a drift waiting to happen (see `rbac.ts`).
+  const mayDelete = can("imposter.delete");
 
   return (
     <section className="screen">
@@ -40,7 +55,64 @@ export function Imposters(): ReactNode {
           {confidence.partial ? ` This node is degraded: ${confidence.reason}.` : ""}
           {confidence.unknown ? ` Caveat: ${confidence.reason}.` : ""}
         </p>
+        {mayCreate ? (
+          <>
+            <div className="spacer" />
+            <button
+              className="btn primary"
+              type="button"
+              data-testid="new-imposter"
+              onClick={() => setCreating(true)}
+            >
+              New imposter
+            </button>
+          </>
+        ) : null}
       </header>
+
+      {create.isError ? (
+        <ErrorNote error={create.error} context="The imposter was not created" />
+      ) : null}
+      {remove.isError ? (
+        <ErrorNote error={remove.error} context="The imposter was not deleted" />
+      ) : null}
+      {create.data?.kind === "unobservable" ? <UnconfirmedNote reason={create.data.reason} /> : null}
+      {remove.data?.kind === "unobservable" ? <UnconfirmedNote reason={remove.data.reason} /> : null}
+
+      {creating ? (
+        <NewImposter
+          busy={create.isPending}
+          onCancel={() => setCreating(false)}
+          onCreate={(body) =>
+            create.mutate(body, {
+              // Closes only on success. A refused create that dismissed its own form would take the
+              // operator's typing with it and leave the error pointing at a screen with no form.
+              onSuccess: () => setCreating(false),
+            })
+          }
+        />
+      ) : null}
+
+      {confirming === null ? null : (
+        <Confirm
+          testId="confirm-delete-imposter"
+          title={`Delete ${confirming.name ?? `imposter ${confirming.port ?? ""}`}?`}
+          body={
+            <>
+              This removes the imposter, its stubs, its recorded requests and its flow state across
+              the fleet. Nothing undoes it.
+            </>
+          }
+          confirmLabel={`Delete ${confirming.name ?? confirming.port ?? "imposter"}`}
+          busy={remove.isPending}
+          onCancel={() => setConfirming(null)}
+          onConfirm={() => {
+            const port = confirming.port;
+            if (port !== undefined) remove.mutate({ port });
+            setConfirming(null);
+          }}
+        />
+      )}
 
       {imposters.isError ? <ErrorNote error={imposters.error} context="Could not list imposters" /> : null}
       {toggle.isError ? <ErrorNote error={toggle.error} context="That change did not take effect" /> : null}
@@ -69,7 +141,7 @@ export function Imposters(): ReactNode {
                       {column.label}
                     </th>
                   ))}
-                  {mayToggle ? <th aria-label="Lifecycle" /> : null}
+                  {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
                 </tr>
               </thead>
               <tbody>
@@ -78,8 +150,10 @@ export function Imposters(): ReactNode {
                     key={imposter.port ?? `unnamed-${index}`}
                     imposter={imposter}
                     mayToggle={mayToggle}
+                    mayDelete={mayDelete}
                     busy={toggle.isPending}
                     onToggle={(port, enable) => toggle.mutate({ port, enable })}
+                    onDelete={() => setConfirming(imposter)}
                   />
                 ))}
               </tbody>
@@ -163,13 +237,17 @@ function EmptyState({
 function Row({
   imposter,
   mayToggle,
+  mayDelete,
   busy,
   onToggle,
+  onDelete,
 }: {
   imposter: Imposter;
   mayToggle: boolean;
+  mayDelete: boolean;
   busy: boolean;
   onToggle: (port: number, enable: boolean) => void;
+  onDelete: () => void;
 }): ReactNode {
   const port = imposter.port;
   const label = imposter.name ?? (port === undefined ? UNKNOWN : String(port));
@@ -181,19 +259,33 @@ function Row({
           <ImposterField imposter={imposter} field={column.key} renderName={nameLink(imposter)} />
         </td>
       ))}
-      {mayToggle ? (
+      {mayToggle || mayDelete ? (
         <td>
-          {/* Rendered only for a role that holds `LifecycleToggle`. RFC-006 §3 rule 3: this is
+          {/* Rendered only for a role that holds the matching action. RFC-006 §3 rule 3: this is
               presentation — the admin front re-checks the same action on the call itself. */}
           {port === undefined ? null : (
-            <button
-              className="btn sm"
-              type="button"
-              disabled={busy}
-              onClick={() => onToggle(port, !imposter.enabled)}
-            >
-              {imposter.enabled ? "Disable" : "Enable"} {label}
-            </button>
+            <span className="row">
+              {mayToggle ? (
+                <button
+                  className="btn sm"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => onToggle(port, !imposter.enabled)}
+                >
+                  {imposter.enabled ? "Disable" : "Enable"} {label}
+                </button>
+              ) : null}
+              {mayDelete ? (
+                <button
+                  className="btn sm danger"
+                  type="button"
+                  data-testid={`delete-imposter-${port}`}
+                  onClick={onDelete}
+                >
+                  Delete {label}
+                </button>
+              ) : null}
+            </span>
           )}
         </td>
       ) : null}
@@ -213,4 +305,142 @@ function nameLink(imposter: Imposter): (name: string) => ReactNode {
       <a href={toHash({ screen: "imposter", port: imposter.port })}>{cell}</a>
     );
   };
+}
+
+/**
+ * The create form.
+ *
+ * **The port is a required field, not a convenience the console hides.** `createImposter` refuses an
+ * auto-assigned port because each node would pick its own and the imposter could not replicate — so
+ * the operator names it, and a blank one is refused here rather than sent.
+ *
+ * Protocol is a closed choice because the engine's is: `manager.rs` accepts `http` and `https` and
+ * answers `InvalidProtocol` for anything else. Choosing `https` reveals the PEM pair, because an
+ * https imposter without a cert fails at creation by design — upstream fails loudly there rather
+ * than silently serving cleartext, and a form that let you submit one would just relay that error.
+ *
+ * No `If-Match`: there is no prior revision of an imposter that does not exist yet. A port already
+ * in use comes back as the fleet's own refusal, which is the only check that sees every node.
+ */
+function NewImposter({
+  busy,
+  onCreate,
+  onCancel,
+}: {
+  busy: boolean;
+  onCreate: (body: Imposter) => void;
+  onCancel: () => void;
+}): ReactNode {
+  const [port, setPort] = useState("");
+  const [protocol, setProtocol] = useState("http");
+  const [name, setName] = useState("");
+  const [recordRequests, setRecordRequests] = useState(true);
+  const [cert, setCert] = useState("");
+  const [certKey, setCertKey] = useState("");
+  const [invalid, setInvalid] = useState<string | null>(null);
+
+  function submit(event: FormEvent): void {
+    event.preventDefault();
+    // A port is 1–65535 and nothing else. Checked here so an obvious typo is a sentence next to the
+    // field rather than a round trip that comes back as a 400 with no field to point at.
+    const parsed = Number(port);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+      setInvalid("Port must be a whole number between 1 and 65535.");
+      return;
+    }
+    if (protocol === "https" && (cert.trim() === "" || certKey.trim() === "")) {
+      setInvalid("An https imposter needs both a certificate and a key, or it refuses to start.");
+      return;
+    }
+    setInvalid(null);
+    onCreate({
+      port: parsed,
+      protocol,
+      recordRequests,
+      // Sent explicitly rather than left to the schema default: the contract marks it required (it
+      // carries a default, which `openapi-typescript` renders as non-optional), and a newly created
+      // imposter that arrived disabled would look like a create that half-worked.
+      enabled: true,
+      // Omitted rather than sent empty: the contract's fields are optional, and a blank name is not
+      // the same fact as no name.
+      ...(name.trim() === "" ? {} : { name: name.trim() }),
+      ...(protocol === "https" ? { cert: cert.trim(), key: certKey.trim() } : {}),
+    });
+  }
+
+  return (
+    <Card title="New imposter">
+      <form className="stub-form" onSubmit={submit} data-testid="new-imposter-form">
+        <div className="field-row">
+          <div className="field">
+            <label htmlFor="new-port">Port</label>
+            <input
+              id="new-port"
+              inputMode="numeric"
+              value={port}
+              onChange={(event) => setPort(event.target.value)}
+              placeholder="4545"
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="new-protocol">Protocol</label>
+            <select
+              id="new-protocol"
+              value={protocol}
+              onChange={(event) => setProtocol(event.target.value)}
+            >
+              <option value="http">http</option>
+              <option value="https">https</option>
+            </select>
+          </div>
+          <div className="field">
+            <label htmlFor="new-name">Name</label>
+            <input
+              id="new-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="checkout-api"
+            />
+          </div>
+        </div>
+
+        {protocol === "https" ? (
+          <div className="field-row">
+            <div className="field">
+              <label htmlFor="new-cert">Certificate (PEM)</label>
+              <textarea id="new-cert" value={cert} onChange={(e) => setCert(e.target.value)} />
+            </div>
+            <div className="field">
+              <label htmlFor="new-key">Private key (PEM)</label>
+              <textarea id="new-key" value={certKey} onChange={(e) => setCertKey(e.target.value)} />
+            </div>
+          </div>
+        ) : null}
+
+        <label className="row">
+          <input
+            type="checkbox"
+            checked={recordRequests}
+            onChange={(event) => setRecordRequests(event.target.checked)}
+          />
+          Record requests — needed for the request log to show anything
+        </label>
+
+        {invalid === null ? null : (
+          <p className="error" data-testid="new-imposter-invalid" role="alert">
+            {invalid}
+          </p>
+        )}
+
+        <div className="row">
+          <button className="btn primary" type="submit" disabled={busy}>
+            {busy ? "Creating…" : "Create imposter"}
+          </button>
+          <button className="btn" type="button" onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+        </div>
+      </form>
+    </Card>
+  );
 }

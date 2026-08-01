@@ -197,6 +197,64 @@ export function UnconfirmedNote({ reason }: { reason: string }): ReactNode {
   );
 }
 
+/**
+ * A modal confirmation for a destructive act.
+ *
+ * Deleting an imposter takes its stubs, its recorded requests and its flow state with it, and
+ * nothing in the fleet undoes that — so this exists to make the operator name the thing before it
+ * goes, not to add ceremony. `confirmLabel` states the act ("Delete checkout-api") rather than
+ * "OK", because the label is the last thing read before the click.
+ *
+ * `role="dialog"` + `aria-modal` and an Escape handler; the surrounding scrim is not clickable to
+ * dismiss, deliberately — a stray click beside a destructive dialog should do nothing at all.
+ */
+export function Confirm({
+  title,
+  body,
+  confirmLabel,
+  busy = false,
+  onConfirm,
+  onCancel,
+  testId,
+}: {
+  title: string;
+  body: ReactNode;
+  confirmLabel: string;
+  busy?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+  testId?: string;
+}): ReactNode {
+  return (
+    <div
+      className="scrim"
+      onKeyDown={(event) => {
+        if (event.key === "Escape") onCancel();
+      }}
+    >
+      <div className="confirm" role="dialog" aria-modal="true" aria-label={title} data-testid={testId}>
+        <h2>{title}</h2>
+        <p>{body}</p>
+        <div className="acts">
+          <button className="btn" type="button" onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+          <button
+            className="btn danger"
+            type="button"
+            onClick={onConfirm}
+            disabled={busy}
+            data-testid="confirm-destructive"
+            autoFocus
+          >
+            {busy ? "Working…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function describe(error: unknown): string {
   if (error instanceof ApiError) {
     switch (error.status) {

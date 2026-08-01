@@ -2,8 +2,9 @@ import { type ReactNode, useState } from "react";
 
 import { ApiError } from "../api/client.ts";
 import type { FleetReadState } from "../app/fleetView.ts";
-import { useFleetView, useImposters, useRequestLog } from "../app/queries.ts";
-import { Card, Empty, Ident, Truncated } from "../components/primitives.tsx";
+import { useClearRequests, useFleetView, useImposters, useRequestLog } from "../app/queries.ts";
+import { useSession } from "../app/session.tsx";
+import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
@@ -36,6 +37,12 @@ function Log({ port }: { port: number }): ReactNode {
   const [offset, setOffset] = useState(0);
   const log = useRequestLog(port);
   const coverage = coverageFor(useFleetReadState());
+  const { can } = useSession();
+  const clear = useClearRequests();
+  const [confirming, setConfirming] = useState(false);
+  // `Action::SavedRequestsClear`, not `LifecycleToggle` — separate actions that happen to share a
+  // role today. See `rbac.ts`.
+  const mayClear = can("requests.clear");
 
   return (
     <section className="screen">
@@ -44,7 +51,44 @@ function Log({ port }: { port: number }): ReactNode {
         <p className="muted">
           Imposter <Ident>{port}</Ident>
         </p>
+        {mayClear ? (
+          <>
+            <div className="spacer" />
+            <button
+              className="btn sm danger"
+              type="button"
+              data-testid="clear-requests"
+              onClick={() => setConfirming(true)}
+            >
+              Clear this node&rsquo;s log
+            </button>
+          </>
+        ) : null}
       </header>
+
+      {clear.isError ? (
+        <ErrorNote error={clear.error} context="The log was not cleared" />
+      ) : null}
+
+      {confirming ? (
+        <Confirm
+          testId="confirm-clear-requests"
+          title="Clear this node's recorded requests?"
+          body={
+            <>
+              This empties what <b>this node</b> recorded for imposter {port}. Other nodes keep
+              their own logs, and nothing restores these rows.
+            </>
+          }
+          confirmLabel="Clear log"
+          busy={clear.isPending}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => {
+            clear.mutate({ port });
+            setConfirming(false);
+          }}
+        />
+      ) : null}
 
       {/*
        * A permanent scope strip, not a dismissible banner — and deliberately the most prominent
