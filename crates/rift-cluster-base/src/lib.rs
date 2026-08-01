@@ -40,6 +40,12 @@ pub mod seams {
         RequestJournal,
     };
 
+    /// The recorded request itself, its match diagnosis, and the response mode it
+    /// carries. These appear in [`RequestJournal`]'s own signatures, so a cluster
+    /// crate cannot implement the seam without naming them — and this facade is its
+    /// only path into the core.
+    pub use rift_mock_core::imposter::{MatchOutcome, RecordedRequest, ResponseMode};
+
     /// Proxy recordings and the `proxyOnce` record-once claim gate.
     pub use rift_mock_core::recording::{
         ClaimOutcome, ClaimToken, LocalProxyStore, ProxyRecordingStore, ProxyStoreError,
@@ -293,6 +299,9 @@ mod tests {
         _named::<JournalEntry>();
         _named::<JournalRead>();
         _named::<JournalReadSince>();
+        _named::<MatchOutcome>();
+        _named::<RecordedRequest>();
+        _named::<ResponseMode>();
         _named::<ClaimToken>();
         _named::<ProxyStoreError>();
         _named::<LocalProxyStore>();

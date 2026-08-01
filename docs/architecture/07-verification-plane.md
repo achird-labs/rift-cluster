@@ -43,9 +43,13 @@ arrived" from "0 requests visible right now" (silently conflating those two is
 how verification tools lie).
 
 **Caps stay writer-local and honest.** Each shard caps at
-`max(500, 10_000 / N_live)` entries per port plus an age cap, evicting oldest
+`max(500, 10_000 / N)` entries per port plus an age cap, evicting oldest
 and advancing an `evicted_below_seq` watermark that readers respect — so every
-node converges on the same visible set even after eviction.
+node converges on the same visible set even after eviction. `N` is the voter
+count of the **applied membership**, not the currently-reachable node count:
+membership changes only through a committed log entry, so every node derives
+the same cap, and a peer flapping in and out of health cannot resize shards —
+which would evict entries a test was still going to assert on.
 `numberOfRequests` is a per-node G-counter slot summed on read (it counts even
 when body recording is off, matching single-node semantics).
 
