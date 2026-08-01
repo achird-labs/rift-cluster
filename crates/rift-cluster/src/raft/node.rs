@@ -1425,6 +1425,21 @@ impl RaftNode {
         }
     }
 
+    /// How many voters the applied membership has.
+    ///
+    /// Cheaper than [`status`](Self::status) or [`ring`](Self::ring), which
+    /// collect the ids into a `Vec` and — in `ring`'s case — sort and dedup
+    /// them. Not allocation-free, though: openraft's `voter_ids()` builds a
+    /// `BTreeSet` internally, so callers on a per-request path (the journal's
+    /// shard cap, issue #222) must still cache the result rather than consult
+    /// this per request.
+    #[must_use]
+    pub fn voter_count(&self) -> usize {
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow();
+        metrics.membership_config.voter_ids().count()
+    }
+
     /// The ownership ring computed from this node's applied membership. Its
     /// `m_idx` is the membership log index, so every node at the same index
     /// derives byte-identical ownership.

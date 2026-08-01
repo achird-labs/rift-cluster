@@ -18,7 +18,8 @@ use arc_swap::ArcSwap;
 use rift_cluster::audit_export::{AuditExporter, ExportContext, ExportStatus};
 use rift_cluster::sources;
 use rift_cluster::stores::{
-    ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, FlowShard, ShardConfig, flow_routes,
+    ClusterJournal, ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, FlowShard, ShardConfig,
+    flow_routes,
 };
 use rift_cluster::{
     Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, OnDrift,
@@ -517,12 +518,23 @@ pub async fn start_with_runtimes(
         }
     };
     let flow_net = FlowNet::new(flow_shard);
+    // This node's writer shard of the fleet request journal (issue #222), constructed
+    // beside `flow_net` for the same reason: the manager needs it now, and the node whose
+    // membership sizes its shard cap does not exist yet.
+    //
+    // The node *id* is passed now rather than bound later, because the manager begins
+    // serving during node startup — catch-up replay drives imposters before
+    // `start_with_front_door_routes` returns. An entry recorded in that window must
+    // already carry this writer's real id: `(node_id, seq, clear_gen)` is the key #223
+    // merges on, and a placeholder there is wrong data, not a late label.
+    let request_journal = ClusterJournal::new(identity.node_id());
 
     let manager = match cluster_manager(
         &cli,
         accept_runtimes,
         Arc::clone(&pull_on_miss),
         Arc::clone(&flow_net),
+        Arc::clone(&request_journal),
     ) {
         Ok(manager) => Arc::new(manager),
         Err(e) => {
@@ -644,6 +656,12 @@ pub async fn start_with_runtimes(
     });
     let (export_status, audit_exporter) =
         AuditExporter::spawn(&tokio::runtime::Handle::current(), &node, export_context);
+
+    // Attach the membership the shard cap divides by. Infallible and immediate — unlike
+    // the flow bridge there is no runtime to start, so there is nothing to unwind. Until
+    // this lands the journal sizes shards as a single voter, which over-retains rather
+    // than evicting entries an early request might still be asserted on.
+    request_journal.bind(&node);
 
     if let Err(e) = flow_net.bind(&node, FlowBindConfig::default()) {
         source_scheduler.abort();
@@ -1229,6 +1247,7 @@ fn cluster_manager(
     accept_runtimes: Vec<tokio::runtime::Handle>,
     pull_on_miss: Arc<PullOnMissInterceptor>,
     flow_net: Arc<FlowNet>,
+    request_journal: Arc<ClusterJournal>,
 ) -> anyhow::Result<ImposterManager> {
     let default_cert = cli
         .oss
@@ -1265,7 +1284,13 @@ fn cluster_manager(
         // round-robin LB is wrong for all of them, not just the ones that set
         // `flowState` (#120). The `--cluster`-off path never reaches this
         // function, which is the whole off-switch.
-        .with_flow_store_provider(Arc::new(ClusteredFlowStoreProvider::new(flow_net))))
+        .with_flow_store_provider(Arc::new(ClusteredFlowStoreProvider::new(flow_net)))
+        // One journal shared by every imposter on this node, keyed by port — the shard
+        // a fleet-wide verification read merges (#223). Same reasoning as the flow store:
+        // a per-imposter private journal behind a round-robin LB answers `savedRequests`
+        // with whatever fraction of the traffic happened to land here, for every imposter
+        // rather than only the ones that opted in.
+        .with_request_journal(request_journal))
 }
 
 /// Replay parked intents (issue #9 R4): drain whenever a leader (re)appears —

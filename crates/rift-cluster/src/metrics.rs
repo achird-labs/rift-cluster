@@ -346,6 +346,53 @@ lazy_static! {
         &["port"]
     )
     .expect("rift_cluster_bind_failures registers once");
+
+    /// `rift_cluster_journal_entries{port}` — entries this node's writer shard
+    /// currently retains for a port. It is one shard of the fleet journal, not
+    /// the fleet total: summing it across nodes is what approximates the whole,
+    /// which is exactly what a fleet dashboard should graph.
+    static ref JOURNAL_ENTRIES: GaugeVec = register_gauge_vec!(
+        "rift_cluster_journal_entries",
+        "Recorded requests retained in this node's journal shard, by imposter port",
+        &["port"]
+    )
+    .expect("rift_cluster_journal_entries registers once");
+
+    /// `rift_cluster_journal_evictions_total{reason}` — entries dropped by
+    /// retention pressure. `cap` = the shard hit `max(500, 10_000/N)`;
+    /// `age` = the entry outlived the age cap. Sustained `cap` evictions mean a
+    /// verification read can legitimately miss entries a test expected, so this
+    /// is the counter that explains an otherwise baffling assertion failure.
+    static ref JOURNAL_EVICTIONS: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_journal_evictions_total",
+        "Journal entries dropped by retention pressure, by reason",
+        &["reason"]
+    )
+    .expect("rift_cluster_journal_evictions_total registers once");
+
+    static ref JOURNAL_EVICTIONS_CAP: IntCounter =
+        JOURNAL_EVICTIONS.with_label_values(&["cap"]);
+    static ref JOURNAL_EVICTIONS_AGE: IntCounter =
+        JOURNAL_EVICTIONS.with_label_values(&["age"]);
+}
+
+/// The retained-depth gauge for one port, resolved once so the recording path never
+/// pays `with_label_values`' label formatting and registry hash per request.
+pub(crate) fn journal_entries_gauge(port: u16) -> Gauge {
+    JOURNAL_ENTRIES.with_label_values(&[&port.to_string()])
+}
+
+/// Count what one append's retention pass dropped. Called with both reasons so a
+/// caller never has to decide which of them to skip.
+pub(crate) fn note_journal_evictions(by_cap: usize, by_age: usize) {
+    // Handles resolved once: at a steady-state-full shard every append evicts, so this
+    // is a per-request path in exactly the regime where it is hottest.
+    if by_cap > 0 {
+        JOURNAL_EVICTIONS_CAP.inc_by(by_cap as u64);
+    }
+    if by_age > 0 {
+        JOURNAL_EVICTIONS_AGE.inc_by(by_age as u64);
+    }
 }
 
 /// One write handed toward the leader (per hop).

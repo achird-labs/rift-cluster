@@ -60,6 +60,10 @@ libc.workspace = true
 [dev-dependencies]
 # Streaming request bodies, to prove the body cap holds without a declared length.
 futures-lite = "2"
+# Captures `tracing` output so the journal's warn-once-per-fill-up guard is testable.
+# Upstream measured a 29-55% RPS loss when that mechanism regressed (rift #718), so the
+# guard is load-bearing rather than cosmetic.
+tracing-test = "0.2"
 # The 3-node integration harness (tests/cluster.rs) drives real nodes directly,
 # so it needs tokio in its own right — integration tests do not inherit the
 # library's normal dependencies.
