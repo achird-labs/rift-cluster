@@ -42,6 +42,8 @@ type RouteTable = components["schemas"]["RouteTable"];
 type Tenant = components["schemas"]["Tenant"];
 type TenantWrite = components["schemas"]["TenantWrite"];
 type Principal = components["schemas"]["Principal"];
+type AuditSink = components["schemas"]["AuditSink"];
+type AuditSinkWrite = components["schemas"]["AuditSinkWrite"];
 type PrincipalCreate = components["schemas"]["PrincipalCreate"];
 type PrincipalUpdate = components["schemas"]["PrincipalUpdate"];
 type IssuedPrincipal = components["schemas"]["IssuedPrincipal"];
@@ -348,6 +350,57 @@ export function useDeleteImposter(): UseMutationResult<CommitOutcome, Error, { p
  * Per-node like the log itself. Clearing here empties what *this* node recorded; another node's log
  * is untouched, which is the same scope caveat the screen already keeps in front of the reader.
  */
+/**
+ * The fleet's declared audit export sink.
+ *
+ * `404` is **not** an error here: the contract uses it for "no sink is declared" as well as for
+ * "caller lacks fleet-scoped access" (RFC-002 §8.4, where the two must be indistinguishable). The
+ * screen is only reachable by a principal that holds `cluster.admin`, so it resolves the absent case
+ * to `null` and lets every other status reject — folding a genuine `503` into "no sink" would report
+ * an unreachable node as a fleet that ships nowhere.
+ */
+export function useAuditSink(options: { enabled?: boolean } = {}) {
+  return useQuery({
+    queryKey: ["audit-sink"],
+    queryFn: async (): Promise<AuditSink | null> => {
+      try {
+        return await apiGet<AuditSink>(API_PATHS.auditSink);
+      } catch (cause) {
+        if (cause instanceof ApiError && cause.status === 404) return null;
+        throw cause;
+      }
+    },
+    enabled: options.enabled ?? true,
+    ...POLLED,
+  });
+}
+
+export function usePutAuditSink(): UseMutationResult<CommitOutcome, Error, AuditSinkWrite> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body) => {
+      const sent = await apiSend("PUT", API_PATHS.auditSink, body);
+      const outcome = await settle(sent, { tenant: null });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["audit-sink"] }),
+  });
+}
+
+export function useDeleteAuditSink(): UseMutationResult<CommitOutcome, Error, void> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const sent = await apiSend("DELETE", API_PATHS.auditSink);
+      const outcome = await settle(sent, { tenant: null });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["audit-sink"] }),
+  });
+}
+
 export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { port: number }> {
   const { tenant } = useSession();
   const client = useQueryClient();
