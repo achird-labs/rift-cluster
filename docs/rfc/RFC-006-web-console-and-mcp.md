@@ -114,7 +114,7 @@ adds no header logic of its own beyond sending the selection.
 | **Front-door routes** — table editor | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` (`admin_front.rs:348-360,405,419-438`) | v1 |
 | **Tenants / principals / roles / tokens / audit** | RFC-002 §5 admin surface + `GET /admin/audit` | with RFC-002 T3/T4 |
 | **Scenarios & state** — scenario states per space, a space's scoped stubs, flow-state entries; set/reset/tear down/clear | `GET/POST/PUT /imposters/:port/scenarios*`, `GET/DELETE /imposters/:port/spaces/:flowId(/stubs)`, `GET/PUT/DELETE /admin/imposters/:port/flow-state/:flowId(/:key)` — all upstream routes that already ship and are contracted in `openapi-ee.yaml` | v1 (#232) |
-| **Sources** — imposter sources status (#20) | doc-13 sources admin surface | with #20 |
+| **Sources** — declared sources, their drift policy, the ports they own, and drift state | `GET /admin/sources` / `GET /admin/sources/{id}` (#239/#240), gated by `source.read` (Viewer+). Read-only: there is no source write surface yet, so the screen offers no controls | v1 (#233) |
 | **Specs** — imported OpenAPI/proto specs | RFC-004 admin surface | with RFC-004 |
 
 Screens whose backend has not shipped render as a named, greyed nav entry with

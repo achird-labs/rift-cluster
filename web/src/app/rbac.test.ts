@@ -29,6 +29,10 @@ const EXPECTED: Record<Capability, Role[]> = {
   // anyway: `authz.rs` grants them from separate arms, so the day one moves this table is what
   // fails rather than a delete button quietly appearing for a role the server refuses.
   "imposter.delete": ["editor", "tenant-admin", "fleet-admin"],
+  // `Action::SourceRead`. Viewer, alongside `ImposterRead` — its own action server-side rather
+  // than a wire-folding onto it, transcribed as its own row for the same reason `imposter.delete`
+  // above gets one: the day the grant moves is what this row exists to catch.
+  "source.read": ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"],
   // `Action::SavedRequestsClear`. Operator-tier: clearing a log disturbs state without redefining
   // configuration, which is the line `authz.rs` draws between the Operator and Editor arms.
   "requests.clear": ["operator", "editor", "tenant-admin", "fleet-admin"],
