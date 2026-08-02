@@ -55,7 +55,7 @@ every run; and label association, which half a console of forms depends on.
 ## The fixture
 
 `scripts/e2e-console.sh` starts **one** node, not three. Every console screen is per-node —
-`/_fleet/*` is one node answering about itself — so one node exercises all seven screens and removes
+`/_fleet/*` is one node answering about itself — so one node exercises all eight screens and removes
 the flakiness that leader election and voter convergence introduce. The cluster's own behaviour
 belongs to `crates/rift-cluster/tests/cluster.rs` and the container chaos tier, which are built for
 it. `--cluster-allow-solo` keeps it a real one-voter cluster, so the fleet screen renders its
@@ -77,3 +77,9 @@ regression accepted in silence.
 Baselines are platform-sensitive (font rasterisation differs between macOS and the CI container).
 `maxDiffPixelRatio: 0.01` absorbs anti-aliasing but not a missing control. If local and CI disagree
 on unchanged code, trust CI's — that is the platform the gate runs on.
+
+A **new** baseline therefore cannot be produced on a macOS checkout at all: `pnpm run e2e:update`
+writes only the `-darwin.png` half, and the gate runs on `-linux.png`. Add the `update-baselines`
+label to the PR and `console-baselines.yml` generates the Linux image on CI and commits it back to
+the branch. That is the only supported way to add one, and it is deliberately a labelled decision
+rather than something a push does quietly.

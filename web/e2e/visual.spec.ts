@@ -92,6 +92,19 @@ test.describe("component baselines", () => {
     await expect(page.getByTestId("request-scope-label")).toHaveScreenshot("request-scope.png");
   });
 
+  test("the scenarios scope strip", async ({ page }) => {
+    /*
+     * The same reasoning as the request log's strip above: this screen's every number and control
+     * acts on **one space**, and the strip is what keeps that in front of the reader. A baseline
+     * fails if it stops being the most prominent thing under the title — which is the failure mode
+     * that turns a per-space reset into one an operator thinks is global.
+     */
+    const { imposters } = fixture();
+    await signIn(page, "editor");
+    await goToScreen(page, `/scenarios/${imposters[0]}`);
+    await expect(page.getByTestId("scenarios-scope")).toHaveScreenshot("scenarios-scope.png");
+  });
+
   test("the stub editor with its summary", async ({ page }) => {
     const { imposters } = fixture();
     await signIn(page, "editor");

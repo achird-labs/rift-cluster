@@ -32,6 +32,27 @@ const EXPECTED: Record<Capability, Role[]> = {
   // `Action::SavedRequestsClear`. Operator-tier: clearing a log disturbs state without redefining
   // configuration, which is the line `authz.rs` draws between the Operator and Editor arms.
   "requests.clear": ["operator", "editor", "tenant-admin", "fleet-admin"],
+  // `Action::ScenarioRead`. Its own Viewer row even though every read folds onto
+  // `Action::ImposterRead` server-side (`principal.rs::map_action`: "reads fold onto imposter_read
+  // regardless of route"), because this table transcribes `role_allows` — where `ScenarioRead` is a
+  // separate arm — and not the coarser wire classification. Both are Viewer, so the two agree today.
+  "scenario.read": ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"],
+  // `Action::ScenarioReset`. Operator-tier "disturb": resetting every scenario in a flow changes
+  // running state without redefining configuration.
+  "scenario.reset": ["operator", "editor", "tenant-admin", "fleet-admin"],
+  // `Action::ScenarioWrite`. Editor-tier "redefine" — and the reason `scenario.reset` above cannot
+  // be folded into it: the reset button and the set-state control are offered to different roles.
+  "scenario.write": ["editor", "tenant-admin", "fleet-admin"],
+  // `Action::SpaceTeardown`. Operator-tier, alongside the other "disturb" actions.
+  "space.teardown": ["operator", "editor", "tenant-admin", "fleet-admin"],
+  // `Action::SpaceStubWrite`. Editor-tier — and it authorizes **two** controls, see `rbac.ts`.
+  "space.stubWrite": ["editor", "tenant-admin", "fleet-admin"],
+  // `Action::FlowStateRead`. Viewer, same reasoning as `scenario.read`.
+  "flowState.read": ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"],
+  // `Action::FlowStateClear`. Operator-tier, and it covers both the clear-one-entry delete and the
+  // clear-the-whole-flow delete: `map_action` returns it for any `imposter.delete` under
+  // `/admin/imposters/`, whether or not a key is named.
+  "flowState.clear": ["operator", "editor", "tenant-admin", "fleet-admin"],
   "tenant.manage": ["tenant-admin", "fleet-admin"],
   "audit.read": ["tenant-admin", "fleet-admin"],
   "fleet.read": ["fleet-admin"],
@@ -57,6 +78,52 @@ describe("roleAllows mirrors authz.rs::role_allows", () => {
     // control Operator is entitled to.
     expect(roleAllows("viewer", "imposter.lifecycle")).toBe(false);
     expect(roleAllows("operator", "imposter.lifecycle")).toBe(true);
+  });
+
+  it("splits the scenario controls across two tiers rather than gating them together", () => {
+    // The two scenario writes are NOT one permission. `map_action` returns `ScenarioReset` for
+    // `POST .../scenarios/reset` and `ScenarioWrite` for `PUT .../scenarios/{name}/state`, and
+    // `role_allows` grants them from different arms — so an operator gets the reset button and not
+    // the set-state control. Gating both on "may write" would offer an operator a control whose
+    // every call answers 403.
+    expect(roleAllows("operator", "scenario.reset")).toBe(true);
+    expect(roleAllows("operator", "scenario.write")).toBe(false);
+    expect(roleAllows("editor", "scenario.write")).toBe(true);
+  });
+
+  it("gates tearing a space down below scoping a stub into it", () => {
+    // Same split on the space controls: `SpaceTeardown` is Operator, `SpaceStubWrite` is Editor.
+    expect(roleAllows("operator", "space.teardown")).toBe(true);
+    expect(roleAllows("operator", "space.stubWrite")).toBe(false);
+  });
+
+  it("gates *writing* flow state on space.stubWrite, because that is what the server checks", () => {
+    /*
+     * The one mapping that is not guessable from the route, and the reason this row exists.
+     *
+     * There is no `FlowStateWrite` action. `admin_front.rs` classifies
+     * `PUT /admin/imposters/{port}/flow-state/{flowId}/{key}` as upstream's `imposter.write` with a
+     * space, and `principal.rs::map_action` maps that to **`Action::SpaceStubWrite`** — its comment
+     * names this exact route. So the set-value control is Editor-tier via the *space* capability,
+     * while the delete beside it is Operator-tier via `flowState.clear`.
+     *
+     * An operator therefore gets "clear" and not "set" on the same panel. That asymmetry looks like
+     * a bug until you read `map_action`, which is precisely why it is pinned here: inventing a
+     * `flowState.write` capability to make the panel symmetrical would draw a control the server
+     * refuses, and it is the drift this whole table exists to prevent.
+     */
+    expect(roleAllows("operator", "flowState.clear")).toBe(true);
+    expect(roleAllows("operator", "space.stubWrite")).toBe(false);
+    expect(roleAllows("editor", "space.stubWrite")).toBe(true);
+  });
+
+  it("lets a viewer read scenarios and flow state without disturbing either", () => {
+    for (const capability of ["scenario.read", "flowState.read"] as const) {
+      expect([capability, roleAllows("viewer", capability)]).toEqual([capability, true]);
+    }
+    for (const capability of ["scenario.reset", "flowState.clear", "space.teardown"] as const) {
+      expect([capability, roleAllows("viewer", capability)]).toEqual([capability, false]);
+    }
   });
 
   it("grants the fleet projection to fleet-admin only", () => {

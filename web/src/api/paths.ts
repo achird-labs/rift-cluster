@@ -31,6 +31,49 @@ export const requestsPath = (port: number): string => `/imposters/${port}/reques
 export const stubsPath = (port: number): string => `/imposters/${port}/stubs`;
 
 /**
+ * Scenario states for one imposter, read under one space.
+ *
+ * `flowId` rides in the **query string**, not the path — a separate contract parameter from the
+ * `flowId` the space routes take in their path, and the two are not interchangeable. Omitted, the
+ * imposter resolves its own default flow and says which one it used in the response; that echo is
+ * what the screen displays, rather than guessing the word "default".
+ */
+export const scenariosPath = (port: number, flowId: string | null): string =>
+  flowId === null
+    ? `/imposters/${port}/scenarios`
+    : `/imposters/${port}/scenarios?flowId=${encodeURIComponent(flowId)}`;
+
+/** One scenario's state. The name is operator-chosen and reaches a path segment, so it is encoded. */
+export const scenarioStatePath = (port: number, scenarioName: string): string =>
+  `/imposters/${port}/scenarios/${encodeURIComponent(scenarioName)}/state`;
+
+export const scenariosResetPath = (port: number): string => `/imposters/${port}/scenarios/reset`;
+
+/** One correlated-isolation space, addressed by its flow id. */
+export const spacePath = (port: number, flowId: string): string =>
+  `/imposters/${port}/spaces/${encodeURIComponent(flowId)}`;
+
+/**
+ * The stubs scoped to one space.
+ *
+ * Not a variant of `stubsPath`: these stubs belong to the space and never appear on the imposter's
+ * own stub list, so the two routes address different collections that happen to share a noun.
+ */
+export const spaceStubsPath = (port: number, flowId: string): string =>
+  `${spacePath(port, flowId)}/stubs`;
+
+/**
+ * A space's whole flow-state scratchpad — the only route that addresses it collectively, and it is
+ * a `DELETE`. There is deliberately no list builder here because the contract publishes no route
+ * that lists a flow's entries: they are addressed one key at a time.
+ */
+export const flowStatePath = (port: number, flowId: string): string =>
+  `/admin/imposters/${port}/flow-state/${encodeURIComponent(flowId)}`;
+
+export const flowStateEntryPath = (port: number, flowId: string, key: string): string =>
+  `${flowStatePath(port, flowId)}/${encodeURIComponent(key)}`;
+
+/**
  * One stub, addressed by its stable id — the **only** way this console writes a stub.
  *
  * The contract also publishes `/imposters/{port}/stubs/{stubIndex}`, and it is deliberately not

@@ -49,6 +49,51 @@ export type Capability =
    * authorizes a different call.
    */
   | "requests.clear"
+  /**
+   * `Action::ScenarioRead` — Viewer, alongside the other reads.
+   *
+   * Server-side every read under `/imposters/:port` folds onto `Action::ImposterRead`
+   * (`principal.rs::map_action`), so this capability names a distinction the wire does not make.
+   * It is transcribed anyway because this table mirrors `role_allows`, where `ScenarioRead` is its
+   * own arm — the same reasoning as `imposter.delete` above. Both sit at Viewer, so the two agree
+   * today and this row is what fails if that stops being true.
+   */
+  | "scenario.read"
+  /**
+   * `Action::ScenarioReset` — Operator-tier "disturb", from `POST .../scenarios/reset`.
+   *
+   * Deliberately not folded into `scenario.write`: `role_allows` grants them from different arms,
+   * so an operator gets the reset button and not the set-state control beside it.
+   */
+  | "scenario.reset"
+  /** `Action::ScenarioWrite` — Editor-tier "redefine", from `PUT .../scenarios/{name}/state`. */
+  | "scenario.write"
+  /** `Action::SpaceTeardown` — Operator-tier, from `DELETE .../spaces/{flowId}`. */
+  | "space.teardown"
+  /**
+   * `Action::SpaceStubWrite` — Editor-tier, and it authorizes **two** controls that do not look
+   * related: scoping a stub into a space, and *setting a flow-state value*.
+   *
+   * There is no `FlowStateWrite` action. `admin_front.rs` classifies
+   * `PUT /admin/imposters/{port}/flow-state/{flowId}/{key}` as upstream's `imposter.write` carrying
+   * a space, and `principal.rs::map_action` maps that pair to `SpaceStubWrite` — its comment names
+   * this route explicitly ("both redefine behaviour rather than merely disturbing it").
+   *
+   * The consequence is visible on screen and looks like a bug until you read that mapping: on the
+   * flow-state panel an operator may *clear* an entry (`flowState.clear`, Operator) but may not
+   * *set* one. Inventing a `flowState.write` capability to make the panel symmetrical would draw a
+   * control the server refuses — the exact drift this table exists to prevent.
+   */
+  | "space.stubWrite"
+  /** `Action::FlowStateRead` — Viewer. Same wire-folding note as `scenario.read`. */
+  | "flowState.read"
+  /**
+   * `Action::FlowStateClear` — Operator-tier.
+   *
+   * Covers both flow-state deletes: `map_action` returns it for any `imposter.delete` under
+   * `/admin/imposters/`, whether the path names a single key or the whole flow.
+   */
+  | "flowState.clear"
   | "tenant.manage"
   | "audit.read"
   | "fleet.read"
@@ -75,18 +120,27 @@ export type Capability =
 export function roleAllows(role: Role, capability: Capability): boolean {
   switch (role) {
     case "viewer":
-      return capability === "imposter.read";
+      return (
+        capability === "imposter.read" ||
+        capability === "scenario.read" ||
+        capability === "flowState.read"
+      );
     case "operator":
       return (
         roleAllows("viewer", capability) ||
         capability === "imposter.lifecycle" ||
-        capability === "requests.clear"
+        capability === "requests.clear" ||
+        capability === "scenario.reset" ||
+        capability === "space.teardown" ||
+        capability === "flowState.clear"
       );
     case "editor":
       return (
         roleAllows("operator", capability) ||
         capability === "imposter.write" ||
-        capability === "imposter.delete"
+        capability === "imposter.delete" ||
+        capability === "scenario.write" ||
+        capability === "space.stubWrite"
       );
     case "tenant-admin":
       return (

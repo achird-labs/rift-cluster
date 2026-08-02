@@ -92,6 +92,18 @@ export const NAV: readonly NavEntry[] = [
   },
   {
     kind: "live",
+    id: "scenarios",
+    label: "Scenarios & state",
+    route: { screen: "scenarios", port: null, flow: null },
+    // The weakest thing the screen can do, deliberately. Its controls gate individually — reset is
+    // Operator, set-state and the flow-state write are Editor — so requiring a write capability
+    // here would hide the whole screen from a viewer entitled to read every scenario on it.
+    requires: "scenario.read",
+    group: "mocks",
+    glyph: "▤",
+  },
+  {
+    kind: "live",
     id: "cluster",
     label: "Cluster & fleet",
     route: { screen: "cluster" },
@@ -114,17 +126,6 @@ export const NAV: readonly NavEntry[] = [
     requires: "tenant.manage",
     group: "administration",
     glyph: "◇",
-  },
-  {
-    kind: "planned",
-    id: "scenarios",
-    label: "Scenarios & state",
-    // #232, not the RFC-005 epic #149. The scenario, space and flow-state routes already ship and
-    // serve — what is missing is a console slice, so the chip must name the work that is actually
-    // outstanding rather than an epic this screen does not depend on.
-    issue: 232,
-    note: "Scenarios, spaces and flow state. The backend ships; the screen does not.",
-    glyph: "○",
   },
   {
     kind: "planned",

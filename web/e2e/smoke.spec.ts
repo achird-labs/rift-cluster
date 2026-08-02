@@ -13,6 +13,7 @@ const SCREENS = [
   { hash: "/cluster", heading: /cluster & fleet/i },
   { hash: "/requests", heading: /request log/i },
   { hash: "/routes", heading: /front-door routes/i },
+  { hash: "/scenarios", heading: /scenarios & state/i },
 ] as const;
 
 test.describe("the shipped console loads", () => {
@@ -95,6 +96,40 @@ test.describe("roles get the console their bindings allow", () => {
   test("the tenant in view is named even with nothing to switch to", async ({ page }) => {
     await signIn(page, "tenant-admin");
     await expect(page.getByTestId("tenant-current")).toContainText("default");
+  });
+
+  test("a viewer reads scenarios and is offered no control that disturbs them", async ({ page }) => {
+    const { imposters } = fixture();
+    await signIn(page, "viewer");
+    // The entry must be *offered* — `scenario.read` is a Viewer grant, so hiding the screen would
+    // withhold a surface the role is entitled to.
+    await expect(page.getByTestId("nav-scenarios")).toBeVisible();
+    await goToScreen(page, `/scenarios/${imposters[0]}`);
+    await expect(page.getByTestId("reset-scenarios")).toHaveCount(0);
+    await expect(page.getByTestId("space-teardown")).toHaveCount(0);
+    await expect(page.getByTestId("flow-state-clear-all")).toHaveCount(0);
+  });
+
+  test("an operator may reset and tear down but not redefine", async ({ page }) => {
+    /*
+     * The disturb/redefine split, in the shipped artifact. `ScenarioReset` and `SpaceTeardown` are
+     * Operator; `ScenarioWrite` and `SpaceStubWrite` are Editor. The flow-state panel is the
+     * counter-intuitive one — an operator may clear an entry but not set one, because the server
+     * classifies the `PUT` as `SpaceStubWrite`.
+     */
+    const { imposters } = fixture();
+    await signIn(page, "operator");
+    await goToScreen(page, `/scenarios/${imposters[0]}`);
+    await expect(page.getByTestId("reset-scenarios")).toBeVisible();
+    await expect(page.getByTestId("flow-state-clear-all")).toBeVisible();
+    await expect(page.getByTestId("space-add-stub")).toHaveCount(0);
+  });
+
+  test("an editor may scope a stub into a space", async ({ page }) => {
+    const { imposters } = fixture();
+    await signIn(page, "editor");
+    await goToScreen(page, `/scenarios/${imposters[0]}`);
+    await expect(page.getByTestId("space-add-stub")).toBeVisible();
   });
 
   test("a fleet-admin sees the fleet screen a viewer is refused", async ({ page }) => {
