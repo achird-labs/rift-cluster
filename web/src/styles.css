@@ -57,6 +57,13 @@
     0 1px 2px rgba(17, 26, 46, 0.07), 0 1px 1px rgba(17, 26, 46, 0.04);
 
   /*
+   * The modal backdrop. A token rather than a literal because it is theme-sensitive in the same way
+   * `--shadow` is: a translucent ink that reads as a dimmed page over `--ground: #f5f7fc` is nearly
+   * invisible over the dark theme's `#0b1326`, so each theme states its own.
+   */
+  --scrim: rgba(17, 26, 46, 0.55);
+
+  /*
    * Motion: the "subtle" tier only — 150–200ms, ease-out. An operator console watching a
    * 12,000-row log has no motion budget beyond acknowledging a click.
    */
@@ -96,6 +103,9 @@
     --idle: #8394b3;
     --idle-soft: #1c2438;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+    /* Deeper than light mode's: the dark surfaces are already close to the backdrop's ink, so the
+       same alpha would barely separate the dialog from the page it is covering. */
+    --scrim: rgba(0, 0, 0, 0.66);
   }
 }
 
@@ -938,6 +948,79 @@ input[type="radio"] {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
+}
+
+/* ── Confirm dialog ────────────────────────────────────────────────────────
+   `primitives.tsx::Confirm` — the modal every destructive act goes through
+   (delete imposter, clear request log, reset scenarios, tear down space, clear
+   flow state).
+
+   These three rules were absent from this sheet until #236. `Confirm` went on
+   rendering the markup, so the dialog appeared as an ordinary block in the page
+   flow: no overlay, no centring, no surface of its own, and a page behind it
+   that stayed clickable while `aria-modal="true"` told assistive technology
+   otherwise. Nothing failed — no test named these selectors, and the committed
+   visual baseline had captured the unstyled rendering as correct.
+
+   Scroll is a separate matter and is NOT addressed here: nothing locks the
+   document while the dialog is open, so a wheel over the scrim still scrolls
+   the page behind it. That needs JS, not CSS. */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  /* The only z-index in this stylesheet, and it is this large for one concrete reason: monaco
+     ships its own stacked layers into the stub editor — 40 for the suggest widget, but also 1000
+     and 10000 (`messageController.css`'s overlay message) — and none of the console's editor
+     containers establishes a stacking context that would box them in. A confirmation opened over
+     an editor must win against all of them, so this sits above monaco's highest rather than above
+     only the popup people think of first. */
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Keeps the dialog off the viewport edges on a short window, and is what bounds it when the
+     content is tall enough to need scrolling. */
+  padding: 24px;
+  background: var(--scrim);
+}
+
+.confirm {
+  width: min(440px, 100%);
+  /* A confirmation names the thing it is about to destroy, and an imposter name can be long. Bound
+     the height and scroll rather than letting the dialog grow past the viewport, which would put
+     its buttons somewhere the operator cannot reach. */
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 18px 20px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+}
+
+.confirm h2 {
+  margin: 0 0 8px;
+  font: 600 15px/1.3 var(--sans);
+}
+
+.confirm p {
+  margin: 0;
+  color: var(--ink-2);
+}
+
+/*
+ * Scoped to the dialog, exactly as the prototype has it (`console-prototype.html:453`), and that
+ * scope is load-bearing rather than tidiness: `.acts` has a second, unrelated use as the
+ * flow-state action area on the scenarios screen (`Scenarios.tsx`), where it wraps a textarea
+ * form beside a danger button. A bare `.acts` rule turns those into shrink-to-fit, right-aligned
+ * flex items and collapses the textarea — a screen this change has no business touching.
+ */
+.confirm .acts {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
 }
 
 /* ── Empty states ──────────────────────────────────────────────────────── */
