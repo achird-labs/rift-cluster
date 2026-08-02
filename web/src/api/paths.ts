@@ -19,6 +19,12 @@ export const API_PATHS = {
    * tenant's rows is not thereby trusted to see — or redirect — where every tenant's rows go.
    */
   auditSink: "/admin/audit/sink",
+  /**
+   * The tenant's declared imposter sources, with this node's poll status kept structurally apart.
+   * No member-path builder: the screen has no per-source route, so `#/sources/mocks` falls back
+   * (see `routing.ts`).
+   */
+  sources: "/admin/sources",
 } as const satisfies Record<string, ApiPath>;
 
 /** Path builders for the templated routes, so a port is interpolated in exactly one place. */

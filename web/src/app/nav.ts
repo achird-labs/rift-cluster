@@ -104,6 +104,18 @@ export const NAV: readonly NavEntry[] = [
   },
   {
     kind: "live",
+    id: "sources",
+    label: "Sources",
+    // #233 shipped: the backend has carried sources, provenance and drift for a while, and this
+    // entry used to tell an operator "not yet shipped, see #233" while pointing at the very issue
+    // that built the screen it was missing.
+    route: { screen: "sources" },
+    requires: "source.read",
+    group: "mocks",
+    glyph: "▤",
+  },
+  {
+    kind: "live",
     id: "cluster",
     label: "Cluster & fleet",
     route: { screen: "cluster" },
@@ -126,17 +138,6 @@ export const NAV: readonly NavEntry[] = [
     requires: "tenant.manage",
     group: "administration",
     glyph: "◇",
-  },
-  {
-    kind: "planned",
-    id: "sources",
-    label: "Sources",
-    // #233, not #20 — which is **closed**. The source providers shipped and the chip went on
-    // telling operators "not yet shipped, see #20", which is precisely the dead end RFC-006 §4's
-    // "a visible roadmap, not a 404" exists to avoid.
-    issue: 233,
-    note: "Imposter sources, provenance and drift. The backend ships; the screen does not.",
-    glyph: "○",
   },
   {
     kind: "planned",

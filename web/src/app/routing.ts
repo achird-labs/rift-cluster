@@ -8,6 +8,8 @@ export type Route =
   | { screen: "imposters" }
   | { screen: "imposter"; port: number }
   | { screen: "cluster" }
+  /** Imposter sources, fleet-replicated. There is no per-source route — see `parseHash`. */
+  | { screen: "sources" }
   /** `port: null` is "no imposter chosen yet", which the screen answers with a picker. */
   | { screen: "requests"; port: number | null }
   | { screen: "routes" }
@@ -46,6 +48,9 @@ export function parseHash(hash: string): Route {
     return port === null ? IMPOSTERS : { screen: "imposter", port };
   }
   if (head === "cluster" && second === undefined) return { screen: "cluster" };
+  // No second segment: there is no per-source screen, so `#/sources/mocks` is a stale bookmark and
+  // falls back like every other unrecognised longer hash.
+  if (head === "sources" && second === undefined) return { screen: "sources" };
   if (head === "requests") {
     if (second === undefined) return { screen: "requests", port: null };
     return { screen: "requests", port: parsePort(second) };
@@ -121,6 +126,8 @@ export function toHash(route: Route): string {
       return `#/imposters/${route.port}`;
     case "cluster":
       return "#/cluster";
+    case "sources":
+      return "#/sources";
     case "requests":
       return route.port === null ? "#/requests" : `#/requests/${route.port}`;
     case "routes":

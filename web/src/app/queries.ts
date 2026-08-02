@@ -63,6 +63,8 @@ type PrincipalCreate = components["schemas"]["PrincipalCreate"];
 type PrincipalUpdate = components["schemas"]["PrincipalUpdate"];
 type IssuedPrincipal = components["schemas"]["IssuedPrincipal"];
 type Role = components["schemas"]["Role"];
+type SourceRecord = components["schemas"]["SourceRecord"];
+type SourcesNodeLocal = components["schemas"]["SourcesNodeLocal"];
 
 /**
  * The tenant is part of every query key, not just the request headers.
@@ -84,6 +86,34 @@ export function useImposters(): UseQueryResult<Imposter[]> {
       // `imposters` is optional in the contract, so an absent array is a shape the schema permits —
       // a domain-optional read, not a swallowed failure. A non-2xx has already thrown in `client`.
       return body.imposters ?? [];
+    },
+    ...POLLED,
+  });
+}
+
+/**
+ * The tenant's declared imposter sources, plus this node's own poll status.
+ *
+ * The two halves are read together, in one round trip, and kept apart in the return type rather
+ * than merged: `sources` is the fleet-replicated projection, `nodeLocal` is true of the answering
+ * node only. Flattening a poll error onto its source's record would render one node's transient
+ * failure as a fleet-wide fact — see `Sources.tsx`.
+ */
+export function useSources(): UseQueryResult<{
+  sources: SourceRecord[];
+  nodeLocal: SourcesNodeLocal;
+}> {
+  const { tenant } = useSession();
+  return useQuery({
+    queryKey: key(["sources"], tenant),
+    queryFn: async () => {
+      // Both keys are **required** by the contract — unlike `/imposters`, whose `imposters?` is
+      // genuinely optional. So there is no `?? []` here: an absent `sources` would be a contract
+      // violation, and defaulting it would turn a broken read into the confident on-screen claim
+      // "no sources declared for this tenant". Let it surface instead.
+      return apiGet<{ sources: SourceRecord[]; nodeLocal: SourcesNodeLocal }>(API_PATHS.sources, {
+        tenant,
+      });
     },
     ...POLLED,
   });

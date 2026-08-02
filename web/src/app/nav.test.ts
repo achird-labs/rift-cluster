@@ -6,15 +6,16 @@ import { toHash } from "./routing.ts";
 describe("nav model", () => {
   it("ships the screens C4, C6 and C7 actually built as live entries", () => {
     // C6 (#189) turns `requests` live and adds the front-door route editor beside it. C7 (#190)
-    // turns `administration` live.
+    // turns `administration` live. #233 turns `sources` live.
     //
-    // The order is the rail's section grouping, not authoring order: the three mock screens, then
+    // The order is the rail's section grouping, not authoring order: the four mock screens, then
     // fleet, then administration.
     expect(liveEntries().map((e) => e.id)).toEqual([
       "imposters",
       "requests",
       "routes",
       "scenarios",
+      "sources",
       "cluster",
       "administration",
     ]);
@@ -45,20 +46,16 @@ describe("nav model", () => {
   it("renders every unshipped screen as a planned entry rather than omitting it", () => {
     /*
      * RFC-006 §4: "a visible roadmap, not a 404" — so each chip must name work that is actually
-     * outstanding, which is not the same as naming the epic the feature belongs to.
+     * outstanding, which is not the same as naming the epic the feature belongs to. `specs` names
+     * #148 because there genuinely is nothing to render until RFC-004 lands.
      *
-     * `sources` points at #233 rather than #20: the provider SPI shipped and the chip went on
-     * telling operators "not yet shipped, see #20", which is **closed** — the exact dead end this
-     * design exists to avoid. `specs` still names #148 because there genuinely is nothing to render
-     * until RFC-004 lands.
-     *
-     * `scenarios` is no longer here: #232 built it, so the chip became a live entry. That is the
-     * whole lifecycle this list is meant to have — a planned entry is a promise, and the promise is
-     * discharged by the entry graduating rather than by the number being edited again.
+     * `sources` is no longer here: #233 built it, so the chip became a live entry. `scenarios` left
+     * the same way for #232. That is the whole lifecycle this list is meant to have — a planned
+     * entry is a promise, and the promise is discharged by the entry graduating rather than by the
+     * number being edited again.
      */
     const planned = Object.fromEntries(plannedEntries().map((e) => [e.id, e.issue]));
     expect(planned).toEqual({
-      sources: 233,
       specs: 148,
     });
   });

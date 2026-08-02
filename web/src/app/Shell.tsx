@@ -7,6 +7,7 @@ import { Imposters } from "../screens/Imposters.tsx";
 import { RequestLog } from "../screens/RequestLog.tsx";
 import { RouteTableScreen } from "../screens/Routes.tsx";
 import { Scenarios } from "../screens/Scenarios.tsx";
+import { Sources } from "../screens/Sources.tsx";
 import { GROUP_LABEL, ISSUE_URL, NAV, NAV_GROUPS, type NavGroup, groupOf } from "./nav.ts";
 import { SignOut } from "./SignOut.tsx";
 import { useSession } from "./session.tsx";
@@ -42,6 +43,8 @@ function Screen({ route }: { route: Route }): ReactNode {
       return <ImposterDetail port={route.port} />;
     case "cluster":
       return <Fleet />;
+    case "sources":
+      return <Sources />;
     case "requests":
       return <RequestLog port={route.port} />;
     case "routes":

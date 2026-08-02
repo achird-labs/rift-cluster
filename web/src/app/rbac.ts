@@ -40,6 +40,16 @@ export type Capability =
    */
   | "imposter.delete"
   /**
+   * `Action::SourceRead` — Viewer, alongside `ImposterRead`.
+   *
+   * Its own action server-side, not a shade of `imposter.read`: `GET /admin/sources` authorizes
+   * directly against `SourceRead` rather than folding onto `ImposterRead` the way `scenario.read`'s
+   * wire route does. A source is a distinct resource from the imposters it produces — it can be
+   * declared and read before it has ever pulled anything — so it earns its own capability rather
+   * than reusing the one for the imposters it may one day own.
+   */
+  | "source.read"
+  /**
    * `Action::SavedRequestsClear` — Operator-tier, alongside `LifecycleToggle`.
    *
    * `authz.rs` groups the Operator arm as "disturb" actions (clear a log, reset a scenario, tear
@@ -123,7 +133,8 @@ export function roleAllows(role: Role, capability: Capability): boolean {
       return (
         capability === "imposter.read" ||
         capability === "scenario.read" ||
-        capability === "flowState.read"
+        capability === "flowState.read" ||
+        capability === "source.read"
       );
     case "operator":
       return (
