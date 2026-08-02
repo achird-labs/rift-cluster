@@ -5,9 +5,16 @@ import { describe, expect, it } from "vitest";
 import {
   API_PATHS,
   fleetOpPath,
+  flowStateEntryPath,
+  flowStatePath,
   imposterPath,
   lifecyclePath,
   requestsPath,
+  scenarioStatePath,
+  scenariosPath,
+  scenariosResetPath,
+  spacePath,
+  spaceStubsPath,
   stubByIdPath,
 } from "../api/paths.ts";
 import { FLEET_HEALTH_FIELDS, FLEET_MEMBER_FIELDS, IMPOSTER_COLUMNS } from "../app/contract.ts";
@@ -191,6 +198,59 @@ describe("stubs are addressed by id and never by index (RFC-006 C5, AC9)", () =>
         /\/imposters\/[^\n"'`]*\/stubs\/(?!by-id\/)/.test(withoutComments(readFileSync(path, "utf8"))),
       );
     expect(offenders).toEqual([]);
+  });
+});
+
+describe("the scenario, space and flow-state routes are published ones (#232)", () => {
+  it("builds every route the screen calls against a template the contract declares", () => {
+    // These builders interpolate a *flow id* as well as a port, so the numeric normalisation the
+    // scan above uses cannot reach them — without this they would be the only builders in the
+    // console not covered by §11's "no field sourced from a UI-only endpoint".
+    const cases: [string, string][] = [
+      [scenariosPath(4545, null), "/imposters/{port}/scenarios"],
+      [scenarioStatePath(4545, "checkout"), "/imposters/{port}/scenarios/{scenarioName}/state"],
+      [scenariosResetPath(4545), "/imposters/{port}/scenarios/reset"],
+      [spacePath(4545, "f1"), "/imposters/{port}/spaces/{flowId}"],
+      [spaceStubsPath(4545, "f1"), "/imposters/{port}/spaces/{flowId}/stubs"],
+      [flowStatePath(4545, "f1"), "/admin/imposters/{port}/flow-state/{flowId}"],
+      [flowStateEntryPath(4545, "f1", "cart"), "/admin/imposters/{port}/flow-state/{flowId}/{key}"],
+    ];
+    for (const [built, template] of cases) {
+      expect([built, CONTRACT.includes(`"${template}": {`)]).toEqual([built, true]);
+    }
+  });
+
+  it("sends the scenario flow as a query parameter, never as a path segment", () => {
+    /*
+     * The contract has two different `flowId` parameters and they are not interchangeable:
+     * `listScenarios` takes one `in: query`, while the space routes take one `in: path`. Splicing
+     * the scenario flow into the path would address `/imposters/4545/scenarios/f1` — a route the
+     * contract does not publish at all, which 404s rather than filtering.
+     */
+    expect(scenariosPath(4545, null)).toBe("/imposters/4545/scenarios");
+    expect(scenariosPath(4545, "f1")).toBe("/imposters/4545/scenarios?flowId=f1");
+  });
+
+  it("percent-encodes every operator-chosen segment rather than splicing it in raw", () => {
+    // Flow ids, scenario names and flow-state keys are all operator-chosen and all reach a path
+    // segment. One carrying a `/` must arrive as a single segment and 404, never address a
+    // different route than the operator asked for.
+    expect(spacePath(4545, "a/b")).toBe("/imposters/4545/spaces/a%2Fb");
+    expect(spaceStubsPath(4545, "a/b")).toBe("/imposters/4545/spaces/a%2Fb/stubs");
+    expect(scenarioStatePath(4545, "a/b")).toBe("/imposters/4545/scenarios/a%2Fb/state");
+    expect(flowStateEntryPath(4545, "a/b", "c/d")).toBe(
+      "/admin/imposters/4545/flow-state/a%2Fb/c%2Fd",
+    );
+    expect(scenariosPath(4545, "a/b")).toBe("/imposters/4545/scenarios?flowId=a%2Fb");
+  });
+
+  it("declares the scenario and flow-state fields the screen renders", () => {
+    for (const field of ["name", "state"]) {
+      expect([field, declares("ScenarioEntry", field)]).toEqual([field, true]);
+    }
+    for (const field of ["flowId", "key", "value"]) {
+      expect([field, declares("FlowStateEntry", field)]).toEqual([field, true]);
+    }
   });
 });
 

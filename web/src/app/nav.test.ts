@@ -14,9 +14,19 @@ describe("nav model", () => {
       "imposters",
       "requests",
       "routes",
+      "scenarios",
       "cluster",
       "administration",
     ]);
+  });
+
+  it("offers scenarios on the read capability, not on a write one (#232)", () => {
+    // The screen gates each control separately — reset is Operator, set-state is Editor — so the
+    // entry itself must gate on the weakest thing it can do. Requiring a write capability here
+    // would hide the whole screen from a viewer entitled to read every scenario on it.
+    const scenarios = liveEntries().find((entry) => entry.id === "scenarios");
+    expect(scenarios?.requires).toBe("scenario.read");
+    expect(scenarios?.group).toBe("mocks");
   });
 
   it("declares entries already sorted into rail group order", () => {
@@ -37,15 +47,17 @@ describe("nav model", () => {
      * RFC-006 §4: "a visible roadmap, not a 404" — so each chip must name work that is actually
      * outstanding, which is not the same as naming the epic the feature belongs to.
      *
-     * `scenarios` points at #232 rather than the RFC-005 epic #149, and `sources` at #233 rather
-     * than #20: both backends already ship, so what is missing is a console slice. #20 in
-     * particular is **closed**, and the chip went on telling operators "not yet shipped, see #20" —
-     * the exact dead end this design exists to avoid. `specs` still names #148 because there
-     * genuinely is nothing to render until RFC-004 lands.
+     * `sources` points at #233 rather than #20: the provider SPI shipped and the chip went on
+     * telling operators "not yet shipped, see #20", which is **closed** — the exact dead end this
+     * design exists to avoid. `specs` still names #148 because there genuinely is nothing to render
+     * until RFC-004 lands.
+     *
+     * `scenarios` is no longer here: #232 built it, so the chip became a live entry. That is the
+     * whole lifecycle this list is meant to have — a planned entry is a promise, and the promise is
+     * discharged by the entry graduating rather than by the number being edited again.
      */
     const planned = Object.fromEntries(plannedEntries().map((e) => [e.id, e.issue]));
     expect(planned).toEqual({
-      scenarios: 232,
       sources: 233,
       specs: 148,
     });

@@ -113,7 +113,7 @@ adds no header logic of its own beyond sending the selection.
 | **Cluster** — members, leader, ring epoch, readiness, pending ops | §5.2's admin-port fleet reads (projection of `cluster_api.rs:63-191`) | v1 |
 | **Front-door routes** — table editor | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` (`admin_front.rs:348-360,405,419-438`) | v1 |
 | **Tenants / principals / roles / tokens / audit** | RFC-002 §5 admin surface + `GET /admin/audit` | with RFC-002 T3/T4 |
-| **Scenarios & flow state** — inspect, reset | RFC-005 state API | with RFC-005 |
+| **Scenarios & state** — scenario states per space, a space's scoped stubs, flow-state entries; set/reset/tear down/clear | `GET/POST/PUT /imposters/:port/scenarios*`, `GET/DELETE /imposters/:port/spaces/:flowId(/stubs)`, `GET/PUT/DELETE /admin/imposters/:port/flow-state/:flowId(/:key)` — all upstream routes that already ship and are contracted in `openapi-ee.yaml` | v1 (#232) |
 | **Sources** — imposter sources status (#20) | doc-13 sources admin surface | with #20 |
 | **Specs** — imported OpenAPI/proto specs | RFC-004 admin surface | with RFC-004 |
 
@@ -482,7 +482,15 @@ C1–C3 are strictly ordered; C4+ and M1+ parallelize.
 | **M1 — MCP scaffold** | `mcp` subcommand, rmcp pinned, read tools + `lint`, `--api-key-file` | An agent lists imposters against a live cluster via stdio |
 | **M2 — MCP writes** | write tools with idempotency-from-call-id, `expected_revision`/409 shape, `{parked, op_id}` + `op_status` | Retry-after-timeout dedups (one commit); conflict returns structured rebase error |
 | **M3 — MCP scoping** | `whoami`-driven tool registration, audit attribution verified end-to-end | Viewer key exposes no write tools; MCP write appears in audit as its principal |
-| **v2 (follow-ups, not this RFC)** | SSE cache invalidation (§6); scenario/state screens (RFC-005); specs screen (RFC-004); merged-journal request log (doc-07); OIDC session minting; MCP HTTP transport | — |
+| **C8 — scenarios & state** (#232) | scenario states per space, space stubs and teardown, flow-state entries; seven capabilities transcribed into `rbac.ts` | Every control gated on the action `map_action` actually returns; unreadable ≠ empty on all three panels |
+| **v2 (follow-ups, not this RFC)** | SSE cache invalidation (§6); specs screen (RFC-004); merged-journal request log (doc-07); OIDC session minting; MCP HTTP transport | — |
+
+The scenario/state screens were listed here as a v2 follow-up "with RFC-005",
+and that was a scheduling error rather than a dependency: the routes they read
+have shipped since before this RFC, so nothing about them was waiting on
+RFC-005. #232 built them as C8. RFC-005 still gates the *richer* model that
+comes later — datasets, contexts, the inspector — which converges on this
+screen rather than replacing it.
 
 ## 12. Open questions
 

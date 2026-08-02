@@ -55,7 +55,7 @@ test.describe("accessibility", () => {
     expect(found, describeViolations(found)).toEqual([]);
   });
 
-  for (const hash of ["/imposters", "/cluster", "/requests", "/routes"]) {
+  for (const hash of ["/imposters", "/cluster", "/requests", "/routes", "/scenarios"]) {
     test(`the ${hash} screen`, async ({ page }) => {
       await signIn(page, "fleet-admin");
       await goToScreen(page, hash);
@@ -79,6 +79,17 @@ test.describe("accessibility", () => {
     await signIn(page, "editor");
     await goToScreen(page, "/imposters");
     await page.getByTestId("new-imposter").click();
+    const found = await violations(page);
+    expect(found, describeViolations(found)).toEqual([]);
+  });
+
+  test("the scenarios screen, whose panels are three forms", async ({ page }) => {
+    // The picker above covers the empty shape; this covers the populated one. Every panel here is a
+    // form — a scenario state input, a stub textarea, a flow-state key and value — and a field that
+    // loses its label association is invisible to a screen reader and to `getByLabel`.
+    const { imposters } = fixture();
+    await signIn(page, "editor");
+    await goToScreen(page, `/scenarios/${imposters[0]}`);
     const found = await violations(page);
     expect(found, describeViolations(found)).toEqual([]);
   });

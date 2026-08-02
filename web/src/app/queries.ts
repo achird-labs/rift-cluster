@@ -18,9 +18,16 @@ import {
   frontDoorRoutePath,
   imposterPath,
   lifecyclePath,
+  flowStateEntryPath,
+  flowStatePath,
   principalPath,
   principalsPath,
   requestsPath,
+  scenarioStatePath,
+  scenariosPath,
+  scenariosResetPath,
+  spacePath,
+  spaceStubsPath,
   stubByIdPath,
   stubsPath,
   tenantPath,
@@ -29,6 +36,14 @@ import type { components } from "../api/schema.ts";
 import { type AuditRow, auditPage, readAuditRows } from "../features/admin/audit.ts";
 import { stripApiKey } from "../features/admin/key.ts";
 import { type LogState, readLog } from "../features/requests/source.ts";
+import {
+  type FlowStateRead,
+  type ScenarioState,
+  type SpaceState,
+  readFlowStateEntry,
+  readScenarios,
+  readSpace,
+} from "../features/scenarios/space.ts";
 import { type Route, normalizeTable } from "../features/routes/order.ts";
 import { type FleetView, fleetView } from "./fleetView.ts";
 import { POLLED, POLLED_REQUESTS } from "./query.ts";
@@ -432,6 +447,260 @@ export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { po
       return outcome;
     },
     onSettled: () => client.invalidateQueries({ queryKey: ["requests"] }),
+  });
+}
+
+/**
+ * Scenario states for one imposter, under one space (#232).
+ *
+ * `flow: null` sends no `flowId`, and the imposter resolves its own default — the response echoes
+ * which one it used, and that echo is what every other read on the screen is then scoped to. A
+ * failed read becomes `unknown` rather than rejecting, because "this imposter declares no
+ * scenarios" and "this node could not answer" are different sentences and only the type keeps them
+ * apart.
+ */
+export function useScenarios(port: number, flow: string | null): UseQueryResult<ScenarioState> {
+  const { tenant } = useSession();
+  return useQuery({
+    queryKey: key(["scenarios", port, flow], tenant),
+    queryFn: async (): Promise<ScenarioState> => {
+      try {
+        return readScenarios(await apiGet<unknown>(scenariosPath(port, flow), { tenant }));
+      } catch (error) {
+        return {
+          kind: "unknown",
+          reason: error instanceof Error ? error.message : "this node could not be reached",
+        };
+      }
+    },
+    ...POLLED,
+  });
+}
+
+/**
+ * One correlated-isolation space.
+ *
+ * `flowId` is `null` until the scenario read has resolved which flow the screen is looking at —
+ * there is no route that lists spaces, so a space cannot be read before its id is known.
+ */
+export function useSpace(port: number, flowId: string | null): UseQueryResult<SpaceState> {
+  const { tenant } = useSession();
+  return useQuery({
+    queryKey: key(["space", port, flowId], tenant),
+    queryFn: async (): Promise<SpaceState> => {
+      // `enabled` below keeps this unreachable with a null flow; the guard is here so the type
+      // narrows rather than being asserted away.
+      if (flowId === null) return { kind: "unknown", reason: "no flow selected" };
+      try {
+        return readSpace(await apiGet<unknown>(spacePath(port, flowId), { tenant }));
+      } catch (error) {
+        return {
+          kind: "unknown",
+          reason: error instanceof Error ? error.message : "this node could not be reached",
+        };
+      }
+    },
+    enabled: flowId !== null,
+    ...POLLED,
+  });
+}
+
+/**
+ * One flow-state entry, read on demand.
+ *
+ * On demand rather than polled, and keyed by a key the operator typed, because the contract
+ * publishes no route that lists a flow's entries — the panel can only answer about a key someone
+ * names. A `404` becomes `absent` rather than an error: the contract documents it as "no such
+ * entry", though see `ABSENT_ENTRY_CAVEAT` for why the screen does not read that as proof.
+ */
+export function useFlowStateEntry(
+  port: number,
+  flowId: string | null,
+  entryKey: string | null,
+): UseQueryResult<FlowStateRead> {
+  const { tenant } = useSession();
+  return useQuery({
+    queryKey: key(["flow-state", port, flowId, entryKey], tenant),
+    queryFn: async (): Promise<FlowStateRead> => {
+      if (flowId === null || entryKey === null) {
+        return { kind: "unknown", reason: "no key requested" };
+      }
+      try {
+        return readFlowStateEntry(
+          await apiGet<unknown>(flowStateEntryPath(port, flowId, entryKey), { tenant }),
+        );
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) return { kind: "absent" };
+        return {
+          kind: "unknown",
+          reason: error instanceof Error ? error.message : "this node could not be reached",
+        };
+      }
+    },
+    enabled: flowId !== null && entryKey !== null,
+  });
+}
+
+/**
+ * Move one scenario to a state, **within one space**.
+ *
+ * `flowId` is always sent when the screen knows one. Omitting it is not a no-op: the route silently
+ * writes the imposter's *default* flow, so a screen scoped to `checkout-1` that forgot it would
+ * move a scenario in a space the operator is not looking at and report success.
+ */
+export function useSetScenarioState(): UseMutationResult<
+  CommitOutcome,
+  Error,
+  { port: number; name: string; state: string; flowId: string | null }
+> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port, name, state, flowId }) => {
+      const body = flowId === null ? { state } : { state, flowId };
+      const sent = await apiSend("PUT", scenarioStatePath(port, name), body, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => {
+      void client.invalidateQueries({ queryKey: ["scenarios"] });
+      void client.invalidateQueries({ queryKey: ["space"] });
+    },
+  });
+}
+
+/** Reset every scenario in one space. Same `flowId` discipline as the write above. */
+export function useResetScenarios(): UseMutationResult<
+  CommitOutcome,
+  Error,
+  { port: number; flowId: string | null }
+> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port, flowId }) => {
+      const sent = await apiSend(
+        "POST",
+        scenariosResetPath(port),
+        flowId === null ? {} : { flowId },
+        { tenant },
+      );
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => {
+      void client.invalidateQueries({ queryKey: ["scenarios"] });
+      void client.invalidateQueries({ queryKey: ["space"] });
+    },
+  });
+}
+
+/** Tear one space down — its scoped stubs and its scenario states go with it. */
+export function useTeardownSpace(): UseMutationResult<
+  CommitOutcome,
+  Error,
+  { port: number; flowId: string }
+> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port, flowId }) => {
+      const sent = await apiSend("DELETE", spacePath(port, flowId), undefined, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => {
+      void client.invalidateQueries({ queryKey: ["space"] });
+      void client.invalidateQueries({ queryKey: ["scenarios"] });
+    },
+  });
+}
+
+/**
+ * Append a stub scoped to one space.
+ *
+ * Sent as `RawJsonBody` for the same reason the imposter's own stub editor does: the operator's
+ * text is stored as they typed it rather than reordered by a parse-and-restringify round trip.
+ */
+export function useAddSpaceStub(): UseMutationResult<
+  CommitOutcome,
+  Error,
+  { port: number; flowId: string; body: RawJsonBody }
+> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port, flowId, body }) => {
+      const sent = await apiSend("POST", spaceStubsPath(port, flowId), body, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => {
+      void client.invalidateQueries({ queryKey: ["space"] });
+      // A space stub may declare a `scenarioName`, which adds a scenario to this space — so the
+      // scenario list is stale too, and invalidating only the space would leave it a poll behind.
+      void client.invalidateQueries({ queryKey: ["scenarios"] });
+    },
+  });
+}
+
+/**
+ * Write one flow-state value.
+ *
+ * Gated in the UI on `space.stubWrite`, not on a flow-state capability — there is no
+ * `FlowStateWrite` action, and `principal.rs::map_action` classifies this route as
+ * `Action::SpaceStubWrite`. See the capability's own note in `rbac.ts`.
+ */
+export function useSetFlowStateEntry(): UseMutationResult<
+  CommitOutcome,
+  Error,
+  { port: number; flowId: string; key: string; body: RawJsonBody }
+> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port, flowId, key: entryKey, body }) => {
+      const sent = await apiSend("PUT", flowStateEntryPath(port, flowId, entryKey), body, {
+        tenant,
+      });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["flow-state"] }),
+  });
+}
+
+/**
+ * Clear flow state: one key when `key` is given, the whole space when it is not.
+ *
+ * One hook for both because the server authorizes them identically — `map_action` returns
+ * `Action::FlowStateClear` for any `imposter.delete` under `/admin/imposters/`, whether or not the
+ * path names a key.
+ */
+export function useClearFlowState(): UseMutationResult<
+  CommitOutcome,
+  Error,
+  { port: number; flowId: string; key?: string }
+> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port, flowId, key: entryKey }) => {
+      const path =
+        entryKey === undefined
+          ? flowStatePath(port, flowId)
+          : flowStateEntryPath(port, flowId, entryKey);
+      const sent = await apiSend("DELETE", path, undefined, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["flow-state"] }),
   });
 }
 
