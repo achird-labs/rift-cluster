@@ -3,6 +3,7 @@ import { type FormEvent, type ReactNode, useState } from "react";
 import { ApiError } from "../api/client.ts";
 import { isAddressablePrincipalId } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
+import { DEFAULT_TENANT } from "../app/rbac.ts";
 import type { Capability } from "../app/rbac.ts";
 import type { AdminTab } from "../app/routing.ts";
 import { toHash } from "../app/routing.ts";
@@ -124,11 +125,24 @@ export function Admin({
    * tab-specific content exists to render — the other tabs' own tab-scoped queries surface the
    * same distinction later, through `AdminApiError` again.
    */
+  /*
+   * `default` is never probed, because it has no record to find.
+   *
+   * It exists implicitly — it is where an unscoped request lands — but `/admin/tenants/default`
+   * answers `404` until somebody creates one, and the branch below renders that as the §8.4
+   * anti-oracle: no header, no tab bar, nothing at all. So the Administration screen greeted a
+   * fleet-admin with a bare "no such thing" for the tenant it had just defaulted them to.
+   *
+   * Special-casing it leaks nothing. §8.4 exists so a caller cannot learn which *other* tenants
+   * exist by watching a 403 turn into a 404; that `default` exists is a secret from nobody, and
+   * every other tenant still goes through the probe unchanged.
+   */
+  const probeable = tenant !== null && tenant !== DEFAULT_TENANT;
   const probe = useTenantProbe(tenant ?? "", {
-    enabled: tab === "tenants" && tenant !== null && mayManage,
+    enabled: tab === "tenants" && probeable && mayManage,
   });
 
-  if (tab === "tenants" && tenant !== null && mayManage && probe.isError) {
+  if (tab === "tenants" && probeable && mayManage && probe.isError) {
     /*
      * Nothing else renders in this branch — not the header, not the tab nav — because both would
      * have to encode `tenant` to stay useful, and RFC-002 §8.4 requires a cross-tenant probe and a
