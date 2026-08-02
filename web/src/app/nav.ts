@@ -103,7 +103,11 @@ export const NAV: readonly NavEntry[] = [
     kind: "live",
     id: "administration",
     label: "Tenants & principals",
-    route: { screen: "admin", tab: "tenants", tenant: null },
+    // `principals`, not `tenants`: the tenants tab is `ClusterAdmin`, while this entry is offered to
+    // anyone holding `tenant.manage`. Landing a TenantAdmin on a tab its role cannot open — and
+    // whose probe renders a bare refusal with no tab bar — left the role with no route to the two
+    // surfaces it exists for. `principals` requires exactly the capability that gates this entry.
+    route: { screen: "admin", tab: "principals", tenant: null },
     // Gates on the weakest admin capability, not `imposter.*`: viewer/operator/editor hold none of
     // `CAPABILITY_MATRIX`'s admin capabilities, so the entry (and every control inside the screen)
     // is invisible below tenant-admin, where `tenant.manage` and `audit.read` both start.

@@ -140,8 +140,27 @@ function Nav({ current }: { current: Route }): ReactNode {
 function TenantSwitcher(): ReactNode {
   const { tenant, tenants, setTenant } = useSession();
 
-  // Nothing to switch between. An inert control would imply there is.
-  if (tenants.length < 2 || tenant === null) return null;
+  // Genuinely nothing to report: no selection means requests carry no `X-Rift-Tenant` and there is
+  // no tenant name that would be true of them.
+  if (tenant === null) return null;
+
+  /*
+   * One tenant still gets a label, just not a control.
+   *
+   * This used to render nothing at all below two tenants — "an inert control would imply there is
+   * something to switch to", which is right about the *control* and wrong about the *fact*. Every
+   * read on every screen is scoped to a tenant, and a single-tenant principal (the common case for
+   * a TenantAdmin) could not see which one anywhere in the console. A static value states the
+   * scope without pretending to offer a choice.
+   */
+  if (tenants.length < 2) {
+    return (
+      <div className="tenant-switch" data-testid="tenant-current">
+        <span className="eyebrow">Tenant</span>
+        <span className="ident">{tenant}</span>
+      </div>
+    );
+  }
 
   return (
     <label className="tenant-switch">

@@ -865,19 +865,33 @@ input[type="radio"] {
   flex: none;
 }
 
-/* A checkbox and its sentence, aligned on the first line rather than centred on a wrapped block. */
-.check {
+/*
+ * A checkbox and its sentence, aligned on the first line rather than centred on a wrapped block.
+ *
+ * Written to out-specify `.stub-form label`, which sets every label in a form to the uppercase
+ * monospace eyebrow treatment and `display: grid`. Inherited by a checkbox row that produced a
+ * shouting all-caps sentence with the box stacked above it — caught by the visual baseline, which
+ * is the only layer that could have.
+ */
+.check,
+.stub-form label.check {
   display: flex;
   align-items: flex-start;
   gap: 9px;
-  font-size: 13px;
+  font: 400 13px/1.5 var(--sans);
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--ink);
   cursor: pointer;
 }
 
-.check .note {
+.check .note,
+.stub-form label.check .note {
   display: block;
   color: var(--ink-3);
-  font-size: 12px;
+  font: 400 12px/1.45 var(--sans);
+  letter-spacing: normal;
+  text-transform: none;
   margin-top: 2px;
 }
 

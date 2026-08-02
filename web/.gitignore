@@ -14,3 +14,9 @@ public/lint/
 
 # The bundle-offline gate builds here so it cannot clobber a `pnpm build` result someone is using.
 dist-scan/
+
+# Playwright's run artifacts. Traces, videos and diff images are per-run and can be megabytes; CI
+# uploads them from `test-results/` on failure rather than anyone committing them. The *baselines*
+# under `e2e/**/-snapshots/` are committed on purpose — they are the expected output, not a result.
+playwright-report/
+test-results/

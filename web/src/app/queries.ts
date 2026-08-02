@@ -3,7 +3,7 @@ import type { UseMutationResult, UseQueryResult } from "@tanstack/react-query";
 
 import {
   ApiError,
-  type RawJsonBody,
+  RawJsonBody,
   type RevisionedRead,
   type SendResult,
   apiGet,
@@ -285,8 +285,28 @@ export function useDeleteStub(): UseMutationResult<CommitOutcome, Error, StubWri
  */
 export function useAddStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
   return useStubWrite((write, tenant) =>
-    apiSend("POST", stubsPath(write.port), write.body, { tenant, ifMatch: write.revision }),
+    apiSend("POST", stubsPath(write.port), addStubBody(write.body), {
+      tenant,
+      ifMatch: write.revision,
+    }),
   );
+}
+
+/**
+ * Wrap a stub in the envelope `addStub` requires: `{"stub": …}`, optionally with an `index`.
+ *
+ * The two stub-writing routes take **different bodies** and the console got it wrong: the by-id
+ * `PUT` takes a bare `Stub`, `POST /imposters/:port/stubs` takes `{stub, index?}`. Sending the bare
+ * stub to the collection answered `400 missing field 'stub'`, so appending a stub never worked at
+ * all. Nothing caught it because the unit tests stub `fetch` — they assert what the client sends,
+ * which is precisely the thing that was wrong; only the contract or a real server can say.
+ *
+ * Wrapped textually rather than by parsing and re-serialising, because the operator's own bytes are
+ * the document (`StubEditor`'s second rule): key order and whitespace they chose survive the save,
+ * and a round trip through `JSON.parse` would quietly normalise both.
+ */
+function addStubBody(body: RawJsonBody | undefined): RawJsonBody | undefined {
+  return body === undefined ? undefined : new RawJsonBody(`{"stub":${body.text}}`);
 }
 
 /**

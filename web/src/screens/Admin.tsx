@@ -3,6 +3,7 @@ import { type FormEvent, type ReactNode, useState } from "react";
 import { ApiError } from "../api/client.ts";
 import { isAddressablePrincipalId } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
+import type { Capability } from "../app/rbac.ts";
 import type { AdminTab } from "../app/routing.ts";
 import { toHash } from "../app/routing.ts";
 import {
@@ -53,9 +54,69 @@ const TAB_LABEL: Record<AdminTab, string> = {
   sink: "Audit sink",
 };
 
-export function Admin({ tab, tenant }: { tab: AdminTab; tenant: string | null }): ReactNode {
-  const { can } = useSession();
+/**
+ * The capability each tab's own routes actually require.
+ *
+ * The tenancy surface splits across two actions and the tabs split with it: `TenantList`/`TenantRead`
+ * and the whole audit-sink triple are `ClusterAdmin`, while listing and minting principals and
+ * writing bindings are `TenantManage`. Reading a tenant's audit rows is `AuditRead`.
+ *
+ * Filtering on this is load-bearing rather than tidy. `tenants` is the tab the nav lands on, and it
+ * probes `GET /admin/tenants/:id` before rendering anything — including the tab bar, deliberately,
+ * because RFC-002 §8.4 requires a cross-tenant probe and a nonexistent tenant to produce
+ * byte-identical DOM. For a TenantAdmin that probe answers `403`, so the screen rendered a bare
+ * refusal with no navigation at all and the role could not reach the two tabs it exists for.
+ */
+export const ADMIN_TABS: readonly AdminTab[] = [
+  "tenants",
+  "principals",
+  "bindings",
+  "audit",
+  "sink",
+];
+
+const TAB_CAPABILITY: Record<AdminTab, Capability> = {
+  tenants: "cluster.admin",
+  principals: "tenant.manage",
+  bindings: "tenant.manage",
+  audit: "audit.read",
+  sink: "cluster.admin",
+};
+
+export function Admin({
+  tab: requestedTab,
+  tenant: routeTenant,
+}: {
+  tab: AdminTab;
+  tenant: string | null;
+}): ReactNode {
+  const { can, tenant: sessionTenant } = useSession();
   const mayManage = can("tenant.manage");
+  /*
+   * Fall back to the tenant the session is already scoped to.
+   *
+   * The nav links here with `tenant: null`, and the only control that *set* a tenant was a row in
+   * the Tenants tab — which lists `/admin/tenants`, a `ClusterAdmin` route. A TenantAdmin therefore
+   * could not read that list, could not pick a tenant, and hit "Choose a tenant to see this" on
+   * both Principals and Bindings forever: the role whose entire grant is `PrincipalCreate` and
+   * `BindingPut` had no route to either.
+   *
+   * The session already knows the answer — `initialTenant` resolves it from the principal's own
+   * bindings — so the screen asks it rather than requiring a fleet-scoped list to supply it. An
+   * explicit tenant in the hash still wins, which keeps every existing link and the fleet-admin's
+   * cross-tenant navigation working.
+   */
+  const tenant = routeTenant ?? sessionTenant;
+  /*
+   * The requested tab is honoured as asked, deliberately — including one this role cannot use.
+   *
+   * Redirecting away from `tenants` would strand nobody, but it would also delete the RFC-002 §8.4
+   * branch: a TenantAdmin probing that tab is exactly the caller for whom a cross-tenant tenant and
+   * a nonexistent one must answer with byte-identical DOM, and the screen renders that. The tab
+   * *bar* is filtered by capability so nothing unusable is offered; a URL typed by hand still
+   * reaches the honest refusal rather than being quietly rerouted.
+   */
+  const tab = requestedTab;
   /*
    * Only the `tenants` tab addresses one tenant directly by path (`GET /admin/tenants/:id`), so
    * it is the only tab that can answer this existence-and-permission question before any
@@ -97,7 +158,8 @@ export function Admin({ tab, tenant }: { tab: AdminTab; tenant: string | null })
 }
 
 function AdminTabs({ tab, tenant }: { tab: AdminTab; tenant: string | null }): ReactNode {
-  const tabs: AdminTab[] = ["tenants", "principals", "bindings", "audit", "sink"];
+  const { can } = useSession();
+  const tabs = ADMIN_TABS.filter((t) => can(TAB_CAPABILITY[t]));
   return (
     <nav className="admin-tabs">
       {tabs.map((t) => (
