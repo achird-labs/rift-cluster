@@ -1272,6 +1272,16 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// Every declared source in the fleet paired with its owning tenant,
+    /// `(tenant, id)`-ascending (issue #241). What the poll scheduler
+    /// reconciles against, so that a tracking source polls whichever tenant
+    /// declared it.
+    pub fn sources_all(&self) -> Result<Vec<(String, SourceRecord)>, NodeError> {
+        self.sm_reader
+            .sources_all()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// One source by id, or `None` when `tenant` has no such source.
     pub fn source(&self, tenant: &str, id: &str) -> Result<Option<SourceRecord>, NodeError> {
         self.sm_reader

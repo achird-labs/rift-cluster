@@ -12,6 +12,8 @@ use rift_cluster_base::seams::{
     FetchedImposters, ImposterConfig, ImposterSource, SourceMeta, SourceRef, SourceRegistry,
 };
 
+use crate::control::DEFAULT_TENANT;
+
 use super::{PullError, SourcePuller, bootstrap_id, canonical, check_credential_use, digest_of};
 
 /// `digest_of` is fallible; every config these tests build encodes, so a
@@ -134,7 +136,7 @@ async fn an_unbound_puller_reports_that_it_is_not_ready() {
         configs: vec![config(8080, "a")],
         version: None,
     }));
-    match puller.pull("mocks", None).await {
+    match puller.pull(DEFAULT_TENANT, "mocks", None).await {
         Err(PullError::Internal(detail)) => assert!(detail.contains("not available"), "{detail}"),
         other => panic!("an unbound puller must refuse, got {other:?}"),
     }

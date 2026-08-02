@@ -1164,7 +1164,10 @@ async fn source_pull_fetches_exactly_once_and_converges_the_fleet() {
         .status()
         .last_applied
         .expect("an applied index");
-    let report = puller.pull("mocks", None).await.expect("re-pull");
+    let report = puller
+        .pull(DEFAULT_TENANT, "mocks", None)
+        .await
+        .expect("re-pull");
     assert!(report.unchanged, "identical content is not a change");
     assert!(report.changed.is_empty());
     assert_eq!(
@@ -1186,7 +1189,10 @@ async fn source_pull_fetches_exactly_once_and_converges_the_fleet() {
     // A real change does move the fleet.
     *source.body.lock().expect("body lock") = vec![source_config(9401, "from-source-v2")];
     *source.version.lock().expect("version lock") = "v2".to_owned();
-    let report = puller.pull("mocks", None).await.expect("pull v2");
+    let report = puller
+        .pull(DEFAULT_TENANT, "mocks", None)
+        .await
+        .expect("pull v2");
     assert!(!report.unchanged);
     assert!(
         cluster
@@ -1532,7 +1538,10 @@ async fn a_credentialed_source_short_circuits_on_unchanged_content() {
         .last_applied
         .expect("an applied index");
 
-    let second = puller.pull("cred-mocks", None).await.expect("second pull");
+    let second = puller
+        .pull(DEFAULT_TENANT, "cred-mocks", None)
+        .await
+        .expect("second pull");
     assert!(
         second.unchanged,
         "identical content through a credentialed provider must short circuit"
