@@ -119,16 +119,22 @@ export const NAV: readonly NavEntry[] = [
     kind: "planned",
     id: "scenarios",
     label: "Scenarios & state",
-    issue: 149,
-    note: "Scenario and flow state (RFC-005).",
+    // #232, not the RFC-005 epic #149. The scenario, space and flow-state routes already ship and
+    // serve — what is missing is a console slice, so the chip must name the work that is actually
+    // outstanding rather than an epic this screen does not depend on.
+    issue: 232,
+    note: "Scenarios, spaces and flow state. The backend ships; the screen does not.",
     glyph: "○",
   },
   {
     kind: "planned",
     id: "sources",
     label: "Sources",
-    issue: 20,
-    note: "Data sources and tracked corpora.",
+    // #233, not #20 — which is **closed**. The source providers shipped and the chip went on
+    // telling operators "not yet shipped, see #20", which is precisely the dead end RFC-006 §4's
+    // "a visible roadmap, not a 404" exists to avoid.
+    issue: 233,
+    note: "Imposter sources, provenance and drift. The backend ships; the screen does not.",
     glyph: "○",
   },
   {

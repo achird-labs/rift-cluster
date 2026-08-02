@@ -20,3 +20,8 @@ dist-scan/
 # under `e2e/**/-snapshots/` are committed on purpose — they are the expected output, not a result.
 playwright-report/
 test-results/
+
+# Screenshot survey output (`pnpm run e2e:survey`). Exploration for a person to look at, not a
+# result to keep: regenerated on demand, changes on every UI edit, and megabytes of PNG. Committed
+# once by mistake in #230 and removed here.
+survey/
