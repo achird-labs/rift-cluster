@@ -290,6 +290,7 @@ function TenantsTab(): ReactNode {
               <th>Name</th>
               <th>Quotas</th>
               <th>Journal retention</th>
+              <th style={{ width: "12ch" }}>State</th>
               {mayManage ? <th>Actions</th> : null}
             </tr>
           </thead>
@@ -346,14 +347,46 @@ function TenantRow({
         {tenant.quotas?.maxFlowEntries ?? UNKNOWN} flow entries
       </td>
       <td>{tenant.journalRetentionSecs === 0 ? "unlimited" : `${tenant.journalRetentionSecs}s`}</td>
+      {/*
+       * `TenantDelete` is a tombstone (RFC-002 §3.3), not a row removal — the record stays with
+       * `deleted: true` and its resources are cascaded. The table rendered a deleted tenant
+       * identically to a live one, so a delete looked like it had silently failed. The tenant
+       * switcher already filters them; showing the state here is what makes the two agree.
+       */}
+      <td>
+        {tenant.deleted === true ? (
+          <Status tone="idle" label="deleted" />
+        ) : (
+          <Status tone="ok" label="active" />
+        )}
+      </td>
       {mayManage ? (
         <td>
-          <button className="btn" type="button" onClick={onEdit}>
-            Edit {tenant.displayName}
-          </button>
-          <button className="btn" type="button" onClick={onDelete}>
-            Delete {tenant.displayName}
-          </button>
+          {/* No controls on a tombstone. Editing one writes to a record nothing reads, and
+              "Delete" on an already-deleted tenant is a button whose only outcome is no change —
+              which is how an operator concludes the first delete failed. */}
+          {tenant.deleted === true ? (
+            <span className="muted">—</span>
+          ) : (
+            <span className="row">
+              <button
+                className="btn sm"
+                type="button"
+                aria-label={`Edit ${tenant.displayName}`}
+                onClick={onEdit}
+              >
+                Edit
+              </button>
+              <button
+                className="btn sm danger"
+                type="button"
+                aria-label={`Delete ${tenant.displayName}`}
+                onClick={onDelete}
+              >
+                Delete
+              </button>
+            </span>
+          )}
         </td>
       ) : null}
     </tr>

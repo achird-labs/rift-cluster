@@ -8,35 +8,33 @@ import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
  * is one stateful node shared serially — a test that leaves a tenant behind changes the next run's
  * baselines.
  *
- * ## Status: six of eight pass; two remain untriaged
+ * ## All eight pass, and every failure along the way was this spec's own
  *
- * Still excluded from `pnpm run e2e` until all eight are green — a gate that is red for reasons
- * nobody has read is a gate people learn to skip. Run with
- * `E2E_INTERACTIONS=1 pnpm exec playwright test interactions`.
+ * Worth recording, because two of them looked exactly like broken features and one produced a real
+ * product fix anyway.
  *
- * **The first triage pass found no product defects — all four failures were this spec's own.** Two
- * were wrong selectors (the tenant field is "Tenant id", not "Id"; the principal form's submit is
- * "Mint", while "Create principal" is the button that opens it) and two were Playwright strict-mode
- * violations, where `getByText` matched both a table cell and a row button. That last one mattered:
- * it made the binding and add-stub flows look broken when the captured page showed both had
- * worked — **the `{stub}` envelope fix is confirmed end to end in a real browser.**
+ * - Wrong labels: the tenant field is "Tenant id", not "Id"; the principal form's submit is "Mint"
+ *   ("Create principal" opens it); the stub row's button reads "Edit" but its accessible name is
+ *   `Edit <stubId>`, because the id moved into `aria-label` when the labels were shortened.
+ * - Strict-mode violations: `getByText` matched a table cell *and* a row button, so a locator
+ *   resolving to two elements failed as though nothing had rendered. Both the binding and the
+ *   added stub had in fact been created.
+ * - A missing `baseURL`: the conflict test opened a second browser context for realism, and
+ *   `newContext()` does not inherit it — every relative request went nowhere, no write landed, the
+ *   revision never moved, and the save under test succeeded. It waited out its timeout for a
+ *   conflict it had never caused.
+ * - A race on the pinned revision: the editor pins `If-Match` at first render, so opening it before
+ *   the imposter read lands pins `null`, which disables Save outright.
  *
- * A locator note worth keeping, because it cost two cycles: `getByText` matches text nodes only, so
- * a row button carrying its target in `aria-label` does not collide with it. `getByRole("cell")`
- * matches the cell's *accessible name*, which for the principal and imposter tables concatenates the
- * display name with the truncated id — so it matches neither cleanly. Prefer
- * `locator("tr", { hasText })` for a row.
+ * The tenants case was the one that was not a test bug on both sides: `TenantDelete` is a tombstone
+ * (RFC-002 §3.3) and the table rendered a deleted tenant identically to a live one, so a working
+ * delete read as a silent failure. The table now shows the state and drops the controls.
  *
- * Remaining, both still unexplained:
- *
- * - **tenants lifecycle** — creation works and the row appears; the delete assertion is what fails.
- *   `TenantDelete` is a tombstone rather than a row removal, so the row may legitimately remain with
- *   `deleted: true` and this spec may be asserting the wrong model. Read `TenantsTab` before
- *   changing either side.
- * - **stub conflict** — times out with no conflict panel. The likeliest cause is that the
- *   second-writer setup never provokes a 409 at all, not that the console mishandles one. Confirm
- *   the second write actually lands and moves the revision before concluding anything about the UI.
-  */
+ * Locator rules that came out of it: `getByText` matches text nodes only, so a button carrying its
+ * target in `aria-label` does not collide with it; `getByRole("cell")` matches the cell's accessible
+ * name, which in these tables concatenates a display name with a truncated id and so matches neither
+ * cleanly. Prefer `locator("tr", { hasText })` for a row.
+ */
 
 test.describe("tenants: the full lifecycle", () => {
   test("creates, edits and deletes a tenant", async ({ page }) => {
@@ -56,10 +54,16 @@ test.describe("tenants: the full lifecycle", () => {
     await row.getByRole("button", { name: /delete/i }).click();
     const confirm = page.getByTestId("confirm-destructive");
     if (await confirm.isVisible().catch(() => false)) await confirm.click();
-    // `TenantDelete` is a tombstone, not a row removal — the record stays with `deleted: true`, and
-    // the switcher is what filters it. Asserting the row vanishes would be asserting the wrong
-    // model; what must be true is that it stops being offered as a tenant to work in.
-    await expect(page.locator("tr", { hasText: "e2e-temp" })).toHaveCount(0, { timeout: 10_000 });
+    /*
+     * The row stays. `TenantDelete` is a tombstone (RFC-002 §3.3), so what must be true is that the
+     * table *says so* — it used to render a deleted tenant identically to a live one, which is how
+     * a working delete reads as a silent failure. The switcher filters them separately.
+     */
+    const deleted = page.locator("tr", { hasText: "e2e-temp" });
+    await expect(deleted).toContainText(/deleted/i, { timeout: 10_000 });
+    // And no controls on a tombstone: "Delete" whose only outcome is no change teaches the operator
+    // the first one did not work.
+    await expect(deleted.getByRole("button")).toHaveCount(0);
   });
 });
 
@@ -105,23 +109,47 @@ test.describe("stubs: the conflict flow", () => {
     const port = imposters[0];
     await signIn(page, "editor");
     await goToScreen(page, `/imposters/${port}`);
-    await page.getByRole("button", { name: /^edit$/i }).first().click();
+    // `/^edit /` with the trailing space, not `/^edit$/`: the button's visible text is "Edit" but
+    // its accessible name is `Edit <stubId>`, because the id moved into `aria-label` when the
+    // labels were shortened to stop them wrapping.
+    await page.getByRole("button", { name: /^edit /i }).first().click();
     await expect(page.getByTestId("stub-editor")).toBeVisible();
+    /*
+     * Wait for Save to be *enabled* before provoking the conflict.
+     *
+     * The editor pins its `If-Match` at first render (`useState(revision)`), so an editor opened
+     * before the imposter read lands pins `null` — and a null token disables the save entirely. The
+     * click then does nothing at all, and the test waits out its timeout for a conflict that was
+     * never attempted. Enabled means a revision is pinned, which is the precondition this whole
+     * flow is about.
+     */
+    await expect(page.getByRole("button", { name: /save stub/i })).toBeEnabled();
 
-    // A second writer moves the imposter underneath the open editor.
-    const other = await page.context().browser()?.newContext();
-    if (other === undefined) throw new Error("no browser for the second writer");
-    const second = await other.newPage();
-    await second.goto("/console/");
-    const response = await second.request.get(`/imposters/${port}`, {
+    /*
+     * A second writer moves the imposter underneath the open editor.
+     *
+     * Issued through `page.request`, which shares this context and therefore the config's
+     * `baseURL`. The first version opened a whole second browser context for realism, and
+     * `newContext()` does **not** inherit `baseURL` — so every relative request went nowhere, no
+     * write landed, the revision never moved, and the save under test succeeded. The test timed out
+     * waiting for a conflict it had never caused, which looks identical to the console failing to
+     * render one.
+     *
+     * A separate context was never needed anyway: the pinned revision is client state in the open
+     * editor, so anything that commits a write is a second writer as far as this flow is concerned.
+     */
+    const read = await page.request.get(`/imposters/${port}`, {
       headers: { Authorization: keys.editor },
     });
-    const revision = response.headers()["rift-cluster-revision"] ?? "";
-    await second.request.post(`/imposters/${port}/stubs`, {
-      headers: { Authorization: keys.editor, "If-Match": revision, "X-Rift-CSRF": "1" },
+    const revision = read.headers()["rift-cluster-revision"] ?? "";
+    expect(revision, "the read must carry a revision to write against").not.toBe("");
+    const wrote = await page.request.post(`/imposters/${port}/stubs`, {
+      headers: { Authorization: keys.editor, "If-Match": revision },
       data: { stub: { id: "e2e-conflict", responses: [{ is: { statusCode: 200 } }] } },
     });
-    await other.close();
+    // Asserted, not assumed: a second write that quietly failed would leave the revision where the
+    // editor pinned it, and the save below would succeed for the wrong reason.
+    expect(wrote.ok(), `second write failed: ${wrote.status()} ${await wrote.text()}`).toBe(true);
 
     // Now the first editor saves against the revision it pinned.
     await page.getByRole("button", { name: /save stub/i }).click();
@@ -183,6 +211,6 @@ test.describe("imposters: create then remove", () => {
     await page.getByRole("button", { name: /not found 404/i }).click();
     await page.getByLabel(/^id$/i).fill("e2e-added");
     await page.getByRole("button", { name: /save stub/i }).click();
-    await expect(page.getByText("e2e-added")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("tr", { hasText: "e2e-added" }).first()).toBeVisible({ timeout: 10_000 });
   });
 });
