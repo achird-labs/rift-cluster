@@ -87,7 +87,15 @@ export default defineConfig({
 
   webServer: {
     command: "bash ../scripts/e2e-console.sh up",
-    url: `${ADMIN}/console/`,
+    /*
+     * The seeded sentinel imposter, not `/console/`.
+     *
+     * The console answers as soon as the node binds — before any tenant, principal or imposter
+     * exists — so waiting on it starts the suite mid-seed. `scripts/e2e-console.sh` creates
+     * imposter 4699 as its very last action, so a 200 here means every seeding step committed.
+     * Gateway traffic is auth-exempt, so the probe needs no credential.
+     */
+    url: "http://127.0.0.1:4699/",
     // Reuses an already-running fixture locally so the edit/run loop is fast; CI always starts its
     // own, because a reused one there would mean state leaking between jobs.
     reuseExistingServer: !process.env.CI,

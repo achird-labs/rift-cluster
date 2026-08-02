@@ -123,6 +123,23 @@ case "${1:-up}" in
       "match":{"path_prefix":"/checkout"},"target":{"port":4645,"strip_prefix":true},"enabled":true}]}' \
       >/dev/null 2>&1 || true
 
+    # --- the readiness sentinel, created LAST ------------------------------------
+    #
+    # `playwright.config.ts` waits on this imposter, not on `/console/`. The console is served the
+    # moment the node binds a socket — before a single tenant, principal or imposter exists — so
+    # waiting on it starts the suite mid-seed. That is not theoretical: it raced in CI and failed
+    # the first two visual specs while every later one passed, which reads like two flaky tests
+    # rather than a fixture that had not finished.
+    #
+    # An imposter is the right sentinel because gateway traffic is auth-exempt (RFC-002 §7), so the
+    # probe needs no key, and because it can only answer once every step above it has committed.
+    # Created in `acme`, not `default`, so it stays out of the imposter table the visual specs
+    # capture — a sentinel that changed the baseline would be a fixture detail leaking into the
+    # thing under test. Its port still serves traffic regardless of tenant.
+    api POST /imposters -H "X-Rift-Tenant: acme" -d '{
+      "port": 4699, "protocol": "http", "name": "e2e-ready", "recordRequests": false,
+      "stubs": [{"responses":[{"is":{"statusCode":200,"body":"seeded"}}]}]}' >/dev/null
+
     python3 - "$FIXTURE" "$ADMIN_PORT" "$BOOTSTRAP_KEY" \
       "$VIEWER" "$OPERATOR" "$EDITOR" "$TENANT_ADMIN" "$FLEET_ADMIN" "$ACME_EDITOR" <<'PY'
 import json, sys
