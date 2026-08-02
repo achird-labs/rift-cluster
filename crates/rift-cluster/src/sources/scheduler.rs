@@ -65,37 +65,42 @@ const JITTER_FRACTION: f64 = 0.10;
 /// circuit exists to prevent.
 #[derive(Debug, Default)]
 pub struct PollStatus {
-    last_error: Mutex<BTreeMap<String, String>>,
+    /// Keyed `(tenant, id)`, matching `SM_SOURCES_TABLE`: a source id is only
+    /// unique within its tenant, so a bare-id key would hand tenant A's
+    /// failure string — which routinely embeds A's source URI — to tenant B's
+    /// viewer asking about B's same-named source (issue #239's admin front is
+    /// tenant-scoped, unlike the cluster port that first grew this map).
+    last_error: Mutex<BTreeMap<(String, String), String>>,
 }
 
 impl PollStatus {
-    /// The last poll error for `id`, if the most recent attempt on this node
-    /// failed. `None` once a later attempt succeeds.
+    /// The last poll error for `tenant`'s `id`, if the most recent attempt on
+    /// this node failed. `None` once a later attempt succeeds.
     #[must_use]
-    pub fn last_error(&self, id: &str) -> Option<String> {
+    pub fn last_error(&self, tenant: &str, id: &str) -> Option<String> {
         self.last_error
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(id)
+            .get(&(tenant.to_owned(), id.to_owned()))
             .cloned()
     }
 
-    fn record_failure(&self, id: &str, detail: String) {
+    fn record_failure(&self, tenant: &str, id: &str, detail: String) {
         self.last_error
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.to_owned(), detail);
+            .insert((tenant.to_owned(), id.to_owned()), detail);
     }
 
-    fn record_success(&self, id: &str) {
+    fn record_success(&self, tenant: &str, id: &str) {
         self.last_error
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(id);
+            .remove(&(tenant.to_owned(), id.to_owned()));
     }
 
-    fn forget(&self, id: &str) {
-        self.record_success(id);
+    fn forget(&self, tenant: &str, id: &str) {
+        self.record_success(tenant, id);
     }
 }
 
@@ -225,7 +230,7 @@ impl SourceScheduler {
         for id in stale {
             if let Some(previous) = running.remove(&id) {
                 previous.task.abort();
-                self.status.forget(&id);
+                self.status.forget(DEFAULT_TENANT, &id);
                 tracing::debug!(source_id = %id, "stopped polling");
             }
         }
@@ -249,7 +254,7 @@ impl SourceScheduler {
     fn stop_all(running: &mut BTreeMap<String, Running>, status: &PollStatus) {
         for (id, r) in std::mem::take(running) {
             r.task.abort();
-            status.forget(&id);
+            status.forget(DEFAULT_TENANT, &id);
         }
     }
 }
@@ -268,9 +273,12 @@ async fn poll_loop(
             break;
         };
         let started = std::time::Instant::now();
+        // The scheduler serves the default tenant's source table only — the
+        // same `DEFAULT_TENANT` that `reconcile` builds its desired set from —
+        // so its status entries are recorded under that tenant.
         match puller.pull(&id, Some("scheduler".to_owned())).await {
             Ok(report) => {
-                status.record_success(&id);
+                status.record_success(DEFAULT_TENANT, &id);
                 crate::metrics::source_poll(
                     if report.unchanged {
                         "unchanged"
@@ -288,7 +296,7 @@ async fn poll_loop(
                 // keeps its cadence — the next tick retries.
                 let detail = e.to_string();
                 tracing::warn!(source_id = %id, error = %detail, "source poll failed");
-                status.record_failure(&id, detail);
+                status.record_failure(DEFAULT_TENANT, &id, detail);
                 crate::metrics::source_poll("error", started.elapsed());
             }
         }
@@ -332,26 +340,48 @@ mod tests {
     #[test]
     fn poll_status_tracks_the_last_error_per_source() {
         let status = PollStatus::default();
-        assert_eq!(status.last_error("a"), None);
+        assert_eq!(status.last_error(DEFAULT_TENANT, "a"), None);
 
-        status.record_failure("a", "connection refused".to_owned());
-        status.record_failure("b", "404".to_owned());
+        status.record_failure(DEFAULT_TENANT, "a", "connection refused".to_owned());
+        status.record_failure(DEFAULT_TENANT, "b", "404".to_owned());
         assert_eq!(
-            status.last_error("a").as_deref(),
+            status.last_error(DEFAULT_TENANT, "a").as_deref(),
             Some("connection refused")
         );
-        assert_eq!(status.last_error("b").as_deref(), Some("404"));
-
-        status.record_success("a");
         assert_eq!(
-            status.last_error("a"),
+            status.last_error(DEFAULT_TENANT, "b").as_deref(),
+            Some("404")
+        );
+
+        status.record_success(DEFAULT_TENANT, "a");
+        assert_eq!(
+            status.last_error(DEFAULT_TENANT, "a"),
             None,
             "a recovered source must stop reporting a stale failure"
         );
         assert_eq!(
-            status.last_error("b").as_deref(),
+            status.last_error(DEFAULT_TENANT, "b").as_deref(),
             Some("404"),
             "one source recovering says nothing about another"
         );
+    }
+
+    /// Issue #239: source ids are only unique within a tenant, so the map must
+    /// never answer one tenant's question with another tenant's failure — the
+    /// error string embeds the other tenant's source URI.
+    #[test]
+    fn poll_status_keeps_same_named_sources_of_different_tenants_apart() {
+        let status = PollStatus::default();
+        status.record_failure(
+            DEFAULT_TENANT,
+            "payments",
+            "https://internal/x timed out".to_owned(),
+        );
+        assert_eq!(
+            status.last_error("acme", "payments"),
+            None,
+            "acme must not see the default tenant's failure for its own source name"
+        );
+        assert!(status.last_error(DEFAULT_TENANT, "payments").is_some());
     }
 }

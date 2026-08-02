@@ -78,7 +78,7 @@ use rift_cluster::decorate::{
 };
 use rift_cluster::{
     ControlOutcome, ControlResponse, FLEET_SCOPE, NodeError, RaftNode, SESSION_KEY_BYTES,
-    SessionKey, TenantId,
+    SessionKey, SourcePuller, TenantId,
 };
 use rift_cluster_base::seams::{
     ErrorKind, ImposterConfig, RiftScriptConfig, RouteTable, SCOPE_HEADER, ScriptBaseDir, Stub,
@@ -150,6 +150,10 @@ pub struct FrontConfig {
     /// issue #185) can report the same state `/readyz` does without a second latch to keep in
     /// sync.
     pub readiness: Arc<Readiness>,
+    /// This node's source puller, for the `nodeLocal` half of
+    /// `GET /admin/sources` (issue #239) — the last poll error per source is
+    /// deliberately node-local state, reachable only through it.
+    pub puller: Arc<SourcePuller>,
 }
 
 /// A bound, serving admin front.
@@ -266,6 +270,8 @@ struct FrontState {
     admin_async: bool,
     export_status: Option<Arc<ExportStatus>>,
     readiness: Arc<Readiness>,
+    /// See [`FrontConfig::puller`].
+    puller: Arc<SourcePuller>,
     /// Streams proxied requests through unchanged (SSE included).
     proxy: Client<hyper_util::client::legacy::connect::HttpConnector, Incoming>,
     /// Issues the internal re-reads mutation responses are rendered from.
@@ -294,6 +300,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         admin_async: config.admin_async,
         export_status: config.export_status,
         readiness: config.readiness,
+        puller: config.puller,
         proxy: Client::builder(TokioExecutor::new()).build_http(),
         fetch: Client::builder(TokioExecutor::new()).build_http(),
     });
@@ -370,7 +377,9 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
     })
 }
 
-/// The config-mutating routes the front terminates. Everything else proxies.
+/// The routes the front terminates: the config-mutating surface, plus the
+/// EE-only reads that have no upstream to proxy to (the tenancy surface and
+/// the source inspection routes). Everything else proxies.
 ///
 /// The test-only `EnumDiscriminants` derive exists for the route-parity gate (issue #184): it lets
 /// `openapi::parity` prove its representative list covers every variant. Without it the compiler
@@ -400,6 +409,13 @@ pub(crate) enum Terminated {
     /// **terminates**, reads included — there is no upstream `/admin/tenants`
     /// to proxy to, exactly as with `GET /front-door/routes`.
     Tenancy(tenancy::Route),
+    /// `GET /admin/sources` (issue #239): the fleet's source declarations for
+    /// the tenant in view. Terminates — the upstream admin has no source
+    /// surface; the cluster-port `/admin/sources` (issue #134) is a different
+    /// listener with a different trust model.
+    SourceList,
+    /// `GET /admin/sources/{id}` — one source record.
+    SourceRead(String),
 }
 
 /// The tenant a terminated route is authorized against, when the route names
@@ -440,7 +456,9 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::DeleteAllImposters
         | Terminated::PutRoutes
         | Terminated::DeleteRoute(_)
-        | Terminated::Tenancy(_) => None,
+        | Terminated::Tenancy(_)
+        | Terminated::SourceList
+        | Terminated::SourceRead(_) => None,
     }
 }
 
@@ -459,7 +477,12 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::DeleteStubById(_, _)
         | Terminated::SetEnabled(_, _)
         | Terminated::PutRoutes
-        | Terminated::DeleteRoute(_) => None,
+        | Terminated::DeleteRoute(_)
+        // Resource routes: the id names a record *within* the caller's
+        // tenant, so `X-Rift-Tenant` is the subject — unlike the tenancy
+        // surface, where the tenant is the path segment being administered.
+        | Terminated::SourceList
+        | Terminated::SourceRead(_) => None,
     }
 }
 
@@ -469,9 +492,31 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
     if let Some(route) = tenancy::classify(method, path, query) {
         return Some(Terminated::Tenancy(route));
     }
+    // The source inspection surface (issue #239): EE-only and terminating for
+    // the same reason as tenancy. Reads only — a recognized path with another
+    // method falls through to the proxy and answers upstream's own 404/405,
+    // exactly as tenancy::classify does for its half-matches.
+    if path == "/admin/sources" {
+        return match *method {
+            Method::GET => Some(Terminated::SourceList),
+            _ => None,
+        };
+    }
+    if let Some(id) = path.strip_prefix("/admin/sources/") {
+        // Percent-decoding is deliberately not done, for tenancy::classify's
+        // reason: a source id is validated printable-ASCII without `/`, so
+        // nothing legal needs escaping and `%2f` must not smuggle a segment.
+        return match *method {
+            Method::GET if !id.is_empty() && !id.contains('/') => {
+                Some(Terminated::SourceRead(id.to_owned()))
+            }
+            _ => None,
+        };
+    }
     if path == "/front-door/routes" {
-        // `GET` is a read, not a mutation — it terminates in `handle` directly
-        // rather than through this (write-only) classifier.
+        // `GET` is a read with no `Terminated` variant — it predates the
+        // tenancy/sources pattern of classifying EE reads, and terminates in
+        // `handle` directly instead (see `HANDLE_DIRECT_ROUTES`).
         return match *method {
             Method::PUT => Some(Terminated::PutRoutes),
             _ => None,
@@ -550,6 +595,7 @@ fn action_for(kind: &Terminated) -> Action {
         Terminated::PutRoutes => Action::ImposterWrite,
         Terminated::DeleteRoute(_) => Action::ImposterWrite,
         Terminated::Tenancy(route) => route.action(),
+        Terminated::SourceList | Terminated::SourceRead(_) => Action::SourceRead,
     }
 }
 
@@ -1786,6 +1832,18 @@ async fn terminate(
             .await;
     }
 
+    // So does the source inspection surface (issue #239): same shared gate,
+    // and nothing of the write machinery below applies to a read.
+    match kind {
+        Terminated::SourceRead(id) => {
+            return terminate_sources(&state, &node, Some(id.as_str()), &tenant);
+        }
+        Terminated::SourceList => {
+            return terminate_sources(&state, &node, None, &tenant);
+        }
+        _ => {}
+    }
+
     // Authorization already ran in `handle`, once, for every admin request —
     // terminated, proxied, or the front door's own read. Nothing here
     // re-checks it.
@@ -2182,6 +2240,106 @@ async fn build_and_run(
         set_header(&mut response, HEADER_WARNINGS, &warnings.join(","));
     }
     Ok(response)
+}
+
+/// `GET /admin/sources` / `GET /admin/sources/{id}` (issue #239).
+///
+/// The response deliberately keeps two kinds of fact in two shapes:
+///
+/// - **`sources` / `source`** is the replicated projection, verbatim. Every
+///   converged node answers it byte-identically, and `RedbStateMachine::
+///   sources` documents that diffing two nodes' answers is how an operator
+///   checks a `SourcePut` has converged — a property that survives only if
+///   nothing node-local is ever mixed into this half.
+/// - **`nodeLocal`** carries what is true of *this node only*: which node
+///   answered, and the last poll error per source. A poll failure is
+///   deliberately not replicated (`scheduler.rs::PollStatus`), so it can
+///   differ across the fleet — flattening it into the record would tell an
+///   operator the fleet is failing when one node is, or that it is healthy
+///   when only the node they happened to hit is.
+///
+/// The cluster-port `read_source` (sources/mod.rs) *does* flat-merge
+/// `lastPollError`, and that is not a contradiction: there the caller
+/// addressed one node explicitly, so "this node's view" is the question being
+/// asked. This surface sits behind one fleet address, where it is not.
+fn terminate_sources(
+    state: &Arc<FrontState>,
+    node: &Arc<RaftNode>,
+    id: Option<&str>,
+    tenant: &TenantId,
+) -> Response<FrontBody> {
+    let view = match id {
+        Some(id) => {
+            match node.source(tenant.as_str(), id) {
+                Ok(Some(record)) => SourcesView::One(record),
+                // Byte-identical to the cross-tenant refusal (RFC-002 §8.4):
+                // a source that exists in another tenant must be
+                // indistinguishable from one that never existed.
+                Ok(None) => return tenant_boundary_not_found(),
+                Err(e) => return internal(&e.to_string()),
+            }
+        }
+        None => match node.sources(tenant.as_str()) {
+            Ok(records) => SourcesView::List(records),
+            Err(e) => return internal(&e.to_string()),
+        },
+    };
+    // The poll-error lookup carries the authorized tenant: source ids are only
+    // unique within a tenant, and a bare-id lookup would answer with another
+    // tenant's failure string — see `PollStatus::last_error`'s key doc.
+    let body = match render_sources(node.id(), &view, |id| {
+        state.puller.last_poll_error(tenant.as_str(), id)
+    }) {
+        Ok(body) => body,
+        Err(e) => return internal(&format!("rendering sources: {e}")),
+    };
+    buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
+        .unwrap_or_else(|response| response)
+}
+
+/// Which of the two response shapes a sources read renders.
+enum SourcesView {
+    List(Vec<rift_cluster::SourceRecord>),
+    One(rift_cluster::SourceRecord),
+}
+
+impl SourcesView {
+    fn records(&self) -> &[rift_cluster::SourceRecord] {
+        match self {
+            SourcesView::List(records) => records,
+            SourcesView::One(record) => std::slice::from_ref(record),
+        }
+    }
+}
+
+/// Render the two-part sources body — see [`terminate_sources`] for why the
+/// parts must stay apart. The poll-error lookup is injected so the separation
+/// is unit-testable without a bound front or a live puller.
+fn render_sources(
+    node_id: rift_cluster::NodeId,
+    view: &SourcesView,
+    last_poll_error: impl Fn(&str) -> Option<String>,
+) -> serde_json::Result<Vec<u8>> {
+    let poll_errors: serde_json::Map<String, serde_json::Value> = view
+        .records()
+        .iter()
+        .filter_map(|record| {
+            last_poll_error(&record.id).map(|error| (record.id.clone(), error.into()))
+        })
+        .collect();
+    let node_local = serde_json::json!({
+        "nodeId": node_id,
+        "pollErrors": serde_json::Value::Object(poll_errors),
+    });
+    let body = match view {
+        SourcesView::List(records) => {
+            serde_json::json!({ "sources": records, "nodeLocal": node_local })
+        }
+        SourcesView::One(record) => {
+            serde_json::json!({ "source": record, "nodeLocal": node_local })
+        }
+    };
+    serde_json::to_vec(&body)
 }
 
 /// Serve one RFC-002 §5 tenancy route (issue #162): read from local applied
@@ -2717,6 +2875,11 @@ async fn build_mutation(
         // failure than the mistake.
         Terminated::Tenancy(_) => Err(internal(
             "tenancy routes are served by terminate_tenancy, not build_mutation",
+        )),
+        // Same shape, same reasoning: source reads divert to
+        // `terminate_sources` before this is reached.
+        Terminated::SourceList | Terminated::SourceRead(_) => Err(internal(
+            "source reads are served by terminate_sources, not build_mutation",
         )),
     }
 }
@@ -3394,6 +3557,87 @@ mod tests {
         assert!(classify(&Method::DELETE, "/imposters/not-a-port", None).is_none());
     }
 
+    /// The source inspection surface (issue #239): the two reads terminate,
+    /// everything else on the path falls through to the proxy and answers
+    /// upstream's own 404/405.
+    #[test]
+    fn classify_terminates_exactly_the_source_read_surface() {
+        assert!(matches!(
+            classify(&Method::GET, "/admin/sources", None),
+            Some(Terminated::SourceList)
+        ));
+        assert!(matches!(
+            classify(&Method::GET, "/admin/sources/payments", None),
+            Some(Terminated::SourceRead(id)) if id == "payments"
+        ));
+        // `%2f` must not smuggle a segment: the id is matched literally,
+        // undecoded, exactly as the classifier's comment promises.
+        assert!(matches!(
+            classify(&Method::GET, "/admin/sources/pay%2Fments", None),
+            Some(Terminated::SourceRead(id)) if id == "pay%2Fments"
+        ));
+
+        for (method, path) in [
+            (Method::POST, "/admin/sources"),
+            (Method::PUT, "/admin/sources/payments"),
+            (Method::DELETE, "/admin/sources/payments"),
+            (Method::GET, "/admin/sources/"),
+            (Method::GET, "/admin/sources/a/b"),
+        ] {
+            assert!(
+                classify(&method, path, None).is_none(),
+                "{method} {path} must not terminate"
+            );
+        }
+    }
+
+    /// Issue #239's design decision, asserted at the render seam: a poll error
+    /// is this node's observation, so it travels under `nodeLocal` and never
+    /// lands on the replicated record — which stays byte-comparable across
+    /// nodes for convergence checks.
+    #[test]
+    fn render_sources_keeps_node_local_facts_off_the_replicated_record() {
+        let record = rift_cluster::SourceRecord {
+            id: "payments".to_owned(),
+            uri: "scripted://cfg/payments.json".to_owned(),
+            mode: rift_cluster::control::SourceMode::Tracking,
+            auth_ref: None,
+            on_drift: rift_cluster::control::OnDrift::Overwrite,
+            poll_secs: Some(60),
+            drifted: false,
+            last_version: Some("v1".to_owned()),
+            last_digest: None,
+            last_pulled_at_secs: None,
+            last_outcome: None,
+            ports: vec![9301],
+            revision: 12,
+        };
+
+        let body = render_sources(7, &SourcesView::One(record.clone()), |id| {
+            (id == "payments").then(|| "connect timeout".to_owned())
+        })
+        .expect("renders");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert!(
+            body["source"].get("lastPollError").is_none(),
+            "the record must stay exactly the replicated projection: {body}"
+        );
+        assert_eq!(body["nodeLocal"]["nodeId"], 7);
+        assert_eq!(
+            body["nodeLocal"]["pollErrors"]["payments"],
+            "connect timeout"
+        );
+
+        let body = render_sources(7, &SourcesView::List(vec![record]), |_| None).expect("renders");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(body["sources"][0]["id"], "payments");
+        assert_eq!(
+            body["nodeLocal"]["pollErrors"],
+            serde_json::json!({}),
+            "no error is an empty map, not an absent field"
+        );
+    }
+
     /// The front-door route surface (issue #131): `PUT`/`DELETE` terminate,
     /// `GET` does not (it never reaches `classify` at all — `handle` answers
     /// it directly, since there is no upstream endpoint to proxy it to).
@@ -3500,6 +3744,9 @@ mod tests {
                 admin_async: false,
                 export_status: None,
                 readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
+                puller: Arc::new(SourcePuller::new(
+                    rift_cluster_base::seams::SourceRegistry::default(),
+                )),
             },
             &node,
         )

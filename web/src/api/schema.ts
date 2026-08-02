@@ -696,6 +696,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The tenant's imposter sources, with this node's poll status apart
+         * @description Terminates. The `sources` half is the fleet-replicated projection, id-ascending and byte-identical on every converged node — diffing two nodes' answers is how an operator checks a `SourcePut` has converged. The `nodeLocal` half is true of the answering node only: a poll failure is deliberately never replicated (a log entry per failure is the log growth the digest short-circuit exists to prevent), so it may differ across the fleet and is kept structurally apart rather than flattened into the record. Requires `source.read` (Viewer and up).
+         */
+        get: operations["listSources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/sources/{sourceId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One imposter source
+         * @description Terminates. The same two-part shape as the list — see `GET /admin/sources` for why the replicated record and this node's poll status never merge. Requires `source.read` (Viewer and up).
+         */
+        get: operations["getSource"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/whoami": {
         parameters: {
             query?: never;
@@ -1212,6 +1252,65 @@ export interface components {
                 /** Format: int64 */
                 shippedRows?: number;
                 consecutiveFailures?: number;
+            };
+        };
+        /** @description One imposter source as the fleet has agreed on it — the replicated projection, identical on every converged node. Deliberately carries nothing node-local, so two nodes' answers stay byte-comparable as a convergence check. */
+        SourceRecord: {
+            /** @description The source's declared id, unique within its tenant. */
+            id: string;
+            /** @description The URI the fleet pulls imposters from. */
+            uri: string;
+            /**
+             * @description Explicit pulls only, or scheduled polls on `pollSecs`.
+             * @enum {string}
+             */
+            mode: "pinned" | "tracking";
+            /** @description The **name** of a credential, never the credential — a URI carrying embedded credentials is refused before it can enter the replicated log. */
+            authRef?: string;
+            /**
+             * @description What a pull does when the source's imposters were hand-edited since it last applied.
+             * @enum {string}
+             */
+            onDrift: "overwrite" | "skip" | "fail";
+            /**
+             * Format: int64
+             * @description Poll interval for a `tracking` source; absent for `pinned`.
+             */
+            pollSecs?: number;
+            /** @description An operator has edited this source's imposters by hand since it last applied. */
+            drifted: boolean;
+            /** @description The version label the last pull reported, when the source names one. */
+            lastVersion?: string;
+            /** @description Digest of the content the last pull saw. */
+            lastDigest?: string;
+            /**
+             * Format: int64
+             * @description When the last pull committed, in UNIX seconds.
+             */
+            lastPulledAtSecs?: number;
+            /**
+             * @description How the last pull ended; absent when the source has never pulled.
+             * @enum {string}
+             */
+            lastOutcome?: "applied" | "skipped";
+            /** @description The ports this source currently owns, ascending. */
+            ports: number[];
+            /**
+             * Format: int64
+             * @description The log index that last wrote this record.
+             */
+            revision: number;
+        };
+        /** @description The answering node's own view — **not** a fleet fact. A poll failure is a property of one node's reach to an external host at one moment and is deliberately never replicated, so this half can differ across the fleet; it is kept apart from the record precisely so that it cannot be mistaken for one more replicated field. */
+        SourcesNodeLocal: {
+            /**
+             * Format: int64
+             * @description The cluster node that answered this request.
+             */
+            nodeId: number;
+            /** @description Last poll error per source id, for sources this node has seen fail. Empty when nothing is failing — an explicit empty map, not an absent field. Polls run on the leader, so a follower's map is usually empty; and the poll scheduler currently serves only the default tenant's tracking sources, so other tenants' maps are empty until that widens. */
+            pollErrors: {
+                [key: string]: string;
             };
         };
         WhoAmI: {
@@ -3887,6 +3986,83 @@ export interface operations {
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
             504: components["responses"]["WriteTimeout"];
+        };
+    };
+    listSources: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tenant's declared sources, plus this node's poll status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        sources: components["schemas"]["SourceRecord"][];
+                        nodeLocal: components["schemas"]["SourcesNodeLocal"];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description Caller holds no binding in the tenant in view (RFC-002 §8.4 — not a 403). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getSource: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                /** @description The source's declared id, unique within its tenant. */
+                sourceId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The source, plus this node's poll status for it. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        source: components["schemas"]["SourceRecord"];
+                        nodeLocal: components["schemas"]["SourcesNodeLocal"];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description No such source in the tenant in view. Byte-identical whether the id never existed, exists in another tenant, or the caller holds no binding here at all (RFC-002 §8.4). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
         };
     };
     getWhoAmI: {

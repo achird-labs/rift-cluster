@@ -1035,6 +1035,29 @@ These endpoints are on the cluster port, so reach them with `cluster-curl` (see
 "Imposter sources demo" for a three-node walkthrough that rolls the whole fleet
 with one pull.
 
+### Reading sources from the admin front (#239)
+
+The **public admin address** also serves the read half, RBAC-gated instead of
+cluster-credentialed, which is the surface the console uses:
+
+| Endpoint | Action | Floor |
+|---|---|---|
+| `GET /admin/sources` | `source.read` | Viewer |
+| `GET /admin/sources/:id` | `source.read` | Viewer |
+
+Both are tenant-scoped by `X-Rift-Tenant`, and a source in another tenant
+answers `404`, indistinguishable from one that never existed (RFC-002 §8.4).
+The response keeps two kinds of fact structurally apart: `sources` / `source`
+is the fleet-replicated record, byte-identical on every converged node — so
+diffing two nodes' answers remains a convergence check — while `nodeLocal
+{ nodeId, pollErrors }` is the answering node's own view. A poll failure is
+deliberately node-local (see "Tracking sources" below), so it rides the
+scope-named field rather than being flattened into the record, unlike the
+cluster-port `GET /admin/sources/:id`, where you addressed one node explicitly
+and the flat `lastPollError` is the question you asked. Declaring, deleting
+and pulling stay cluster-port-only for now — a write touches `authRef` and
+deserves its own authorization tier before it moves here.
+
 | Field | Values | Meaning |
 |---|---|---|
 | `mode` | `"pinned"` (default) \| `"tracking"` | `pinned`: explicit pulls only. `tracking`: the fleet re-fetches on `pollSecs` — see below |

@@ -327,8 +327,8 @@ impl SourcePuller {
 
     /// The last poll error this node recorded for `id`, if any.
     #[must_use]
-    pub fn last_poll_error(&self, id: &str) -> Option<String> {
-        self.poll_status.get()?.upgrade()?.last_error(id)
+    pub fn last_poll_error(&self, tenant: &str, id: &str) -> Option<String> {
+        self.poll_status.get()?.upgrade()?.last_error(tenant, id)
     }
 
     /// Whether this build can serve the scheme `uri` names. Node-local
@@ -930,7 +930,7 @@ async fn read_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, Rpc
     // failure is deliberately never written to the log (#135), so this is the
     // only place it surfaces.
     let mut rendered = serde_json::to_value(&record).map_err(handler_error)?;
-    if let Some(error) = puller.last_poll_error(id)
+    if let Some(error) = puller.last_poll_error(DEFAULT_TENANT, id)
         && let Some(object) = rendered.as_object_mut()
     {
         object.insert("lastPollError".to_owned(), serde_json::Value::String(error));

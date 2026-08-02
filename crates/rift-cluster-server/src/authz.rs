@@ -56,6 +56,7 @@ pub enum Action {
     SpaceTeardown,
     FlowStateRead,
     FlowStateClear,
+    SourceRead,
     VerifyRun,
     StreamSubscribe,
     TenantManage,
@@ -69,7 +70,7 @@ impl Action {
     ///
     /// Kept beside the enum so the two cannot drift: `every_action_is_listed`
     /// fails if a variant is added without extending this.
-    pub const ALL: [Action; 19] = [
+    pub const ALL: [Action; 20] = [
         Action::ImposterRead,
         Action::ImposterWrite,
         Action::ImposterDelete,
@@ -84,6 +85,7 @@ impl Action {
         Action::SpaceTeardown,
         Action::FlowStateRead,
         Action::FlowStateClear,
+        Action::SourceRead,
         Action::VerifyRun,
         Action::StreamSubscribe,
         Action::TenantManage,
@@ -109,6 +111,7 @@ impl Action {
             Action::SpaceTeardown => "space.teardown",
             Action::FlowStateRead => "flowState.read",
             Action::FlowStateClear => "flowState.clear",
+            Action::SourceRead => "source.read",
             Action::VerifyRun => "verify.run",
             Action::StreamSubscribe => "stream.subscribe",
             Action::TenantManage => "tenant.manage",
@@ -149,6 +152,13 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                 | Action::SavedRequestsRead
                 | Action::ScenarioRead
                 | Action::FlowStateRead
+                // A source declaration is config an imposter was built from,
+                // not a credential: `auth_ref` is a name (control.rs refuses
+                // URIs carrying secrets), so reading it sits with the other
+                // Viewer reads. *Writing* one is a different power and gets
+                // its own action when the write surface ships (#239 scoped
+                // reads only).
+                | Action::SourceRead
                 | Action::StreamSubscribe
         ),
         Role::Operator => {
@@ -302,8 +312,8 @@ mod tests {
     fn every_action_is_listed_in_all() {
         assert_eq!(
             Action::ALL.len(),
-            19,
-            "RFC-002 §4.1 defines 19 actions; ALL must carry every one"
+            20,
+            "RFC-002 §4.1 defines 20 actions; ALL must carry every one"
         );
         let unique: std::collections::BTreeSet<_> = Action::ALL.iter().collect();
         assert_eq!(unique.len(), Action::ALL.len(), "ALL contains a duplicate");
@@ -327,6 +337,7 @@ mod tests {
             Action::SavedRequestsRead,
             Action::ScenarioRead,
             Action::FlowStateRead,
+            Action::SourceRead,
             Action::StreamSubscribe,
         ];
         let operator_adds = [
