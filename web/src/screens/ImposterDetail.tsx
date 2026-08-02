@@ -240,8 +240,13 @@ function StubActions({
   }
   return (
     <>
-      <button className="btn sm" type="button" onClick={() => onEdit({ kind: "existing", stubId })}>
-        Edit {stubId}
+      <button
+        className="btn sm"
+        type="button"
+        aria-label={`Edit ${stubId}`}
+        onClick={() => onEdit({ kind: "existing", stubId })}
+      >
+        Edit
       </button>
       <DeleteStubButton port={port} stubId={stubId} revision={revision} />
     </>

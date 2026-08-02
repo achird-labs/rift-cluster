@@ -270,9 +270,10 @@ function Row({
                   className="btn sm"
                   type="button"
                   disabled={busy}
+                  aria-label={`${imposter.enabled ? "Disable" : "Enable"} ${label}`}
                   onClick={() => onToggle(port, !imposter.enabled)}
                 >
-                  {imposter.enabled ? "Disable" : "Enable"} {label}
+                  {imposter.enabled ? "Disable" : "Enable"}
                 </button>
               ) : null}
               {mayDelete ? (
@@ -280,9 +281,10 @@ function Row({
                   className="btn sm danger"
                   type="button"
                   data-testid={`delete-imposter-${port}`}
+                  aria-label={`Delete ${label}`}
                   onClick={onDelete}
                 >
-                  Delete {label}
+                  Delete
                 </button>
               ) : null}
             </span>

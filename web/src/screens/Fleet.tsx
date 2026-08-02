@@ -118,14 +118,20 @@ function View({ view }: { view: FleetView }): ReactNode {
 }
 
 /**
- * Member fields whose value is a pill or a list rather than a single figure.
+ * Member fields that must not get the big-figure treatment.
  *
- * `voters` is a comma-separated set of 19-digit raft ids — at 25px it simply overflows the tile —
- * and `is_leader` renders a status pill.
+ * Everything here is an identifier, a set of them, or a pill. `last_applied` is the only member
+ * field that is genuinely a magnitude, so it is the only one left rendered as one.
  */
 const PLAIN_MEMBER_FIELDS = new Set<(typeof FLEET_MEMBER_FIELDS)[number]["key"]>([
   "voters",
   "is_leader",
+  // Raft ids are 19 digits. At the tile's 25px figure size they overflow and are **silently
+  // clipped** — `9597282464125895000` rendered as `959728246412`, with no ellipsis to say so, which
+  // is a wrong value presented as a complete one rather than a cosmetic overflow. They are
+  // identifiers, not magnitudes, so they get the identifier treatment.
+  "node_id",
+  "current_leader",
 ]);
 
 const DEGRADATION_WORDING = {

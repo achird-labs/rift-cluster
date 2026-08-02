@@ -33,6 +33,7 @@ import {
   Ident,
   Status,
   Tile,
+  Truncated,
   UNKNOWN,
   UnconfirmedNote,
 } from "../components/primitives.tsx";
@@ -577,16 +578,36 @@ function PrincipalsTab({ tenant }: { tenant: string }): ReactNode {
             }
           />
         ) : (
-          <button className="btn" type="button" onClick={() => setCreating(true)}>
-            Create principal
-          </button>
+          // Wrapped in a row: a bare button is a stretch-aligned child of the screen's flex column
+          // and spans its full width, which reads as a broken banner rather than as an action.
+          <div className="row">
+            <button className="btn primary" type="button" onClick={() => setCreating(true)}>
+              Create principal
+            </button>
+          </div>
         )
       ) : null}
 
       {principals.isPending ? <p className="muted">Reading…</p> : null}
 
       {principals.isSuccess ? (
-        <div className="rows">
+        <Card
+          title={`${principals.data.length} principal${principals.data.length === 1 ? "" : "s"}`}
+          bleed
+        >
+          <div className="scroll-x">
+            <table className="dense">
+              <thead>
+                <tr>
+                  <th>Principal</th>
+                  <th style={{ width: "16ch" }}>Role</th>
+                  {/* Wide enough for the pill plus the cell's own 28px of padding — `dense` cells
+                      clip, so a pill that overruns is silently cut in half rather than wrapped. */}
+                  <th style={{ width: "18ch" }}>State</th>
+                  {mayAdminister ? <th style={{ width: "18ch" }} aria-label="Actions" /> : null}
+                </tr>
+              </thead>
+              <tbody>
           {principals.data.map((p) => (
             <PrincipalRow
               key={p.id}
@@ -603,7 +624,10 @@ function PrincipalsTab({ tenant }: { tenant: string }): ReactNode {
               onDelete={() => del.mutate({ tenantId: tenant, principalId: p.id })}
             />
           ))}
-        </div>
+              </tbody>
+            </table>
+          </div>
+        </Card>
       ) : null}
     </>
   );
@@ -723,25 +747,55 @@ function PrincipalRow({
 }): ReactNode {
   const addressable = isAddressablePrincipalId(principal.id);
   return (
-    <div className="row" data-testid="principal-row">
-      <span data-testid={`principal-${principal.id}`}>
-        <Ident>{principal.id}</Ident> {principal.displayName} · {principal.role ?? UNKNOWN} ·{" "}
+    <tr data-testid="principal-row">
+      {/*
+       * The **name** leads and the id is secondary, truncated. A minted principal's id is
+       * `key:<sha256-hex>` — not a credential, but 64 hex characters that look exactly like one, and
+       * letting it lead made the list unreadable and taught the wrong instinct about what is safe to
+       * paste. The whole id is still on the title and still selectable.
+       */}
+      <td data-testid={`principal-${principal.id}`}>
+        <div className="id-cell">
+          <span className="name">{principal.displayName}</span>
+          <span className="meta" title={principal.id}>
+            <Truncated value={principal.id} max={28} />
+          </span>
+        </div>
+      </td>
+      <td>{principal.role ?? UNKNOWN}</td>
+      <td>
         {principal.disabled ? (
           <Status tone="idle" label="disabled" />
         ) : (
           <Status tone="ok" label="enabled" />
         )}
-      </span>
+      </td>
       {mayManage ? (
-        addressable ? (
-          <>
-            <button type="button" disabled={busy} onClick={onToggle}>
-              {principal.disabled ? "Enable" : "Disable"} {principal.displayName}
+        <td>
+        {addressable ? (
+          <span className="row">
+            {/* The label is the verb alone; `aria-label` carries which principal it acts on. The
+                name in the visible label wrapped every button onto two lines in a table where the
+                row already says whose it is. */}
+            <button
+              className="btn sm"
+              type="button"
+              disabled={busy}
+              aria-label={`${principal.disabled ? "Enable" : "Disable"} ${principal.displayName}`}
+              onClick={onToggle}
+            >
+              {principal.disabled ? "Enable" : "Disable"}
             </button>
-            <button type="button" disabled={busy} onClick={onDelete}>
-              Delete {principal.displayName}
+            <button
+              className="btn sm danger"
+              type="button"
+              disabled={busy}
+              aria-label={`Delete ${principal.displayName}`}
+              onClick={onDelete}
+            >
+              Delete
             </button>
-          </>
+          </span>
         ) : (
           /*
            * Not merely disabled — unreachable. The server matches the raw path, so an id carrying
@@ -753,9 +807,10 @@ function PrincipalRow({
             This id cannot be addressed in a URL path, so it cannot be changed from the console. Use
             the admin API directly.
           </span>
-        )
+        )}
+        </td>
       ) : null}
-    </div>
+    </tr>
   );
 }
 

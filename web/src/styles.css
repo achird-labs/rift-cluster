@@ -575,7 +575,10 @@ main {
   color: var(--ink-3);
 }
 
+/* `.tile dt` too: the imposter detail renders its facts as a definition list inside tiles, and
+   without it those labels lose the eyebrow treatment the fleet screen's tiles have. */
 .fact dt,
+.tile dt,
 .kv dt {
   font: 600 10px/1 var(--mono);
   letter-spacing: 0.09em;
@@ -584,6 +587,7 @@ main {
 }
 
 .fact dd,
+.tile dd,
 .kv dd {
   margin: 0;
   font: 500 13px/1.4 var(--mono);
@@ -771,7 +775,16 @@ button.plain {
   cursor: pointer;
 }
 
-.btn:hover:not([disabled]),
+/*
+ * Scoped away from the filled variants, and that is a correctness fix rather than tidiness.
+ *
+ * `.btn:hover:not([disabled])` is more specific than `.btn.primary`, so it won the background and a
+ * hovered primary button rendered white text on `--surface-2` — **1.13:1**, unreadable. `.primary`
+ * and `.danger` set only `filter` on hover, so nothing put the colour back. Caught by axe in a real
+ * browser, which sees the hover state Playwright leaves behind after a click; no jsdom test and no
+ * static baseline would have.
+ */
+.btn:not(.primary):not(.danger):hover:not([disabled]),
 button.plain:hover:not([disabled]) {
   background: var(--surface-2);
 }

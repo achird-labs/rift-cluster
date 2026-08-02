@@ -23,6 +23,19 @@ import type { Page } from "@playwright/test";
  */
 
 async function violations(page: Page) {
+  /*
+   * Settle before scanning.
+   *
+   * The console polls every 5s, so a screen re-renders underneath axe while it walks the DOM — and
+   * axe then computes a contrast pair against a background that is mid-swap. It showed up as
+   * `color-contrast` failing roughly one run in three on the new-imposter form, with the same page
+   * passing on the next run and a scoped probe finding nothing at all.
+   *
+   * This is a mitigation, not a diagnosis: it narrows the window rather than closing it. If this
+   * rule starts flaking again, the honest fix is to pause polling for the scan rather than to widen
+   * the wait.
+   */
+  await page.waitForTimeout(600);
   const results = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
     .analyze();

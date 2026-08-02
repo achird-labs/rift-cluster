@@ -30,6 +30,11 @@ const CHANNEL = process.env.PLAYWRIGHT_CHANNEL ?? "chromium";
 
 export default defineConfig({
   testDir: "./e2e",
+  // The survey is an exploration tool, not a gate: it writes a directory of screenshots for a
+  // person to look at and asserts almost nothing. Excluded from the default run so `pnpm run e2e`
+  // stays a check. Opted into by `E2E_SURVEY=1` (`pnpm run e2e:survey`) rather than by naming the
+  // file, because `testIgnore` wins over an explicit filename argument.
+  ...(process.env.E2E_SURVEY ? {} : { testIgnore: /survey\.spec\.ts/ }),
   // Serial. The fixture is a single stateful node with fixed ports, and the specs write to it
   // (creating imposters, clearing logs). Parallel workers would race each other's fixture.
   workers: 1,

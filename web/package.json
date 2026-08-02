@@ -17,7 +17,8 @@
     "generate:client": "openapi-typescript ../docs/api/openapi-ee.yaml --output src/api/schema.ts",
     "e2e": "playwright test",
     "e2e:update": "playwright test --update-snapshots",
-    "e2e:ui": "playwright test --ui"
+    "e2e:ui": "playwright test --ui",
+    "e2e:survey": "E2E_SURVEY=1 playwright test survey --project=chromium"
   },
   "dependencies": {
     "@tanstack/react-query": "5.101.4",
