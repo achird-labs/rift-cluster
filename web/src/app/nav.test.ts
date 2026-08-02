@@ -33,12 +33,20 @@ describe("nav model", () => {
   });
 
   it("renders every unshipped screen as a planned entry rather than omitting it", () => {
-    // RFC-006 §4: "a visible roadmap, not a 404". The issue names scenarios (#149), sources (#20)
-    // and specs (#148) explicitly; administration (#190) is now built and no longer planned.
+    /*
+     * RFC-006 §4: "a visible roadmap, not a 404" — so each chip must name work that is actually
+     * outstanding, which is not the same as naming the epic the feature belongs to.
+     *
+     * `scenarios` points at #232 rather than the RFC-005 epic #149, and `sources` at #233 rather
+     * than #20: both backends already ship, so what is missing is a console slice. #20 in
+     * particular is **closed**, and the chip went on telling operators "not yet shipped, see #20" —
+     * the exact dead end this design exists to avoid. `specs` still names #148 because there
+     * genuinely is nothing to render until RFC-004 lands.
+     */
     const planned = Object.fromEntries(plannedEntries().map((e) => [e.id, e.issue]));
     expect(planned).toEqual({
-      scenarios: 149,
-      sources: 20,
+      scenarios: 232,
+      sources: 233,
       specs: 148,
     });
   });
