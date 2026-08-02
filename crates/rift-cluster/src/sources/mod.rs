@@ -373,14 +373,24 @@ impl SourcePuller {
             .ok_or_else(|| PullError::Internal("cluster node is shutting down".to_owned()))
     }
 
-    /// Fetch the named source and submit what it produced.
+    /// Fetch `tenant`'s named source and submit what it produced.
     ///
     /// `principal` is recorded on the op for audit — "who updated the mocks, and
     /// to which version" is a log query rather than a mystery.
-    pub async fn pull(&self, id: &str, principal: Option<String>) -> Result<PullReport, PullError> {
+    ///
+    /// `tenant` is explicit rather than defaulted because a source id is unique
+    /// only within its tenant: the poll scheduler pulls whichever tenant
+    /// declared the source (#241), while the cluster-port CRUD stays
+    /// default-scoped.
+    pub async fn pull(
+        &self,
+        tenant: &str,
+        id: &str,
+        principal: Option<String>,
+    ) -> Result<PullReport, PullError> {
         let node = self.node()?;
         let record = node
-            .source(DEFAULT_TENANT, id)
+            .source(tenant, id)
             .map_err(|e| PullError::Internal(e.to_string()))?
             .ok_or_else(|| PullError::UnknownSource(id.to_owned()))?;
 
@@ -465,7 +475,7 @@ impl SourcePuller {
         let request = mint(
             principal.clone(),
             ControlOp::SourcePullResult {
-                tenant: TenantId::default(),
+                tenant: TenantId::new(tenant),
                 id: id.to_owned(),
                 version: version.clone(),
                 digest: digest.clone(),
@@ -511,7 +521,7 @@ impl SourcePuller {
         // "source pull applied" line in the audit log and name ports in
         // `changed` that were never touched.
         let skipped = node
-            .source(DEFAULT_TENANT, id)
+            .source(tenant, id)
             .map_err(|e| PullError::Internal(e.to_string()))?
             .is_some_and(|after| {
                 after.revision == response.revision
@@ -525,6 +535,7 @@ impl SourcePuller {
         tracing::info!(
             target: "audit",
             event = "source.pull",
+            tenant = %tenant,
             source_id = %id,
             principal = principal.as_deref().unwrap_or("-"),
             version = version.as_deref().unwrap_or("-"),
@@ -598,7 +609,9 @@ impl SourcePuller {
         // under ordinary replication lag.
         node.await_local_applied(response.revision, LOCAL_APPLY_TIMEOUT)
             .await;
-        self.pull(id, None).await
+        // The `--imposters` bootstrap is default-tenant by definition — it is
+        // the op this function just minted.
+        self.pull(DEFAULT_TENANT, id, None).await
     }
 }
 
@@ -978,7 +991,13 @@ async fn pull_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, Rpc
     if id.is_empty() || id.contains('/') {
         return Err(unknown_route("POST", suffix));
     }
-    let report = puller.pull(id, None).await.map_err(pull_error)?;
+    // The cluster port's source CRUD is default-tenant throughout; widening it
+    // is an operator-surface authz question of its own (RFC-005), not part of
+    // widening the scheduler.
+    let report = puller
+        .pull(DEFAULT_TENANT, id, None)
+        .await
+        .map_err(pull_error)?;
     serde_json::to_vec(&report).map_err(handler_error)
 }
 

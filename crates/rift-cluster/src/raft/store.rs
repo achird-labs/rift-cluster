@@ -1134,6 +1134,53 @@ impl RedbStateMachine {
         Ok(records)
     }
 
+    /// Every declared source in the fleet paired with the tenant that owns it,
+    /// `(tenant, id)`-ascending — the table's own key order (issue #241).
+    ///
+    /// One scan, rather than [`Self::sources`] looped over a tenant list. A
+    /// tenant list is the wrong driver twice over: it carries tombstones
+    /// ([`Tenant::deleted`]) and omits the always-present implicit default
+    /// tenant, and each per-tenant call re-scans the whole table anyway.
+    ///
+    /// This is what the poll scheduler reconciles against, which is also what
+    /// makes `TenantDelete` correct for free: the cascade drops that tenant's
+    /// `sm_sources` rows in the same committed op, so they simply stop
+    /// appearing here and the next reconcile stops their pollers.
+    #[allow(clippy::result_large_err)]
+    pub fn sources_all(&self) -> StorageResult<Vec<(String, SourceRecord)>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let sources = read_txn
+            .open_table(SM_SOURCES_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let configs = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let owned = Self::ports_by_source_all(&configs)
+            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+
+        let mut records = Vec::new();
+        for item in sources
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (tenant, id) = key.value();
+            // Reported rather than skipped, exactly as in `sources`: silently
+            // shrinking this list would stop a live source's poller and say
+            // nothing about why.
+            let stored: StoredSource = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(tenant = %tenant, source_id = %id, error = %e, "corrupt stored source");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            let ports = owned.get(tenant).and_then(|by_source| by_source.get(id));
+            records.push((tenant.to_owned(), Self::render_source(id, &stored, ports)));
+        }
+        Ok(records)
+    }
+
     /// One source by id, or `None` if `tenant` has no such source.
     #[allow(clippy::result_large_err)]
     pub fn source(&self, tenant: &str, id: &str) -> StorageResult<Option<SourceRecord>> {
@@ -1460,6 +1507,45 @@ impl RedbStateMachine {
         Ok(owned)
     }
 
+    /// tenant -> source id -> the ports it owns, across every tenant — the
+    /// all-tenants counterpart of [`Self::ports_by_source`], for the one reader
+    /// that takes the whole source table at once.
+    ///
+    /// Nested rather than keyed by a `(tenant, id)` pair so the caller can look
+    /// a row up by borrowing both halves: this runs on every reconcile tick, and
+    /// a tuple key would mean allocating a throwaway `String` pair per source
+    /// row just to probe the map.
+    ///
+    /// Unparsable rows are ignored for the same reason as there: as far as
+    /// *provenance* goes such a record owns no port, and the config read paths
+    /// are what report the corruption. Ignoring one can only under-report
+    /// ownership, never delete anything.
+    fn ports_by_source_all(
+        table: &impl ReadableTable<(&'static str, u16), &'static str>,
+    ) -> Result<BTreeMap<String, BTreeMap<String, Vec<u16>>>, redb::StorageError> {
+        let mut owned: BTreeMap<String, BTreeMap<String, Vec<u16>>> = BTreeMap::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            let (tenant, port) = key.value();
+            if let Ok(stored) = serde_json::from_str::<StoredImposter>(value.value())
+                && let Some(provenance) = stored.source
+            {
+                owned
+                    .entry(tenant.to_owned())
+                    .or_default()
+                    .entry(provenance.id)
+                    .or_default()
+                    .push(port);
+            }
+        }
+        for by_source in owned.values_mut() {
+            for ports in by_source.values_mut() {
+                ports.sort_unstable();
+            }
+        }
+        Ok(owned)
+    }
+
     fn render_source(id: &str, stored: &StoredSource, ports: Option<&Vec<u16>>) -> SourceRecord {
         SourceRecord {
             id: id.to_owned(),
@@ -1738,6 +1824,19 @@ impl RedbStateMachine {
             .get((tenant, id))
             .expect("test get")
             .map(|g| g.value().to_owned())
+    }
+
+    /// Test-only: overwrite a raw `sm_sources` row, bypassing validation — like
+    /// [`Self::inject_raw_config`], the corrupt-record path is unreachable
+    /// through the public API.
+    #[cfg(test)]
+    fn inject_raw_source(&self, tenant: &str, id: &str, value: &str) {
+        let txn = self.db.begin_write().expect("test txn");
+        {
+            let mut table = txn.open_table(SM_SOURCES_TABLE).expect("test table");
+            table.insert((tenant, id), value).expect("test insert");
+        }
+        txn.commit().expect("test commit");
     }
 
     /// Test-only: the raw `sm_sources` row for an arbitrary `(tenant, id)`.
@@ -4475,6 +4574,12 @@ mod tests {
         )
     }
 
+    fn tenant_and_id(all: &[(String, SourceRecord)]) -> Vec<(&str, &str)> {
+        all.iter()
+            .map(|(tenant, record)| (tenant.as_str(), record.id.as_str()))
+            .collect()
+    }
+
     fn pull(op_id: u128, id: &str, version: &str, ports: &[u16]) -> ControlRequest {
         pull_at(op_id, 0, id, version, ports)
     }
@@ -5923,6 +6028,155 @@ mod tests {
         );
     }
 
+    // -- issue #241: the poll scheduler's whole-table view ---------------------
+
+    /// The scheduler drives off one scan of the source table rather than a
+    /// per-tenant read looped over a tenant list — that list carries tombstones
+    /// and omits the always-present implicit default tenant, and N tenants
+    /// would mean N full scans of the same table.
+    #[tokio::test]
+    async fn sources_all_spans_every_tenant_in_key_order() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(
+            &mut sm,
+            2,
+            source_put_in(2, "acme", "mocks", "https://acme/mocks.json"),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            3,
+            source_put_in(3, DEFAULT_TENANT, "mocks", "https://default/mocks.json"),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            4,
+            source_put_in(4, "acme", "billing", "https://acme/billing.json"),
+        )
+        .await;
+
+        let all = sm.sources_all().expect("read every tenant's sources");
+        assert_eq!(
+            tenant_and_id(&all),
+            vec![
+                ("acme", "billing"),
+                ("acme", "mocks"),
+                (DEFAULT_TENANT, "mocks"),
+            ],
+            "(tenant, id)-ascending, which is the table's own key order"
+        );
+
+        // A source id is unique only within its tenant, so the same name in two
+        // tenants must come back as two records — not one shadowing the other.
+        assert_eq!(
+            all.iter()
+                .filter(|(_, record)| record.id == "mocks")
+                .map(|(_, record)| record.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://acme/mocks.json", "https://default/mocks.json"]
+        );
+    }
+
+    /// Port provenance must not cross tenants either. Both tenants own a source
+    /// called `mocks`, so a provenance map keyed by bare source id would hand
+    /// each of them the other's ports — the same shadowing bug as above, one
+    /// level down, and invisible in a fixture where no source owns anything.
+    #[tokio::test]
+    async fn sources_all_keeps_each_tenants_port_provenance_to_itself() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(
+            &mut sm,
+            2,
+            source_put_in(2, "acme", "mocks", "https://acme/mocks.json"),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            3,
+            source_put_in(3, DEFAULT_TENANT, "mocks", "https://default/mocks.json"),
+        )
+        .await;
+        apply_one(&mut sm, 4, pull_in(4, "acme", "mocks", &[19401], 1)).await;
+        apply_one(&mut sm, 5, pull_in(5, DEFAULT_TENANT, "mocks", &[19402], 1)).await;
+
+        let all = sm.sources_all().expect("read");
+        let ports: Vec<(&str, &[u16])> = all
+            .iter()
+            .map(|(tenant, record)| (tenant.as_str(), record.ports.as_slice()))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![("acme", &[19401u16][..]), (DEFAULT_TENANT, &[19402u16][..]),],
+            "each same-named source keeps only the ports its own tenant pulled"
+        );
+    }
+
+    /// A corrupt row is an error, not a silently shorter list — the same
+    /// discipline [`RedbStateMachine::sources`] holds to. Shrinking the
+    /// projection would stop a live source's poller and report nothing.
+    #[tokio::test]
+    async fn sources_all_reports_a_corrupt_row_rather_than_skipping_it() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            source_put_in(1, "acme", "mocks", "https://acme/mocks.json"),
+        )
+        .await;
+        assert_eq!(sm.sources_all().expect("read").len(), 1);
+
+        sm.inject_raw_source("acme", "mocks", "{not json");
+
+        assert!(
+            sm.sources_all().is_err(),
+            "committed-state corruption must surface, not vanish from the list"
+        );
+    }
+
+    /// Deleting a tenant takes its sources out of the scheduler's view in the
+    /// same committed op, so the next reconcile simply stops their pollers —
+    /// no tombstone check and no tenant-list staleness anywhere in the
+    /// scheduler.
+    #[tokio::test]
+    async fn sources_all_drops_a_deleted_tenants_rows() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(
+            &mut sm,
+            2,
+            source_put_in(2, "acme", "mocks", "https://acme/mocks.json"),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            3,
+            source_put_in(3, DEFAULT_TENANT, "mocks", "https://default/mocks.json"),
+        )
+        .await;
+        assert_eq!(sm.sources_all().expect("read").len(), 2);
+
+        apply_one(
+            &mut sm,
+            4,
+            request(
+                4,
+                ControlOp::TenantDelete {
+                    tenant: TenantId::new("acme"),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            tenant_and_id(&sm.sources_all().expect("read")),
+            vec![(DEFAULT_TENANT, "mocks")],
+            "a deleted tenant's sources must stop being polled"
+        );
+    }
+
     // -- issue #159: tenancy and RBAC records (RFC-002 §10 slice T1) -----------
 
     fn tenant_put_req(op_id: u128, tenant: &str, display_name: &str) -> ControlRequest {
@@ -7128,14 +7382,15 @@ mod tests {
     }
 
     /// A `SourcePut` in a named tenant — the existing `source_put` helper is
-    /// default-tenant only.
-    fn source_put_in(op_id: u128, tenant: &str, id: &str) -> ControlRequest {
+    /// default-tenant only. `uri` is explicit because the multi-tenant
+    /// projection tests (#241) distinguish records by it.
+    fn source_put_in(op_id: u128, tenant: &str, id: &str, uri: &str) -> ControlRequest {
         request(
             op_id,
             ControlOp::SourcePut {
                 tenant: TenantId::new(tenant),
                 id: id.to_owned(),
-                uri: "https://h/i.json".to_owned(),
+                uri: uri.to_owned(),
                 mode: SourceMode::Pinned,
                 auth_ref: None,
                 on_drift: OnDrift::Overwrite,
@@ -8220,7 +8475,12 @@ mod tests {
             ),
         )
         .await;
-        apply_one(&mut sm, 2, source_put_in(2, "acme", "mocks")).await;
+        apply_one(
+            &mut sm,
+            2,
+            source_put_in(2, "acme", "mocks", "https://h/i.json"),
+        )
+        .await;
 
         let refused = apply_one(
             &mut sm,
@@ -8262,7 +8522,12 @@ mod tests {
             ),
         )
         .await;
-        apply_one(&mut sm, 2, source_put_in(2, "acme", "mocks")).await;
+        apply_one(
+            &mut sm,
+            2,
+            source_put_in(2, "acme", "mocks", "https://h/i.json"),
+        )
+        .await;
 
         let refused = apply_one(&mut sm, 3, pull_in(3, "acme", "mocks", &[9010], 2)).await;
         let ControlOutcome::Failed { reason } = &refused.outcome else {

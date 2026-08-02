@@ -10,9 +10,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
+use rift_cluster::control::MIN_POLL_SECS;
 use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, RpcError, Signer};
-use rift_cluster::{DEFAULT_TENANT, NodeConfig, RaftNode, SourcePuller, TenantId, sources};
+use rift_cluster::{
+    ControlOp, ControlOutcome, ControlRequest, DEFAULT_TENANT, NodeConfig, RaftNode, SourceMode,
+    SourcePuller, SourceScheduler, TenantId, sources,
+};
 use rift_cluster_base::seams::{
     FetchedImposters, ImposterConfig, ImposterSource, SourceMeta, SourceRef, SourceRegistry,
 };
@@ -25,6 +30,7 @@ const SECRET: &str = "sources-test-secret";
 /// A source whose content the test controls, counting fetches so "fetch once"
 /// is an assertion rather than a claim.
 struct ScriptedSource {
+    schemes: &'static [&'static str],
     fetches: Arc<AtomicUsize>,
     body: std::sync::Mutex<Vec<ImposterConfig>>,
     version: std::sync::Mutex<String>,
@@ -34,7 +40,7 @@ struct ScriptedSource {
 
 impl ImposterSource for ScriptedSource {
     fn schemes(&self) -> &'static [&'static str] {
-        &["scripted"]
+        self.schemes
     }
 
     fn fetch<'a>(
@@ -71,6 +77,7 @@ impl ImposterSource for ScriptedSource {
 
 struct Fixture {
     node: Arc<RaftNode>,
+    puller: Arc<SourcePuller>,
     addr: SocketAddr,
     source: Arc<ScriptedSource>,
     fetches: Arc<AtomicUsize>,
@@ -93,8 +100,21 @@ async fn start() -> Fixture {
 
     let fetches = Arc::new(AtomicUsize::new(0));
     let source = Arc::new(ScriptedSource {
+        schemes: &["scripted"],
         fetches: Arc::clone(&fetches),
         body: std::sync::Mutex::new(vec![imposter(9301, "v1")]),
+        version: std::sync::Mutex::new("v1".to_owned()),
+        routes_block: std::sync::Mutex::new(false),
+        intercept_block: std::sync::Mutex::new(false),
+    });
+    // A second provider, on its own scheme and serving a different port. Ports
+    // are fleet-unique across tenants (RFC-002 §3.2), so two tenants pulling
+    // the *same* document is a port collision — a refusal, not two pollers.
+    // Distinguishing "each tenant polls" therefore needs distinct content.
+    let source_b = Arc::new(ScriptedSource {
+        schemes: &["scripted-b"],
+        fetches: Arc::new(AtomicUsize::new(0)),
+        body: std::sync::Mutex::new(vec![imposter(9302, "v1")]),
         version: std::sync::Mutex::new("v1".to_owned()),
         routes_block: std::sync::Mutex::new(false),
         intercept_block: std::sync::Mutex::new(false),
@@ -103,6 +123,9 @@ async fn start() -> Fixture {
     registry
         .register(Arc::clone(&source) as Arc<dyn ImposterSource>)
         .expect("register the scripted source");
+    registry
+        .register(source_b as Arc<dyn ImposterSource>)
+        .expect("register the second scripted source");
     let puller = Arc::new(SourcePuller::new(registry));
 
     let config = NodeConfig {
@@ -133,6 +156,7 @@ async fn start() -> Fixture {
         .expect("advertise is a literal address in tests");
     Fixture {
         node,
+        puller,
         addr,
         source,
         fetches,
@@ -843,6 +867,133 @@ async fn a_tracking_source_round_trips_with_its_poll_interval() {
         fetched["pollSecs"], 30,
         "the cadence must survive the round trip: it is what the scheduler reads"
     );
+}
+
+// -- issue #241: the poll scheduler serves every tenant ----------------------
+
+/// How long a scheduler test will wait for a timer-driven effect. The first
+/// poll lands one jittered `MIN_POLL_SECS` interval after the supervisor
+/// reconciles (4.5–5.5s), plus the pull's own round trip; the margin is for a
+/// loaded CI box, and the deadline is polled rather than slept through so a
+/// healthy run does not pay for it.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Commit `op` and wait for this node to apply it, so a read that follows sees
+/// it. Bypasses the cluster port deliberately: that surface is
+/// `DEFAULT_TENANT`-hardcoded (out of scope for #241), and what is under test
+/// is that a *committed* row for any tenant gets polled.
+async fn commit(fixture: &Fixture, op: ControlOp) {
+    let response = fixture
+        .node
+        .write(ControlRequest {
+            op_id: uuid::Uuid::new_v4(),
+            principal: None,
+            issued_at_secs: 0,
+            expected_revision: None,
+            op,
+        })
+        .await
+        .expect("the op commits");
+    assert!(
+        matches!(response.outcome, ControlOutcome::Applied),
+        "{:?}",
+        response.outcome
+    );
+    fixture
+        .node
+        .await_local_applied(response.revision, Duration::from_secs(5))
+        .await;
+}
+
+async fn declare_tracking_source(fixture: &Fixture, tenant: &str, id: &str, uri: &str) {
+    commit(
+        fixture,
+        ControlOp::SourcePut {
+            tenant: TenantId::new(tenant),
+            id: id.to_owned(),
+            uri: uri.to_owned(),
+            mode: SourceMode::Tracking,
+            auth_ref: None,
+            on_drift: rift_cluster::OnDrift::Overwrite,
+            poll_secs: Some(MIN_POLL_SECS),
+        },
+    )
+    .await;
+}
+
+/// Poll `check` until it holds or `deadline` passes.
+///
+/// The scheduler is timer-driven, so every assertion about it is "within a
+/// bound" rather than "now" — and a bare sleep of the worst case would make
+/// every green run pay the worst case.
+async fn within(deadline: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < deadline {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    check()
+}
+
+/// A non-default tenant's tracking source must actually be polled, and two
+/// tenants' same-named sources must poll independently.
+///
+/// Before #241 the supervisor built its desired set from
+/// `sources(DEFAULT_TENANT)`, so `acme`'s declaration below committed,
+/// validated, and was served by `GET /admin/sources` — and then was never
+/// fetched. The state machine was promising a behaviour the scheduler did not
+/// deliver. The `default` half then pins down the other error the fix could
+/// make: a running set keyed by bare id would poll one of two same-named
+/// sources and silently starve the other, which from the outside is
+/// indistinguishable from never having declared it.
+///
+/// Both halves live in one test on purpose. Each one costs a live node, a real
+/// scheduler and a jittered `MIN_POLL_SECS` wait, and running two of those
+/// concurrently with the rest of the workspace was enough to push an unrelated
+/// deadline-bounded test in `rift-cluster` past its `CONVERGE_DEADLINE`. One
+/// test proves the same two things for half the contention.
+///
+/// The two sources point at different documents deliberately: ports are
+/// fleet-unique across tenants (RFC-002 §3.2), so aiming both at the same one
+/// would prove nothing — the second pull would be refused for the port
+/// collision, whichever poller reached it first.
+#[tokio::test]
+async fn tracking_sources_poll_per_tenant_and_same_names_stay_apart() {
+    let fixture = start().await;
+    declare_tracking_source(&fixture, "acme", "mocks", "scripted-b://cfg/i.json").await;
+    declare_tracking_source(&fixture, DEFAULT_TENANT, "mocks", "scripted://cfg/i.json").await;
+    let before = fixture.fetches.load(Ordering::SeqCst);
+
+    let (_status, supervisor) = SourceScheduler::spawn(
+        &tokio::runtime::Handle::current(),
+        &fixture.node,
+        &fixture.puller,
+    );
+    // One deadline covers everything: the applied ports prove each poller ran
+    // *and* that what it produced committed under the tenant that owns the
+    // source, rather than under the tenant the puller used to be pinned to.
+    let both = within(POLL_DEADLINE, || {
+        let ports = fixture.node.configured_ports().expect("ports");
+        ports.contains(&(TenantId::new("acme"), 9302))
+            && ports.contains(&(TenantId::new(DEFAULT_TENANT), 9301))
+    })
+    .await;
+    let fetched = fixture.fetches.load(Ordering::SeqCst) > before;
+    supervisor.abort();
+
+    let ports = fixture.node.configured_ports().expect("ports");
+    assert!(
+        ports.contains(&(TenantId::new("acme"), 9302)),
+        "a non-default tenant's tracking source must be polled, and its pull must commit under \
+         that tenant: {ports:?}"
+    );
+    assert!(
+        both,
+        "each tenant's same-named source needs its own poller: {ports:?}"
+    );
+    assert!(fetched, "no source was fetched at all");
 }
 
 /// The source surface rides the authenticated cluster port, so it is subject to

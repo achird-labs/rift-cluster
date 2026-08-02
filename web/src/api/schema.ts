@@ -1308,7 +1308,7 @@ export interface components {
              * @description The cluster node that answered this request.
              */
             nodeId: number;
-            /** @description Last poll error per source id, for sources this node has seen fail. Empty when nothing is failing — an explicit empty map, not an absent field. Polls run on the leader, so a follower's map is usually empty; and the poll scheduler currently serves only the default tenant's tracking sources, so other tenants' maps are empty until that widens. */
+            /** @description Last poll error per source id, for sources this node has seen fail. Empty when nothing is failing — an explicit empty map, not an absent field. Polls run on the leader, so a follower's map is usually empty. Scoped to the tenant of the request: the scheduler polls every tenant's tracking sources, and a source id is unique only within its tenant. */
             pollErrors: {
                 [key: string]: string;
             };

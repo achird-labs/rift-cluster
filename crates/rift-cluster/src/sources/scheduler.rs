@@ -27,6 +27,17 @@
 //! is the property that makes tracking mode affordable: a 30-second poll
 //! against a static document grows the log by zero forever.
 //!
+//! ## Every tenant, one supervisor
+//!
+//! The supervisor polls **every** tenant's tracking sources, keyed
+//! `(tenant, id)` — a source id is unique only within its tenant, so a bare-id
+//! running set would poll one tenant's source and silently starve another's of
+//! the same name (#241). It reconciles against one whole-table scan
+//! (`RaftNode::sources_all`) rather than a tenant list: that list carries
+//! tombstones and omits the implicit default tenant, and a tenant's
+//! cascade-delete drops its source rows in the same committed op — so they stop
+//! appearing, and the next reconcile stops their pollers with nothing to check.
+//!
 //! ## Failures are visible without being written down
 //!
 //! A failing poll must not write a log entry per failure — that would
@@ -41,7 +52,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use crate::control::DEFAULT_TENANT;
 use crate::raft::RaftNode;
 
 use super::SourcePuller;
@@ -104,12 +114,16 @@ impl PollStatus {
     }
 }
 
-/// What the supervisor believes it is currently polling: source id → the
+/// What the supervisor believes it is currently polling: `(tenant, id)` → the
 /// interval it was started with, plus the task's abort handle.
 struct Running {
     poll_secs: u64,
     task: tokio::task::JoinHandle<()>,
 }
+
+/// A source's fleet-wide identity: a bare id is unique only within its tenant,
+/// so it is the pair that names a poller.
+type SourceKey = (String, String);
 
 /// The leader-only poll supervisor.
 pub struct SourceScheduler {
@@ -154,7 +168,7 @@ impl SourceScheduler {
     /// The supervisor loop: reconcile the running task set against what the
     /// applied state machine says this node should be polling.
     async fn supervise(self) {
-        let mut running: BTreeMap<String, Running> = BTreeMap::new();
+        let mut running: BTreeMap<SourceKey, Running> = BTreeMap::new();
         // Start pessimistic. If this node is already leader, the first
         // `await_leadership_change` returns immediately with `true`, which is
         // the reconcile that starts the tasks.
@@ -192,14 +206,14 @@ impl SourceScheduler {
 
     /// Bring the running task set in line with the applied source table.
     /// `None` means the node or puller is gone and the supervisor should exit.
-    fn reconcile(&self, running: &mut BTreeMap<String, Running>) -> Option<()> {
+    fn reconcile(&self, running: &mut BTreeMap<SourceKey, Running>) -> Option<()> {
         let node = self.node.upgrade()?;
         let puller = self.puller.upgrade()?;
 
-        let desired: BTreeMap<String, u64> = match node.sources(DEFAULT_TENANT) {
+        let desired: BTreeMap<SourceKey, u64> = match node.sources_all() {
             Ok(sources) => sources
                 .into_iter()
-                .filter_map(|source| {
+                .filter_map(|(tenant, source)| {
                     // A source that tracks without an interval cannot be
                     // polled; `validate` refuses that combination, so this is
                     // belt-and-braces against a record written by some other
@@ -207,13 +221,23 @@ impl SourceScheduler {
                     matches!(source.mode, crate::control::SourceMode::Tracking)
                         .then_some(())
                         .and(source.poll_secs)
-                        .map(|secs| (source.id, secs))
+                        .map(|secs| ((tenant, source.id), secs))
                 })
                 .collect(),
             Err(e) => {
                 // A read failure is this node's problem, not a reason to tear
                 // down healthy pollers: keep what is running and retry on the
                 // next tick.
+                //
+                // Note the blast radius, which widened with #241: the read is
+                // now one whole-table scan, and `sources_all` treats a corrupt
+                // row as an error rather than shrinking the list. So a single
+                // unparsable row in *any* tenant parks reconciliation for
+                // *every* tenant — no poller starts, stops, or adopts a new
+                // interval until it is repaired. That is the deliberate trade
+                // (a silently shorter list would stop a live source's poller
+                // and say nothing), but it is a fleet-wide stall behind a log
+                // line, so it needs a real signal — tracked as its own issue.
                 tracing::warn!(error = %e, "source scheduler could not read the source table");
                 return Some(());
             }
@@ -222,39 +246,42 @@ impl SourceScheduler {
         // Stop what is no longer wanted, or whose interval changed — a changed
         // interval is a new schedule, and restarting the task is the honest way
         // to adopt it.
-        let stale: Vec<String> = running
+        let stale: Vec<SourceKey> = running
             .iter()
-            .filter(|(id, r)| desired.get(*id).is_none_or(|secs| *secs != r.poll_secs))
-            .map(|(id, _)| id.clone())
+            .filter(|(key, r)| desired.get(*key).is_none_or(|secs| *secs != r.poll_secs))
+            .map(|(key, _)| key.clone())
             .collect();
-        for id in stale {
-            if let Some(previous) = running.remove(&id) {
+        for key in stale {
+            if let Some(previous) = running.remove(&key) {
                 previous.task.abort();
-                self.status.forget(DEFAULT_TENANT, &id);
-                tracing::debug!(source_id = %id, "stopped polling");
+                let (tenant, id) = &key;
+                self.status.forget(tenant, id);
+                tracing::debug!(tenant = %tenant, source_id = %id, "stopped polling");
             }
         }
 
-        for (id, poll_secs) in desired {
-            if running.contains_key(&id) {
+        for (key, poll_secs) in desired {
+            if running.contains_key(&key) {
                 continue;
             }
+            let (tenant, id) = &key;
+            tracing::info!(tenant = %tenant, source_id = %id, poll_secs, "polling a tracking source");
             let task = tokio::spawn(poll_loop(
+                tenant.clone(),
                 id.clone(),
                 poll_secs,
                 Arc::downgrade(&puller),
                 Arc::clone(&self.status),
             ));
-            running.insert(id.clone(), Running { poll_secs, task });
-            tracing::info!(source_id = %id, poll_secs, "polling a tracking source");
+            running.insert(key, Running { poll_secs, task });
         }
         Some(())
     }
 
-    fn stop_all(running: &mut BTreeMap<String, Running>, status: &PollStatus) {
-        for (id, r) in std::mem::take(running) {
+    fn stop_all(running: &mut BTreeMap<SourceKey, Running>, status: &PollStatus) {
+        for ((tenant, id), r) in std::mem::take(running) {
             r.task.abort();
-            status.forget(DEFAULT_TENANT, &id);
+            status.forget(&tenant, &id);
         }
     }
 }
@@ -262,6 +289,7 @@ impl SourceScheduler {
 /// One source's poll loop. Sleeps first, so a `SourcePut` does not double up
 /// with the pull its own creation path already performed.
 async fn poll_loop(
+    tenant: String,
     id: String,
     poll_secs: u64,
     puller: Weak<SourcePuller>,
@@ -273,12 +301,12 @@ async fn poll_loop(
             break;
         };
         let started = std::time::Instant::now();
-        // The scheduler serves the default tenant's source table only — the
-        // same `DEFAULT_TENANT` that `reconcile` builds its desired set from —
-        // so its status entries are recorded under that tenant.
-        match puller.pull(&id, Some("scheduler".to_owned())).await {
+        match puller
+            .pull(&tenant, &id, Some("scheduler".to_owned()))
+            .await
+        {
             Ok(report) => {
-                status.record_success(DEFAULT_TENANT, &id);
+                status.record_success(&tenant, &id);
                 crate::metrics::source_poll(
                     if report.unchanged {
                         "unchanged"
@@ -295,8 +323,8 @@ async fn poll_loop(
                 // outage must not turn into fleet-wide write traffic. The loop
                 // keeps its cadence — the next tick retries.
                 let detail = e.to_string();
-                tracing::warn!(source_id = %id, error = %detail, "source poll failed");
-                status.record_failure(DEFAULT_TENANT, &id, detail);
+                tracing::warn!(tenant = %tenant, source_id = %id, error = %detail, "source poll failed");
+                status.record_failure(&tenant, &id, detail);
                 crate::metrics::source_poll("error", started.elapsed());
             }
         }
@@ -319,6 +347,7 @@ fn jittered(poll_secs: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::DEFAULT_TENANT;
 
     #[test]
     fn jitter_stays_within_ten_percent_and_never_collapses() {

@@ -1104,6 +1104,11 @@ meant to drive it. So the scheduler is **leader-only**.
 - On losing leadership a node stops every poll task; on gaining it, it starts
   them. `SourcePut` and `SourceDelete` reconcile the running set without a
   restart.
+- **Polls cover every tenant's tracking sources**, not just the default
+  tenant's (#241). The running set is keyed `(tenant, id)` — a source id is
+  unique only within its tenant — and a pull commits under the tenant that owns
+  the source. Deleting a tenant removes its source rows in the same committed
+  op, so the next reconcile stops their pollers with no tombstone check.
 - Intervals are jittered ±10%, so sources declared together do not arrive at the
   upstream host as a burst every interval.
 - **`pollSecs` has a 5-second floor**, enforced at admission with a typed `400`.
