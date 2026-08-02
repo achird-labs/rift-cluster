@@ -195,8 +195,15 @@ A closed enum, one per route class:
 `ImposterRead` · `ImposterWrite` · `ImposterDelete` · `StubWrite` ·
 `LifecycleToggle` · `SavedRequestsRead` · `SavedRequestsClear` · `ScenarioRead` ·
 `ScenarioWrite` · `ScenarioReset` · `SpaceStubWrite` · `SpaceTeardown` ·
-`FlowStateRead` · `FlowStateClear` · `VerifyRun` · `StreamSubscribe` ·
-`TenantManage` · `AuditRead` · `ClusterAdmin`
+`FlowStateRead` · `FlowStateClear` · `SourceRead` · `VerifyRun` ·
+`StreamSubscribe` · `TenantManage` · `AuditRead` · `ClusterAdmin`
+
+`SourceRead` (issue #239) covers the read-only source inspection surface
+(`GET /admin/sources`, `GET /admin/sources/{id}`). It sits with the other
+Viewer reads: a source declaration is config, and its `authRef` is the *name*
+of a credential, never the credential. Declaring or deleting a source is a
+different power — credential-adjacent through `authRef` — and gets its own
+action when a write surface ships; until then writes stay on the cluster port.
 
 `AuditRead` is granted to `TenantAdmin` (scoped to its own tenant) and to
 `FleetAdmin` (fleet-wide). It is deliberately **not** part of `TenantManage`:

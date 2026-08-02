@@ -873,6 +873,7 @@ async fn attach_data_plane(
             admin_async,
             export_status: Some(export_status),
             readiness: Arc::clone(readiness),
+            puller: Arc::clone(&puller),
         },
         node,
     )

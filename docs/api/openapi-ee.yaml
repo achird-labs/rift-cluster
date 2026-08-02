@@ -72,6 +72,11 @@ tags:
       equivalent.
   - name: session
     description: RFC-006 §5.3 browser session exchange — no upstream equivalent.
+  - name: sources
+    description: >
+      Issue #239's read-only imposter-source inspection — no upstream
+      equivalent. Declaring, deleting, and pulling sources stay on the
+      cluster port.
   - name: meta
     description: Identity and contract introspection.
   - name: upstream-core
@@ -2464,6 +2469,98 @@ paths:
           $ref: '#/components/responses/WriteTimeout'
 
   # ---------------------------------------------------------------------
+  # ee: imposter-source inspection (issue #239; read-only — declaring or
+  # deleting a source stays on the cluster port pending its own authz tier)
+  # ---------------------------------------------------------------------
+  /admin/sources:
+    get:
+      operationId: listSources
+      summary: The tenant's imposter sources, with this node's poll status apart
+      description: >
+        Terminates. The `sources` half is the fleet-replicated projection,
+        id-ascending and byte-identical on every converged node — diffing two
+        nodes' answers is how an operator checks a `SourcePut` has converged.
+        The `nodeLocal` half is true of the answering node only: a poll
+        failure is deliberately never replicated (a log entry per failure is
+        the log growth the digest short-circuit exists to prevent), so it may
+        differ across the fleet and is kept structurally apart rather than
+        flattened into the record. Requires `source.read` (Viewer and up).
+      tags: [sources]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The tenant's declared sources, plus this node's poll status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sources, nodeLocal]
+                properties:
+                  sources:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SourceRecord'
+                  nodeLocal:
+                    $ref: '#/components/schemas/SourcesNodeLocal'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Caller holds no binding in the tenant in view (RFC-002 §8.4 — not a 403).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/sources/{sourceId}:
+    get:
+      operationId: getSource
+      summary: One imposter source
+      description: >
+        Terminates. The same two-part shape as the list — see `GET
+        /admin/sources` for why the replicated record and this node's poll
+        status never merge. Requires `source.read` (Viewer and up).
+      tags: [sources]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: sourceId
+          in: path
+          required: true
+          description: The source's declared id, unique within its tenant.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The source, plus this node's poll status for it.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [source, nodeLocal]
+                properties:
+                  source:
+                    $ref: '#/components/schemas/SourceRecord'
+                  nodeLocal:
+                    $ref: '#/components/schemas/SourcesNodeLocal'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: >
+            No such source in the tenant in view. Byte-identical whether the
+            id never existed, exists in another tenant, or the caller holds
+            no binding here at all (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ---------------------------------------------------------------------
   # ee: identity / contract introspection
   # ---------------------------------------------------------------------
   /admin/whoami:
@@ -3851,6 +3948,92 @@ components:
                   format: int64
                 consecutiveFailures:
                   type: integer
+
+    SourceRecord:
+      type: object
+      description: >
+        One imposter source as the fleet has agreed on it — the replicated
+        projection, identical on every converged node. Deliberately carries
+        nothing node-local, so two nodes' answers stay byte-comparable as a
+        convergence check.
+      required: [id, uri, mode, onDrift, drifted, ports, revision]
+      properties:
+        id:
+          type: string
+          description: The source's declared id, unique within its tenant.
+        uri:
+          type: string
+          description: The URI the fleet pulls imposters from.
+        mode:
+          type: string
+          enum: [pinned, tracking]
+          description: Explicit pulls only, or scheduled polls on `pollSecs`.
+        authRef:
+          type: string
+          description: >
+            The **name** of a credential, never the credential — a URI
+            carrying embedded credentials is refused before it can enter the
+            replicated log.
+        onDrift:
+          type: string
+          enum: [overwrite, skip, fail]
+          description: What a pull does when the source's imposters were hand-edited since it last applied.
+        pollSecs:
+          type: integer
+          format: int64
+          description: Poll interval for a `tracking` source; absent for `pinned`.
+        drifted:
+          type: boolean
+          description: An operator has edited this source's imposters by hand since it last applied.
+        lastVersion:
+          type: string
+          description: The version label the last pull reported, when the source names one.
+        lastDigest:
+          type: string
+          description: Digest of the content the last pull saw.
+        lastPulledAtSecs:
+          type: integer
+          format: int64
+          description: When the last pull committed, in UNIX seconds.
+        lastOutcome:
+          type: string
+          enum: [applied, skipped]
+          description: How the last pull ended; absent when the source has never pulled.
+        ports:
+          type: array
+          items:
+            type: integer
+          description: The ports this source currently owns, ascending.
+        revision:
+          type: integer
+          format: int64
+          description: The log index that last wrote this record.
+
+    SourcesNodeLocal:
+      type: object
+      description: >
+        The answering node's own view — **not** a fleet fact. A poll failure
+        is a property of one node's reach to an external host at one moment
+        and is deliberately never replicated, so this half can differ across
+        the fleet; it is kept apart from the record precisely so that it
+        cannot be mistaken for one more replicated field.
+      required: [nodeId, pollErrors]
+      properties:
+        nodeId:
+          type: integer
+          format: int64
+          description: The cluster node that answered this request.
+        pollErrors:
+          type: object
+          additionalProperties:
+            type: string
+          description: >
+            Last poll error per source id, for sources this node has seen
+            fail. Empty when nothing is failing — an explicit empty map, not
+            an absent field. Polls run on the leader, so a follower's map is
+            usually empty; and the poll scheduler currently serves only the
+            default tenant's tracking sources, so other tenants' maps are
+            empty until that widens.
 
     WhoAmI:
       type: object
