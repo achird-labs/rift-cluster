@@ -91,7 +91,7 @@ export default defineConfig({
   },
 
   webServer: {
-    command: "bash ../scripts/e2e-console.sh up",
+    command: "bash ../scripts/e2e-console.sh serve",
     /*
      * The seeded sentinel imposter, not `/console/`.
      *

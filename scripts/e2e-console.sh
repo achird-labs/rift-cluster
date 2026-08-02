@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The fixture the browser tests drive: one console-enabled node, seeded deterministically.
 #
-#     scripts/e2e-console.sh up     # build if needed, start, seed, write the fixture file
+#     scripts/e2e-console.sh up     # build if needed, start, seed, write the fixture file, return
+#     scripts/e2e-console.sh serve  # the same, then block — what Playwright's webServer runs
 #     scripts/e2e-console.sh down   # stop and wipe
 #
 # **One node, not three.** Every console screen is per-node — `/_fleet/*` is one node answering
@@ -156,5 +157,23 @@ PY
     echo "e2e fixture up on http://127.0.0.1:${ADMIN_PORT}/console/ (keys in ${FIXTURE})"
     ;;
 
-  *) echo "usage: $0 {up|down}"; exit 2 ;;
+  serve)
+    # `up`, then block on the node.
+    #
+    # Playwright's `webServer` requires a command that stays in the foreground; `up` backgrounds the
+    # node and returns, which it reports as "Process from config.webServer exited early". It only
+    # showed up in CI: locally `reuseExistingServer` is true, so Playwright found a fixture already
+    # running and never executed the command at all.
+    #
+    # Polled, not `wait`: the node is backgrounded inside the `bash "$0" up` subshell, so it is not
+    # a child of this one and `wait` answers "not a child of this shell" (exit 127, which Playwright
+    # reports as "webServer was not able to start"). Polling also still exits when the node dies, so
+    # Playwright fails fast rather than running every spec against a dead port.
+    bash "$0" up
+    node_pid="$(cat "${RUN}/node.pid")"
+    while kill -0 "$node_pid" 2>/dev/null; do sleep 1; done
+    echo "e2e fixture: node ${node_pid} exited"
+    ;;
+
+  *) echo "usage: $0 {up|serve|down}"; exit 2 ;;
 esac
