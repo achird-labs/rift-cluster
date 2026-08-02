@@ -30,7 +30,7 @@ use super::network::{
     JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
 };
 use super::ring::Ring;
-use super::store::{self, RedbStateMachine, SourceRecord};
+use super::store::{self, RedbStateMachine, SourceRecord, SourceRow};
 use super::{NodeId, TypeConfig};
 use crate::control::{
     AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, Principal, Role, SessionKey,
@@ -1276,7 +1276,11 @@ impl RaftNode {
     /// `(tenant, id)`-ascending (issue #241). What the poll scheduler
     /// reconciles against, so that a tracking source polls whichever tenant
     /// declared it.
-    pub fn sources_all(&self) -> Result<Vec<(String, SourceRecord)>, NodeError> {
+    ///
+    /// A row whose stored value will not decode comes back with
+    /// [`SourceRow::record`] `= Err` rather than failing the call — one
+    /// tenant's corruption must not park the fleet's reconciliation (#243).
+    pub fn sources_all(&self) -> Result<Vec<SourceRow>, NodeError> {
         self.sm_reader
             .sources_all()
             .map_err(|e| NodeError::Storage(e.to_string()))

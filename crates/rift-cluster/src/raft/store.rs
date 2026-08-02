@@ -297,6 +297,23 @@ impl PullOutcome {
     }
 }
 
+/// One row of the fleet-wide source scan: its identity, and its value *or* the
+/// reason the value would not decode (issue #243).
+///
+/// The split exists because the two halves fail independently. A redb key is a
+/// `(tenant, id)` pair of strings and decodes even when the JSON value beside it
+/// is garbage — so a corrupt row can still be *named*. That is what lets the
+/// poll scheduler hold exactly that source's poller instead of either dropping
+/// it silently (which stops a live poller and says nothing) or failing the whole
+/// scan (which parks reconciliation for every tenant at once).
+#[derive(Debug, Clone)]
+pub struct SourceRow {
+    pub tenant: String,
+    pub id: String,
+    /// `Err` carries the decode failure, for the caller to report.
+    pub record: Result<SourceRecord, String>,
+}
+
 /// One source as reported by the read paths — the shape `GET /admin/sources`
 /// and `GET /admin/sources/:id` render.
 ///
@@ -1146,8 +1163,21 @@ impl RedbStateMachine {
     /// makes `TenantDelete` correct for free: the cascade drops that tenant's
     /// `sm_sources` rows in the same committed op, so they simply stop
     /// appearing here and the next reconcile stops their pollers.
+    ///
+    /// **A row that will not decode is reported in band** as
+    /// [`SourceRow::record`] `= Err`, not skipped and not fatal to the scan
+    /// (issue #243). The two rejected alternatives are why: skipping shrinks
+    /// the list, which stops a live source's poller and says nothing; failing
+    /// the call parks reconciliation for *every* tenant over one tenant's bad
+    /// row. [`Self::sources`] and [`Self::source`] keep the strict behaviour —
+    /// they answer a tenant about its own state, where a loud error is exactly
+    /// right, and this method's caller is a fleet-wide control loop instead.
+    ///
+    /// Table and transaction failures still fail the whole call. Those are
+    /// transient and say nothing about any individual row, so the scheduler's
+    /// keep-what-is-running-and-retry response remains the correct one.
     #[allow(clippy::result_large_err)]
-    pub fn sources_all(&self) -> StorageResult<Vec<(String, SourceRecord)>> {
+    pub fn sources_all(&self) -> StorageResult<Vec<SourceRow>> {
         let read_txn = self
             .db
             .begin_read()
@@ -1161,24 +1191,30 @@ impl RedbStateMachine {
         let owned = Self::ports_by_source_all(&configs)
             .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
-        let mut records = Vec::new();
+        let mut rows = Vec::new();
         for item in sources
             .iter()
             .map_err(|e| StorageIOError::read_state_machine(&e))?
         {
             let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
             let (tenant, id) = key.value();
-            // Reported rather than skipped, exactly as in `sources`: silently
-            // shrinking this list would stop a live source's poller and say
-            // nothing about why.
-            let stored: StoredSource = serde_json::from_str(value.value()).map_err(|e| {
-                tracing::error!(tenant = %tenant, source_id = %id, error = %e, "corrupt stored source");
-                StorageError::from(StorageIOError::read_state_machine(&e))
-            })?;
-            let ports = owned.get(tenant).and_then(|by_source| by_source.get(id));
-            records.push((tenant.to_owned(), Self::render_source(id, &stored, ports)));
+            // Not logged here. This runs on every reconcile tick (1 Hz), and a
+            // corrupt row stays corrupt until someone rewrites it, so logging
+            // per read would emit the same line forever. The detail travels to
+            // the scheduler, which logs the transition instead.
+            let record = serde_json::from_str::<StoredSource>(value.value())
+                .map(|stored| {
+                    let ports = owned.get(tenant).and_then(|by_source| by_source.get(id));
+                    Self::render_source(id, &stored, ports)
+                })
+                .map_err(|e| e.to_string());
+            rows.push(SourceRow {
+                tenant: tenant.to_owned(),
+                id: id.to_owned(),
+                record,
+            });
         }
-        Ok(records)
+        Ok(rows)
     }
 
     /// One source by id, or `None` if `tenant` has no such source.
@@ -4403,7 +4439,7 @@ mod tests {
 
     use super::{
         DEDUP_TTL_SECS, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine, SM_CONFIGS_TABLE,
-        SM_DEDUP_TABLE, SM_TENANTS_TABLE, SourceRecord, StoredImposter, new,
+        SM_DEDUP_TABLE, SM_TENANTS_TABLE, SourceRecord, SourceRow, StoredImposter, new,
     };
     use crate::control::{
         AUDIT_RESOURCE_ALL, AuditRow, AuthSource, ControlOp, ControlOutcome, ControlRequest,
@@ -4574,9 +4610,12 @@ mod tests {
         )
     }
 
-    fn tenant_and_id(all: &[(String, SourceRecord)]) -> Vec<(&str, &str)> {
+    /// Every row's identity, readable whether or not its value decoded — which
+    /// is the property that lets the scheduler hold a corrupt source's poller
+    /// instead of losing track of it (#243).
+    fn tenant_and_id(all: &[SourceRow]) -> Vec<(&str, &str)> {
         all.iter()
-            .map(|(tenant, record)| (tenant.as_str(), record.id.as_str()))
+            .map(|row| (row.tenant.as_str(), row.id.as_str()))
             .collect()
     }
 
@@ -6057,6 +6096,11 @@ mod tests {
         )
         .await;
 
+        // A corrupt row must not displace the rest of the scan, nor its own
+        // place in it: key order is the table's, and the key is readable even
+        // when the value is not (#243).
+        sm.inject_raw_source("acme", "billing", "{not json");
+
         let all = sm.sources_all().expect("read every tenant's sources");
         assert_eq!(
             tenant_and_id(&all),
@@ -6072,8 +6116,9 @@ mod tests {
         // tenants must come back as two records — not one shadowing the other.
         assert_eq!(
             all.iter()
-                .filter(|(_, record)| record.id == "mocks")
-                .map(|(_, record)| record.uri.as_str())
+                .filter_map(|row| row.record.as_ref().ok())
+                .filter(|record| record.id == "mocks")
+                .map(|record| record.uri.as_str())
                 .collect::<Vec<_>>(),
             vec!["https://acme/mocks.json", "https://default/mocks.json"]
         );
@@ -6105,7 +6150,10 @@ mod tests {
         let all = sm.sources_all().expect("read");
         let ports: Vec<(&str, &[u16])> = all
             .iter()
-            .map(|(tenant, record)| (tenant.as_str(), record.ports.as_slice()))
+            .map(|row| {
+                let record = row.record.as_ref().expect("these rows decode");
+                (row.tenant.as_str(), record.ports.as_slice())
+            })
             .collect();
         assert_eq!(
             ports,
@@ -6114,25 +6162,94 @@ mod tests {
         );
     }
 
-    /// A corrupt row is an error, not a silently shorter list — the same
-    /// discipline [`RedbStateMachine::sources`] holds to. Shrinking the
-    /// projection would stop a live source's poller and report nothing.
+    /// A corrupt row is reported, not skipped — and reported **in band**, so it
+    /// costs only itself (#243).
+    ///
+    /// Skipping it would stop a live source's poller and say nothing. Failing
+    /// the whole scan — what #241 did — says something, but it says it about
+    /// every tenant at once: this projection drives the fleet's poll scheduler,
+    /// so one unreadable row would park reconciliation everywhere. The row's
+    /// key decodes even when its value does not, which is what makes the third
+    /// option available.
     #[tokio::test]
     async fn sources_all_reports_a_corrupt_row_rather_than_skipping_it() {
         let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
         apply_one(
             &mut sm,
-            1,
-            source_put_in(1, "acme", "mocks", "https://acme/mocks.json"),
+            2,
+            source_put_in(2, "acme", "mocks", "https://acme/mocks.json"),
         )
         .await;
-        assert_eq!(sm.sources_all().expect("read").len(), 1);
+        apply_one(
+            &mut sm,
+            3,
+            source_put_in(3, DEFAULT_TENANT, "healthy", "https://default/h.json"),
+        )
+        .await;
+
+        sm.inject_raw_source("acme", "mocks", "{not json");
+
+        let all = sm
+            .sources_all()
+            .expect("a corrupt row must not fail the scan");
+        assert_eq!(
+            tenant_and_id(&all),
+            vec![("acme", "mocks"), (DEFAULT_TENANT, "healthy")],
+            "the corrupt row keeps its place in the list — it is reported, not dropped"
+        );
+
+        let corrupt = &all[0];
+        let detail = corrupt
+            .record
+            .as_ref()
+            .expect_err("the unparsable row must carry its decode failure");
+        assert!(
+            !detail.is_empty(),
+            "the failure must say something a human can act on"
+        );
+
+        assert!(
+            all[1].record.is_ok(),
+            "another tenant's readable row must be unaffected: one bad row costs only itself"
+        );
+    }
+
+    /// The per-row tolerance is `sources_all`'s alone. A tenant asking about
+    /// its own sources still gets a hard error, because that is the surface
+    /// where the corruption is actionable — and because the two must not drift
+    /// together: someone "fixing" these to match `sources_all`'s new leniency
+    /// would turn a tenant's committed-state corruption into an empty list.
+    #[tokio::test]
+    async fn a_corrupt_row_still_fails_the_strict_per_tenant_reads() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, tenant_put_req(1, "acme", "Acme")).await;
+        apply_one(
+            &mut sm,
+            2,
+            source_put_in(2, "acme", "mocks", "https://acme/mocks.json"),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            3,
+            source_put_in(3, DEFAULT_TENANT, "healthy", "https://default/h.json"),
+        )
+        .await;
 
         sm.inject_raw_source("acme", "mocks", "{not json");
 
         assert!(
-            sm.sources_all().is_err(),
-            "committed-state corruption must surface, not vanish from the list"
+            sm.sources("acme").is_err(),
+            "the owning tenant's list must not silently lose the source"
+        );
+        assert!(
+            sm.source("acme", "mocks").is_err(),
+            "nor may reading it directly answer `None`, which reads as 'no such source'"
+        );
+        assert!(
+            sm.sources(DEFAULT_TENANT).is_ok(),
+            "another tenant's read is unaffected — it filters before it parses"
         );
     }
 

@@ -45,7 +45,8 @@ pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;
 pub use raft::{
     DEFAULT_AUDIT_RETENTION_SECS, KeyClass, LeaveOutcome, NodeConfig, NodeError, NodeId,
-    NodeIdentity, OwnStatus, OwnedKey, PullOutcome, RaftNode, Ring, SourceRecord, StatusReport,
+    NodeIdentity, OwnStatus, OwnedKey, PullOutcome, RaftNode, Ring, SourceRecord, SourceRow,
+    StatusReport,
 };
 pub use rpc::{Authority, AuthorityError, Router, RpcClient, RpcError, RpcServer};
 pub use sources::scheduler::{PollStatus, SourceScheduler};
