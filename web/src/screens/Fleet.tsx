@@ -4,7 +4,7 @@ import { ApiError } from "../api/client.ts";
 import { FLEET_HEALTH_FIELDS, FLEET_MEMBER_FIELDS } from "../app/contract.ts";
 import type { FleetView } from "../app/fleetView.ts";
 import { useFleetView } from "../app/queries.ts";
-import { ErrorNote, Ident, Status, UNKNOWN } from "../components/primitives.tsx";
+import { Card, ErrorNote, Ident, Status, Tile, UNKNOWN } from "../components/primitives.tsx";
 
 export function Fleet(): ReactNode {
   const fleet = useFleetView();
@@ -24,7 +24,7 @@ export function Fleet(): ReactNode {
     const scoped = status === 404 || status === 403;
     return (
       <section className="screen">
-        <h1>Cluster</h1>
+        <h1>Cluster &amp; fleet</h1>
         {scoped ? (
           <p className="error" role="alert">
             The fleet projection is fleet-scoped and is not available to this principal. A
@@ -40,7 +40,7 @@ export function Fleet(): ReactNode {
   return (
     <section className="screen">
       <header className="screen-head">
-        <h1>Cluster</h1>
+        <h1>Cluster &amp; fleet</h1>
         <p className="scope-label" data-testid="fleet-scope-label">
           {/* `/_fleet/*` is one node answering about itself. Presenting it as the fleet's own state
               would be the UI equivalent of a vacuous test — and there is no fleet-wide read to
@@ -60,43 +60,79 @@ function View({ view }: { view: FleetView }): ReactNode {
   return (
     <>
       {view.degraded.length > 0 ? (
-        <div className="degraded" data-testid="fleet-degraded" role="status">
-          <strong>This node is degraded.</strong>
-          <ul>
-            {view.degraded.map((reason) => (
-              <li key={reason}>{DEGRADATION_WORDING[reason]}</li>
-            ))}
-          </ul>
+        <div className="banner warn" data-testid="fleet-degraded" role="status">
+          <span className="b-glyph" aria-hidden="true">
+            ▲
+          </span>
+          <div>
+            <strong>This node is degraded.</strong>
+            <ul>
+              {view.degraded.map((reason) => (
+                <li key={reason}>{DEGRADATION_WORDING[reason]}</li>
+              ))}
+            </ul>
+          </div>
         </div>
       ) : null}
 
-      <dl className="facts">
+      {/*
+       * Tiles, not sparklines. `/_fleet/members` and `/_fleet/health` are point-in-time reads, so a
+       * trend line would imply history the API does not have — RFC-006 §3 rule 2 applied to charts.
+       *
+       * Both grids are still driven by the contract field lists rather than hand-written cells, so
+       * the traceability property holds exactly as before: a tile for a field the contract does not
+       * publish fails `tsc`.
+       */}
+      <div className="tiles">
         {FLEET_MEMBER_FIELDS.map((field) => (
-          <div key={field.key} className="fact">
-            <dt>{field.label}</dt>
-            <dd data-testid={field.testId}>
-              <MemberValue view={view} field={field.key} />
-            </dd>
-          </div>
+          <Tile
+            key={field.key}
+            label={field.label}
+            testId={field.testId}
+            plain={PLAIN_MEMBER_FIELDS.has(field.key)}
+            value={<MemberValue view={view} field={field.key} />}
+          />
         ))}
-        {FLEET_HEALTH_FIELDS.map((field) => (
-          <div key={field.key} className="fact">
-            <dt>{field.label}</dt>
-            <dd data-testid={field.testId}>
-              <HealthValue view={view} field={field.key} />
-            </dd>
-          </div>
-        ))}
-      </dl>
+      </div>
+
+      <Card title="Health">
+        <dl className="detail">
+          {FLEET_HEALTH_FIELDS.map((field) => (
+            <div key={field.key} className="kv">
+              <dt>{field.label}</dt>
+              <dd data-testid={field.testId}>
+                <HealthValue view={view} field={field.key} />
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </Card>
 
       {view.singleNode ? (
-        <p className="muted" data-testid="fleet-single-note">
+        <p className="hint" data-testid="fleet-single-note">
           A single-node fleet. One voter is this deployment&rsquo;s membership, not a shortfall.
         </p>
       ) : null}
     </>
   );
 }
+
+/**
+ * Member fields that must not get the big-figure treatment.
+ *
+ * Everything here is an identifier, a set of them, or a pill. `last_applied` is the only member
+ * field that is genuinely a magnitude, so it is the only one left rendered as one.
+ */
+const PLAIN_MEMBER_FIELDS = new Set<(typeof FLEET_MEMBER_FIELDS)[number]["key"]>([
+  "voters",
+  "is_leader",
+  // Raft ids are 19 digits. At the tile's 25px figure size they overflow and are **silently
+  // clipped** — `9597282464125895000` rendered as `959728246412`, with no ellipsis to say so, which
+  // is a wrong value presented as a complete one rather than a cosmetic overflow. They are
+  // identifiers, not magnitudes, so they get the identifier treatment.
+  "node_id",
+  "current_leader",
+]);
 
 const DEGRADATION_WORDING = {
   "not-ready": "Not ready: a load balancer should not route to it.",

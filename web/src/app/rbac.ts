@@ -28,6 +28,27 @@ export type Capability =
   | "imposter.read"
   | "imposter.lifecycle"
   | "imposter.write"
+  /**
+   * `Action::ImposterDelete` — its own action server-side, not a shade of `ImposterWrite`.
+   *
+   * The two are granted together today (both start at Editor), so folding them into one capability
+   * here would decide identically and read as harmless. It is the shape of drift this table exists
+   * to prevent: `authz.rs` keeps them separate precisely so the grant can move, and the day it does
+   * a delete button gated on `imposter.write` is drawn for a role the server refuses. Transcribing
+   * the action that actually authorizes the call costs one line and cannot go stale silently —
+   * `rbac.test.ts` mirrors the Rust table.
+   */
+  | "imposter.delete"
+  /**
+   * `Action::SavedRequestsClear` — Operator-tier, alongside `LifecycleToggle`.
+   *
+   * `authz.rs` groups the Operator arm as "disturb" actions (clear a log, reset a scenario, tear
+   * down a space) against Editor's "redefine" ones. Clearing a request log changes no
+   * configuration, which is why it sits below `imposter.write` rather than above it — and why it
+   * is transcribed as its own capability rather than reusing `imposter.lifecycle`, which
+   * authorizes a different call.
+   */
+  | "requests.clear"
   | "tenant.manage"
   | "audit.read"
   | "fleet.read"
@@ -56,9 +77,17 @@ export function roleAllows(role: Role, capability: Capability): boolean {
     case "viewer":
       return capability === "imposter.read";
     case "operator":
-      return roleAllows("viewer", capability) || capability === "imposter.lifecycle";
+      return (
+        roleAllows("viewer", capability) ||
+        capability === "imposter.lifecycle" ||
+        capability === "requests.clear"
+      );
     case "editor":
-      return roleAllows("operator", capability) || capability === "imposter.write";
+      return (
+        roleAllows("operator", capability) ||
+        capability === "imposter.write" ||
+        capability === "imposter.delete"
+      );
     case "tenant-admin":
       return (
         roleAllows("editor", capability) ||

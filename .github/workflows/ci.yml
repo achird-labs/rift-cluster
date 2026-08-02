@@ -445,3 +445,51 @@ jobs:
       - name: Console serving tests
         working-directory: ${{ github.workspace }}
         run: cargo test -p rift-cluster-server --features console --lib --test console
+
+      # ---------------------------------------------------------------------
+      # Browser tests against the artifact the release actually ships.
+      #
+      # The vitest suite above runs under jsdom, which parses CSS but never computes the cascade or
+      # paints — so an entire class of defect is invisible to it. The one that motivated this lane:
+      # `background-color` on an `input` suppresses a checkbox's native checked indicator in Blink
+      # and makes `accent-color` a no-op, so every checkbox in the console rendered as an empty
+      # square that never ticked. 375 green jsdom tests said nothing, and it was found by hand.
+      #
+      # These run against the binary serving `/console/`, not the Vite dev server, so the shipped
+      # CSP, the real bundle and the bundled wasm linter are under test rather than assumed.
+      # `scripts/e2e-console.sh` provides the seeded single node; its header says why one and not
+      # three.
+      # ---------------------------------------------------------------------
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          # Keyed on the lockfile so a Playwright bump re-downloads: the browser build is pinned to
+          # the library version, and a stale cache fails with "executable doesn't exist" rather than
+          # anything that names the real cause.
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install --with-deps chromium
+
+      # System deps are not cached with the browser binaries, so they are installed even on a hit.
+      - name: Install Playwright system dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: pnpm exec playwright install-deps chromium
+
+      - name: Browser tests (smoke, visual, accessibility)
+        run: pnpm run e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          # The diff images are the whole point of the upload: a visual failure is unreadable
+          # without the expected/actual/diff triple.
+          path: |
+            web/playwright-report/
+            web/test-results/
+          retention-days: 7

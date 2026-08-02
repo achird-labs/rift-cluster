@@ -14,6 +14,11 @@ export const API_PATHS = {
   session: "/session",
   frontDoorRoutes: "/front-door/routes",
   audit: "/admin/audit",
+  /**
+   * Where the fleet ships its audit rows. Fleet-scoped: a `TenantAdmin` trusted to read their own
+   * tenant's rows is not thereby trusted to see — or redirect — where every tenant's rows go.
+   */
+  auditSink: "/admin/audit/sink",
 } as const satisfies Record<string, ApiPath>;
 
 /** Path builders for the templated routes, so a port is interpolated in exactly one place. */

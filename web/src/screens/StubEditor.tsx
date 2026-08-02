@@ -5,7 +5,13 @@ import { StubConflict, useAddStub, useDeleteStub, usePutStub } from "../app/quer
 import { CodeEditor } from "../components/CodeEditor.tsx";
 import { UnconfirmedNote } from "../components/primitives.tsx";
 import { type Finding, lintStub } from "../features/stubs/lint.ts";
-import { STUB_FIELDS, type StubForm, project, render } from "../features/stubs/projection.ts";
+import {
+  STUB_FIELDS,
+  type StubField,
+  type StubForm,
+  project,
+  render,
+} from "../features/stubs/projection.ts";
 
 /**
  * The stub editor (RFC-006 C5, issue #188).
@@ -35,8 +41,94 @@ function pretty(value: unknown): string {
   return JSON.stringify(value, null, PRETTY_INDENT);
 }
 
-/** A blank stub for the append case: the fields the form models, all empty. */
+/**
+ * A blank stub for the append case.
+ *
+ * Deliberately still predicate-less: guessing a path would put words in the operator's mouth, and
+ * the editor says out loud what a predicate-less stub does (see `Summary`) rather than hiding the
+ * consequence behind a plausible default.
+ */
 const NEW_STUB_TEXT = pretty({ responses: [{ is: { statusCode: 200 } }] });
+
+/**
+ * Starting points for a new stub.
+ *
+ * Not templates in any clever sense — each one is a whole stub the operator then edits. They exist
+ * because the distance from "Add stub" to "a stub that does something" was six empty boxes and a
+ * knowledge of the mountebank shape, and the first one is the hardest to write.
+ *
+ * Every preset carries a method and path predicate, so picking one also moves off the
+ * matches-everything state rather than leaving the operator in it.
+ */
+const PRESETS: readonly { label: string; note: string; stub: unknown }[] = [
+  {
+    label: "JSON 200",
+    note: "A GET that returns a JSON body",
+    stub: {
+      predicates: [{ equals: { method: "GET", path: "/example" } }],
+      responses: [
+        {
+          is: {
+            statusCode: 200,
+            headers: { "Content-Type": "application/json" },
+            body: '{"ok":true}',
+          },
+        },
+      ],
+    },
+  },
+  {
+    label: "Created 201",
+    note: "A POST that accepts and echoes an id",
+    stub: {
+      predicates: [{ equals: { method: "POST", path: "/example" } }],
+      responses: [
+        {
+          is: {
+            statusCode: 201,
+            headers: { "Content-Type": "application/json" },
+            body: '{"id":1}',
+          },
+        },
+      ],
+    },
+  },
+  {
+    label: "Not found 404",
+    note: "A path that should answer as missing",
+    stub: {
+      predicates: [{ equals: { method: "GET", path: "/missing" } }],
+      responses: [{ is: { statusCode: 404 } }],
+    },
+  },
+  {
+    label: "No content 204",
+    note: "A DELETE that succeeds with no body",
+    stub: {
+      predicates: [{ equals: { method: "DELETE", path: "/example" } }],
+      responses: [{ is: { statusCode: 204 } }],
+    },
+  },
+];
+
+function Presets({ onPick }: { onPick: (stub: unknown) => void }): ReactNode {
+  return (
+    <div className="presets" data-testid="stub-presets">
+      <span className="eyebrow">Start from</span>
+      {PRESETS.map((preset) => (
+        <button
+          key={preset.label}
+          className="btn sm"
+          type="button"
+          title={preset.note}
+          onClick={() => onPick(preset.stub)}
+        >
+          {preset.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 type Parsed = { ok: true; value: unknown } | { ok: false; message: string };
 
@@ -206,6 +298,12 @@ export function StubEditor({
         </div>
       ) : null}
 
+      {target.kind === "new" && projection?.kind === "form" ? (
+        <Presets onPick={(stub) => setText(pretty(stub))} />
+      ) : null}
+
+      {projection?.kind === "form" ? <Summary form={projection.form} /> : null}
+
       <div className="stub-panes">
         {projection?.kind === "form" ? (
           <StubFields
@@ -249,37 +347,103 @@ function StubFields({
   form: StubForm;
   onChange: (form: StubForm) => void;
 }): ReactNode {
+  /*
+   * An empty box means "this stub does not carry that field", so it becomes `null` and `render`
+   * emits no key — not an empty string, which would be a stub with a `path` predicate matching "".
+   */
+  const edit = (field: StubField, raw: string): void => {
+    const next =
+      raw === ""
+        ? null
+        : field.kind === "number"
+          ? Number.isFinite(Number(raw))
+            ? Number(raw)
+            : null
+          : raw;
+    onChange({ ...form, [field.key]: next });
+  };
+
   return (
     <div className="stub-form" data-testid="stub-form">
-      {STUB_FIELDS.map((field) => {
+      {/*
+        Widened to `StubField` deliberately. `STUB_FIELDS` is `as const`, so each entry narrows to
+        its own literal type and an optional key absent from one entry is absent from the union —
+        the renderer needs the declared shape, while `project`/`render` keep the literal one.
+      */}
+      {(STUB_FIELDS as readonly StubField[]).map((field) => {
         const value = form[field.key];
+        const shown = value === null ? "" : String(value);
+        const listId = field.suggest === undefined ? undefined : `suggest-${field.key}`;
         return (
-          <label key={field.key}>
-            <span>{field.label}</span>
-            <input
-              type={field.kind === "number" ? "number" : "text"}
-              value={value === null ? "" : String(value)}
-              onChange={(event) => {
-                const raw = event.target.value;
-                /*
-                 * An empty box means "this stub does not carry that field", so it becomes `null`
-                 * and `render` emits no key — not an empty string, which would be a stub with a
-                 * `path` predicate matching "".
-                 */
-                const next =
-                  raw === ""
-                    ? null
-                    : field.kind === "number"
-                      ? Number.isFinite(Number(raw))
-                        ? Number(raw)
-                        : null
-                      : raw;
-                onChange({ ...form, [field.key]: next });
-              }}
-            />
-          </label>
+          <div className="field" key={field.key}>
+            <label htmlFor={`stub-${field.key}`}>{field.label}</label>
+            {field.multiline === true ? (
+              <textarea
+                id={`stub-${field.key}`}
+                rows={8}
+                value={shown}
+                onChange={(event) => edit(field, event.target.value)}
+              />
+            ) : (
+              <input
+                id={`stub-${field.key}`}
+                type={field.kind === "number" ? "number" : "text"}
+                list={listId}
+                value={shown}
+                onChange={(event) => edit(field, event.target.value)}
+              />
+            )}
+            {field.suggest === undefined ? null : (
+              <datalist id={listId}>
+                {field.suggest.map((option) => (
+                  <option key={option} value={option} />
+                ))}
+              </datalist>
+            )}
+            {field.hint === undefined ? null : <span className="field-hint">{field.hint}</span>}
+          </div>
         );
       })}
+    </div>
+  );
+}
+
+/**
+ * What this stub will actually do, in a sentence.
+ *
+ * The form is six boxes and the JSON is a document; neither answers "so what does it match?" at a
+ * glance. This is derived from the projection rather than from the text, so it cannot claim
+ * anything the modelled fields do not say.
+ */
+function Summary({ form }: { form: StubForm }): ReactNode {
+  const method = form.method ?? "any method";
+  const path = form.path ?? "any path";
+  const matchesEverything = form.method === null && form.path === null;
+  return (
+    <div className={matchesEverything ? "banner warn" : "hint"} data-testid="stub-summary">
+      {matchesEverything ? (
+        <span className="b-glyph" aria-hidden="true">
+          ▲
+        </span>
+      ) : null}
+      <div>
+        {matchesEverything ? (
+          <>
+            <strong>This stub matches every request.</strong>
+            <p>
+              It carries no method or path predicate, so it answers anything reaching this imposter
+              that no earlier stub claimed. That is occasionally what you want — a catch-all — and
+              usually not.
+            </p>
+          </>
+        ) : (
+          <>
+            Matches <b>{method}</b> <b>{path}</b> and answers{" "}
+            <b>{form.statusCode ?? 200}</b>
+            {form.contentType === null ? "" : ` as ${form.contentType}`}.
+          </>
+        )}
+      </div>
     </div>
   );
 }

@@ -5,7 +5,7 @@ import { ApiError, apiGet } from "./api/client.ts";
 import { API_PATHS } from "./api/paths.ts";
 import type { components } from "./api/schema.ts";
 import { Shell } from "./app/Shell.tsx";
-import { FLEET_SCOPE, selectableTenants } from "./app/rbac.ts";
+import { DEFAULT_TENANT, FLEET_SCOPE, selectableTenants } from "./app/rbac.ts";
 import { SessionProvider, initialTenant } from "./app/session.tsx";
 import { ErrorNote } from "./components/primitives.tsx";
 import { Login } from "./screens/Login.tsx";
@@ -56,7 +56,18 @@ function Authenticated({ whoami }: { whoami: WhoAmI }): ReactNode {
     queryKey: ["tenants"],
     queryFn: async () => {
       const list = await apiGet<Tenant[]>(API_PATHS.tenants);
-      return list.filter((tenant) => tenant.deleted !== true).map((tenant) => tenant.id);
+      const named = list.filter((tenant) => tenant.deleted !== true).map((tenant) => tenant.id);
+      /*
+       * `default` is unioned in, because it exists whether or not a record does.
+       *
+       * It is the tenant an unscoped request lands in (`TenantId::default()`), but `/admin/tenants`
+       * lists committed *records* — and nobody creates one for `default`. So a fleet whose operators
+       * never explicitly created it returned a list without it, the switcher offered one other
+       * tenant, `initialTenant` fell to that one, and every resource in `default` — which on most
+       * fleets is all of them — became unreachable from the console. With one other tenant the
+       * switcher did not even render, so there was no control to correct it with.
+       */
+      return named.includes(DEFAULT_TENANT) ? named : [DEFAULT_TENANT, ...named].sort();
     },
     enabled: holdsFleetScope,
   });

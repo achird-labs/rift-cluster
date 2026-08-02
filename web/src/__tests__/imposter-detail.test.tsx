@@ -75,7 +75,12 @@ describe("imposter detail", () => {
     // include them" — rendering that as "no stubs" would assert something the body never said.
     stubFetch({ "/imposters/4545": { json: { ...IMPOSTER, stubs: [] } } });
     const { unmount } = renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("viewer") });
-    expect((await screen.findByText(/No stubs\./i)).textContent).toMatch(/falls through/i);
+    // Asserted on the whole empty-state panel rather than one text node: the heading and the
+    // sentence that carries the meaning are separate elements, and matching only the heading would
+    // pass for a panel that had lost its explanation.
+    expect((await screen.findByTestId("imposter-no-stubs")).textContent).toMatch(
+      /no stubs[\s\S]*falls through/i,
+    );
     unmount();
 
     const { stubs: _dropped, ...withoutStubs } = IMPOSTER;

@@ -313,7 +313,9 @@ describe("principals: disable is not a soft delete", () => {
       tenant: "acme",
     });
     await waitFor(() => expect(screen.getAllByTestId("principal-row").length).toBe(3));
-    expect(screen.getByTestId("principal-p-2").textContent).toMatch(/disabled/i);
+    // Asserted on the whole row: the principal cell names it, and the state pill is its own cell
+    // now that this is a table. Reading one cell would pass for a row that lost its status.
+    expect(screen.getByTestId("principal-p-2").closest("tr")?.textContent).toMatch(/disabled/i);
   });
 });
 

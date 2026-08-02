@@ -158,8 +158,26 @@ mobile layout.
 - Not the component architecture. It is one file of vanilla JS; the real thing is React + TanStack
   Query with a client generated from `openapi-ee.yaml` (#184).
 - Not a data contract. Field names here are indicative; the schema in #184 is authoritative.
-- Not styled with the eventual design system. The token block at the top of the file is a starting
-  palette that has been contrast-validated, not a finished system.
+
+## The token block *is* the design system now
+
+This section used to say the palette was "a starting palette that has been contrast-validated, not
+a finished system". That stopped being true: nothing else was ever specified, the console shipped
+C4–C7 against an unrelated set of nine ad-hoc greys, and the two had visibly diverged — 27 tokens
+here against 9 there, sharing three names and not one value.
+
+So the token block was adopted wholesale into `web/src/styles.css`, along with the component
+vocabulary that hangs off it (`card`, `tile`, `pill`, `banner`, `method`, `diag`, `key-once`,
+`tabs`, `order-rank`, `clause`). **Change a token here and in `styles.css` together**, or this file
+resumes being a prototype of something we do not ship.
+
+Two things did not carry over, both deliberate:
+
+- The `:root[data-theme]` overrides. They exist here because the prototype has a theme toggle; the
+  console ships none, and a selector for a control that does not exist reads as a missing feature.
+  Light is `:root`, dark comes from `prefers-color-scheme`, as it does here.
+- The violet `--proto` pair and everything wearing it — the control strip and the notes footer.
+  That is prototype scaffolding, and it says so above.
 
 ## Regenerating raster screenshots
 

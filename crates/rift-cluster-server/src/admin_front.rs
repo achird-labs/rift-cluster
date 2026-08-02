@@ -654,17 +654,45 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     // action would be the wrong answer for a principal reading only itself.
     if req.method() == Method::GET && path == tenancy::WHOAMI_PATH {
         return match authenticate(&state, &req) {
-            Ok(authenticated) => match tenancy::whoami_body(
-                authenticated
+            Ok(authenticated) => {
+                let resolved = authenticated
                     .as_ref()
-                    .map(|authenticated| &authenticated.resolved),
-            ) {
-                Ok(body) => {
-                    buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
-                        .unwrap_or_else(|response| response)
+                    .map(|authenticated| &authenticated.resolved);
+                // The principal's own name, for a console to render instead of the
+                // `key:<sha256-hex>` id. Read here rather than threaded out of `authenticate`
+                // because only this route wants it.
+                //
+                // A storage error is **not** folded into "no name": that would be
+                // indistinguishable from the legacy identity, which legitimately has none. It
+                // propagates to a 500, which is also nearly unreachable — `resolve_bindings`
+                // already read this exact row to authenticate, so a failure here means the
+                // control plane broke between the two reads, and a 500 is then the honest answer.
+                let display_name = match resolved {
+                    Some(resolved) if !principal::is_legacy_identity(&resolved.principal_id) => {
+                        let Some(node) = state.node.upgrade() else {
+                            return typed_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                ErrorKind::Unavailable,
+                                "cluster node is shutting down",
+                            );
+                        };
+                        match node.principal(&resolved.principal_id) {
+                            Ok(stored) => stored.map(|stored| stored.display_name),
+                            Err(e) => return internal(&e.to_string()),
+                        }
+                    }
+                    // The legacy `--api-key` principal is minted in code, and the bypass has no
+                    // principal at all. Neither has a row, so neither has a name.
+                    _ => None,
+                };
+                match tenancy::whoami_body(resolved, display_name) {
+                    Ok(body) => {
+                        buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
+                            .unwrap_or_else(|response| response)
+                    }
+                    Err(e) => internal(&e),
                 }
-                Err(e) => internal(&e),
-            },
+            }
             Err(response) => response,
         };
     }

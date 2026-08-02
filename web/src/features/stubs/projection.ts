@@ -27,6 +27,18 @@ export type StubField = {
   readonly at: JsonPath;
   /** The JSON type the field holds. A value of any other type is unmodelled, never coerced. */
   readonly kind: "string" | "number";
+  /**
+   * Presentation only — none of the three below reaches `project` or `render`.
+   *
+   * They live here because this table is the one place a field is described, and splitting "what
+   * the field is" from "how it is typed" across two files is how the two drift.
+   */
+  /** Render a textarea. A response body on one line is the single worst thing about this form. */
+  readonly multiline?: boolean;
+  /** Offered in a datalist. Suggestions, never a closed set: the API constrains none of these. */
+  readonly suggest?: readonly string[];
+  /** One line under the input, for a field whose meaning is not obvious from its label. */
+  readonly hint?: string;
 };
 
 /**
@@ -39,17 +51,55 @@ export type StubField = {
  * demand-driven and costs one row.
  */
 export const STUB_FIELDS = [
-  { key: "id", label: "Id", at: ["id"], kind: "string" },
-  { key: "method", label: "Method", at: ["predicates", 0, "equals", "method"], kind: "string" },
-  { key: "path", label: "Path", at: ["predicates", 0, "equals", "path"], kind: "string" },
-  { key: "statusCode", label: "Status", at: ["responses", 0, "is", "statusCode"], kind: "number" },
+  {
+    key: "id",
+    label: "Id",
+    at: ["id"],
+    kind: "string",
+    hint: "Optional. A stable name this console and the API address the stub by.",
+  },
+  {
+    key: "method",
+    label: "Method",
+    at: ["predicates", 0, "equals", "method"],
+    kind: "string",
+    // Suggestions, not a select: `equals.method` is an arbitrary string server-side, and a closed
+    // dropdown would make a stub for a custom verb unwritable through the form.
+    suggest: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    hint: "Leave blank to match any method.",
+  },
+  {
+    key: "path",
+    label: "Path",
+    at: ["predicates", 0, "equals", "path"],
+    kind: "string",
+    hint: "Matched exactly, not as a prefix or pattern. Leave blank to match any path.",
+  },
+  {
+    key: "statusCode",
+    label: "Status",
+    at: ["responses", 0, "is", "statusCode"],
+    kind: "number",
+    hint: "The status this stub answers with.",
+  },
   {
     key: "contentType",
     label: "Content-Type",
     at: ["responses", 0, "is", "headers", "Content-Type"],
     kind: "string",
+    suggest: ["application/json", "text/plain", "text/html", "application/xml"],
   },
-  { key: "body", label: "Body", at: ["responses", 0, "is", "body"], kind: "string" },
+  {
+    key: "body",
+    label: "Body",
+    at: ["responses", 0, "is", "body"],
+    kind: "string",
+    multiline: true,
+    // `kind: "string"` is the honest constraint, not a limitation to route around: a JSON *object*
+    // body is a different shape at this path, so `project` calls it unmodelled and the stub opens
+    // raw-only. That is correct — silently stringifying it would change what the mock returns.
+    hint: "Sent verbatim as text. A stub whose body is a JSON object rather than a string opens in raw JSON instead.",
+  },
 ] as const satisfies readonly StubField[];
 
 /** A stub expressed in the modelled set. `null` means "this stub does not carry that field". */

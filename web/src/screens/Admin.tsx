@@ -3,16 +3,21 @@ import { type FormEvent, type ReactNode, useState } from "react";
 import { ApiError } from "../api/client.ts";
 import { isAddressablePrincipalId } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
+import { DEFAULT_TENANT } from "../app/rbac.ts";
+import type { Capability } from "../app/rbac.ts";
 import type { AdminTab } from "../app/routing.ts";
 import { toHash } from "../app/routing.ts";
 import {
   useAuditRows,
+  useAuditSink,
   useCreatePrincipal,
   useCreateTenant,
+  useDeleteAuditSink,
   useDeleteBinding,
   useDeletePrincipal,
   useDeleteTenant,
   usePrincipals,
+  usePutAuditSink,
   usePutBinding,
   useSavePrincipal,
   useSaveTenant,
@@ -21,7 +26,18 @@ import {
   AUDIT_PAGE_SIZE,
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { ErrorNote, Ident, Status, UNKNOWN } from "../components/primitives.tsx";
+import {
+  Card,
+  Confirm,
+  Empty,
+  ErrorNote,
+  Ident,
+  Status,
+  Tile,
+  Truncated,
+  UNKNOWN,
+  UnconfirmedNote,
+} from "../components/primitives.tsx";
 import { failureReason, hasMorePages, isApplied, nextSince } from "../features/admin/audit.ts";
 import { KEY_NOT_SHOWN_AGAIN } from "../features/admin/key.ts";
 import { assignableRoles } from "../features/admin/roles.ts";
@@ -37,22 +53,96 @@ const TAB_LABEL: Record<AdminTab, string> = {
   principals: "Principals",
   bindings: "Bindings",
   audit: "Audit",
+  sink: "Audit sink",
 };
 
-export function Admin({ tab, tenant }: { tab: AdminTab; tenant: string | null }): ReactNode {
-  const { can } = useSession();
+/**
+ * The capability each tab's own routes actually require.
+ *
+ * The tenancy surface splits across two actions and the tabs split with it: `TenantList`/`TenantRead`
+ * and the whole audit-sink triple are `ClusterAdmin`, while listing and minting principals and
+ * writing bindings are `TenantManage`. Reading a tenant's audit rows is `AuditRead`.
+ *
+ * Filtering on this is load-bearing rather than tidy. `tenants` is the tab the nav lands on, and it
+ * probes `GET /admin/tenants/:id` before rendering anything — including the tab bar, deliberately,
+ * because RFC-002 §8.4 requires a cross-tenant probe and a nonexistent tenant to produce
+ * byte-identical DOM. For a TenantAdmin that probe answers `403`, so the screen rendered a bare
+ * refusal with no navigation at all and the role could not reach the two tabs it exists for.
+ */
+export const ADMIN_TABS: readonly AdminTab[] = [
+  "tenants",
+  "principals",
+  "bindings",
+  "audit",
+  "sink",
+];
+
+const TAB_CAPABILITY: Record<AdminTab, Capability> = {
+  tenants: "cluster.admin",
+  principals: "tenant.manage",
+  bindings: "tenant.manage",
+  audit: "audit.read",
+  sink: "cluster.admin",
+};
+
+export function Admin({
+  tab: requestedTab,
+  tenant: routeTenant,
+}: {
+  tab: AdminTab;
+  tenant: string | null;
+}): ReactNode {
+  const { can, tenant: sessionTenant } = useSession();
   const mayManage = can("tenant.manage");
+  /*
+   * Fall back to the tenant the session is already scoped to.
+   *
+   * The nav links here with `tenant: null`, and the only control that *set* a tenant was a row in
+   * the Tenants tab — which lists `/admin/tenants`, a `ClusterAdmin` route. A TenantAdmin therefore
+   * could not read that list, could not pick a tenant, and hit "Choose a tenant to see this" on
+   * both Principals and Bindings forever: the role whose entire grant is `PrincipalCreate` and
+   * `BindingPut` had no route to either.
+   *
+   * The session already knows the answer — `initialTenant` resolves it from the principal's own
+   * bindings — so the screen asks it rather than requiring a fleet-scoped list to supply it. An
+   * explicit tenant in the hash still wins, which keeps every existing link and the fleet-admin's
+   * cross-tenant navigation working.
+   */
+  const tenant = routeTenant ?? sessionTenant;
+  /*
+   * The requested tab is honoured as asked, deliberately — including one this role cannot use.
+   *
+   * Redirecting away from `tenants` would strand nobody, but it would also delete the RFC-002 §8.4
+   * branch: a TenantAdmin probing that tab is exactly the caller for whom a cross-tenant tenant and
+   * a nonexistent one must answer with byte-identical DOM, and the screen renders that. The tab
+   * *bar* is filtered by capability so nothing unusable is offered; a URL typed by hand still
+   * reaches the honest refusal rather than being quietly rerouted.
+   */
+  const tab = requestedTab;
   /*
    * Only the `tenants` tab addresses one tenant directly by path (`GET /admin/tenants/:id`), so
    * it is the only tab that can answer this existence-and-permission question before any
    * tab-specific content exists to render — the other tabs' own tab-scoped queries surface the
    * same distinction later, through `AdminApiError` again.
    */
+  /*
+   * `default` is never probed, because it has no record to find.
+   *
+   * It exists implicitly — it is where an unscoped request lands — but `/admin/tenants/default`
+   * answers `404` until somebody creates one, and the branch below renders that as the §8.4
+   * anti-oracle: no header, no tab bar, nothing at all. So the Administration screen greeted a
+   * fleet-admin with a bare "no such thing" for the tenant it had just defaulted them to.
+   *
+   * Special-casing it leaks nothing. §8.4 exists so a caller cannot learn which *other* tenants
+   * exist by watching a 403 turn into a 404; that `default` exists is a secret from nobody, and
+   * every other tenant still goes through the probe unchanged.
+   */
+  const probeable = tenant !== null && tenant !== DEFAULT_TENANT;
   const probe = useTenantProbe(tenant ?? "", {
-    enabled: tab === "tenants" && tenant !== null && mayManage,
+    enabled: tab === "tenants" && probeable && mayManage,
   });
 
-  if (tab === "tenants" && tenant !== null && mayManage && probe.isError) {
+  if (tab === "tenants" && probeable && mayManage && probe.isError) {
     /*
      * Nothing else renders in this branch — not the header, not the tab nav — because both would
      * have to encode `tenant` to stay useful, and RFC-002 §8.4 requires a cross-tenant probe and a
@@ -83,21 +173,19 @@ export function Admin({ tab, tenant }: { tab: AdminTab; tenant: string | null })
 }
 
 function AdminTabs({ tab, tenant }: { tab: AdminTab; tenant: string | null }): ReactNode {
-  const tabs: AdminTab[] = ["tenants", "principals", "bindings", "audit"];
+  const { can } = useSession();
+  const tabs = ADMIN_TABS.filter((t) => can(TAB_CAPABILITY[t]));
   return (
     <nav className="admin-tabs">
-      <ul>
-        {tabs.map((t) => (
-          <li key={t}>
-            <a
-              href={toHash({ screen: "admin", tab: t, tenant })}
-              aria-current={t === tab ? "page" : undefined}
-            >
-              {TAB_LABEL[t]}
-            </a>
-          </li>
-        ))}
-      </ul>
+      {tabs.map((t) => (
+        <a
+          key={t}
+          href={toHash({ screen: "admin", tab: t, tenant })}
+          aria-current={t === tab ? "page" : undefined}
+        >
+          {TAB_LABEL[t]}
+        </a>
+      ))}
     </nav>
   );
 }
@@ -112,6 +200,8 @@ function Content({ tab, tenant }: { tab: AdminTab; tenant: string | null }): Rea
       return tenant === null ? <NoTenantChosen /> : <BindingsTab tenant={tenant} />;
     case "audit":
       return <AuditTab tenant={tenant} />;
+    case "sink":
+      return <AuditSinkTab />;
   }
 }
 
@@ -182,7 +272,7 @@ function TenantsTab(): ReactNode {
             onSubmit={(body) => create.mutate(body, { onSuccess: () => setCreating(false) })}
           />
         ) : (
-          <button type="button" onClick={() => setCreating(true)}>
+          <button className="btn" type="button" onClick={() => setCreating(true)}>
             Create tenant
           </button>
         )
@@ -191,6 +281,8 @@ function TenantsTab(): ReactNode {
       {tenants.isPending ? <p className="muted">Reading…</p> : null}
 
       {tenants.isSuccess ? (
+        <section className="card">
+          <div className="scroll-x">
         <table className="dense">
           <thead>
             <tr>
@@ -198,6 +290,7 @@ function TenantsTab(): ReactNode {
               <th>Name</th>
               <th>Quotas</th>
               <th>Journal retention</th>
+              <th style={{ width: "12ch" }}>State</th>
               {mayManage ? <th>Actions</th> : null}
             </tr>
           </thead>
@@ -224,6 +317,8 @@ function TenantsTab(): ReactNode {
             )}
           </tbody>
         </table>
+          </div>
+        </section>
       ) : null}
     </>
   );
@@ -252,14 +347,46 @@ function TenantRow({
         {tenant.quotas?.maxFlowEntries ?? UNKNOWN} flow entries
       </td>
       <td>{tenant.journalRetentionSecs === 0 ? "unlimited" : `${tenant.journalRetentionSecs}s`}</td>
+      {/*
+       * `TenantDelete` is a tombstone (RFC-002 §3.3), not a row removal — the record stays with
+       * `deleted: true` and its resources are cascaded. The table rendered a deleted tenant
+       * identically to a live one, so a delete looked like it had silently failed. The tenant
+       * switcher already filters them; showing the state here is what makes the two agree.
+       */}
+      <td>
+        {tenant.deleted === true ? (
+          <Status tone="idle" label="deleted" />
+        ) : (
+          <Status tone="ok" label="active" />
+        )}
+      </td>
       {mayManage ? (
         <td>
-          <button type="button" onClick={onEdit}>
-            Edit {tenant.displayName}
-          </button>
-          <button type="button" onClick={onDelete}>
-            Delete {tenant.displayName}
-          </button>
+          {/* No controls on a tombstone. Editing one writes to a record nothing reads, and
+              "Delete" on an already-deleted tenant is a button whose only outcome is no change —
+              which is how an operator concludes the first delete failed. */}
+          {tenant.deleted === true ? (
+            <span className="muted">—</span>
+          ) : (
+            <span className="row">
+              <button
+                className="btn sm"
+                type="button"
+                aria-label={`Edit ${tenant.displayName}`}
+                onClick={onEdit}
+              >
+                Edit
+              </button>
+              <button
+                className="btn sm danger"
+                type="button"
+                aria-label={`Delete ${tenant.displayName}`}
+                onClick={onDelete}
+              >
+                Delete
+              </button>
+            </span>
+          )}
         </td>
       ) : null}
     </tr>
@@ -393,8 +520,8 @@ function TenantEditRow({
               Not a whole number, so nothing was sent: {invalid.join(", ")}.
             </p>
           ) : null}
-          <button type="submit">Save tenant</button>
-          <button type="button" onClick={onCancel}>
+          <button className="btn primary" type="submit">Save tenant</button>
+          <button className="btn" type="button" onClick={onCancel}>
             Cancel
           </button>
         </form>
@@ -437,8 +564,8 @@ function CreateTenantForm({
         Display name
         <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
       </label>
-      <button type="submit">Create tenant</button>
-      <button type="button" onClick={onCancel}>
+      <button className="btn primary" type="submit">Create tenant</button>
+      <button className="btn" type="button" onClick={onCancel}>
         Cancel
       </button>
     </form>
@@ -498,16 +625,36 @@ function PrincipalsTab({ tenant }: { tenant: string }): ReactNode {
             }
           />
         ) : (
-          <button type="button" onClick={() => setCreating(true)}>
-            Create principal
-          </button>
+          // Wrapped in a row: a bare button is a stretch-aligned child of the screen's flex column
+          // and spans its full width, which reads as a broken banner rather than as an action.
+          <div className="row">
+            <button className="btn primary" type="button" onClick={() => setCreating(true)}>
+              Create principal
+            </button>
+          </div>
         )
       ) : null}
 
       {principals.isPending ? <p className="muted">Reading…</p> : null}
 
       {principals.isSuccess ? (
-        <div className="rows">
+        <Card
+          title={`${principals.data.length} principal${principals.data.length === 1 ? "" : "s"}`}
+          bleed
+        >
+          <div className="scroll-x">
+            <table className="dense">
+              <thead>
+                <tr>
+                  <th>Principal</th>
+                  <th style={{ width: "16ch" }}>Role</th>
+                  {/* Wide enough for the pill plus the cell's own 28px of padding — `dense` cells
+                      clip, so a pill that overruns is silently cut in half rather than wrapped. */}
+                  <th style={{ width: "18ch" }}>State</th>
+                  {mayAdminister ? <th style={{ width: "18ch" }} aria-label="Actions" /> : null}
+                </tr>
+              </thead>
+              <tbody>
           {principals.data.map((p) => (
             <PrincipalRow
               key={p.id}
@@ -524,7 +671,10 @@ function PrincipalsTab({ tenant }: { tenant: string }): ReactNode {
               onDelete={() => del.mutate({ tenantId: tenant, principalId: p.id })}
             />
           ))}
-        </div>
+              </tbody>
+            </table>
+          </div>
+        </Card>
       ) : null}
     </>
   );
@@ -556,19 +706,22 @@ function MintedKeyPanel({
 
   return (
     <div className="minted-key" data-testid="minted-key" role="alert">
+      <div className="kh">
+        <span aria-hidden="true">▲</span>
+        Shown once
+      </div>
       <p>
-        <strong>{issued.displayName}</strong> was minted for role {issued.role}.
+        <strong>{issued.displayName}</strong> was minted for role {issued.role}. {KEY_NOT_SHOWN_AGAIN}
       </p>
-      <p>{KEY_NOT_SHOWN_AGAIN}</p>
-      <p>
-        <Ident>{issued.apiKey}</Ident>
-      </p>
-      <button type="button" onClick={copy}>
-        Copy key
-      </button>
-      <button type="button" onClick={onDismiss}>
-        Dismiss
-      </button>
+      <code>{issued.apiKey}</code>
+      <div className="row">
+        <button className="btn primary sm" type="button" onClick={copy}>
+          Copy key
+        </button>
+        <button className="btn sm" type="button" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
       {copyFailed ? (
         <p className="error" data-testid="copy-failed">
           Could not reach the clipboard — select the key above and copy it manually before
@@ -619,7 +772,7 @@ function CreatePrincipalForm({
       <button type="submit" disabled={busy}>
         Mint
       </button>
-      <button type="button" onClick={onCancel}>
+      <button className="btn" type="button" onClick={onCancel}>
         Cancel
       </button>
     </form>
@@ -641,25 +794,55 @@ function PrincipalRow({
 }): ReactNode {
   const addressable = isAddressablePrincipalId(principal.id);
   return (
-    <div className="row" data-testid="principal-row">
-      <span data-testid={`principal-${principal.id}`}>
-        <Ident>{principal.id}</Ident> {principal.displayName} · {principal.role ?? UNKNOWN} ·{" "}
+    <tr data-testid="principal-row">
+      {/*
+       * The **name** leads and the id is secondary, truncated. A minted principal's id is
+       * `key:<sha256-hex>` — not a credential, but 64 hex characters that look exactly like one, and
+       * letting it lead made the list unreadable and taught the wrong instinct about what is safe to
+       * paste. The whole id is still on the title and still selectable.
+       */}
+      <td data-testid={`principal-${principal.id}`}>
+        <div className="id-cell">
+          <span className="name">{principal.displayName}</span>
+          <span className="meta" title={principal.id}>
+            <Truncated value={principal.id} max={28} />
+          </span>
+        </div>
+      </td>
+      <td>{principal.role ?? UNKNOWN}</td>
+      <td>
         {principal.disabled ? (
           <Status tone="idle" label="disabled" />
         ) : (
           <Status tone="ok" label="enabled" />
         )}
-      </span>
+      </td>
       {mayManage ? (
-        addressable ? (
-          <>
-            <button type="button" disabled={busy} onClick={onToggle}>
-              {principal.disabled ? "Enable" : "Disable"} {principal.displayName}
+        <td>
+        {addressable ? (
+          <span className="row">
+            {/* The label is the verb alone; `aria-label` carries which principal it acts on. The
+                name in the visible label wrapped every button onto two lines in a table where the
+                row already says whose it is. */}
+            <button
+              className="btn sm"
+              type="button"
+              disabled={busy}
+              aria-label={`${principal.disabled ? "Enable" : "Disable"} ${principal.displayName}`}
+              onClick={onToggle}
+            >
+              {principal.disabled ? "Enable" : "Disable"}
             </button>
-            <button type="button" disabled={busy} onClick={onDelete}>
-              Delete {principal.displayName}
+            <button
+              className="btn sm danger"
+              type="button"
+              disabled={busy}
+              aria-label={`Delete ${principal.displayName}`}
+              onClick={onDelete}
+            >
+              Delete
             </button>
-          </>
+          </span>
         ) : (
           /*
            * Not merely disabled — unreachable. The server matches the raw path, so an id carrying
@@ -671,9 +854,10 @@ function PrincipalRow({
             This id cannot be addressed in a URL path, so it cannot be changed from the console. Use
             the admin API directly.
           </span>
-        )
+        )}
+        </td>
       ) : null}
-    </div>
+    </tr>
   );
 }
 
@@ -759,7 +943,7 @@ function BindingsTab({ tenant }: { tenant: string }): ReactNode {
               ))}
             </select>
           </label>
-          <button type="submit">Bind</button>
+          <button className="btn primary" type="submit">Bind</button>
         </form>
       ) : null}
     </>
@@ -785,7 +969,9 @@ function AuditTab({ tenant }: { tenant: string | null }): ReactNode {
       {rows.isPending ? <p className="muted">Reading…</p> : null}
       {rows.isSuccess ? (
         <>
-          <table className="dense">
+          <section className="card">
+          <div className="scroll-x">
+        <table className="dense">
             <thead>
               <tr>
                 <th>Revision</th>
@@ -814,8 +1000,11 @@ function AuditTab({ tenant }: { tenant: string | null }): ReactNode {
               ))}
             </tbody>
           </table>
+          </div>
+        </section>
           <nav className="pager">
             <button
+              className="btn"
               type="button"
               data-testid="audit-next"
               // A page shorter than the limit is the end of the journal. Gating on the cursor alone
@@ -833,5 +1022,272 @@ function AuditTab({ tenant }: { tenant: string | null }): ReactNode {
         </>
       ) : null}
     </>
+  );
+}
+
+/**
+ * Where the fleet ships its audit rows.
+ *
+ * `ClusterAdmin` throughout, and that is a deliberate ceiling rather than an oversight: a
+ * `TenantAdmin` trusted to read their own tenant's audit rows is not thereby trusted to see — or
+ * redirect — where every tenant's rows go. `authz.rs` puts `AuditSinkRead` in the same arm as the
+ * writes for exactly that reason, so reading this screen is as privileged as changing it.
+ */
+function AuditSinkTab(): ReactNode {
+  const { can } = useSession();
+  const mayAdminister = can("cluster.admin");
+  const sink = useAuditSink({ enabled: mayAdminister });
+  const put = usePutAuditSink();
+  const remove = useDeleteAuditSink();
+  const [editing, setEditing] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+
+  if (!mayAdminister) {
+    return (
+      <p className="muted" data-testid="sink-forbidden">
+        The audit sink is fleet-scoped. A FleetAdmin binding is required to read or change it.
+      </p>
+    );
+  }
+
+  return (
+    <div className="rows">
+      {sink.isError ? <ErrorNote error={sink.error} context="Could not read the audit sink" /> : null}
+      {put.isError ? <ErrorNote error={put.error} context="The sink was not saved" /> : null}
+      {remove.isError ? <ErrorNote error={remove.error} context="The sink was not removed" /> : null}
+      {put.data?.kind === "unobservable" ? <UnconfirmedNote reason={put.data.reason} /> : null}
+      {remove.data?.kind === "unobservable" ? <UnconfirmedNote reason={remove.data.reason} /> : null}
+
+      {sink.isPending ? <p className="muted">Reading…</p> : null}
+
+      {sink.isSuccess && sink.data === null && !editing ? (
+        <Empty
+          testId="sink-none"
+          title="No audit sink declared"
+          body="Audit rows are retained in the fleet and readable on the Audit tab, but nothing is exporting them anywhere."
+        >
+          <button className="btn primary" type="button" onClick={() => setEditing(true)}>
+            Declare a sink
+          </button>
+        </Empty>
+      ) : null}
+
+      {sink.isSuccess && sink.data !== null && !editing ? (
+        <>
+          <Card
+            title="Declared sink"
+            actions={
+              <span className="row">
+                <button className="btn sm" type="button" onClick={() => setEditing(true)}>
+                  Edit
+                </button>
+                <button
+                  className="btn sm danger"
+                  type="button"
+                  data-testid="remove-sink"
+                  onClick={() => setConfirming(true)}
+                >
+                  Remove
+                </button>
+              </span>
+            }
+          >
+            <dl className="detail" data-testid="sink-detail">
+              <div className="kv">
+                <dt>URI</dt>
+                <dd>{sink.data.uri}</dd>
+              </div>
+              <div className="kv">
+                <dt>Credential</dt>
+                {/* A *name* the fleet resolves, never the credential. Absent is a real state — an
+                    unauthenticated sink — not a missing field to paper over. */}
+                <dd>{sink.data.authRef ?? <span className="muted">none</span>}</dd>
+              </div>
+              <div className="kv">
+                <dt>Batch max rows</dt>
+                <dd>{sink.data.batchMaxRows}</dd>
+              </div>
+              <div className="kv">
+                <dt>Declared at revision</dt>
+                <dd>{sink.data.revision}</dd>
+              </div>
+            </dl>
+          </Card>
+
+          <ExportStatus status={sink.data.exportStatus} />
+        </>
+      ) : null}
+
+      {editing ? (
+        <SinkForm
+          existing={sink.data ?? null}
+          busy={put.isPending}
+          onCancel={() => setEditing(false)}
+          onSave={(body) => put.mutate(body, { onSuccess: () => setEditing(false) })}
+        />
+      ) : null}
+
+      {confirming ? (
+        <Confirm
+          testId="confirm-remove-sink"
+          title="Remove the audit sink?"
+          body="The fleet stops exporting audit rows. They are still retained and still readable on the Audit tab; nothing is shipped until a sink is declared again."
+          confirmLabel="Remove sink"
+          busy={remove.isPending}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => {
+            remove.mutate();
+            setConfirming(false);
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Export status, or the honest absence of it.
+ *
+ * **Only the leader runs the exporter**, so only the leader reports status. A follower answers with
+ * the sink and no status at all — and the contract says so in as many words, "rather than a
+ * fabricated all-zero one". Rendering absent as `0 rows shipped, not running` would turn "this node
+ * cannot say" into "the export is broken", which is the same unknown-as-zero laundering the fleet
+ * screen refuses.
+ */
+function ExportStatus({
+  status,
+}: {
+  status: NonNullable<components["schemas"]["AuditSink"]["exportStatus"]> | undefined;
+}): ReactNode {
+  if (status === undefined) {
+    return (
+      <p className="hint" data-testid="sink-status-unknown">
+        Export status is reported by the leader only, and this node is not it. Nothing here says
+        whether the export is running — read this screen from the leader to see that.
+      </p>
+    );
+  }
+  return (
+    <div className="tiles" data-testid="sink-status">
+      <Tile
+        label="Exporter"
+        plain
+        value={
+          status.running ? (
+            <Status tone="ok" label="running" />
+          ) : (
+            <Status tone="warn" label="not running" />
+          )
+        }
+      />
+      <Tile label="Rows shipped" value={status.shippedRows ?? UNKNOWN} />
+      <Tile
+        label="Consecutive failures"
+        value={status.consecutiveFailures ?? UNKNOWN}
+        // Spread rather than `tone={cond ? "warn" : undefined}`: `exactOptionalPropertyTypes` makes
+        // an explicit `undefined` a different thing from an absent prop, and it is right to.
+        {...((status.consecutiveFailures ?? 0) > 0 ? { tone: "warn" as const } : {})}
+      />
+      <Tile
+        label="Last error"
+        plain
+        // `null` is "no error since the exporter started" and is a different fact from a missing
+        // field; both render as a word rather than an empty cell.
+        value={status.lastError ?? <span className="muted">none</span>}
+      />
+    </div>
+  );
+}
+
+function SinkForm({
+  existing,
+  busy,
+  onSave,
+  onCancel,
+}: {
+  existing: components["schemas"]["AuditSink"] | null;
+  busy: boolean;
+  onSave: (body: components["schemas"]["AuditSinkWrite"]) => void;
+  onCancel: () => void;
+}): ReactNode {
+  const [uri, setUri] = useState(existing?.uri ?? "");
+  const [authRef, setAuthRef] = useState(existing?.authRef ?? "");
+  const [batch, setBatch] = useState(existing?.batchMaxRows?.toString() ?? "");
+  const [invalid, setInvalid] = useState<string | null>(null);
+
+  function submit(event: FormEvent): void {
+    event.preventDefault();
+    if (uri.trim() === "") return setInvalid("A sink needs a URI.");
+    let batchMaxRows: number | undefined;
+    if (batch.trim() !== "") {
+      const parsed = Number(batch);
+      // Zero is refused rather than sent: the contract's default applies when the field is
+      // *omitted*, and a literal 0 is a batch size that ships nothing, forever.
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        return setInvalid("Batch max rows must be a whole number of 1 or more, or left blank for the server default.");
+      }
+      batchMaxRows = parsed;
+    }
+    setInvalid(null);
+    onSave({
+      uri: uri.trim(),
+      ...(authRef.trim() === "" ? {} : { authRef: authRef.trim() }),
+      ...(batchMaxRows === undefined ? {} : { batchMaxRows }),
+    });
+  }
+
+  return (
+    <Card title={existing === null ? "Declare audit sink" : "Edit audit sink"}>
+      <form className="stub-form" onSubmit={submit} data-testid="sink-form">
+        <div className="field">
+          <label htmlFor="sink-uri">URI</label>
+          <input id="sink-uri" value={uri} onChange={(e) => setUri(e.target.value)} />
+        </div>
+        <div className="field-row">
+          <div className="field">
+            <label htmlFor="sink-auth">Credential name</label>
+            {/*
+              Deliberately a plain text input, not a password field. This names a credential the
+              fleet already holds — it is never the credential itself, and masking it would invite
+              an operator to paste a secret into a field that ships it verbatim into the audit
+              record.
+            */}
+            <input
+              id="sink-auth"
+              value={authRef}
+              onChange={(e) => setAuthRef(e.target.value)}
+              placeholder="optional"
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="sink-batch">Batch max rows</label>
+            <input
+              id="sink-batch"
+              inputMode="numeric"
+              value={batch}
+              onChange={(e) => setBatch(e.target.value)}
+              placeholder="server default"
+            />
+          </div>
+        </div>
+        {invalid === null ? null : (
+          <p className="error" data-testid="sink-invalid" role="alert">
+            {invalid}
+          </p>
+        )}
+        <div className="row">
+          <button className="btn primary" type="submit" disabled={busy}>
+            {busy ? "Saving…" : "Save sink"}
+          </button>
+          <button className="btn" type="button" onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+        </div>
+        <p className="hint">
+          A re-declared sink resumes exporting from its own recorded revision, so re-saving does not
+          replay the whole stream.
+        </p>
+      </form>
+    </Card>
   );
 }

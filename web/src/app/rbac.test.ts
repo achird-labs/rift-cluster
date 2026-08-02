@@ -25,6 +25,13 @@ const EXPECTED: Record<Capability, Role[]> = {
   "imposter.read": ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"],
   "imposter.lifecycle": ["operator", "editor", "tenant-admin", "fleet-admin"],
   "imposter.write": ["editor", "tenant-admin", "fleet-admin"],
+  // `Action::ImposterDelete`. Identical to `imposter.write`'s row today, and kept as its own row
+  // anyway: `authz.rs` grants them from separate arms, so the day one moves this table is what
+  // fails rather than a delete button quietly appearing for a role the server refuses.
+  "imposter.delete": ["editor", "tenant-admin", "fleet-admin"],
+  // `Action::SavedRequestsClear`. Operator-tier: clearing a log disturbs state without redefining
+  // configuration, which is the line `authz.rs` draws between the Operator and Editor arms.
+  "requests.clear": ["operator", "editor", "tenant-admin", "fleet-admin"],
   "tenant.manage": ["tenant-admin", "fleet-admin"],
   "audit.read": ["tenant-admin", "fleet-admin"],
   "fleet.read": ["fleet-admin"],

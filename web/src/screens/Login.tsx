@@ -43,30 +43,36 @@ export function Login({ onAuthenticated }: { onAuthenticated: () => void }): Rea
 
   return (
     <main className="login">
-      <h1>Rift Console</h1>
       <form onSubmit={(event) => void submit(event)}>
-        <label htmlFor="api-key">API key</label>
-        <input
-          id="api-key"
-          // `password`, so a shoulder-surfer and a screen-share see nothing. `off` on both
-          // autocomplete and password managers: this is a fleet credential, not a login.
-          type="password"
-          autoComplete="off"
-          value={apiKey}
-          onChange={(event) => setApiKey(event.target.value)}
-        />
-        <button type="submit" disabled={busy || apiKey.length === 0}>
-          Sign in
+        <div className="mark">
+          <b>Rift</b>
+          <span>CONSOLE</span>
+        </div>
+        <h1>Sign in</h1>
+        <div className="field">
+          <label htmlFor="api-key">API key</label>
+          <input
+            id="api-key"
+            // `password`, so a shoulder-surfer and a screen-share see nothing. `off` on both
+            // autocomplete and password managers: this is a fleet credential, not a login.
+            type="password"
+            autoComplete="off"
+            value={apiKey}
+            onChange={(event) => setApiKey(event.target.value)}
+          />
+        </div>
+        <button className="btn primary" type="submit" disabled={busy || apiKey.length === 0}>
+          {busy ? "Signing in…" : "Sign in"}
         </button>
-      </form>
-      {error === null ? null : (
-        <p className="error" role="alert">
-          {error}
+        {error === null ? null : (
+          <p className="error" role="alert">
+            {error}
+          </p>
+        )}
+        <p className="muted">
+          The key is exchanged for a session cookie and is not stored by this page.
         </p>
-      )}
-      <p className="muted">
-        The key is exchanged for a session cookie and is not stored by this page.
-      </p>
+      </form>
     </main>
   );
 }

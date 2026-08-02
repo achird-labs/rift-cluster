@@ -1,9 +1,9 @@
-import { type ReactNode, useEffect, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useState } from "react";
 
 import { ApiError } from "../api/client.ts";
 import { RouteTableConflict, useDeleteRoute, usePutRoutes, useRouteTable } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { ErrorNote, Ident, Status, UnconfirmedNote } from "../components/primitives.tsx";
+import { Card, Empty, ErrorNote, Ident, Status, UnconfirmedNote } from "../components/primitives.tsx";
 import type { Route } from "../features/routes/order.ts";
 import { effectiveOrder, orderReason, validateTable } from "../features/routes/order.ts";
 
@@ -38,6 +38,7 @@ export function RouteTableScreen(): ReactNode {
 
 function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): ReactNode {
   const [draft, setDraft] = useState<Route[]>(loaded);
+  const [adding, setAdding] = useState(false);
   const [base, setBase] = useState<Route[]>(loaded);
   const [conflict, setConflict] = useState<Route[] | null>(null);
   const put = usePutRoutes();
@@ -122,17 +123,28 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
       ) : null}
       {remove.data?.kind === "unobservable" ? <UnconfirmedNote reason={remove.data.reason} /> : null}
       {conflict !== null ? (
-        <div className="degraded" data-testid="route-conflict" role="alert">
-          <strong>The route table changed while you were editing.</strong> Your edits have not been
-          sent, and the other change is still in place. Reapply your edits on top of the current
-          table, or discard them.
-          <p className="muted">
-            Now on the fleet: {conflict.map((route) => route.id).join(", ") || "(empty table)"}
-          </p>
-          <button type="button" onClick={() => reapply(conflict)}>
+        <div className="banner warn" data-testid="route-conflict" role="alert">
+          <span className="b-glyph" aria-hidden="true">
+            ▲
+          </span>
+          <div>
+            <strong>The route table changed while you were editing.</strong>
+            <p>
+              Your edits have not been sent, and the other change is still in place. Reapply your
+              edits on top of the current table, or discard them.
+            </p>
+            <p>
+              Now on the fleet:{" "}
+              <span className="ident">
+                {conflict.map((route) => route.id).join(", ") || "(empty table)"}
+              </span>
+            </p>
+            <div className="row">
+          <button className="btn sm" type="button" onClick={() => reapply(conflict)}>
             Reapply my edits
           </button>
           <button
+            className="btn sm"
             type="button"
             onClick={() => {
               setDraft(conflict);
@@ -142,17 +154,24 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
           >
             Discard my edits
           </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
       {errors.length > 0 ? (
-        <div className="error" data-testid="route-validation" role="alert">
+        <div className="banner crit" data-testid="route-validation" role="alert">
+          <span className="b-glyph" aria-hidden="true">
+            ■
+          </span>
+          <div>
           <strong>The fleet would refuse this table as a whole.</strong>
           <ul>
             {errors.map((error) => (
               <li key={`${error.kind}-${error.message}`}>{error.message}</li>
             ))}
           </ul>
+          </div>
         </div>
       ) : null}
 
@@ -171,10 +190,12 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
         </p>
       ) : null}
 
+      <section className="card">
+        <div className="scroll-x">
       <table className="dense">
         <thead>
           <tr>
-            <th>Rank</th>
+            <th style={{ width: "7ch" }}>Rank</th>
             <th>Id</th>
             <th>Match</th>
             <th>Target</th>
@@ -186,11 +207,19 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
           {rows.map((route) => (
             <tr key={route.id} data-testid="route-row">
               {/* A disabled route is excluded from dispatch, so it has no place in the chain. */}
-              <td data-testid="route-rank">{rank.get(route.id) ?? "—"}</td>
+              <td data-testid="route-rank">
+                <span className={route.enabled ? "order-rank" : "order-rank off"}>
+                  {rank.get(route.id) ?? "—"}
+                </span>
+              </td>
               <td data-testid="route-id">
                 <Ident>{route.id}</Ident>
               </td>
-              <td>{describeMatch(route)}</td>
+              <td>
+                <span className="match-clauses">
+                  <span className="clause">{describeMatch(route)}</span>
+                </span>
+              </td>
               <td>
                 <Ident>{route.target.port}</Ident>
                 {route.target.strip_prefix ? " · strips prefix" : ""}
@@ -199,6 +228,7 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
               {mayWrite ? (
                 <td>
                   <button
+                    className="btn sm"
                     type="button"
                     onClick={() =>
                       setDraft(
@@ -212,7 +242,11 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
                    * A single removal goes through DELETE rather than a whole-table PUT: it cannot
                    * take an unrelated concurrent edit down with it.
                    */}
-                  <button type="button" onClick={() => remove.mutate({ routeId: route.id })}>
+                  <button
+                    className="btn sm danger"
+                    type="button"
+                    onClick={() => remove.mutate({ routeId: route.id })}
+                  >
                     Delete {route.id}
                   </button>
                 </td>
@@ -221,17 +255,52 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
           ))}
         </tbody>
       </table>
+        </div>
+      </section>
 
-      {draft.length === 0 ? <p className="muted">This tenant has no front-door routes.</p> : null}
+      {draft.length === 0 ? (
+        <Empty
+          title="This tenant has no front-door routes"
+          body="Every request reaches its imposter by port until a route is added here."
+        />
+      ) : null}
+
+      {mayWrite && adding ? (
+        <NewRoute
+          existingIds={draft.map((route) => route.id)}
+          onCancel={() => setAdding(false)}
+          onAdd={(route) => {
+            // Appended to the draft, not sent. The table is written whole, so a new route is
+            // validated with the rest of it — `errors` already covers duplicate ids and the
+            // ambiguity two routes only create together — and reaches the fleet on Save.
+            setDraft([...draft, route]);
+            setAdding(false);
+          }}
+        />
+      ) : null}
 
       {mayWrite ? (
         <nav className="pager">
+          <button
+            className="btn"
+            type="button"
+            data-testid="add-route"
+            onClick={() => setAdding(true)}
+            disabled={adding}
+          >
+            Add route
+          </button>
           {/* Disabled rather than silently no-op: `save()` returns early on a validation error, and
               a button that looks live but does nothing reads as a broken console. */}
-          <button type="button" onClick={save} disabled={put.isPending || errors.length > 0}>
+          <button
+            className="btn primary"
+            type="button"
+            onClick={save}
+            disabled={put.isPending || errors.length > 0}
+          >
             Save table
           </button>
-          <button type="button" onClick={() => setDraft(base)} disabled={!dirty}>
+          <button className="btn" type="button" onClick={() => setDraft(base)} disabled={!dirty}>
             Revert
           </button>
           {dirty ? <Status tone="warn" label="unsaved changes" /> : null}
@@ -250,4 +319,128 @@ function describeMatch(route: Route): string {
     clauses.push(`${header.name ?? ""}: ${header.value ?? ""}`);
   }
   return clauses.length === 0 ? "everything (catch-all)" : clauses.join(" · ");
+}
+
+/**
+ * Add one route to the draft table.
+ *
+ * Fields are the wire's, snake_case included: `path_prefix`, `strip_prefix`, `set_host` carry no
+ * `serde(rename_all)` in `front_door/route_table.rs`, and this screen is where that already cost a
+ * debugging cycle once (#189) — a camelCase guess here reads `undefined` and silently ranks the
+ * route in an order the front door does not use.
+ *
+ * The only check here is a duplicate id, and only because the table's own validator reports it
+ * against the whole table after the fact — catching it at the point of typing names the field.
+ * Everything else (ambiguity, malformed host, strip-without-prefix) is deliberately left to
+ * `validate`, which sees the table as a set: those are properties of the *combination*, and a form
+ * that judged them alone would disagree with the fleet.
+ */
+function NewRoute({
+  existingIds,
+  onAdd,
+  onCancel,
+}: {
+  existingIds: string[];
+  onAdd: (route: Route) => void;
+  onCancel: () => void;
+}): ReactNode {
+  const [id, setId] = useState("");
+  const [port, setPort] = useState("");
+  const [priority, setPriority] = useState("0");
+  const [host, setHost] = useState("");
+  const [pathPrefix, setPathPrefix] = useState("");
+  const [method, setMethod] = useState("");
+  const [stripPrefix, setStripPrefix] = useState(false);
+  const [invalid, setInvalid] = useState<string | null>(null);
+
+  function submit(event: FormEvent): void {
+    event.preventDefault();
+    const trimmedId = id.trim();
+    if (trimmedId === "") return setInvalid("A route needs an id — it is how the API addresses it.");
+    if (existingIds.includes(trimmedId)) return setInvalid(`The id ${trimmedId} is already used.`);
+    const targetPort = Number(port);
+    if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
+      return setInvalid("Target port must be a whole number between 1 and 65535.");
+    }
+    const parsedPriority = Number(priority === "" ? "0" : priority);
+    if (!Number.isInteger(parsedPriority)) return setInvalid("Priority must be a whole number.");
+
+    // Empty clauses are omitted, never sent as "". A `path_prefix: ""` is a match clause that
+    // matches everything, which is a materially different route from one with no path clause.
+    const match: NonNullable<Route["match"]> = {};
+    if (host.trim() !== "") match.host = host.trim();
+    if (pathPrefix.trim() !== "") match.path_prefix = pathPrefix.trim();
+    if (method.trim() !== "") match.method = method.trim().toUpperCase();
+
+    setInvalid(null);
+    onAdd({
+      id: trimmedId,
+      priority: parsedPriority,
+      enabled: true,
+      ...(Object.keys(match).length === 0 ? {} : { match }),
+      target: { port: targetPort, strip_prefix: stripPrefix },
+    });
+  }
+
+  return (
+    <Card title="Add route">
+      <form className="stub-form" onSubmit={submit} data-testid="new-route-form">
+        <div className="field-row">
+          <div className="field">
+            <label htmlFor="route-id">Id</label>
+            <input id="route-id" value={id} onChange={(e) => setId(e.target.value)} placeholder="checkout" />
+          </div>
+          <div className="field">
+            <label htmlFor="route-port">Target port</label>
+            <input id="route-port" inputMode="numeric" value={port} onChange={(e) => setPort(e.target.value)} placeholder="4545" />
+          </div>
+          <div className="field">
+            <label htmlFor="route-priority">Priority</label>
+            <input id="route-priority" inputMode="numeric" value={priority} onChange={(e) => setPriority(e.target.value)} />
+          </div>
+        </div>
+        <div className="field-row">
+          <div className="field">
+            <label htmlFor="route-host">Host</label>
+            <input id="route-host" value={host} onChange={(e) => setHost(e.target.value)} placeholder="api.example.com or *.example.com" />
+          </div>
+          <div className="field">
+            <label htmlFor="route-path">Path prefix</label>
+            <input id="route-path" value={pathPrefix} onChange={(e) => setPathPrefix(e.target.value)} placeholder="/orders" />
+          </div>
+          <div className="field">
+            <label htmlFor="route-method">Method</label>
+            <input id="route-method" value={method} onChange={(e) => setMethod(e.target.value)} placeholder="GET" />
+          </div>
+        </div>
+        <label className="check">
+          <input type="checkbox" checked={stripPrefix} onChange={(e) => setStripPrefix(e.target.checked)} />
+          <span>
+            Strip the path prefix before forwarding
+            <span className="note">
+              Needs a path prefix above — the fleet refuses the whole table otherwise
+              (<code>StripWithoutPrefix</code>).
+            </span>
+          </span>
+        </label>
+        {invalid === null ? null : (
+          <p className="error" data-testid="new-route-invalid" role="alert">
+            {invalid}
+          </p>
+        )}
+        <div className="row">
+          <button className="btn primary" type="submit">
+            Add to table
+          </button>
+          <button className="btn" type="button" onClick={onCancel}>
+            Cancel
+          </button>
+        </div>
+        <p className="hint">
+          Added to the draft table. Nothing reaches the fleet until you save, and the table is
+          validated as a whole first.
+        </p>
+      </form>
+    </Card>
+  );
 }

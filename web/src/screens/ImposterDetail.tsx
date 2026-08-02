@@ -6,7 +6,7 @@ import { useImposter } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { toHash } from "../app/routing.ts";
 import { ImposterField } from "../components/imposterFields.tsx";
-import { ErrorNote, Ident, UNKNOWN } from "../components/primitives.tsx";
+import { Empty, ErrorNote, Ident, UNKNOWN } from "../components/primitives.tsx";
 import { DeleteStubButton, StubEditor, type StubTarget } from "./StubEditor.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
@@ -50,9 +50,9 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
 
       {imposter.isSuccess ? (
         <>
-          <dl className="facts">
+          <dl className="tiles">
             {DETAIL_FIELDS.map((field) => (
-              <div key={field.key} className="fact">
+              <div key={field.key} className="tile">
                 <dt>{field.label}</dt>
                 <dd data-testid={`detail-${field.key}`}>
                   <ImposterField imposter={imposter.data.data} field={field.key} />
@@ -97,7 +97,7 @@ function Stubs({
     <>
       {mayWrite ? (
         <nav className="pager">
-          <button type="button" onClick={() => onEdit({ kind: "new" })}>
+          <button className="btn sm" type="button" onClick={() => onEdit({ kind: "new" })}>
             Add stub
           </button>
         </nav>
@@ -147,9 +147,17 @@ function StubTable({
     return <p className="muted">This response carried no stub list.</p>;
   }
   if (stubs.length === 0) {
-    return <p className="muted">No stubs. Every request to this imposter falls through.</p>;
+    return (
+      <Empty
+        testId="imposter-no-stubs"
+        title="No stubs"
+        body="Every request to this imposter falls through to the default response."
+      />
+    );
   }
   return (
+    <section className="card">
+      <div className="scroll-x">
     <table className="dense">
       <thead>
         <tr>
@@ -192,6 +200,8 @@ function StubTable({
         ))}
       </tbody>
     </table>
+      </div>
+    </section>
   );
 }
 
@@ -218,7 +228,7 @@ function StubActions({
   if (stubId === undefined) {
     return (
       <span data-testid="stub-not-addressable">
-        <button type="button" disabled>
+        <button className="btn sm" type="button" disabled>
           Edit
         </button>{" "}
         <span className="muted">
@@ -230,8 +240,13 @@ function StubActions({
   }
   return (
     <>
-      <button type="button" onClick={() => onEdit({ kind: "existing", stubId })}>
-        Edit {stubId}
+      <button
+        className="btn sm"
+        type="button"
+        aria-label={`Edit ${stubId}`}
+        onClick={() => onEdit({ kind: "existing", stubId })}
+      >
+        Edit
       </button>
       <DeleteStubButton port={port} stubId={stubId} revision={revision} />
     </>

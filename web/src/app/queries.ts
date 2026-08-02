@@ -3,7 +3,7 @@ import type { UseMutationResult, UseQueryResult } from "@tanstack/react-query";
 
 import {
   ApiError,
-  type RawJsonBody,
+  RawJsonBody,
   type RevisionedRead,
   type SendResult,
   apiGet,
@@ -42,6 +42,8 @@ type RouteTable = components["schemas"]["RouteTable"];
 type Tenant = components["schemas"]["Tenant"];
 type TenantWrite = components["schemas"]["TenantWrite"];
 type Principal = components["schemas"]["Principal"];
+type AuditSink = components["schemas"]["AuditSink"];
+type AuditSinkWrite = components["schemas"]["AuditSinkWrite"];
 type PrincipalCreate = components["schemas"]["PrincipalCreate"];
 type PrincipalUpdate = components["schemas"]["PrincipalUpdate"];
 type IssuedPrincipal = components["schemas"]["IssuedPrincipal"];
@@ -283,8 +285,154 @@ export function useDeleteStub(): UseMutationResult<CommitOutcome, Error, StubWri
  */
 export function useAddStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
   return useStubWrite((write, tenant) =>
-    apiSend("POST", stubsPath(write.port), write.body, { tenant, ifMatch: write.revision }),
+    apiSend("POST", stubsPath(write.port), addStubBody(write.body), {
+      tenant,
+      ifMatch: write.revision,
+    }),
   );
+}
+
+/**
+ * Wrap a stub in the envelope `addStub` requires: `{"stub": …}`, optionally with an `index`.
+ *
+ * The two stub-writing routes take **different bodies** and the console got it wrong: the by-id
+ * `PUT` takes a bare `Stub`, `POST /imposters/:port/stubs` takes `{stub, index?}`. Sending the bare
+ * stub to the collection answered `400 missing field 'stub'`, so appending a stub never worked at
+ * all. Nothing caught it because the unit tests stub `fetch` — they assert what the client sends,
+ * which is precisely the thing that was wrong; only the contract or a real server can say.
+ *
+ * Wrapped textually rather than by parsing and re-serialising, because the operator's own bytes are
+ * the document (`StubEditor`'s second rule): key order and whitespace they chose survive the save,
+ * and a round trip through `JSON.parse` would quietly normalise both.
+ */
+function addStubBody(body: RawJsonBody | undefined): RawJsonBody | undefined {
+  return body === undefined ? undefined : new RawJsonBody(`{"stub":${body.text}}`);
+}
+
+/**
+ * Create an imposter.
+ *
+ * The port is part of the body and never auto-assigned: `createImposter` requires it explicitly
+ * because an auto-assigned port cannot replicate across the fleet — the other nodes would each pick
+ * their own. So this is a form field, not a convenience the console can hide.
+ *
+ * No `If-Match`. The route accepts one, but a create has nothing to condition on: there is no prior
+ * revision of an imposter that does not exist. A port already in use comes back as the server's own
+ * refusal, which is the check that matters and the only one that sees the whole fleet.
+ */
+export function useCreateImposter(): UseMutationResult<CommitOutcome, Error, Imposter> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body) => {
+      const sent = await apiSend("POST", API_PATHS.imposters, body, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["imposters"] }),
+  });
+}
+
+/**
+ * Delete an imposter, and everything hanging off it.
+ *
+ * Authorized by `Action::ImposterDelete`, which is why the screen gates on `imposter.delete` rather
+ * than `imposter.write` even though the two are granted together today (see `rbac.ts`).
+ *
+ * Both caches are invalidated: the detail read is keyed by port, and leaving it would let a
+ * back-navigation render a deleted imposter from cache as though it still existed.
+ */
+export function useDeleteImposter(): UseMutationResult<CommitOutcome, Error, { port: number }> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port }) => {
+      const sent = await apiSend("DELETE", imposterPath(port), undefined, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: (_data, _error, { port }) => {
+      void client.invalidateQueries({ queryKey: ["imposters"] });
+      void client.removeQueries({ queryKey: ["imposter", port] });
+    },
+  });
+}
+
+/**
+ * Empty one imposter's recorded requests on this node.
+ *
+ * `Action::SavedRequestsClear` — an Operator-tier "disturb" action, not an Editor-tier "redefine"
+ * one, so the screen gates it on `imposter.lifecycle`. That grouping is `authz.rs`'s, not a guess:
+ * clearing a log changes no configuration.
+ *
+ * Per-node like the log itself. Clearing here empties what *this* node recorded; another node's log
+ * is untouched, which is the same scope caveat the screen already keeps in front of the reader.
+ */
+/**
+ * The fleet's declared audit export sink.
+ *
+ * `404` is **not** an error here: the contract uses it for "no sink is declared" as well as for
+ * "caller lacks fleet-scoped access" (RFC-002 §8.4, where the two must be indistinguishable). The
+ * screen is only reachable by a principal that holds `cluster.admin`, so it resolves the absent case
+ * to `null` and lets every other status reject — folding a genuine `503` into "no sink" would report
+ * an unreachable node as a fleet that ships nowhere.
+ */
+export function useAuditSink(options: { enabled?: boolean } = {}) {
+  return useQuery({
+    queryKey: ["audit-sink"],
+    queryFn: async (): Promise<AuditSink | null> => {
+      try {
+        return await apiGet<AuditSink>(API_PATHS.auditSink);
+      } catch (cause) {
+        if (cause instanceof ApiError && cause.status === 404) return null;
+        throw cause;
+      }
+    },
+    enabled: options.enabled ?? true,
+    ...POLLED,
+  });
+}
+
+export function usePutAuditSink(): UseMutationResult<CommitOutcome, Error, AuditSinkWrite> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body) => {
+      const sent = await apiSend("PUT", API_PATHS.auditSink, body);
+      const outcome = await settle(sent, { tenant: null });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["audit-sink"] }),
+  });
+}
+
+export function useDeleteAuditSink(): UseMutationResult<CommitOutcome, Error, void> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const sent = await apiSend("DELETE", API_PATHS.auditSink);
+      const outcome = await settle(sent, { tenant: null });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["audit-sink"] }),
+  });
+}
+
+export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { port: number }> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port }) => {
+      const sent = await apiSend("DELETE", requestsPath(port), undefined, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["requests"] }),
+  });
 }
 
 export function useRouteTable(): UseQueryResult<Route[]> {
