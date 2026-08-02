@@ -45,6 +45,16 @@ asserts the bytes differ. A baseline can only catch a control that regressed *aw
 good state; that one catches a control that never rendered its state to begin with, which is what
 actually happened.
 
+The same limit bit again in #236, and worse. `.scrim`, `.confirm` and `.acts` had no rules at all,
+so the modal guarding every destructive act rendered as a block in the page flow — and the confirm
+baseline had been taken *after* that regression, so the image recorded the bug as the expected
+appearance and the gate defended it. A baseline is only ever as good as the render it was taken
+from. Where a property is what matters rather than an appearance, assert the property: the `#236`
+block in `smoke.spec.ts` checks the overlay's computed `position`, that its box fills the initial
+containing block, that `elementFromPoint` over the page resolves inside the scrim, and that the
+action row shares a baseline — none of which a screenshot can state, and all of which would have
+failed on the day the rules went missing.
+
 **Accessibility** fails on `serious` and `critical` only. `moderate` and `minor` include advisory
 rules (landmark structure, heading order) that would make this a style gate reviewers learn to skip
 — the same reasoning behind the console's deliberately one-rule eslint config. It earns its place on
