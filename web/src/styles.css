@@ -1498,6 +1498,24 @@ input[type="radio"] {
   flex-wrap: wrap;
 }
 
+/*
+ * The latency & faults panel (issue #249). Collapsed by default, so the padding and border only
+ * cost anything once an operator opens it — a plain status/headers/body stub shows one summary line.
+ */
+.response-chaos {
+  border: 1px dashed var(--line);
+  border-radius: 3px;
+  padding: 8px;
+}
+
+.response-chaos > summary {
+  cursor: pointer;
+}
+
+.response-chaos > *:not(summary) {
+  margin-top: 8px;
+}
+
 .response-labels {
   margin: 6px 0 0;
   padding-left: 1.2em;

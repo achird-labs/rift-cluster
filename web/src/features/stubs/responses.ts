@@ -33,6 +33,17 @@
  * only be exercised through a component.
  */
 
+import {
+  type BehaviorModel,
+  type BehaviorSpelling,
+  type FaultModel,
+  parseBehaviors,
+  parseResponseFault,
+  parseRiftTcpFault,
+  renderBehaviors,
+  renderFault,
+} from "./behaviors.ts";
+
 /**
  * One header line. `value` is whatever JSON the document carried — usually a string, sometimes a
  * number or a boolean (see the module comment). `multi` records that this row came from a JSON
@@ -55,6 +66,16 @@ export type ResponseBody =
 export type ResponseModel = {
   /** `false` for the flat, wrapper-less form recorded mocks use. See the module comment. */
   wrapped: boolean;
+  /**
+   * `_behaviors` — a delay and/or a repeat count hanging off this response (#249). `null` means the
+   * response carries no behaviours key at all, which is different from carrying an empty one.
+   */
+  behaviors: BehaviorModel | null;
+  /**
+   * A connection fault (#249). Note this REPLACES the response rather than decorating it: `fault`
+   * is its own `StubResponse` variant, dispatched after `is`/`proxy`/`inject`.
+   */
+  fault: FaultModel | null;
   /** `null` means the key is ABSENT, not that the status is zero — the engine then defaults to 200. */
   statusCode: number | null;
   /**
@@ -95,12 +116,24 @@ const IS_KEYS = ["statusCode", "headers", "body"] as const;
 /**
  * The response variants this form does not edit, in the order they are reported.
  *
- * `_rift` belongs here for the same reason the other three do: `StubResponseRaw` gives it its own
- * field and a `_rift`-only response becomes a `RiftScript`, a fifth kind of response entirely. It
- * would otherwise fall through to the `is` branch of `describeResponses` and be labelled as a plain
- * 200 — telling the operator the stub answers a status when it actually runs a script.
+ * `fault` left this list in #249 — it is now modelled by the latency-and-fault panel. `_rift` left
+ * it too, but only part-way: `parseResponse` accepts a `_rift` whose sole content is `fault.tcp`
+ * and names everything else it might carry (`script`, `templated`, the `latency`/`error` fault
+ * kinds). It remains a `describeResponses` *label* kind, because a `_rift`-only response becomes a
+ * `RiftScript` — a fifth kind of response entirely — and would otherwise be labelled as a plain 200,
+ * telling the operator the stub answers a status when it actually runs a script.
  */
-const FOREIGN_VARIANTS = ["proxy", "inject", "fault", "_rift"] as const;
+const FOREIGN_VARIANTS = ["proxy", "inject"] as const;
+
+/**
+ * Keys that live on the RESPONSE, beside `is`, rather than inside it.
+ *
+ * `StubResponseRaw` declares these at the same level as the flat form's `statusCode`/`headers`/
+ * `body`, so in a flat response `_behaviors` and `statusCode` are genuinely adjacent and "is this
+ * an is-body key or a response-level one" can only be decided by name. This list is that decision,
+ * in one place, used by both branches of `parseResponse`.
+ */
+const RESPONSE_LEVEL_KEYS = ["is", "proxy", "inject", "fault", "_behaviors", "behaviors", "_rift"] as const;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -111,6 +144,26 @@ function isHeaderScalar(value: unknown): boolean {
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
 
+/**
+ * Does this response carry an `is` body — a status, headers, or a body?
+ *
+ * Load-bearing for faults, not cosmetic. The engine dispatches `is > proxy > inject > fault`
+ * (`From<StubResponseRaw> for StubResponse`), so a top-level `fault` key on a response that ALSO
+ * has an `is` never fires — and `StubResponseOut`'s `Is` arm sets `fault: None`, so the key does not
+ * even survive the next `GET /imposters`. The Rift extension is different: `raw.rift` is passed
+ * straight into `new_is(..., raw.rift)`, so `_rift.fault.tcp` fires perfectly well beside a body.
+ * Which form the fault picker may write therefore depends on this question.
+ */
+export function hasIsBody(response: ResponseModel): boolean {
+  return (
+    response.wrapped ||
+    response.statusCode !== null ||
+    response.headersPresent ||
+    response.headers.length > 0 ||
+    response.body.kind !== "absent"
+  );
+}
+
 export function blankResponse(): ResponseModel {
   return {
     wrapped: true,
@@ -118,6 +171,8 @@ export function blankResponse(): ResponseModel {
     headersPresent: false,
     headers: [],
     body: { kind: "absent" },
+    behaviors: null,
+    fault: null,
   };
 }
 
@@ -187,7 +242,21 @@ function renderIsBody(response: ResponseModel): Record<string, unknown> {
 export function renderResponses(items: ResponseModel[]): unknown[] {
   return items.map((response) => {
     const body = renderIsBody(response);
-    return response.wrapped ? { is: body } : body;
+    /*
+     * Response-level keys come AFTER the body in the flat form, so a document that was read as
+     * `{statusCode, _behaviors}` is written back in that order rather than reshuffled. In the
+     * wrapped form they are siblings of `is`, which is where `StubResponseRaw` declares them.
+     */
+    const level: Record<string, unknown> = {};
+    if (response.behaviors !== null) {
+      const rendered = renderBehaviors(response.behaviors);
+      if (rendered !== null) level[rendered.key] = rendered.value;
+    }
+    if (response.fault !== null) {
+      const rendered = renderFault(response.fault);
+      level[rendered.key] = rendered.value;
+    }
+    return response.wrapped ? { is: body, ...level } : { ...body, ...level };
   });
 }
 
@@ -196,6 +265,9 @@ export function renderResponses(items: ResponseModel[]): unknown[] {
 // ---------------------------------------------------------------------------------------------
 
 type ParseResult<T> = { ok: true; value: T } | { ok: false; issues: string[] };
+
+/** The parts of a response that live inside `is` — everything `parseIsBody` is responsible for. */
+type IsBodyFields = Pick<ResponseModel, "statusCode" | "headersPresent" | "headers" | "body">;
 
 /**
  * Read a response's `headers` object into rows, appending to `headers` and returning the paths of
@@ -256,7 +328,7 @@ function parseHeaders(raw: unknown, path: string, headers: ResponseHeader[]): st
  * `path` is where this object lives (`responses[0].is`, or `responses[0]` for the flat form), so a
  * refusal names the key an operator would actually go looking for.
  */
-function parseIsBody(value: Record<string, unknown>, path: string): ParseResult<Omit<ResponseModel, "wrapped">> {
+function parseIsBody(value: Record<string, unknown>, path: string): ParseResult<IsBodyFields> {
   const issues: string[] = [];
 
   // `_mode: "binary"` means the body is base64. The form has no way to edit that without
@@ -291,6 +363,102 @@ function parseIsBody(value: Record<string, unknown>, path: string): ParseResult<
   return { ok: true, value: { statusCode, headersPresent, headers, body } };
 }
 
+/**
+ * Read the response-level keys that sit BESIDE the response body — behaviours and faults.
+ *
+ * These are siblings of `is`, not fields inside it (`StubResponseRaw` declares them at the same
+ * level), which is what makes the flat form fiddly: there, `_behaviors` and `statusCode` are
+ * genuinely adjacent, so "is this an is-body key or a response-level one" has to be decided by
+ * name rather than by depth. `RESPONSE_LEVEL_KEYS` is that decision, in one place.
+ */
+function parseResponseLevel(
+  value: Record<string, unknown>,
+  path: string,
+): ParseResult<{ behaviors: BehaviorModel | null; fault: FaultModel | null }> {
+  const issues: string[] = [];
+
+  let behaviors: BehaviorModel | null = null;
+  const spelling: BehaviorSpelling | null =
+    "_behaviors" in value
+      ? "_behaviors"
+      : "behaviors" in value
+        ? Array.isArray(value.behaviors)
+          ? "behaviorsArray"
+          : "behaviorsObject"
+        : null;
+  if (spelling !== null) {
+    const key = spelling === "_behaviors" ? "_behaviors" : "behaviors";
+    // Both spellings at once: the engine takes one and drops the other, and there is no honest
+    // single model of "these two disagree", so it is named rather than silently resolved.
+    if ("_behaviors" in value && "behaviors" in value) {
+      issues.push(`${path}._behaviors`, `${path}.behaviors`);
+    } else {
+      const parsed = parseBehaviors(value[key], spelling, `${path}.${key}`);
+      if (parsed.ok) behaviors = parsed.value;
+      else issues.push(...parsed.issues);
+    }
+  }
+
+  let fault: FaultModel | null = null;
+  if ("fault" in value) {
+    const parsed = parseResponseFault(value.fault, `${path}.fault`);
+    if (parsed.ok) fault = parsed.value;
+    else issues.push(...parsed.issues);
+  }
+
+  if ("_rift" in value) {
+    const rift = value._rift;
+    if (!isPlainObject(rift)) {
+      issues.push(`${path}._rift`);
+    } else {
+      /*
+       * Only `_rift.fault.tcp` is modelled. `script`, `templated`, and the `latency`/`error` fault
+       * kinds are real engine features with their own shapes; naming them keeps them out of the
+       * form without dropping them from the document.
+       */
+      const riftExtra = Object.keys(rift).filter((key) => key !== "fault");
+      if (riftExtra.length > 0) issues.push(...riftExtra.map((key) => `${path}._rift.${key}`));
+      if (Object.keys(rift).length === 0) {
+        /*
+         * A bare `_rift: {}`. There is nothing in it to model, and the model has no way to say "the
+         * source carried an empty extension" — so rendering would drop the key unnamed. That is not
+         * inert on a FLAT response: the engine checks `raw.rift` BEFORE the flat statusCode/body
+         * branch, so the mere presence of `_rift` decides whether it builds a `RiftScript` or an
+         * `Is`. Dropping it would change which response variant the engine constructs.
+         */
+        issues.push(`${path}._rift`);
+      }
+      if ("fault" in rift) {
+        const riftFault = rift.fault;
+        if (!isPlainObject(riftFault)) {
+          issues.push(`${path}._rift.fault`);
+        } else {
+          const faultExtra = Object.keys(riftFault).filter((key) => key !== "tcp");
+          if (faultExtra.length > 0) {
+            issues.push(...faultExtra.map((key) => `${path}._rift.fault.${key}`));
+          }
+          // Same reasoning as the empty `_rift` above: nothing to model, and dropping it silently
+          // would rewrite the document.
+          if (Object.keys(riftFault).length === 0) issues.push(`${path}._rift.fault`);
+          if ("tcp" in riftFault) {
+            // Two faults at once — one on the response key, one under `_rift` — is a document the
+            // form cannot re-emit without choosing which to keep.
+            if (fault !== null) issues.push(`${path}._rift.fault.tcp`);
+            else {
+              const parsed = parseRiftTcpFault(riftFault.tcp, `${path}._rift.fault.tcp`);
+              if (parsed.ok) fault = parsed.value;
+              else issues.push(...parsed.issues);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (issues.length > 0) return { ok: false, issues };
+  return { ok: true, value: { behaviors, fault } };
+}
+
 /** Parse one element of the `responses` array: an `is` response, wrapped or flat, or a refusal. */
 function parseResponse(value: unknown, index: number): ParseResult<ResponseModel> {
   const path = `responses[${index}]`;
@@ -301,21 +469,30 @@ function parseResponse(value: unknown, index: number): ParseResult<ResponseModel
   const foreign = FOREIGN_VARIANTS.filter((variant) => variant in value);
   if (foreign.length > 0) return { ok: false, issues: foreign.map((variant) => `${path}.${variant}`) };
 
+  const level = parseResponseLevel(value, path);
+  if (!level.ok) return level;
+
   if ("is" in value) {
-    // Wrapped. Nothing may ride alongside `is` — `_behaviors` beside it is #249's territory, and a
-    // form that quietly dropped it would erase a wait the operator configured.
-    const extras = Object.keys(value).filter((key) => key !== "is");
+    // Wrapped. Only response-level keys may ride alongside `is`; anything else is named, because a
+    // form that quietly dropped it would erase something the operator configured.
+    const extras = Object.keys(value).filter(
+      (key) => !(RESPONSE_LEVEL_KEYS as readonly string[]).includes(key),
+    );
     if (extras.length > 0) return { ok: false, issues: extras.map((key) => `${path}.${key}`) };
     const inner = value.is;
     if (!isPlainObject(inner)) return { ok: false, issues: [`${path}.is`] };
     const parsed = parseIsBody(inner, `${path}.is`);
     if (!parsed.ok) return parsed;
-    return { ok: true, value: { wrapped: true, ...parsed.value } };
+    return { ok: true, value: { wrapped: true, ...parsed.value, ...level.value } };
   }
 
-  const parsed = parseIsBody(value, path);
+  // Flat: everything that is not a response-level key belongs to the is-body.
+  const flatBody = Object.fromEntries(
+    Object.entries(value).filter(([key]) => !(RESPONSE_LEVEL_KEYS as readonly string[]).includes(key)),
+  );
+  const parsed = parseIsBody(flatBody, path);
   if (!parsed.ok) return parsed;
-  return { ok: true, value: { wrapped: false, ...parsed.value } };
+  return { ok: true, value: { wrapped: false, ...parsed.value, ...level.value } };
 }
 
 /**
@@ -386,6 +563,33 @@ export function describeResponses(stub: unknown): ResponseLabel[] {
     // No variant key at all: the flat, wrapper-less form.
     return { index, kind: "is", detail: describeStatus(raw) };
   });
+}
+
+/**
+ * The behaviours a response runs that the form does not edit, named for the card (#249 AC5).
+ *
+ * Without this a response carrying `decorate` or a JS-function `wait` is labelled identically to a
+ * plain one: the only trace is a dotted key buried in the generic "Unmodelled:" banner text. The AC
+ * asks for the operator to be able to see, per response, that it runs something the form is not
+ * showing them — "recognised" is exactly the half that is supposed to survive the refusal.
+ */
+export function foreignBehaviorsOf(raw: unknown): string[] {
+  if (!isPlainObject(raw)) return [];
+  const container = "_behaviors" in raw ? raw._behaviors : "behaviors" in raw ? raw.behaviors : undefined;
+  if (container === undefined) return [];
+
+  const entries: string[] = [];
+  const collect = (value: unknown): void => {
+    if (!isPlainObject(value)) return;
+    for (const [key, inner] of Object.entries(value)) {
+      // A string `wait` is a JS function the engine evaluates — recognised, never edited here.
+      if (key === "wait" && typeof inner === "string") entries.push("wait (function)");
+      else if (key !== "wait" && key !== "repeat") entries.push(key);
+    }
+  };
+  if (Array.isArray(container)) for (const element of container) collect(element);
+  else collect(container);
+  return entries;
 }
 
 /**

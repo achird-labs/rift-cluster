@@ -2,6 +2,14 @@ import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 
 import {
+  type BehaviorModel,
+  type BehaviorSpelling,
+  FAULT_KINDS,
+  type FaultModel,
+  type ModelledBehavior,
+  type WaitModel,
+} from "./behaviors.ts";
+import {
   type ResponseBody,
   type ResponseHeader,
   type ResponseModel,
@@ -45,12 +53,55 @@ const anyBody: fc.Arbitrary<ResponseBody> = fc.oneof(
     .map<ResponseBody>((value) => ({ kind: "json", value })),
 );
 
+/**
+ * Behaviours in all three spellings, including the array form whose ORDER must survive. `null` (no
+ * behaviours key at all) is generated too: it is a different document from an empty one.
+ */
+const anyBehaviors: fc.Arbitrary<BehaviorModel | null> = fc.option(
+  fc
+    .record({
+      spelling: fc.constantFrom<BehaviorSpelling>("_behaviors", "behaviorsObject", "behaviorsArray"),
+      order: fc.shuffledSubarray(["wait", "repeat"] as ModelledBehavior[], { minLength: 1 }),
+      wait: fc.oneof(
+        fc.constant<WaitModel>({ kind: "none" }),
+        fc.integer({ min: 0, max: 5000 }).map<WaitModel>((ms) => ({ kind: "fixed", ms })),
+        fc
+          .tuple(fc.integer({ min: 0, max: 100 }), fc.integer({ min: 100, max: 5000 }))
+          .map<WaitModel>(([min, max]) => ({ kind: "range", min, max })),
+      ),
+      repeat: fc.option(fc.integer({ min: 1, max: 10 }), { nil: null }),
+    })
+    // A model whose `order` names a key it does not carry renders nothing for it, which is fine —
+    // but then `order` itself cannot round-trip, so the generator only lists keys that are present.
+    .map((model) => ({
+      ...model,
+      order: model.order.filter((key) =>
+        key === "repeat" ? model.repeat !== null : model.wait.kind !== "none",
+      ),
+    })),
+  { nil: null },
+);
+
+/** All three fault spellings — the response key, and `_rift.fault.tcp` bare and probabilistic. */
+const anyFault: fc.Arbitrary<FaultModel | null> = fc.option(
+  fc.oneof(
+    fc.constantFrom(...FAULT_KINDS).map<FaultModel>((kind) => ({ form: "responseKey", kind })),
+    fc.constantFrom(...FAULT_KINDS).map<FaultModel>((kind) => ({ form: "riftString", kind })),
+    fc
+      .tuple(fc.constantFrom(...FAULT_KINDS), fc.double({ min: 0, max: 1, noNaN: true }))
+      .map<FaultModel>(([kind, probability]) => ({ form: "riftObject", kind, probability })),
+  ),
+  { nil: null },
+);
+
 const anyResponse: fc.Arbitrary<ResponseModel> = fc.record({
   wrapped: fc.boolean(),
   statusCode: fc.option(fc.integer({ min: 100, max: 599 }), { nil: null }),
   headersPresent: fc.boolean(),
   headers: fc.array(anyHeader, { maxLength: 4 }),
   body: anyBody,
+  behaviors: anyBehaviors,
+  fault: anyFault,
 });
 
 const anyResponseList: fc.Arbitrary<ResponseModel[]> = fc.array(anyResponse, { maxLength: 4 });
@@ -295,14 +346,18 @@ describe("responses richer than the form are recognised, labelled, and refused (
     expect(describeResponses(stub).map((label) => label.kind)).toEqual(["inject"]);
   });
 
-  it("names a fault response and labels it", () => {
-    // A fourth variant alongside is/proxy/inject in the engine's `StubResponseRaw`. Editing faults
-    // is #249's job; recognising one here is this issue's.
+  it("models a fault response now, and still labels it as a fault", () => {
+    // #248 refused this; #249 models it, because the fault picker is the whole point of that slice.
+    // The LABEL is unchanged either way — a fault still replaces the response.
     const stub = { responses: [{ fault: "CONNECTION_RESET_BY_PEER" }] };
     const projected = projectResponses(stub);
-    expect(projected.kind).toBe("rawOnly");
-    if (projected.kind !== "rawOnly") return;
-    expect(projected.unmodelledKeys).toEqual(["responses[0].fault"]);
+    expect(projected.kind).toBe("responses");
+    if (projected.kind !== "responses") return;
+    expect(projected.items[0]?.fault).toEqual({
+      form: "responseKey",
+      kind: "CONNECTION_RESET_BY_PEER",
+    });
+    expect(renderResponses(projected.items)).toEqual(stub.responses);
     expect(describeResponses(stub)).toEqual([
       { index: 0, kind: "fault", detail: "CONNECTION_RESET_BY_PEER" },
     ]);
@@ -327,7 +382,9 @@ describe("responses richer than the form are recognised, labelled, and refused (
     const projected = projectResponses(stub);
     expect(projected.kind).toBe("rawOnly");
     if (projected.kind !== "rawOnly") return;
-    expect(projected.unmodelledKeys).toEqual(["responses[0]._rift"]);
+    // #249 made this more precise: `_rift.fault.tcp` is modelled now, so the refusal names the
+    // part that is NOT (`script`) rather than the whole extension.
+    expect(projected.unmodelledKeys).toEqual(["responses[0]._rift.script"]);
     expect(describeResponses(stub)).toEqual([{ index: 0, kind: "_rift", detail: "" }]);
   });
 
@@ -365,13 +422,13 @@ describe("responses richer than the form are recognised, labelled, and refused (
     }
   });
 
-  it("leaves `_behaviors` unmodelled — that is #249, and this form must not swallow it", () => {
-    const projected = projectResponses({
-      responses: [{ is: { statusCode: 200 }, _behaviors: { wait: 50 } }],
-    });
-    expect(projected.kind).toBe("rawOnly");
-    if (projected.kind !== "rawOnly") return;
-    expect(projected.unmodelledKeys).toEqual(["responses[0]._behaviors"]);
+  it("models a `_behaviors` wait beside `is`, which #248 refused", () => {
+    const source = [{ is: { statusCode: 200 }, _behaviors: { wait: 50 } }];
+    const projected = projectResponses({ responses: source });
+    expect(projected.kind).toBe("responses");
+    if (projected.kind !== "responses") return;
+    expect(projected.items[0]?.behaviors?.wait).toEqual({ kind: "fixed", ms: 50 });
+    expect(renderResponses(projected.items)).toEqual(source);
   });
 
   it("treats a status code of the wrong JSON type as unmodelled, not as a coercion", () => {

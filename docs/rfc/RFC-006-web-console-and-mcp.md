@@ -544,12 +544,20 @@ screen rather than replacing it.
    meant refusing every stub that used them. `STUB_FIELDS` is now the `id` row
    alone, and `project`'s `walk` treats both subtrees as out of its scope.
 
+   - **#249** widened the response model again, with `features/stubs/behaviors.ts`:
+     the `wait` (fixed and random-range) and `repeat` behaviours, and connection
+     faults — both the `fault` response variant and the Rift `_rift.fault.tcp`
+     extension, whose object form carries a firing probability.
+
    Still out, and still landing in raw-JSON-only rather than being half-modelled:
-   scenarios, `space`, `_behaviors` (queued as #249), and the `proxy`, `inject`
-   and `fault` response variants. Those three are *recognised and labelled* in
-   the editor — an operator can see that a stub carries a proxy and where it
-   points — but recognised is not editable: they open raw-only, because a form
-   that pretended to edit injected JavaScript would be lying about what it saves.
+   scenarios, `space`, the `proxy` and `inject` response variants, the `copy`,
+   `lookup`, `decorate` and `shellTransform` behaviours, the JS-function form of
+   `wait`, and `_rift`'s `script`, `templated` and `latency`/`error` faults. All
+   of these are *recognised and labelled* in the editor — an operator can see
+   that a stub carries a proxy and where it points — but recognised is not
+   editable: they open raw-only, because a form that pretended to edit injected
+   JavaScript, or a shell command, would be lying about what it saves. Building
+   those editors is a separate decision with its own security surface.
 
    The rule that makes any of this safe: **the form never silently drops a
    key.** Each projection either understands its whole subtree or refuses it,
@@ -567,6 +575,16 @@ screen rather than replacing it.
    either would be harmless to the mock and still wrong — it shows up as a diff
    on every export of a recorded imposter, which teaches operators to distrust
    the console.
+
+   #249 made that rule carry most of its weight. Behaviours have **three**
+   accepted spellings (`_behaviors` as an object, `behaviors` as an object,
+   `behaviors` as an array of single-key objects) and `_rift.fault.tcp` has two
+   (a bare kind string, and an object carrying a probability) — and the engine
+   re-emits each exactly as given, because its own SDK parse-fidelity gate
+   requires `GET /imposters` to round-trip. The form matches that, down to the
+   order of keys inside an array-spelled behaviours list. The engine's short
+   fault aliases (`reset`, `empty`, …) are likewise accepted and never rewritten,
+   even though the picker itself writes the canonical `SCREAMING_CASE` names.
 
    Widening remains data, not redesign, within each projection. Demand-driven
    from here, as proposed.

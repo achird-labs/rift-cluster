@@ -345,6 +345,28 @@ describe("AC5 — the lint pane is advisory and the server's refusal is the auth
     const error = await screen.findByTestId("stub-server-error");
     expect(error.textContent).toContain("predicates[0].equals.method must be a string");
   });
+
+  it("shows the engine's own fault-probability message verbatim, not a rewritten one (#249 AC3)", async () => {
+    /*
+     * `RiftTcpFault`'s deserializer is hand-written specifically so a malformed object form gets an
+     * actionable message instead of serde's opaque "data did not match any variant". That message
+     * is a gift — it names the fix ("use the bare fault-type string for an always-firing fault").
+     * Replacing it with a generic "invalid fault" would throw away the only thing that tells the
+     * operator what to do, so this pins that the server's text reaches them intact.
+     */
+    const engineMessage =
+      "_rift.fault.tcp object form requires a numeric 'probability' (use the bare fault-type string for an always-firing fault)";
+    stubFleet({
+      read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }),
+      write: () => ({ status: 400, json: { message: engineMessage } }),
+    });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    await openEditor("s-1");
+
+    await userEvent.setup().click(screen.getByRole("button", { name: /save stub/i }));
+
+    expect((await screen.findByTestId("stub-server-error")).textContent).toContain(engineMessage);
+  });
 });
 
 describe("AC7 — a stub body is rendered as text, never as markup", () => {
