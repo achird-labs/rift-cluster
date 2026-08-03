@@ -149,17 +149,75 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
     expect(screen.getByTestId("stub-form")).toBeTruthy();
     expect(screen.queryByTestId("stub-raw-banner")).toBeNull();
     expect(JSON.parse(editor.value)).toEqual(MODELLED);
-    expect((screen.getByLabelText("Path") as HTMLInputElement).value).toBe("/users");
+    // `MODELLED`'s predicate is `{equals: {method, path}}` — the two-field-in-one-object shape this
+    // console has always written (#247's load-bearing read case). That is a *read* shape, not one
+    // the row editor's single-entry rows construct, so the builder shows it as a fixed summary
+    // rather than a `Path` input this form does not have anymore.
+    expect(screen.getByTestId("predicate-builder")).toBeTruthy();
+    expect(screen.getByTestId("predicate-row-readonly").textContent).toContain('Path equals "/users"');
   });
 
-  it("moves an edit made in the form into the JSON", async () => {
-    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
+  it("opens raw-only and names the predicate it could not model", async () => {
+    /*
+     * The regression test #247 asks for by name. `projectPredicates` refusing is well covered on
+     * its own, but this is the *composition*: the editor must require both projections and put the
+     * predicate projection's key into the same banner the form projection's keys go to. Without
+     * this, a refusal could be computed correctly and then dropped on the floor, and the operator
+     * would get a form for a stub the builder cannot represent — which is the silent-rewrite
+     * failure the whole module exists to prevent.
+     */
+    const unrepresentable = {
+      id: "s-1",
+      predicates: [{ soundsLike: { path: "/users" } }],
+      responses: [{ is: { statusCode: 200 } }],
+    };
+    stubFleet({ read: () => ({ json: imposter([unrepresentable]), revision: "default:4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    await openEditor("s-1");
+
+    const banner = await screen.findByTestId("stub-raw-banner");
+    expect(banner.textContent).toMatch(/predicates\[0\]|soundsLike/);
+    // And no form — a half-form over a stub with an unmodelled predicate is the shape that saves
+    // the parts it understood and drops the rest.
+    expect(screen.queryByTestId("stub-form")).toBeNull();
+    expect(screen.queryByTestId("predicate-builder")).toBeNull();
+  });
+
+  it("warns that a stub with no predicates matches everything, and stops once one exists", async () => {
+    // The catch-all warning is the one thing `Summary` must keep saying after #247 moved predicates
+    // out of `STUB_FIELDS` — it used to key off the method/path fields, which no longer exist.
+    stubFleet({
+      read: () => ({
+        json: imposter([{ id: "s-1", responses: [{ is: { statusCode: 200 } }] }]),
+        revision: "default:4545@7",
+      }),
+    });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    await openEditor("s-1");
+
+    expect((await screen.findByTestId("stub-summary")).textContent).toMatch(
+      /matches every|no predicates/i,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /add predicate/i }));
+    expect(screen.getByTestId("stub-summary").textContent).not.toMatch(/matches every request/i);
+  });
+
+  it("moves an edit made in the predicate builder into the JSON", async () => {
+    // A single-entry predicate — the shape the builder's own rows write — unlike `MODELLED` above,
+    // so this exercises the row the builder actually renders as an editable field.
+    const singleEntry = {
+      id: "s-1",
+      predicates: [{ equals: { path: "/users" } }],
+      responses: [{ is: { statusCode: 200, headers: { "Content-Type": "application/json" }, body: "[]" } }],
+    };
+    stubFleet({ read: () => ({ json: imposter([singleEntry]), revision: "default:4545@7" }) });
     renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
     const editor = await openEditor("s-1");
 
     const user = userEvent.setup();
-    await user.clear(screen.getByLabelText("Path"));
-    await user.type(screen.getByLabelText("Path"), "/orders");
+    await user.clear(screen.getByLabelText("Value"));
+    await user.type(screen.getByLabelText("Value"), "/orders");
 
     await waitFor(() => expect(JSON.parse(editor.value).predicates[0].equals.path).toBe("/orders"));
   });

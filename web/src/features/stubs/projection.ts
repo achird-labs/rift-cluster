@@ -15,7 +15,7 @@
  */
 
 /** The fields the form models. Widening the form means adding an entry here. */
-export type FieldKey = "id" | "method" | "path" | "statusCode" | "contentType" | "body";
+export type FieldKey = "id" | "statusCode" | "contentType" | "body";
 
 /** A path into the stub JSON: object keys as strings, array indices as numbers. */
 export type JsonPath = readonly (string | number)[];
@@ -42,13 +42,18 @@ export type StubField = {
 };
 
 /**
- * The starting set (RFC-006 §12 Q2): a stub's stable id, a single method/path `equals` predicate,
- * and a single `is` response with a status code, a `Content-Type` and a text body.
+ * The starting set (RFC-006 §12 Q2): a stub's stable id, and a single `is` response with a status
+ * code, a `Content-Type` and a text body.
  *
- * Chosen because it is what a console operator writes by hand; everything else — scenarios, spaces,
- * behaviors, proxies, `matches`/`contains`/`deepEquals` predicates, multiple responses — is
- * deliberately *out*, and lands in raw-only rather than being half-modelled. Widening is
- * demand-driven and costs one row.
+ * The predicate side of a stub — method, path, and everything else a request can be matched on —
+ * moved to the sibling `predicates.ts` projection in issue #247: it needed a richer unit than one
+ * row (a clause, not a field — see that file's header comment), so it earned its own table rather
+ * than living in this one. `walk`, below, treats the whole `predicates` subtree as out of scope for
+ * exactly that reason.
+ *
+ * Everything else — scenarios, spaces, behaviors, proxies, multiple responses — is deliberately
+ * *out*, and lands in raw-only rather than being half-modelled. Widening is demand-driven and costs
+ * one row.
  */
 export const STUB_FIELDS = [
   {
@@ -57,23 +62,6 @@ export const STUB_FIELDS = [
     at: ["id"],
     kind: "string",
     hint: "Optional. A stable name this console and the API address the stub by.",
-  },
-  {
-    key: "method",
-    label: "Method",
-    at: ["predicates", 0, "equals", "method"],
-    kind: "string",
-    // Suggestions, not a select: `equals.method` is an arbitrary string server-side, and a closed
-    // dropdown would make a stub for a custom verb unwritable through the form.
-    suggest: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
-    hint: "Leave blank to match any method.",
-  },
-  {
-    key: "path",
-    label: "Path",
-    at: ["predicates", 0, "equals", "path"],
-    kind: "string",
-    hint: "Matched exactly, not as a prefix or pattern. Leave blank to match any path.",
   },
   {
     key: "statusCode",
@@ -105,15 +93,13 @@ export const STUB_FIELDS = [
 /** A stub expressed in the modelled set. `null` means "this stub does not carry that field". */
 export type StubForm = {
   id: string | null;
-  method: string | null;
-  path: string | null;
   statusCode: number | null;
   contentType: string | null;
   body: string | null;
 };
 
 export function blankForm(): StubForm {
-  return { id: null, method: null, path: null, statusCode: null, contentType: null, body: null };
+  return { id: null, statusCode: null, contentType: null, body: null };
 }
 
 /**
@@ -168,6 +154,13 @@ function walk(
   form: StubForm,
   unmodelled: string[],
 ): void {
+  // `predicates` is wholly owned by the sibling `predicates.ts` projection now (issue #247, see
+  // `STUB_FIELDS`'s comment above). Descending into it here would mean two projections disagreeing
+  // about the same subtree — this one refusing shapes it was never taught, the other accepting
+  // them — so this walk stops at the key and reports nothing under it. The editor composes both
+  // projections' verdicts; a stub is form-editable only when both agree.
+  if (path[0] === "predicates") return;
+
   if (isPlainObject(value)) {
     const entries = Object.entries(value);
     if (entries.length === 0) {

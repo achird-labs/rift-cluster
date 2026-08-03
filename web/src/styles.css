@@ -1368,6 +1368,83 @@ input[type="radio"] {
   gap: 10px;
 }
 
+.stub-form-pane {
+  display: grid;
+  gap: 14px;
+}
+
+.predicate-builder {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 10px;
+}
+
+.predicate-row {
+  display: grid;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.predicate-row:last-of-type {
+  border-bottom: none;
+}
+
+.predicate-row-options {
+  padding: 8px;
+  background: var(--ground);
+  border-radius: 3px;
+}
+
+.predicate-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.predicate-group {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px dashed var(--line);
+  border-radius: 3px;
+}
+
+.predicate-group ul {
+  margin: 0;
+  padding-left: 1.2em;
+}
+
+/*
+ * The group's own action row. `.acts` is scoped to `.confirm` elsewhere on purpose (see the note
+ * there), so it carries no layout here and the two buttons would stack full-width without this.
+ */
+.predicate-group .acts {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* The per-row gear. Without a size it renders as a full-width button beside the value input. */
+.btn.icon {
+  padding: 2px 6px;
+  min-width: 0;
+  line-height: 1;
+}
+
+/*
+ * The JSONPath/XPath sub-form. It sits inside `.field-row`'s `auto-fit` grid, which would otherwise
+ * lay its inputs out as if they were siblings of the field/operator selects rather than a block
+ * belonging to the row.
+ */
+.predicate-selector {
+  display: grid;
+  gap: 6px;
+  grid-column: 1 / -1;
+}
+
 .presets {
   display: flex;
   align-items: center;

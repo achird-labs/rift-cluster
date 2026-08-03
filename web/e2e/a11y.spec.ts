@@ -100,6 +100,18 @@ test.describe("accessibility", () => {
     await goToScreen(page, `/imposters/${imposters[0]}`);
     await page.getByRole("button", { name: /add stub/i }).click();
     await expect(page.getByTestId("stub-form")).toBeVisible();
+
+    /*
+     * Populate the predicate builder before scanning. A new stub carries no predicates, so scanning
+     * straight after "add stub" sees only the builder's empty-state paragraph and its buttons — none
+     * of the selects, inputs or the options panel that are the actual a11y surface. The criterion
+     * asks for the *builder* to be covered, and an empty builder is the one state with no inputs in
+     * it to get wrong.
+     */
+    await page.getByRole("button", { name: /add predicate/i }).click();
+    await page.getByRole("button", { name: /more options for predicate 1/i }).click();
+    await expect(page.getByLabel(/case sensitivity/i)).toBeVisible();
+
     const found = await violations(page);
     expect(found, describeViolations(found)).toEqual([]);
   });
