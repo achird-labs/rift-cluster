@@ -586,6 +586,18 @@ screen rather than replacing it.
    fault aliases (`reset`, `empty`, …) are likewise accepted and never rewritten,
    even though the picker itself writes the canonical `SCREAMING_CASE` names.
 
+   **#257 is why that rule is not merely tidiness.** `IsResponseOut.status_code`
+   is serialized *as a string* — deliberately, for Mountebank wire compatibility,
+   and the SDK conformance corpus pins it. So every response read back from
+   `GET /imposters/{port}` carries `"statusCode": "200"`, while the form modelled
+   only the number spelling and refused everything else. The consequence was not
+   a spurious diff but a dead feature: **every existing stub opened raw-only**,
+   and the form was reachable for a never-saved stub and nothing else. Nothing
+   caught it because the e2e only ever clicked *Add stub* — which starts from a
+   local constant with a numeric status — and every unit fixture used numbers too.
+   The fix carries the arrival spelling like the others, and the e2e now opens a
+   stub that has actually been through the engine.
+
    Widening remains data, not redesign, within each projection. Demand-driven
    from here, as proposed.
 3. **Fleet-read authorization split** (§5.2): under RFC-002, is

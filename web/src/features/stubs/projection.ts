@@ -138,6 +138,19 @@ function walk(
   // when every one of them agrees.
   if (path[0] === "predicates" || path[0] === "responses") return;
 
+  /*
+   * `_links` is HAL metadata the SERVER adds on read, not configuration the operator authored:
+   * `StubWithLinks` flattens the stub and appends it, so every stub returned by
+   * `GET /imposters/{port}` carries one. Naming it unmodelled meant it was a second, independent
+   * reason every existing stub opened raw-only — #257 diagnosed the string `statusCode` and fixing
+   * that alone left the symptom exactly as it was, which is how the new end-to-end test found this.
+   *
+   * Skipped rather than modelled, and deliberately not written back: the server regenerates it on
+   * every read, and a `PUT` carrying one would be asserting a self-link the console does not own.
+   * That is the same call `portable.ts` makes for `_links` on the export path.
+   */
+  if (path[0] === "_links") return;
+
   if (isPlainObject(value)) {
     const entries = Object.entries(value);
     if (entries.length === 0) {

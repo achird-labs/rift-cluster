@@ -68,7 +68,15 @@ export function ResponseBuilder({
      */
     const previous = items[items.length - 1];
     const next = blankResponse();
-    onChange([...items, previous === undefined ? next : { ...next, wrapped: previous.wrapped }]);
+    onChange([
+      ...items,
+      previous === undefined
+        ? next
+        : // `statusText` rides along with `wrapped` for the same reason: a stub read from the engine
+          // spells every status as a string, and appending a number-spelled response beside them is
+          // the mixed document the carry exists to avoid.
+          { ...next, wrapped: previous.wrapped, statusText: previous.statusText },
+    ]);
   };
 
   const removeResponse = (index: number): void => {

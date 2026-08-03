@@ -389,6 +389,134 @@ describe("AC5 — the lint pane is advisory and the server's refusal is the auth
   });
 });
 
+describe("#257 — a stub as the API actually returns it", () => {
+  it("opens the form, not raw-only, for the string statusCode the engine emits", async () => {
+    /*
+     * `IsResponseOut.status_code` serializes as a STRING for Mountebank compatibility, so this is
+     * what every stub read back from `GET /imposters/:port` looks like. Before #257 the form
+     * modelled only the number spelling, so this stub — the normal case — opened raw-only, and the
+     * form was reachable for a never-saved stub and nothing else.
+     *
+     * The absent raw banner is the load-bearing assertion: `stub-form` renders for the id field
+     * either way, so asserting its presence alone would have passed on the broken build.
+     */
+    stubFleet({
+      read: () => ({
+        json: imposter([
+          {
+            id: "s-1",
+            predicates: [{ equals: { method: "GET", path: "/users" } }],
+            responses: [
+              { is: { statusCode: "200", headers: { "Content-Type": "application/json" }, body: "[]" } },
+            ],
+          },
+        ]),
+        revision: "default:4545@7",
+      }),
+    });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    await openEditor("s-1");
+
+    expect(screen.queryByTestId("stub-raw-banner")).toBeNull();
+    expect(screen.getByTestId("response-builder")).toBeTruthy();
+    // And the status is shown as the number it means, in the field an operator edits.
+    expect((screen.getByLabelText("Status code for response 1") as HTMLInputElement).value).toBe("200");
+  });
+
+  it("opens a stub in the EXACT shape `GET /imposters/:port` returns it", async () => {
+    /*
+     * The whole point of #257, asserted against the real wire shape rather than a fixture the
+     * console authored. Two independent things had to be fixed for this to pass, and each alone
+     * left the symptom untouched:
+     *   - `statusCode` arrives as a STRING (`serialize_status_code_as_string`);
+     *   - every stub carries `_links`, because `StubWithLinks` flattens the stub and appends it.
+     * Both were named unmodelled, so every existing stub opened raw-only.
+     */
+    stubFleet({
+      read: () => ({
+        json: imposter([
+          {
+            id: "get-order",
+            predicates: [{ equals: { method: "GET", path: "/orders/42" } }],
+            responses: [
+              {
+                is: {
+                  statusCode: "200",
+                  headers: { "Content-Type": "application/json" },
+                  body: '{"id":42}',
+                },
+              },
+            ],
+            _links: { self: { href: "http://node-1:2525/imposters/4545/stubs/0" } },
+          },
+        ]),
+        revision: "default:4545@7",
+      }),
+    });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    await openEditor("get-order");
+
+    expect(screen.queryByTestId("stub-raw-banner")).toBeNull();
+    expect(screen.getByTestId("response-builder")).toBeTruthy();
+    expect(screen.getByTestId("stub-summary")).toBeTruthy();
+  });
+
+  it("stays in the form when a status is typed that no canonical string can express", async () => {
+    /*
+     * The regression the first cut of #257 introduced. `parseIsBody` accepts a string status only
+     * if it is canonical, but render stringified unconditionally — so typing `200.5` into a stub
+     * read from the engine produced `"200.5"`, which projects to raw-only. The form ejected
+     * mid-edit on exactly the stubs this fix exists to make editable, while the identical keystroke
+     * on a number-spelled stub stayed put. Render now falls back to the number spelling instead.
+     */
+    stubFleet({
+      read: () => ({
+        json: imposter([
+          { id: "s-1", predicates: [{ equals: { path: "/x" } }], responses: [{ is: { statusCode: "200" } }] },
+        ]),
+        revision: "default:4545@7",
+      }),
+    });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    const editor = await openEditor("s-1");
+
+    const user = userEvent.setup();
+    const status = screen.getByLabelText("Status code for response 1");
+    await user.clear(status);
+    await user.type(status, "200.5");
+
+    await waitFor(() => expect(JSON.parse(editor.value).responses[0].is.statusCode).toBe(200.5));
+    // Still editable — this is the assertion the defect broke.
+    expect(screen.queryByTestId("stub-raw-banner")).toBeNull();
+    expect(screen.getByTestId("response-builder")).toBeTruthy();
+  });
+
+  it("saves an untouched stub back byte-identically, string status and all", async () => {
+    // Opening a stub and saving it without editing must not be a diff — that is the whole reason
+    // the arrival spelling is carried rather than normalised.
+    const original = {
+      id: "s-1",
+      predicates: [{ equals: { path: "/users" } }],
+      responses: [{ is: { statusCode: "204" } }],
+    };
+    stubFleet({ read: () => ({ json: imposter([original]), revision: "default:4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    const editor = await openEditor("s-1");
+
+    /*
+     * Nudge the form so it rewrites the whole document through the projection, then confirm the
+     * rewrite is a no-op for the status: an edit ELSEWHERE must not silently convert `"204"` to
+     * `204`. The body-type select is the nudge because it always re-renders the document — an
+     * unnamed header row would not, since #248 deliberately drops those before they are persisted.
+     */
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByLabelText("Body type for response 1"), "text");
+
+    await waitFor(() => expect(JSON.parse(editor.value).responses[0].is.body).toBe(""));
+    expect(JSON.parse(editor.value).responses[0].is.statusCode).toBe("204");
+  });
+});
+
 describe("#250 — a stub seeded from a recorded request", () => {
   it("opens the seed as the draft, and says the response is a default the journal never recorded", async () => {
     /*

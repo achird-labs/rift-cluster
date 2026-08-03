@@ -96,7 +96,23 @@ const anyFault: fc.Arbitrary<FaultModel | null> = fc.option(
 
 const anyResponse: fc.Arbitrary<ResponseModel> = fc.record({
   wrapped: fc.boolean(),
-  statusCode: fc.option(fc.integer({ min: 100, max: 599 }), { nil: null }),
+  /*
+   * NOT restricted to 100..599. That range is what a status code sensibly is, but it is not what
+   * this field can HOLD: the status input accepts any finite number, and a generator confined to
+   * plausible values could never reach the case where the string spelling and the number disagree
+   * (`200.5` stringifies to `"200.5"`, which is not a spelling the parser accepts back).
+   */
+  statusCode: fc.option(
+    fc.oneof(
+      fc.integer({ min: 0, max: 65535 }),
+      fc.integer(),
+      fc.double({ noNaN: true, noDefaultInfinity: true }),
+    ),
+    { nil: null },
+  ),
+  // Both spellings, because the round-trip has to be a fixed point over each of them — and the
+  // string one is what every response read back from the engine actually carries.
+  statusText: fc.boolean(),
   headersPresent: fc.boolean(),
   headers: fc.array(anyHeader, { maxLength: 4 }),
   body: anyBody,
@@ -397,7 +413,9 @@ describe("responses richer than the form are recognised, labelled, and refused (
      * wrong in the one place it is most relied on.
      */
     const stub = { responses: [{ is: { statusCode: "404" } }] };
-    expect(projectResponses(stub).kind).toBe("rawOnly");
+    // #257 made this the MODELLED path — it used to be raw-only, which meant every stub read back
+    // from the API opened raw-only. The label was correct even then and still is.
+    expect(projectResponses(stub).kind).toBe("responses");
     expect(describeResponses(stub)).toEqual([{ index: 0, kind: "is", detail: "404" }]);
   });
 
@@ -431,13 +449,21 @@ describe("responses richer than the form are recognised, labelled, and refused (
     expect(renderResponses(projected.items)).toEqual(source);
   });
 
-  it("treats a status code of the wrong JSON type as unmodelled, not as a coercion", () => {
-    // Carried over verbatim from `projection.test.ts`: `statusCode: "200"` is a string, and
-    // coercing it would rewrite the operator's stub on the way through the form.
-    const projected = projectResponses({ responses: [{ is: { statusCode: "200" } }] });
-    expect(projected.kind).toBe("rawOnly");
-    if (projected.kind !== "rawOnly") return;
-    expect(projected.unmodelledKeys).toEqual(["responses[0].is.statusCode"]);
+  it("treats a status code of a type the engine never emits as unmodelled, not as a coercion", () => {
+    /*
+     * A number and a canonical numeric string are both real wire spellings and both model now
+     * (#257). Everything else is still named rather than guessed at — coercing would rewrite the
+     * operator's document on the way through the form.
+     */
+    // Note `200.5` is deliberately absent: it is a `number`, and this form has never validated the
+    // numeric range or integrality of a status code — the server and `rift-lint` own that. Refusing
+    // it here would be new behaviour smuggled in under a serialization fix.
+    for (const statusCode of [true, null, [200], { code: 200 }]) {
+      const projected = projectResponses({ responses: [{ is: { statusCode } }] });
+      expect([statusCode, projected.kind]).toEqual([statusCode, "rawOnly"]);
+      if (projected.kind !== "rawOnly") continue;
+      expect(projected.unmodelledKeys).toEqual(["responses[0].is.statusCode"]);
+    }
   });
 
   it("names every unmodelled response, not merely the first", () => {
@@ -475,5 +501,124 @@ describe("the empty and absent cases", () => {
 
   it("renders a blank response as an is-wrapped 200, the shape the editor appends", () => {
     expect(renderResponses([blankResponse()])).toEqual([{ is: { statusCode: 200 } }]);
+  });
+});
+
+describe("#257 — the string status code the engine actually emits", () => {
+  /*
+   * `IsResponseOut.status_code` goes through `serialize_status_code_as_string`, deliberately, for
+   * Mountebank wire compatibility. So EVERY response read back from `GET /imposters/:port` carries
+   * `"statusCode": "200"` — and modelling only the number spelling meant every existing stub opened
+   * raw-only. The form was reachable for a never-saved stub and nothing else.
+   *
+   * Nothing caught it because the e2e only ever clicked "Add stub" (which starts from a local
+   * constant with a numeric status) and every unit fixture used the numeric spelling too.
+   */
+  it("opens a stub whose statusCode is a string, and writes it back as a string", () => {
+    const source = [{ is: { statusCode: "200", headers: { "Content-Type": "application/json" } } }];
+    const projected = projectResponses({ responses: source });
+    expect(projected.kind).toBe("responses");
+    if (projected.kind !== "responses") return;
+    expect(projected.items[0]?.statusCode).toBe(200);
+    expect(projected.items[0]?.statusText).toBe(true);
+    // Byte-identical: the spelling it arrived in is the spelling it leaves in, so opening a stub
+    // and saving it untouched is not a diff.
+    expect(JSON.stringify(renderResponses(projected.items))).toBe(JSON.stringify(source));
+  });
+
+  it("does the same for the flat, wrapper-less form recorded mocks use", () => {
+    const source = [{ statusCode: "204" }];
+    const projected = projectResponses({ responses: source });
+    if (projected.kind !== "responses") throw new Error("expected a response list");
+    expect(projected.items[0]?.statusText).toBe(true);
+    expect(JSON.stringify(renderResponses(projected.items))).toBe(JSON.stringify(source));
+  });
+
+  it("keeps the numeric spelling numeric, so a hand-written stub is not rewritten either", () => {
+    const source = [{ is: { statusCode: 201 } }];
+    const projected = projectResponses({ responses: source });
+    if (projected.kind !== "responses") throw new Error("expected a response list");
+    expect(projected.items[0]?.statusText).toBe(false);
+    expect(JSON.stringify(renderResponses(projected.items))).toBe(JSON.stringify(source));
+  });
+
+  it("refuses a numeric string the engine could never have emitted", () => {
+    /*
+     * `u16::to_string()` produces digits with no sign, no padding, no leading zero. A `"0200"` is
+     * legal input to the engine but the model holds a number, so accepting it would rewrite it to
+     * `"200"` on the first save — the silent rewrite this whole module exists to prevent. Refusing
+     * costs a hand-written document a trip through the raw editor and costs a real one nothing.
+     */
+    for (const statusCode of ["0200", "+200", "20x", "", " 200", "200 ", "2e2"]) {
+      const projected = projectResponses({ responses: [{ is: { statusCode } }] });
+      expect([statusCode, projected.kind]).toEqual([statusCode, "rawOnly"]);
+      if (projected.kind !== "rawOnly") continue;
+      expect(projected.unmodelledKeys).toEqual(["responses[0].is.statusCode"]);
+    }
+  });
+
+  it("round-trips the wire shape the conformance corpus pins", () => {
+    // `vendor/rift/sdk-conformance/corpus/imposters/20-migration-compat.json` carries the string
+    // form; that corpus is why the engine's serialization cannot simply be changed instead.
+    const source = [
+      { is: { statusCode: "200", headers: { "Content-Type": "application/json" }, body: '{"ok":true}' } },
+    ];
+    const projected = projectResponses({ responses: source });
+    if (projected.kind !== "responses") throw new Error("expected a response list");
+    expect(JSON.stringify(renderResponses(projected.items))).toBe(JSON.stringify(source));
+  });
+
+  it("keeps the arrival spelling when the operator edits the status", () => {
+    /*
+     * The flag survives an edit because `ResponseBuilder` updates the model with a spread. An
+     * operator changing 200 to 201 on a stub read from the API gets `"201"` back, not `201` — the
+     * response is re-emitted in its own spelling rather than silently converted.
+     */
+    const projected = projectResponses({ responses: [{ is: { statusCode: "200" } }] });
+    if (projected.kind !== "responses") throw new Error("expected a response list");
+    const [item] = projected.items;
+    if (item === undefined) throw new Error("expected one response");
+    expect(renderResponses([{ ...item, statusCode: 201 }])).toEqual([{ is: { statusCode: "201" } }]);
+  });
+});
+
+describe("#257 — render and parse agree about what a string status code can be", () => {
+  /*
+   * The invariant: `renderIsBody` must never emit a `statusCode` that `parseIsBody` would refuse.
+   * Break it and the form ejects to raw-only mid-edit — on exactly the engine-read stubs #257
+   * exists to make editable, while the identical keystroke on a number-spelled stub stays put.
+   */
+  it("falls back to the number spelling for a value no canonical string can express", () => {
+    const projected = projectResponses({ responses: [{ is: { statusCode: "200" } }] });
+    if (projected.kind !== "responses") throw new Error("expected a response list");
+    const [item] = projected.items;
+    if (item === undefined) throw new Error("expected one response");
+
+    // Each of these is typeable in the status field, and none is a canonical u16 spelling.
+    for (const [statusCode, expected] of [
+      [200.5, 200.5],
+      [-1, -1],
+      [1e21, 1e21],
+    ] as const) {
+      const rendered = renderResponses([{ ...item, statusCode }]) as { is: { statusCode: unknown } }[];
+      expect([statusCode, rendered[0]?.is.statusCode]).toEqual([statusCode, expected]);
+    }
+
+    // And a value that CAN be spelled canonically still keeps the string spelling.
+    expect(renderResponses([{ ...item, statusCode: 201 }])).toEqual([{ is: { statusCode: "201" } }]);
+  });
+
+  it("never renders a status the projection would then refuse", () => {
+    // Stated as a property over the number, because that is the domain the status input admits.
+    fc.assert(
+      fc.property(
+        fc.oneof(fc.integer(), fc.double({ noNaN: true, noDefaultInfinity: true })),
+        (statusCode) => {
+          const model = { ...blankResponse(), statusCode, statusText: true };
+          const rendered = renderResponses([model]);
+          expect(projectResponses({ responses: rendered }).kind).toBe("responses");
+        },
+      ),
+    );
   });
 });
