@@ -15,7 +15,7 @@
  */
 
 /** The fields the form models. Widening the form means adding an entry here. */
-export type FieldKey = "id" | "statusCode" | "contentType" | "body";
+export type FieldKey = "id";
 
 /** A path into the stub JSON: object keys as strings, array indices as numbers. */
 export type JsonPath = readonly (string | number)[];
@@ -42,18 +42,22 @@ export type StubField = {
 };
 
 /**
- * The starting set (RFC-006 §12 Q2): a stub's stable id, and a single `is` response with a status
- * code, a `Content-Type` and a text body.
+ * What is left of the flat field table: a stub's stable id.
  *
- * The predicate side of a stub — method, path, and everything else a request can be matched on —
- * moved to the sibling `predicates.ts` projection in issue #247: it needed a richer unit than one
- * row (a clause, not a field — see that file's header comment), so it earned its own table rather
- * than living in this one. `walk`, below, treats the whole `predicates` subtree as out of scope for
- * exactly that reason.
+ * Both of the interesting subtrees have since earned their own projection, for the same reason and
+ * by the same rule — a subtree that needs a richer unit than one row moves out rather than being
+ * half-modelled here:
  *
- * Everything else — scenarios, spaces, behaviors, proxies, multiple responses — is deliberately
- * *out*, and lands in raw-only rather than being half-modelled. Widening is demand-driven and costs
- * one row.
+ * - **`predicates`** moved to `predicates.ts` in issue #247. Its unit is a clause, not a field.
+ * - **`responses`** moved to `responses.ts` in issue #248. Its unit is a response, and there are N
+ *   of them: this table modelled `responses[0].is` and nothing else, so a second response, a second
+ *   header, or a JSON-object body each sent the whole stub to raw-only. That was honest but
+ *   crippling — cycling responses are how you mock "202 accepted, then 200 with a result".
+ *
+ * `walk`, below, treats both subtrees as out of scope for exactly that reason.
+ *
+ * Everything else — scenarios, spaces, top-level behaviors — is deliberately *out*, and lands in
+ * raw-only rather than being half-modelled. Widening is demand-driven and costs one row.
  */
 export const STUB_FIELDS = [
   {
@@ -63,43 +67,15 @@ export const STUB_FIELDS = [
     kind: "string",
     hint: "Optional. A stable name this console and the API address the stub by.",
   },
-  {
-    key: "statusCode",
-    label: "Status",
-    at: ["responses", 0, "is", "statusCode"],
-    kind: "number",
-    hint: "The status this stub answers with.",
-  },
-  {
-    key: "contentType",
-    label: "Content-Type",
-    at: ["responses", 0, "is", "headers", "Content-Type"],
-    kind: "string",
-    suggest: ["application/json", "text/plain", "text/html", "application/xml"],
-  },
-  {
-    key: "body",
-    label: "Body",
-    at: ["responses", 0, "is", "body"],
-    kind: "string",
-    multiline: true,
-    // `kind: "string"` is the honest constraint, not a limitation to route around: a JSON *object*
-    // body is a different shape at this path, so `project` calls it unmodelled and the stub opens
-    // raw-only. That is correct — silently stringifying it would change what the mock returns.
-    hint: "Sent verbatim as text. A stub whose body is a JSON object rather than a string opens in raw JSON instead.",
-  },
 ] as const satisfies readonly StubField[];
 
 /** A stub expressed in the modelled set. `null` means "this stub does not carry that field". */
 export type StubForm = {
   id: string | null;
-  statusCode: number | null;
-  contentType: string | null;
-  body: string | null;
 };
 
 export function blankForm(): StubForm {
-  return { id: null, statusCode: null, contentType: null, body: null };
+  return { id: null };
 }
 
 /**
@@ -154,12 +130,13 @@ function walk(
   form: StubForm,
   unmodelled: string[],
 ): void {
-  // `predicates` is wholly owned by the sibling `predicates.ts` projection now (issue #247, see
-  // `STUB_FIELDS`'s comment above). Descending into it here would mean two projections disagreeing
-  // about the same subtree — this one refusing shapes it was never taught, the other accepting
-  // them — so this walk stops at the key and reports nothing under it. The editor composes both
-  // projections' verdicts; a stub is form-editable only when both agree.
-  if (path[0] === "predicates") return;
+  // `predicates` and `responses` are wholly owned by the sibling `predicates.ts` (#247) and
+  // `responses.ts` (#248) projections now — see `STUB_FIELDS`'s comment above. Descending into
+  // either here would mean two projections disagreeing about the same subtree — this one refusing
+  // shapes it was never taught, the other accepting them — so this walk stops at the key and
+  // reports nothing under it. The editor composes all three verdicts; a stub is form-editable only
+  // when every one of them agrees.
+  if (path[0] === "predicates" || path[0] === "responses") return;
 
   if (isPlainObject(value)) {
     const entries = Object.entries(value);
