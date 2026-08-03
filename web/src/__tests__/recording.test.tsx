@@ -208,6 +208,42 @@ describe("the review table", () => {
     expect(body.textContent).not.toContain('"is"');
   });
 
+  it("renders a wrapped-form recorded response too, and promotes it unchanged", async () => {
+    /*
+     * The projection emits **either** form. The flat case is above; this is the canonical
+     * `{ is: … }` one, which the real engine returned for a proxied `GET /orders/42` and which the
+     * first cut of this table rendered as a blank row with an unknown status — worse than no row,
+     * because the operator then promotes a capture they were shown nothing about.
+     *
+     * Unwrapping is for *reading* only: the promoted document below still carries the `is` wrapper
+     * exactly as it arrived.
+     */
+    const wrapped: Stub = {
+      predicates: [{ equals: { method: "GET", path: "/orders/42" } }],
+      responses: [{ is: { statusCode: 200, body: '{"id":42}' } }],
+    };
+    const { requests } = stubFetch({
+      ...routes([PROXY_STUB], { recorded: [wrapped] }),
+      "/imposters/4545/stubs": { json: imposterBody([wrapped]) },
+    });
+    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });
+
+    const row = await screen.findByTestId("recorded-row-0");
+    expect(row.textContent).toContain("200");
+    expect(screen.getByTestId("recorded-body-0").textContent).toContain('{"id":42}');
+
+    await userEvent.click(screen.getByRole("button", { name: /stop & promote/i }));
+    await userEvent.click(await screen.findByTestId("confirm-destructive"));
+    await waitFor(() =>
+      expect(requests.some((r) => r.path === "/imposters/4545/stubs")).toBe(true),
+    );
+
+    const put = requests.find((r) => r.path === "/imposters/4545/stubs");
+    expect(JSON.parse(String(put?.body)).stubs[0].responses[0]).toEqual({
+      is: { statusCode: 200, body: '{"id":42}' },
+    });
+  });
+
   it("says so when a recording has captured nothing yet", async () => {
     stubFetch(routes([PROXY_STUB], { recorded: [] }));
     renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("editor") });

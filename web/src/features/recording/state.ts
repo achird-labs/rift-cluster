@@ -114,6 +114,25 @@ export function proxyStubFor(form: ProxyStubForm): Stub {
   };
 }
 
+/**
+ * The fields of a recorded response, whichever form it arrived in.
+ *
+ * The engine accepts — and this projection emits — both the **flat** form (`statusCode`/`headers`/
+ * `body` at the top level) and the canonical **wrapped** form (`{ is: { … } }`), and serves them
+ * identically (`vendor/rift/docs/mountebank/proxy.md:208-226`). A review table that reads only one
+ * of them renders the other as a blank row with an unknown status — which is worse than not showing
+ * it, because the operator then promotes a document they were shown nothing about.
+ *
+ * `is` wins when both are present, which is the precedence the engine itself documents.
+ *
+ * This is a **reading** helper only. Promote sends the recorded stub back exactly as it arrived —
+ * unwrapping here must never become rewriting there.
+ */
+export function responseFields(response: unknown): unknown {
+  const wrapped = recordAt(response, "is");
+  return wrapped === undefined ? response : wrapped;
+}
+
 /** A recorded stub's response read defensively, for a projection that is `unknown` beyond its shape. */
 export function recordAt(value: unknown, key: string): unknown {
   return isRecord(value) ? value[key] : undefined;

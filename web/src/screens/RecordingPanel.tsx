@@ -31,6 +31,7 @@ import {
   proxyStubFor,
   recordAt,
   recordingState,
+  responseFields,
   stringAt,
 } from "../features/recording/state.ts";
 
@@ -270,7 +271,7 @@ function FleetCaveat(): ReactNode {
           A proxy stub records only the requests this node itself answers — traffic another node in
           this fleet serves captures nothing here, and there is no merged view of every node&rsquo;s
           captures. Until{" "}
-          <a href={ISSUE_URL(226)} target="_blank" rel="noreferrer">
+          <a className="prose-link" href={ISSUE_URL(226)} target="_blank" rel="noreferrer">
             #226
           </a>{" "}
           lands, drive the traffic you want recorded at the node you are watching.
@@ -340,7 +341,11 @@ function RecordedRow({ stub, index }: { stub: Stub; index: number }): ReactNode 
   const method = stringAt(equals, "method");
   const path = stringAt(equals, "path");
 
-  const response = stub.responses?.[0];
+  // Read through `responseFields`, which unwraps `{ is: … }` when the projection used the wrapped
+  // form. Reading only the flat form renders a wrapped capture as a blank row with an unknown
+  // status — and a blank row is worse than no row, because the operator promotes it having been
+  // shown nothing about it. Promote still sends the stub exactly as it arrived.
+  const response = responseFields(stub.responses?.[0]);
   const statusCode = numberAt(response, "statusCode");
   const body = recordAt(response, "body");
 

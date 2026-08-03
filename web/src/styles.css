@@ -857,6 +857,18 @@ ul.plain,
   gap: 4px;
 }
 
+/*
+ * A link sitting *inside a sentence* rather than standing alone.
+ *
+ * The `main a` rule above is underline-on-hover, which is fine for a link that is its own element —
+ * a nav chip, a breadcrumb — because position already distinguishes it. Inside a paragraph nothing
+ * does, so colour becomes the only cue and axe's `link-in-text-block` fails the page (serious).
+ * This is that case, kept as its own class so the standalone links keep their quieter treatment.
+ */
+.prose-link {
+  text-decoration: underline;
+}
+
 /* A control that reads as a link but is a button, so it keeps button semantics for the keyboard. */
 .linklike {
   background: none;
