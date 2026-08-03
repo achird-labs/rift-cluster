@@ -1,0 +1,22 @@
+{{/*
+Gated on more than one replica. A single-replica install is a throwaway environment by definition
+(see `replicas` in values.yaml), and there is no useful budget to express over one pod: this one
+would permit taking the whole cluster down during a node drain while looking like a protection.
+Rendering nothing is the honest answer.
+*/}}
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.replicas) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "rift-cluster.fullname" . }}
+  labels:
+    {{- include "rift-cluster.labels" . | nindent 4 }}
+spec:
+  # Expressed as maxUnavailable rather than minAvailable so it stays correct when `replicas`
+  # changes: "one voter at a time" is the invariant, and with an odd replica count that always
+  # leaves a majority for Raft to commit with during a voluntary drain.
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "rift-cluster.selectorLabels" . | nindent 6 }}
+{{- end }}

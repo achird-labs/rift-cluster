@@ -437,8 +437,46 @@ jobs:
           path: ${{ steps.package.outputs.artifact }}
           retention-days: 1
 
+  # ---------------------------------------------------------------------------
+  # Helm chart → GHCR (OCI)
+  # ---------------------------------------------------------------------------
+  # Needs `image-manifest`, not just the guard: the chart's default `image.tag` is its `appVersion`,
+  # so publishing a chart before the image it points at exists would produce a one-command install
+  # that pulls a tag nobody can resolve.
+  chart:
+    needs: [guard, image-manifest]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Log in to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      # Chart version and app version are both the tag. The chart's committed `version`/`appVersion`
+      # are the development values; a published chart that claimed a version other than the tag it
+      # was cut from is the same class of lie the tag/version guard exists to prevent.
+      - name: Package and push
+        run: |
+          set -euo pipefail
+          version="${{ needs.guard.outputs.version }}"
+          # `--version` takes SemVer without a leading `v`, unlike the image tag.
+          semver="${version#v}"
+          helm package deploy/helm/rift-cluster \
+            --version "$semver" --app-version "$semver" --destination /tmp/chart
+          helm push "/tmp/chart/rift-cluster-${semver}.tgz" oci://ghcr.io/achird-labs/charts
+
   release:
-    needs: [guard, binaries, image-manifest]
+    needs: [guard, binaries, image-manifest, chart]
     permissions:
       contents: write
     runs-on: ubuntu-latest

@@ -1,0 +1,24 @@
+# Azure / AKS.
+#
+#   helm install rift oci://ghcr.io/achird-labs/charts/rift-cluster -f values-aks.yaml
+#
+# The Azure mapping — zonal disks, internal load balancer, Key Vault, VMSS lifecycle — is
+# `docs/architecture/15-azure-deployment.md` (#268).
+
+storage:
+  # `managed-csi` is the non-zone-redundant default (LRS). Azure managed disks are zonal in the same
+  # sense EBS volumes are, so the zone spread below matters for the same reason. `managed-csi-premium`
+  # if the Raft log's fsync latency shows up in your write path.
+  className: managed-csi
+  size: 20Gi
+
+clusterSecret:
+  # Projected by the Key Vault CSI driver into a Kubernetes Secret of this name — the chart consumes
+  # the Secret, never Key Vault directly.
+  existingSecret: rift-cluster-secret
+
+service:
+  type: LoadBalancer
+  annotations:
+    # Internal, for the same reason as the EKS file.
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"

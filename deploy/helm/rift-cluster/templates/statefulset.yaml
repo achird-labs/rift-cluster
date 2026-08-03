@@ -1,0 +1,223 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rift-cluster.fullname" . }}
+  labels:
+    {{- include "rift-cluster.labels" . | nindent 4 }}
+spec:
+  # A StatefulSet rather than a Deployment for two reasons that both matter: each node needs stable
+  # durable storage for its Raft log and node identity, and each needs a stable DNS name for peers
+  # to dial. A rescheduled Deployment pod would come back as a *different* node with an empty state
+  # directory.
+  serviceName: {{ include "rift-cluster.peerService" . }}
+  replicas: {{ .Values.replicas }}
+  # Parallel: ordinal 0 bootstraps and the rest join it. Serial startup would make every node wait
+  # for its predecessor to be Ready, and nobody is Ready until the cluster forms.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "rift-cluster.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rift-cluster.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      # ---------------------------------------------------------------------
+      # THE RULE THIS CHART EXISTS TO MAKE UNBREAKABLE.
+      #
+      # DERIVED from `leaveTimeoutSeconds`, never set independently: on SIGTERM the node fails
+      # readiness first, keeps serving in-flight work for the leave timeout, and only then closes
+      # its listeners. The kubelet starts counting at SIGTERM, so this must be at least twice that
+      # or the pod is SIGKILLed mid-leave and the graceful leave becomes a hard one.
+      #
+      # The raw manifest states "raise both together, never one alone" in a comment. Here there is
+      # only one number to raise, so the rule cannot be half-applied.
+      # ---------------------------------------------------------------------
+      terminationGracePeriodSeconds: {{ include "rift-cluster.terminationGracePeriod" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (include "rift-cluster.serviceAccountName" .) }}
+      serviceAccountName: {{ . }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        {{- with .Values.topologySpreadConstraints }}
+        {{- toYaml . | nindent 8 }}
+        {{- else }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "rift-cluster.selectorLabels" . | nindent 14 }}
+        {{- end }}
+      containers:
+        - name: rift-cluster-server
+          image: {{ include "rift-cluster.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # A StatefulSet template is uniform, but the founding node is not: ordinal 0 must BOOTSTRAP
+          # the cluster and every other ordinal must JOIN it. Handing ordinal 0 a seed list
+          # containing only itself would deadlock — it would spend the whole seed-retry window
+          # dialling a cluster that does not exist yet, then fail to start.
+          #
+          # `exec` matters as much as the branch: without it `sh` stays PID 1, SIGTERM never reaches
+          # the server, and the graceful leave this whole chart is tuned around silently never
+          # happens — the drain would look configured and do nothing.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if [ "${POD_NAME##*-}" = "0" ]; then
+                export RIFT_CLUSTER_ALLOW_SOLO=true
+                unset RIFT_CLUSTER_SEEDS
+              fi
+              exec rift-cluster-server
+          ports:
+            - name: admin
+              containerPort: 2525
+            - name: probes
+              containerPort: 2526
+            - name: cluster
+              containerPort: 4790
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # `--cluster-advertise` takes a socket address, not a DNS name, so the pod's own IP is
+            # what it must announce. (The seed list below IS a name — that one is re-resolved on
+            # every join attempt, which is what keeps it valid across rescheduling.)
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RIFT_CLUSTER
+              value: "true"
+            - name: RIFT_CLUSTER_ADVERTISE
+              value: "$(POD_IP):4790"
+            - name: RIFT_CLUSTER_BIND
+              value: "0.0.0.0:4790"
+            # Binding the wildcard is a deliberate acknowledgment: inside a pod network namespace it
+            # is the only way to accept peer traffic. The cluster port stays protected by the shared
+            # secret and by NetworkPolicy, not by the bind address.
+            - name: RIFT_CLUSTER_BIND_PUBLIC_OK
+              value: "true"
+            # Every pod seeds from ordinal 0, which finds only itself here — hence the branch above.
+            - name: RIFT_CLUSTER_SEEDS
+              value: "{{ include "rift-cluster.fullname" . }}-0.{{ include "rift-cluster.peerService" . }}:4790"
+            - name: RIFT_CLUSTER_NODE_NAME
+              value: "$(POD_NAME)"
+            - name: RIFT_CLUSTER_PROBE_BIND
+              value: "0.0.0.0:2526"
+            - name: RIFT_CLUSTER_LEAVE_TIMEOUT
+              value: {{ .Values.leaveTimeoutSeconds | quote }}
+            - name: RIFT_CLUSTER_STATE_DIR
+              value: "/var/lib/rift/_cluster"
+            - name: MB_DATADIR
+              value: "/var/lib/rift/data"
+            # The secret by PATH, not by value. See `clusterSecret` in values.yaml for why an env
+            # var is the wrong place for it.
+            - name: RIFT_CLUSTER_SECRET_FILE
+              value: "/etc/rift/cluster-secret"
+            {{- with .Values.sources.imposters }}
+            - name: RIFT_IMPOSTERS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Liveness: is the process alive? Answered throughout the join and throughout the drain,
+          # because restarting a node in either state makes things strictly worse. `failureThreshold`
+          # is generous for the same reason.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          # Readiness: should traffic come here? Closed until every startup gate reports in, and
+          # closed again the moment a graceful leave begins — which is what sheds this pod from the
+          # client Service before any socket closes.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          # Startup: gives a cold cluster time to elect and converge without the liveness probe
+          # killing pods mid-join. 30 x 5s = 150s.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/rift
+            - name: cluster-secret
+              mountPath: /etc/rift
+              readOnly: true
+            # readOnlyRootFilesystem is on, so anything wanting a scratch path needs one provided.
+            - name: tmp
+              mountPath: /tmp
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cluster-secret
+          secret:
+            secretName: {{ include "rift-cluster.secretName" . }}
+            items:
+              - key: {{ include "rift-cluster.secretKey" . }}
+                path: cluster-secret
+            defaultMode: 0400
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.storage.className }}
+        storageClassName: {{ .Values.storage.className | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.size | quote }}

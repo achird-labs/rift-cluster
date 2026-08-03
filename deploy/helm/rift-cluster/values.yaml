@@ -1,0 +1,111 @@
+# Default values for the rift-cluster chart.
+#
+# The defaults here are the ones `deploy/k8s/statefulset.yaml` encodes, so `helm install` with no
+# values produces a cluster shaped the way that manifest's comments argue for. Anything you can set
+# that would break one of those arguments is called out below rather than left to be discovered.
+
+image:
+  repository: ghcr.io/achird-labs/rift-cluster-server
+  # Empty means "the chart's appVersion". Pinning a tag here is the normal thing to do in an
+  # environment that cares about reproducibility; `latest` is deliberately not the default.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# THREE, and odd. Raft needs a majority to elect and to commit, so an even count buys nothing: 4
+# voters tolerate one failure exactly as 3 do, while costing an extra node and making a symmetric
+# split possible. 1 is legitimate for a throwaway environment and tolerates nothing.
+replicas: 3
+
+# The single knob the drain is tuned around.
+#
+# On SIGTERM a node fails readiness first, keeps serving in-flight work for this long, and only then
+# closes its listeners. `terminationGracePeriodSeconds` is DERIVED from it in the template as
+# `2 * leaveTimeoutSeconds + 10` — the kubelet starts counting at SIGTERM and the drain has to finish
+# with room to spare, or the pod is SIGKILLed mid-leave and the graceful leave becomes a hard one.
+#
+# `deploy/README.md` states this as "raise them together, never one alone". Deriving it is what makes
+# that rule impossible to violate rather than merely documented: there is no second number to forget.
+leaveTimeoutSeconds: 15
+
+storage:
+  # Empty means the cluster's default StorageClass. On a real cluster name one explicitly — see the
+  # per-cloud examples in `values-*.yaml`, which is also where the zonal-disk caveat lives.
+  className: ""
+  size: 20Gi
+
+clusterSecret:
+  # The cluster port authenticates every peer RPC with this. A node started without one refuses to
+  # start unless explicitly told to run insecure.
+  #
+  # Mounted as a FILE and passed via `RIFT_CLUSTER_SECRET_FILE`, never inlined into an env var: env
+  # is visible to anything that can read the pod spec or exec into the container, and it lands in
+  # `kubectl describe` output and in most log/telemetry agents' process metadata.
+  #
+  # Point `existingSecret` at a Secret you manage (External Secrets, Key Vault CSI, SOPS…). Setting
+  # `create: true` instead has the chart carry the value you supply below — fine for a test
+  # environment, and NOT a secret-management strategy: the value lives in the release and in
+  # whatever passed it there.
+  existingSecret: ""
+  existingSecretKey: cluster-secret
+  create: false
+  # Only read when `create: true`. Left empty, the template refuses rather than inventing one:
+  # a randomly generated secret that changes on every upgrade would break peer auth fleet-wide.
+  value: ""
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# Left empty, the template supplies a one-per-zone spread with `ScheduleAnyway` — rather than
+# `DoNotSchedule`, so a cluster with fewer zones than replicas still comes up, degraded in placement
+# instead of stuck Pending.
+#
+# The default lives in the template rather than here because a values file cannot reach `.Release`,
+# and a spread whose selector is not release-scoped makes two releases in one namespace spread
+# against each other's pods. Set this only to override the topology key or the skew.
+topologySpreadConstraints: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podDisruptionBudget:
+  enabled: true
+  # One voter at a time. With 3 replicas this leaves a majority during a drain; expressed as
+  # maxUnavailable rather than minAvailable so it stays correct if `replicas` changes.
+  maxUnavailable: 1
+
+metrics:
+  # The metrics port is always exposed on the pod; this only controls whether a Prometheus Operator
+  # ServiceMonitor is created. Off by default because the CRD may not exist, and a chart that fails
+  # to install on a cluster without Prometheus would be a poor default.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+sources:
+  # Rendered into `RIFT_IMPOSTERS`. A declarative imposter source the fleet pulls at startup.
+  imposters: ""
+
+# Appended verbatim to the container's env. Anything set here wins over nothing — the chart does not
+# de-duplicate against its own vars, so setting one the template already sets is undefined.
+extraEnv: []
+
+service:
+  # The Service clients talk to. Respects readiness, unlike the headless peer Service.
+  type: ClusterIP
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}

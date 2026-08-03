@@ -8,7 +8,8 @@ Five artifacts, in increasing order of how much they promise:
 | `compose/docker-compose.yml` | A real 3-node cluster for local work | Stood up and asserted by `compose/verify.sh` |
 | `compose/front-door-demo.yml` | The "no nginx" front-door demo (one node, two virtual services) | Stood up by hand — see below |
 | `compose/sources-demo.yml` | The imposter-sources demo (three nodes + a config server) | Stood up by hand — see below; the properties it shows are asserted by chaos scenarios C20–C23 |
-| `k8s/statefulset.yaml` | A production-shaped StatefulSet | Schema only (`kubeconform -strict`) — see the caveat below |
+| `k8s/statefulset.yaml` | A production-shaped StatefulSet. Kept for shops that refuse Helm; **the chart is the maintained path** | Schema only (`kubeconform -strict`) — see the caveat below |
+| `helm/rift-cluster/` | The same topology as a chart, parameterized. Published as an OCI chart by the release lane | Schema only, but across a values matrix — `helm lint` + `helm template` + `kubeconform -strict` in CI, plus an assertion that the grace period stays derived. Same caveat below |
 
 ## Quick start
 
@@ -218,6 +219,51 @@ docker run --rm -v "$PWD/deploy/k8s:/mnt" ghcr.io/yannh/kubeconform:latest \
 Note that `kubectl apply --dry-run=client` is *not* an offline check: it fetches
 the API group list from a cluster and fails without one, which is why the
 container above is used instead.
+
+**The chart carries the same caveat, across more axes.** `ci.yml`'s `helm` job
+runs `helm lint`, then renders a values matrix — defaults, everything-on,
+single-node, and the three environment files — through the same
+`kubeconform -strict`. That is a wider net than the raw manifest gets, and it is
+still schema only: nothing here proves a cluster forms.
+
+So a set of properties is asserted beyond the schema — each one a decision the
+raw manifest argues for in a comment, and each one something a template edit
+could quietly break while still emitting valid YAML:
+
+- **A chart with no cluster secret must refuse to render.** `helm install` is one
+  command, so a chart that happily installed a fleet with unconfigured peer
+  authentication would be worse than the manifest it replaces. The refusal
+  *reason* is matched too, not just the exit status — otherwise an unrelated
+  template syntax error would score as a pass on the security guard.
+- **`terminationGracePeriodSeconds` stays `2 × leaveTimeoutSeconds + 10`.** The
+  manifest states "raise them together, never one alone" in a comment; the chart
+  derives it, and CI checks the derivation at three values. Hard-coding it back
+  to a literal would pass every schema check and reintroduce the SIGKILL-mid-drain
+  that rule exists to prevent. `values.schema.json` closes the other half:
+  Helm's `int` is a coercion, not a parse, so `leaveTimeoutSeconds=abc` would
+  otherwise render a grace period of 10 and `=-5` a negative one, both of which
+  `kubeconform -strict` accepts.
+- **Two Services, distinctly named, and the seed points at the headless one.**
+  Checked under a 53-character release name, because name truncation is invisible
+  until the name is long: a `-peers` suffix appended to an already-truncated base
+  disappears, the headless Service collapses onto the client one, and the seed
+  address ends up naming a readiness-gating Service that publishes nothing during
+  a cold start. That is a cluster that never forms, from a chart that lints,
+  renders and schema-validates.
+- **`publishNotReadyAddresses` appears exactly once, and `exec` survives.** The
+  first on the client Service would route traffic to unconverged nodes; losing the
+  second leaves `sh` as PID 1, so SIGTERM never reaches the server and the drain
+  everything above is tuned around silently never happens.
+
+```sh
+helm install rift oci://ghcr.io/achird-labs/charts/rift-cluster \
+  --version 0.1.0 -f deploy/helm/rift-cluster/values-eks.yaml
+```
+
+Example values for on-prem, EKS and AKS live beside the chart. The cluster secret
+is mounted as a **file** in every one of them (`--cluster-secret-file`), never
+inlined into an env var — env is visible to anything that can read the pod spec,
+and it lands in `kubectl describe` and most telemetry agents' process metadata.
 
 Schema-valid is a real but limited guarantee — it proves the manifest is
 well-formed and every field exists, not that the cluster behaves as intended.
