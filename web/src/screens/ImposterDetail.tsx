@@ -7,6 +7,7 @@ import { useSession } from "../app/session.tsx";
 import { toHash } from "../app/routing.ts";
 import { ImposterField } from "../components/imposterFields.tsx";
 import { Empty, ErrorNote, Ident, UNKNOWN } from "../components/primitives.tsx";
+import { RecordingPanel } from "./RecordingPanel.tsx";
 import { DeleteStubButton, StubEditor, type StubTarget } from "./StubEditor.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
@@ -60,6 +61,7 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
               </div>
             ))}
           </dl>
+          <RecordingPanel port={port} imposter={imposter.data.data} revision={imposter.data.revision} />
           <Stubs
             port={port}
             imposter={imposter.data.data}
