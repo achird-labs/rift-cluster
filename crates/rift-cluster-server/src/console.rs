@@ -382,7 +382,10 @@ mod tests {
     /// glue reaches for `WebAssembly.instantiateStreaming`, and that refuses any other MIME type.
     #[test]
     fn the_consoles_own_wasm_linter_has_the_type_a_browser_will_instantiate() {
-        assert_eq!(content_type("lint/rift_lint_wasm_bg.wasm"), "application/wasm");
+        assert_eq!(
+            content_type("lint/rift_lint_wasm_bg.wasm"),
+            "application/wasm"
+        );
         // The glue beside it is ordinary JavaScript and must stay so.
         assert_eq!(
             content_type("lint/rift_lint_wasm.js"),
