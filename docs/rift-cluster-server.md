@@ -33,6 +33,36 @@ rift-cluster-server --port 2525 --datadir ./data \
   --cluster-seeds rift-headless.default.svc.cluster.local:4790
 ```
 
+## Installing from a release
+
+Tagging `vX.Y.Z` publishes two kinds of artifact, both carrying the web console
+at `/console` (#265, #266). Neither needs a checkout, a submodule or a toolchain.
+
+**Container image** — `linux/amd64` and `linux/arm64`, built on native runners:
+
+```
+docker pull ghcr.io/achird-labs/rift-cluster-server:vX.Y.Z
+```
+
+`:latest` follows the newest *non-prerelease* tag. A release candidate is
+reachable only by its exact tag, so `latest` cannot quietly become an rc.
+
+**Binaries** — attached to the GitHub Release as
+`rift-cluster-server-<version>-<target>.tar.gz` for `x86_64`/`aarch64` Linux and
+macOS, with one `SHA256SUMS` covering all of them:
+
+```
+curl -sSLO https://github.com/achird-labs/rift-cluster/releases/download/vX.Y.Z/SHA256SUMS
+curl -sSLO https://github.com/achird-labs/rift-cluster/releases/download/vX.Y.Z/rift-cluster-server-vX.Y.Z-<target>.tar.gz
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+Every published binary has been checked to genuinely embed the console bundle —
+per platform, not just on the one the lane happens to build first. A build that
+silently shipped consoleless is the specific failure
+`scripts/check-console-embed.sh` exists to catch, so checking one of four would
+have read like coverage while leaving three unverified.
+
 ## Identifying a build
 
 ```

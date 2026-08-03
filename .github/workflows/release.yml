@@ -1,23 +1,102 @@
 name: Release
 
-# The console-bearing build (RFC-006 §7 option D, issue #186).
+# The console-bearing build (RFC-006 §7 option D, issue #186), and the lane that publishes it
+# (#266).
 #
-# A lane of its own, not a job in `ci.yml`, because it is the ONLY place `--features console` is
-# ever enabled. That feature makes `web/dist/` a compile-time requirement, so enabling it anywhere on
-# the PR path would make every ordinary build depend on a `pnpm build` having run first — which is
-# exactly the hermeticity RFC-006 §7 rejected options A and B to avoid.
+# A lane of its own, not a job in `ci.yml`, because `console-release` below is the ONLY place
+# `--features console` is ever enabled. That feature makes `web/dist/` a compile-time requirement, so
+# enabling it anywhere on the PR path would make every ordinary build depend on a `pnpm build` having
+# run first — which is exactly the hermeticity RFC-006 §7 rejected options A and B to avoid.
 #
-# Manual and tag-triggered only. There is no publish step yet: this lane's job today is to prove the
-# release artifact can be built and is correct. Whoever adds distribution adds it here.
+# **Two modes, and the difference is the trigger.**
+#
+#   `workflow_dispatch` — build and verify everything, publish nothing. This is the old behaviour of
+#                         the lane, kept as the dry run, and it is what proves the pipeline on a
+#                         branch without minting an artifact anybody can pull.
+#   `push: tags/v*`     — the same verification, and then publish.
+#
+# That split is mechanical rather than a pile of `if:` conditions: `guard` runs only on a tag, every
+# publishing job `needs:` it, and a skipped dependency skips its dependents. There is no path on
+# which a dispatch run pushes anything, because on a dispatch the guard never produced a version for
+# it to push under.
+#
+# **Nothing publishes on an unverified build.** Every publishing job also needs `console-release`,
+# which is where `check-console-embed.sh` proves the bundle is genuinely inside the binary. A red
+# verification cannot be followed by a green push.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
+# Read-only by default. The two capabilities that can write are granted per-job, to the jobs that
+# need them and nowhere else: `packages: write` to push the image, `contents: write` to create the
+# Release. A workflow-wide grant would hand both to every step in the lane, including the ones that
+# run third-party actions over the checkout.
 permissions:
   contents: read
 
+env:
+  IMAGE: ghcr.io/achird-labs/rift-cluster-server
+  WASM_PACK_VERSION: v0.13.1
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # Tag ↔ version guard
+  # ---------------------------------------------------------------------------
+  # Fails fast, before anything is built, when the tag and the workspace disagree. Cutting `v0.2.0`
+  # on a tree that still says `0.1.0` would otherwise publish an image and a Release whose contents
+  # report a different version than their name — discoverable only by someone running `--version` on
+  # the artifact they already trusted.
+  #
+  # Its `if:` is also the mode switch for the whole lane (see the header).
+  guard:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag must match the workspace version
+        id: check
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          # A prerelease tag keeps the workspace version and adds a suffix: `v0.1.0-rc.1` is a
+          # candidate FOR 0.1.0, so it is compared on its release core. This is what lets the full
+          # publish path be proven once without first bumping the workspace to a version that was
+          # never released.
+          core="${tag%%-*}"
+          declared="$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            /^\[/                      { in_section = 0 }
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/[",[:space:]]/, ""); sub(/version=/, ""); print; exit
+            }' Cargo.toml)"
+
+          if [ -z "$declared" ]; then
+            echo "could not read [workspace.package] version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "$core" != "$declared" ]; then
+            echo "tag/version mismatch: tag ${GITHUB_REF_NAME} implies ${core}, Cargo.toml says ${declared}" >&2
+            exit 1
+          fi
+
+          echo "version=${tag}" >> "$GITHUB_OUTPUT"
+          # `latest` and a non-prerelease GitHub Release are for real releases only. Pointing
+          # `latest` at an rc is how someone who typed no tag at all ends up running one.
+          if [ "$tag" = "$core" ]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches workspace ${declared}"
+
+  # ---------------------------------------------------------------------------
+  # Verification — the gate everything else hangs off
+  # ---------------------------------------------------------------------------
   console-release:
     runs-on: ubuntu-latest
     steps:
@@ -51,9 +130,8 @@ jobs:
       - name: Install wasm-pack (pinned)
         run: |
           set -euo pipefail
-          version=v0.13.1
-          asset="wasm-pack-${version}-x86_64-unknown-linux-musl"
-          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/${version}/${asset}.tar.gz" \
+          asset="wasm-pack-${WASM_PACK_VERSION}-x86_64-unknown-linux-musl"
+          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/${WASM_PACK_VERSION}/${asset}.tar.gz" \
             | sudo tar -xz --strip-components=1 -C /usr/local/bin "${asset}/wasm-pack"
           wasm-pack --version
 
@@ -102,3 +180,310 @@ jobs:
       # reading from disk, so this is the console served the way an operator will get it.
       - name: Console serving tests against the embedded assets
         run: cargo test -p rift-cluster-server --release --features console --lib --test console
+
+  # ---------------------------------------------------------------------------
+  # Container image → GHCR
+  # ---------------------------------------------------------------------------
+  # One job per architecture on a NATIVE runner, then a manifest merge. Deliberately not QEMU: an
+  # emulated Rust release build of this workspace is a multi-hour proposition and the first thing
+  # that would be quietly dropped the next time the lane got slow.
+  #
+  # Each job pushes by digest only — no tag. Tags are applied once, by `image-manifest`, so there is
+  # no window in which `:latest` resolves to a half-published manifest with one architecture in it.
+  image:
+    needs: [guard, console-release]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The image build discovers nothing about git — `.dockerignore` excludes `.git`, and a
+      # submodule's `.git` is only a pointer into the parent's object store anyway. So the pin is
+      # read here and passed in, which is what keeps the published banner from saying `rift unknown`.
+      - name: Read the upstream pin
+        id: pin
+        run: echo "version=$(git -C vendor/rift describe --tags --always)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            RIFT_UPSTREAM_VERSION=${{ steps.pin.outputs.version }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      # The digest is the only thing this job produces that the merge needs. Passed as a file named
+      # after itself rather than as an output, because outputs cannot be collected across a matrix.
+      - name: Export the digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  image-manifest:
+    needs: [guard, image]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` only for a real release — see the guard's `prerelease` output for why.
+      - name: Create the manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          tags=(-t "${IMAGE}:${{ needs.guard.outputs.version }}")
+          if [ "${{ needs.guard.outputs.prerelease }}" = "false" ]; then
+            tags+=(-t "${IMAGE}:latest")
+          fi
+          # shellcheck disable=SC2046
+          docker buildx imagetools create "${tags[@]}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      # The published artifact, exercised as an operator would get it — pulled by tag, not the local
+      # build cache. `--version` proves the upstream pin survived the build args, and `/console`
+      # proves E1's whole point actually shipped. A publish lane that pushed a consoleless image and
+      # said nothing is precisely what this step exists to prevent.
+      - name: Smoke the published image
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}:${{ needs.guard.outputs.version }}"
+          docker pull "$ref"
+
+          echo "--- version ---"
+          banner="$(docker run --rm "$ref" --version)"
+          echo "$banner"
+          case "$banner" in
+            *"rift unknown"*) echo "FAIL: published image does not carry the upstream pin" >&2; exit 1 ;;
+          esac
+
+          echo "--- console ---"
+          docker run -d --name smoke -p 12525:2525 \
+            -e RIFT_CLUSTER=true \
+            -e RIFT_CLUSTER_BIND=0.0.0.0:4790 \
+            -e RIFT_CLUSTER_BIND_PUBLIC_OK=true \
+            -e RIFT_CLUSTER_ADVERTISE=127.0.0.1:4790 \
+            -e RIFT_CLUSTER_ALLOW_SOLO=true \
+            -e RIFT_CLUSTER_SECRET=smoke \
+            -e RIFT_CLUSTER_PROBE_BIND=0.0.0.0:2526 \
+            -e RIFT_CLUSTER_STATE_DIR=/var/lib/rift/_cluster \
+            "$ref"
+          trap 'docker logs smoke || true; docker rm -f smoke >/dev/null 2>&1 || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://127.0.0.1:12525/console/ >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          # Asserted on the SPA shell, not the status: `rust-embed` over an empty `web/dist`
+          # compiles happily and answers with an explanatory body, which a status-only check would
+          # accept. Same reasoning as `deploy/compose/verify.sh`.
+          body="$(curl -fsS --max-time 5 http://127.0.0.1:12525/console/)"
+          case "$body" in
+            *'<div id="root"'*) echo "PASS: published image serves the console" ;;
+            *) echo "FAIL: published image served no console SPA shell" >&2; exit 1 ;;
+          esac
+
+  # ---------------------------------------------------------------------------
+  # Binaries → GitHub Release
+  # ---------------------------------------------------------------------------
+  binaries:
+    needs: [guard, console-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            wasm_asset: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            wasm_asset: aarch64-unknown-linux-musl
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            # wasm-pack publishes no aarch64-apple-darwin asset; the x86_64 one runs under Rosetta,
+            # which every GitHub arm64 macOS runner has. Checked against the v0.13.1 asset list
+            # rather than assumed.
+            wasm_asset: x86_64-apple-darwin
+          # `macos-15-intel`, not `macos-13`: the older label has been retired from the hosted
+          # runner set, and a workflow naming it fails to schedule rather than falling back.
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            wasm_asset: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install wasm-pack (pinned)
+        run: |
+          set -euo pipefail
+          asset="wasm-pack-${WASM_PACK_VERSION}-${{ matrix.wasm_asset }}"
+          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/${WASM_PACK_VERSION}/${asset}.tar.gz" \
+            | sudo tar -xz --strip-components=1 -C /usr/local/bin "${asset}/wasm-pack"
+          wasm-pack --version
+
+      # Same order as `console-release`, and for the same reason: wasm, then bundle, then cargo.
+      - name: Build the console bundle
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+          wasm-pack build crates/rift-lint-wasm \
+            --release --target web --no-pack \
+            --out-dir ../../web/public/lint --out-name rift_lint_wasm
+          test -f web/public/lint/rift_lint_wasm_bg.wasm
+          cd web
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Build the binary
+        run: cargo build -p rift-cluster-server --release --features console --target ${{ matrix.target }}
+
+      # Run against EVERY matrix binary, not just the x86_64 Linux one. A platform that silently
+      # shipped consoleless is exactly the failure this script exists to catch, and checking only one
+      # of four would leave three unchecked while reading like coverage.
+      - name: The binary really embeds the bundle
+        run: scripts/check-console-embed.sh embedded target/${{ matrix.target }}/release/rift-cluster-server
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          name="rift-cluster-server-${{ needs.guard.outputs.version }}-${{ matrix.target }}"
+          staging="$(mktemp -d)/${name}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/rift-cluster-server" "$staging/"
+          cp LICENSE "$staging/"
+          # A pointer rather than a copy of README.md: the deploy docs move faster than a release
+          # tarball, and a stale copy inside an artifact is worse than a link to the current one.
+          cat > "$staging/README" <<EOF
+          rift-cluster-server ${{ needs.guard.outputs.version }} (${{ matrix.target }})
+
+          Docs:   https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/rift-cluster-server.md
+          Deploy: https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/deploy/README.md
+
+          Run \`./rift-cluster-server --help\`, or \`--version\` to see the engine pin this build carries.
+          EOF
+          tar -czf "${name}.tar.gz" -C "$(dirname "$staging")" "${name}"
+          echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: ${{ steps.package.outputs.artifact }}
+          retention-days: 1
+
+  release:
+    needs: [guard, binaries, image-manifest]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+          pattern: tarball-*
+          merge-multiple: true
+
+      # One checksum file over every tarball, generated where they are all together — the only
+      # place it can be correct. Generating it per-matrix-job would produce four files each
+      # covering one artifact, which is not what a checksum file is for.
+      - name: Checksums
+        working-directory: /tmp/artifacts
+        run: |
+          set -euo pipefail
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the Release
+        working-directory: /tmp/artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          {
+            echo "## rift-cluster-server ${{ needs.guard.outputs.version }}"
+            echo
+            echo "Container image:"
+            echo
+            echo '```'
+            echo "docker pull ${IMAGE}:${{ needs.guard.outputs.version }}"
+            echo '```'
+            echo
+            echo "The image and every binary below carry the web console at \`/console\`."
+            echo
+            echo "- [Server docs](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/rift-cluster-server.md)"
+            echo "- [Deploying](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/deploy/README.md)"
+            echo
+            echo "Verify a download against \`SHA256SUMS\`."
+          } > "$notes"
+
+          flags=(--title "${{ needs.guard.outputs.version }}" --notes-file "$notes")
+          if [ "${{ needs.guard.outputs.prerelease }}" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" "${flags[@]}" ./*.tar.gz SHA256SUMS

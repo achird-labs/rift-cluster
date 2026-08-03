@@ -240,6 +240,24 @@ The two Services are also deliberate: the headless one (peer discovery) ignores
 readiness, and the `rift` one (client traffic) respects it. Collapsing them
 would either break joining or route traffic at nodes that have not converged.
 
+## Published artifacts
+
+Everything below builds from this checkout. If you only want to *run* a node,
+tagging `vX.Y.Z` publishes artifacts that need none of it (#266):
+
+```sh
+docker pull ghcr.io/achird-labs/rift-cluster-server:vX.Y.Z    # amd64 + arm64
+```
+
+and per-platform binary tarballs with a `SHA256SUMS` on the GitHub Release. Both
+carry the web console. See `docs/rift-cluster-server.md` → *Installing from a
+release*; the pull-not-build quick start is #269's.
+
+The publish lane rides the same verification that already proved the artifact —
+nothing is pushed on a build that failed `check-console-embed.sh` — and the
+published image is smoke-tested after the push by pulling it back by tag and
+asking it for `--version` and `/console`.
+
 ## Images and the upstream pin
 
 `--version` reports which open-source Rift is embedded, e.g.
