@@ -300,6 +300,13 @@ mod parity {
             Terminated::Tenancy(route) => tenancy_contract_route(route),
             Terminated::SourceList => RouteKey::new(&Method::GET, "/admin/sources"),
             Terminated::SourceRead(_) => RouteKey::new(&Method::GET, "/admin/sources/{sourceId}"),
+            Terminated::SourcePut => RouteKey::new(&Method::POST, "/admin/sources"),
+            Terminated::SourceDelete(_) => {
+                RouteKey::new(&Method::DELETE, "/admin/sources/{sourceId}")
+            }
+            Terminated::SourcePull(_) => {
+                RouteKey::new(&Method::POST, "/admin/sources/{sourceId}/pull")
+            }
         }
     }
 
@@ -388,6 +395,9 @@ mod parity {
             Terminated::Tenancy(Route::AuditSinkDelete),
             Terminated::SourceList,
             Terminated::SourceRead("payments".to_owned()),
+            Terminated::SourcePut,
+            Terminated::SourceDelete("payments".to_owned()),
+            Terminated::SourcePull("payments".to_owned()),
         ]
     }
 

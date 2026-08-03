@@ -12,11 +12,14 @@
 //! address, exactly as `tenancy_api.rs` does, seeding fixture state by
 //! submitting `ControlOp`s directly through the node.
 
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use rift_cluster::control::{OnDrift, Quotas, Role, SourceMode};
-use rift_cluster::{ControlOp, ControlRequest, RaftNode, TenantId};
+use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, Signer};
+use rift_cluster::{ControlOp, ControlRequest, DEFAULT_TENANT, RaftNode, TenantId};
 use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose::{self, ComposedServer};
 use serde_json::Value;
@@ -316,6 +319,345 @@ async fn an_unauthenticated_read_answers_401() {
         let seen = Seen::of(response).await;
         assert_eq!(seen.status, 401, "unauthenticated {path}: {seen}");
     }
+
+    fixture.server.shutdown().await;
+}
+
+const EDITOR_ACME_KEY: &str = "sources-front-editor-acme-key";
+const EDITOR_OTHER_KEY: &str = "sources-front-editor-other-key";
+
+/// Issue #253: `POST /admin/sources` lands the declaration in the tenant `authorize_action`
+/// resolved for the caller — `X-Rift-Tenant`, for an Editor bound there — never in whichever
+/// tenant a bystander happens to read from. Proven from both directions: the declaring tenant
+/// sees it, and a *different* tenant's own list (read by a principal genuinely bound there, not
+/// merely refused at the boundary) does not.
+#[tokio::test]
+async fn an_editor_declares_a_source_into_its_own_tenant_and_nowhere_else() {
+    let fixture = start().await;
+    let client = reqwest::Client::new();
+    let node = fixture.server.node().expect("clustered");
+    let mut op_id = 1_000u128;
+    seed_key(node, &mut op_id, "acme", EDITOR_ACME_KEY, Role::Editor).await;
+    seed_key(node, &mut op_id, "other", EDITOR_OTHER_KEY, Role::Editor).await;
+
+    let response = client
+        .post(format!("http://{}/admin/sources", fixture.admin))
+        .header("authorization", EDITOR_ACME_KEY)
+        .header("x-rift-tenant", "acme")
+        .json(&serde_json::json!({
+            "id": "acme-only",
+            // A scheme this build actually serves. `scripted:` is registered only by the
+            // harness the read tests use; a declare is never dereferenced, so any served
+            // scheme with a host does.
+            "uri": "git+https://host/org/acme-only#main:mocks.json",
+        }))
+        .send()
+        .await
+        .expect("declare source");
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 200, "editor declare: {seen}");
+    let created: Value = serde_json::from_str(&seen.body).expect("created is JSON");
+    assert_eq!(created["id"], "acme-only");
+
+    // Visible under the declaring tenant.
+    let seen = get(
+        &client,
+        &fixture.admin,
+        "/admin/sources/acme-only",
+        EDITOR_ACME_KEY,
+        "acme",
+    )
+    .await;
+    assert_eq!(seen.status, 200, "acme reads its own declaration: {seen}");
+
+    // Absent from `other`'s own list — read by a principal genuinely bound to `other` (so this is
+    // a real "not there" within a tenant it CAN see, not the §8.4 boundary 404 a probe from a
+    // principal that is NOT bound to `other` would get instead, which would prove nothing about
+    // where the write landed).
+    let seen = get(
+        &client,
+        &fixture.admin,
+        "/admin/sources",
+        EDITOR_OTHER_KEY,
+        "other",
+    )
+    .await;
+    assert_eq!(
+        seen.status, 200,
+        "other's editor lists its own tenant: {seen}"
+    );
+    let body: Value = serde_json::from_str(&seen.body).expect("list is JSON");
+    let ids: Vec<&str> = body["sources"]
+        .as_array()
+        .expect("sources array")
+        .iter()
+        .map(|s| s["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["foreign"],
+        "acme's declaration must not appear in other's own list: {ids:?}"
+    );
+
+    /*
+     * DELETE and PULL are tenant-scoped too — and neither was covered until a mutation run showed
+     * both shipping green when pointed at `TenantId::default()`. The PUT above would still have
+     * passed, because it is a different call site: each of the three carries its own tenant
+     * argument, so each needs its own proof.
+     *
+     * `other`'s editor addressing `acme-only` must not reach acme's source. It is a real "not
+     * there" within a tenant `other` genuinely holds, not a boundary refusal.
+     */
+    let response = client
+        .delete(format!("http://{}/admin/sources/acme-only", fixture.admin))
+        .header("authorization", EDITOR_OTHER_KEY)
+        .header("x-rift-tenant", "other")
+        .send()
+        .await
+        .expect("cross-tenant delete");
+    /*
+     * The status is deliberately NOT asserted: `SourceDelete` is an idempotent forget, so deleting
+     * an id absent from the caller's own tenant is a legitimate 200 no-op. What must hold is that
+     * acme's source is still there afterwards — asserted below. A status check here would pin the
+     * wrong thing and would pass just as happily if the delete had reached across the boundary.
+     */
+    let _ = Seen::of(response).await;
+
+    let response = client
+        .post(format!(
+            "http://{}/admin/sources/acme-only/pull",
+            fixture.admin
+        ))
+        .header("authorization", EDITOR_OTHER_KEY)
+        .header("x-rift-tenant", "other")
+        .send()
+        .await
+        .expect("cross-tenant pull");
+    // Same reasoning as the delete above — survival is the property, not the status.
+    let _ = Seen::of(response).await;
+
+    // And acme's source is still there — the point of the two calls above is that neither reached
+    // it, which a status code alone does not prove.
+    let seen = get(
+        &client,
+        &fixture.admin,
+        "/admin/sources/acme-only",
+        EDITOR_ACME_KEY,
+        "acme",
+    )
+    .await;
+    assert_eq!(
+        seen.status, 200,
+        "acme's source survives another tenant addressing it: {seen}"
+    );
+
+    /*
+     * Pull's tenant argument, pinned the same positive way and for the same reason: acme pulling
+     * its OWN source must find it. The fetch itself then fails — the URI is never dereferenceable
+     * from a test — so the status is deliberately not pinned; what matters is that it is not the
+     * 404 the mutant produces by looking in `default`, where this source does not exist.
+     */
+    let response = client
+        .post(format!(
+            "http://{}/admin/sources/acme-only/pull",
+            fixture.admin
+        ))
+        .header("authorization", EDITOR_ACME_KEY)
+        .header("x-rift-tenant", "acme")
+        .send()
+        .await
+        .expect("own-tenant pull");
+    let seen = Seen::of(response).await;
+    assert_ne!(
+        seen.status, 404,
+        "acme pulling its own source must find it: {seen}"
+    );
+
+    /*
+     * The assertion that actually pins delete's tenant argument — and the reason it is a POSITIVE
+     * one rather than the cross-tenant probe above.
+     *
+     * A first attempt asserted only that `other` could not delete acme's source. That guards
+     * nothing: point the front at `TenantId::default()` and `other`'s delete lands in `default`,
+     * acme's source is in `acme`, and it survives either way — the test passes on the broken code.
+     * What separates them is acme deleting its OWN source: with the tenant carried through it is
+     * gone, and with `default` substituted it is untouched. Mutation-verified in both directions.
+     */
+    let response = client
+        .delete(format!("http://{}/admin/sources/acme-only", fixture.admin))
+        .header("authorization", EDITOR_ACME_KEY)
+        .header("x-rift-tenant", "acme")
+        .send()
+        .await
+        .expect("own-tenant delete");
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 200, "acme deletes its own source: {seen}");
+
+    let seen = get(
+        &client,
+        &fixture.admin,
+        "/admin/sources/acme-only",
+        EDITOR_ACME_KEY,
+        "acme",
+    )
+    .await;
+    assert_eq!(
+        seen.status, 404,
+        "acme's own delete must actually remove it from acme: {seen}"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+/// Issue #253's explicit constraint: promoting the write verbs to the admin front must leave the
+/// cluster port's own default-tenant `POST /admin/sources` (issue #134) unchanged. Both now
+/// delegate to the same `SourcePuller::put`, but the cluster port still calls it with
+/// `TenantId::default()` hardcoded — never a caller-supplied tenant, because the cluster port has
+/// no notion of one. Proven over the wire through the cluster port's own RPC signer, a listener
+/// entirely separate from the admin front's RBAC the rest of this file drives.
+#[tokio::test]
+async fn the_cluster_port_still_declares_into_the_default_tenant() {
+    let fixture = start().await;
+    let node = fixture.server.node().expect("clustered");
+    let cluster_addr: SocketAddr = node
+        .advertise()
+        .as_str()
+        .parse()
+        .expect("advertise is a literal address in tests");
+    let rpc = RpcClient::new(
+        Some(Signer::new(SECRET)),
+        Arc::new(AlwaysHealthy),
+        RpcClientConfig::default(),
+    );
+
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "id": "cluster-port-default",
+        // See the note in the tenancy test above: a served scheme, never dereferenced.
+        "uri": "git+https://host/org/cluster-port-default#main:mocks.json",
+    }))
+    .expect("encode");
+    let raw = rpc
+        .call(cluster_addr, "POST", "/admin/sources", payload)
+        .await
+        .expect("cluster port declare");
+    let created: Value = serde_json::from_slice(&raw).expect("json body");
+    assert_eq!(created["id"], "cluster-port-default");
+
+    assert!(
+        node.source(DEFAULT_TENANT, "cluster-port-default")
+            .expect("read source")
+            .is_some(),
+        "the cluster port's own declare must land under DEFAULT_TENANT"
+    );
+    // And nowhere an admin-front tenant would see it as its own — `acme`'s own list (read by a
+    // principal genuinely bound there) stays exactly the two the fixture seeded.
+    let mut op_id = 1_000u128;
+    seed_key(node, &mut op_id, "acme", EDITOR_ACME_KEY, Role::Editor).await;
+    let client = reqwest::Client::new();
+    let seen = get(
+        &client,
+        &fixture.admin,
+        "/admin/sources",
+        EDITOR_ACME_KEY,
+        "acme",
+    )
+    .await;
+    let body: Value = serde_json::from_str(&seen.body).expect("list is JSON");
+    let ids: Vec<&str> = body["sources"]
+        .as_array()
+        .expect("sources array")
+        .iter()
+        .map(|s| s["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["billing", "payments"],
+        "the cluster port's default-tenant write must not appear under acme: {ids:?}"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+/// Issue #253, secret hygiene: a URI carrying userinfo is refused before it ever reaches
+/// `node.submit` — the same guarantee `control::validate` already gives the cluster port
+/// (`tests/sources.rs::operator_errors_are_refusals_not_internal_failures`), now exercised
+/// through the admin front's own `POST /admin/sources` (`SourcePuller::put`, shared by both).
+/// "Refused before submit" is asserted here as "not even a committed `Failed` entry exists" —
+/// reading the tenant's list back and finding nothing, not merely checking the response code. A
+/// **separate** declaration naming a credential by reference (`authRef`), never embedding one,
+/// must still succeed and round-trip that name byte-for-byte — proving the refusal above is about
+/// the credential *embedded in the URI*, not a blanket rejection of `authRef`.
+#[tokio::test]
+async fn a_credential_bearing_uri_is_refused_before_it_ever_reaches_the_log() {
+    let fixture = start().await;
+    let client = reqwest::Client::new();
+    let node = fixture.server.node().expect("clustered");
+    let mut op_id = 1_000u128;
+    seed_key(node, &mut op_id, "acme", EDITOR_ACME_KEY, Role::Editor).await;
+
+    let response = client
+        .post(format!("http://{}/admin/sources", fixture.admin))
+        .header("authorization", EDITOR_ACME_KEY)
+        .header("x-rift-tenant", "acme")
+        .json(&serde_json::json!({
+            "id": "leaky",
+            "uri": "git+https://user:pw@host/repo",
+        }))
+        .send()
+        .await
+        .expect("declare a leaky source");
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 400, "credential-bearing uri: {seen}");
+    assert!(
+        seen.body.contains("auth_ref"),
+        "the refusal should point the operator at authRef instead of an embedded credential: \
+         {seen}"
+    );
+
+    // Not committed at all — not even as a `Failed` entry, which would keep the refusal (and the
+    // fact a credential was ever typed) on every replica's disk forever.
+    let seen = get(
+        &client,
+        &fixture.admin,
+        "/admin/sources",
+        EDITOR_ACME_KEY,
+        "acme",
+    )
+    .await;
+    let body: Value = serde_json::from_str(&seen.body).expect("list is JSON");
+    let ids: Vec<&str> = body["sources"]
+        .as_array()
+        .expect("sources array")
+        .iter()
+        .map(|s| s["id"].as_str().expect("id"))
+        .collect();
+    assert!(
+        !ids.contains(&"leaky"),
+        "a refused declare must leave no trace at all: {ids:?}"
+    );
+
+    // The named-credential twin: no userinfo anywhere in the uri, `authRef` names the credential
+    // instead, and this build's `git+https:` provider is registered credentialed (`GitSource`) —
+    // so this must be accepted, and `authRef` must come back as exactly the string it was sent as.
+    let response = client
+        .post(format!("http://{}/admin/sources", fixture.admin))
+        .header("authorization", EDITOR_ACME_KEY)
+        .header("x-rift-tenant", "acme")
+        .json(&serde_json::json!({
+            "id": "named-cred",
+            "uri": "git+https://host/org/repo#main:mocks.json",
+            "authRef": "acme-github-token",
+        }))
+        .send()
+        .await
+        .expect("declare with a named credential");
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 200, "named credential: {seen}");
+    let created: Value = serde_json::from_str(&seen.body).expect("created is JSON");
+    assert_eq!(
+        created["authRef"], "acme-github-token",
+        "authRef must round-trip as exactly the reference string, never a credential: {created}"
+    );
 
     fixture.server.shutdown().await;
 }

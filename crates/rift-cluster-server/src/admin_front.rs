@@ -77,8 +77,8 @@ use rift_cluster::decorate::{
     HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS,
 };
 use rift_cluster::{
-    ControlOutcome, ControlResponse, FLEET_SCOPE, NodeError, RaftNode, SESSION_KEY_BYTES,
-    SessionKey, SourcePuller, TenantId,
+    ControlOutcome, ControlResponse, FLEET_SCOPE, NodeError, PullError, RaftNode,
+    SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId,
 };
 use rift_cluster_base::seams::{
     ErrorKind, ImposterConfig, RiftScriptConfig, RouteTable, SCOPE_HEADER, ScriptBaseDir, Stub,
@@ -416,6 +416,23 @@ pub(crate) enum Terminated {
     SourceList,
     /// `GET /admin/sources/{id}` — one source record.
     SourceRead(String),
+    /// `POST /admin/sources` (issue #253): declare (upsert by id) a source
+    /// under the caller's tenant. The cluster port already serves this verb,
+    /// default-tenant and under the cluster credential (issue #134); this
+    /// promotes it to the RBAC'd front, tenant-resolved from `X-Rift-Tenant`,
+    /// through the very same [`rift_cluster::SourcePuller::put`] the cluster
+    /// port now delegates to — so the two fronts cannot answer differently
+    /// for the same declaration.
+    SourcePut,
+    /// `DELETE /admin/sources/{id}` (issue #253). "Stop tracking this URI":
+    /// the source row is removed, but the imposters it created stay bound —
+    /// only their provenance is cleared. Orphaned, never torn down; see
+    /// [`rift_cluster::SourcePuller::delete`]'s doc.
+    SourceDelete(String),
+    /// `POST /admin/sources/{id}/pull` (issue #253): fetch the source now and
+    /// apply what it produced, under the caller's tenant rather than the
+    /// cluster port's fixed default.
+    SourcePull(String),
 }
 
 /// The tenant a terminated route is authorized against, when the route names
@@ -458,7 +475,16 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::DeleteRoute(_)
         | Terminated::Tenancy(_)
         | Terminated::SourceList
-        | Terminated::SourceRead(_) => None,
+        | Terminated::SourceRead(_)
+        // A source names no imposter port of its own — the ports it owns are
+        // a *consequence* of a pull, not the address a write is made to. A
+        // cross-tenant source id is refused by tenant scoping alone (the
+        // source table is keyed `(tenant, id)`), the same way a cross-tenant
+        // tenancy-surface record is: there is no separate port to check
+        // ownership of the way an imposter write has one.
+        | Terminated::SourcePut
+        | Terminated::SourceDelete(_)
+        | Terminated::SourcePull(_) => None,
     }
 }
 
@@ -482,7 +508,10 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         // tenant, so `X-Rift-Tenant` is the subject — unlike the tenancy
         // surface, where the tenant is the path segment being administered.
         | Terminated::SourceList
-        | Terminated::SourceRead(_) => None,
+        | Terminated::SourceRead(_)
+        | Terminated::SourcePut
+        | Terminated::SourceDelete(_)
+        | Terminated::SourcePull(_) => None,
     }
 }
 
@@ -499,6 +528,11 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
     if path == "/admin/sources" {
         return match *method {
             Method::GET => Some(Terminated::SourceList),
+            // `POST /admin/sources` (issue #253): declare (upsert by id) a
+            // source. There is no separate "create vs replace" distinction
+            // the way imposters have one — `SourcePut` is an upsert either
+            // way — so one variant covers both.
+            Method::POST => Some(Terminated::SourcePut),
             _ => None,
         };
     }
@@ -510,6 +544,22 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
             Method::GET if !id.is_empty() && !id.contains('/') => {
                 Some(Terminated::SourceRead(id.to_owned()))
             }
+            Method::DELETE if !id.is_empty() && !id.contains('/') => {
+                Some(Terminated::SourceDelete(id.to_owned()))
+            }
+            // `POST /admin/sources/{id}/pull`: `/pull` is a suffix on the id
+            // path rather than its own path segment, so an id that itself
+            // ends in `/pull` cannot be confused with the verb — stripping
+            // the suffix and then re-running the same empty/`/`-free check
+            // the other two arms use closes exactly that. Mirrors the
+            // cluster port's own `pull_source` (`sources/mod.rs`), which
+            // parses the identical shape for the identical reason.
+            Method::POST => match id.strip_suffix("/pull") {
+                Some(inner) if !inner.is_empty() && !inner.contains('/') => {
+                    Some(Terminated::SourcePull(inner.to_owned()))
+                }
+                _ => None,
+            },
             _ => None,
         };
     }
@@ -596,6 +646,26 @@ fn action_for(kind: &Terminated) -> Action {
         Terminated::DeleteRoute(_) => Action::ImposterWrite,
         Terminated::Tenancy(route) => route.action(),
         Terminated::SourceList | Terminated::SourceRead(_) => Action::SourceRead,
+        // Deliberately NOT `Action::SourceRead` and deliberately NOT a new
+        // `Action::SourceWrite` (issue #253's explicit design decision).
+        // `control.rs`'s own audit mapping already names these ops:
+        // `SourcePut`/`SourcePullResult` emit `imposter.write`, `SourceDelete`
+        // emits `imposter.delete` (`control::action_for`, ~line 919-920) — a
+        // pull commits as `SourcePullResult`, the same op a declare's
+        // `SourcePut` does not, but both land on the write action. Minting a
+        // `SourceWrite` action here would make the audit stream and this
+        // enforcement gate disagree about what the *same event* was called,
+        // which is worse than the asymmetry with the read side looks: a
+        // security reviewer correlating "who wrote this imposter" from the
+        // audit log by action name would find writes attributed to an action
+        // nothing ever authorized. The read/write split itself is
+        // deliberate too — reading a source is its own, lighter power (a
+        // Viewer may see what an imposter was built from, `role_allows`'s own
+        // comment on `Action::SourceRead`), while writing one is exactly as
+        // consequential as `PUT /imposters`, because that is what a pull
+        // ultimately produces.
+        Terminated::SourcePut | Terminated::SourcePull(_) => Action::ImposterWrite,
+        Terminated::SourceDelete(_) => Action::ImposterDelete,
     }
 }
 
@@ -1832,14 +1902,40 @@ async fn terminate(
             .await;
     }
 
-    // So does the source inspection surface (issue #239): same shared gate,
-    // and nothing of the write machinery below applies to a read.
+    // So does the whole source surface (issue #239 for the reads, #253 for
+    // the three writes below): same shared gate, but none of the imposter
+    // write machinery below applies — a source is not an imposter record,
+    // has no `If-Match` surface, and needs no `_rift.script` resolution.
     match kind {
         Terminated::SourceRead(id) => {
             return terminate_sources(&state, &node, Some(id.as_str()), &tenant);
         }
         Terminated::SourceList => {
             return terminate_sources(&state, &node, None, &tenant);
+        }
+        Terminated::SourcePut => {
+            return terminate_source_write(&state, req, SourceWrite::Put, principal_id, &tenant)
+                .await;
+        }
+        Terminated::SourceDelete(id) => {
+            return terminate_source_write(
+                &state,
+                req,
+                SourceWrite::Delete(id),
+                principal_id,
+                &tenant,
+            )
+            .await;
+        }
+        Terminated::SourcePull(id) => {
+            return terminate_source_write(
+                &state,
+                req,
+                SourceWrite::Pull(id),
+                principal_id,
+                &tenant,
+            )
+            .await;
         }
         _ => {}
     }
@@ -2340,6 +2436,154 @@ fn render_sources(
         }
     };
     serde_json::to_vec(&body)
+}
+
+/// Which of the three source-write routes (issue #253) `terminate_source_write` is serving.
+///
+/// Carved out of `Terminated` at the `terminate` call site rather than matched there directly, so
+/// the match inside `terminate_source_write` is exhaustive with no wildcard arm — the same reason
+/// `action_for` has none. A route this function was never meant to receive is a compile error
+/// here, not a `_ => unreachable!()` waiting to fire in production.
+enum SourceWrite {
+    Put,
+    Delete(String),
+    Pull(String),
+}
+
+/// Serve one of the three RBAC'd source write routes (issue #253): `POST /admin/sources`,
+/// `DELETE /admin/sources/{id}`, `POST /admin/sources/{id}/pull`.
+///
+/// Follows `terminate_tenancy`'s shape — a direct control-plane submit with an `Rift-Cluster-Op-Id`
+/// header on the response — rather than `build_and_run`'s: that path is built around a single
+/// *imposter* record (`If-Match` against a port, `_rift.script` resolution, a post-commit re-read
+/// of the loopback admin), and none of it applies to a source, which upstream has no concept of at
+/// all. There is deliberately no `If-Match` here: a source row carries no revision surface of its
+/// own to condition on (`SourceRecord.revision` is *when it last wrote*, not something a client
+/// hands back as a precondition), and `SourcePut` is an idempotent upsert by id rather than a
+/// read-modify-write, so there is no lost update for a precondition to guard against.
+///
+/// All three commit through [`SourcePuller`], which does the actual parse -> validate -> submit ->
+/// read-back work identically for the cluster port's default-tenant twin of each route (see its own
+/// doc) — this function only supplies the tenant `authorize_action` already resolved and renders
+/// the result as an HTTP response.
+async fn terminate_source_write(
+    state: &Arc<FrontState>,
+    req: Request<Incoming>,
+    kind: SourceWrite,
+    principal_id: Option<String>,
+    tenant: &TenantId,
+) -> Response<FrontBody> {
+    // Collected unconditionally, like every other terminated write in this file (`terminate`'s own
+    // body read above `build_and_run`, `terminate_tenancy`'s) — `Delete` and `Pull` carry no body of
+    // their own, but draining it here rather than leaving it unread is what keeps a client that sent
+    // one anyway from stalling the connection's keep-alive.
+    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return typed_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorKind::RequestTooLarge,
+                &format!("admin request body refused: {e}"),
+            );
+        }
+    };
+
+    match kind {
+        SourceWrite::Put => {
+            let (record, op_id) = match state.puller.put(tenant.clone(), &body, principal_id).await
+            {
+                Ok(ok) => ok,
+                Err(e) => return source_write_error(e),
+            };
+            let payload = match serde_json::to_vec(&record) {
+                Ok(payload) => payload,
+                Err(e) => return internal(&e.to_string()),
+            };
+            let mut response = match buffered_response(
+                StatusCode::OK,
+                Bytes::from(payload),
+                json_content_type(),
+            ) {
+                Ok(response) | Err(response) => response,
+            };
+            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
+            response
+        }
+        SourceWrite::Delete(id) => {
+            let (revision, op_id) =
+                match state.puller.delete(tenant.clone(), &id, principal_id).await {
+                    Ok(ok) => ok,
+                    Err(e) => return source_write_error(e),
+                };
+            let payload = serde_json::json!({ "revision": revision }).to_string();
+            let mut response = match buffered_response(
+                StatusCode::OK,
+                Bytes::from(payload),
+                json_content_type(),
+            ) {
+                Ok(response) | Err(response) => response,
+            };
+            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
+            response
+        }
+        SourceWrite::Pull(id) => {
+            let report = match state.puller.pull(tenant.as_str(), &id, principal_id).await {
+                Ok(report) => report,
+                Err(e) => return source_write_error(e),
+            };
+            let payload = match serde_json::to_vec(&report) {
+                Ok(payload) => payload,
+                Err(e) => return internal(&e.to_string()),
+            };
+            // No `Rift-Cluster-Op-Id` here, unlike the two arms above: `pull` is the
+            // pre-existing cluster-port method (kept byte-for-byte so its behaviour towards its
+            // existing caller is unchanged — issue #253's explicit constraint), and it does not
+            // surface the op id it minted internally for the write it committed. A client that
+            // needs to correlate a pull has the report's own `revision`; the `Unavailable` error
+            // path below still names an op id to poll, from `PullError` itself.
+            match buffered_response(StatusCode::OK, Bytes::from(payload), json_content_type()) {
+                Ok(response) | Err(response) => response,
+            }
+        }
+    }
+}
+
+/// Map a [`PullError`] from one of the three source-write routes onto the front's status classes —
+/// the cluster port's own `pull_error` (`rift-cluster`'s `sources` module) draws the identical
+/// distinction, reproduced here because this front renders `Response<FrontBody>`, not `RpcError`,
+/// and putting a dependency on the front's HTTP types into `rift-cluster` (a crate with no `hyper`
+/// dependency at all) to share one function would be the wrong direction for it.
+fn source_write_error(e: PullError) -> Response<FrontBody> {
+    match e {
+        // Byte-identical to `terminate_sources`'s own cross-tenant/absent 404 (RFC-002 §8.4): a
+        // pull of an id that does not exist in the caller's tenant must not be distinguishable from
+        // one that belongs to someone else. `put`/`delete` never produce this variant — an upsert
+        // has no "unknown" case, and a delete is idempotent when absent (`SourcePuller::delete`'s
+        // own doc) — only `pull` reads the record first and can find nothing there.
+        PullError::UnknownSource(_) => tenant_boundary_not_found(),
+        PullError::BadRequest(detail) => refusal_response(&detail),
+        // The fetch itself failed against the source's own host — the upstream's fault, not this
+        // cluster's, and worth retrying. Mirrors `sources::pull_error`'s identical reasoning for the
+        // cluster port.
+        PullError::Fetch { id, detail } => typed_error(
+            StatusCode::BAD_GATEWAY,
+            ErrorKind::UpstreamFailure,
+            &format!("fetching source {id:?}: {detail}"),
+        ),
+        PullError::Unavailable { detail, op_id } => {
+            let mut response = typed_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorKind::Unavailable,
+                &detail,
+            );
+            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
+            response
+        }
+        PullError::Internal(detail) => internal(&detail),
+    }
 }
 
 /// Serve one RFC-002 §5 tenancy route (issue #162): read from local applied
@@ -2881,6 +3125,13 @@ async fn build_mutation(
         Terminated::SourceList | Terminated::SourceRead(_) => Err(internal(
             "source reads are served by terminate_sources, not build_mutation",
         )),
+        // Same shape again: the three source writes divert to
+        // `terminate_source_write` before this is reached — none of them is a
+        // `ControlOp` sequence `build_mutation` knows how to build (a source
+        // write is not an imposter record at all).
+        Terminated::SourcePut | Terminated::SourceDelete(_) | Terminated::SourcePull(_) => Err(
+            internal("source writes are served by terminate_source_write, not build_mutation"),
+        ),
     }
 }
 
@@ -3561,7 +3812,7 @@ mod tests {
     /// everything else on the path falls through to the proxy and answers
     /// upstream's own 404/405.
     #[test]
-    fn classify_terminates_exactly_the_source_read_surface() {
+    fn classify_terminates_exactly_the_source_surface() {
         assert!(matches!(
             classify(&Method::GET, "/admin/sources", None),
             Some(Terminated::SourceList)
@@ -3577,12 +3828,39 @@ mod tests {
             Some(Terminated::SourceRead(id)) if id == "pay%2Fments"
         ));
 
+        // The write half, promoted from the cluster port in #253.
+        assert!(matches!(
+            classify(&Method::POST, "/admin/sources", None),
+            Some(Terminated::SourcePut)
+        ));
+        assert!(matches!(
+            classify(&Method::DELETE, "/admin/sources/payments", None),
+            Some(Terminated::SourceDelete(id)) if id == "payments"
+        ));
+        assert!(matches!(
+            classify(&Method::POST, "/admin/sources/payments/pull", None),
+            Some(Terminated::SourcePull(id)) if id == "payments"
+        ));
+        // The `/pull` verb is a suffix on the id path, not its own segment, so
+        // an id containing a slash still cannot smuggle one past the check.
+        assert!(matches!(
+            classify(&Method::DELETE, "/admin/sources/pay%2Fments", None),
+            Some(Terminated::SourceDelete(id)) if id == "pay%2Fments"
+        ));
+
         for (method, path) in [
-            (Method::POST, "/admin/sources"),
+            // `PUT` is not the upsert verb here — `POST` is, mirroring the
+            // cluster port — so it must not terminate as one.
             (Method::PUT, "/admin/sources/payments"),
-            (Method::DELETE, "/admin/sources/payments"),
             (Method::GET, "/admin/sources/"),
             (Method::GET, "/admin/sources/a/b"),
+            (Method::DELETE, "/admin/sources/"),
+            (Method::DELETE, "/admin/sources/a/b"),
+            // An empty id in front of the verb, and a nested one behind it.
+            (Method::POST, "/admin/sources//pull"),
+            (Method::POST, "/admin/sources/a/b/pull"),
+            // `POST` on an id with no verb is not a route.
+            (Method::POST, "/admin/sources/payments"),
         ] {
             assert!(
                 classify(&method, path, None).is_none(),

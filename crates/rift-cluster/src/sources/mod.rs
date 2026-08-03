@@ -28,10 +28,17 @@
 //! ## Where these endpoints live
 //!
 //! The `/admin/sources*` routes are registered on the **cluster port** through
-//! the `NodeConfig.routes` seam, beside `/_cluster/*` — not on the public admin
-//! front. Sources are a control-plane object an operator manages, they are
-//! authenticated with the cluster credential, and the cluster port is the
-//! single authenticated listener that already carries exactly that.
+//! the `NodeConfig.routes` seam, beside `/_cluster/*` — not (only) on the
+//! public admin front. Sources are a control-plane object an operator
+//! manages, they are authenticated with the cluster credential, and the
+//! cluster port is the single authenticated listener that already carries
+//! exactly that. `GET`/`GET list` are also read straight off local applied
+//! state by `admin_front::terminate_sources` (issue #239), and the three
+//! write verbs below (`declare`, `delete`, `pull`) are promoted to the
+//! RBAC'd admin front, tenant-resolved, by `admin_front::terminate_source_write`
+//! (issue #253) — both reuse [`SourcePuller::put`]/[`SourcePuller::delete`]/
+//! [`SourcePuller::pull`] rather than duplicating the write path, so the two
+//! fronts can never answer differently for the same request.
 //!
 //! ## Credentials
 //!
@@ -613,6 +620,162 @@ impl SourcePuller {
         // the op this function just minted.
         self.pull(DEFAULT_TENANT, id, None).await
     }
+
+    /// Upsert `tenant`'s source per what `body` declares (issue #253) — the
+    /// shared body behind the cluster port's default-tenant
+    /// `POST /admin/sources` (`create_source`, above `Self::pull`'s callers in
+    /// this module) and the RBAC'd admin front's tenant-resolved twin
+    /// (`admin_front::terminate_source_write`). `tenant` is a parameter for
+    /// the same reason [`Self::pull`]'s is: a source id is unique only within
+    /// its tenant, so which tenant the write lands in cannot be baked in
+    /// here.
+    ///
+    /// `body` is parsed inside this method rather than by each caller, so
+    /// there is exactly one shape a `POST /admin/sources` body can have —
+    /// `SourceBody` below — instead of the admin front inventing a second one
+    /// that could drift from the cluster port's.
+    ///
+    /// Returns the stored record and the op id the write committed under, so
+    /// a caller that wants to report it (the admin front's
+    /// `Rift-Cluster-Op-Id` header) is not left minting a second, unrelated
+    /// one just to have something to show.
+    ///
+    /// # Errors
+    /// A body that will not parse, a scheme this build cannot serve, an
+    /// `authRef` a scheme cannot use, or anything [`crate::control::validate`]
+    /// or the state machine itself refuses is [`PullError::BadRequest`]. No
+    /// quorum to commit against is [`PullError::Unavailable`].
+    pub async fn put(
+        &self,
+        tenant: TenantId,
+        body: &[u8],
+        principal: Option<String>,
+    ) -> Result<(SourceRecord, Uuid), PullError> {
+        let parsed: SourceBody = serde_json::from_slice(body)
+            .map_err(|e| PullError::BadRequest(format!("source body: {e}")))?;
+        let node = self.node()?;
+
+        // Node-local, and therefore *not* part of deterministic op
+        // validation: which schemes a node serves is per-node configuration,
+        // so checking it inside `apply` would let two replicas disagree
+        // about a committed op.
+        if !self.serves(&parsed.uri) {
+            return Err(PullError::BadRequest(format!(
+                "no imposter source is registered for the `{}:` scheme; this build serves: {}",
+                SourceRef::new(&parsed.uri).scheme(),
+                self.schemes().join(", ")
+            )));
+        }
+        check_credential_use(self, parsed.auth_ref.as_deref(), &parsed.uri)
+            .map_err(PullError::BadRequest)?;
+
+        let id = parsed.id.clone();
+        let request = mint(
+            principal,
+            ControlOp::SourcePut {
+                tenant: tenant.clone(),
+                id: parsed.id,
+                uri: parsed.uri,
+                mode: parsed.mode,
+                auth_ref: parsed.auth_ref,
+                on_drift: parsed.on_drift,
+                poll_secs: parsed.poll_secs,
+            },
+        );
+        // Refused before the submit, so a credential-bearing URI never
+        // reaches the log at all — not even as a committed `Failed` entry,
+        // which would keep the secret on every replica's disk and in every
+        // snapshot.
+        if let Err(reason) = crate::control::validate(&request.op) {
+            return Err(PullError::BadRequest(reason));
+        }
+
+        let op_id = request.op_id;
+        let response = match node.submit(request).await {
+            Ok(response) => response,
+            Err(NodeError::Unavailable(detail)) => {
+                return Err(PullError::Unavailable {
+                    detail: format!("no quorum / leader unreachable: {detail}"),
+                    op_id,
+                });
+            }
+            Err(e) => return Err(PullError::Internal(e.to_string())),
+        };
+        if let ControlOutcome::Failed { reason } = response.outcome {
+            return Err(PullError::BadRequest(reason));
+        }
+        // Render by reading back what was committed — so wait for *this* node
+        // to apply it first. The same #99 reasoning as everywhere else on
+        // this surface: a 404 for a write that just succeeded would be
+        // indistinguishable from "no such source". The `Unavailable` below is
+        // the honest answer if the apply genuinely did not land in time, and
+        // it still names the op to poll.
+        node.await_local_applied(response.revision, LOCAL_APPLY_TIMEOUT)
+            .await;
+        let record = node
+            .source(tenant.as_str(), &id)
+            .map_err(|e| PullError::Internal(e.to_string()))?
+            .ok_or_else(|| PullError::Unavailable {
+                detail: "source committed but not yet applied on this node".to_owned(),
+                op_id,
+            })?;
+        Ok((record, op_id))
+    }
+
+    /// Delete `tenant`'s source `id` (issue #253) — the shared body behind
+    /// the cluster port's default-tenant `DELETE /admin/sources/:id`
+    /// (`delete_source`) and the RBAC'd admin front's tenant-resolved twin.
+    ///
+    /// Idempotent by construction: `apply`'s own `SourceDelete` arm removes
+    /// the row if present and does nothing otherwise, exactly like
+    /// `DeleteImposter` — so unlike [`Self::pull`] there is no "unknown
+    /// source" outcome to report here, and deleting an absent id commits and
+    /// answers the same as deleting one that exists. The imposters a deleted
+    /// source owned stay bound; only their provenance is cleared (see the
+    /// module doc's "delete" note) — orphaned, never torn down.
+    ///
+    /// # Errors
+    /// A malformed tenant or id is [`PullError::BadRequest`] — unreachable
+    /// from a well-formed admin route, which validates the id shape before
+    /// ever calling this. No quorum to commit against is
+    /// [`PullError::Unavailable`].
+    pub async fn delete(
+        &self,
+        tenant: TenantId,
+        id: &str,
+        principal: Option<String>,
+    ) -> Result<(u64, Uuid), PullError> {
+        let node = self.node()?;
+        let request = mint(
+            principal,
+            ControlOp::SourceDelete {
+                tenant,
+                id: id.to_owned(),
+            },
+        );
+        if let Err(reason) = crate::control::validate(&request.op) {
+            return Err(PullError::BadRequest(reason));
+        }
+        let op_id = request.op_id;
+        let response = match node.submit(request).await {
+            Ok(response) => response,
+            Err(NodeError::Unavailable(detail)) => {
+                return Err(PullError::Unavailable {
+                    detail: format!("no quorum / leader unreachable: {detail}"),
+                    op_id,
+                });
+            }
+            Err(e) => return Err(PullError::Internal(e.to_string())),
+        };
+        if let ControlOutcome::Failed { reason } = response.outcome {
+            return Err(PullError::BadRequest(reason));
+        }
+        // No barrier wait, unlike `put`: there is nothing to read back and
+        // render — the response is just the revision `submit` already
+        // reported, and `terminate_sources`'/`read_source`'s own reads are
+        // what a client would poll to observe the deletion having landed.
+        Ok((response.revision, op_id))
+    }
 }
 
 /// Binding an already-bound [`SourcePuller`].
@@ -847,86 +1010,39 @@ pub fn routes(base: Router, puller: Arc<SourcePuller>) -> Router {
 /// move into [`crate::control::validate`], which has to give the same answer
 /// on every replica regardless of which providers that replica happens to
 /// have registered.
+///
+/// Returns a bare `String` reason rather than either caller's own error type:
+/// [`SourcePuller::put`] (which both `create_source` below and the admin
+/// front's `POST /admin/sources` now go through) wants a [`PullError`], while
+/// nothing outside this module ever called this directly against an
+/// [`RpcError`] — so a shared reason string, mapped once at each call site, is
+/// the version that does not force one error type to know about the other.
 fn check_credential_use(
     puller: &SourcePuller,
     auth_ref: Option<&str>,
     uri: &str,
-) -> Result<(), RpcError> {
+) -> Result<(), String> {
     if auth_ref.is_some() && !puller.uses_credential(uri) {
-        return Err(RpcError::BadRequest(format!(
+        return Err(format!(
             "authRef is set, but the `{}:` scheme does not consume a credential; only these \
              schemes take one: {}",
             SourceRef::new(uri).scheme(),
             puller.credentialed_schemes().join(", ")
-        )));
+        ));
     }
     Ok(())
 }
 
 async fn create_source(puller: &SourcePuller, body: &[u8]) -> Result<Vec<u8>, RpcError> {
-    let parsed: SourceBody = serde_json::from_slice(body)
-        .map_err(|e| RpcError::BadRequest(format!("source body: {e}")))?;
-    let node = puller.node().map_err(pull_error)?;
-
-    // Node-local, and therefore *not* part of deterministic op validation:
-    // which schemes a node serves is per-node configuration, so checking it
-    // inside `apply` would let two replicas disagree about a committed op.
-    if !puller.serves(&parsed.uri) {
-        return Err(RpcError::BadRequest(format!(
-            "no imposter source is registered for the `{}:` scheme; this build serves: {}",
-            SourceRef::new(&parsed.uri).scheme(),
-            puller.schemes().join(", ")
-        )));
-    }
-    check_credential_use(puller, parsed.auth_ref.as_deref(), &parsed.uri)?;
-
-    let request = mint(
-        None,
-        ControlOp::SourcePut {
-            tenant: TenantId::default(),
-            id: parsed.id.clone(),
-            uri: parsed.uri,
-            mode: parsed.mode,
-            auth_ref: parsed.auth_ref,
-            on_drift: parsed.on_drift,
-            poll_secs: parsed.poll_secs,
-        },
-    );
-    // Refused before the submit, so a credential-bearing URI never reaches the
-    // log at all — not even as a committed `Failed` entry, which would keep the
-    // secret on every replica's disk and in every snapshot.
-    if let Err(reason) = crate::control::validate(&request.op) {
-        return Err(RpcError::BadRequest(reason));
-    }
-
-    let op_id = request.op_id;
-    let response = match node.submit(request).await {
-        Ok(response) => response,
-        Err(NodeError::Unavailable(detail)) => {
-            return Err(RpcError::Unavailable {
-                detail: format!("no quorum / leader unreachable: {detail}"),
-                op_id: Some(op_id.to_string()),
-            });
-        }
-        Err(e) => return Err(RpcError::Handler(e.to_string())),
-    };
-    if let ControlOutcome::Failed { reason } = response.outcome {
-        return Err(RpcError::BadRequest(reason));
-    }
-    // Render by reading back what was committed — so wait for *this* node to
-    // apply it first. The same #99 reasoning as the admin front's write
-    // barrier: a 404 for a write that just succeeded is indistinguishable from
-    // "no such source". The `Unavailable` below is the honest answer if the
-    // apply genuinely did not land in time, and it names the op to poll.
-    node.await_local_applied(response.revision, LOCAL_APPLY_TIMEOUT)
-        .await;
-    let record = node
-        .source(DEFAULT_TENANT, &parsed.id)
-        .map_err(handler_error)?
-        .ok_or_else(|| RpcError::Unavailable {
-            detail: "source committed but not yet applied on this node".to_owned(),
-            op_id: Some(op_id.to_string()),
-        })?;
+    // The cluster port's own default-tenant CRUD (issue #134) is now a thin
+    // wrapper over the same method the RBAC'd admin front calls with the
+    // caller's resolved tenant (issue #253) — see `SourcePuller::put`'s doc
+    // for the full parse -> validate -> submit -> read-back sequence this
+    // used to spell out inline here.
+    let (record, _op_id) = puller
+        .put(TenantId::default(), body, None)
+        .await
+        .map_err(pull_error)?;
     serde_json::to_vec(&record).map_err(handler_error)
 }
 
@@ -953,32 +1069,12 @@ async fn read_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, Rpc
 
 async fn delete_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, RpcError> {
     let id = path_id(suffix)?;
-    let node = puller.node().map_err(pull_error)?;
-    let request = mint(
-        None,
-        ControlOp::SourceDelete {
-            tenant: TenantId::default(),
-            id: id.to_owned(),
-        },
-    );
-    if let Err(reason) = crate::control::validate(&request.op) {
-        return Err(RpcError::BadRequest(reason));
-    }
-    let op_id = request.op_id;
-    let response = match node.submit(request).await {
-        Ok(response) => response,
-        Err(NodeError::Unavailable(detail)) => {
-            return Err(RpcError::Unavailable {
-                detail: format!("no quorum / leader unreachable: {detail}"),
-                op_id: Some(op_id.to_string()),
-            });
-        }
-        Err(e) => return Err(RpcError::Handler(e.to_string())),
-    };
-    if let ControlOutcome::Failed { reason } = response.outcome {
-        return Err(RpcError::BadRequest(reason));
-    }
-    serde_json::to_vec(&serde_json::json!({ "revision": response.revision })).map_err(handler_error)
+    // Same delegation as `create_source`, over `SourcePuller::delete`.
+    let (revision, _op_id) = puller
+        .delete(TenantId::default(), id, None)
+        .await
+        .map_err(pull_error)?;
+    serde_json::to_vec(&serde_json::json!({ "revision": revision })).map_err(handler_error)
 }
 
 async fn pull_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, RpcError> {

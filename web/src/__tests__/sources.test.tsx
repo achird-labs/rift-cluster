@@ -1,5 +1,6 @@
 /** @vitest-environment jsdom */
-import { screen } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Sources } from "../screens/Sources.tsx";
@@ -240,5 +241,201 @@ describe("source.read mirrors authz.rs", () => {
     for (const role of ["viewer", "operator", "editor", "tenant-admin", "fleet-admin"] as const) {
       expect(can(whoamiWith(role), "acme", "source.read")).toBe(true);
     }
+  });
+});
+
+describe("declare/edit form", () => {
+  it("is offered to an editor, who holds imposter.write", async () => {
+    stubFetch(listing([CLEAN]));
+    renderInApp(<Sources />, { whoami: whoamiWith("editor") });
+
+    expect(await screen.findByTestId("new-source")).toBeTruthy();
+  });
+
+  it("is hidden from a viewer, who still sees the list", async () => {
+    // Presentation only — the admin front refuses the same principal either way — but a form that
+    // can only ever answer 403 is worse than no form, and a hidden write control must not cost the
+    // read the screen is still entitled to.
+    stubFetch(listing([CLEAN]));
+    renderInApp(<Sources />, { whoami: whoamiWith("viewer") });
+
+    const row = await screen.findByTestId("source-row-mocks");
+    expect(row.textContent).toContain("mocks");
+    expect(screen.queryByTestId("new-source")).toBeNull();
+    expect(screen.queryByTestId("source-edit-mocks")).toBeNull();
+    expect(screen.queryByTestId("source-pull-mocks")).toBeNull();
+    expect(screen.queryByTestId("source-delete")).toBeNull();
+  });
+
+  it("shows the poll interval only when mode is tracking, and hides it again for pinned", async () => {
+    stubFetch(listing([CLEAN]));
+    renderInApp(<Sources />, { whoami: whoamiWith("editor") });
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByTestId("new-source"));
+    // `CLEAN` is pinned, and `Declare source` (not `Edit`) starts from a blank form either way —
+    // the default is `pinned`, so the field must not be there yet.
+    expect(screen.queryByLabelText(/poll interval/i)).toBeNull();
+
+    await user.selectOptions(screen.getByLabelText(/^mode$/i), "tracking");
+    expect(screen.getByLabelText(/poll interval/i)).toBeTruthy();
+
+    await user.selectOptions(screen.getByLabelText(/^mode$/i), "pinned");
+    expect(screen.queryByLabelText(/poll interval/i)).toBeNull();
+  });
+
+  it("renders a server refusal verbatim rather than replacing it with a generic message", async () => {
+    /*
+     * The refusal text is written to be actionable (names the scheme, names what this build
+     * actually serves) and must reach the operator unmodified — a console that swapped it for
+     * "400 Bad Request" would throw away the one thing the server said that the operator can act
+     * on. `GET` and `POST` share the `/admin/sources` path, so `stubFetch`'s path-only routing
+     * cannot serve both from one entry; this mocks `fetch` directly, keyed on method as well.
+     */
+    const REFUSAL =
+      "no imposter source is registered for the `ftp:` scheme; this build serves: git+https, file";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        if (path === "/admin/sources" && method === "GET") {
+          return Promise.resolve(
+            new Response(JSON.stringify(listing([CLEAN])["/admin/sources"].json), { status: 200 }),
+          );
+        }
+        if (path === "/admin/sources" && method === "POST") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({ errors: [{ code: "bad_data", type: "bad_data", message: REFUSAL }] }),
+              { status: 400 },
+            ),
+          );
+        }
+        return Promise.reject(new Error(`test stub has no reply for ${method} ${path}`));
+      }),
+    );
+    renderInApp(<Sources />, { whoami: whoamiWith("editor") });
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByTestId("new-source"));
+    await user.type(screen.getByLabelText(/^id$/i), "bad");
+    await user.type(screen.getByLabelText(/^uri$/i), "ftp://host/x.json");
+    await user.click(screen.getByTestId("source-save"));
+
+    expect((await screen.findByRole("alert")).textContent).toContain(REFUSAL);
+  });
+});
+
+describe("forgetting a source", () => {
+  it("is hidden without imposter.delete", async () => {
+    stubFetch(listing([CLEAN]));
+    renderInApp(<Sources />, { whoami: whoamiWith("operator") });
+
+    await screen.findByTestId("source-row-mocks");
+    expect(screen.queryByTestId("source-delete")).toBeNull();
+  });
+
+  it("asks before it forgets, and names the orphan semantics rather than 'are you sure?'", async () => {
+    stubFetch(listing([CLEAN]));
+    renderInApp(<Sources />, { whoami: whoamiWith("editor") });
+
+    await userEvent.setup().click(await screen.findByTestId("source-delete"));
+
+    const dialog = await screen.findByTestId("confirm-delete-source");
+    // The decided semantics: forgetting a source never cascades. Its imposters keep running,
+    // hand-managed from then on, with nothing left to reapply them — not "are you sure?".
+    expect(dialog.textContent).toMatch(/orphan/i);
+    expect(dialog.textContent).toMatch(/hand-managed/i);
+    expect(dialog.textContent).toMatch(/never cascades|not undeployed/i);
+    // Nothing sent yet — the dialog only asks, it does not act.
+    expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
+  });
+
+  it("sends the delete once confirmed", async () => {
+    stubFetch({ ...listing([CLEAN]), "/admin/sources/mocks": { status: 204 } });
+    renderInApp(<Sources />, { whoami: whoamiWith("editor") });
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByTestId("source-delete"));
+    await user.click(screen.getByTestId("confirm-destructive"));
+
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.some(
+            ([input, init]) => String(input) === "/admin/sources/mocks" && init?.method === "DELETE",
+          ),
+      ).toBe(true),
+    );
+  });
+});
+
+describe("pull now", () => {
+  it("renders what a pull reported: changed ports, unchanged ports, and that it ran", async () => {
+    stubFetch({
+      ...listing([CLEAN]),
+      "/admin/sources/mocks/pull": {
+        json: { revision: 42, digest: "d", unchanged: false, skipped: false, changed: [9301], warnings: ["port 9302 was left alone: it is hand-managed"] },
+      },
+    });
+    renderInApp(<Sources />, { whoami: whoamiWith("editor") });
+
+    await userEvent.setup().click(await screen.findByTestId("source-pull-mocks"));
+
+    const report = await screen.findByTestId("source-pull-report");
+    expect(report.textContent).toMatch(/applied/i);
+    expect(report.textContent).toContain("9301");
+    // A pull that replaced a port must not read as "nothing changed". An earlier draft invented
+    // `changedPorts`/`unchangedPorts`; the server sends `changed` plus BOOLEAN `unchanged`, so the
+    // guessed shape rendered the exact opposite of what happened.
+    expect(report.textContent).not.toMatch(/no port changed/i);
+    // Server-authored caveats are the part the operator needs; dropping them hides what was skipped.
+    expect(screen.getByTestId("source-pull-warnings").textContent).toContain("hand-managed");
+  });
+
+  it("distinguishes an unchanged pull from one that changed nothing", async () => {
+    /*
+     * `unchanged` means the fetched content matched what was last applied, so nothing reached the
+     * log at all — a different fact from "it applied and no port moved", and different again from
+     * a drifted source that was skipped. Collapsing them would hide a source that is silently no
+     * longer tracking.
+     */
+    stubFetch({
+      ...listing([CLEAN]),
+      "/admin/sources/mocks/pull": {
+        json: { revision: 42, digest: "d", unchanged: true, skipped: false, changed: [], warnings: [] },
+      },
+    });
+    renderInApp(<Sources />, { whoami: whoamiWith("editor") });
+
+    await userEvent.setup().click(await screen.findByTestId("source-pull-mocks"));
+
+    const report = await screen.findByTestId("source-pull-report");
+    expect(report.textContent).toMatch(/unchanged/i);
+    expect(report.textContent).not.toMatch(/skipped/i);
+  });
+
+  it("renders a skipped pull as skipped, not as an empty change set", async () => {
+    stubFetch({
+      ...listing([DRIFTED]),
+      "/admin/sources/payments/pull": {
+        json: { revision: 42, digest: "d", unchanged: false, skipped: true, changed: [], warnings: [] },
+      },
+    });
+    renderInApp(<Sources />, { whoami: whoamiWith("editor") });
+
+    await userEvent.setup().click(await screen.findByTestId("source-pull-payments"));
+
+    expect((await screen.findByTestId("source-pull-report")).textContent).toMatch(/skipped/i);
+  });
+
+  it("is hidden without imposter.write", async () => {
+    stubFetch(listing([CLEAN]));
+    renderInApp(<Sources />, { whoami: whoamiWith("operator") });
+
+    await screen.findByTestId("source-row-mocks");
+    expect(screen.queryByTestId("source-pull-mocks")).toBeNull();
   });
 });

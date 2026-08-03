@@ -727,6 +727,129 @@ async fn an_editor_cannot_use_x_rift_tenant_to_create_into_a_tenant_it_is_not_bo
     server.shutdown().await;
 }
 
+/// Issue #253: the three source-write routes require `imposter.write` (`putSource`,
+/// `pullSource`) or `imposter.delete` (`deleteSource`) — Editor and up; Operator and Viewer are
+/// refused with the same `403` this file's other write probes use, never the `404` reserved for
+/// a tenant boundary the caller genuinely isn't bound to (this test stays inside `default`
+/// throughout, so every refusal here is role-insufficiency, not tenancy).
+///
+/// Each sub-probe uses its own id, declared by nobody, so the three are independent of each
+/// other's outcome and of ordering:
+///
+/// - `putSource` uses a `file:` URI (the composed server always registers `FileSource`) that this
+///   build never has to dereference — declaring a source only checks the scheme is registered, so
+///   the assertion is purely about RBAC, not about a real file existing.
+/// - `pullSource` targets an id nobody declared, so an Editor who clears the gate gets the honest
+///   `404` for "no such source" (`PullError::UnknownSource`) rather than actually fetching
+///   anything — deterministic and network-free.
+/// - `deleteSource` targets an id nobody declared too: `SourceDelete` is idempotent on an absent
+///   id (`SourcePuller::delete`'s own doc, mirroring `DeleteImposter`), so an Editor sees `200`
+///   for a delete that removed nothing.
+#[tokio::test]
+async fn source_write_routes_require_editor_or_above() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let cases = [
+        (Role::Viewer, false),
+        (Role::Operator, false),
+        (Role::Editor, true),
+        (Role::TenantAdmin, true),
+        (Role::FleetAdmin, true),
+    ];
+
+    for (role, allowed) in cases {
+        let label = format!("source-rbac-{role:?}");
+        let raw_key = seed_bound_principal(node, &mut op_id, &label, "default", role).await;
+
+        // POST /admin/sources — Action::ImposterWrite.
+        let response = client
+            .post(format!("http://{admin}/admin/sources"))
+            .header("authorization", &raw_key)
+            .json(&serde_json::json!({
+                "id": format!("put-{role:?}"),
+                "uri": "file:///rbac-test-never-dereferenced.json",
+            }))
+            .send()
+            .await
+            .expect("post source");
+        let seen = Seen::of(response).await;
+        /*
+         * An RBAC test asserts the GATE, not the body validator. A refused role gets exactly 403;
+         * an allowed one gets whatever the handler makes of the request — here a 400, because the
+         * fixture URI names no host and the source validator says so. That 400 is itself the proof
+         * the gate let it through, and pinning 200 would couple this file to what makes a valid
+         * source URI, which is `sources_front.rs`'s business and would break here every time that
+         * changed.
+         */
+        if allowed {
+            assert_ne!(
+                seen.status, 403,
+                "{role:?} POST /admin/sources (ImposterWrite) must not be refused: {seen}"
+            );
+        } else {
+            assert_eq!(
+                seen.status, 403,
+                "{role:?} POST /admin/sources (ImposterWrite): {seen}"
+            );
+        }
+
+        // POST /admin/sources/:id/pull — Action::ImposterWrite, unknown id.
+        let response = client
+            .post(format!("http://{admin}/admin/sources/pull-{role:?}/pull"))
+            .header("authorization", &raw_key)
+            .send()
+            .await
+            .expect("pull source");
+        let seen = Seen::of(response).await;
+        // Same reasoning: an allowed role reaches the handler and gets a 404 for the unknown id —
+        // what matters here is only that it is not a 403.
+        if allowed {
+            assert_ne!(
+                seen.status, 403,
+                "{role:?} POST /admin/sources/:id/pull (ImposterWrite) must not be refused: {seen}"
+            );
+        } else {
+            assert_eq!(
+                seen.status, 403,
+                "{role:?} POST /admin/sources/:id/pull (ImposterWrite): {seen}"
+            );
+        }
+
+        // DELETE /admin/sources/:id — Action::ImposterDelete, unknown id.
+        let response = client
+            .delete(format!("http://{admin}/admin/sources/delete-{role:?}"))
+            .header("authorization", &raw_key)
+            .send()
+            .await
+            .expect("delete source");
+        let seen = Seen::of(response).await;
+        // `ImposterDelete`, not `ImposterWrite` — the one place these three routes' actions differ,
+        // and the reason an Editor-but-not-deleter would show up here rather than above.
+        if allowed {
+            assert_ne!(
+                seen.status, 403,
+                "{role:?} DELETE /admin/sources/:id (ImposterDelete) must not be refused: {seen}"
+            );
+        } else {
+            assert_eq!(
+                seen.status, 403,
+                "{role:?} DELETE /admin/sources/:id (ImposterDelete): {seen}"
+            );
+        }
+    }
+
+    server.shutdown().await;
+}
+
 /// `rift_cluster_no_principals` (issue #161): observable and correct before
 /// and after a `PrincipalPut` — the gauge that makes the open-admin-plane
 /// bypass an audited state rather than a silent one.

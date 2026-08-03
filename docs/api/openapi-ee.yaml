@@ -2469,8 +2469,9 @@ paths:
           $ref: '#/components/responses/WriteTimeout'
 
   # ---------------------------------------------------------------------
-  # ee: imposter-source inspection (issue #239; read-only — declaring or
-  # deleting a source stays on the cluster port pending its own authz tier)
+  # ee: imposter sources (issue #239 read surface; #253 promotes the write
+  # verbs the cluster port already served — declare, delete, pull now — to
+  # this RBAC'd front, tenant-resolved rather than fixed to `default`)
   # ---------------------------------------------------------------------
   /admin/sources:
     get:
@@ -2514,6 +2515,61 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalError'
+    post:
+      operationId: putSource
+      summary: Declare (upsert by id) an imposter source
+      description: >
+        Terminates: commits a `SourcePut` op and answers `200` with the
+        stored record. An upsert, not a create-vs-replace distinction — the
+        same `id` re-declared replaces the prior declaration. Requires
+        `imposter.write` (Editor and up) — deliberately not a dedicated
+        `source.write`: the audit stream already names this op
+        `imposter.write` (it is exactly as consequential as `PUT
+        /imposters`, because that is what a pull ultimately produces), and
+        the read side above is the lighter, separately-gated
+        `source.read`. A `uri` carrying embedded userinfo
+        (`user:pass@host`) is refused before the write reaches the
+        replicated log — name a credential with `authRef` instead. No
+        `If-Match`: a source row has no revision surface of its own to
+        condition on, and this is an idempotent upsert, not a
+        read-modify-write.
+      tags: [sources]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SourceWrite'
+      responses:
+        '200':
+          description: The source as stored (an upsert, so this is also the shape a replace answers).
+          headers:
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceRecord'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Caller holds no binding in the tenant named by `X-Rift-Tenant` (RFC-002 §8.4 — not a 403).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
 
   /admin/sources/{sourceId}:
     get:
@@ -2559,6 +2615,124 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteSource
+      summary: Stop tracking a source
+      description: >
+        Terminates: commits a `SourceDelete` op and answers `200` with the
+        committed revision. Idempotent — deleting an absent id commits and
+        answers the same as deleting one that exists, exactly like
+        `DeleteImposter`, so there is no "unknown source" 404 the way a
+        pull of an absent id has. The imposters this source owned stay
+        bound; only their provenance is cleared — orphaned, never torn
+        down. Requires `imposter.delete` (Editor and up). No `If-Match` —
+        see `putSource`'s description for why.
+      tags: [sources]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/CsrfHeader'
+        - name: sourceId
+          in: path
+          required: true
+          description: The source's declared id, unique within its tenant.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The source is no longer tracked.
+          headers:
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revision]
+                properties:
+                  revision:
+                    type: integer
+                    format: int64
+                    description: The log index this delete committed at.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Caller holds no binding in the tenant named by `X-Rift-Tenant` (RFC-002 §8.4 — not a 403).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /admin/sources/{sourceId}/pull:
+    post:
+      operationId: pullSource
+      summary: Fetch a source now and apply what it produced
+      description: >
+        Terminates: fetches the source's `uri` outside the replicated log
+        (fetching is not deterministic), then commits what was fetched as a
+        `SourcePullResult` op — an ordinary validated write every replica
+        applies identically. Identical content to what the source last
+        applied writes no log entry at all (`unchanged: true`) rather than
+        re-churning state on every poll of a stable document. Requires
+        `imposter.write` (Editor and up) — the same action `putSource`
+        does, and for the same reason: a pull is what actually produces the
+        `PUT /imposters`-equivalent write. No `If-Match` — see
+        `putSource`'s description.
+      tags: [sources]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/CsrfHeader'
+        - name: sourceId
+          in: path
+          required: true
+          description: The source's declared id, unique within its tenant.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: >
+            What the pull did. Carries no `Rift-Cluster-Op-Id`: unlike
+            `putSource`/`deleteSource`, this route's underlying write path
+            is shared byte-for-byte with the cluster port's pre-existing
+            pull (issue #134) and does not surface the op id it minted
+            internally — `revision` in the body is what a client
+            correlates a pull with instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PullReport'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            No such source in the tenant in view. Byte-identical whether the
+            id never existed, exists in another tenant, or the caller holds
+            no binding here at all (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          description: The source's own host refused or failed the fetch; the cluster's write path was never reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/Unavailable'
 
   # ---------------------------------------------------------------------
   # ee: identity / contract introspection
@@ -4008,6 +4182,93 @@ components:
           type: integer
           format: int64
           description: The log index that last wrote this record.
+
+    SourceWrite:
+      type: object
+      description: >
+        A source declaration: `POST /admin/sources` upserts by `id`. Fields
+        left out take their documented defaults (`mode: pinned`, `onDrift:
+        overwrite`) — the same defaults the server applies when they are
+        absent from the wire — so a minimal `{id, uri}` body is a complete,
+        valid declaration.
+      required: [id, uri]
+      properties:
+        id:
+          type: string
+          description: >
+            The source's id; unique within the caller's tenant, at most 128
+            characters drawn from `[A-Za-z0-9._-]`.
+        uri:
+          type: string
+          description: >
+            The URI to pull from. Must not carry embedded userinfo
+            (`user:pass@host`) — refused before the write ever reaches the
+            replicated log, not even as a committed-but-failed entry; name
+            a credential with `authRef` instead.
+        mode:
+          type: string
+          enum: [pinned, tracking]
+          description: Explicit pulls only (the default), or scheduled polls on `pollSecs`.
+        authRef:
+          type: string
+          description: >
+            The **name** of a credential resolved at fetch time, never the
+            credential itself. Refused if the URI's scheme has no provider
+            that consumes one.
+        onDrift:
+          type: string
+          enum: [overwrite, skip, fail]
+          description: What a pull does when this source's imposters were hand-edited since it last applied.
+        pollSecs:
+          type: integer
+          format: int64
+          description: >
+            Poll interval for a `tracking` source; refused on any other
+            mode, and refused below the server's poll-interval floor.
+
+    PullReport:
+      type: object
+      description: >
+        What one pull did, as reported by `POST /admin/sources/{sourceId}/pull`.
+      required: [revision, digest, unchanged, skipped, changed]
+      properties:
+        revision:
+          type: integer
+          format: int64
+          description: >
+            The applying log index, or the source's last one when the
+            digest short-circuit meant nothing was written.
+        version:
+          type: string
+          description: The version label the source's document reported, when it names one.
+        digest:
+          type: string
+          description: Content digest of what was fetched.
+        unchanged:
+          type: boolean
+          description: >
+            True when the fetched content matched what the source last
+            applied, so no log entry was written.
+        skipped:
+          type: boolean
+          description: >
+            True when the pull committed a decision *not* to apply — a
+            drifted source under `onDrift: skip`. Distinct from
+            `unchanged`: a skip did reach the log, and the fleet does not
+            hold this content.
+        changed:
+          type: array
+          items:
+            type: integer
+          description: The ports this pull created, replaced or removed. Empty when nothing was applied.
+        warnings:
+          type: array
+          items:
+            type: string
+          description: >
+            Anything the document declared that a clustered pull does not
+            apply (e.g. a `routes` or `intercept` block). Absent entirely
+            when empty, never `[]`.
 
     SourcesNodeLocal:
       type: object
