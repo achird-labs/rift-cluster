@@ -19,6 +19,7 @@ import {
   type ResponseLabel,
   type ResponseModel,
   describeResponses,
+  foreignBehaviorsOf,
   projectResponses,
   renderResponses,
 } from "../features/stubs/responses.ts";
@@ -253,6 +254,16 @@ export function StubEditor({
    * a proxy and where it points without reading the JSON.
    */
   const responseLabels = parsed.ok ? describeResponses(parsed.value) : [];
+  /*
+   * Per-response, the behaviours the form does not edit (#249 AC5). Kept beside the labels rather
+   * than folded into them because it answers a different question: `kind` says what the response
+   * IS, this says what else it runs on the way out.
+   */
+  const responseExtras: string[][] = parsed.ok
+    ? (((parsed.value as { responses?: unknown }).responses as unknown[] | undefined) ?? []).map(
+        foreignBehaviorsOf,
+      )
+    : [];
 
   /*
    * Advisory lint, re-run as the document changes. Deliberately not gating the save button: the
@@ -372,7 +383,7 @@ export function StubEditor({
           <strong>Raw JSON only.</strong> This stub carries fields the form does not model, so
           editing it through the form would drop them. Unmodelled: {unmodelledKeys.join(", ")}
           {responseLabels.length === 0 ? null : (
-            <ResponseLabels labels={responseLabels} />
+            <ResponseLabels labels={responseLabels} extras={responseExtras} />
           )}
         </div>
       ) : null}
@@ -557,15 +568,25 @@ function Summary({
  * from the JSON what kind of responses they are looking at. Read-only by construction — there is no
  * `onChange` here, so nothing this renders can write to the document.
  */
-function ResponseLabels({ labels }: { labels: ResponseLabel[] }): ReactNode {
+function ResponseLabels({
+  labels,
+  extras,
+}: {
+  labels: ResponseLabel[];
+  extras: string[][];
+}): ReactNode {
   return (
     <ul className="response-labels" data-testid="stub-response-labels">
-      {labels.map((label) => (
-        <li key={label.index}>
-          Response {label.index + 1}: <b>{label.kind}</b>
-          {label.detail === "" ? null : ` — ${label.detail}`}
-        </li>
-      ))}
+      {labels.map((label) => {
+        const runs = extras[label.index] ?? [];
+        return (
+          <li key={label.index}>
+            Response {label.index + 1}: <b>{label.kind}</b>
+            {label.detail === "" ? null : ` — ${label.detail}`}
+            {runs.length === 0 ? null : <> · also runs: <b>{runs.join(", ")}</b></>}
+          </li>
+        );
+      })}
     </ul>
   );
 }

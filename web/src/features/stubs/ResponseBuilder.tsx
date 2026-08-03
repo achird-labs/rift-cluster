@@ -1,7 +1,14 @@
 import { type ReactNode, useId, useState } from "react";
 
 import {
+  FAULT_KINDS,
+  type BehaviorModel,
+  type WaitModel,
+  canonicalFaultKind,
+} from "./behaviors.ts";
+import {
   DEFAULT_STATUS_CODE,
+  hasIsBody,
   type ResponseBody,
   type ResponseHeader,
   type ResponseModel,
@@ -28,6 +35,10 @@ function removeAt<T>(list: readonly T[], index: number): T[] {
 
 function isBodyKind(value: string): value is ResponseBody["kind"] {
   return value === "absent" || value === "text" || value === "json";
+}
+
+function isWaitKind(value: string): value is WaitModel["kind"] {
+  return value === "none" || value === "fixed" || value === "range";
 }
 
 /** The sentence `StubEditor`'s `Summary` shows — exported so it stays derived from one place. */
@@ -168,6 +179,150 @@ function ResponseCard({
     onChange({ ...item, body });
   };
 
+  // The current delay, defaulted rather than read straight off `item.behaviors` — a response with
+  // only `repeat` set (or no `_behaviors` key at all) still has to show the delay select at "None".
+  const wait: WaitModel = item.behaviors?.wait ?? { kind: "none" };
+
+  const onDelayKindChange = (kind: WaitModel["kind"]): void => {
+    if (kind === "none") {
+      if (item.behaviors === null) return;
+      // Mirrors the repeat field's own emptiness: a delay-less, repeat-less behaviours object is
+      // nothing the source ever had, so it is not invented here either.
+      if (item.behaviors.repeat === null) {
+        onChange({ ...item, behaviors: null });
+        return;
+      }
+      onChange({
+        ...item,
+        behaviors: {
+          ...item.behaviors,
+          wait: { kind: "none" },
+          order: item.behaviors.order.filter((key) => key !== "wait"),
+        },
+      });
+      return;
+    }
+    const nextWait: WaitModel = kind === "fixed" ? { kind: "fixed", ms: 0 } : { kind: "range", min: 0, max: 0 };
+    // A newly created `_behaviors` object always uses the `_behaviors` spelling — the canonical one,
+    // per behaviors.ts — since there is no source spelling to preserve for a key that did not exist.
+    const base: BehaviorModel =
+      item.behaviors ?? { spelling: "_behaviors", order: [], wait: { kind: "none" }, repeat: null };
+    onChange({
+      ...item,
+      behaviors: {
+        ...base,
+        wait: nextWait,
+        order: base.order.includes("wait") ? base.order : [...base.order, "wait"],
+      },
+    });
+  };
+
+  // `raw === ""` is a no-op rather than a write, for the fixed/range fields below: `WaitModel` has
+  // no "empty" ms/min/max, so treating a mid-clear keystroke as 0 would fight the operator typing a
+  // fresh number over a cleared box. Skipping the write leaves the DOM's own value alone until the
+  // next keystroke parses, the same trick `JsonBodyField` uses for its textarea.
+  const onFixedMsChange = (raw: string): void => {
+    const behaviors = item.behaviors;
+    if (behaviors === null || behaviors.wait.kind !== "fixed" || raw === "") return;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return;
+    onChange({ ...item, behaviors: { ...behaviors, wait: { kind: "fixed", ms: parsed } } });
+  };
+
+  const onRangeBoundChange = (bound: "min" | "max", raw: string): void => {
+    const behaviors = item.behaviors;
+    if (behaviors === null || behaviors.wait.kind !== "range" || raw === "") return;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return;
+    const current = behaviors.wait;
+    const nextWait: WaitModel =
+      bound === "min"
+        ? { kind: "range", min: parsed, max: current.max }
+        : { kind: "range", min: current.min, max: parsed };
+    onChange({ ...item, behaviors: { ...behaviors, wait: nextWait } });
+  };
+
+  const onRepeatChange = (raw: string): void => {
+    if (raw === "") {
+      if (item.behaviors === null) return;
+      onChange({
+        ...item,
+        behaviors: {
+          ...item.behaviors,
+          repeat: null,
+          order: item.behaviors.order.filter((key) => key !== "repeat"),
+        },
+      });
+      return;
+    }
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return;
+    const base: BehaviorModel =
+      item.behaviors ?? { spelling: "_behaviors", order: [], wait: { kind: "none" }, repeat: null };
+    onChange({
+      ...item,
+      behaviors: {
+        ...base,
+        repeat: parsed,
+        order: base.order.includes("repeat") ? base.order : [...base.order, "repeat"],
+      },
+    });
+  };
+
+  /*
+   * Which fault form actually FIRES on this response.
+   *
+   * The engine dispatches `is > proxy > inject > fault`, so a top-level `fault` key beside an `is`
+   * is dead — it never fires, and `StubResponseOut`'s `Is` arm drops it entirely, so it does not
+   * even survive the next read. `_rift.fault.tcp` is the opposite: `raw.rift` is handed straight to
+   * `new_is(..., raw.rift)`, so it fires alongside a body. Writing `responseKey` on a response that
+   * has a body would therefore configure nothing at all while the panel claimed otherwise.
+   */
+  const faultFiresAsRift = hasIsBody(item);
+
+  const onFaultKindChange = (raw: string): void => {
+    if (raw === "") {
+      onChange({ ...item, fault: null });
+      return;
+    }
+    // Changing the kind keeps whichever form is already in the document — downgrading a working
+    // `_rift` fault to the dead top-level key would silently switch off config that was correct.
+    const current = item.fault;
+    if (current !== null && current.form === "riftObject") {
+      onChange({ ...item, fault: { ...current, kind: raw } });
+      return;
+    }
+    const form = faultFiresAsRift ? "riftString" : "responseKey";
+    onChange({ ...item, fault: { form, kind: raw } });
+  };
+
+  const onFaultProbabilityChange = (raw: string): void => {
+    const fault = item.fault;
+    if (fault === null) return;
+    if (raw === "") {
+      // Clearing a probability that was actually set is itself an edit — but it must land on a form
+      // that still fires. Collapsing to the top-level `fault` key here would switch the fault off
+      // on any response with a body, which is every response the panel is normally open on.
+      if (fault.form === "riftObject") {
+        const form = faultFiresAsRift ? "riftString" : "responseKey";
+        onChange({ ...item, fault: { form, kind: fault.kind } });
+      }
+      return;
+    }
+    const parsed = Number(raw);
+    /*
+     * Range-checked here, not just via the input's `min`/`max`: those attributes do not stop the
+     * operator typing `1.5`, and the engine — and `parseRiftTcpFault` with it — refuses a
+     * probability outside 0..1. Writing one anyway would produce a document the form itself can no
+     * longer read, so the panel would vanish into raw-only mid-keystroke. Skipping the write leaves
+     * the box showing what they typed until it becomes valid.
+     */
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) return;
+    onChange({ ...item, fault: { form: "riftObject", kind: fault.kind, probability: parsed } });
+  };
+
+  const faultSelectValue = item.fault === null ? "" : (canonicalFaultKind(item.fault.kind) ?? "");
+
   return (
     <div className="response-card" data-testid={`response-card-${index}`}>
       <div className="response-card-header">
@@ -292,6 +447,139 @@ function ResponseCard({
           onChange={(value) => onChange({ ...item, body: { kind: "json", value } })}
         />
       ) : null}
+
+      {/*
+       * Collapsed by default: a plain status/headers/body stub — the common case — never shows a
+       * delay or a fault to worry about. `<details>` rather than a toggle button of our own so the
+       * open/closed state needs no model and no state hook of its own.
+       */}
+      <details className="response-chaos" data-testid={`response-chaos-${index}`}>
+        <summary>Latency & faults</summary>
+
+        <div className="field">
+          <label htmlFor={`${uid}-delay-kind`}>Delay for response {n}</label>
+          <select
+            id={`${uid}-delay-kind`}
+            value={wait.kind}
+            onChange={(event) => {
+              const value = event.target.value;
+              if (isWaitKind(value)) onDelayKindChange(value);
+            }}
+          >
+            <option value="none">None</option>
+            <option value="fixed">Fixed</option>
+            <option value="range">Random range</option>
+          </select>
+        </div>
+
+        {wait.kind === "fixed" ? (
+          <div className="field">
+            <label htmlFor={`${uid}-delay-ms`}>Delay milliseconds for response {n}</label>
+            <input
+              id={`${uid}-delay-ms`}
+              type="number"
+              value={wait.ms}
+              onChange={(event) => onFixedMsChange(event.target.value)}
+            />
+          </div>
+        ) : null}
+
+        {wait.kind === "range" ? (
+          <>
+            <div className="field">
+              <label htmlFor={`${uid}-delay-min`}>Minimum delay milliseconds for response {n}</label>
+              <input
+                id={`${uid}-delay-min`}
+                type="number"
+                value={wait.min}
+                onChange={(event) => onRangeBoundChange("min", event.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor={`${uid}-delay-max`}>Maximum delay milliseconds for response {n}</label>
+              <input
+                id={`${uid}-delay-max`}
+                type="number"
+                value={wait.max}
+                onChange={(event) => onRangeBoundChange("max", event.target.value)}
+              />
+            </div>
+          </>
+        ) : null}
+
+        <div className="field">
+          <label htmlFor={`${uid}-repeat`}>Repeat count for response {n}</label>
+          <input
+            id={`${uid}-repeat`}
+            type="number"
+            value={item.behaviors?.repeat ?? ""}
+            onChange={(event) => onRepeatChange(event.target.value)}
+          />
+        </div>
+        <p className="muted">
+          This response is served this many times before the cycle advances to the next response.
+        </p>
+
+        <div className="field">
+          <label htmlFor={`${uid}-fault-kind`}>Fault for response {n}</label>
+          <select
+            id={`${uid}-fault-kind`}
+            value={faultSelectValue}
+            onChange={(event) => onFaultKindChange(event.target.value)}
+          >
+            <option value="">None</option>
+            {FAULT_KINDS.map((kind) => (
+              <option key={kind} value={kind}>
+                {kind}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {item.fault !== null ? (
+          <div className="field">
+            <label htmlFor={`${uid}-fault-probability`}>Fault probability for response {n}</label>
+            <input
+              id={`${uid}-fault-probability`}
+              type="number"
+              step={0.01}
+              min={0}
+              max={1}
+              value={item.fault.form === "riftObject" ? item.fault.probability : ""}
+              onChange={(event) => onFaultProbabilityChange(event.target.value)}
+            />
+          </div>
+        ) : null}
+
+        {item.fault !== null ? (
+          <div className="banner warn" data-testid={`response-fault-warning-${index}`}>
+            <span className="b-glyph" aria-hidden="true">
+              ▲
+            </span>
+            {item.fault.form === "responseKey" && faultFiresAsRift ? (
+              /*
+               * A document that is already in the dead shape — a top-level `fault` beside an `is`.
+               * The engine dispatches `is` first and never reaches the fault, and drops the key on
+               * the next read. The panel must not show this as an armed fault: saying "this replaces
+               * the response" about a key that does nothing is worse than saying nothing at all.
+               * The picker never writes this shape; only a hand-authored stub can arrive in it.
+               */
+              <div>
+                <strong>This fault never fires.</strong> The response also has a status, headers or
+                a body, and the engine answers with those — a top-level <code>fault</code> is only
+                reached when there is no response to send, and it is dropped the next time this
+                imposter is read. Pick the fault again to rewrite it as{" "}
+                <code>_rift.fault.tcp</code>, which does fire alongside a body.
+              </div>
+            ) : (
+              <div>
+                This response returns a connection-level fault instead of the status, headers and
+                body above — not in addition to them.
+              </div>
+            )}
+          </div>
+        ) : null}
+      </details>
     </div>
   );
 }

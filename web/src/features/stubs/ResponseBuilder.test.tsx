@@ -5,6 +5,7 @@ import { type ReactNode, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ResponseBuilder, describeResponseList } from "./ResponseBuilder.tsx";
+import { FAULT_KINDS } from "./behaviors.ts";
 import { type ResponseModel, blankResponse, renderResponses } from "./responses.ts";
 
 afterEach(cleanup);
@@ -291,6 +292,198 @@ describe("AC3 — a JSON body is edited as JSON and written back as a JSON value
     await user.type(screen.getByRole("textbox", { name: "Body for response 1" }), "hello");
 
     expect(last()?.[0]?.body).toEqual({ kind: "text", text: "hello" });
+  });
+});
+
+describe("#249 — the latency & faults panel", () => {
+  it("builds a fixed delay on a response that had no behaviours key at all", async () => {
+    const user = userEvent.setup();
+    const { last } = mount([response(200)]);
+
+    await user.selectOptions(screen.getByLabelText("Delay for response 1"), "fixed");
+    const ms = screen.getByLabelText("Delay milliseconds for response 1");
+    await user.clear(ms);
+    await user.type(ms, "250");
+
+    expect(last()?.[0]?.behaviors).toEqual({
+      spelling: "_behaviors",
+      order: ["wait"],
+      wait: { kind: "fixed", ms: 250 },
+      repeat: null,
+    });
+    // `order` must never name a key whose value is absent, or the round-trip breaks.
+    expect(renderResponses(last() ?? [])).toEqual([{ is: { statusCode: 200 }, _behaviors: { wait: 250 } }]);
+  });
+
+  it("builds a random range", async () => {
+    const user = userEvent.setup();
+    const { last } = mount([response(200)]);
+
+    await user.selectOptions(screen.getByLabelText("Delay for response 1"), "range");
+    const min = screen.getByLabelText("Minimum delay milliseconds for response 1");
+    const max = screen.getByLabelText("Maximum delay milliseconds for response 1");
+    await user.clear(min);
+    await user.type(min, "10");
+    await user.clear(max);
+    await user.type(max, "100");
+
+    expect(last()?.[0]?.behaviors?.wait).toEqual({ kind: "range", min: 10, max: 100 });
+  });
+
+  it("removes the behaviours key entirely when the last behaviour is cleared", async () => {
+    // Leaving `_behaviors: {}` behind would put a key in the document that the operator never
+    // wrote and cannot see — and that they would then find in an export.
+    const user = userEvent.setup();
+    const { last } = mount([
+      response(200, {
+        behaviors: { spelling: "_behaviors", order: ["wait"], wait: { kind: "fixed", ms: 5 }, repeat: null },
+      }),
+    ]);
+
+    await user.selectOptions(screen.getByLabelText("Delay for response 1"), "none");
+
+    expect(last()?.[0]?.behaviors).toBeNull();
+    expect(renderResponses(last() ?? [])).toEqual([{ is: { statusCode: 200 } }]);
+  });
+
+  it("keeps the behaviours key when a repeat survives the delay being cleared", async () => {
+    const user = userEvent.setup();
+    const { last } = mount([
+      response(200, {
+        behaviors: { spelling: "_behaviors", order: ["wait", "repeat"], wait: { kind: "fixed", ms: 5 }, repeat: 3 },
+      }),
+    ]);
+
+    await user.selectOptions(screen.getByLabelText("Delay for response 1"), "none");
+
+    expect(last()?.[0]?.behaviors?.repeat).toBe(3);
+    expect(last()?.[0]?.behaviors?.order).toEqual(["repeat"]);
+    expect(renderResponses(last() ?? [])).toEqual([{ is: { statusCode: 200 }, _behaviors: { repeat: 3 } }]);
+  });
+
+  it("offers every fault kind the engine defines, by its canonical name", () => {
+    mount([response(200)]);
+    const select = screen.getByLabelText("Fault for response 1") as HTMLSelectElement;
+    const values = [...select.options].map((option) => option.value);
+    expect(values).toEqual(["", ...FAULT_KINDS]);
+  });
+
+  it("selects a fault and says, visibly, that it REPLACES the response (AC4)", async () => {
+    const user = userEvent.setup();
+    const { last } = mount([response(200)]);
+
+    expect(screen.queryByTestId("response-fault-warning-0")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("Fault for response 1"), "EMPTY_RESPONSE");
+
+    /*
+     * `riftString`, NOT the top-level `fault` key. The engine dispatches `is > proxy > inject >
+     * fault`, so a top-level fault beside a body never fires and is dropped on the next read;
+     * `_rift.fault.tcp` is handed to `new_is(..., raw.rift)` and does fire. Writing the dead form
+     * here would have configured nothing while the banner claimed the response was replaced.
+     */
+    expect(last()?.[0]?.fault).toEqual({ form: "riftString", kind: "EMPTY_RESPONSE" });
+    // Visible text, not a tooltip: a fault silently discarding the status/headers/body above it is
+    // the single most surprising thing this panel can do.
+    const warning = screen.getByTestId("response-fault-warning-0");
+    expect(warning.textContent).toMatch(/instead of|replaces/i);
+  });
+
+  it("switches to the probabilistic form when a probability is given, and back when cleared", async () => {
+    const user = userEvent.setup();
+    const { last } = mount([response(200, { fault: { form: "responseKey", kind: "EMPTY_RESPONSE" } })]);
+
+    const probability = screen.getByLabelText("Fault probability for response 1");
+    await user.type(probability, "0.25");
+    expect(last()?.[0]?.fault).toEqual({
+      form: "riftObject",
+      kind: "EMPTY_RESPONSE",
+      probability: 0.25,
+    });
+
+    // Clearing lands back on `riftString`, the form that still fires beside a body — not on the
+    // top-level key, which would silently switch the fault off.
+    await user.clear(probability);
+    expect(last()?.[0]?.fault).toEqual({ form: "riftString", kind: "EMPTY_RESPONSE" });
+  });
+
+  it("writes the top-level fault key only on a response that has no body to answer with", async () => {
+    // There, `fault` IS the response — `StubResponse::Fault` — and the Rift extension would instead
+    // make the engine build a `RiftScript`.
+    const user = userEvent.setup();
+    const { last } = mount([
+      response(200, { wrapped: false, statusCode: null, body: { kind: "absent" } }),
+    ]);
+
+    await user.selectOptions(screen.getByLabelText("Fault for response 1"), "EMPTY_RESPONSE");
+
+    expect(last()?.[0]?.fault).toEqual({ form: "responseKey", kind: "EMPTY_RESPONSE" });
+  });
+
+  it("does not downgrade a working _rift fault when only the kind is changed", async () => {
+    // The regression that destroys config that was already correct: rewriting a firing
+    // `_rift.fault.tcp` into the dead top-level key just because the operator picked another kind.
+    const user = userEvent.setup();
+    const { last } = mount([
+      response(200, { fault: { form: "riftObject", kind: "EMPTY_RESPONSE", probability: 0.5 } }),
+    ]);
+
+    await user.selectOptions(screen.getByLabelText("Fault for response 1"), "CONNECTION_RESET_BY_PEER");
+
+    expect(last()?.[0]?.fault).toEqual({
+      form: "riftObject",
+      kind: "CONNECTION_RESET_BY_PEER",
+      probability: 0.5,
+    });
+  });
+
+  it("says a hand-authored top-level fault beside a body never fires, rather than calling it armed", async () => {
+    /*
+     * The picker never writes this shape, but a hand-written stub can arrive in it, and it is the
+     * engine's sharpest footgun here: the fault is inert AND disappears on the next read. Claiming
+     * "this replaces the response" about it would be actively misleading.
+     */
+    mount([response(200, { fault: { form: "responseKey", kind: "EMPTY_RESPONSE" } })]);
+
+    const warning = screen.getByTestId("response-fault-warning-0");
+    expect(warning.textContent).toMatch(/never fires/i);
+    expect(warning.textContent).not.toMatch(/instead of the status/i);
+  });
+
+  it("refuses a probability outside 0..1 rather than writing a document it cannot read back", async () => {
+    /*
+     * The input's `min`/`max` attributes do not stop the operator typing `1.5`. The engine refuses
+     * such a probability and so does `parseRiftTcpFault`, so writing it would produce a document
+     * this very form can no longer project — the panel would vanish into raw-only mid-keystroke.
+     */
+    const user = userEvent.setup();
+    const { onChange } = mount([
+      response(200, { fault: { form: "responseKey", kind: "EMPTY_RESPONSE" } }),
+    ]);
+
+    // `5`, not `1.5`: typing is keystroke by keystroke, and `1.5` passes through `1` — which is a
+    // perfectly valid probability that the field is right to accept. A value with no valid prefix
+    // is the only one that actually exercises the guard.
+    await user.type(screen.getByLabelText("Fault probability for response 1"), "5");
+
+    // Nothing is proposed at all — not a corrected value, not the old one. Asserting over every
+    // call rather than the last: one bad proposal mid-sequence is enough to break the document.
+    expect(onChange.mock.calls).toEqual([]);
+  });
+
+  it("shows an aliased fault kind under its canonical name without rewriting the document", async () => {
+    // `reset` is a spelling the engine accepts. The picker shows the canonical name so the operator
+    // knows what it is, but the document keeps its own spelling until they actually change it.
+    const { last } = mount([response(200, { fault: { form: "responseKey", kind: "reset" } })]);
+
+    const select = screen.getByLabelText("Fault for response 1") as HTMLSelectElement;
+    expect(select.value).toBe("CONNECTION_RESET_BY_PEER");
+    expect(last()).toBeUndefined();
+  });
+
+  it("is collapsed by default, so a plain stub stays plain", () => {
+    mount([response(200)]);
+    const panel = screen.getByTestId("response-chaos-0") as HTMLDetailsElement;
+    expect(panel.open).toBe(false);
   });
 });
 
