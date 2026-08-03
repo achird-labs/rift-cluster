@@ -1,0 +1,26 @@
+# On-prem / bare-metal.
+#
+#   helm install rift oci://ghcr.io/achird-labs/charts/rift-cluster -f values-onprem.yaml
+#
+# The assumption that differs from the cloud files: your StorageClass is probably not zonal, so the
+# default zone-spread constraint has nothing to spread across. It is left on because
+# `whenUnsatisfiable: ScheduleAnyway` makes it a no-op rather than a scheduling failure when the
+# topology label is absent.
+
+storage:
+  # Name it. Relying on the cluster default is how a StatefulSet ends up on a StorageClass whose
+  # reclaim policy nobody checked.
+  className: local-path
+  size: 20Gi
+
+clusterSecret:
+  # Create this out of band: `kubectl create secret generic rift-cluster-secret
+  #   --from-literal=cluster-secret="$(openssl rand -base64 32)"`
+  existingSecret: rift-cluster-secret
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    memory: 2Gi

@@ -1,0 +1,38 @@
+# AWS / EKS.
+#
+#   helm install rift oci://ghcr.io/achird-labs/charts/rift-cluster -f values-eks.yaml
+#
+# See `docs/architecture/14-cloud-deployment.md` for the EKS reference this mirrors, including the
+# IRSA and External Secrets wiring that produces the Secret named below.
+
+image:
+  # ECR pull-through or a private mirror goes here if you do not pull from GHCR directly.
+  repository: ghcr.io/achird-labs/rift-cluster-server
+
+storage:
+  # gp3 over gp2: independent IOPS/throughput, and cheaper at the same size. EBS volumes are
+  # ZONAL — a pod whose node dies in one AZ cannot reattach its volume in another, which is exactly
+  # why the zone spread below is not cosmetic. Ch.14 covers the trade in full.
+  className: gp3
+  size: 20Gi
+
+clusterSecret:
+  # Produced by External Secrets from Secrets Manager / Parameter Store — not by this chart. See
+  # Ch.14's checklist item on never inlining the cluster secret.
+  existingSecret: rift-cluster-secret
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app: rift-cluster-server
+
+service:
+  type: ClusterIP
+  annotations:
+    # An internal NLB. Deliberately internal: the admin API is a control plane, and Ch.14's position
+    # is that it does not belong on the public internet even behind auth.
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb

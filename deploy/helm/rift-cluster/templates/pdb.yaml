@@ -1,0 +1,16 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "rift-cluster.fullname" . }}
+  labels:
+    {{- include "rift-cluster.labels" . | nindent 4 }}
+spec:
+  # Expressed as maxUnavailable rather than minAvailable so it stays correct when `replicas`
+  # changes: "one voter at a time" is the invariant, and with an odd replica count that always
+  # leaves a majority for Raft to commit with during a voluntary drain.
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "rift-cluster.selectorLabels" . | nindent 6 }}
+{{- end }}

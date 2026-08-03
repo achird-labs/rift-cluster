@@ -1,0 +1,47 @@
+# TWO Services, and the split is load-bearing.
+#
+# Peers must be able to resolve and dial each other BEFORE anyone is Ready — during a cold start no
+# node is Ready until it has joined, so a Service that hid not-ready pods would deadlock the whole
+# cluster. Client traffic must do the opposite and respect readiness, because routing to a node that
+# has not finished converging is exactly what /readyz exists to stop.
+#
+# One Service cannot be both. Hence one headless with `publishNotReadyAddresses`, and one ordinary.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rift-cluster.peerService" . }}
+  labels:
+    {{- include "rift-cluster.labels" . | nindent 4 }}
+spec:
+  # Headless: peers resolve this name straight to pod IPs. It is what the seed address points at,
+  # and it is why `publishNotReadyAddresses` below is not optional.
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "rift-cluster.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: cluster
+      port: 4790
+      targetPort: cluster
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rift-cluster.fullname" . }}
+  labels:
+    {{- include "rift-cluster.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "rift-cluster.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: admin
+      port: 2525
+      targetPort: admin
+    - name: metrics
+      port: 9090
+      targetPort: metrics

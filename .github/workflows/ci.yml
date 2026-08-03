@@ -493,3 +493,94 @@ jobs:
             web/playwright-report/
             web/test-results/
           retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Helm chart (#267)
+  # ---------------------------------------------------------------------------
+  # Cheap and cluster-free: this validates the chart's SCHEMA across a values matrix, exactly the bar
+  # `deploy/k8s/statefulset.yaml` already meets — now across the axes a chart adds. It does not, and
+  # cannot here, prove the cluster forms; `deploy/README.md` carries that caveat verbatim.
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Install kubeconform (pinned)
+        run: |
+          set -euo pipefail
+          version=v0.6.7
+          curl -sSfL "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      - name: helm lint
+        run: helm lint deploy/helm/rift-cluster --set clusterSecret.existingSecret=ci
+
+      # The guard is a feature, so it is tested like one. With no secret configured the chart must
+      # REFUSE to render rather than install a cluster whose peer authentication is unconfigured —
+      # and `helm install` makes that a single command, so a chart that rendered anyway would be
+      # worse than the raw manifest it replaces.
+      - name: A chart with no cluster secret must refuse to render
+        run: |
+          set -euo pipefail
+          if helm template r deploy/helm/rift-cluster >/dev/null 2>&1; then
+            echo "FAIL: the chart rendered with no clusterSecret configured" >&2
+            exit 1
+          fi
+          echo "PASS: refused, as it should"
+
+      # Rendered to a FILE rather than piped: kubeconform reading a pipe reports "0 resources found"
+      # and exits 0, which is a summary that looks like a pass and checks nothing. A file also leaves
+      # the rendered manifest inspectable in the log when a case fails.
+      #
+      # `-skip ServiceMonitor`: a Prometheus Operator CRD, so there is no upstream schema to validate
+      # it against. Skipping it by name keeps `-strict` in force for everything else, which
+      # `-ignore-missing-schemas` would not.
+      - name: helm template + kubeconform across the values matrix
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/rift-cluster
+          render() {
+            local name="$1"; shift
+            echo "--- ${name} ---"
+            helm template r "$chart" "$@" > "/tmp/${name}.yaml"
+            kubeconform -strict -summary -skip ServiceMonitor "/tmp/${name}.yaml"
+          }
+
+          render defaults --set clusterSecret.existingSecret=ci
+          render everything-on \
+            --set clusterSecret.create=true --set clusterSecret.value=ci \
+            --set replicas=5 --set storage.className=gp3 \
+            --set metrics.serviceMonitor.enabled=true \
+            --set serviceAccount.create=true \
+            --set service.type=LoadBalancer \
+            --set leaveTimeoutSeconds=45
+          render single-node --set clusterSecret.existingSecret=ci --set replicas=1 --set podDisruptionBudget.enabled=false
+
+          for env in onprem eks aks; do
+            render "values-${env}" -f "${chart}/values-${env}.yaml"
+          done
+
+      # The rule the chart exists to make unbreakable, asserted rather than trusted:
+      # terminationGracePeriodSeconds must be 2 x leaveTimeoutSeconds + 10. A template edit that
+      # hard-coded it back to a literal would pass every schema check above and silently reintroduce
+      # the SIGKILL-mid-drain the raw manifest's comment warns about.
+      - name: The termination grace period stays derived from the leave timeout
+        run: |
+          set -euo pipefail
+          for leave in 15 30 45; do
+            want=$(( 2 * leave + 10 ))
+            got="$(helm template r deploy/helm/rift-cluster \
+              --set clusterSecret.existingSecret=ci \
+              --set "leaveTimeoutSeconds=${leave}" \
+              | grep -m1 'terminationGracePeriodSeconds:' | tr -dc '0-9')"
+            if [ "$got" != "$want" ]; then
+              echo "FAIL: leaveTimeoutSeconds=${leave} produced grace ${got}, expected ${want}" >&2
+              exit 1
+            fi
+            echo "ok: leave=${leave} -> grace=${got}"
+          done

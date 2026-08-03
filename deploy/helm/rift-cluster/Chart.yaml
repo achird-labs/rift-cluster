@@ -1,0 +1,23 @@
+apiVersion: v2
+name: rift-cluster
+description: RiftCluster — a clustered mock server with an embedded web console
+type: application
+
+# Chart version and app version move together, and the release lane packages with
+# `--version`/`--app-version` from the tag, so a chart can never claim an app version that was
+# never published. `image.tag` defaults to this appVersion for the same reason.
+version: 0.1.0
+appVersion: "0.1.0"
+
+kubeVersion: ">=1.27.0-0"
+
+home: https://github.com/achird-labs/rift-cluster
+sources:
+  - https://github.com/achird-labs/rift-cluster
+keywords:
+  - mock
+  - service-virtualization
+  - testing
+  - raft
+maintainers:
+  - name: achird-labs
