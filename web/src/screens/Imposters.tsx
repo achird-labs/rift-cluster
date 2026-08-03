@@ -6,6 +6,7 @@ import { IMPOSTER_COLUMNS } from "../app/contract.ts";
 import type { FleetReadState, FleetView } from "../app/fleetView.ts";
 import { viewConfidence } from "../app/fleetView.ts";
 import {
+  useClearRequests,
   useCreateImposter,
   useDeleteImposter,
   useFleetView,
@@ -13,10 +14,28 @@ import {
   useImposters,
   useLifecycleToggle,
   useReplaceImposters,
+  useSources,
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { toHash } from "../app/routing.ts";
+import { toHash, useHashQuery } from "../app/routing.ts";
 import { ImposterField } from "../components/imposterFields.tsx";
+import {
+  type BulkAction,
+  BulkBar,
+  BulkReport,
+  ImposterFilters,
+  SortHeader,
+} from "../components/imposterList.tsx";
+import { type BulkResult, runBulk } from "../features/imposters/bulk.ts";
+import {
+  EMPTY_QUERY,
+  actionablePorts,
+  decodeQuery,
+  encodeQuery,
+  sourceOwnedPorts,
+  unclassifiedCount,
+  visibleImposters,
+} from "../features/imposters/list.ts";
 import {
   Card,
   Confirm,
@@ -37,6 +56,7 @@ import {
   renderSetDocument,
 } from "../features/imposters/portable.ts";
 import { type Finding, lintStub } from "../features/stubs/lint.ts";
+import type { CommitOutcome } from "../features/writes/commit.ts";
 
 type Imposter = components["schemas"]["Imposter"];
 
@@ -99,7 +119,124 @@ export function Imposters(): ReactNode {
    * what stops the table going stale silently the day one of the grants moves.
    */
   const mayReplace = mayDelete;
+  const mayClear = can("requests.clear");
   const existingPorts = imposters.data?.flatMap((i) => (i.port === undefined ? [] : [i.port])) ?? [];
+
+  // ── Filter, sort, selection ───────────────────────────────────────────────
+  // The query lives in the URL so a filtered view is linkable and survives a reload; the screen
+  // holds no copy of it. `decodeQuery` is total, so a stale bookmark renders rather than throwing.
+  const [search, setSearch] = useHashQuery();
+  const query = decodeQuery(search);
+  const setQuery = (next: typeof query): void => setSearch(encodeQuery(next));
+
+  /*
+   * Provenance, joined rather than assumed: every `SourceRecord` carries the `ports` it owns, so the
+   * union of those IS the source-owned set. It needs `source.read`, which the imposter list itself
+   * does not, so a principal without it never issues the call and is never offered the filter — the
+   * same shape as the fleet-health read above.
+   */
+  const maySeeSources = can("source.read");
+  const sources = useSources({ enabled: maySeeSources });
+  const sourceOwned = sourceOwnedPorts(sources.data?.sources);
+
+  const all = imposters.data ?? [];
+  const rows = visibleImposters(all, query, sourceOwned);
+  const unclassified = unclassifiedCount(all, query, sourceOwned);
+
+  const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
+
+  /*
+   * A tick is dropped as soon as its imposter leaves the fleet.
+   *
+   * Selection is a set of bare port numbers, and ports are reused constantly — a source pull, an
+   * import, or another operator can recreate one. Without this, ticking 4545, watching it be
+   * deleted, and seeing a *different* imposter appear at 4545 leaves the new one silently ticked and
+   * one click from a bulk delete the operator never asked for. `effective` intersecting with the
+   * visible rows keeps the count honest and is exactly what hides that.
+   *
+   * Returns `current` unchanged when nothing was pruned, so this cannot loop.
+   */
+  const livePorts = actionablePorts(all);
+  const liveKey = livePorts.join(",");
+  useEffect(() => {
+    const live = new Set(livePorts);
+    setSelected((current) => {
+      const next = new Set([...current].filter((port) => live.has(port)));
+      return next.size === current.size ? current : next;
+    });
+    // Keyed on `liveKey`, not `livePorts`: the array is a fresh identity every render and would
+    // re-run this on every one.
+  }, [liveKey]);
+  const clearRequests = useClearRequests();
+  const [running, setRunning] = useState<BulkAction | null>(null);
+  const [progress, setProgress] = useState<{ completed: number; total: number } | null>(null);
+  const [report, setReport] = useState<{ result: BulkResult; verb: string } | null>(null);
+  const [confirmingBulk, setConfirmingBulk] = useState<BulkAction | null>(null);
+  const batchOwnsOutcome = running !== null || report !== null;
+
+  /*
+   * Selection is intersected with what the filter currently shows, every render.
+   *
+   * The acceptance criterion is that the count shown is the count acted on. Keeping a selection of
+   * rows that are no longer visible would break that in the most confusing possible way: narrow the
+   * filter, press Delete, and imposters you cannot see disappear. So narrowing the filter narrows
+   * the selection, and the number on the bar is always the number of rows on screen that are ticked.
+   */
+  const visiblePorts = new Set(actionablePorts(rows));
+  const effective = actionablePorts(rows).filter((port) => selected.has(port));
+  const allVisibleSelected = effective.length > 0 && effective.length === visiblePorts.size;
+
+  const bulkActions: BulkAction[] = [
+    ...(mayDelete
+      ? [{ key: "delete" as const, label: "Delete", verb: "deleted", destructive: true }]
+      : []),
+    ...(mayToggle
+      ? [
+          { key: "enable" as const, label: "Enable", verb: "enabled", destructive: false },
+          { key: "disable" as const, label: "Disable", verb: "disabled", destructive: false },
+        ]
+      : []),
+    ...(mayClear
+      ? [{ key: "clear" as const, label: "Clear request log", verb: "cleared", destructive: true }]
+      : []),
+  ];
+
+  // Exhaustive over the narrowed `BulkActionKey`, with no `default`. A fifth action whose case is
+  // forgotten is then a compile error rather than a silent fall-through to clearing request logs.
+  function callFor(action: BulkAction): (port: number) => Promise<CommitOutcome> {
+    switch (action.key) {
+      case "delete":
+        return (port) => remove.mutateAsync({ port });
+      case "enable":
+        return (port) => toggle.mutateAsync({ port, enable: true });
+      case "disable":
+        return (port) => toggle.mutateAsync({ port, enable: false });
+      case "clear":
+        return (port) => clearRequests.mutateAsync({ port });
+    }
+  }
+
+  async function runAction(action: BulkAction): Promise<void> {
+    const ports = [...effective];
+    setRunning(action);
+    setProgress({ completed: 0, total: ports.length });
+    setReport(null);
+    const result = await runBulk(ports, callFor(action), (completed, total) =>
+      setProgress({ completed, total }),
+    );
+    setRunning(null);
+    setProgress(null);
+    setReport({ result, verb: action.verb });
+    /*
+     * Only the items that actually landed leave the selection. A refused imposter stays ticked so
+     * the operator can retry it without hunting for it again, and a still-committing one stays
+     * because nobody has established what happened to it yet.
+     */
+    const settled = new Set(
+      result.results.filter((item) => item.outcome.kind === "done").map((item) => item.port),
+    );
+    setSelected((current) => new Set([...current].filter((port) => !settled.has(port))));
+  }
 
   return (
     <section className="screen">
@@ -148,11 +285,18 @@ export function Imposters(): ReactNode {
       {create.isError ? (
         <ErrorNote error={create.error} context="The imposter was not created" />
       ) : null}
-      {remove.isError ? (
+      {/*
+        Suppressed while a batch owns the outcome. These notes are the SINGLE-row vocabulary: during
+        a bulk run they report only the last item, name no port, and sit alongside a per-item report
+        that already says more — and they outlive dismissing it.
+      */}
+      {remove.isError && !batchOwnsOutcome ? (
         <ErrorNote error={remove.error} context="The imposter was not deleted" />
       ) : null}
       {create.data?.kind === "unobservable" ? <UnconfirmedNote reason={create.data.reason} /> : null}
-      {remove.data?.kind === "unobservable" ? <UnconfirmedNote reason={remove.data.reason} /> : null}
+      {remove.data?.kind === "unobservable" && !batchOwnsOutcome ? (
+        <UnconfirmedNote reason={remove.data.reason} />
+      ) : null}
 
       {creating ? (
         <NewImposter
@@ -190,8 +334,12 @@ export function Imposters(): ReactNode {
       )}
 
       {imposters.isError ? <ErrorNote error={imposters.error} context="Could not list imposters" /> : null}
-      {toggle.isError ? <ErrorNote error={toggle.error} context="That change did not take effect" /> : null}
-      {toggle.data?.kind === "unobservable" ? <UnconfirmedNote reason={toggle.data.reason} /> : null}
+      {toggle.isError && !batchOwnsOutcome ? (
+        <ErrorNote error={toggle.error} context="That change did not take effect" />
+      ) : null}
+      {toggle.data?.kind === "unobservable" && !batchOwnsOutcome ? (
+        <UnconfirmedNote reason={toggle.data.reason} />
+      ) : null}
 
       {imposters.isPending ? <p className="muted">Reading…</p> : null}
 
@@ -203,39 +351,159 @@ export function Imposters(): ReactNode {
       ) : null}
 
       {imposters.isSuccess && imposters.data.length > 0 ? (
-        <Card
-          title={`${imposters.data.length} imposter${imposters.data.length === 1 ? "" : "s"}`}
-          bleed
-        >
-          <div className="scroll-x">
-            <table className="dense">
-              <thead>
-                <tr>
-                  {IMPOSTER_COLUMNS.map((column) => (
-                    <th key={column.key} className={column.numeric ? "numeric" : undefined}>
-                      {column.label}
-                    </th>
+        <Card title="Imposters" bleed>
+          <ImposterFilters
+            query={query}
+            onChange={setQuery}
+            onReset={() => setQuery(EMPTY_QUERY)}
+            shown={rows.length}
+            total={all.length}
+            unclassified={unclassified}
+            showOwner={sourceOwned !== null}
+          />
+
+          {bulkActions.length > 0 ? (
+            <BulkBar
+              count={effective.length}
+              actions={bulkActions}
+              running={running}
+              progress={progress}
+              onAct={(action) => setConfirmingBulk(action)}
+              onClear={() => setSelected(new Set())}
+            />
+          ) : null}
+
+          {report === null ? null : (
+            <BulkReport
+              result={report.result}
+              verb={report.verb}
+              onDismiss={() => setReport(null)}
+            />
+          )}
+
+          {rows.length === 0 ? (
+            <p className="muted" data-testid="imposters-no-matches">
+              No imposter in this tenant matches that filter.
+            </p>
+          ) : (
+            <div className="scroll-x">
+              <table className="dense">
+                <thead>
+                  <tr>
+                    {bulkActions.length > 0 ? (
+                      <th className="select-col">
+                        {/*
+                          Select-all means "everything the current filter shows", which is what the
+                          label says out loud. Selecting rows the operator cannot see is the one
+                          behaviour a bulk delete must never have.
+                        */}
+                        <input
+                          type="checkbox"
+                          data-testid="imposter-select-all"
+                          aria-label={`Select all ${visiblePorts.size} shown`}
+                          checked={allVisibleSelected}
+                          disabled={running !== null || visiblePorts.size === 0}
+                          onChange={(event) =>
+                            /*
+                              Union in, and remove only what is shown — individual ticks accumulate
+                              across filter changes, so a select-all that REPLACED the set would
+                              silently discard ticks made under a previous filter. The two paths
+                              have to agree or the count is a lie in one of them.
+                            */
+                            setSelected((current) => {
+                              const next = new Set(current);
+                              for (const port of visiblePorts) {
+                                if (event.target.checked) next.add(port);
+                                else next.delete(port);
+                              }
+                              return next;
+                            })
+                          }
+                        />
+                      </th>
+                    ) : null}
+                    {IMPOSTER_COLUMNS.map((column) =>
+                      column.key === "port" || column.key === "name" || column.key === "stubs" ? (
+                        <SortHeader
+                          key={column.key}
+                          label={column.label}
+                          column={column.key}
+                          query={query}
+                          onChange={setQuery}
+                          numeric={column.numeric}
+                        />
+                      ) : (
+                        <th key={column.key} className={column.numeric ? "numeric" : undefined}>
+                          {column.label}
+                        </th>
+                      ),
+                    )}
+                    {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((imposter, index) => (
+                    <Row
+                      key={imposter.port ?? `unnamed-${index}`}
+                      imposter={imposter}
+                      mayToggle={mayToggle}
+                      mayDelete={mayDelete}
+                      busy={toggle.isPending}
+                      selectable={bulkActions.length > 0}
+                      selected={imposter.port !== undefined && selected.has(imposter.port)}
+                      selectionDisabled={running !== null}
+                      onSelect={(port, checked) =>
+                        setSelected((current) => {
+                          const next = new Set(current);
+                          if (checked) next.add(port);
+                          else next.delete(port);
+                          return next;
+                        })
+                      }
+                      onToggle={(port, enable) => toggle.mutate({ port, enable })}
+                      onDelete={() => setConfirming(imposter)}
+                    />
                   ))}
-                  {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
-                </tr>
-              </thead>
-              <tbody>
-                {imposters.data.map((imposter, index) => (
-                  <Row
-                    key={imposter.port ?? `unnamed-${index}`}
-                    imposter={imposter}
-                    mayToggle={mayToggle}
-                    mayDelete={mayDelete}
-                    busy={toggle.isPending}
-                    onToggle={(port, enable) => toggle.mutate({ port, enable })}
-                    onDelete={() => setConfirming(imposter)}
-                  />
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </tbody>
+              </table>
+            </div>
+          )}
         </Card>
       ) : null}
+
+      {confirmingBulk === null ? null : (
+        <Confirm
+          testId="confirm-bulk-imposters"
+          title={`${confirmingBulk.label} ${effective.length} imposter${effective.length === 1 ? "" : "s"}?`}
+          body={
+            <>
+              {/*
+                The exact count and, for a delete, the exact ports. There is no bulk endpoint — this
+                is one call per imposter, and some may be refused — so the dialog says that here
+                rather than letting a half-applied batch be the first the operator hears of it.
+              */}
+              This runs one request per imposter. Some may be refused; the batch does not stop at the
+              first failure, and every outcome is reported.
+              {confirmingBulk.key === "delete" ? (
+                <>
+                  {" "}
+                  Deleting removes each imposter, its stubs, its recorded requests and its flow state
+                  across the fleet. Nothing undoes it. Ports:{" "}
+                  <code data-testid="confirm-bulk-ports">{effective.join(", ")}</code>
+                </>
+              ) : null}
+            </>
+          }
+          confirmLabel={`${confirmingBulk.label} ${effective.length}`}
+          busy={running !== null}
+          onCancel={() => setConfirmingBulk(null)}
+          onConfirm={() => {
+            const action = confirmingBulk;
+            setConfirmingBulk(null);
+            void runAction(action);
+          }}
+        />
+      )}
     </section>
   );
 }
@@ -314,6 +582,10 @@ function Row({
   mayToggle,
   mayDelete,
   busy,
+  selectable,
+  selected,
+  selectionDisabled,
+  onSelect,
   onToggle,
   onDelete,
 }: {
@@ -321,6 +593,10 @@ function Row({
   mayToggle: boolean;
   mayDelete: boolean;
   busy: boolean;
+  selectable: boolean;
+  selected: boolean;
+  selectionDisabled: boolean;
+  onSelect: (port: number, checked: boolean) => void;
   onToggle: (port: number, enable: boolean) => void;
   onDelete: () => void;
 }): ReactNode {
@@ -329,6 +605,25 @@ function Row({
 
   return (
     <tr data-testid={`imposter-row-${port ?? "unnamed"}`}>
+      {selectable ? (
+        <td className="select-col">
+          {/*
+            No checkbox for an imposter with no port. Every bulk call is `/imposters/{port}`, so
+            there is nothing to send — and `actionablePorts` drops it on the other side, which is
+            what keeps the checkbox column and the acted-on set in agreement by construction.
+          */}
+          {port === undefined ? null : (
+            <input
+              type="checkbox"
+              data-testid={`imposter-select-${port}`}
+              aria-label={`Select ${label}`}
+              checked={selected}
+              disabled={selectionDisabled}
+              onChange={(event) => onSelect(port, event.target.checked)}
+            />
+          )}
+        </td>
+      ) : null}
       {IMPOSTER_COLUMNS.map((column) => (
         <td key={column.key} className={column.numeric ? "numeric" : undefined}>
           <ImposterField imposter={imposter} field={column.key} renderName={nameLink(imposter)} />

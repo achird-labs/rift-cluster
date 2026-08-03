@@ -31,8 +31,24 @@ const IMPOSTERS: Route = { screen: "imposters" };
  * `rust-embed` with an SPA fallback: a path-based route would be a real request the binary has to
  * recognise, and a hash never leaves the browser.
  */
+/**
+ * Screen *state* — a filter, a sort — rides in a query string after the route segments, and is
+ * deliberately NOT part of `Route`.
+ *
+ * `Route` answers "which screen, scoped to what", and every construction site of it (`nav.ts`, the
+ * back-links, this module's own fallback) means the screen and nothing else. Widening the union with
+ * a filter would make all of them state a filter they have no opinion about, and would give "the
+ * default view" two spellings. So the two are split: `parseHash` ignores the query string entirely,
+ * and a screen that has state reads it with `useHashQuery`.
+ */
+function splitQuery(hash: string): [string, string] {
+  const index = hash.indexOf("?");
+  return index === -1 ? [hash, ""] : [hash.slice(0, index), hash.slice(index + 1)];
+}
+
 export function parseHash(hash: string): Route {
-  const segments = hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+  const [path] = splitQuery(hash);
+  const segments = path.replace(/^#\/?/, "").split("/").filter(Boolean);
   const [head, ...tail] = segments;
 
   if (head === "admin") return parseAdmin(tail);
@@ -152,4 +168,47 @@ export function useRoute(): Route {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   return route;
+}
+
+/** The raw query string a hash carries, without its `?`. */
+export function hashQuery(hash: string): string {
+  return splitQuery(hash)[1];
+}
+
+/**
+ * A hash with its query string replaced — the route segments left exactly as they were.
+ *
+ * An empty `query` drops the `?` rather than leaving a bare one, so returning a screen to its
+ * default view produces the same URL it had before anyone touched a filter. A trailing `?` would
+ * make "default" and "explicitly default" two different bookmarks of the same view.
+ */
+export function withHashQuery(hash: string, query: string): string {
+  const [path] = splitQuery(hash);
+  const base = path === "" ? "#/imposters" : path;
+  return query === "" ? base : `${base}?${query}`;
+}
+
+/**
+ * Screen state in the URL, kept in step with the address bar in both directions.
+ *
+ * Written with `replaceState` rather than by assigning `location.hash`: typing in a filter box
+ * produces one URL per keystroke, and pushing each of them would make the browser Back button walk
+ * backwards through the operator's typing instead of leaving the screen. `hashchange` does not fire
+ * for `replaceState`, which is why the setter also updates local state directly.
+ */
+export function useHashQuery(): [string, (query: string) => void] {
+  const [query, setQueryState] = useState(() => hashQuery(window.location.hash));
+
+  useEffect(() => {
+    const onChange = (): void => setQueryState(hashQuery(window.location.hash));
+    window.addEventListener("hashchange", onChange);
+    return () => window.removeEventListener("hashchange", onChange);
+  }, []);
+
+  const setQuery = (next: string): void => {
+    window.history.replaceState(null, "", withHashQuery(window.location.hash, next));
+    setQueryState(next);
+  };
+
+  return [query, setQuery];
 }

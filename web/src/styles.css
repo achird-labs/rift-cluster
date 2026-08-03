@@ -1820,3 +1820,61 @@ input[type="radio"] {
     align-items: center;
   }
 }
+
+/* ── Imposter list controls (#252) ─────────────────────────────────────────
+   The filter bar, the sortable headers and the bulk bar. Everything about what
+   the filter MEANS lives in `features/imposters/list.ts`; this is only its
+   presentation. */
+
+.filters {
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.filters .field {
+  flex: 0 1 auto;
+}
+
+/* A sortable header is a button so it is reachable by keyboard and announced as
+   activatable; it is styled to look like the header text it replaces. */
+.btn-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  letter-spacing: inherit;
+  text-transform: inherit;
+}
+
+.btn-link:hover {
+  color: var(--ink-1);
+}
+
+.bulk-bar {
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--surface-2, transparent);
+}
+
+.bulk-report {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.bulk-report-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font: 500 12px/1.6 var(--mono);
+}
+
+.select-col {
+  width: 1%;
+  white-space: nowrap;
+}
