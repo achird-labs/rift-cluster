@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Imposters } from "../screens/Imposters.tsx";
+import { createQueryClient } from "../app/query.ts";
 import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
 
 /**
@@ -174,14 +175,21 @@ describe("sorting", () => {
     expect(window.location.hash).toContain("dir=desc");
   });
 
-  it("announces the sorted column to assistive technology", async () => {
+  it("announces the sorted column and its DIRECTION to assistive technology", async () => {
+    // Both branches, because a header stuck on "ascending" while the arrow shows ▼ tells a
+    // screen-reader user the opposite of what everyone else can see.
     stubFetch(base());
     await rendered();
 
     await userEvent.click(screen.getByTestId("imposter-sort-stubs"));
+    const header = (): Element | null => screen.getByTestId("imposter-sort-stubs").closest("th");
+    await waitFor(() => expect(header()?.getAttribute("aria-sort")).toBe("ascending"));
 
-    const header = screen.getByTestId("imposter-sort-stubs").closest("th");
-    await waitFor(() => expect(header?.getAttribute("aria-sort")).toBe("ascending"));
+    await userEvent.click(screen.getByTestId("imposter-sort-stubs"));
+    await waitFor(() => expect(header()?.getAttribute("aria-sort")).toBe("descending"));
+
+    // And exactly one column claims a sort at a time.
+    expect(document.querySelectorAll('th[aria-sort="ascending"], th[aria-sort="descending"]')).toHaveLength(1);
   });
 });
 
@@ -235,6 +243,105 @@ describe("selection", () => {
     expect(screen.getByTestId("imposter-bulk-count").textContent).toBe("1 selected");
     expect((screen.getByTestId("imposter-select-4545") as HTMLInputElement).checked).toBe(true);
     expect((screen.getByTestId("imposter-select-4546") as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("shows no bulk bar until something is actually ticked", async () => {
+    // A principal who HOLDS the actions but has selected nothing. Distinct from the viewer case
+    // below, which short-circuits earlier — nothing was asserting the zero-count guard itself.
+    stubFetch(base());
+    await rendered();
+
+    expect(screen.queryByTestId("imposter-bulk-bar")).toBeNull();
+    await userEvent.click(screen.getByTestId("imposter-select-4545"));
+    expect(await screen.findByTestId("imposter-bulk-bar")).toBeTruthy();
+  });
+
+  it("select-all UNIONS with ticks made under a previous filter", async () => {
+    // Individual ticks accumulate across filter changes; a select-all that replaced the set would
+    // silently discard them. The two paths have to agree or the count lies in one of them.
+    stubFetch(base());
+    await rendered();
+
+    await userEvent.type(screen.getByTestId("imposter-filter-text"), "zeta");
+    await waitFor(() => expect(visiblePorts()).toEqual([4545]));
+    await userEvent.click(screen.getByTestId("imposter-select-4545"));
+
+    await userEvent.clear(screen.getByTestId("imposter-filter-text"));
+    await userEvent.type(screen.getByTestId("imposter-filter-text"), "alpha");
+    await waitFor(() => expect(visiblePorts()).toEqual([4546]));
+    await userEvent.click(screen.getByTestId("imposter-select-all"));
+
+    await userEvent.click(screen.getByTestId("imposter-filter-reset"));
+    await waitFor(() => expect(visiblePorts()).toHaveLength(3));
+    expect(screen.getByTestId("imposter-bulk-count").textContent).toBe("2 selected");
+  });
+
+  it("un-checking select-all clears only what is shown, not ticks held elsewhere", async () => {
+    // The other direction of the same rule. If un-checking removed nothing, the box would be a
+    // one-way switch; if it cleared everything, it would silently discard ticks the current filter
+    // is not even showing — the mirror of the bug the union fixes.
+    stubFetch(base());
+    await rendered();
+
+    await userEvent.click(screen.getByTestId("imposter-select-all"));
+    expect(screen.getByTestId("imposter-bulk-count").textContent).toBe("3 selected");
+
+    await userEvent.type(screen.getByTestId("imposter-filter-text"), "zeta");
+    await waitFor(() => expect(visiblePorts()).toEqual([4545]));
+    await userEvent.click(screen.getByTestId("imposter-select-all"));
+
+    // 4545 released; 4546 and 4547 untouched behind the filter.
+    expect(screen.queryByTestId("imposter-bulk-bar")).toBeNull();
+    await userEvent.click(screen.getByTestId("imposter-filter-reset"));
+    await waitFor(() => expect(visiblePorts()).toHaveLength(3));
+    expect(screen.getByTestId("imposter-bulk-count").textContent).toBe("2 selected");
+    expect((screen.getByTestId("imposter-select-4545") as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("drops a tick when its imposter leaves the fleet, so a REUSED port is not silently selected", async () => {
+    /*
+     * Ports are identity here and they are reused constantly — a source pull, an import, another
+     * operator. Ticking 4545, watching it be deleted, and seeing a *different* imposter appear at
+     * 4545 must not leave the new one ticked and one click from a bulk delete nobody asked for.
+     * `effective` intersecting with the visible rows keeps the count honest and is exactly what
+     * would hide this.
+     */
+    let listing = THREE;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const path = typeof input === "string" ? input : input.toString();
+        if (path === "/imposters") return Promise.resolve(new Response(JSON.stringify(listing)));
+        return Promise.resolve(new Response(null, { status: 404 }));
+      }),
+    );
+    // The list polls every 5s, so waiting two cycles out would make this the slowest test in the
+    // suite by an order of magnitude. Invalidating drives the same refetch immediately — what is
+    // under test is the reconciliation, not the cadence.
+    const client = createQueryClient();
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin"), client });
+    await screen.findByTestId("imposter-row-4545");
+
+    await userEvent.click(screen.getByTestId("imposter-select-4545"));
+    expect(screen.getByTestId("imposter-bulk-count").textContent).toBe("1 selected");
+
+    // 4545 leaves the fleet — deleted by a single-row action, another operator, or a source pull.
+    listing = { imposters: THREE.imposters.filter((i) => i.port !== 4545) };
+    await client.invalidateQueries({ queryKey: ["imposters"] });
+    await waitFor(() => expect(screen.queryByTestId("imposter-row-4545")).toBeNull());
+
+    // …and a DIFFERENT imposter is created at the same port.
+    listing = {
+      imposters: [
+        ...THREE.imposters.filter((i) => i.port !== 4545),
+        { port: 4545, protocol: "http", name: "someone-elses-service", recordRequests: false, enabled: true, stubs: [] },
+      ],
+    };
+    await client.invalidateQueries({ queryKey: ["imposters"] });
+    await waitFor(() => expect(screen.queryByTestId("imposter-row-4545")).not.toBeNull());
+
+    expect((screen.getByTestId("imposter-select-4545") as HTMLInputElement).checked).toBe(false);
+    expect(screen.queryByTestId("imposter-bulk-bar")).toBeNull();
   });
 
   it("offers no bulk bar to a principal who holds none of the actions", async () => {

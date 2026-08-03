@@ -189,8 +189,10 @@ export function SortHeader({
   );
 }
 
+export type BulkActionKey = "delete" | "enable" | "disable" | "clear";
+
 export type BulkAction = {
-  key: string;
+  key: BulkActionKey;
   label: string;
   /** Past tense, for the result line: "17 deleted". */
   verb: string;

@@ -191,6 +191,28 @@ describe("unclassifiedCount", () => {
     expect(unclassifiedCount(list, query({ recording: "has" }))).toBe(2);
   });
 
+  it("counts only rows that pass the TEXT filter", () => {
+    const named = [
+      imposter({ port: 4545, name: "billing", stubs: undefined }),
+      imposter({ port: 4546, name: "checkout", stubs: undefined }),
+    ];
+    expect(unclassifiedCount(named, query({ recording: "has", text: "bill" }))).toBe(1);
+  });
+
+  it("counts only rows that pass the OWNER filter", () => {
+    // The gap that shipped: an earlier version repeated the conjunction and left `owner` out, so a
+    // row excluded because the operator asked for hand-created only was reported as "not shown
+    // because we could not read its stubs" — the count that names the right reason, naming a wrong one.
+    const mixed = [
+      imposter({ port: 4545, stubs: undefined }),
+      imposter({ port: 4546, stubs: undefined }),
+    ];
+    const owned = sourceOwnedPorts([{ ports: [4545] }]);
+    expect(unclassifiedCount(mixed, query({ recording: "has", owner: "hand" }), owned)).toBe(1);
+    expect(unclassifiedCount(mixed, query({ recording: "has", owner: "source" }), owned)).toBe(1);
+    expect(unclassifiedCount(mixed, query({ recording: "has" }), owned)).toBe(2);
+  });
+
   it("counts only rows that pass the OTHER filters", () => {
     // 4547 is disabled, so an enabled-only view never had it in scope — reporting it as
     // "hidden because we do not know" would be a second, wrong reason.

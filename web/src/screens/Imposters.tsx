@@ -141,14 +141,38 @@ export function Imposters(): ReactNode {
 
   const all = imposters.data ?? [];
   const rows = visibleImposters(all, query, sourceOwned);
-  const unclassified = unclassifiedCount(all, query);
+  const unclassified = unclassifiedCount(all, query, sourceOwned);
 
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
+
+  /*
+   * A tick is dropped as soon as its imposter leaves the fleet.
+   *
+   * Selection is a set of bare port numbers, and ports are reused constantly — a source pull, an
+   * import, or another operator can recreate one. Without this, ticking 4545, watching it be
+   * deleted, and seeing a *different* imposter appear at 4545 leaves the new one silently ticked and
+   * one click from a bulk delete the operator never asked for. `effective` intersecting with the
+   * visible rows keeps the count honest and is exactly what hides that.
+   *
+   * Returns `current` unchanged when nothing was pruned, so this cannot loop.
+   */
+  const livePorts = actionablePorts(all);
+  const liveKey = livePorts.join(",");
+  useEffect(() => {
+    const live = new Set(livePorts);
+    setSelected((current) => {
+      const next = new Set([...current].filter((port) => live.has(port)));
+      return next.size === current.size ? current : next;
+    });
+    // Keyed on `liveKey`, not `livePorts`: the array is a fresh identity every render and would
+    // re-run this on every one.
+  }, [liveKey]);
   const clearRequests = useClearRequests();
   const [running, setRunning] = useState<BulkAction | null>(null);
   const [progress, setProgress] = useState<{ completed: number; total: number } | null>(null);
   const [report, setReport] = useState<{ result: BulkResult; verb: string } | null>(null);
   const [confirmingBulk, setConfirmingBulk] = useState<BulkAction | null>(null);
+  const batchOwnsOutcome = running !== null || report !== null;
 
   /*
    * Selection is intersected with what the filter currently shows, every render.
@@ -163,18 +187,22 @@ export function Imposters(): ReactNode {
   const allVisibleSelected = effective.length > 0 && effective.length === visiblePorts.size;
 
   const bulkActions: BulkAction[] = [
-    ...(mayDelete ? [{ key: "delete", label: "Delete", verb: "deleted", destructive: true }] : []),
+    ...(mayDelete
+      ? [{ key: "delete" as const, label: "Delete", verb: "deleted", destructive: true }]
+      : []),
     ...(mayToggle
       ? [
-          { key: "enable", label: "Enable", verb: "enabled", destructive: false },
-          { key: "disable", label: "Disable", verb: "disabled", destructive: false },
+          { key: "enable" as const, label: "Enable", verb: "enabled", destructive: false },
+          { key: "disable" as const, label: "Disable", verb: "disabled", destructive: false },
         ]
       : []),
     ...(mayClear
-      ? [{ key: "clear", label: "Clear request log", verb: "cleared", destructive: true }]
+      ? [{ key: "clear" as const, label: "Clear request log", verb: "cleared", destructive: true }]
       : []),
   ];
 
+  // Exhaustive over the narrowed `BulkActionKey`, with no `default`. A fifth action whose case is
+  // forgotten is then a compile error rather than a silent fall-through to clearing request logs.
   function callFor(action: BulkAction): (port: number) => Promise<CommitOutcome> {
     switch (action.key) {
       case "delete":
@@ -183,7 +211,7 @@ export function Imposters(): ReactNode {
         return (port) => toggle.mutateAsync({ port, enable: true });
       case "disable":
         return (port) => toggle.mutateAsync({ port, enable: false });
-      default:
+      case "clear":
         return (port) => clearRequests.mutateAsync({ port });
     }
   }
@@ -257,11 +285,18 @@ export function Imposters(): ReactNode {
       {create.isError ? (
         <ErrorNote error={create.error} context="The imposter was not created" />
       ) : null}
-      {remove.isError ? (
+      {/*
+        Suppressed while a batch owns the outcome. These notes are the SINGLE-row vocabulary: during
+        a bulk run they report only the last item, name no port, and sit alongside a per-item report
+        that already says more — and they outlive dismissing it.
+      */}
+      {remove.isError && !batchOwnsOutcome ? (
         <ErrorNote error={remove.error} context="The imposter was not deleted" />
       ) : null}
       {create.data?.kind === "unobservable" ? <UnconfirmedNote reason={create.data.reason} /> : null}
-      {remove.data?.kind === "unobservable" ? <UnconfirmedNote reason={remove.data.reason} /> : null}
+      {remove.data?.kind === "unobservable" && !batchOwnsOutcome ? (
+        <UnconfirmedNote reason={remove.data.reason} />
+      ) : null}
 
       {creating ? (
         <NewImposter
@@ -299,8 +334,12 @@ export function Imposters(): ReactNode {
       )}
 
       {imposters.isError ? <ErrorNote error={imposters.error} context="Could not list imposters" /> : null}
-      {toggle.isError ? <ErrorNote error={toggle.error} context="That change did not take effect" /> : null}
-      {toggle.data?.kind === "unobservable" ? <UnconfirmedNote reason={toggle.data.reason} /> : null}
+      {toggle.isError && !batchOwnsOutcome ? (
+        <ErrorNote error={toggle.error} context="That change did not take effect" />
+      ) : null}
+      {toggle.data?.kind === "unobservable" && !batchOwnsOutcome ? (
+        <UnconfirmedNote reason={toggle.data.reason} />
+      ) : null}
 
       {imposters.isPending ? <p className="muted">Reading…</p> : null}
 
@@ -365,7 +404,20 @@ export function Imposters(): ReactNode {
                           checked={allVisibleSelected}
                           disabled={running !== null || visiblePorts.size === 0}
                           onChange={(event) =>
-                            setSelected(event.target.checked ? new Set(visiblePorts) : new Set())
+                            /*
+                              Union in, and remove only what is shown — individual ticks accumulate
+                              across filter changes, so a select-all that REPLACED the set would
+                              silently discard ticks made under a previous filter. The two paths
+                              have to agree or the count is a lie in one of them.
+                            */
+                            setSelected((current) => {
+                              const next = new Set(current);
+                              for (const port of visiblePorts) {
+                                if (event.target.checked) next.add(port);
+                                else next.delete(port);
+                              }
+                              return next;
+                            })
                           }
                         />
                       </th>

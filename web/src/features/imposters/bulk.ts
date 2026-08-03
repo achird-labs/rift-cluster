@@ -1,3 +1,4 @@
+import { describe } from "../../components/primitives.tsx";
 import type { CommitOutcome } from "../writes/commit.ts";
 
 /**
@@ -38,10 +39,16 @@ export type BulkResult = {
   refused: number;
 };
 
-/** The message to show for a thrown error — the fleet's own words when it has them. */
+/**
+ * The message to show for a thrown error.
+ *
+ * `describe` rather than `error.message`: every mutation here rejects with `ApiError`, whose
+ * `message` is the raw `"403: {\"message\":…}"`. Rendering that would make a bulk refusal the one
+ * place in the console that speaks status codes instead of sentences — and a session that dies
+ * mid-batch would produce N raw `401:` lines and no "sign in again" anywhere.
+ */
 function refusalDetail(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
+  return describe(error);
 }
 
 export function summarize(results: readonly BulkItemResult[]): BulkResult {

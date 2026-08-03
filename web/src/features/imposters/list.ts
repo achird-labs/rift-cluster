@@ -195,13 +195,20 @@ export function sourceOwnedPorts(
 export function unclassifiedCount(
   imposters: readonly Imposter[],
   query: ImposterQuery,
+  sourceOwned: ReadonlySet<number> | null = null,
 ): number {
   if (query.recording === "all") return 0;
-  return imposters.filter(
-    (imposter) =>
-      matchesText(imposter, query.text) &&
-      matchesState(imposter, query.state) &&
-      classifyRecording(imposter) === "unknown",
+  /*
+   * Every other filter first, then the unknowns among what survives.
+   *
+   * Expressed as "filter with recording disabled, then count the unknowns" rather than by repeating
+   * the conjunction: an earlier version repeated it and omitted `owner`, so a row excluded because
+   * the operator asked for hand-created only was reported as "not shown because we could not read
+   * its stubs" — the count that exists to name the right reason, naming the wrong one. Deriving it
+   * from `filterImposters` means a filter added later cannot be forgotten here.
+   */
+  return filterImposters(imposters, { ...query, recording: "all" }, sourceOwned).filter(
+    (imposter) => classifyRecording(imposter) === "unknown",
   ).length;
 }
 
