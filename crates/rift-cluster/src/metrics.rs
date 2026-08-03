@@ -179,6 +179,34 @@ lazy_static! {
     )
     .expect("rift_cluster_audit_export_lag_revisions registers once");
 
+    /// `rift_cluster_source_scheduler_corrupt_rows` — source rows the leader's
+    /// poll scheduler could not decode on its last reconcile.
+    ///
+    /// Deliberately unlabelled. Which row is corrupt is a question for the
+    /// transition log, which names tenant and id; a metric label would put
+    /// operator-chosen ids into the cardinality budget for a value that is
+    /// almost always zero. Nonzero is the alert: each of those sources is held
+    /// at whatever cadence it was last started with, and cannot adopt a change
+    /// until the record is rewritten.
+    static ref SOURCE_SCHEDULER_CORRUPT_ROWS: Gauge = register_gauge!(
+        "rift_cluster_source_scheduler_corrupt_rows",
+        "Source rows the poll scheduler could not decode on its last reconcile (leader only)"
+    )
+    .expect("rift_cluster_source_scheduler_corrupt_rows registers once");
+
+    /// `rift_cluster_source_scheduler_read_failures_total` — reconciles that
+    /// could not read the source table at all.
+    ///
+    /// Distinct from the gauge above, and the distinction is the point: a
+    /// corrupt *row* now costs only itself, but a table- or transaction-level
+    /// failure still parks the whole reconcile. That residue is rare and
+    /// transient, and this is what makes it alertable rather than grep-able.
+    static ref SOURCE_SCHEDULER_READ_FAILURES: IntCounter = register_int_counter!(
+        "rift_cluster_source_scheduler_read_failures_total",
+        "Reconciles that could not read the source table"
+    )
+    .expect("rift_cluster_source_scheduler_read_failures_total registers once");
+
     /// `rift_cluster_pull_on_miss_checks_total` — no-match requests the net
     /// actually evaluated, i.e. those reaching a **non-leader** node with a
     /// bound cluster handle. Leaders are excluded on purpose: a leader cannot
@@ -498,6 +526,16 @@ pub(crate) fn flow_repair() {
 pub(crate) fn source_poll(outcome: &str, elapsed: std::time::Duration) {
     SOURCE_POLLS.with_label_values(&[outcome]).inc();
     SOURCE_POLL_SECONDS.observe(elapsed.as_secs_f64());
+}
+
+/// Set on every reconcile, including to zero — a gauge that is only ever
+/// *raised* would keep reporting a repaired row as broken.
+pub(crate) fn source_scheduler_corrupt_rows(count: usize) {
+    SOURCE_SCHEDULER_CORRUPT_ROWS.set(count as f64);
+}
+
+pub(crate) fn source_scheduler_read_failure() {
+    SOURCE_SCHEDULER_READ_FAILURES.inc();
 }
 
 pub(crate) fn flow_conflict(reason: &str) {

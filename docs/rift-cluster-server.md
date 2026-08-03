@@ -1109,6 +1109,30 @@ meant to drive it. So the scheduler is **leader-only**.
   unique only within its tenant — and a pull commits under the tenant that owns
   the source. Deleting a tenant removes its source rows in the same committed
   op, so the next reconcile stops their pollers with no tombstone check.
+- **A source record that will not decode costs only its own source** (#243).
+  It is *held*: neither started, stopped, nor re-intervalled, while every other
+  tenant's sources reconcile normally. Before #243 that one row parked
+  reconciliation for the entire fleet.
+
+  **A held source is not being fetched.** Holding keeps the failure attributable
+  and lets a repair recover without a restart; it does not keep the source
+  up to date. A poll of a held source re-reads the record through the strict
+  path and fails, so its content is frozen at whatever the last successful pull
+  applied, and it stays frozen until someone rewrites the record. Treat a
+  nonzero `rift_cluster_source_scheduler_corrupt_rows` as **mocks going stale**,
+  not as a degraded-but-working source.
+
+  To act on it: the gauge tells you how many rows, and the scheduler logs the
+  tenant, the source id and the decode error at `ERROR` on the leader when the
+  condition starts (and at `INFO` when it clears). The owning tenant's own
+  `GET /admin/sources` also fails hard, which is the tenant-facing half of the
+  same fact. Rewriting the record with `SourcePut` — or deleting it — releases
+  the hold through the ordinary reconcile paths, with no restart.
+
+  Separately, `rift_cluster_source_scheduler_read_failures_total` counts
+  reconciles that could not read the table *at all*. That is a transient storage
+  fault rather than a bad row, and it does still park the whole reconcile until
+  the next tick.
 - Intervals are jittered ±10%, so sources declared together do not arrive at the
   upstream host as a burst every interval.
 - **`pollSecs` has a 5-second floor**, enforced at admission with a typed `400`.
