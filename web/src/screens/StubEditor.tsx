@@ -14,6 +14,14 @@ import {
   project,
   render,
 } from "../features/stubs/projection.ts";
+import { ResponseBuilder, describeResponseList } from "../features/stubs/ResponseBuilder.tsx";
+import {
+  type ResponseLabel,
+  type ResponseModel,
+  describeResponses,
+  projectResponses,
+  renderResponses,
+} from "../features/stubs/responses.ts";
 
 /**
  * The stub editor (RFC-006 C5, issue #188).
@@ -44,28 +52,38 @@ function pretty(value: unknown): string {
 }
 
 /**
- * Merge a form edit and a predicate-builder edit back into one stub document.
+ * Merge the three panes' edits back into one stub document.
  *
- * Safe precisely because both panes are only ever shown together when the stub is projectable by
- * *both* projections (see `editable` below) — which means, by construction, every top-level key
- * the stub carries is covered by `render(form)` or by `predicates`, and there is nothing else to
- * preserve. An empty predicate list omits the key entirely, the same "null emits no key"
- * convention `render` already applies to every other field.
+ * Safe precisely because the panes are only ever shown together when the stub is projectable by
+ * *all three* projections (see `editable` below) — which means, by construction, every top-level
+ * key the stub carries is covered by `render(form)`, by `predicates`, or by `responses`, and there
+ * is nothing else to preserve. An empty predicate or response list omits its key entirely, the same
+ * "null emits no key" convention `render` already applies to every field.
  */
-function composeStubText(form: StubForm, predicateItems: PredicateItem[]): string {
+function composeStubText(
+  form: StubForm,
+  predicateItems: PredicateItem[],
+  responseItems: ResponseModel[],
+): string {
   const rendered = render(form);
   const predicatesJson = renderPredicates(predicateItems);
+  const responsesJson = renderResponses(responseItems);
   /*
-   * Rebuilt in reading order — id, predicates, responses — rather than appending `predicates` to
-   * what `render` produced. Appending would put it *after* `responses`, so every form edit silently
-   * reordered the document relative to what the old form and all four presets wrote. Reordering is
-   * not data loss, but it is a diff the operator did not ask for on a document they may be
-   * reviewing side by side with a file.
+   * Rebuilt in reading order — id, predicates, responses — rather than appending each pane's key to
+   * what `render` produced. Appending would order the document by which projection happened to own
+   * which key, so every form edit silently reordered it relative to what the presets wrote.
+   * Reordering is not data loss, but it is a diff the operator did not ask for on a document they
+   * may be reviewing side by side with a file.
+   *
+   * `rest` is what `render` produced beyond `id` — empty today, since `STUB_FIELDS` is down to that
+   * one row, and spread anyway so a future row added to that table lands in the document without
+   * needing a change here.
    */
   const { id, ...rest } = rendered;
   const stub: Record<string, unknown> = {};
   if (id !== undefined) stub.id = id;
   if (predicatesJson.length > 0) stub.predicates = predicatesJson;
+  if (responsesJson.length > 0) stub.responses = responsesJson;
   return pretty({ ...stub, ...rest });
 }
 
@@ -205,23 +223,36 @@ export function StubEditor({
   const parsed = parse(text);
   const formProjection = parsed.ok ? project(parsed.value) : null;
   const predicateProjection = parsed.ok ? projectPredicates(parsed.value) : null;
+  const responseProjection = parsed.ok ? projectResponses(parsed.value) : null;
   /*
-   * The two projections are independent, and #247 split predicates out of `formProjection` (see
-   * `projection.ts`'s `walk`, which now refuses to look at `predicates` at all) — so a stub is
-   * form-editable only when *both* succeed. Bundled into one object (rather than two booleans)
-   * so every read site below narrows both `.form` and `.predicateItems` from a single null check,
-   * instead of re-deriving the joint condition at each call site.
+   * The three projections are independent — #247 split predicates out of `formProjection` and #248
+   * split responses out (see `projection.ts`'s `walk`, which now refuses to look at either) — so a
+   * stub is form-editable only when *all three* succeed. Bundled into one object (rather than three
+   * booleans) so every read site below narrows `.form`, `.predicateItems` and `.responseItems` from
+   * a single null check, instead of re-deriving the joint condition at each call site.
    */
   const editable =
-    formProjection?.kind === "form" && predicateProjection?.kind === "predicates"
-      ? { form: formProjection.form, predicateItems: predicateProjection.items }
+    formProjection?.kind === "form" &&
+    predicateProjection?.kind === "predicates" &&
+    responseProjection?.kind === "responses"
+      ? {
+          form: formProjection.form,
+          predicateItems: predicateProjection.items,
+          responseItems: responseProjection.items,
+        }
       : null;
-  // Either projection refusing means some key the pair cannot jointly represent; the union of both
-  // key lists is what the banner names, so an operator sees the whole reason, not half of it.
-  const unmodelledKeys = [
-    ...(formProjection?.kind === "rawOnly" ? formProjection.unmodelledKeys : []),
-    ...(predicateProjection?.kind === "rawOnly" ? predicateProjection.unmodelledKeys : []),
-  ];
+  // Any projection refusing means some key the three cannot jointly represent; the union of all
+  // three key lists is what the banner names, so an operator sees the whole reason, not a third of it.
+  const unmodelledKeys = [formProjection, predicateProjection, responseProjection].flatMap(
+    (projection) => (projection?.kind === "rawOnly" ? projection.unmodelledKeys : []),
+  );
+  /*
+   * Labels for every response, derived from the document rather than from the projection — which is
+   * the whole point: they must still render in exactly the case the projection REFUSED (AC5). A
+   * stub carrying a proxy response opens raw-only, and the operator still needs to see that it has
+   * a proxy and where it points without reading the JSON.
+   */
+  const responseLabels = parsed.ok ? describeResponses(parsed.value) : [];
 
   /*
    * Advisory lint, re-run as the document changes. Deliberately not gating the save button: the
@@ -340,6 +371,9 @@ export function StubEditor({
         <div className="degraded" data-testid="stub-raw-banner" role="status">
           <strong>Raw JSON only.</strong> This stub carries fields the form does not model, so
           editing it through the form would drop them. Unmodelled: {unmodelledKeys.join(", ")}
+          {responseLabels.length === 0 ? null : (
+            <ResponseLabels labels={responseLabels} />
+          )}
         </div>
       ) : null}
 
@@ -347,18 +381,33 @@ export function StubEditor({
         <Presets onPick={(stub) => setText(pretty(stub))} />
       ) : null}
 
-      {editable !== null ? <Summary form={editable.form} predicateItems={editable.predicateItems} /> : null}
+      {editable !== null ? (
+        <Summary
+          predicateItems={editable.predicateItems}
+          responseItems={editable.responseItems}
+        />
+      ) : null}
 
       <div className="stub-panes">
         {editable !== null ? (
           <div className="stub-form-pane">
             <PredicateBuilder
               items={editable.predicateItems}
-              onChange={(nextItems) => setText(composeStubText(editable.form, nextItems))}
+              onChange={(nextItems) =>
+                setText(composeStubText(editable.form, nextItems, editable.responseItems))
+              }
+            />
+            <ResponseBuilder
+              items={editable.responseItems}
+              onChange={(nextItems) =>
+                setText(composeStubText(editable.form, editable.predicateItems, nextItems))
+              }
             />
             <StubFields
               form={editable.form}
-              onChange={(nextForm) => setText(composeStubText(nextForm, editable.predicateItems))}
+              onChange={(nextForm) =>
+                setText(composeStubText(nextForm, editable.predicateItems, editable.responseItems))
+              }
             />
           </div>
         ) : null}
@@ -400,18 +449,15 @@ function StubFields({
 }): ReactNode {
   /*
    * An empty box means "this stub does not carry that field", so it becomes `null` and `render`
-   * emits no key — not an empty string, which would be a stub with a `path` predicate matching "".
+   * emits no key — not an empty string, which would be a stub carrying that field set to "".
+   *
+   * There is no numeric coercion here any more: every row left in `STUB_FIELDS` holds a string,
+   * because the one numeric field (`statusCode`) moved into `responses.ts` with #248. `StubField`
+   * still declares `kind: "number"` for the next numeric row — and `StubForm` will have to widen to
+   * admit one, which is precisely what the compiler will point at when that day comes.
    */
   const edit = (field: StubField, raw: string): void => {
-    const next =
-      raw === ""
-        ? null
-        : field.kind === "number"
-          ? Number.isFinite(Number(raw))
-            ? Number(raw)
-            : null
-          : raw;
-    onChange({ ...form, [field.key]: next });
+    onChange({ ...form, [field.key]: raw === "" ? null : raw });
   };
 
   return (
@@ -466,7 +512,13 @@ function StubFields({
  * match?" at a glance. This is derived from both projections rather than from the text, so it
  * cannot claim anything the modelled fields do not say.
  */
-function Summary({ form, predicateItems }: { form: StubForm; predicateItems: PredicateItem[] }): ReactNode {
+function Summary({
+  predicateItems,
+  responseItems,
+}: {
+  predicateItems: PredicateItem[];
+  responseItems: ResponseModel[];
+}): ReactNode {
   const matchesEverything = predicateItems.length === 0;
   return (
     <div className={matchesEverything ? "banner warn" : "hint"} data-testid="stub-summary">
@@ -487,13 +539,34 @@ function Summary({ form, predicateItems }: { form: StubForm; predicateItems: Pre
           </>
         ) : (
           <>
-            Matches requests where <b>{describePredicates(predicateItems)}</b>, and answers{" "}
-            <b>{form.statusCode ?? 200}</b>
-            {form.contentType === null ? "" : ` as ${form.contentType}`}.
+            Matches requests where <b>{describePredicates(predicateItems)}</b>, and{" "}
+            <b>{describeResponseList(responseItems)}</b>.
           </>
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Every response the stub carries, named by kind — shown beside the raw-only banner.
+ *
+ * This is the "recognised, but not editable" half of AC5. A stub with a `proxy` or `inject`
+ * response cannot open in the form without the form pretending it can edit JavaScript or a proxy
+ * rule, so it opens raw-only; that is honest, but on its own it leaves the operator to work out
+ * from the JSON what kind of responses they are looking at. Read-only by construction — there is no
+ * `onChange` here, so nothing this renders can write to the document.
+ */
+function ResponseLabels({ labels }: { labels: ResponseLabel[] }): ReactNode {
+  return (
+    <ul className="response-labels" data-testid="stub-response-labels">
+      {labels.map((label) => (
+        <li key={label.index}>
+          Response {label.index + 1}: <b>{label.kind}</b>
+          {label.detail === "" ? null : ` — ${label.detail}`}
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -544,9 +617,22 @@ function LintPane({ findings }: { findings: Finding[] | "unavailable" | "pending
  * `contract-traceability.test.ts` both ban.
  */
 function BodyPreview({ value }: { value: unknown }): ReactNode {
-  const projection = value === null ? null : project(value);
+  const projection = value === null ? null : projectResponses(value);
+  if (projection?.kind !== "responses") return null;
+  /*
+   * The FIRST response's body. A cycling stub has several, and previewing only the first is the
+   * honest simplification: the panel is a "what does this send" glance, and the response cards
+   * above already show each body in full. Previewing a concatenation of all of them would show
+   * something no single call ever returns.
+   */
+  const [first] = projection.items;
+  if (first === undefined) return null;
   const body =
-    projection?.kind === "form" && projection.form.body !== null ? projection.form.body : null;
+    first.body.kind === "text"
+      ? first.body.text
+      : first.body.kind === "json"
+        ? pretty(first.body.value)
+        : null;
   if (body === null) return null;
   return (
     <details className="stub-body">

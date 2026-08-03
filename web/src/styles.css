@@ -1445,6 +1445,64 @@ input[type="radio"] {
   grid-column: 1 / -1;
 }
 
+/* The response list (issue #248). One card per response; the order is the cycling order. */
+.response-builder {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 10px;
+}
+
+.response-card {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+
+.response-card-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* Pushes the move/remove controls to the trailing edge, away from the card's title. */
+.response-card-header .btn:first-of-type {
+  margin-left: auto;
+}
+
+.response-headers {
+  display: grid;
+  gap: 6px;
+}
+
+/*
+ * Name, value, remove. The generic `.field-row` grid this reuses elsewhere is `auto-fit`, which
+ * would give the remove button a full third of the width; these three have fixed relative weights
+ * instead, so the value box keeps the room it needs as the pane narrows.
+ */
+.response-headers .field-row,
+.response-header-heads {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto;
+  gap: 6px;
+  align-items: start;
+}
+
+.response-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.response-labels {
+  margin: 6px 0 0;
+  padding-left: 1.2em;
+}
+
 .presets {
   display: flex;
   align-items: center;

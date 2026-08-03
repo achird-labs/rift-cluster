@@ -203,6 +203,78 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
     expect(screen.getByTestId("stub-summary").textContent).not.toMatch(/matches every request/i);
   });
 
+  it("reports the response count and the cycling in the summary (#248 AC7)", async () => {
+    // A cycling stub is the case the old summary could not describe at all: it reported
+    // `responses[0]`'s status as though it were the whole story, so "202 then 200" read as a
+    // constant 202 — the console actively misdescribing what the mock does on the second call.
+    stubFleet({
+      read: () => ({
+        json: imposter([
+          {
+            id: "s-1",
+            predicates: [{ equals: { path: "/orders" } }],
+            responses: [{ is: { statusCode: 202 } }, { is: { statusCode: 200 } }],
+          },
+        ]),
+        revision: "default:4545@7",
+      }),
+    });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    await openEditor("s-1");
+
+    expect((await screen.findByTestId("stub-summary")).textContent).toMatch(
+      /answers 202, then cycles through 1 more/i,
+    );
+  });
+
+  it("labels a proxy response it cannot edit, instead of only naming the key (#248 AC5)", async () => {
+    // "Recognised, not editable." The stub opens raw-only — correct, a form must not pretend to
+    // edit a proxy rule — but the operator still has to be able to see that the stub HAS a proxy
+    // and where it points without reading the JSON themselves.
+    stubFleet({
+      read: () => ({
+        json: imposter([
+          { id: "s-1", responses: [{ is: { statusCode: 200 } }, { proxy: { to: "http://api.example.com" } }] },
+        ]),
+        revision: "default:4545@7",
+      }),
+    });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    await openEditor("s-1");
+
+    expect((await screen.findByTestId("stub-raw-banner")).textContent).toContain("responses[1].proxy");
+    const labels = screen.getByTestId("stub-response-labels").textContent ?? "";
+    expect(labels).toContain("proxy");
+    expect(labels).toContain("http://api.example.com");
+    expect(screen.queryByTestId("stub-form")).toBeNull();
+  });
+
+  it("moves an edit made in the response builder into the JSON, as a JSON body not a string", async () => {
+    // The #248 counterpart of the predicate-builder test below. The body assertion is the load
+    // bearing half: writing `{"ok":false}` back as a *string* would change what the mock returns.
+    stubFleet({
+      read: () => ({
+        json: imposter([
+          {
+            id: "s-1",
+            predicates: [{ equals: { path: "/users" } }],
+            responses: [{ is: { statusCode: 200, body: { ok: true } } }],
+          },
+        ]),
+        revision: "default:4545@7",
+      }),
+    });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    const editor = await openEditor("s-1");
+
+    const user = userEvent.setup();
+    const body = screen.getByRole("textbox", { name: "Body for response 1" });
+    await user.clear(body);
+    await user.type(body, '{{"ok":false}');
+
+    await waitFor(() => expect(JSON.parse(editor.value).responses[0].is.body).toEqual({ ok: false }));
+  });
+
   it("moves an edit made in the predicate builder into the JSON", async () => {
     // A single-entry predicate — the shape the builder's own rows write — unlike `MODELLED` above,
     // so this exercises the row the builder actually renders as an editable field.

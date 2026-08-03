@@ -11,9 +11,6 @@ import { STUB_FIELDS, type StubForm, blankForm, project, render } from "./projec
  */
 const anyForm: fc.Arbitrary<StubForm> = fc.record({
   id: fc.option(fc.string(), { nil: null }),
-  statusCode: fc.option(fc.integer({ min: 100, max: 599 }), { nil: null }),
-  contentType: fc.option(fc.string(), { nil: null }),
-  body: fc.option(fc.string(), { nil: null }),
 });
 
 describe("the form ⟷ JSON projection round-trips", () => {
@@ -80,31 +77,20 @@ describe("a stub the form does not model is raw-only, with every unmodelled key 
     expect(projected.kind).toBe("form");
   });
 
-  it("names a second response, which the single-`is` model cannot hold", () => {
+  it("no longer inspects responses content at all — that responsibility moved to responses.ts", () => {
+    // The mirror of the `predicates` test above, and the whole point of #248. This table used to
+    // model `responses[0].is` alone, so a second response, a second header, or a JSON-object body
+    // each sent the stub to raw-only from HERE. All three are now `responses.ts`'s to accept or
+    // refuse (see its round-trip and AC5 tests), so `project` stops at the key — even for shapes it
+    // used to refuse. The editor composes all three projections; this file's contract is only ever
+    // about the *other* keys.
     const projected = project({
-      responses: [{ is: { statusCode: 200 } }, { is: { statusCode: 500 } }],
+      responses: [
+        { is: { statusCode: 200, headers: { "X-Trace": "1" }, body: { ok: true } } },
+        { proxy: { to: "http://api.example.com" } },
+      ],
     });
-    expect(projected.kind).toBe("rawOnly");
-    if (projected.kind !== "rawOnly") return;
-    expect(projected.unmodelledKeys).toEqual(["responses[1].is.statusCode"]);
-  });
-
-  it("names a header the model does not carry, keeping the Content-Type one it does", () => {
-    const projected = project({
-      responses: [{ is: { headers: { "Content-Type": "application/json", "X-Trace": "1" } } }],
-    });
-    expect(projected.kind).toBe("rawOnly");
-    if (projected.kind !== "rawOnly") return;
-    expect(projected.unmodelledKeys).toEqual(['responses[0].is.headers["X-Trace"]']);
-  });
-
-  it("treats a modelled key holding the wrong JSON type as unmodelled, not as a coercion", () => {
-    // `statusCode: "200"` is a string. Coercing it would rewrite the operator's stub on the way
-    // through the form; naming it keeps the raw text authoritative.
-    const projected = project({ responses: [{ is: { statusCode: "200" } }] });
-    expect(projected.kind).toBe("rawOnly");
-    if (projected.kind !== "rawOnly") return;
-    expect(projected.unmodelledKeys).toEqual(["responses[0].is.statusCode"]);
+    expect(projected.kind).toBe("form");
   });
 
   it("refuses anything that is not a JSON object at the root", () => {
@@ -131,14 +117,10 @@ describe("a stub the form does not model is raw-only, with every unmodelled key 
     });
     expect(projected.kind).toBe("form");
     if (projected.kind !== "form") return;
-    // `predicates` is out of scope for this projection now — it does not, and should not, appear
-    // in the form. Its own round trip is `predicates.test.ts`'s job.
-    expect(projected.form).toEqual({
-      id: "s-1",
-      statusCode: 201,
-      contentType: "application/json",
-      body: "{}",
-    });
+    // Neither `predicates` nor `responses` is in scope for this projection now — they do not, and
+    // should not, appear in the form. Their own round trips are `predicates.test.ts`'s and
+    // `responses.test.ts`'s jobs.
+    expect(projected.form).toEqual({ id: "s-1" });
   });
 });
 
@@ -147,7 +129,7 @@ describe("the modelled set is data, not code", () => {
     // RFC-006 §12 Q2's answer lives here: the shipped set is whatever `STUB_FIELDS` lists, and both
     // directions of the projection are driven by it. A field added to the table needs no change to
     // `project` or `render`.
-    expect(STUB_FIELDS.map((field) => field.key)).toEqual(["id", "statusCode", "contentType", "body"]);
+    expect(STUB_FIELDS.map((field) => field.key)).toEqual(["id"]);
     for (const field of STUB_FIELDS) {
       expect([field.key, field.at.length]).toEqual([field.key, expect.any(Number)]);
       expect(field.at.length).toBeGreaterThan(0);

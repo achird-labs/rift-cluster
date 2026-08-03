@@ -524,24 +524,52 @@ screen rather than replacing it.
    adding a row to a table.*** Which predicate/behavior shapes get first-class
    form controls versus raw-JSON-only?
 
-   Shipped set (`web/src/features/stubs/projection.ts`, `STUB_FIELDS`): the
-   stub's `id`; a **single** `equals` predicate over `method` and `path`; and a
-   **single** `is` response with `statusCode`, a `Content-Type` header and a
-   text `body`. Chosen because it is what an operator writes by hand in a
-   console. Everything else — scenarios, `space`, `behaviors`, proxy responses,
-   `matches`/`contains`/`deepEquals`, a second predicate, a second response — is
-   out, and lands in raw-JSON-only rather than being half-modelled.
+   The set shipped by C5 (#188) was deliberately narrow: the stub's `id`; a
+   **single** `equals` predicate over `method` and `path`; and a **single** `is`
+   response with `statusCode`, a `Content-Type` header and a text `body`. It has
+   since been widened twice, demand-driven exactly as proposed — epic #245 is
+   the demand, and the widening cost one new module each rather than a redesign:
 
-   The rule that makes a small set safe: **the form never silently drops a
-   key.** `project()` either understands the whole stub or refuses it, naming
-   every unmodelled key as a dotted path so the banner can say what the form
-   would have lost. There is no partly-populated form, because that is the shape
-   that saves six of a stub's eight keys. Raw-only mode edits and saves the
-   operator's own text, byte for byte.
+   - **#247** gave `predicates` its own projection (`features/stubs/predicates.ts`):
+     the full operator set (`equals`/`deepEquals`/`contains`/`startsWith`/
+     `endsWith`/`matches`/`exists`), `or`/`not` groups, JSONPath/XPath selectors,
+     `caseSensitive` and `except`.
+   - **#248** gave `responses` its own projection (`features/stubs/responses.ts`):
+     N responses in cycling order, arbitrary **multi-value** headers (so
+     `Content-Type` is no longer a special case and `Set-Cookie` is expressible),
+     and JSON-object bodies written back as JSON *values* rather than strings.
 
-   Widening is data, not redesign: both directions of the projection are driven
-   by `STUB_FIELDS`, so a new field is a row in that table and neither
-   `project` nor `render` names a field. Demand-driven from here, as proposed.
+   Both moved out of `STUB_FIELDS` for the same reason: their unit is richer
+   than one row — a clause, and a response — so modelling them as flat fields
+   meant refusing every stub that used them. `STUB_FIELDS` is now the `id` row
+   alone, and `project`'s `walk` treats both subtrees as out of its scope.
+
+   Still out, and still landing in raw-JSON-only rather than being half-modelled:
+   scenarios, `space`, `_behaviors` (queued as #249), and the `proxy`, `inject`
+   and `fault` response variants. Those three are *recognised and labelled* in
+   the editor — an operator can see that a stub carries a proxy and where it
+   points — but recognised is not editable: they open raw-only, because a form
+   that pretended to edit injected JavaScript would be lying about what it saves.
+
+   The rule that makes any of this safe: **the form never silently drops a
+   key.** Each projection either understands its whole subtree or refuses it,
+   naming every unmodelled key as a dotted path so the banner can say what the
+   form would have lost; the editor composes all three verdicts and opens the
+   form only when every one of them agrees. There is no partly-populated form,
+   because that is the shape that saves six of a stub's eight keys. Raw-only
+   mode edits and saves the operator's own text, byte for byte.
+
+   A second, subtler rule arrived with #248 and is worth stating because export
+   (#251) depends on it: **the form preserves the shape a document arrived in.**
+   The engine accepts both `{is: {…}}` and the flat, wrapper-less `{statusCode:
+   …}` that recorded mocks use; a response is re-emitted in the spelling it was
+   read in, and a single-element multi-value header stays an array. Normalising
+   either would be harmless to the mock and still wrong — it shows up as a diff
+   on every export of a recorded imposter, which teaches operators to distrust
+   the console.
+
+   Widening remains data, not redesign, within each projection. Demand-driven
+   from here, as proposed.
 3. **Fleet-read authorization split** (§5.2): under RFC-002, is
    `/_fleet/health` in-tenant-`Viewer`-visible (tenant-filtered) or
    `ClusterAdmin`-only? Topology is infrastructure, not tenant data — but
