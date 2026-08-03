@@ -3,12 +3,14 @@
 #   helm install rift oci://ghcr.io/achird-labs/charts/rift-cluster -f values-aks.yaml
 #
 # The Azure mapping — zonal disks, internal load balancer, Key Vault, VMSS lifecycle — is
-# `docs/architecture/15-azure-deployment.md` (#268).
+# `docs/architecture/15-azure-deployment.md`.
 
 storage:
-  # `managed-csi` is the non-zone-redundant default (LRS). Azure managed disks are zonal in the same
-  # sense EBS volumes are, so the zone spread below matters for the same reason. `managed-csi-premium`
-  # if the Raft log's fsync latency shows up in your write path.
+  # `managed-csi` is the built-in class, and on a zone-spread AKS cluster (1.29+) it provisions
+  # ZONE-REDUNDANT disks — unlike EBS, which is always zonal. That works, but it pays synchronous
+  # cross-zone replication on every Raft append to buy a disk failover this design does not need:
+  # quorum already survives losing a zone. Ch.15 spells out the trade and gives an LRS storage class
+  # to point this at instead; `managed-csi-premium-v2` is LRS by definition if your zones offer it.
   className: managed-csi
   size: 20Gi
 

@@ -8,6 +8,11 @@ routable data port, and a private network for the cluster port.** Any platform
 providing those four runs RiftCluster well; the sections below are those four
 requirements dressed in AWS clothes.
 
+The checklist at the end of this chapter is the portable part, and it is stated
+once, here. [Chapter 15](15-azure-deployment.md) discharges the same six items
+against Azure rather than restating them — including the one case where a major
+platform fails item 2 outright and the honest answer is "not supported."
+
 ## Reference deployment: EKS
 
 EKS is the recommended home — it is exactly the Chapter 10 StatefulSet with
@@ -115,7 +120,8 @@ explicit choice.)
 
 ## The checklist
 
-Any cloud, condensed:
+Any cloud, condensed. This is the portable core of both cloud chapters — Ch.15
+answers these same six against Azure rather than repeating them:
 
 1. One **routable data port** (front door) + admin port behind an internal L4
    LB with `/readyz` health checks; cluster port private.
