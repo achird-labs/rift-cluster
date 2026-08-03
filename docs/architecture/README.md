@@ -44,6 +44,7 @@ If you read only three chapters, read **1 (Overview)**, **4 (Write Path)**, and
 | 12 | [Testing & Correctness](12-testing.md) | The harness, chaos scenarios, and phase exit criteria |
 | 13 | [The Front Door & Imposter Sources](13-front-door-and-sources.md) | Single-port content routing; pulling mocks from Git/S3/registries, cluster-correctly |
 | 14 | [Deploying on AWS](14-cloud-deployment.md) | EKS reference deployment, ECS/Fargate caveats, EC2, cost & checklist |
+| 15 | [Deploying on Azure](15-azure-deployment.md) | AKS reference, why Container Apps is unsupported, VMSS, cost — Ch.14's checklist in Azure clothes |
 
 ## Status and source of truth
 
