@@ -406,17 +406,39 @@ describe("#249 — the latency & faults panel", () => {
     expect(last()?.[0]?.fault).toEqual({ form: "riftString", kind: "EMPTY_RESPONSE" });
   });
 
-  it("writes the top-level fault key only on a response that has no body to answer with", async () => {
-    // There, `fault` IS the response — `StubResponse::Fault` — and the Rift extension would instead
-    // make the engine build a `RiftScript`.
+  it("writes the top-level fault key on a FLAT response, even when it has a body", async () => {
+    /*
+     * The flat form is the recorded-imposter form, and there the engine's dispatch inverts: it tests
+     * `raw.rift` BEFORE the flat statusCode/body branch, so a flat response carrying `_rift` becomes
+     * a RiftScript — the fault never fires and the status and body are erased on the next read. The
+     * top-level `fault` key is the one that works here. A predicate keyed on "has a body" got every
+     * recorded stub backwards.
+     */
     const user = userEvent.setup();
-    const { last } = mount([
-      response(200, { wrapped: false, statusCode: null, body: { kind: "absent" } }),
-    ]);
+    const { last } = mount([response(201, { wrapped: false, body: { kind: "text", text: "hi" } })]);
 
     await user.selectOptions(screen.getByLabelText("Fault for response 1"), "EMPTY_RESPONSE");
 
     expect(last()?.[0]?.fault).toEqual({ form: "responseKey", kind: "EMPTY_RESPONSE" });
+    expect(renderResponses(last() ?? [])).toEqual([
+      { statusCode: 201, body: "hi", fault: "EMPTY_RESPONSE" },
+    ]);
+  });
+
+  it("does not tell the operator to rewrite a flat response's WORKING fault", async () => {
+    // The old warning fired on exactly this document and instructed the operator to switch a
+    // firing fault into the inert `_rift` form.
+    mount([
+      response(201, {
+        wrapped: false,
+        body: { kind: "text", text: "hi" },
+        fault: { form: "responseKey", kind: "EMPTY_RESPONSE" },
+      }),
+    ]);
+
+    const warning = screen.getByTestId("response-fault-warning-0");
+    expect(warning.textContent).not.toMatch(/never fires/i);
+    expect(warning.textContent).toMatch(/instead of the status/i);
   });
 
   it("does not downgrade a working _rift fault when only the kind is changed", async () => {

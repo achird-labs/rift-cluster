@@ -179,6 +179,21 @@ function Presets({ onPick }: { onPick: (stub: unknown) => void }): ReactNode {
 
 type Parsed = { ok: true; value: unknown } | { ok: false; message: string };
 
+/**
+ * A stub's `responses` array, or an empty list for any document that has not got one.
+ *
+ * Guarded rather than cast. Every OTHER reader of this document — `projectResponses`,
+ * `describeResponses` — copes with `responses` being absent, `null`, an object, or a scalar,
+ * because the editor's whole job is to keep rendering while the operator types a document into
+ * existence. A bare `as unknown[]` here re-introduced the one thing this screen must never do:
+ * `{"id":"s-1","responses":{}}` threw during render and took the editor down with it.
+ */
+function responseListOf(value: unknown): unknown[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+  const responses = (value as Record<string, unknown>).responses;
+  return Array.isArray(responses) ? responses : [];
+}
+
 function parse(text: string): Parsed {
   try {
     return { ok: true, value: JSON.parse(text) as unknown };
@@ -259,11 +274,9 @@ export function StubEditor({
    * than folded into them because it answers a different question: `kind` says what the response
    * IS, this says what else it runs on the way out.
    */
-  const responseExtras: string[][] = parsed.ok
-    ? (((parsed.value as { responses?: unknown }).responses as unknown[] | undefined) ?? []).map(
-        foreignBehaviorsOf,
-      )
-    : [];
+  const responseExtras: string[][] = responseListOf(parsed.ok ? parsed.value : null).map(
+    foreignBehaviorsOf,
+  );
 
   /*
    * Advisory lint, re-run as the document changes. Deliberately not gating the save button: the

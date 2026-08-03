@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { FAULT_KINDS, canonicalFaultKind } from "./behaviors.ts";
 import {
   describeResponses,
+  faultFiresAsRift,
+  faultIsArmed,
   foreignBehaviorsOf,
   projectResponses,
   renderResponses,
@@ -173,6 +175,44 @@ describe("AC2 — the four fault kinds, and the probability form", () => {
     expect(describeResponses({ responses: [{ fault: "EMPTY_RESPONSE" }] })).toEqual([
       { index: 0, kind: "fault", detail: "EMPTY_RESPONSE" },
     ]);
+  });
+});
+
+describe("which fault form fires depends on the `is` KEY, not on having a body", () => {
+  /*
+   * Verified against the running engine, not inferred. The two dispatch tests point opposite ways:
+   *
+   *   {"is":{"statusCode":201,"body":"hi"},"_rift":{"fault":{"tcp":"EMPTY_RESPONSE"}}}  -> fires
+   *   {"is":{"statusCode":201,"body":"hi"},"fault":"EMPTY_RESPONSE"}                    -> DEAD
+   *   {"statusCode":201,"body":"hi","fault":"EMPTY_RESPONSE"}                           -> fires
+   *   {"statusCode":201,"body":"hi","_rift":{"fault":{"tcp":"EMPTY_RESPONSE"}}}         -> DEAD,
+   *      and the status and body are erased on the next read (the response becomes a RiftScript).
+   *
+   * The last row is the one that matters most: flat IS the recorded-imposter form, so a predicate
+   * keyed on "has a status or body" gets every recorded stub exactly backwards.
+   */
+  it("arms a rift fault on a wrapped response and a response-key fault on a flat one", () => {
+    const wrappedRift = one({ is: { statusCode: 201 }, _rift: { fault: { tcp: "EMPTY_RESPONSE" } } });
+    expect(faultFiresAsRift(wrappedRift)).toBe(true);
+    expect(faultIsArmed(wrappedRift)).toBe(true);
+
+    const flatResponseKey = one({ statusCode: 201, body: "hi", fault: "EMPTY_RESPONSE" });
+    expect(faultFiresAsRift(flatResponseKey)).toBe(false);
+    expect(faultIsArmed(flatResponseKey)).toBe(true);
+  });
+
+  it("reports a fault as unarmed in each of the two dead spellings", () => {
+    // Wrapped + top-level `fault`: never reached, and dropped on the next read.
+    expect(faultIsArmed(one({ is: { statusCode: 201 }, fault: "EMPTY_RESPONSE" }))).toBe(false);
+    // Flat + `_rift`: becomes a RiftScript, so the fault never fires AND the body is erased.
+    expect(
+      faultIsArmed(one({ statusCode: 201, body: "hi", _rift: { fault: { tcp: "EMPTY_RESPONSE" } } })),
+    ).toBe(false);
+  });
+
+  it("does not treat a flat response's body as evidence that a rift fault would fire", () => {
+    // The exact regression: `hasIsBody` was true here, so the picker wrote `_rift` — inert.
+    expect(faultFiresAsRift(one({ statusCode: 201, headers: { A: "1" }, body: "hi" }))).toBe(false);
   });
 });
 

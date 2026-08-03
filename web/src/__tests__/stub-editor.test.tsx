@@ -294,6 +294,25 @@ describe("AC4 — the editor's JSON view and form view stay one document", () =>
     await waitFor(() => expect(JSON.parse(editor.value).predicates[0].equals.path).toBe("/orders"));
   });
 
+  it("keeps rendering when `responses` is not an array, instead of throwing mid-edit", async () => {
+    /*
+     * A document the operator passes THROUGH while typing: `{"responses":{}}` is one keystroke away
+     * from `{"responses":[]}`. Every other reader copes with it — `projectResponses` returns
+     * rawOnly naming `responses`, `describeResponses` returns [] — but the per-response
+     * "also runs" labels read the array with a bare cast and threw during render, taking the whole
+     * editor down. `send()` already guards its own read of `parsed.value` for exactly this reason.
+     */
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    const editor = await openEditor("s-1");
+
+    for (const document of ['{"id":"s-1","responses":{}}', '{"id":"s-1","responses":"x"}', "null"]) {
+      await retype(editor, document);
+      // Still on screen, and still telling the operator why the form is unavailable.
+      expect(await screen.findByTestId("stub-raw-banner")).toBeTruthy();
+    }
+  });
+
   it("drops to raw-only when a JSON edit introduces a key the form cannot hold", async () => {
     stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
     renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
