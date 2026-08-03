@@ -18,21 +18,49 @@ type Role = components["schemas"]["Role"];
 // whatever ran before it.
 afterEach(cleanup);
 
-/** One route's canned reply: either a JSON body, or a status to fail with. */
-export type Reply = { json: unknown; status?: number } | { status: number; json?: unknown };
+/**
+ * One route's canned reply: either a JSON body, or a status to fail with.
+ *
+ * `headers` exists for the reads whose *header* is load-bearing — `Rift-Cluster-Revision` is the
+ * `If-Match` every write on the imposter screens is conditioned on, and a reply without it makes
+ * those writes correctly refuse to send.
+ */
+export type Reply = ({ json: unknown; status?: number } | { status: number; json?: unknown }) & {
+  headers?: Record<string, string>;
+};
 
 /**
  * A fetch double keyed by the *path* the console asks for, so a test states the fleet's answers
  * rather than the order of calls. An unmatched path is a hard failure: a screen quietly reaching
  * for a route the test never modelled is exactly the drift these tests exist to catch.
  */
-export function stubFetch(routes: Record<string, Reply>): { calls: string[] } {
+/** One call as it was actually sent, for tests that assert on the verb or the payload. */
+export type SentRequest = {
+  path: string;
+  method: string;
+  body: BodyInit | null | undefined;
+  headers: Record<string, string>;
+};
+
+export function stubFetch(routes: Record<string, Reply>): {
+  calls: string[];
+  requests: SentRequest[];
+} {
   const calls: string[] = [];
+  const requests: SentRequest[] = [];
   vi.stubGlobal(
     "fetch",
-    vi.fn((input: RequestInfo | URL) => {
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const path = typeof input === "string" ? input : input.toString();
       calls.push(path);
+      requests.push({
+        path,
+        method: init?.method ?? "GET",
+        body: init?.body,
+        // Normalised to a plain record so a test can assert on `If-Match` without caring whether
+        // the caller passed a `Headers`, an array of pairs, or an object literal.
+        headers: Object.fromEntries(new Headers(init?.headers).entries()),
+      });
       const reply = routes[path];
       if (reply === undefined) {
         return Promise.reject(new Error(`test stub has no reply for ${path}`));
@@ -42,10 +70,10 @@ export function stubFetch(routes: Record<string, Reply>): { calls: string[] } {
       // `new Response("", { status: 204 })` throws a TypeError and the stub fails in a way that
       // looks like the code under test rejecting. `response.text()` reads "" from either.
       const body = reply.json === undefined ? null : JSON.stringify(reply.json);
-      return Promise.resolve(new Response(body, { status }));
+      return Promise.resolve(new Response(body, { status, headers: reply.headers ?? {} }));
     }),
   );
-  return { calls };
+  return { calls, requests };
 }
 
 export function whoamiWith(role: Role, tenants: string[] = ["acme"]): WhoAmI {

@@ -37,6 +37,27 @@ export const requestsPath = (port: number): string => `/imposters/${port}/reques
 export const stubsPath = (port: number): string => `/imposters/${port}/stubs`;
 
 /**
+ * What a recording has captured, cleared. `DELETE` here is not terminated by the admin front — it
+ * proxies upstream, and `principal.rs::map_action` folds it onto `Action::SavedRequestsClear`
+ * alongside `savedRequests` and `requests` (RFC-002 §4.1) — see `rbac.ts`'s `requests.clear` for the
+ * capability this authorizes against.
+ */
+export const savedProxyResponsesPath = (port: number): string =>
+  `/imposters/${port}/savedProxyResponses`;
+
+/**
+ * The recorded projection of one imposter: proxy stubs stripped out (`removeProxies`) and only the
+ * stubs a recording could actually replay (`replayable`), in the flat response form the engine
+ * emits for a captured request (`vendor/rift/docs/mountebank/proxy.md:190-224`).
+ *
+ * Not a member of `API_PATHS`/`ApiPath`: the contract declares `GET /imposters/{port}` with no query
+ * parameters at all, so a templated string is the only way to reach this projection, the same as
+ * `auditPath` below.
+ */
+export const recordedStubsPath = (port: number): string =>
+  `${imposterPath(port)}?replayable=true&removeProxies=true`;
+
+/**
  * Scenario states for one imposter, read under one space.
  *
  * `flowId` rides in the **query string**, not the path — a separate contract parameter from the

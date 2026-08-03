@@ -22,7 +22,9 @@ import {
   flowStatePath,
   principalPath,
   principalsPath,
+  recordedStubsPath,
   requestsPath,
+  savedProxyResponsesPath,
   scenarioStatePath,
   scenariosPath,
   scenariosResetPath,
@@ -352,6 +354,76 @@ export function useAddStub(): UseMutationResult<CommitOutcome, Error, StubWrite>
  */
 function addStubBody(body: RawJsonBody | undefined): RawJsonBody | undefined {
   return body === undefined ? undefined : new RawJsonBody(`{"stub":${body.text}}`);
+}
+
+/**
+ * The recorded projection of one imposter (`replayable=true&removeProxies=true`) — the stubs a
+ * recording has actually captured, in the flat response form the engine emits for them.
+ *
+ * Read as its own query, not folded into `useImposter`: it is a different upstream projection of
+ * the same imposter, not a filtered view of the same body, so a poll of the plain read must not
+ * step on this one's cache and vice versa.
+ */
+export function useRecordedStubs(
+  port: number,
+  options: { enabled?: boolean } = {},
+): UseQueryResult<Stub[]> {
+  const { tenant } = useSession();
+  return useQuery({
+    queryKey: key(["recorded-stubs", port], tenant),
+    queryFn: async () => {
+      const body = await apiGet<Imposter>(recordedStubsPath(port), { tenant });
+      // `stubs` is optional in the contract, same reasoning as `useImposters`.
+      return body.stubs ?? [];
+    },
+    // The caller decides, because only it knows whether this imposter is recording — an imposter
+    // that is not has nothing to project, and polling it would be a request per 5s that can only
+    // answer "nothing".
+    enabled: options.enabled ?? true,
+    ...POLLED,
+  });
+}
+
+/**
+ * Replace the whole stub list with a recording's captured stubs — "stop & promote".
+ *
+ * Reuses `useStubWrite` for its `409` → `StubConflict` handling: a promote is still a
+ * concurrency-conditioned imposter write, and an operator who has just reviewed a page of recorded
+ * responses deserves the same rebase prompt a hand-edited stub gets, not a bare error. `stubId` goes
+ * unused — the route this posts to (`PUT /imposters/:port/stubs`) carries no id in its path — but
+ * `StubWrite` is the shape every write on this screen already speaks, and a promote paying for a
+ * field it never reads is cheaper than a second write pipeline that duplicates the conflict handling.
+ */
+export function usePromoteRecording(): UseMutationResult<CommitOutcome, Error, StubWrite> {
+  return useStubWrite((write, tenant) =>
+    apiSend("PUT", stubsPath(write.port), write.body, { tenant, ifMatch: write.revision }),
+  );
+}
+
+/**
+ * Discard everything a recording has captured so far, without touching the proxy stub itself — the
+ * imposter keeps recording; only what it has captured up to now is cleared.
+ *
+ * Gated by the caller on `requests.clear`, not `imposter.write`: `DELETE .../savedProxyResponses` is
+ * not terminated by the admin front, so it reaches upstream and `principal.rs::map_action` folds it
+ * onto the same `Action::SavedRequestsClear` as clearing the request log (RFC-002 §4.1). See
+ * `rbac.ts`'s `requests.clear` note for the specific mapping this transcribes.
+ */
+export function useDiscardRecording(): UseMutationResult<CommitOutcome, Error, { port: number }> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ port }) => {
+      const sent = await apiSend("DELETE", savedProxyResponsesPath(port), undefined, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: (_data, _error, { port }) => {
+      void client.invalidateQueries({ queryKey: ["imposter", port] });
+      void client.invalidateQueries({ queryKey: ["recorded-stubs", port] });
+    },
+  });
 }
 
 /**
