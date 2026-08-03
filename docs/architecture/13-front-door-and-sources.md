@@ -99,10 +99,21 @@ re-pull clobber, made declared and observable.
 barrier makes a pull fleet-visible at its 2xx". It does not, and the
 distinction matters to anyone scripting against this path.
 `--cluster-write-barrier` is a property of the **admin front**
-(`crates/rift-cluster-server/src/admin_front.rs`), while `POST /admin/sources/:id/pull`
-rides the **cluster port**: `SourcePuller::pull` submits the op and then awaits
+(`crates/rift-cluster-server/src/admin_front.rs`), and it does not extend to a
+source pull on either port. `SourcePuller::pull` submits the op and then awaits
 only *this* node's local apply (#99), so its 2xx means "committed, and the node
-you asked has it". The fleet follows within a replication round, which is what
+you asked has it".
+
+**Updated (#253).** The source *write* verbs — `POST /admin/sources`,
+`DELETE /admin/sources/{id}` and `POST /admin/sources/{id}/pull` — are now served
+on **both** ports. They began on the cluster port under the node-to-node cluster
+credential, where they still are and still write the default tenant; #253
+promoted them to the RBAC'd admin front, where they are authorized as
+`imposter.write` / `imposter.delete` (the names the audit stream already emits
+for these ops, rather than a new `SourceWrite` the audit and the gate would
+disagree about) and write the **caller's resolved tenant**. Both ports run the
+same `SourcePuller` methods, which is what keeps the two from drifting; the
+tenant is the only difference between them. The fleet follows within a replication round, which is what
 `c20_source_pull_converges_and_fetches_once` polls for rather than asserting at
 2xx-return. Read-your-write across the fleet on this path would be a barrier the
 source handler has to take, not one it already has.

@@ -1,16 +1,49 @@
-import type { ReactNode } from "react";
+import { type FormEvent, type ReactNode, useState } from "react";
 
 import { ApiError } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
 import { SOURCE_COLUMNS } from "../app/contract.ts";
-import { useSources } from "../app/queries.ts";
+import {
+  type SourcePullReport,
+  type SourceWrite,
+  useDeleteSource,
+  usePullSource,
+  useSources,
+  useUpsertSource,
+} from "../app/queries.ts";
+import { useSession } from "../app/session.tsx";
 import { assertNever } from "../components/imposterFields.tsx";
-import { Card, Empty, ErrorNote, Ident, Status, UNKNOWN } from "../components/primitives.tsx";
+import {
+  Card,
+  Confirm,
+  Empty,
+  ErrorNote,
+  Ident,
+  Status,
+  UNKNOWN,
+  UnconfirmedNote,
+} from "../components/primitives.tsx";
 
 type SourceRecord = components["schemas"]["SourceRecord"];
 
+/** The one source a `pull` most recently reported on, so the report renders under its own row. */
+type LastPull = { id: string; report: SourcePullReport } | null;
+
 export function Sources(): ReactNode {
   const sources = useSources();
+  const { can } = useSession();
+  // Declare/edit and refresh all condition on the same action the server checks writes against
+  // (`Action::SourceWrite`, granted alongside `ImposterWrite`); delete is its own action, the same
+  // discipline `imposter.delete` already holds to elsewhere in this console — see `rbac.ts`.
+  const mayWrite = can("imposter.write");
+  const mayDelete = can("imposter.delete");
+  const upsert = useUpsertSource();
+  const remove = useDeleteSource();
+  const pull = usePullSource();
+
+  const [editing, setEditing] = useState<SourceRecord | "new" | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState<SourceRecord | null>(null);
+  const [lastPull, setLastPull] = useState<LastPull>(null);
 
   if (sources.isError) {
     /*
@@ -43,7 +76,67 @@ export function Sources(): ReactNode {
         <p className="scope-label">
           Imposter sources, their declared drift policy, and the ports they own.
         </p>
+        {mayWrite ? (
+          <>
+            <div className="spacer" />
+            <button
+              className="btn primary"
+              type="button"
+              data-testid="new-source"
+              onClick={() => setEditing("new")}
+            >
+              Declare source
+            </button>
+          </>
+        ) : null}
       </header>
+
+      {upsert.isError ? (
+        <ErrorNote error={upsert.error} context="The source was not saved" />
+      ) : null}
+      {remove.isError ? (
+        <ErrorNote error={remove.error} context="The source was not forgotten" />
+      ) : null}
+      {pull.isError ? <ErrorNote error={pull.error} context="The pull did not run" /> : null}
+      {upsert.data?.kind === "unobservable" ? <UnconfirmedNote reason={upsert.data.reason} /> : null}
+      {remove.data?.kind === "unobservable" ? <UnconfirmedNote reason={remove.data.reason} /> : null}
+
+      {editing !== null ? (
+        <SourceForm
+          // Forces a remount when the target changes — switching from "new" to an existing source,
+          // or from one row's "Edit" to another's, without closing the form first — so the fields
+          // that seeded from `existing` on mount actually reseed. Without the `key`, React reuses
+          // the same component instance and its `useState` initial values never re-run, leaving the
+          // previous target's text sitting in the fields under a form that now claims to be a
+          // different source's.
+          key={editing === "new" ? "new" : editing.id}
+          existing={editing === "new" ? null : editing}
+          busy={upsert.isPending}
+          onCancel={() => setEditing(null)}
+          onSave={(body) => upsert.mutate(body, { onSuccess: () => setEditing(null) })}
+        />
+      ) : null}
+
+      {confirmingDelete === null ? null : (
+        <Confirm
+          testId="confirm-delete-source"
+          title={`Forget ${confirmingDelete.id}?`}
+          body={
+            <>
+              Forgetting a source never cascades: nothing it produced is undeployed. Its imposters
+              keep running, orphaned from the source and from then on hand-managed — there is
+              nothing left to reapply them from.
+            </>
+          }
+          confirmLabel={`Forget ${confirmingDelete.id}`}
+          busy={remove.isPending}
+          onCancel={() => setConfirmingDelete(null)}
+          onConfirm={() => {
+            remove.mutate({ id: confirmingDelete.id });
+            setConfirmingDelete(null);
+          }}
+        />
+      )}
 
       {/*
        * The permanent scope strip the request log and fleet screens already hold to: `nodeLocal` is
@@ -95,11 +188,28 @@ export function Sources(): ReactNode {
                   ))}
                   <th>Drift</th>
                   <th>Poll (this node)</th>
+                  {mayWrite || mayDelete ? <th aria-label="Actions" /> : null}
                 </tr>
               </thead>
               <tbody>
                 {sources.data.sources.map((source) => (
-                  <Row key={source.id} source={source} pollErrors={sources.data.nodeLocal.pollErrors} />
+                  <Row
+                    key={source.id}
+                    source={source}
+                    pollErrors={sources.data.nodeLocal.pollErrors}
+                    mayWrite={mayWrite}
+                    mayDelete={mayDelete}
+                    pullBusy={pull.isPending}
+                    pullReport={lastPull?.id === source.id ? lastPull.report : null}
+                    onEdit={() => setEditing(source)}
+                    onDelete={() => setConfirmingDelete(source)}
+                    onPull={() =>
+                      pull.mutate(
+                        { id: source.id },
+                        { onSuccess: (report) => setLastPull({ id: source.id, report }) },
+                      )
+                    }
+                  />
                 ))}
               </tbody>
             </table>
@@ -113,9 +223,23 @@ export function Sources(): ReactNode {
 function Row({
   source,
   pollErrors,
+  mayWrite,
+  mayDelete,
+  pullBusy,
+  pullReport,
+  onEdit,
+  onDelete,
+  onPull,
 }: {
   source: SourceRecord;
   pollErrors: Record<string, string>;
+  mayWrite: boolean;
+  mayDelete: boolean;
+  pullBusy: boolean;
+  pullReport: SourcePullReport | null;
+  onEdit: () => void;
+  onDelete: () => void;
+  onPull: () => void;
 }): ReactNode {
   return (
     <tr data-testid={`source-row-${source.id}`}>
@@ -130,11 +254,275 @@ function Row({
       ))}
       <td data-testid={`source-drift-${source.id}`}>
         <DriftCell source={source} />
+        {/* Rendered next to the drift verdict rather than the poll column: a pull report is what
+            "refresh now" just did to the replicated record, the same kind of fact drift is — not a
+            property of this node's reach to the upstream host, which is what the poll column says. */}
+        {pullReport === null ? null : <PullReportView report={pullReport} />}
       </td>
       <td data-testid={`source-poll-${source.id}`}>
         <PollCell error={pollErrors[source.id]} />
       </td>
+      {mayWrite || mayDelete ? (
+        <td>
+          <span className="row">
+            {mayWrite ? (
+              <button
+                className="btn sm"
+                type="button"
+                data-testid={`source-edit-${source.id}`}
+                onClick={onEdit}
+              >
+                Edit
+              </button>
+            ) : null}
+            {mayWrite ? (
+              <button
+                className="btn sm"
+                type="button"
+                data-testid={`source-pull-${source.id}`}
+                disabled={pullBusy}
+                onClick={onPull}
+              >
+                {pullBusy ? "Pulling…" : "Pull now"}
+              </button>
+            ) : null}
+            {mayDelete ? (
+              <button
+                className="btn sm danger"
+                type="button"
+                data-testid="source-delete"
+                aria-label={`Forget ${source.id}`}
+                onClick={onDelete}
+              >
+                Forget
+              </button>
+            ) : null}
+          </span>
+        </td>
+      ) : null}
     </tr>
+  );
+}
+
+/**
+ * What a pull just reported.
+ *
+ * The three outcomes are genuinely different and an operator has to be able to tell them apart:
+ * `unchanged` means the fetched content matched what the source last applied, so nothing reached
+ * the log at all; `skipped` means the pull DID commit a decision not to apply, because the source
+ * had drifted and its policy said to leave it; and otherwise `changed` names the ports it created,
+ * replaced or removed. Collapsing the first two into "nothing happened" would hide a drifted source
+ * that is silently no longer tracking.
+ *
+ * `warnings` is server-authored text about what the pull did NOT apply. It is rendered rather than
+ * dropped for the usual reason: the caveat is the part the operator needs.
+ */
+function PullReportView({ report }: { report: SourcePullReport }): ReactNode {
+  return (
+    <div className="note" data-testid="source-pull-report">
+      {report.skipped ? (
+        <span>
+          Pull <b>skipped</b> — this source had drifted and its policy left it alone. The fleet does
+          not hold the fetched content.
+        </span>
+      ) : report.unchanged ? (
+        <span>
+          <b>Unchanged</b> — what was fetched matched what this source last applied, so nothing was
+          written.
+        </span>
+      ) : report.changed.length === 0 ? (
+        <span>Applied, and no port changed.</span>
+      ) : (
+        <span>
+          Applied — changed {report.changed.length === 1 ? "port" : "ports"}{" "}
+          <b>{report.changed.join(", ")}</b>.
+        </span>
+      )}
+      {report.version === null ? null : <span> Version {report.version}.</span>}
+      {report.warnings.length === 0 ? null : (
+        <ul className="plain" data-testid="source-pull-warnings">
+          {report.warnings.map((warning) => (
+            <li key={warning} className="warn-text">
+              {warning}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+const SOURCE_MODES = ["pinned", "tracking"] as const satisfies readonly SourceRecord["mode"][];
+const ON_DRIFT_POLICIES = [
+  "overwrite",
+  "skip",
+  "fail",
+] as const satisfies readonly SourceRecord["onDrift"][];
+
+/**
+ * Declare or edit a source — one form, because `POST /admin/sources` is an upsert and there is no
+ * separate create route to give a second form to.
+ *
+ * `id` is locked once a source exists. The route addresses a source by the `id` **in its body**,
+ * not a path segment, so changing it here on an edit would not rename the source — it would declare
+ * a second one and leave the first behind, silently. The same one-way-field trap `NewImposter`'s
+ * port avoids, for the same reason: there is nothing server-side to catch it.
+ *
+ * `onDrift`'s options are `SOURCE_COLUMNS`' own values, transcribed once as `ON_DRIFT_POLICIES`
+ * rather than re-typed here — the column that already renders `source.onDrift` and this select draw
+ * from the same three-value type, so neither can drift from the other without `tsc` noticing.
+ */
+function SourceForm({
+  existing,
+  busy,
+  onSave,
+  onCancel,
+}: {
+  existing: SourceRecord | null;
+  busy: boolean;
+  onSave: (body: SourceWrite) => void;
+  onCancel: () => void;
+}): ReactNode {
+  const [id, setId] = useState(existing?.id ?? "");
+  const [uri, setUri] = useState(existing?.uri ?? "");
+  const [mode, setMode] = useState<SourceRecord["mode"]>(existing?.mode ?? "pinned");
+  const [pollSecs, setPollSecs] = useState(existing?.pollSecs?.toString() ?? "");
+  const [onDrift, setOnDrift] = useState<SourceRecord["onDrift"]>(existing?.onDrift ?? "fail");
+  const [authRef, setAuthRef] = useState(existing?.authRef ?? "");
+  const [invalid, setInvalid] = useState<string | null>(null);
+
+  function submit(event: FormEvent): void {
+    event.preventDefault();
+    if (id.trim() === "") return setInvalid("A source needs an id.");
+    if (uri.trim() === "") return setInvalid("A source needs a URI.");
+    let parsedPollSecs: number | undefined;
+    if (mode === "tracking") {
+      const parsed = Number(pollSecs);
+      // Only the shape is checked here — a whole number of seconds. *How short is too short* is
+      // deliberately not asserted client-side: the server enforces its own floor, and duplicating
+      // a number here would drift the day that floor changes. The refusal that comes back is the
+      // one place that number is allowed to live.
+      if (pollSecs.trim() === "" || !Number.isInteger(parsed) || parsed < 1) {
+        setInvalid(
+          "A tracking source needs a poll interval, in whole seconds. The server enforces its " +
+            "own minimum — its refusal, not this hint, is the authority on what that floor is.",
+        );
+        return;
+      }
+      parsedPollSecs = parsed;
+    }
+    setInvalid(null);
+    onSave({
+      id: id.trim(),
+      uri: uri.trim(),
+      mode,
+      onDrift,
+      // Omitted rather than sent empty: `authRef` absent is "no credential", not a name that
+      // happens to be the empty string.
+      ...(authRef.trim() === "" ? {} : { authRef: authRef.trim() }),
+      ...(parsedPollSecs === undefined ? {} : { pollSecs: parsedPollSecs }),
+    });
+  }
+
+  return (
+    <Card title={existing === null ? "Declare source" : `Edit ${existing.id}`}>
+      <form className="stub-form" onSubmit={submit} data-testid="source-form">
+        <div className="field-row">
+          <div className="field">
+            <label htmlFor="source-id">Id</label>
+            <input
+              id="source-id"
+              value={id}
+              onChange={(event) => setId(event.target.value)}
+              disabled={existing !== null}
+              placeholder="payments"
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="source-uri">URI</label>
+            <input id="source-uri" value={uri} onChange={(event) => setUri(event.target.value)} />
+          </div>
+        </div>
+
+        <div className="field-row">
+          <div className="field">
+            <label htmlFor="source-mode">Mode</label>
+            <select
+              id="source-mode"
+              value={mode}
+              onChange={(event) => setMode(event.target.value as SourceRecord["mode"])}
+            >
+              {SOURCE_MODES.map((value) => (
+                <option key={value} value={value}>
+                  {value}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="field">
+            <label htmlFor="source-drift">On drift</label>
+            <select
+              id="source-drift"
+              value={onDrift}
+              onChange={(event) => setOnDrift(event.target.value as SourceRecord["onDrift"])}
+            >
+              {ON_DRIFT_POLICIES.map((value) => (
+                <option key={value} value={value}>
+                  {value}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {mode === "tracking" ? (
+          <div className="field">
+            <label htmlFor="source-poll">Poll interval (seconds)</label>
+            <input
+              id="source-poll"
+              inputMode="numeric"
+              value={pollSecs}
+              onChange={(event) => setPollSecs(event.target.value)}
+              placeholder="60"
+            />
+            <p className="hint">
+              The server enforces a minimum poll interval. If this is too short, its refusal — not
+              this hint — is the authority on what the floor actually is.
+            </p>
+          </div>
+        ) : null}
+
+        <div className="field">
+          <label htmlFor="source-auth">Credential reference (never a secret)</label>
+          <input
+            id="source-auth"
+            value={authRef}
+            onChange={(event) => setAuthRef(event.target.value)}
+            placeholder="optional"
+          />
+          <p className="hint">
+            The name of a credential already configured on this node — never the credential
+            itself. The server refuses a URI carrying embedded userinfo precisely so a secret can
+            never reach the replicated log; do not paste one into the URI field either.
+          </p>
+        </div>
+
+        {invalid === null ? null : (
+          <p className="error" data-testid="source-invalid" role="alert">
+            {invalid}
+          </p>
+        )}
+
+        <div className="row">
+          <button className="btn primary" type="submit" data-testid="source-save" disabled={busy}>
+            {busy ? "Saving…" : "Save source"}
+          </button>
+          <button className="btn" type="button" onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+        </div>
+      </form>
+    </Card>
   );
 }
 

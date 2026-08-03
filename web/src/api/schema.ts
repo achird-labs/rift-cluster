@@ -709,7 +709,11 @@ export interface paths {
          */
         get: operations["listSources"];
         put?: never;
-        post?: never;
+        /**
+         * Declare (upsert by id) an imposter source
+         * @description Terminates: commits a `SourcePut` op and answers `200` with the stored record. An upsert, not a create-vs-replace distinction — the same `id` re-declared replaces the prior declaration. Requires `imposter.write` (Editor and up) — deliberately not a dedicated `source.write`: the audit stream already names this op `imposter.write` (it is exactly as consequential as `PUT /imposters`, because that is what a pull ultimately produces), and the read side above is the lighter, separately-gated `source.read`. A `uri` carrying embedded userinfo (`user:pass@host`) is refused before the write reaches the replicated log — name a credential with `authRef` instead. No `If-Match`: a source row has no revision surface of its own to condition on, and this is an idempotent upsert, not a read-modify-write.
+         */
+        post: operations["putSource"];
         delete?: never;
         options?: never;
         head?: never;
@@ -730,6 +734,30 @@ export interface paths {
         get: operations["getSource"];
         put?: never;
         post?: never;
+        /**
+         * Stop tracking a source
+         * @description Terminates: commits a `SourceDelete` op and answers `200` with the committed revision. Idempotent — deleting an absent id commits and answers the same as deleting one that exists, exactly like `DeleteImposter`, so there is no "unknown source" 404 the way a pull of an absent id has. The imposters this source owned stay bound; only their provenance is cleared — orphaned, never torn down. Requires `imposter.delete` (Editor and up). No `If-Match` — see `putSource`'s description for why.
+         */
+        delete: operations["deleteSource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/sources/{sourceId}/pull": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Fetch a source now and apply what it produced
+         * @description Terminates: fetches the source's `uri` outside the replicated log (fetching is not deterministic), then commits what was fetched as a `SourcePullResult` op — an ordinary validated write every replica applies identically. Identical content to what the source last applied writes no log entry at all (`unchanged: true`) rather than re-churning state on every poll of a stable document. Requires `imposter.write` (Editor and up) — the same action `putSource` does, and for the same reason: a pull is what actually produces the `PUT /imposters`-equivalent write. No `If-Match` — see `putSource`'s description.
+         */
+        post: operations["pullSource"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1300,6 +1328,50 @@ export interface components {
              * @description The log index that last wrote this record.
              */
             revision: number;
+        };
+        /** @description A source declaration: `POST /admin/sources` upserts by `id`. Fields left out take their documented defaults (`mode: pinned`, `onDrift: overwrite`) — the same defaults the server applies when they are absent from the wire — so a minimal `{id, uri}` body is a complete, valid declaration. */
+        SourceWrite: {
+            /** @description The source's id; unique within the caller's tenant, at most 128 characters drawn from `[A-Za-z0-9._-]`. */
+            id: string;
+            /** @description The URI to pull from. Must not carry embedded userinfo (`user:pass@host`) — refused before the write ever reaches the replicated log, not even as a committed-but-failed entry; name a credential with `authRef` instead. */
+            uri: string;
+            /**
+             * @description Explicit pulls only (the default), or scheduled polls on `pollSecs`.
+             * @enum {string}
+             */
+            mode?: "pinned" | "tracking";
+            /** @description The **name** of a credential resolved at fetch time, never the credential itself. Refused if the URI's scheme has no provider that consumes one. */
+            authRef?: string;
+            /**
+             * @description What a pull does when this source's imposters were hand-edited since it last applied.
+             * @enum {string}
+             */
+            onDrift?: "overwrite" | "skip" | "fail";
+            /**
+             * Format: int64
+             * @description Poll interval for a `tracking` source; refused on any other mode, and refused below the server's poll-interval floor.
+             */
+            pollSecs?: number;
+        };
+        /** @description What one pull did, as reported by `POST /admin/sources/{sourceId}/pull`. */
+        PullReport: {
+            /**
+             * Format: int64
+             * @description The applying log index, or the source's last one when the digest short-circuit meant nothing was written.
+             */
+            revision: number;
+            /** @description The version label the source's document reported, when it names one. */
+            version?: string;
+            /** @description Content digest of what was fetched. */
+            digest: string;
+            /** @description True when the fetched content matched what the source last applied, so no log entry was written. */
+            unchanged: boolean;
+            /** @description True when the pull committed a decision *not* to apply — a drifted source under `onDrift: skip`. Distinct from `unchanged`: a skip did reach the log, and the fleet does not hold this content. */
+            skipped: boolean;
+            /** @description The ports this pull created, replaced or removed. Empty when nothing was applied. */
+            changed: number[];
+            /** @description Anything the document declared that a clustered pull does not apply (e.g. a `routes` or `intercept` block). Absent entirely when empty, never `[]`. */
+            warnings?: string[];
         };
         /** @description The answering node's own view — **not** a fleet fact. A poll failure is a property of one node's reach to an external host at one moment and is deliberately never replicated, so this half can differ across the fleet; it is kept apart from the record precisely so that it cannot be mistaken for one more replicated field. */
         SourcesNodeLocal: {
@@ -4025,6 +4097,50 @@ export interface operations {
             500: components["responses"]["InternalError"];
         };
     };
+    putSource: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceWrite"];
+            };
+        };
+        responses: {
+            /** @description The source as stored (an upsert, so this is also the shape a replace answers). */
+            200: {
+                headers: {
+                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceRecord"];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Caller holds no binding in the tenant named by `X-Rift-Tenant` (RFC-002 §8.4 — not a 403). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
     getSource: {
         parameters: {
             query?: never;
@@ -4063,6 +4179,105 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalError"];
+        };
+    };
+    deleteSource: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path: {
+                /** @description The source's declared id, unique within its tenant. */
+                sourceId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The source is no longer tracked. */
+            200: {
+                headers: {
+                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /**
+                         * Format: int64
+                         * @description The log index this delete committed at.
+                         */
+                        revision: number;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Caller holds no binding in the tenant named by `X-Rift-Tenant` (RFC-002 §8.4 — not a 403). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    pullSource: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path: {
+                /** @description The source's declared id, unique within its tenant. */
+                sourceId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What the pull did. Carries no `Rift-Cluster-Op-Id`: unlike `putSource`/`deleteSource`, this route's underlying write path is shared byte-for-byte with the cluster port's pre-existing pull (issue #134) and does not surface the op id it minted internally — `revision` in the body is what a client correlates a pull with instead. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PullReport"];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No such source in the tenant in view. Byte-identical whether the id never existed, exists in another tenant, or the caller holds no binding here at all (RFC-002 §8.4). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            /** @description The source's own host refused or failed the fetch; the cluster's write path was never reached. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            503: components["responses"]["Unavailable"];
         };
     };
     getWhoAmI: {

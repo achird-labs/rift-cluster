@@ -122,6 +122,133 @@ export function useSources(): UseQueryResult<{
 }
 
 /**
+ * Upsert a source declaration — `POST /admin/sources`. There is no separate create route: an id
+ * already declared is replaced in place and a new one is created, which is why the console offers
+ * one form for both rather than two (`Sources.tsx`'s `SourceForm`).
+ *
+ * Field casing follows every other admin-plane write body in this file (`AuditSinkWrite`,
+ * `TenantWrite`, …): camelCase, matching `SourceRecord`'s own read-side fields — and matching the
+ * vocabulary `control.rs::validate`'s own refusals already use on the wire (its poll-interval
+ * refusal reads `"pollSecs {secs} is below the {MIN_POLL_SECS}s floor"`, camelCase, even though the
+ * Rust field behind it is `poll_secs`). This route lands in parallel with this change; if it ships
+ * a different casing, this type and the two hooks below are the only place to fix.
+ */
+export type SourceWrite = {
+  id: string;
+  uri: string;
+  mode: SourceRecord["mode"];
+  authRef?: string;
+  onDrift: SourceRecord["onDrift"];
+  pollSecs?: number;
+};
+
+export function useUpsertSource(): UseMutationResult<CommitOutcome, Error, SourceWrite> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body) => {
+      const sent = await apiSend("POST", API_PATHS.sources, body, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["sources"] }),
+  });
+}
+
+/**
+ * Forget a source — `DELETE /admin/sources/{id}`.
+ *
+ * This never cascades: the apply path leaves a forgotten source's imposters exactly as they are,
+ * only dropping their provenance, so its ports keep serving with no source left to reapply them
+ * from. `Sources.tsx`'s confirm dialog states that in as many words — "delete" reads as "undeploy"
+ * to an operator who has not read the apply path.
+ */
+export function useDeleteSource(): UseMutationResult<CommitOutcome, Error, { id: string }> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id }) => {
+      const sent = await apiSend(
+        "DELETE",
+        `${API_PATHS.sources}/${encodeURIComponent(id)}`,
+        undefined,
+        { tenant },
+      );
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["sources"] }),
+  });
+}
+
+/**
+ * What one pull reported: which ports it changed, which it looked at and left alone, and whether it
+ * ran at all.
+ *
+ * Transcribed from `PullReport` in the OpenAPI document this change extends — NOT guessed. An
+ * earlier draft invented `changedPorts`/`unchangedPorts`, which meant a pull that had just replaced
+ * a port rendered as "no ports changed": the screen confidently reported the opposite of what
+ * happened. The real shape is `changed` (the ports created, replaced or removed), with `unchanged`
+ * and `skipped` as BOOLEANS that mean different things — `unchanged` wrote no log entry at all,
+ * while `skipped` committed a decision not to apply a drifted source.
+ *
+ * Still read defensively, because a screen must not throw on a malformed body — but defensive is
+ * not the same as speculative, and the field names come from the contract.
+ */
+export type SourcePullReport = {
+  revision: number | null;
+  version: string | null;
+  changed: number[];
+  unchanged: boolean;
+  skipped: boolean;
+  /** Server-authored text about what the pull did NOT apply. Dropping it hides the caveat. */
+  warnings: string[];
+};
+
+function readPullReport(body: unknown): SourcePullReport {
+  const record = (body ?? {}) as Record<string, unknown>;
+  const strings = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+  return {
+    revision: typeof record.revision === "number" ? record.revision : null,
+    version: typeof record.version === "string" ? record.version : null,
+    changed: Array.isArray(record.changed)
+      ? record.changed.filter((entry): entry is number => typeof entry === "number")
+      : [],
+    unchanged: record.unchanged === true,
+    skipped: record.skipped === true,
+    warnings: strings(record.warnings),
+  };
+}
+
+/**
+ * Pull one source now — `POST /admin/sources/{id}/pull`.
+ *
+ * Returns the parsed report directly rather than a `CommitOutcome`: the whole point of "refresh
+ * now" is to show the operator what the pull just did, so `applied()` is the right assertion here —
+ * a report that has not landed yet is not a report, and a route that answered `202` for this would
+ * be a contract this hook does not yet understand, not a case to quietly paper over.
+ */
+export function usePullSource(): UseMutationResult<SourcePullReport, Error, { id: string }> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id }) => {
+      const sent = await apiSend<unknown>(
+        "POST",
+        `${API_PATHS.sources}/${encodeURIComponent(id)}/pull`,
+        undefined,
+        { tenant },
+      );
+      return readPullReport(applied(sent));
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["sources"] }),
+  });
+}
+
+/**
  * This node's own fleet reading.
  *
  * `enabled` is a caller's decision, not a fixed capability check, because the two callers want
