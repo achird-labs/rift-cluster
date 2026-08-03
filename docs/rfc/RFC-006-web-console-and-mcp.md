@@ -107,7 +107,7 @@ adds no header logic of its own beyond sending the selection.
 
 | Screen | Backend | Availability |
 |---|---|---|
-| **Imposters** — list, per-imposter detail, enable/disable | `GET/POST/DELETE /imposters*` (terminated routes — `classify()` at `admin_front.rs:435`, the `Terminated` enum at `:351`; reads proxied to the engine) | v1 |
+| **Imposters** — list, per-imposter detail, enable/disable; filter/sort/bulk (#252) | `GET/POST/DELETE /imposters*` (terminated routes — `classify()` at `admin_front.rs:435`, the `Terminated` enum at `:351`; reads proxied to the engine). Filtering and sorting are **client-side** over the list already fetched — no query parameter is added, because `GET /imposters` returns the tenant's whole set and a server-side filter would give "what is in this list" a second source of truth. Bulk actions are **N calls, not a batch endpoint**: one request per imposter, reported per item (see below) | v1, bulk #252 |
 | **Stub editor** — form ⟷ raw JSON, monaco, lint-on-save | stub CRUD incl. by-id routes (`admin_front.rs:378-395`); lint via `rift-lint` in-browser (§4.1) | v1 |
 | **Request log** — recorded requests, match diagnostics | v1: `GET /imposters/:port/requests` per node, labelled **per-node view**; converges to the doc-07 merged journal when the verification plane ships, same screen, no redesign | v1 (degraded) |
 | **Cluster** — members, leader, ring epoch, readiness, pending ops | §5.2's admin-port fleet reads (projection of `cluster_api.rs:63-191`) | v1 |
@@ -145,6 +145,46 @@ the wasm-unfriendly part pre-neutralized — but the full dependency tree
 compiling to wasm is **to-verify** (§12 Q1); the fallback is calling a
 dry-run lint endpoint, which would then be added to the schema as a general
 API feature per rule 2.
+
+### 4.2 Bulk actions are N calls, and say so (#252)
+
+Tearing down twenty imposters after a test run should not be twenty confirm
+dialogs. It is also not a reason to add a set-level write: a bulk endpoint would
+need its own partial-failure semantics inside the replicated state machine, and
+the honest client-side version is one call per imposter whose individual
+outcomes are reported individually.
+
+Three properties make that honest rather than merely convenient, and all three
+live in `features/imposters/bulk.ts` where they can be tested, not in a
+component where they cannot:
+
+- **The batch does not halt.** A refusal partway through leaves the operator
+  with a partially-applied set; stopping there would leave them with no record
+  of which part. Every selected imposter is attempted.
+- **A parked write is reported as still committing, never as applied.** §5's
+  `202 AcceptedParked` contract applies per item exactly as it does to a single
+  write — `settle()` polls each op, and an op this session cannot read resolves
+  to *unobservable*, which the bar renders as "still committing".
+- **The result names every item that was not a plain success**, with its port
+  and the fleet's own words. "17 deleted, 3 refused" is followed by the three.
+  A single green toast over a partial failure is the specific outcome this
+  design exists to prevent.
+
+Filtering and sorting sit beside it on the same principle: they are pure
+functions over the already-fetched list, so what the count says and what the
+rows show cannot disagree. Select-all means *what the filter currently shows*,
+and narrowing the filter narrows the selection — otherwise the count on the bar
+is not the count acted on, and a bulk delete can reach imposters the operator
+cannot see.
+
+Two derivations refuse to guess rather than answering confidently:
+`GET /imposters` is not guaranteed to carry each imposter's stubs, so an
+imposter whose stubs are absent is *unclassifiable* for the has-recording filter
+and is excluded from both answers with the count of such rows shown; and the
+source-owned/hand-created filter joins `GET /admin/sources` (whose
+`SourceRecord.ports` is the ownership fact), so a principal without `source.read`
+is not offered the filter at all rather than shown one that would answer
+"hand-created" for everything.
 
 ## 5. API contract
 

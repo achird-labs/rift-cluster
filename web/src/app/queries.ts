@@ -101,12 +101,17 @@ export function useImposters(): UseQueryResult<Imposter[]> {
  * node only. Flattening a poll error onto its source's record would render one node's transient
  * failure as a fleet-wide fact — see `Sources.tsx`.
  */
-export function useSources(): UseQueryResult<{
+export function useSources(options: { enabled?: boolean } = {}): UseQueryResult<{
   sources: SourceRecord[];
   nodeLocal: SourcesNodeLocal;
 }> {
   const { tenant } = useSession();
   return useQuery({
+    // `source.read` is its own action server-side, so a principal that lacks it must not issue the
+    // read at all — a 403 on a screen whose own read succeeded is noise, not information. The
+    // imposter list passes `false`; `Sources.tsx` is only reachable with the capability and passes
+    // nothing, keeping its existing behaviour exactly.
+    enabled: options.enabled ?? true,
     queryKey: key(["sources"], tenant),
     queryFn: async () => {
       // Both keys are **required** by the contract — unlike `/imposters`, whose `imposters?` is

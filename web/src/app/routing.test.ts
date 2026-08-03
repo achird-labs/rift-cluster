@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { type Route, parseHash, toHash } from "./routing.ts";
+import { type Route, hashQuery, parseHash, toHash, withHashQuery } from "./routing.ts";
 
 describe("parseHash", () => {
   it("defaults to the imposters screen", () => {
@@ -81,5 +81,46 @@ describe("parseHash", () => {
     for (const route of routes) {
       expect(parseHash(toHash(route))).toEqual(route);
     }
+  });
+});
+
+describe("query strings are screen state, not route", () => {
+  it("parses the route while ignoring the query string entirely", () => {
+    // The filter on the imposters list must not change which screen the hash names, and must not
+    // turn a valid hash into the fallback by being mistaken for an extra segment.
+    expect(parseHash("#/imposters?q=checkout&sort=name")).toEqual({ screen: "imposters" });
+    expect(parseHash("#/imposters/4545?q=x")).toEqual({ screen: "imposter", port: 4545 });
+    expect(parseHash("#/cluster?anything")).toEqual({ screen: "cluster" });
+    expect(parseHash("#/scenarios/4545/flow-a?x=1")).toEqual({
+      screen: "scenarios",
+      port: 4545,
+      flow: "flow-a",
+    });
+  });
+
+  it("still falls back for a genuinely unknown route that happens to carry a query", () => {
+    expect(parseHash("#/specs?q=x")).toEqual({ screen: "imposters" });
+  });
+
+  it("reads the query string back out", () => {
+    expect(hashQuery("#/imposters?q=checkout")).toBe("q=checkout");
+    expect(hashQuery("#/imposters")).toBe("");
+    expect(hashQuery("")).toBe("");
+  });
+
+  it("replaces the query while leaving the route segments alone", () => {
+    expect(withHashQuery("#/imposters/4545", "q=x")).toBe("#/imposters/4545?q=x");
+    expect(withHashQuery("#/imposters?q=old", "q=new")).toBe("#/imposters?q=new");
+  });
+
+  it("drops the `?` entirely for an empty query, so default has ONE spelling", () => {
+    // A trailing `?` would make the default view and the explicitly-default view two different
+    // bookmarks of the same thing.
+    expect(withHashQuery("#/imposters?q=old", "")).toBe("#/imposters");
+    expect(withHashQuery("#/imposters", "")).toBe("#/imposters");
+  });
+
+  it("gives an empty hash a route to hang the query off", () => {
+    expect(withHashQuery("", "q=x")).toBe("#/imposters?q=x");
   });
 });

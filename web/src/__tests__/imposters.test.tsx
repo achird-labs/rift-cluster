@@ -193,21 +193,34 @@ describe("every rendered cell comes from the declared column table", () => {
     renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
     await screen.findByText("billing");
 
-    const headers = [...screen.getAllByRole("columnheader")].map((cell) => cell.textContent?.trim());
+    // The sort affordance (#252) appends an `aria-hidden` arrow to whichever column is sorted, so
+    // the label is compared with it stripped. Stripping it is not weakening the assertion: an
+    // undeclared *column* still fails, which is what this test is for.
+    const headers = [...screen.getAllByRole("columnheader")].map((cell) =>
+      cell.textContent?.replace(/[\u25b2\u25bc]/g, "").trim(),
+    );
     expect(headers).toEqual(IMPOSTER_COLUMNS.map((column) => column.label));
 
-    // A viewer gets no lifecycle column, so the cell count is exactly the declared columns.
+    // A viewer gets neither the lifecycle column nor the bulk-selection one (it holds none of the
+    // bulk actions), so the cell count is exactly the declared columns.
     const cells = within(screen.getByTestId("imposter-row-4545")).getAllByRole("cell");
     expect(cells.length).toBe(IMPOSTER_COLUMNS.length);
   });
 
-  it("adds exactly one column for the lifecycle control, and only for a role that holds it", async () => {
+  it("adds exactly two control columns for a role that holds the actions, and no data column", async () => {
+    /*
+     * An operator holds `imposter.lifecycle` and `requests.clear`, so the row carries two columns
+     * that are not data: the bulk-selection checkbox (#252) and the lifecycle control. Both are
+     * named here rather than left as a bare `+2`, so a third one appearing has to be justified by
+     * editing this sentence.
+     */
     stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
     renderInApp(<Imposters />, { whoami: whoamiWith("operator") });
     await screen.findByText("billing");
 
     const cells = within(screen.getByTestId("imposter-row-4545")).getAllByRole("cell");
-    expect(cells.length).toBe(IMPOSTER_COLUMNS.length + 1);
+    expect(cells.length).toBe(IMPOSTER_COLUMNS.length + 2);
+    expect(screen.getByTestId("imposter-select-4545")).toBeTruthy();
   });
 });
 
