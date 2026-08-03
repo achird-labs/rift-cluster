@@ -45,8 +45,8 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.serviceAccount.create }}
-      serviceAccountName: {{ include "rift-cluster.serviceAccountName" . }}
+      {{- with (include "rift-cluster.serviceAccountName" .) }}
+      serviceAccountName: {{ . }}
       {{- end }}
       securityContext:
         runAsNonRoot: true
@@ -64,10 +64,17 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.topologySpreadConstraints }}
       topologySpreadConstraints:
+        {{- with .Values.topologySpreadConstraints }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- else }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "rift-cluster.selectorLabels" . | nindent 14 }}
+        {{- end }}
       containers:
         - name: rift-cluster-server
           image: {{ include "rift-cluster.image" . }}

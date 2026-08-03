@@ -1,4 +1,10 @@
-{{- if .Values.podDisruptionBudget.enabled }}
+{{/*
+Gated on more than one replica. A single-replica install is a throwaway environment by definition
+(see `replicas` in values.yaml), and there is no useful budget to express over one pod: this one
+would permit taking the whole cluster down during a node drain while looking like a protection.
+Rendering nothing is the honest answer.
+*/}}
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.replicas) 1) }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

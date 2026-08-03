@@ -21,16 +21,12 @@ clusterSecret:
   # Ch.14's checklist item on never inlining the cluster secret.
   existingSecret: rift-cluster-secret
 
-topologySpreadConstraints:
-  - maxSkew: 1
-    topologyKey: topology.kubernetes.io/zone
-    whenUnsatisfiable: ScheduleAnyway
-    labelSelector:
-      matchLabels:
-        app: rift-cluster-server
-
 service:
-  type: ClusterIP
+  # LoadBalancer, not ClusterIP. The `aws-load-balancer-*` annotations below are read by the AWS load
+  # balancer controller ONLY for a Service of this type; on a ClusterIP Service they are inert
+  # metadata and no NLB is ever created — a misconfiguration that renders, validates and installs
+  # cleanly, then quietly leaves the fleet unreachable from outside the cluster.
+  type: LoadBalancer
   annotations:
     # An internal NLB. Deliberately internal: the admin API is a control plane, and Ch.14's position
     # is that it does not belong on the public internet even behind auth.

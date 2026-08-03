@@ -23,6 +23,15 @@ spec:
     - name: cluster
       port: 4790
       targetPort: cluster
+    # Metrics ride the headless Service, not the client one. `service.type` is routinely
+    # `LoadBalancer` (see values-eks.yaml / values-aks.yaml), and a port on that Service is a port on
+    # the load balancer — publishing /metrics there would put the fleet's internals one hop from
+    # whatever can reach the front door. Ch.14 keeps them separate on purpose: "front-door/admin from
+    # the NLB; metrics from the scrape infrastructure". A headless Service has no LB to leak onto,
+    # and the ServiceMonitor scrapes pod IPs either way.
+    - name: metrics
+      port: 9090
+      targetPort: metrics
 ---
 apiVersion: v1
 kind: Service
@@ -42,6 +51,3 @@ spec:
     - name: admin
       port: 2525
       targetPort: admin
-    - name: metrics
-      port: 9090
-      targetPort: metrics

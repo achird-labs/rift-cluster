@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "rift-cluster values",
+  "description": "Constrains only the values whose bad inputs render successfully. Helm's `int` is a coercion, not a parse: it turns \"abc\", \"7.5\" and \"\" into 0 and silently overflows past int64, so `2 * leaveTimeoutSeconds + 10` can produce a zero or negative terminationGracePeriodSeconds that passes kubeconform -strict (the Kubernetes schema sets no minimum) and SIGKILLs every pod the instant it is asked to drain. The engine's own u64 parse would reject the garbage at startup, but only after the pod is already misconfigured. Failing at `helm template` is where this belongs.",
+  "type": "object",
+  "properties": {
+    "replicas": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "leaveTimeoutSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3600
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "maxUnavailable": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "clusterSecret": {
+      "type": "object",
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "existingSecretKey": { "type": "string", "minLength": 1 },
+        "create": { "type": "boolean" },
+        "value": { "type": "string" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer"]
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "className": { "type": "string" },
+        "size": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

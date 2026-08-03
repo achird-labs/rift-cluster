@@ -226,17 +226,34 @@ single-node, and the three environment files — through the same
 `kubeconform -strict`. That is a wider net than the raw manifest gets, and it is
 still schema only: nothing here proves a cluster forms.
 
-Two properties are asserted beyond the schema, because they are the ones a
-template edit could quietly break while staying valid YAML:
+So a set of properties is asserted beyond the schema — each one a decision the
+raw manifest argues for in a comment, and each one something a template edit
+could quietly break while still emitting valid YAML:
 
 - **A chart with no cluster secret must refuse to render.** `helm install` is one
   command, so a chart that happily installed a fleet with unconfigured peer
-  authentication would be worse than the manifest it replaces.
+  authentication would be worse than the manifest it replaces. The refusal
+  *reason* is matched too, not just the exit status — otherwise an unrelated
+  template syntax error would score as a pass on the security guard.
 - **`terminationGracePeriodSeconds` stays `2 × leaveTimeoutSeconds + 10`.** The
   manifest states "raise them together, never one alone" in a comment; the chart
   derives it, and CI checks the derivation at three values. Hard-coding it back
   to a literal would pass every schema check and reintroduce the SIGKILL-mid-drain
-  that rule exists to prevent.
+  that rule exists to prevent. `values.schema.json` closes the other half:
+  Helm's `int` is a coercion, not a parse, so `leaveTimeoutSeconds=abc` would
+  otherwise render a grace period of 10 and `=-5` a negative one, both of which
+  `kubeconform -strict` accepts.
+- **Two Services, distinctly named, and the seed points at the headless one.**
+  Checked under a 53-character release name, because name truncation is invisible
+  until the name is long: a `-peers` suffix appended to an already-truncated base
+  disappears, the headless Service collapses onto the client one, and the seed
+  address ends up naming a readiness-gating Service that publishes nothing during
+  a cold start. That is a cluster that never forms, from a chart that lints,
+  renders and schema-validates.
+- **`publishNotReadyAddresses` appears exactly once, and `exec` survives.** The
+  first on the client Service would route traffic to unconverged nodes; losing the
+  second leaves `sh` as PID 1, so SIGTERM never reaches the server and the drain
+  everything above is tuned around silently never happens.
 
 ```sh
 helm install rift oci://ghcr.io/achird-labs/charts/rift-cluster \

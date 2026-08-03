@@ -44,9 +44,9 @@ clusterSecret:
   # `kubectl describe` output and in most log/telemetry agents' process metadata.
   #
   # Point `existingSecret` at a Secret you manage (External Secrets, Key Vault CSI, SOPS…). Setting
-  # `create: true` instead generates one at install time, which is fine for a test environment and
-  # is NOT a secret-management strategy: it lives in the release, and `helm upgrade` regenerates it
-  # unless you keep passing the same value.
+  # `create: true` instead has the chart carry the value you supply below — fine for a test
+  # environment, and NOT a secret-management strategy: the value lives in the release and in
+  # whatever passed it there.
   existingSecret: ""
   existingSecretKey: cluster-secret
   create: false
@@ -61,15 +61,14 @@ resources:
   limits:
     memory: 1Gi
 
-# Spread across zones by default. `ScheduleAnyway` rather than `DoNotSchedule`: a cluster with fewer
-# zones than replicas should still come up, degraded in placement rather than stuck Pending.
-topologySpreadConstraints:
-  - maxSkew: 1
-    topologyKey: topology.kubernetes.io/zone
-    whenUnsatisfiable: ScheduleAnyway
-    labelSelector:
-      matchLabels:
-        app: rift-cluster-server
+# Left empty, the template supplies a one-per-zone spread with `ScheduleAnyway` — rather than
+# `DoNotSchedule`, so a cluster with fewer zones than replicas still comes up, degraded in placement
+# instead of stuck Pending.
+#
+# The default lives in the template rather than here because a values file cannot reach `.Release`,
+# and a spread whose selector is not release-scoped makes two releases in one namespace spread
+# against each other's pods. Set this only to override the topology key or the skew.
+topologySpreadConstraints: []
 
 nodeSelector: {}
 tolerations: []

@@ -524,11 +524,20 @@ jobs:
       # REFUSE to render rather than install a cluster whose peer authentication is unconfigured —
       # and `helm install` makes that a single command, so a chart that rendered anyway would be
       # worse than the raw manifest it replaces.
+      #
+      # The failure output is matched, not just the exit status: discarding stderr would score an
+      # unrelated template syntax error as a PASS on the security guard — the one assertion here
+      # that must never pass for the wrong reason.
       - name: A chart with no cluster secret must refuse to render
         run: |
           set -euo pipefail
-          if helm template r deploy/helm/rift-cluster >/dev/null 2>&1; then
+          if helm template r deploy/helm/rift-cluster >/dev/null 2>/tmp/no-secret.err; then
             echo "FAIL: the chart rendered with no clusterSecret configured" >&2
+            exit 1
+          fi
+          if ! grep -q 'clusterSecret:' /tmp/no-secret.err; then
+            echo "FAIL: the chart refused, but not because of the secret guard:" >&2
+            cat /tmp/no-secret.err >&2
             exit 1
           fi
           echo "PASS: refused, as it should"
@@ -583,4 +592,64 @@ jobs:
               exit 1
             fi
             echo "ok: leave=${leave} -> grace=${got}"
+          done
+
+      # Four more properties that render as valid YAML when broken, so nothing above would catch
+      # them. Each is a decision `deploy/k8s/statefulset.yaml` argues for in a comment, and a chart
+      # that quietly dropped one would install a cluster that never forms.
+      #
+      # The long-release-name case is the reason this step exists at all: every case above uses the
+      # release name `r`, and name truncation is invisible until the name is long. A `-peers` suffix
+      # appended to an already-truncated base disappears, collapsing the headless Service onto the
+      # client one — two Services with one name, and the survivor is the readiness-gating one the
+      # seed address must never point at.
+      - name: The cluster-forming invariants survive templating
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/rift-cluster
+          # 53 a's — the longest release name Helm accepts, so name truncation is guaranteed to bite.
+          long=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+          for release in r "$long"; do
+            svcs=$(helm template "$release" "$chart" --set clusterSecret.existingSecret=ci \
+              -s templates/services.yaml | sed -n 's/^  name: //p')
+            sts=$(helm template "$release" "$chart" --set clusterSecret.existingSecret=ci \
+              -s templates/statefulset.yaml)
+
+            if [ "$(echo "$svcs" | sort -u | wc -l)" -ne 2 ]; then
+              echo "FAIL[${release:0:8}…]: expected 2 distinctly-named Services, got:" >&2
+              echo "$svcs" >&2
+              exit 1
+            fi
+            for name in $svcs; do
+              [ "${#name}" -le 63 ] \
+                || { echo "FAIL: Service name '$name' is ${#name} chars, over the DNS label limit" >&2; exit 1; }
+            done
+
+            # publishNotReadyAddresses belongs to the headless peer Service and to nothing else. On
+            # the client Service it would route traffic to nodes that have not converged, which is
+            # the whole point of /readyz.
+            n=$(helm template "$release" "$chart" --set clusterSecret.existingSecret=ci \
+              -s templates/services.yaml | grep -c 'publishNotReadyAddresses: true' || true)
+            [ "$n" -eq 1 ] || { echo "FAIL: publishNotReadyAddresses appears ${n}x, expected 1" >&2; exit 1; }
+
+            # The seed must be <statefulset>-0.<serviceName> — the pod DNS name the headless Service
+            # actually publishes. A seed that does not resolve deadlocks a cold start, and no schema
+            # check can see it, because any string is a valid env value.
+            name=$(echo "$sts" | sed -n 's/^  name: //p')
+            svcname=$(echo "$sts" | sed -n 's/^  serviceName: //p')
+            seed=$(echo "$sts" | grep -A1 'name: RIFT_CLUSTER_SEEDS' | sed -n 's/.*value: "\(.*\)"/\1/p')
+            want="${name}-0.${svcname}:4790"
+            [ "$seed" = "$want" ] || { echo "FAIL: seed '$seed', expected '$want'" >&2; exit 1; }
+            echo "$svcs" | grep -qx "$svcname" \
+              || { echo "FAIL: serviceName '$svcname' names no rendered Service" >&2; exit 1; }
+            [ "${#name}" -le 61 ] \
+              || { echo "FAIL: pod hostname '${name}-0' would exceed the DNS label limit" >&2; exit 1; }
+
+            # exec, so SIGTERM reaches PID 1 instead of stopping at the shell. Without it the
+            # graceful leave everything else here is tuned around silently never happens.
+            echo "$sts" | grep -q 'exec rift-cluster-server' \
+              || { echo "FAIL: the container args no longer exec the server" >&2; exit 1; }
+
+            echo "ok[${release:0:8}…]: 2 services, seed ${seed}"
           done
