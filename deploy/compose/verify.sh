@@ -98,6 +98,52 @@ for port in 12525 22525 32525; do
 done
 echo "PASS: admin API live on 3/3"
 
+# The console, on every node (#265).
+#
+# This is what makes "the image carries the console" a *verified* row in
+# `deploy/README.md` rather than an assumed one. The build already has its own
+# guards — `wasm-pack` output asserted, `dist/index.html` asserted,
+# `--features console` compiled — but every one of those is a statement about
+# the build, and a binary that compiled the feature can still serve nothing if
+# the embed folder was empty. Asking a *running* node is the only check that
+# cannot pass vacuously.
+#
+# Asserted on the SPA shell, not merely on a 200: `rust-embed` over an empty
+# `web/dist` compiles perfectly happily, and `console.rs` answers that case with
+# a deliberate explanatory body. A status-only check would pass on exactly the
+# image this assertion exists to catch.
+echo "--- asserting the console is served on every node ---"
+for port in 12525 22525 32525; do
+  # Deliberately NOT `curl -f`. Under `set -e` a non-2xx would abort the script
+  # before the diagnostic below could run, so the two failures this check exists
+  # to name — a 404 from an image built without `--features console`, and a 500
+  # from one built with an empty `web/dist` — would both die with no message but
+  # the teardown trap. Capturing the status separately is what makes the
+  # explanation reachable on exactly the runs that need it.
+  status="$(curl -sS -o /tmp/console-body.$$ -w '%{http_code}' --max-time 5 \
+    "http://127.0.0.1:${port}/console/" || echo 000)"
+  body="$(cat /tmp/console-body.$$ 2>/dev/null || true)"
+  rm -f "/tmp/console-body.$$"
+
+  if [ "$status" != "200" ]; then
+    echo "FAIL: node on ${port} answered ${status} for /console/"
+    echo "      404 => image built without --features console"
+    echo "      500 => built with the feature but an empty web/dist"
+    exit 1
+  fi
+  # Asserted on the shell, not merely on the status: `rust-embed` over an empty
+  # `web/dist` compiles happily, and a 200 carrying an explanatory body would
+  # satisfy a status-only check while serving no console at all.
+  case "$body" in
+    *"<div id=\"root\""*) ;;
+    *)
+      echo "FAIL: node on ${port} answered 200 but served no SPA shell at /console/"
+      exit 1
+      ;;
+  esac
+done
+echo "PASS: console served on 3/3"
+
 # The image must identify itself, including which engine is inside it — the
 # whole point of plumbing the pin through the build.
 echo "--- asserting the image reports its identity ---"

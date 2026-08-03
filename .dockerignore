@@ -10,5 +10,27 @@ deploy/
 .git/
 vendor/rift/target/
 vendor/rift/.git/
+# The console bundle, its dependencies, and the wasm the bundle embeds are all
+# produced by the image's own `wasm` and `web` stages (#265). Excluding them is
+# what makes that guarantee real rather than aspirational: without it, a
+# developer who has run `pnpm build` on the host gets that bundle copied into the
+# builder by `COPY . .`, and the image's console is silently whatever was last
+# built locally instead of what this Dockerfile produced. The stages COPY their
+# own output in explicitly, so nothing here is lost.
+web/dist/
+web/node_modules/
+web/public/lint/
+# Vite inlines `VITE_*` values from a `.env` file into the bundle at build time,
+# so a developer's local `web/.env.local` would otherwise be baked into a shipped
+# image. There is no such file today; the exclusion is here so there never can be
+# one by accident.
+web/.env
+web/.env.*
+# Local test output. None of it can reach `dist/`, but all of it would bloat the
+# layer and bust the `COPY web/ ./` cache after any local playwright run.
+web/test-results/
+web/playwright-report/
+web/dist-scan/
+web/survey/
 **/*.md
 !README.md

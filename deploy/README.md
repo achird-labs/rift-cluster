@@ -4,7 +4,7 @@ Five artifacts, in increasing order of how much they promise:
 
 | Path | What it is | Verified how |
 |---|---|---|
-| `Dockerfile` | The `rift-cluster-server` image | Built and run by `compose/verify.sh` |
+| `Dockerfile` | The `rift-cluster-server` image, **with the web console** | Built and run by `compose/verify.sh`, which asks every node for `/console` |
 | `compose/docker-compose.yml` | A real 3-node cluster for local work | Stood up and asserted by `compose/verify.sh` |
 | `compose/front-door-demo.yml` | The "no nginx" front-door demo (one node, two virtual services) | Stood up by hand — see below |
 | `compose/sources-demo.yml` | The imposter-sources demo (three nodes + a config server) | Stood up by hand — see below; the properties it shows are asserted by chaos scenarios C20–C23 |
