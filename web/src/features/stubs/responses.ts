@@ -145,23 +145,33 @@ function isHeaderScalar(value: unknown): boolean {
 }
 
 /**
- * Does this response carry an `is` body — a status, headers, or a body?
+ * Which fault form actually FIRES on this response — and it turns on the `is` KEY alone.
  *
- * Load-bearing for faults, not cosmetic. The engine dispatches `is > proxy > inject > fault`
- * (`From<StubResponseRaw> for StubResponse`), so a top-level `fault` key on a response that ALSO
- * has an `is` never fires — and `StubResponseOut`'s `Is` arm sets `fault: None`, so the key does not
- * even survive the next `GET /imposters`. The Rift extension is different: `raw.rift` is passed
- * straight into `new_is(..., raw.rift)`, so `_rift.fault.tcp` fires perfectly well beside a body.
- * Which form the fault picker may write therefore depends on this question.
+ * The engine has two separate dispatch tests, and they point opposite ways:
+ *
+ * - **With an `is` key**, `From<StubResponseRaw>` takes the `is` branch and hands `raw.rift` to
+ *   `new_is(..., raw.rift)`, so `_rift.fault.tcp` fires — while the top-level `fault` is never
+ *   reached, and `StubResponseOut`'s `Is` arm sets `fault: None` so the key does not even survive
+ *   the next `GET /imposters`.
+ * - **Without one** (the flat, recorded form), `raw.rift` is tested BEFORE the flat
+ *   `statusCode`/`body`/`headers` branch, so a flat response carrying `_rift` becomes a
+ *   `RiftScript` — `execute_stub_response_with_rift` returns `None` for that, `apply_rift_fault` is
+ *   never called, and the request falls through to a default 200 with the status and body erased.
+ *   There it is the top-level `fault` key that fires.
+ *
+ * So the predicate is exactly "does the document carry an `is` key", which is `wrapped`. An earlier
+ * version of this asked "does it have a status, headers or a body" instead; that is true of a flat
+ * recorded response, where the answer inverts — and recorded responses are the flat ones.
  */
-export function hasIsBody(response: ResponseModel): boolean {
-  return (
-    response.wrapped ||
-    response.statusCode !== null ||
-    response.headersPresent ||
-    response.headers.length > 0 ||
-    response.body.kind !== "absent"
-  );
+export function faultFiresAsRift(response: ResponseModel): boolean {
+  return response.wrapped;
+}
+
+/** Does the fault this response carries actually fire, given the dispatch above? */
+export function faultIsArmed(response: ResponseModel): boolean {
+  if (response.fault === null) return false;
+  const isRiftForm = response.fault.form !== "responseKey";
+  return faultFiresAsRift(response) === isRiftForm;
 }
 
 export function blankResponse(): ResponseModel {

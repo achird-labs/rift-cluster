@@ -8,7 +8,8 @@ import {
 } from "./behaviors.ts";
 import {
   DEFAULT_STATUS_CODE,
-  hasIsBody,
+  faultFiresAsRift,
+  faultIsArmed,
   type ResponseBody,
   type ResponseHeader,
   type ResponseModel,
@@ -269,16 +270,9 @@ function ResponseCard({
     });
   };
 
-  /*
-   * Which fault form actually FIRES on this response.
-   *
-   * The engine dispatches `is > proxy > inject > fault`, so a top-level `fault` key beside an `is`
-   * is dead — it never fires, and `StubResponseOut`'s `Is` arm drops it entirely, so it does not
-   * even survive the next read. `_rift.fault.tcp` is the opposite: `raw.rift` is handed straight to
-   * `new_is(..., raw.rift)`, so it fires alongside a body. Writing `responseKey` on a response that
-   * has a body would therefore configure nothing at all while the panel claimed otherwise.
-   */
-  const faultFiresAsRift = hasIsBody(item);
+  // Which fault form fires here — see `faultFiresAsRift` in responses.ts for the engine's two
+  // opposite dispatch tests. It turns on the `is` KEY, not on whether there is a body.
+  const firesAsRift = faultFiresAsRift(item);
 
   const onFaultKindChange = (raw: string): void => {
     if (raw === "") {
@@ -292,7 +286,7 @@ function ResponseCard({
       onChange({ ...item, fault: { ...current, kind: raw } });
       return;
     }
-    const form = faultFiresAsRift ? "riftString" : "responseKey";
+    const form = firesAsRift ? "riftString" : "responseKey";
     onChange({ ...item, fault: { form, kind: raw } });
   };
 
@@ -304,7 +298,7 @@ function ResponseCard({
       // that still fires. Collapsing to the top-level `fault` key here would switch the fault off
       // on any response with a body, which is every response the panel is normally open on.
       if (fault.form === "riftObject") {
-        const form = faultFiresAsRift ? "riftString" : "responseKey";
+        const form = firesAsRift ? "riftString" : "responseKey";
         onChange({ ...item, fault: { form, kind: fault.kind } });
       }
       return;
@@ -556,7 +550,7 @@ function ResponseCard({
             <span className="b-glyph" aria-hidden="true">
               ▲
             </span>
-            {item.fault.form === "responseKey" && faultFiresAsRift ? (
+            {!faultIsArmed(item) ? (
               /*
                * A document that is already in the dead shape — a top-level `fault` beside an `is`.
                * The engine dispatches `is` first and never reaches the fault, and drops the key on
@@ -565,11 +559,13 @@ function ResponseCard({
                * The picker never writes this shape; only a hand-authored stub can arrive in it.
                */
               <div>
-                <strong>This fault never fires.</strong> The response also has a status, headers or
-                a body, and the engine answers with those — a top-level <code>fault</code> is only
-                reached when there is no response to send, and it is dropped the next time this
-                imposter is read. Pick the fault again to rewrite it as{" "}
-                <code>_rift.fault.tcp</code>, which does fire alongside a body.
+                <strong>This fault never fires.</strong> The engine reaches a different branch for
+                a response spelled like this one, so the fault is inert — and{" "}
+                {item.fault.form === "responseKey"
+                  ? "it is dropped the next time this imposter is read"
+                  : "the status and body are erased on the next read too"}
+                . Pick the fault again to rewrite it in the form that does fire here:{" "}
+                <code>{firesAsRift ? "_rift.fault.tcp" : "fault"}</code>.
               </div>
             ) : (
               <div>
