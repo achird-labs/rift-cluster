@@ -11,8 +11,6 @@ import { STUB_FIELDS, type StubForm, blankForm, project, render } from "./projec
  */
 const anyForm: fc.Arbitrary<StubForm> = fc.record({
   id: fc.option(fc.string(), { nil: null }),
-  method: fc.option(fc.constantFrom("GET", "POST", "PUT", "DELETE", "PATCH"), { nil: null }),
-  path: fc.option(fc.string(), { nil: null }),
   statusCode: fc.option(fc.integer({ min: 100, max: 599 }), { nil: null }),
   contentType: fc.option(fc.string(), { nil: null }),
   body: fc.option(fc.string(), { nil: null }),
@@ -68,13 +66,18 @@ describe("a stub the form does not model is raw-only, with every unmodelled key 
     expect(projected.unmodelledKeys).toContain("behaviors[0].wait");
   });
 
-  it("names a second predicate rather than modelling only the first", () => {
+  it("no longer inspects predicates content at all — that responsibility moved to predicates.ts", () => {
+    // Before #247, `walk` modelled a single `equals.method`/`equals.path` predicate directly, and
+    // a second predicate object (or an operator this table didn't know) fell out as unmodelled.
+    // Predicates are now the sibling `predicates.ts` projection's whole job — including refusing a
+    // shape like this one (see its "refuses an operator it does not know" and "carrying two
+    // operators" tests) — so `project` treats the entire `predicates` subtree as out of its scope,
+    // even a shape it used to refuse. The editor composes both projections; this file's contract is
+    // only ever about the *other* keys.
     const projected = project({
       predicates: [{ equals: { path: "/a" } }, { contains: { body: "hello" } }],
     });
-    expect(projected.kind).toBe("rawOnly");
-    if (projected.kind !== "rawOnly") return;
-    expect(projected.unmodelledKeys).toEqual(["predicates[1].contains.body"]);
+    expect(projected.kind).toBe("form");
   });
 
   it("names a second response, which the single-`is` model cannot hold", () => {
@@ -128,10 +131,10 @@ describe("a stub the form does not model is raw-only, with every unmodelled key 
     });
     expect(projected.kind).toBe("form");
     if (projected.kind !== "form") return;
+    // `predicates` is out of scope for this projection now — it does not, and should not, appear
+    // in the form. Its own round trip is `predicates.test.ts`'s job.
     expect(projected.form).toEqual({
       id: "s-1",
-      method: "POST",
-      path: "/orders",
       statusCode: 201,
       contentType: "application/json",
       body: "{}",
@@ -144,14 +147,7 @@ describe("the modelled set is data, not code", () => {
     // RFC-006 §12 Q2's answer lives here: the shipped set is whatever `STUB_FIELDS` lists, and both
     // directions of the projection are driven by it. A field added to the table needs no change to
     // `project` or `render`.
-    expect(STUB_FIELDS.map((field) => field.key)).toEqual([
-      "id",
-      "method",
-      "path",
-      "statusCode",
-      "contentType",
-      "body",
-    ]);
+    expect(STUB_FIELDS.map((field) => field.key)).toEqual(["id", "statusCode", "contentType", "body"]);
     for (const field of STUB_FIELDS) {
       expect([field.key, field.at.length]).toEqual([field.key, expect.any(Number)]);
       expect(field.at.length).toBeGreaterThan(0);

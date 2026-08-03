@@ -5,6 +5,8 @@ import { StubConflict, useAddStub, useDeleteStub, usePutStub } from "../app/quer
 import { CodeEditor } from "../components/CodeEditor.tsx";
 import { UnconfirmedNote } from "../components/primitives.tsx";
 import { type Finding, lintStub } from "../features/stubs/lint.ts";
+import { PredicateBuilder, describePredicates } from "../features/stubs/PredicateBuilder.tsx";
+import { type PredicateItem, projectPredicates, renderPredicates } from "../features/stubs/predicates.ts";
 import {
   STUB_FIELDS,
   type StubField,
@@ -39,6 +41,32 @@ const PRETTY_INDENT = 2;
 /** JSON as the editor shows it. Only used for text this console generated, never for stored text. */
 function pretty(value: unknown): string {
   return JSON.stringify(value, null, PRETTY_INDENT);
+}
+
+/**
+ * Merge a form edit and a predicate-builder edit back into one stub document.
+ *
+ * Safe precisely because both panes are only ever shown together when the stub is projectable by
+ * *both* projections (see `editable` below) — which means, by construction, every top-level key
+ * the stub carries is covered by `render(form)` or by `predicates`, and there is nothing else to
+ * preserve. An empty predicate list omits the key entirely, the same "null emits no key"
+ * convention `render` already applies to every other field.
+ */
+function composeStubText(form: StubForm, predicateItems: PredicateItem[]): string {
+  const rendered = render(form);
+  const predicatesJson = renderPredicates(predicateItems);
+  /*
+   * Rebuilt in reading order — id, predicates, responses — rather than appending `predicates` to
+   * what `render` produced. Appending would put it *after* `responses`, so every form edit silently
+   * reordered the document relative to what the old form and all four presets wrote. Reordering is
+   * not data loss, but it is a diff the operator did not ask for on a document they may be
+   * reviewing side by side with a file.
+   */
+  const { id, ...rest } = rendered;
+  const stub: Record<string, unknown> = {};
+  if (id !== undefined) stub.id = id;
+  if (predicatesJson.length > 0) stub.predicates = predicatesJson;
+  return pretty({ ...stub, ...rest });
 }
 
 /**
@@ -175,7 +203,25 @@ export function StubEditor({
   const write = target.kind === "new" ? add : put;
 
   const parsed = parse(text);
-  const projection = parsed.ok ? project(parsed.value) : null;
+  const formProjection = parsed.ok ? project(parsed.value) : null;
+  const predicateProjection = parsed.ok ? projectPredicates(parsed.value) : null;
+  /*
+   * The two projections are independent, and #247 split predicates out of `formProjection` (see
+   * `projection.ts`'s `walk`, which now refuses to look at `predicates` at all) — so a stub is
+   * form-editable only when *both* succeed. Bundled into one object (rather than two booleans)
+   * so every read site below narrows both `.form` and `.predicateItems` from a single null check,
+   * instead of re-deriving the joint condition at each call site.
+   */
+  const editable =
+    formProjection?.kind === "form" && predicateProjection?.kind === "predicates"
+      ? { form: formProjection.form, predicateItems: predicateProjection.items }
+      : null;
+  // Either projection refusing means some key the pair cannot jointly represent; the union of both
+  // key lists is what the banner names, so an operator sees the whole reason, not half of it.
+  const unmodelledKeys = [
+    ...(formProjection?.kind === "rawOnly" ? formProjection.unmodelledKeys : []),
+    ...(predicateProjection?.kind === "rawOnly" ? predicateProjection.unmodelledKeys : []),
+  ];
 
   /*
    * Advisory lint, re-run as the document changes. Deliberately not gating the save button: the
@@ -290,26 +336,31 @@ export function StubEditor({
         </p>
       )}
 
-      {projection?.kind === "rawOnly" ? (
+      {parsed.ok && editable === null ? (
         <div className="degraded" data-testid="stub-raw-banner" role="status">
           <strong>Raw JSON only.</strong> This stub carries fields the form does not model, so
-          editing it through the form would drop them. Unmodelled:{" "}
-          {projection.unmodelledKeys.join(", ")}
+          editing it through the form would drop them. Unmodelled: {unmodelledKeys.join(", ")}
         </div>
       ) : null}
 
-      {target.kind === "new" && projection?.kind === "form" ? (
+      {target.kind === "new" && editable !== null ? (
         <Presets onPick={(stub) => setText(pretty(stub))} />
       ) : null}
 
-      {projection?.kind === "form" ? <Summary form={projection.form} /> : null}
+      {editable !== null ? <Summary form={editable.form} predicateItems={editable.predicateItems} /> : null}
 
       <div className="stub-panes">
-        {projection?.kind === "form" ? (
-          <StubFields
-            form={projection.form}
-            onChange={(next) => setText(pretty(render(next)))}
-          />
+        {editable !== null ? (
+          <div className="stub-form-pane">
+            <PredicateBuilder
+              items={editable.predicateItems}
+              onChange={(nextItems) => setText(composeStubText(editable.form, nextItems))}
+            />
+            <StubFields
+              form={editable.form}
+              onChange={(nextForm) => setText(composeStubText(nextForm, editable.predicateItems))}
+            />
+          </div>
         ) : null}
         <CodeEditor value={text} onChange={setText} label="Stub JSON" testId="stub-json" />
       </div>
@@ -411,14 +462,12 @@ function StubFields({
 /**
  * What this stub will actually do, in a sentence.
  *
- * The form is six boxes and the JSON is a document; neither answers "so what does it match?" at a
- * glance. This is derived from the projection rather than from the text, so it cannot claim
- * anything the modelled fields do not say.
+ * The form is a handful of boxes and the JSON is a document; neither answers "so what does it
+ * match?" at a glance. This is derived from both projections rather than from the text, so it
+ * cannot claim anything the modelled fields do not say.
  */
-function Summary({ form }: { form: StubForm }): ReactNode {
-  const method = form.method ?? "any method";
-  const path = form.path ?? "any path";
-  const matchesEverything = form.method === null && form.path === null;
+function Summary({ form, predicateItems }: { form: StubForm; predicateItems: PredicateItem[] }): ReactNode {
+  const matchesEverything = predicateItems.length === 0;
   return (
     <div className={matchesEverything ? "banner warn" : "hint"} data-testid="stub-summary">
       {matchesEverything ? (
@@ -431,14 +480,14 @@ function Summary({ form }: { form: StubForm }): ReactNode {
           <>
             <strong>This stub matches every request.</strong>
             <p>
-              It carries no method or path predicate, so it answers anything reaching this imposter
-              that no earlier stub claimed. That is occasionally what you want — a catch-all — and
-              usually not.
+              It carries no predicates, so it answers anything reaching this imposter that no
+              earlier stub claimed. That is occasionally what you want — a catch-all — and usually
+              not.
             </p>
           </>
         ) : (
           <>
-            Matches <b>{method}</b> <b>{path}</b> and answers{" "}
+            Matches requests where <b>{describePredicates(predicateItems)}</b>, and answers{" "}
             <b>{form.statusCode ?? 200}</b>
             {form.contentType === null ? "" : ` as ${form.contentType}`}.
           </>
