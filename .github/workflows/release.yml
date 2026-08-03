@@ -150,6 +150,7 @@ jobs:
           # because the artifact was written somewhere else.
           test -f web/public/lint/rift_lint_wasm.js
           test -f web/public/lint/rift_lint_wasm_bg.wasm
+          scripts/prune-wasm-out.sh web/public/lint
 
       # Order matters and is the whole point of the lane: the bundle must exist before cargo runs,
       # because `rust-embed` resolves `web/dist/` at compile time. It must also come after the wasm
