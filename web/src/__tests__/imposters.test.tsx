@@ -309,3 +309,123 @@ describe("a parked write is not reported as saved (#211)", () => {
     expect(note.getAttribute("role")).toBe("status");
   });
 });
+
+describe("#251 — import", () => {
+  const FLEET = { "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } };
+
+  /** Render the list and open the import panel, which lives behind a toggle. */
+  async function openImport(role: "editor" | "viewer" | "fleet-admin" = "editor"): Promise<void> {
+    renderInApp(<Imposters />, { whoami: whoamiWith(role) });
+    await screen.findByText("billing");
+    const toggle = screen.queryByTestId("open-import");
+    if (toggle !== null) await userEvent.setup().click(toggle);
+  }
+
+  async function paste(text: string): Promise<void> {
+    const user = userEvent.setup();
+    const box = screen.getByLabelText("Imposter JSON to import");
+    await user.clear(box);
+    await user.click(box);
+    await user.paste(text);
+  }
+
+  it("says what an import would do before anything is written", async () => {
+    /*
+     * The pre-flight is the whole point: `Add` is refused per-imposter by the port check while
+     * `Replace all` succeeds and destroys what was there, and neither outcome is visible from the
+     * document alone. Naming the overlap first is what makes the choice informed.
+     */
+    stubFetch({ "/imposters": { json: TWO }, ...FLEET });
+    await openImport();
+    await paste(JSON.stringify({ imposters: [{ port: 4545, protocol: "http" }, { port: 9000, protocol: "http" }] }));
+
+    const preflight = await screen.findByTestId("import-preflight");
+    expect(preflight.textContent).toContain("9000");
+    // 4545 is already on screen, so it must be called out as a collision.
+    expect(preflight.textContent).toContain("4545");
+    expect(preflight.textContent).toMatch(/already|exist|collision/i);
+  });
+
+  it("names the JSON error and refuses to apply a document it could not read", async () => {
+    stubFetch({ "/imposters": { json: TWO }, ...FLEET });
+    await openImport();
+    await paste("{not json");
+
+    expect((await screen.findByTestId("import-error")).textContent).toMatch(/not valid JSON/i);
+    expect((screen.getByTestId("import-add") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("reports each imposter's outcome individually when one of a batch fails", async () => {
+    /*
+     * The worst outcome here is a half-applied batch that does not say which half. A port collision
+     * refuses one imposter; the rest must still be attempted, and the panel must name both sides.
+     */
+    stubFetch({
+      "/imposters": { json: TWO },
+      ...FLEET,
+    });
+    // `stubFetch` answers by path, so both POSTs hit `/imposters`. Override with a fetch double that
+    // fails the first write and accepts the second, which is the case this test exists for.
+    const realFetch = globalThis.fetch as unknown as (...args: unknown[]) => Promise<Response>;
+    let writes = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if ((init?.method ?? "GET") !== "POST") return realFetch(input, init);
+        writes += 1;
+        return writes === 1
+          ? Promise.resolve(new Response("port 4545 is already claimed", { status: 400 }))
+          : Promise.resolve(new Response("{}", { status: 201 }));
+      }),
+    );
+
+    await openImport();
+    await paste(JSON.stringify({ imposters: [{ port: 4545, protocol: "http" }, { port: 9000, protocol: "http" }] }));
+    await userEvent.setup().click(screen.getByTestId("import-add"));
+
+    const results = await screen.findByTestId("import-results");
+    await waitFor(() => expect(results.textContent).toContain("9000"));
+    expect(results.textContent).toContain("4545");
+    // The server's own words, not a rewrite of them.
+    expect(results.textContent).toContain("already claimed");
+    expect(writes).toBe(2);
+  });
+
+  it("offers replace-all to a role holding imposter.delete", async () => {
+    /*
+     * The previous version of this test could not fail: it rendered the default role (which holds
+     * everything), then asserted `expect(x).toBeTruthy()` inside `if (x !== null)`. Both branches
+     * passed unconditionally, so it read as coverage of the authorization rule while checking
+     * nothing. Asserted directly now, in both directions — see the viewer case below.
+     */
+    stubFetch({ "/imposters": { json: TWO }, ...FLEET });
+    await openImport("editor");
+    await paste(JSON.stringify({ port: 9000, protocol: "http" }));
+
+    expect(await screen.findByTestId("import-add")).toBeTruthy();
+    expect(screen.getByTestId("import-replace")).toBeTruthy();
+  });
+
+  it("names the count it is about to destroy before replacing everything", async () => {
+    // Replace-all is the destructive one, and the number it destroys is not visible from the
+    // document being imported — it is a fact about the fleet.
+    stubFetch({ "/imposters": { json: TWO }, ...FLEET });
+    await openImport("editor");
+    await paste(JSON.stringify({ port: 9000, protocol: "http" }));
+    await userEvent.setup().click(screen.getByTestId("import-replace"));
+
+    const confirm = await screen.findByTestId("confirm-replace-imposters");
+    // Two imposters are on screen; the confirm must say so rather than just "are you sure".
+    expect(confirm.textContent).toContain("2");
+  });
+
+  it("offers a viewer no import at all", async () => {
+    stubFetch({ "/imposters": { json: TWO }, ...FLEET });
+    await openImport("viewer");
+    // No toggle for a viewer, so no panel — and none reachable by any other route either.
+    expect(screen.queryByTestId("open-import")).toBeNull();
+    expect(screen.queryByTestId("import-panel")).toBeNull();
+    // Export is a read affordance and stays.
+    expect(screen.getByTestId("export-imposters")).toBeTruthy();
+  });
+});

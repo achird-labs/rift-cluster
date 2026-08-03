@@ -1,5 +1,6 @@
-import { type FormEvent, type ReactNode, useState } from "react";
+import { type ChangeEvent, type FormEvent, type ReactNode, useEffect, useState } from "react";
 
+import { ApiError, apiGetText } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
 import { IMPOSTER_COLUMNS } from "../app/contract.ts";
 import type { FleetReadState, FleetView } from "../app/fleetView.ts";
@@ -8,8 +9,10 @@ import {
   useCreateImposter,
   useDeleteImposter,
   useFleetView,
+  useImportAddImposter,
   useImposters,
   useLifecycleToggle,
+  useReplaceImposters,
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { toHash } from "../app/routing.ts";
@@ -23,15 +26,54 @@ import {
   UNKNOWN,
   UnconfirmedNote,
 } from "../components/primitives.tsx";
+import {
+  type ExportProjection,
+  type ImportEntry,
+  type ImportPlan,
+  exportQuery,
+  exportSetFilename,
+  importPlan,
+  parseImportDocument,
+  renderSetDocument,
+} from "../features/imposters/portable.ts";
+import { type Finding, lintStub } from "../features/stubs/lint.ts";
 
 type Imposter = components["schemas"]["Imposter"];
 
+/**
+ * Trigger a browser download of text this console already has in hand — never re-fetched, never
+ * re-serialized. `apiGetText`'s whole point (#251) is bytes the download path must not touch.
+ */
+function downloadText(filename: string, text: string): void {
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  /*
+   * Deferred a tick rather than revoked inline. Chrome copes with an immediate revoke, but Safari
+   * and older Firefox can abort a download that is still being handed to the browser — the file
+   * silently never arrives, which looks exactly like the export having failed.
+   */
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+/** The message a failed export or import step should show — the server's own words when it has them. */
+function errorText(error: unknown): string {
+  if (error instanceof ApiError) return error.body;
+  return error instanceof Error ? error.message : String(error);
+}
+
 export function Imposters(): ReactNode {
-  const { can } = useSession();
+  const { can, tenant } = useSession();
   const imposters = useImposters();
   const create = useCreateImposter();
   const remove = useDeleteImposter();
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [confirming, setConfirming] = useState<Imposter | null>(null);
   // Only to qualify what the list shows. A principal without the fleet scope simply gets no
   // qualification — never a 404 error on a screen whose own read succeeded.
@@ -45,6 +87,19 @@ export function Imposters(): ReactNode {
   // `imposter.delete`, not `imposter.write`: they are separate actions server-side and granted from
   // separate arms, so gating on the wrong one is a drift waiting to happen (see `rbac.ts`).
   const mayDelete = can("imposter.delete");
+  const mayExport = can("imposter.read");
+  // `rbac.ts` has no `imposter.exportSet`/`imposter.import` — export reads through the same read
+  // gate every other list on this screen uses, import-add writes through the same write gate
+  // `New imposter` does, and Replace all additionally needs delete because it is one.
+  /*
+   * `imposter.delete` ALONE, transcribed from the action that actually authorizes the call:
+   * `action_for(Terminated::ReplaceAllImposters) => Action::ImposterDelete` in `admin_front.rs`.
+   * Both capabilities start at Editor today so `&& mayCreate` would decide identically — which is
+   * exactly why it is wrong to write. `rbac.ts` makes the point: transcribing the real action is
+   * what stops the table going stale silently the day one of the grants moves.
+   */
+  const mayReplace = mayDelete;
+  const existingPorts = imposters.data?.flatMap((i) => (i.port === undefined ? [] : [i.port])) ?? [];
 
   return (
     <section className="screen">
@@ -55,20 +110,40 @@ export function Imposters(): ReactNode {
           {confidence.partial ? ` This node is degraded: ${confidence.reason}.` : ""}
           {confidence.unknown ? ` Caveat: ${confidence.reason}.` : ""}
         </p>
+        <div className="spacer" />
         {mayCreate ? (
-          <>
-            <div className="spacer" />
-            <button
-              className="btn primary"
-              type="button"
-              data-testid="new-imposter"
-              onClick={() => setCreating(true)}
-            >
-              New imposter
-            </button>
-          </>
+          <button
+            className="btn"
+            type="button"
+            data-testid="open-import"
+            onClick={() => setImporting(true)}
+          >
+            Import
+          </button>
+        ) : null}
+        {mayCreate ? (
+          <button
+            className="btn primary"
+            type="button"
+            data-testid="new-imposter"
+            onClick={() => setCreating(true)}
+          >
+            New imposter
+          </button>
         ) : null}
       </header>
+
+      {mayExport ? <ExportSetControl tenant={tenant} /> : null}
+
+      {importing ? (
+        <ImportPanel
+          existingPorts={existingPorts}
+          existingCount={imposters.data?.length ?? 0}
+          mayWrite={mayCreate}
+          mayReplace={mayReplace}
+          onClose={() => setImporting(false)}
+        />
+      ) : null}
 
       {create.isError ? (
         <ErrorNote error={create.error} context="The imposter was not created" />
@@ -459,5 +534,327 @@ function NewImposter({
         </div>
       </form>
     </Card>
+  );
+}
+
+/**
+ * Export the whole tenant, in either projection (#251).
+ *
+ * Two buttons, not a select-then-go: the projections carry a real semantic difference (whether the
+ * import goes on recording), and naming both up front is worth more than one fewer click.
+ */
+function ExportSetControl({ tenant }: { tenant: string | null }): ReactNode {
+  const [busy, setBusy] = useState<ExportProjection | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function run(projection: ExportProjection): Promise<void> {
+    setError(null);
+    setBusy(projection);
+    try {
+      const text = await apiGetText(`/imposters${exportQuery(projection)}`, { tenant });
+      downloadText(exportSetFilename(tenant), text);
+    } catch (error_) {
+      setError(errorText(error_));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="card" data-testid="export-imposters">
+      <div className="card-body">
+        <span className="eyebrow">Export every imposter in this tenant</span>
+        <div className="field-row">
+          <button
+            className="btn sm"
+            type="button"
+            disabled={busy !== null}
+            onClick={() => void run("replay-ready")}
+          >
+            {busy === "replay-ready" ? "Exporting…" : "Replay-ready"}
+          </button>
+          <span className="note">
+            Default. Recorded proxy responses become static stubs; proxy stubs are dropped.
+          </span>
+        </div>
+        <div className="field-row">
+          <button
+            className="btn sm"
+            type="button"
+            disabled={busy !== null}
+            onClick={() => void run("as-configured")}
+          >
+            {busy === "as-configured" ? "Exporting…" : "As configured"}
+          </button>
+          <span className="note">Proxy stubs kept, so the importer goes on recording.</span>
+        </div>
+        {error === null ? null : (
+          <p className="error" data-testid="export-imposters-error" role="alert">
+            {error}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** One imposter's outcome from an `Add` run. */
+type ImportResult = { port: number | null; ok: boolean; message?: string };
+
+/**
+ * The import panel (#251): paste or choose a file, see a pre-flight before anything is written,
+ * then either `Add` (per-imposter, one request each) or the destructive `Replace all`.
+ */
+function ImportPanel({
+  existingPorts,
+  existingCount,
+  mayWrite,
+  mayReplace,
+  onClose,
+}: {
+  existingPorts: readonly number[];
+  existingCount: number;
+  mayWrite: boolean;
+  mayReplace: boolean;
+  onClose: () => void;
+}): ReactNode {
+  const [text, setText] = useState("");
+  const [findings, setFindings] = useState<Finding[] | "unavailable" | "pending">("pending");
+  const [results, setResults] = useState<ImportResult[] | null>(null);
+  const [running, setRunning] = useState(false);
+  const [confirmingReplace, setConfirmingReplace] = useState(false);
+
+  const add = useImportAddImposter();
+  const replace = useReplaceImposters();
+
+  const doc = parseImportDocument(text);
+  const plan = doc.kind === "ok" ? importPlan(doc.entries, existingPorts) : null;
+
+  // Advisory only, exactly as `StubEditor`'s pane: the server validates every write, and its
+  // refusal — not this — is what an operator must act on.
+  useEffect(() => {
+    let current = true;
+    setFindings("pending");
+    void lintStub(text).then((result) => {
+      if (current) setFindings(result);
+    });
+    return () => {
+      current = false;
+    };
+  }, [text]);
+
+  function onTextChange(next: string): void {
+    setText(next);
+    setResults(null);
+  }
+
+  async function handleFile(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    const file = event.target.files?.[0];
+    // Cleared unconditionally, so choosing the same file again after an edit still fires a change.
+    event.target.value = "";
+    if (file === undefined) return;
+    onTextChange(await file.text());
+  }
+
+  async function runAdd(entries: ImportEntry[]): Promise<void> {
+    setRunning(true);
+    const collected: ImportResult[] = [];
+    setResults(collected);
+    for (const entry of entries) {
+      try {
+        const outcome = await add.mutateAsync(entry.imposter);
+        // A failure of one must not abort the rest — the loop always continues to the next entry.
+        collected.push({
+          port: entry.port,
+          ok: true,
+          ...(outcome.kind === "unobservable" ? { message: outcome.reason } : {}),
+        });
+      } catch (error) {
+        collected.push({ port: entry.port, ok: false, message: errorText(error) });
+      }
+      setResults([...collected]);
+    }
+    setRunning(false);
+  }
+
+  async function runReplace(entries: ImportEntry[]): Promise<void> {
+    setConfirmingReplace(false);
+    setRunning(true);
+    try {
+      await replace.mutateAsync(renderSetDocument(entries));
+    } catch {
+      // Nothing to do here: `replace.isError`/`replace.error` below renders it. An empty catch would
+      // be the swallow; this one exists only to keep the rejection from becoming an unhandled one.
+    }
+    setRunning(false);
+  }
+
+  return (
+    <Card title="Import imposters" testId="import-panel">
+      <div className="field">
+        <label htmlFor="import-text">Imposter JSON to import</label>
+        <textarea
+          id="import-text"
+          rows={10}
+          value={text}
+          onChange={(event) => onTextChange(event.target.value)}
+          placeholder='A single imposter, an {"imposters": [...]} document, or a bare list.'
+        />
+      </div>
+      <div className="field">
+        <label htmlFor="import-file">Or choose a file</label>
+        <input
+          id="import-file"
+          type="file"
+          accept=".json,application/json"
+          onChange={(event) => void handleFile(event)}
+        />
+      </div>
+
+      {doc.kind === "error" ? (
+        <p className="error" data-testid="import-error" role="alert">
+          {doc.message}
+        </p>
+      ) : null}
+
+      {plan === null ? null : <ImportPreflight plan={plan} />}
+
+      <ImportLint findings={findings} />
+
+      {mayWrite ? (
+        <nav className="pager">
+          <button
+            className="btn primary"
+            type="button"
+            data-testid="import-add"
+            disabled={doc.kind !== "ok" || running}
+            onClick={() => void runAdd(doc.kind === "ok" ? doc.entries : [])}
+          >
+            {running ? "Adding…" : "Add"}
+          </button>
+          {mayReplace ? (
+            <button
+              className="btn danger"
+              type="button"
+              data-testid="import-replace"
+              disabled={doc.kind !== "ok" || running}
+              onClick={() => setConfirmingReplace(true)}
+            >
+              Replace all
+            </button>
+          ) : null}
+          <button className="btn" type="button" onClick={onClose} disabled={running}>
+            Close
+          </button>
+        </nav>
+      ) : null}
+
+      {replace.isError ? <ErrorNote error={replace.error} context="The set was not replaced" /> : null}
+      {replace.isSuccess ? (
+        <p className="hint" role="status">
+          Replaced. The list above reflects it once this reads back.
+        </p>
+      ) : null}
+
+      {results === null ? null : <ImportResults results={results} />}
+
+      {confirmingReplace ? (
+        <Confirm
+          testId="confirm-replace-imposters"
+          title="Replace every imposter on this tenant?"
+          body={
+            <>
+              This destroys the {existingCount} imposter{existingCount === 1 ? "" : "s"} currently
+              on this screen — their stubs, their recorded requests and their flow state — and
+              replaces them with exactly what this document names. Nothing undoes it.
+            </>
+          }
+          confirmLabel={`Replace ${existingCount} imposter${existingCount === 1 ? "" : "s"}`}
+          busy={running}
+          onCancel={() => setConfirmingReplace(false)}
+          onConfirm={() => void runReplace(doc.kind === "ok" ? doc.entries : [])}
+        />
+      ) : null}
+    </Card>
+  );
+}
+
+/**
+ * What an import would do, worked out before anything is written (AC in #251): how many, which
+ * ports, which already exist, which repeat within the document, and how many carry no port.
+ */
+function ImportPreflight({ plan }: { plan: ImportPlan }): ReactNode {
+  const ports = plan.entries.map((entry) => entry.port ?? "no port").join(", ");
+  return (
+    <div className="hint" data-testid="import-preflight" role="status">
+      <p>
+        {plan.entries.length} imposter{plan.entries.length === 1 ? "" : "s"} in this document
+        {plan.entries.length === 0 ? "" : `: ${ports}`}.
+      </p>
+      {plan.collisions.length === 0 ? null : (
+        <p className="warn-text">
+          Already served by this fleet: {plan.collisions.join(", ")}. <b>Add</b> will be refused for
+          these; <b>Replace all</b> will overwrite them.
+        </p>
+      )}
+      {plan.duplicates.length === 0 ? null : (
+        <p className="warn-text">
+          Named more than once in this document: {plan.duplicates.join(", ")} — only the last of
+          each survives <b>Replace all</b>, and <b>Add</b> refuses every repeat after the first.
+        </p>
+      )}
+      {plan.portless === 0 ? null : (
+        <p className="warn-text">
+          {plan.portless} carr{plan.portless === 1 ? "ies" : "y"} no usable port and will be
+          refused.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Advisory lint for the pasted document, the same discipline `StubEditor`'s pane follows. */
+function ImportLint({ findings }: { findings: Finding[] | "unavailable" | "pending" }): ReactNode {
+  return (
+    <div className="stub-lint" data-testid="import-lint">
+      {findings === "pending" ? <p className="muted">Linting…</p> : null}
+      {findings === "unavailable" ? (
+        <p className="muted">
+          lint unavailable — the server still validates every write, and its refusal is what
+          counts.
+        </p>
+      ) : null}
+      {Array.isArray(findings) ? (
+        findings.length === 0 ? (
+          <p className="muted">No findings.</p>
+        ) : (
+          <ul>
+            {findings.map((finding) => (
+              <li key={`${finding.code}-${finding.location ?? ""}-${finding.message}`}>
+                <strong>{finding.severity}</strong> {finding.code}: {finding.message}
+                {finding.location === undefined ? null : ` (${finding.location})`}
+              </li>
+            ))}
+          </ul>
+        )
+      ) : null}
+    </div>
+  );
+}
+
+/** Every imposter `Add` has attempted so far, in the order it attempted them. */
+function ImportResults({ results }: { results: ImportResult[] }): ReactNode {
+  return (
+    <ul data-testid="import-results">
+      {results.map((result, index) => (
+        <li
+          key={`${result.port ?? "no-port"}-${index}`}
+          data-testid={`import-result-${result.port ?? "no-port"}-${index}`}
+        >
+          <b>{result.port ?? "(no port)"}</b>: {result.ok ? "ok" : "failed"}
+          {result.message === undefined ? null : ` — ${result.message}`}
+        </li>
+      ))}
+    </ul>
   );
 }

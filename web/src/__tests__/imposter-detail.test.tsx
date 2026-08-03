@@ -62,12 +62,26 @@ describe("imposter detail", () => {
     expect(screen.getByTestId("stub-row-1").textContent).toContain("checkout");
   });
 
-  it("offers a viewer no write control at all", async () => {
+  it("offers a viewer no write control, while still allowing a read-only export", async () => {
+    /*
+     * This used to assert `queryByRole("button")` was null — a proxy for "no write controls" that
+     * held only because the screen happened to have no buttons of any kind. #251 added export, which
+     * is a READ affordance gated on `imposter.read`, so a viewer legitimately gets it now and the
+     * blanket assertion would fail for the right reason.
+     *
+     * Narrowed to the write affordances by name, and the export is asserted PRESENT rather than
+     * merely tolerated: `rbac.ts` makes the point repeatedly that hiding a control from a role that
+     * holds the capability is the same class of bug as offering one to a role that does not.
+     */
     stubFetch({ "/imposters/4545": { json: IMPOSTER } });
     renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("viewer") });
 
     await screen.findByTestId("stub-row-0");
-    expect(screen.queryByRole("button")).toBeNull();
+    for (const name of [/add stub/i, /edit /i, /delete /i, /duplicate/i, /disable/i, /enable/i]) {
+      expect([name, screen.queryByRole("button", { name })]).toEqual([name, null]);
+    }
+    expect(screen.queryByTestId("clone-imposter")).toBeNull();
+    expect(screen.getByTestId("export-imposter")).toBeTruthy();
   });
 
   it("distinguishes an imposter with no stubs from a response that carried no stub list", async () => {
