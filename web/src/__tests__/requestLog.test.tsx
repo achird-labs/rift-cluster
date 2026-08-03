@@ -487,3 +487,295 @@ describe("polling (RFC-006 §6)", () => {
     );
   });
 });
+
+describe("#250 — turning a request into a stub", () => {
+  const IMPOSTER = `/imposters/${PORT}`;
+
+  function imposterWith(stubs: unknown[]): Record<string, unknown> {
+    return {
+      port: PORT,
+      host: "0.0.0.0",
+      protocol: "http",
+      name: "billing",
+      recordRequests: true,
+      enabled: true,
+      stubs,
+    };
+  }
+
+  /** Expand the row's detail panel, where the action lives. */
+  async function openRow(): Promise<void> {
+    await userEvent.setup().click(await screen.findByTestId("request-open"));
+  }
+
+  it("offers to stub an unmatched request", async () => {
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
+      [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+
+    expect(await screen.findByTestId("request-stub-this")).toBeTruthy();
+    expect(screen.queryByTestId("request-open-stub")).toBeNull();
+  });
+
+  it("offers to open the stub that answered a matched request", async () => {
+    // The useful verb on a matched row is not "make a new stub" — one already answered it.
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: true, stubId: "s-1" } })] },
+      [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+
+    expect(await screen.findByTestId("request-open-stub")).toBeTruthy();
+    expect(screen.queryByTestId("request-stub-this")).toBeNull();
+  });
+
+  it("offers no edit action when the winning stub declares no id, and says why", async () => {
+    // By-index editing is the documented lost-update window, so the console declines rather than
+    // offering something unsafe — and explains the refusal instead of rendering a dead row.
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: true, stubIndex: 2 } })] },
+      [IMPOSTER]: { json: imposterWith([{ predicates: [{ equals: { path: "/x" } }] }]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+
+    expect(await screen.findByTestId("request-no-stub-action")).toBeTruthy();
+    expect(screen.queryByTestId("request-stub-this")).toBeNull();
+    expect(screen.queryByTestId("request-open-stub")).toBeNull();
+  });
+
+  it("offers nothing at all to a reader who cannot write stubs", async () => {
+    // The screen itself stays readable at `imposter.read`; only the actions are gated.
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
+      [IMPOSTER]: { json: imposterWith([]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("viewer") });
+    await openRow();
+
+    expect(screen.queryByTestId("request-stub-this")).toBeNull();
+    expect(screen.queryByTestId("request-no-stub-action")).toBeNull();
+    expect(await screen.findByTestId("request-row")).toBeTruthy();
+  });
+
+  it("opens the editor seeded from the request, matching method and path by default", async () => {
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: {
+        json: [
+          recorded({
+            method: "POST",
+            path: "/v1/payments",
+            matchOutcome: { matched: false, tried: [] },
+          }),
+        ],
+      },
+      [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+    await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
+
+    const editor = (await screen.findByTestId("code-editor-fallback")) as HTMLTextAreaElement;
+    await waitFor(() => expect(editor.value.length).toBeGreaterThan(0));
+    expect(JSON.parse(editor.value)).toEqual({
+      predicates: [{ equals: { method: "POST", path: "/v1/payments" } }],
+      responses: [
+        { is: { statusCode: 200, headers: { "Content-Type": "application/json" }, body: "{}" } },
+      ],
+    });
+  });
+
+  it("honours the field selection chosen before the editor opens", async () => {
+    // The selection is made up-front precisely so nothing re-derives over a hand-edited draft.
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: {
+        json: [
+          recorded({
+            query: { page: "2" },
+            matchOutcome: { matched: false, tried: [] },
+          }),
+        ],
+      },
+      [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+
+    const user = userEvent.setup();
+    // Query is ON by default (it agrees with the recording flow), so exercise the selection in the
+    // direction that actually changes something: turn it off, and opt a header IN.
+    await user.click(await screen.findByRole("checkbox", { name: "Match on query" }));
+    await user.click(screen.getByRole("checkbox", { name: "Match on header user-agent" }));
+    await user.click(screen.getByTestId("request-stub-this"));
+
+    const editor = (await screen.findByTestId("code-editor-fallback")) as HTMLTextAreaElement;
+    await waitFor(() => expect(editor.value.length).toBeGreaterThan(0));
+    const stub = JSON.parse(editor.value) as { predicates: { equals: Record<string, unknown> }[] };
+    expect(stub.predicates[0]?.equals.query).toBeUndefined();
+    expect(stub.predicates[0]?.equals.headers).toEqual({ "user-agent": "curl/8" });
+  });
+
+  it("refuses to re-seed over an open draft, rather than discarding it silently", async () => {
+    /*
+     * Clicking "Stub this" again remounts the editor with a fresh seed — which would throw away
+     * whatever the operator had typed, with no warning. The selection is chosen BEFORE opening
+     * precisely so nothing re-derives afterwards; this is the other half of that rule.
+     */
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
+      [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+    await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
+    await screen.findByTestId("code-editor-fallback");
+
+    expect((screen.getByTestId("request-stub-this") as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTestId("stub-this-busy").textContent).toMatch(/discard the draft/i);
+  });
+
+  it("does not open an editor over a stub the imposter no longer carries", async () => {
+    /*
+     * A journal entry outlives the stub that served it: the id can be gone by the time the row is
+     * clicked. Opening an editor over `{}` would show an empty document titled with the missing id,
+     * and a save would then PUT `{}` over whatever the fleet actually has. `ImposterDetail` refuses
+     * to mount in this case; so must this screen.
+     */
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: true, stubId: "s-gone" } })] },
+      [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+    await userEvent.setup().click(await screen.findByTestId("request-open-stub"));
+
+    expect((await screen.findByTestId("stub-gone")).textContent).toMatch(/no longer in this/i);
+    expect(screen.queryByTestId("code-editor-fallback")).toBeNull();
+  });
+
+  it("does not claim a catch-all shadows an EXISTING stub being edited", async () => {
+    /*
+     * The warning is about appends — "new stubs are appended, first-match-wins". An existing stub
+     * may sit above the catch-all and fire perfectly well, so saying it will never fire is simply
+     * false, and a wrong claim on this screen is the failure mode the module set exists to avoid.
+     */
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: true, stubId: "s-1" } })] },
+      [IMPOSTER]: {
+        json: imposterWith([
+          { id: "s-1", predicates: [{ equals: { path: "/x" } }] },
+          { id: "catch", responses: [{ is: { statusCode: 200 } }] },
+        ]),
+      },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+    await userEvent.setup().click(await screen.findByTestId("request-open-stub"));
+
+    await screen.findByTestId("code-editor-fallback");
+    expect(screen.queryByTestId("stub-shadow-warning")).toBeNull();
+  });
+
+  it("offers no action, and says why, when the match diagnostics cannot be read", async () => {
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: "yes" } })] },
+      [IMPOSTER]: { json: imposterWith([]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+
+    expect((await screen.findByTestId("request-no-stub-action")).textContent).toMatch(/unreadable/i);
+    expect(screen.queryByTestId("request-stub-this")).toBeNull();
+  });
+
+  it("keeps rendering when a row's match outcome is null", async () => {
+    // `diagnostics.ts` folds null into absence; reading `.matched` off it would throw and unmount
+    // the screen an operator opened precisely because something was already wrong.
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: null })] },
+      [IMPOSTER]: { json: imposterWith([]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+
+    expect(await screen.findByTestId("request-stub-this")).toBeTruthy();
+  });
+
+  it("keeps rendering when the imposter's stub list is not an array", async () => {
+    /*
+     * The list comes off the wire, and this is the screen an operator opens when something is
+     * already wrong. A `stubs: null` reaching `hasCatchAll(...).some` would throw during render and
+     * take the log down at the worst possible moment.
+     */
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
+      [IMPOSTER]: {
+        json: {
+          port: PORT,
+          host: "0.0.0.0",
+          protocol: "http",
+          name: "billing",
+          recordRequests: true,
+          enabled: true,
+          stubs: null,
+        },
+      },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+    await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
+
+    expect(await screen.findByTestId("code-editor-fallback")).toBeTruthy();
+    // No catch-all can be proven from a list that is not a list, so it must not claim one.
+    expect(screen.queryByTestId("stub-shadow-warning")).toBeNull();
+  });
+
+  it("warns that a catch-all stub will shadow the one being added", async () => {
+    /*
+     * Stubs append and matching is first-match-wins, so a stub added below a catch-all never fires.
+     * Without this the operator saves, sees no change, and has nothing on screen explaining why.
+     */
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
+      [IMPOSTER]: { json: imposterWith([{ id: "catch-all", responses: [{ is: { statusCode: 200 } }] }]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+    await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
+
+    expect((await screen.findByTestId("stub-shadow-warning")).textContent).toMatch(
+      /every request|first match|never fire/i,
+    );
+  });
+
+  it("does not warn when the imposter has no catch-all", async () => {
+    stubFetch({
+      ...SINGLE_NODE,
+      [REQUESTS]: { json: [recorded({ matchOutcome: { matched: false, tried: [] } })] },
+      [IMPOSTER]: { json: imposterWith([{ id: "s-1", predicates: [{ equals: { path: "/x" } }] }]) },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
+    await openRow();
+    await userEvent.setup().click(await screen.findByTestId("request-stub-this"));
+
+    await screen.findByTestId("code-editor-fallback");
+    expect(screen.queryByTestId("stub-shadow-warning")).toBeNull();
+  });
+});

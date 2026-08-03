@@ -1,14 +1,31 @@
 import { type ReactNode, useState } from "react";
 
+import type { components } from "../api/schema.ts";
 import { ApiError } from "../api/client.ts";
 import type { FleetReadState } from "../app/fleetView.ts";
-import { useClearRequests, useFleetView, useImposters, useRequestLog } from "../app/queries.ts";
+import {
+  useClearRequests,
+  useFleetView,
+  useImposter,
+  useImposters,
+  useRequestLog,
+} from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
 import { coverageFor, describeCoverage, headerValues, page } from "../features/requests/source.ts";
+import {
+  type FieldSelection,
+  defaultSelection,
+  hasCatchAll,
+  rowActionFor,
+  stubFromRequest,
+} from "../features/requests/stubFromRequest.ts";
+import { StubEditor, type StubTarget } from "./StubEditor.tsx";
+
+type Stub = components["schemas"]["Stub"];
 
 const PAGE_SIZE = 50;
 
@@ -43,6 +60,53 @@ function Log({ port }: { port: number }): ReactNode {
   // `Action::SavedRequestsClear`, not `LifecycleToggle` — separate actions that happen to share a
   // role today. See `rbac.ts`.
   const mayClear = can("requests.clear");
+  const mayWriteStubs = can("imposter.write");
+
+  // Same read `ImposterDetail` drives its editor from: the body carries the stub list this screen's
+  // shadow warning needs, and the `Rift-Cluster-Revision` header is the `If-Match` a save is
+  // conditioned on. Called unconditionally (never behind `mayWriteStubs`) because a hook cannot come
+  // and go across renders — `ImposterDetail` makes the same call.
+  const imposter = useImposter(port);
+  /*
+   * `Array.isArray`, not a cast. The stub list arrives over the wire and this screen is the one an
+   * operator opens while something is already wrong — a `stubs` that is `null`, an object, or a
+   * scalar would otherwise reach `hasCatchAll(...).some` and `stubs.find(...)` and throw during
+   * render, taking the log down at the worst possible moment. Same guard, and the same reason, as
+   * `responseListOf` in `StubEditor.tsx`.
+   */
+  const rawStubs: unknown = imposter.data?.data.stubs;
+  const stubs: Stub[] = Array.isArray(rawStubs) ? (rawStubs as Stub[]) : [];
+  const revision = imposter.data?.revision ?? null;
+
+  const [editing, setEditing] = useState<StubTarget | null>(null);
+  // Bumped on every open so two "Stub this" clicks in a row get distinct React keys even when both
+  // targets are `{kind: "new"}` — without it the editor would not remount and would keep showing the
+  // first row's seed under the second row's button.
+  const [editSeq, setEditSeq] = useState(0);
+  const openEditor = (target: StubTarget): void => {
+    setEditing(target);
+    setEditSeq((n) => n + 1);
+  };
+  /*
+   * While an editor is open its draft is the operator's, and re-seeding would remount and discard
+   * whatever they have typed with no warning. So the row actions are disabled rather than allowed
+   * to silently throw the draft away: closing the editor is an explicit act, and only then can a
+   * new seed be derived. This is the other half of "re-deriving stops once the draft is edited" —
+   * the selection is chosen BEFORE opening, and no path re-derives after.
+   */
+  const editorOpen = editing !== null;
+  /*
+   * The stub "Open stub" points at, if the list still carries it. A journal entry outlives the stub
+   * that served it, so the id can be gone by the time the row is clicked — deleted between polls, or
+   * read from a node behind on replication. `ImposterDetail` refuses to mount the editor in that
+   * case and so does this screen: opening one over `{}` shows an empty document titled with the
+   * missing id, and a save would then PUT `{}` over whatever the fleet actually has.
+   */
+  const existingStub =
+    editing !== null && editing.kind === "existing"
+      ? stubs.find((stub) => stub.id === editing.stubId)
+      : undefined;
+  const editorReady = editing !== null && (editing.kind === "new" || existingStub !== undefined);
 
   return (
     <section className="screen">
@@ -108,9 +172,66 @@ function Log({ port }: { port: number }): ReactNode {
         <span className="coverage">{describeCoverage(coverage)}</span>
       </div>
 
+      {mayWriteStubs && editing !== null && !editorReady ? (
+        <div className="banner warn" data-testid="stub-gone" role="status">
+          <span className="b-glyph" aria-hidden="true">
+            &#9650;
+          </span>
+          <div>
+            The stub that answered this request is no longer in this imposter&rsquo;s list. It may
+            have been deleted since the request was recorded. Nothing has been opened.
+          </div>
+        </div>
+      ) : null}
+
+      {mayWriteStubs && editorReady && editing !== null ? (
+        <>
+          {/*
+            Gated on `kind === "new"`, not merely on the editor being open. The sentence is about
+            APPENDING — "new stubs are appended, matching is first-match-wins" — which says nothing
+            true about a stub that already exists somewhere in the list, possibly above the
+            catch-all and firing perfectly well. A confidently wrong claim on this screen is the
+            failure mode the whole module set is built to avoid.
+          */}
+          {editing.kind === "new" && hasCatchAll(stubs) ? (
+            <div className="banner warn" data-testid="stub-shadow-warning" role="status">
+              <span className="b-glyph" aria-hidden="true">
+                ▲
+              </span>
+              <div>
+                <strong>This imposter already has a stub that matches every request.</strong>
+                <p>
+                  New stubs are appended to the end of the list, and matching is first-match-wins,
+                  so a stub saved below a catch-all is never reached — it will not fire.
+                </p>
+              </div>
+            </div>
+          ) : null}
+          <StubEditor
+            // Keyed by what is being edited, not by its content: an existing stub keeps its key
+            // across the imposter's 5s poll (the same reason `ImposterDetail` keys this way), and a
+            // new seeded stub gets a fresh key per `editSeq` so a second "Stub this" click remounts
+            // with its own seed instead of reusing the first click's draft.
+            key={editing.kind === "existing" ? `existing-${editing.stubId}` : `new-${editSeq}`}
+            port={port}
+            target={editing}
+            original={editing.kind === "existing" ? existingStub : {}}
+            revision={revision}
+            onDone={() => setEditing(null)}
+          />
+        </>
+      ) : null}
+
       {log.isPending ? <p className="muted">Reading…</p> : null}
       {log.isSuccess ? (
-        <Rows state={log.data} offset={offset} onOffset={setOffset} />
+        <Rows
+          state={log.data}
+          offset={offset}
+          onOffset={setOffset}
+          mayWriteStubs={mayWriteStubs}
+          onEdit={openEditor}
+          editorOpen={editorOpen}
+        />
       ) : null}
     </section>
   );
@@ -120,10 +241,16 @@ function Rows({
   state,
   offset,
   onOffset,
+  mayWriteStubs,
+  onEdit,
+  editorOpen,
 }: {
   state: { kind: "rows"; rows: RecordedRequest[] } | { kind: "unknown"; reason: string };
   offset: number;
   onOffset: (next: number) => void;
+  mayWriteStubs: boolean;
+  editorOpen: boolean;
+  onEdit: (target: StubTarget) => void;
 }): ReactNode {
   if (state.kind === "unknown") {
     /*
@@ -190,7 +317,13 @@ function Rows({
                 request.
               */}
               {view.rows.map((request, index) => (
-                <Row key={`${start + index}`} request={request} />
+                <Row
+                  key={`${start + index}`}
+                  request={request}
+                  mayWriteStubs={mayWriteStubs}
+                  editorOpen={editorOpen}
+                  onEdit={onEdit}
+                />
               ))}
             </tbody>
           </table>
@@ -249,7 +382,17 @@ function Method({ method }: { method: string | undefined }): ReactNode {
  * innerHTML escape hatch is banned by lint — this component exists so that stays true in one place
  * rather than at every call site.
  */
-function Row({ request }: { request: RecordedRequest }): ReactNode {
+function Row({
+  request,
+  mayWriteStubs,
+  editorOpen,
+  onEdit,
+}: {
+  request: RecordedRequest;
+  mayWriteStubs: boolean;
+  editorOpen: boolean;
+  onEdit: (target: StubTarget) => void;
+}): ReactNode {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -306,10 +449,146 @@ function Row({ request }: { request: RecordedRequest }): ReactNode {
               </div>
             </dl>
             <Diagnostics outcome={request.matchOutcome} />
+            {mayWriteStubs ? (
+              <StubRowAction request={request} onEdit={onEdit} editorOpen={editorOpen} />
+            ) : null}
           </td>
         </tr>
       ) : null}
     </>
+  );
+}
+
+/**
+ * "Stub this" / "Open stub", per `rowActionFor` (#250).
+ *
+ * Gated on `imposter.write` by the caller, same as every other write control on this screen — this
+ * component assumes it is only mounted when that capability is present.
+ */
+function StubRowAction({
+  request,
+  onEdit,
+  editorOpen,
+}: {
+  request: RecordedRequest;
+  onEdit: (target: StubTarget) => void;
+  /** An editor is already open somewhere on this screen; see `editorOpen` in `Log`. */
+  editorOpen: boolean;
+}): ReactNode {
+  const action = rowActionFor(request.matchOutcome);
+  /*
+   * Chosen up front, not while the editor is open: `StubEditor` owns the draft text once it opens
+   * and exposes no "the operator has typed" signal this screen could watch, so there is no safe way
+   * to re-derive the seed after the fact without silently overwriting a hand edit. Deriving the seed
+   * once, from whatever is checked at the moment "Stub this" is clicked, sidesteps the problem
+   * instead of solving it — the seed is a snapshot, and after that it is the operator's document.
+   */
+  const [selection, setSelection] = useState<FieldSelection>(defaultSelection);
+
+  if (action.kind === "open") {
+    return (
+      <button
+        className="btn sm"
+        type="button"
+        data-testid="request-open-stub"
+        disabled={editorOpen}
+        onClick={() => onEdit({ kind: "existing", stubId: action.stubId })}
+      >
+        Open stub
+      </button>
+    );
+  }
+
+  if (action.kind === "none") {
+    return (
+      <p className="muted" data-testid="request-no-stub-action">
+        {action.reason === "matched-without-id"
+          ? "The stub that matched declares no id, so it cannot be opened safely by id."
+          : // The diagnostics panel directly above already says the outcome is unreadable. Offering
+            // an action beside it would be this screen asserting two different things about one row.
+            "These match diagnostics are unreadable, so there is nothing to act on."}
+      </p>
+    );
+  }
+
+  // action.kind === "stub": nothing matched (or nothing was recorded), so the useful verb is to
+  // seed a new one from this request.
+  const headerNames = Object.keys(request.headers ?? {});
+  const toggleHeader = (name: string, checked: boolean): void => {
+    const headers = new Set(selection.headers);
+    if (checked) headers.add(name);
+    else headers.delete(name);
+    setSelection({ ...selection, headers });
+  };
+
+  return (
+    <div className="stub-row-action">
+      <fieldset className="stub-seed-fields" data-testid="stub-seed-fields">
+        <legend>Match on</legend>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={selection.method}
+            onChange={(event) => setSelection({ ...selection, method: event.target.checked })}
+          />
+          <span>Match on method</span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={selection.path}
+            onChange={(event) => setSelection({ ...selection, path: event.target.checked })}
+          />
+          <span>Match on path</span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={selection.query}
+            onChange={(event) => setSelection({ ...selection, query: event.target.checked })}
+          />
+          <span>Match on query</span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={selection.body}
+            onChange={(event) => setSelection({ ...selection, body: event.target.checked })}
+          />
+          <span>Match on body</span>
+        </label>
+        {headerNames.map((name) => (
+          <label className="check" key={name}>
+            <input
+              type="checkbox"
+              checked={selection.headers.has(name)}
+              onChange={(event) => toggleHeader(name, event.target.checked)}
+            />
+            <span>Match on header {name}</span>
+          </label>
+        ))}
+      </fieldset>
+      <button
+        className="btn sm"
+        type="button"
+        data-testid="request-stub-this"
+        /*
+         * Disabled while an editor is open. Clicking again would remount `StubEditor` with a fresh
+         * seed and silently discard whatever the operator had typed into the previous draft —
+         * exactly the regeneration-over-hand-edits this flow is supposed to make impossible.
+         * Closing the editor is an explicit act; only then is a new seed derived.
+         */
+        disabled={editorOpen}
+        onClick={() => onEdit({ kind: "new", seed: stubFromRequest(request, selection) })}
+      >
+        Stub this
+      </button>
+      {editorOpen ? (
+        <p className="muted" data-testid="stub-this-busy">
+          Close the open stub editor before seeding another — re-seeding would discard the draft.
+        </p>
+      ) : null}
+    </div>
   );
 }
 

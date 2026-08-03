@@ -42,8 +42,17 @@ import {
  * left behind, with that state's token.
  */
 
-/** What this panel is editing. An append has no id yet; the by-id routes cannot address it. */
-export type StubTarget = { kind: "existing"; stubId: string } | { kind: "new" };
+/**
+ * What this panel is editing. An append has no id yet; the by-id routes cannot address it.
+ *
+ * `seed` (issue #250) is a starting document for a new stub — derived from a request the journal
+ * recorded. One optional field rather than a second entry path into the editor, so the projection,
+ * the lint pane, the pinned revision, the If-Match save and the 409 rebase all apply to a seeded
+ * stub exactly as they do to a hand-written one.
+ */
+export type StubTarget =
+  | { kind: "existing"; stubId: string }
+  | { kind: "new"; seed?: unknown };
 
 const PRETTY_INDENT = 2;
 
@@ -217,9 +226,17 @@ export function StubEditor({
   revision: string | null;
   onDone: () => void;
 }): ReactNode {
-  const [text, setText] = useState(() =>
-    target.kind === "new" ? NEW_STUB_TEXT : pretty(original),
-  );
+  const [text, setText] = useState(() => {
+    if (target.kind !== "new") return pretty(original);
+    return target.seed === undefined ? NEW_STUB_TEXT : pretty(target.seed);
+  });
+  /*
+   * Was this draft seeded from a request? Used only to swap the presets for a note explaining where
+   * the response came from — there is no re-derivation to guard against here. The seed is a
+   * one-shot snapshot taken before this editor mounts (see `StubRowAction` in `RequestLog.tsx`),
+   * and from the first keystroke the draft is the operator's.
+   */
+  const seeded = target.kind === "new" && target.seed !== undefined;
   /*
    * The If-Match token this editor will save with, pinned at open. The `revision` prop tracks the
    * polled imposter query, and the poll (or a focus refetch — the second-tab workflow verbatim)
@@ -401,7 +418,14 @@ export function StubEditor({
         </div>
       ) : null}
 
-      {target.kind === "new" && editable !== null ? (
+      {seeded ? (
+        <p className="hint" data-testid="stub-seed-note">
+          Seeded from the recorded request. The journal records requests, not responses — so the
+          response below is a starting point, not something this request actually returned.
+        </p>
+      ) : null}
+
+      {target.kind === "new" && !seeded && editable !== null ? (
         <Presets onPick={(stub) => setText(pretty(stub))} />
       ) : null}
 

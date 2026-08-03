@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { REVISION_HEADER } from "../api/client.ts";
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
+import { StubEditor } from "../screens/StubEditor.tsx";
 import { renderInApp, whoamiWith } from "./harness.tsx";
 
 const PORT = 4545;
@@ -385,6 +386,60 @@ describe("AC5 — the lint pane is advisory and the server's refusal is the auth
     await userEvent.setup().click(screen.getByRole("button", { name: /save stub/i }));
 
     expect((await screen.findByTestId("stub-server-error")).textContent).toContain(engineMessage);
+  });
+});
+
+describe("#250 — a stub seeded from a recorded request", () => {
+  it("opens the seed as the draft, and says the response is a default the journal never recorded", async () => {
+    /*
+     * `RecordedRequest` carries no response field at all, so the seeded 200 is invented by the
+     * console. Letting an operator assume it was replayed from the journal would be the console
+     * lying about what it knows — hence the line, and hence a test for the line.
+     */
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
+    const seed = {
+      predicates: [{ equals: { method: "POST", path: "/orders" } }],
+      responses: [{ is: { statusCode: 200, headers: { "Content-Type": "application/json" }, body: "{}" } }],
+    };
+    renderInApp(
+      <StubEditor port={PORT} target={{ kind: "new", seed }} original={null} revision="default:4545@7" onDone={() => {}} />,
+      { whoami: whoamiWith("editor") },
+    );
+
+    const editor = (await screen.findByTestId("code-editor-fallback")) as HTMLTextAreaElement;
+    await waitFor(() => expect(editor.value.length).toBeGreaterThan(0));
+    expect(JSON.parse(editor.value)).toEqual(seed);
+    expect((await screen.findByTestId("stub-seed-note")).textContent).toMatch(
+      /records requests, not responses/i,
+    );
+  });
+
+  it("offers no presets for a seeded stub — the seed IS the starting point", async () => {
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
+    renderInApp(
+      <StubEditor
+        port={PORT}
+        target={{ kind: "new", seed: { responses: [{ is: { statusCode: 200 } }] } }}
+        original={null}
+        revision="default:4545@7"
+        onDone={() => {}}
+      />,
+      { whoami: whoamiWith("editor") },
+    );
+
+    await screen.findByTestId("code-editor-fallback");
+    expect(screen.queryByTestId("stub-presets")).toBeNull();
+  });
+
+  it("still offers presets for an unseeded new stub", async () => {
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
+    renderInApp(
+      <StubEditor port={PORT} target={{ kind: "new" }} original={null} revision="default:4545@7" onDone={() => {}} />,
+      { whoami: whoamiWith("editor") },
+    );
+
+    expect(await screen.findByTestId("stub-presets")).toBeTruthy();
+    expect(screen.queryByTestId("stub-seed-note")).toBeNull();
   });
 });
 
