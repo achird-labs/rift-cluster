@@ -836,13 +836,13 @@ button[disabled] {
  * tab bar, the issue chips): those carry their own treatment, and a blanket `a { }` would repaint
  * the rail and every button-shaped link with link colour.
  */
-main a:not(.btn):not(.nav-item):not(.issue),
+main a:not(.btn):not(.nav-item):not(.issue):not(.prose-link),
 .admin-tabs a.plain-link {
   color: var(--accent);
   text-decoration: none;
 }
 
-main a:not(.btn):not(.nav-item):not(.issue):hover {
+main a:not(.btn):not(.nav-item):not(.issue):not(.prose-link):hover {
   text-decoration: underline;
 }
 
@@ -864,8 +864,14 @@ ul.plain,
  * a nav chip, a breadcrumb — because position already distinguishes it. Inside a paragraph nothing
  * does, so colour becomes the only cue and axe's `link-in-text-block` fails the page (serious).
  * This is that case, kept as its own class so the standalone links keep their quieter treatment.
+ *
+ * Excluded from the `main a` rule above by name, like `.issue` is, rather than relying on this
+ * declaration to win: `main a:not(…):not(…):not(…)` outweighs a bare class three times over, so a
+ * class that merely *sets* `underline` here would lose to the `none` there and the violation would
+ * survive the fix.
  */
 .prose-link {
+  color: var(--accent);
   text-decoration: underline;
 }
 
