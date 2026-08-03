@@ -60,11 +60,19 @@ COPY . .
 
 # `--target web` + `--no-pack`: the console imports the module directly as
 # `/console/lint/rift_lint_wasm.js`, and there is no npm package to publish.
+#
+# The prune is not tidiness. `vite` copies `web/public/` verbatim into `dist/` and the console embeds
+# `dist/` byte for byte, so anything else wasm-pack leaves here ships inside the binary with no
+# content type — which `console::tests::content_types_cover_what_the_bundle_actually_contains` fails
+# on. `--no-pack` does NOT suppress the `.gitignore` wasm-pack writes, despite the release lane's
+# comment saying so; that shipped unnoticed because the console tests run on no lane but the release
+# one. See `scripts/prune-wasm-out.sh`.
 RUN wasm-pack build crates/rift-lint-wasm \
       --release --target web --no-pack \
       --out-dir ../../web/public/lint --out-name rift_lint_wasm \
     && test -f web/public/lint/rift_lint_wasm.js \
-    && test -f web/public/lint/rift_lint_wasm_bg.wasm
+    && test -f web/public/lint/rift_lint_wasm_bg.wasm \
+    && bash scripts/prune-wasm-out.sh web/public/lint
 
 # ---------------------------------------------------------------------------
 # Console bundle

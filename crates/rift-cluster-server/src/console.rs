@@ -260,6 +260,16 @@ fn content_type(relative: &str) -> &'static str {
         "ttf" => "font/ttf",
         "txt" => "text/plain; charset=utf-8",
         "map" => "application/json",
+        // The console's own advisory linter (`crates/rift-lint-wasm`, RFC-006 §12 Q1). Missing from
+        // this table until #266, which means the only asset the console compiles itself has been
+        // served as `application/octet-stream` — and `WebAssembly.instantiateStreaming`, which
+        // wasm-bindgen's `--target web` glue reaches for first, refuses anything that is not
+        // `application/wasm`.
+        //
+        // It went unnoticed because `web/public/lint/` is empty on every ordinary lane: the wasm is
+        // built only where `--features console` is, so the coverage test below had nothing to catch.
+        // The first `workflow_dispatch` run of the publish lane is what surfaced it.
+        "wasm" => "application/wasm",
         _ => "application/octet-stream",
     }
 }
@@ -361,6 +371,26 @@ mod tests {
                 "{relative} is in the bundle but has no content type — a browser will not use it"
             );
         }
+    }
+
+    /// The coverage test above can only see what is *in* the bundle, and on every lane but the
+    /// release one `web/public/lint/` is empty — so the missing `wasm` entry sat undetected from
+    /// #188 until the publish lane was first run (#266). This asserts the table directly instead,
+    /// which holds no matter what the embed happens to contain.
+    ///
+    /// `application/wasm` specifically, not merely "not octet-stream": wasm-bindgen's `--target web`
+    /// glue reaches for `WebAssembly.instantiateStreaming`, and that refuses any other MIME type.
+    #[test]
+    fn the_consoles_own_wasm_linter_has_the_type_a_browser_will_instantiate() {
+        assert_eq!(
+            content_type("lint/rift_lint_wasm_bg.wasm"),
+            "application/wasm"
+        );
+        // The glue beside it is ordinary JavaScript and must stay so.
+        assert_eq!(
+            content_type("lint/rift_lint_wasm.js"),
+            "text/javascript; charset=utf-8"
+        );
     }
 
     #[test]
