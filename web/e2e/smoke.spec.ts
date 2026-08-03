@@ -62,6 +62,31 @@ test.describe("the shipped console loads", () => {
     await expect(page.getByTestId("stub-form")).toBeVisible();
     await expect(page.getByTestId("stub-summary")).toBeVisible();
   });
+
+  test("opens an EXISTING stub in the form, not raw-only (#257)", async ({ page }) => {
+    /*
+     * The gap that let #257 ship. The test above only ever clicks "Add stub", which starts from
+     * `NEW_STUB_TEXT` — a local constant carrying a NUMERIC `statusCode`. So the whole e2e suite
+     * never opened a stub that had been through the engine, and never saw that
+     * `IsResponseOut.status_code` serializes as a STRING: every existing stub opened raw-only,
+     * while a brand-new one opened in the form and looked fine.
+     *
+     * Asserting the raw-only banner is ABSENT is the load-bearing half. `stub-form` is rendered for
+     * the id field either way, so its presence alone would have passed on the broken build.
+     */
+    const { imposters } = fixture();
+    await signIn(page, "editor");
+    await goToScreen(page, `/imposters/${imposters[0]}`);
+
+    // `/^edit /` with the trailing space: the visible text is "Edit" but the accessible name is
+    // `Edit <stubId>` (see interactions.spec.ts).
+    await page.getByRole("button", { name: /^edit /i }).first().click();
+    await expect(page.getByTestId("stub-editor")).toBeVisible();
+
+    await expect(page.getByTestId("stub-raw-banner")).toHaveCount(0);
+    await expect(page.getByTestId("response-builder")).toBeVisible();
+    await expect(page.getByTestId("stub-summary")).toBeVisible();
+  });
 });
 
 test.describe("roles get the console their bindings allow", () => {

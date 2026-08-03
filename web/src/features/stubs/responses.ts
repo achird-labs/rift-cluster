@@ -79,6 +79,21 @@ export type ResponseModel = {
   /** `null` means the key is ABSENT, not that the status is zero — the engine then defaults to 200. */
   statusCode: number | null;
   /**
+   * Did the source spell `statusCode` as a STRING?
+   *
+   * The engine always emits the string form: `IsResponseOut.status_code` goes through
+   * `serialize_status_code_as_string`, deliberately, for Mountebank wire compatibility. So every
+   * response read back from `GET /imposters/:port` carries `"statusCode": "200"` — which means that
+   * before #257, modelling only the number spelling sent EVERY EXISTING STUB to raw-only. The form
+   * was reachable in practice for a never-saved stub and nothing else, which quietly undid the form
+   * work in #188, #247 and #248.
+   *
+   * Carried rather than normalised, for the same reason as `wrapped` and `multi`: the shape a
+   * response arrived in is the shape it leaves in. Normalising to a number would rewrite every stub
+   * on its first save through the form — a diff on every export, which is what #251 exists to avoid.
+   */
+  statusText: boolean;
+  /**
    * Did the source carry a `headers` key at all?
    *
    * Not the same question as "are there any headers". `IsResponseOut` has no
@@ -139,6 +154,17 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Is this exactly the spelling the engine itself emits for a status code?
+ *
+ * `u16::to_string()` produces digits with no sign, no padding and no leading zero, so
+ * `String(Number(raw)) === raw` is precisely the set of strings a real response can carry. Anything
+ * else is hand-written, and the model has no way to hold it without rewriting it.
+ */
+function isCanonicalStatusText(raw: string): boolean {
+  return /^\d+$/.test(raw) && String(Number(raw)) === raw;
+}
+
 /** A header value the engine accepts on the wire: a string, or a scalar it coerces to one. */
 function isHeaderScalar(value: unknown): boolean {
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
@@ -178,6 +204,9 @@ export function blankResponse(): ResponseModel {
   return {
     wrapped: true,
     statusCode: DEFAULT_STATUS_CODE,
+    // A brand-new stub keeps the numeric spelling, matching `NEW_STUB_TEXT`. The engine will echo
+    // it back as a string on the next read; that is its serialization, not a rewrite by this form.
+    statusText: false,
     headersPresent: false,
     headers: [],
     body: { kind: "absent" },
@@ -237,7 +266,26 @@ function renderIsBody(response: ResponseModel): Record<string, unknown> {
   const rendered: Record<string, unknown> = {};
   // Key order matches the engine's own examples. It matters only in that it must be deterministic:
   // the round-trip property compares this function's output against itself.
-  if (response.statusCode !== null) rendered.statusCode = response.statusCode;
+  if (response.statusCode !== null) {
+    /*
+     * Re-emitted in the spelling it arrived in — see `statusText` on `ResponseModel` — but only
+     * when the number can still BE that spelling.
+     *
+     * `parseIsBody` accepts a string only if it is canonical, so an unguarded `String(n)` here
+     * would let render emit something parse then refuses: type `200.5` into a stub read from the
+     * engine and the document becomes `"200.5"`, which projects to raw-only. The form would eject
+     * mid-edit, on precisely the stubs #257 exists to make editable — and the identical keystroke
+     * on a number-spelled stub stays in the form, which is an incoherence an operator cannot see.
+     *
+     * Reusing the same predicate makes the two directions agree by construction rather than by
+     * two rules that have to be kept in step. A value that cannot be spelled as a canonical string
+     * falls back to the number spelling, which the engine accepts just as happily.
+     */
+    rendered.statusCode =
+      response.statusText && isCanonicalStatusText(String(response.statusCode))
+        ? String(response.statusCode)
+        : response.statusCode;
+  }
   // `headersPresent` keeps an empty `"headers": {}` — which the engine emits on every header-less
   // response — instead of deleting the key on the way through the form. See the type's comment.
   if (response.headersPresent || response.headers.length > 0) {
@@ -277,7 +325,10 @@ export function renderResponses(items: ResponseModel[]): unknown[] {
 type ParseResult<T> = { ok: true; value: T } | { ok: false; issues: string[] };
 
 /** The parts of a response that live inside `is` — everything `parseIsBody` is responsible for. */
-type IsBodyFields = Pick<ResponseModel, "statusCode" | "headersPresent" | "headers" | "body">;
+type IsBodyFields = Pick<
+  ResponseModel,
+  "statusCode" | "statusText" | "headersPresent" | "headers" | "body"
+>;
 
 /**
  * Read a response's `headers` object into rows, appending to `headers` and returning the paths of
@@ -349,12 +400,25 @@ function parseIsBody(value: Record<string, unknown>, path: string): ParseResult<
   }
 
   let statusCode: number | null = null;
+  let statusText = false;
   if ("statusCode" in value) {
     const raw = value.statusCode;
-    // A string status code is a real shape the engine coerces, but coercing it here would rewrite
-    // the operator's document through the form. Named instead — `projection.ts` did the same.
-    if (typeof raw !== "number") issues.push(`${path}.statusCode`);
-    else statusCode = raw;
+    if (typeof raw === "number") {
+      statusCode = raw;
+    } else if (typeof raw === "string" && isCanonicalStatusText(raw)) {
+      statusCode = Number(raw);
+      statusText = true;
+    } else {
+      /*
+       * Everything else is still named rather than coerced. A NON-canonical numeric string —
+       * `"0200"`, `"+200"` — is the interesting case: it is legal input to the engine, but the
+       * model holds a number, so re-emitting it would silently rewrite `"0200"` to `"200"` on the
+       * first save. The engine never emits those spellings (`u16::to_string()` cannot produce one),
+       * so refusing costs a hand-written document a trip through the raw editor and costs a real
+       * one nothing.
+       */
+      issues.push(`${path}.statusCode`);
+    }
   }
 
   const headers: ResponseHeader[] = [];
@@ -370,7 +434,7 @@ function parseIsBody(value: Record<string, unknown>, path: string): ParseResult<
   }
 
   if (issues.length > 0) return { ok: false, issues };
-  return { ok: true, value: { statusCode, headersPresent, headers, body } };
+  return { ok: true, value: { statusCode, statusText, headersPresent, headers, body } };
 }
 
 /**
