@@ -136,3 +136,29 @@ describe("the modelled set is data, not code", () => {
     }
   });
 });
+
+describe("#257 — the metadata the server adds on read", () => {
+  it("opens a stub carrying `_links`, which every stub read from the API has", () => {
+    /*
+     * `StubWithLinks` flattens the stub and appends `_links`, so this is what a real
+     * `GET /imposters/{port}` returns for every stub. Naming it unmodelled was a second,
+     * independent reason the editor opened raw-only for everything — fixing the string
+     * `statusCode` alone left the symptom unchanged, which the new e2e caught.
+     */
+    const projected = project({
+      id: "s-1",
+      predicates: [{ equals: { method: "GET", path: "/orders/42" } }],
+      responses: [{ is: { statusCode: "200" } }],
+      _links: { self: { href: "http://node-1:2525/imposters/4545/stubs/0" } },
+    });
+    expect(projected.kind).toBe("form");
+    if (projected.kind !== "form") return;
+    expect(projected.form).toEqual({ id: "s-1" });
+  });
+
+  it("does not write `_links` back — the server owns it and regenerates it", () => {
+    // Dropping it is not the silent rewrite the module forbids: it is not part of the document the
+    // operator authored, and a PUT carrying one would assert a self-link the console does not own.
+    expect(render({ id: "s-1" })).toEqual({ id: "s-1" });
+  });
+});

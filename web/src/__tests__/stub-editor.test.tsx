@@ -423,6 +423,44 @@ describe("#257 — a stub as the API actually returns it", () => {
     expect((screen.getByLabelText("Status code for response 1") as HTMLInputElement).value).toBe("200");
   });
 
+  it("opens a stub in the EXACT shape `GET /imposters/:port` returns it", async () => {
+    /*
+     * The whole point of #257, asserted against the real wire shape rather than a fixture the
+     * console authored. Two independent things had to be fixed for this to pass, and each alone
+     * left the symptom untouched:
+     *   - `statusCode` arrives as a STRING (`serialize_status_code_as_string`);
+     *   - every stub carries `_links`, because `StubWithLinks` flattens the stub and appends it.
+     * Both were named unmodelled, so every existing stub opened raw-only.
+     */
+    stubFleet({
+      read: () => ({
+        json: imposter([
+          {
+            id: "get-order",
+            predicates: [{ equals: { method: "GET", path: "/orders/42" } }],
+            responses: [
+              {
+                is: {
+                  statusCode: "200",
+                  headers: { "Content-Type": "application/json" },
+                  body: '{"id":42}',
+                },
+              },
+            ],
+            _links: { self: { href: "http://node-1:2525/imposters/4545/stubs/0" } },
+          },
+        ]),
+        revision: "default:4545@7",
+      }),
+    });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+    await openEditor("get-order");
+
+    expect(screen.queryByTestId("stub-raw-banner")).toBeNull();
+    expect(screen.getByTestId("response-builder")).toBeTruthy();
+    expect(screen.getByTestId("stub-summary")).toBeTruthy();
+  });
+
   it("stays in the form when a status is typed that no canonical string can express", async () => {
     /*
      * The regression the first cut of #257 introduced. `parseIsBody` accepts a string status only
