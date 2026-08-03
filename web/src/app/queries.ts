@@ -452,6 +452,59 @@ export function useCreateImposter(): UseMutationResult<CommitOutcome, Error, Imp
 }
 
 /**
+ * Add one imposter carried in from an import document, or a clone (#251).
+ *
+ * Deliberately not `useCreateImposter`: that hook's body is typed `Imposter`, the schema-shaped
+ * form `NewImposter` builds field by field. An import entry (and a clone's rewritten document) is
+ * `parseImportDocument`/`cloneImposter`'s output — an already-assembled `Record<string, unknown>`
+ * lifted out of the operator's own document — and casting it to `Imposter` to reuse the other hook
+ * would just be the unsafety of `as` wearing a different hat. Same wire call, same settle
+ * discipline, a body type that matches what actually gets sent.
+ */
+export function useImportAddImposter(): UseMutationResult<
+  CommitOutcome,
+  Error,
+  Record<string, unknown>
+> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (imposter) => {
+      const sent = await apiSend("POST", API_PATHS.imposters, imposter, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["imposters"] }),
+  });
+}
+
+/**
+ * Replace the tenant's whole imposter set with an imported document (#251, "Replace all").
+ *
+ * The caller gates this on `imposter.delete` as well as `imposter.write` and routes it through the
+ * destructive `Confirm` modal — every imposter this fleet currently serves that the document does
+ * not name is gone once this lands, and neither of those facts is visible from this hook.
+ */
+export function useReplaceImposters(): UseMutationResult<
+  CommitOutcome,
+  Error,
+  { imposters: Record<string, unknown>[] }
+> {
+  const { tenant } = useSession();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body) => {
+      const sent = await apiSend("PUT", API_PATHS.imposters, body, { tenant });
+      const outcome = await settle(sent, { tenant });
+      if (outcome.kind === "failed") throw new Error(outcome.detail);
+      return outcome;
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ["imposters"] }),
+  });
+}
+
+/**
  * Delete an imposter, and everything hanging off it.
  *
  * Authorized by `Action::ImposterDelete`, which is why the screen gates on `imposter.delete` rather

@@ -183,6 +183,35 @@ async function request(
 }
 
 /**
+ * Read a path and return the server's response text **verbatim**, unparsed.
+ *
+ * Exists for export (#251). Every other read goes through `apiGet`, which parses — and for an
+ * export that parse is exactly the problem: `JSON.parse` followed by `JSON.stringify` reorders
+ * nothing but re-indents everything and drops the server's own formatting, so a mock exported
+ * twice from two console versions diffs against itself in a repository. What a developer commits
+ * beside their tests should be the bytes the fleet actually returned.
+ *
+ * Errors are raised exactly as `request` raises them, so a 403 or a 404 still surfaces normally.
+ */
+export async function apiGetText(
+  path: ApiPath | (string & {}),
+  options?: RequestOptions,
+): Promise<string> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  const tenant = options?.tenant;
+  if (tenant !== undefined && tenant !== null && tenant !== "") headers[TENANT_HEADER] = tenant;
+
+  const response = await fetch(path, {
+    method: "GET",
+    headers,
+    credentials: "same-origin",
+  });
+  const text = await response.text();
+  if (!response.ok) throw new ApiError(response.status, text);
+  return text;
+}
+
+/**
  * `T` is an **assertion**, not a validation — nothing here checks the body against the schema.
  *
  * It defaults to `unknown` so an un-annotated call still forces the caller to narrow. Naming the
