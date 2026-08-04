@@ -1,0 +1,34 @@
+# RFC-004 §8 threat item 1: a pathological recursive schema must compile depth-capped rather than
+# OOM the compiler. `Node` refers to itself both directly and through an array.
+openapi: 3.0.3
+info:
+  title: Deeply Recursive
+  version: 1.0.0
+paths:
+  /tree:
+    get:
+      operationId: getTree
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+components:
+  schemas:
+    Node:
+      type: object
+      required:
+        - id
+        - child
+      properties:
+        id:
+          type: string
+        child:
+          $ref: '#/components/schemas/Node'
+        children:
+          type: array
+          minItems: 2
+          items:
+            $ref: '#/components/schemas/Node'

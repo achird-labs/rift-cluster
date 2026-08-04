@@ -1,0 +1,152 @@
+# Template-heavy fixture: exercises path-template compilation, ordering, regex escaping,
+# predicate emission for required-vs-optional parameters, and every response-synthesis branch.
+openapi: 3.0.1
+info:
+  title: Template Corners
+  version: 2.3.1
+paths:
+  # Ordering: this literal path must precede /users/{id} in the compiled stub list.
+  /users/me:
+    get:
+      operationId: getSelf
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+              example:
+                id: 'self'
+                name: 'Ada'
+                role: 'admin'
+  /users/{id}:
+    get:
+      operationId: getUser
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: expand
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: fields
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Trace
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '404':
+          description: absent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        default:
+          description: fallback
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    delete:
+      operationId: deleteUser
+      responses:
+        '204':
+          description: gone
+  /users/{id}/posts/{postId}:
+    get:
+      operationId: getPost
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Post'
+  # RFC-004 §8 threat item 2: regex metacharacters in a LITERAL segment must be escaped, so this
+  # compiles to ^/a\(b/[^/]+$ and not a broken or widened pattern.
+  '/a(b/{id}':
+    get:
+      operationId: metacharLiteral
+      responses:
+        '200':
+          description: ok
+          content:
+            text/plain:
+              schema:
+                type: string
+  # additionalProperties must render nothing; the object has no declared properties.
+  /bag:
+    get:
+      operationId: getBag
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: string
+components:
+  schemas:
+    User:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        role:
+          type: string
+          enum: [admin, member, guest]
+        tags:
+          type: array
+          minItems: 3
+          items:
+            type: string
+        active:
+          type: boolean
+        score:
+          type: number
+    Post:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+        author:
+          $ref: '#/components/schemas/User'
+    Problem:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: integer
+        detail:
+          type: string
