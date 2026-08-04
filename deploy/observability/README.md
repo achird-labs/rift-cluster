@@ -137,3 +137,21 @@ it additionally layers in this overlay and asserts Prometheus reports 3/3
 scrape targets up and Grafana serves all three dashboards by UID. The
 default `verify.sh` run (no env var) is unaffected and stays
 dependency-free.
+
+## What CI checks, and when
+
+Two lanes, split by cost (issue #316 — before it, only the static lane
+existed and the runtime assertions above ran nowhere):
+
+| lane | job | runs | asserts |
+|---|---|---|---|
+| static | `observability` | **every PR** | `promtool check config/rules`, `promtool test rules`, every referenced `rift_*` family is registered, every dashboard parses, every panel's `datasource.uid` matches provisioning, the overlay merges |
+| runtime | `observability-runtime` | only when this pack, the overlay, `verify.sh` or the gate scripts change | `RIFT_OBSERVABILITY=1 verify.sh` — Prometheus scrapes 3/3, Grafana serves the dashboards |
+
+The runtime lane is path-gated through `scripts/cluster-smoke-paths.sh
+--job observability`, whose case table is the specification of when it runs;
+`--self-test` pins it and runs before the gate is trusted.
+
+Neither lane is a **required** status check. That is deliberate: a Grafana
+provisioning typo should be loud, but it should not block an unrelated PR
+from merging. The required set stays `build`, `public-api`, `cluster-smoke`.

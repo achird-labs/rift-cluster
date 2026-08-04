@@ -742,6 +742,13 @@ jobs:
           set -euo pipefail
           bash scripts/check-observability-families.sh
 
+      # The gate's own failure branches, exercised against fixture trees. Issue
+      # #316 is about a check that never ran; a check whose detectors are never
+      # exercised is the same thing one layer down, since the real pack is
+      # well-formed and can only ever take the happy path.
+      - name: Verify the families gate still detects what it claims to
+        run: bash scripts/check-observability-families.sh --self-test
+
       # The overlay has to merge with the base compose and its mount paths have to resolve, which
       # `config` proves without starting anything.
       - name: The observability overlay composes
@@ -750,3 +757,78 @@ jobs:
           docker compose -f deploy/compose/docker-compose.yml \
                          -f deploy/compose/observability.overlay.yml config -q
           echo "PASS: overlay merges and its mounts resolve"
+
+  # The overlay's RUNTIME assertions (issue #316).
+  #
+  # Everything in the `observability` job above is static: promtool checks the
+  # rules, the families gate checks the names, `config -q` checks the merge.
+  # None of that can tell you whether Prometheus actually *scrapes* the fleet or
+  # whether Grafana actually *serves* the dashboards it provisions. Those
+  # assertions already existed — in `deploy/compose/verify.sh`, behind
+  # `RIFT_OBSERVABILITY=1` — and no workflow ever invoked it, so they had never
+  # run anywhere. This job is only an invoker; the assertions stay in the script
+  # a developer can run locally, so CI and local cannot drift into checking
+  # different things.
+  #
+  # Its own job rather than folded into `cluster-smoke`, deliberately:
+  # `cluster-smoke` is a REQUIRED check, and a Grafana provisioning typo must
+  # not be able to redden a required check on an unrelated PR. This job is NOT
+  # in the required set — it is meant to be loud and cheap to consult, not a
+  # merge gate. Keeping it separate also keeps its ~stack-bring-up cost off
+  # every PR that touches a cluster source file.
+  observability-runtime:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # The path filter diffs against the base commit, which a shallow clone
+          # does not have. Without this the diff errors, the filter reads as
+          # "nothing changed", and the job goes green having run nothing.
+          fetch-depth: 0
+
+      # Same reasoning as `cluster-smoke`'s copy: this job's greenness depends on
+      # the filter, so it verifies the filter itself rather than trusting another
+      # job to have done it.
+      - name: Verify the path filter before trusting it
+        run: scripts/cluster-smoke-paths.sh --self-test
+
+      - name: Which paths changed
+        id: changed
+        run: |
+          set -euo pipefail
+          base='${{ github.event.pull_request.base.sha }}'
+          changed="$(git -c core.quotePath=false diff --no-renames --name-only "$base"...HEAD)"
+          echo "$changed"
+          printf '%s\n' "$changed" \
+            | scripts/cluster-smoke-paths.sh --job observability | tee -a "$GITHUB_OUTPUT"
+
+      # The full list, not just the one port this stack publishes inside the
+      # ephemeral range (39090). `ci_reserves_every_published_port_that_linux_
+      # could_hand_out` asserts that EVERY reservation in the file covers every
+      # vulnerable published port — deliberately, so a partial list cannot drift
+      # unwatched. Reserving ports this stack does not publish costs nothing.
+      - name: Reserve the stack's published ports from the ephemeral range
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901"
+
+      # `verify.sh` self-locates (`cd "$(dirname "$0")"`), so it runs from the
+      # repo root. `RIFT_OBSERVABILITY=1` is what turns on the overlay half —
+      # without it the script is the plain 3-node compose smoke and asserts
+      # nothing about Prometheus or Grafana.
+      - name: Prometheus scrapes 3/3 and Grafana serves the dashboards
+        if: steps.changed.outputs.run == 'true'
+        env:
+          RIFT_OBSERVABILITY: "1"
+        run: deploy/compose/verify.sh
+
+      # No log-dump step here, deliberately. `verify.sh` installs
+      # `trap cleanup EXIT`, which runs `compose down -v` on every exit path
+      # including its own `exit 1` branches — so by the time a step here could
+      # ask for logs, the containers are gone and it would print nothing while
+      # looking like diagnostics exist. The dumps live inside the script's FAIL
+      # branches instead, where they run before the trap fires.
