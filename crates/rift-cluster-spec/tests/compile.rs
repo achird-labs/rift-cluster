@@ -369,9 +369,12 @@ fn a_recursive_schema_compiles_bounded_with_null_at_the_floor() {
 /// One stub per declared status, with the unconditional one **last**.
 ///
 /// Mountebank is first-match-wins, and the unconditional stub's predicates are a strict subset of
-/// every other stub's for this operation — so emitting it first makes every discriminated stub
-/// unreachable, and for a spec that declares a `default` it makes the mock answer the *error* body
-/// on the happy path.
+/// every other stub's for this operation — so emitting it first would make every discriminated
+/// stub unreachable.
+///
+/// The expected list changed with issue #314: the unconditional answer is now the first declared
+/// **2xx** (`200`) rather than `default`, so `200` is the one that sorts last and `default` joins
+/// the discriminated stubs in document order.
 #[test]
 fn one_stub_per_declared_status_with_the_unconditional_one_last() {
     let c = compile(TEMPLATES, &opts()).expect("compiles");
@@ -384,9 +387,9 @@ fn one_stub_per_declared_status_with_the_unconditional_one_last() {
     assert_eq!(
         get_user,
         vec![
-            "spec:getUser:200",
             "spec:getUser:404",
-            "spec:getUser:default"
+            "spec:getUser:default",
+            "spec:getUser:200"
         ],
     );
 }
@@ -400,7 +403,9 @@ fn every_declared_status_is_reachable_by_its_discriminator_header() {
     let required = [("X-Tenant", "t")];
     let query = [("fields", "a")];
 
-    for status in ["200", "404"] {
+    // `default` joins the discriminated statuses (issue #314): it names no status of its own, so
+    // it is no longer privileged as the unconditional answer, but it must stay reachable.
+    for status in ["200", "404", "default"] {
         let headers = [("X-Tenant", "t"), ("X-Rift-Spec-Status", status)];
         let selected = first_match(&c.imposter, "GET", "/users/abc", &headers, &query);
         assert_eq!(
@@ -411,11 +416,18 @@ fn every_declared_status_is_reachable_by_its_discriminator_header() {
     }
 
     // With no discriminator, the catch-all answers — and it must be the one that is last.
+    //
+    // This assertion is deliberately inverted by issue #314. It previously required
+    // `spec:getUser:default`, which *was* the defect: `default` declares no status, so it compiled
+    // to `statusCode: 200` carrying the error body, and a bare request got a success status
+    // wrapping an error. The unconditional answer is now the first declared 2xx.
     let selected = first_match(&c.imposter, "GET", "/users/abc", &required, &query);
-    assert_eq!(selected.as_deref(), Some("spec:getUser:default"));
+    assert_eq!(selected.as_deref(), Some("spec:getUser:200"));
 }
 
-/// A spec whose `default` is an error response must not serve that error on the happy path.
+/// The declared success is reachable by its discriminator even when the spec also declares a
+/// `default` error. That a bare request *gets* the success is the separate, stronger claim of
+/// `a_bare_request_gets_the_declared_success_not_the_default_error`.
 #[test]
 fn a_declared_success_is_reachable_even_when_the_spec_has_a_default_error() {
     let c = compile(PETSTORE, &opts()).expect("compiles");
@@ -483,24 +495,36 @@ fn first_match(
         .and_then(|stub| stub["id"].as_str().map(str::to_string))
 }
 
-/// The default stub answers unconditionally; every other status is opt-in via the discriminator, so
-/// a test can reach a declared error without editing the imposter.
+/// Every status but the unconditional one is opt-in via the discriminator, so a test can reach any
+/// declared response without editing the imposter.
+///
+/// Renamed and inverted by issue #314. `default` used to be the unconditional stub and therefore
+/// carried no discriminator; it is now gated like any other declared response, and the first
+/// declared 2xx is what answers a bare request.
 #[test]
-fn non_default_statuses_are_gated_by_the_status_discriminator_header() {
+fn every_status_but_the_unconditional_one_is_gated_by_the_discriminator_header() {
     let c = compile(TEMPLATES, &opts()).expect("compiles");
 
-    assert!(has_predicate(
-        &c.imposter,
-        "spec:getUser:404",
-        &serde_json::json!({ "equals": { "headers": { "X-Rift-Spec-Status": "404" } } }),
-    ));
+    for status in ["404", "default"] {
+        let id = format!("spec:getUser:{status}");
+        assert!(
+            has_predicate(
+                &c.imposter,
+                &id,
+                &serde_json::json!({ "equals": { "headers": { "X-Rift-Spec-Status": status } } }),
+            ),
+            "{status} must be opt-in; predicates were {:#?}",
+            predicates(&c.imposter, &id),
+        );
+    }
+
     assert!(
-        !predicates(&c.imposter, "spec:getUser:default")
+        !predicates(&c.imposter, "spec:getUser:200")
             .iter()
             .any(|p| serde_json::to_string(p)
                 .unwrap_or_default()
                 .contains("X-Rift-Spec-Status")),
-        "the default stub must answer unconditionally",
+        "the first declared 2xx must answer unconditionally",
     );
 }
 
@@ -918,8 +942,15 @@ fn a_spec_with_no_paths_compiles_to_an_imposter_with_no_stubs() {
     assert!(c.operations.is_empty());
 }
 
-/// Response order is the spec's, not the alphabet's: the first declared response is the one that
-/// answers unconditionally, so parsing through a key-sorted map would change which status that is.
+/// Response order is the spec's, not the alphabet's: the discriminated stubs are emitted in
+/// document order, so parsing through a key-sorted map would reorder them.
+///
+/// The fixture declares **two** non-2xx statuses in non-alphabetical order on purpose. Issue #314
+/// made the unconditional answer the first declared 2xx rather than the first declared response,
+/// which cost the original two-response fixture (`'404'` then `'200'`) its power to detect
+/// alphabetisation: under the new rule `200` is the unconditional either way, so document and
+/// alphabetical parses emit an identical list. `'500'` before `'404'` restores the signal —
+/// alphabetically `404` sorts first, so a key-sorted parse would swap them.
 #[test]
 fn response_order_follows_the_document_not_the_alphabet() {
     let spec = br#"
@@ -930,13 +961,152 @@ paths:
     get:
       operationId: u
       responses:
-        '404': { description: declared first }
-        '200': { description: declared second }
+        '500': { description: declared first }
+        '404': { description: declared second }
+        '200': { description: the success }
 "#;
     let c = compile(spec, &opts()).expect("compiles");
     assert_eq!(
         stub_ids(&c.imposter),
-        vec!["spec:u:200", "spec:u:404"],
-        "404 is declared first, so it is the unconditional stub and sorts last",
+        vec!["spec:u:500", "spec:u:404", "spec:u:200"],
+        "500 is declared before 404, and the 2xx answers unconditionally so it sorts last",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #314: which response answers unconditionally.
+//
+// RFC-004 §3.2 originally said "default response first", and the compiler
+// implemented it faithfully. But `default` names no HTTP status, so
+// `StatusKey::http_status` serves it as 200 — meaning a spec whose `default` is
+// an error compiled to a mock that answered a bare request with **200 carrying
+// an error body**. A success status wrapping an error is the shape client code
+// fails to notice, which is why this is a defect and not merely surprising UX.
+// ---------------------------------------------------------------------------
+
+/// The headline fix: a bare request gets the declared success, not the default
+/// error. Asserted on the response *body and status* rather than only the stub
+/// id, because the defect was precisely that the id said `default` while the
+/// status said 200 — an id-only assertion would not have shown the harm.
+#[test]
+fn a_bare_request_gets_the_declared_success_not_the_default_error() {
+    let c = compile(PETSTORE, &opts()).expect("compiles");
+    let required = [("X-Request-Id", "r")];
+
+    let selected = first_match(&c.imposter, "GET", "/pets", &required, &[]);
+    assert_eq!(
+        selected.as_deref(),
+        Some("spec:listPets:200"),
+        "a request carrying no discriminator must get the declared 2xx"
+    );
+
+    let answer = &stub_by_id(&c.imposter, "spec:listPets:200")["responses"][0]["is"];
+    assert_eq!(answer["statusCode"], 200);
+    assert!(
+        answer["body"].is_array(),
+        "the unconditional answer must be the pet array, not the error object: {}",
+        answer["body"]
+    );
+}
+
+/// `default` stays reachable — it is discriminated now, not dropped.
+#[test]
+fn the_default_response_is_reachable_by_its_own_discriminator() {
+    let c = compile(PETSTORE, &opts()).expect("compiles");
+    let headers = [("X-Request-Id", "r"), ("X-Rift-Spec-Status", "default")];
+
+    let selected = first_match(&c.imposter, "GET", "/pets", &headers, &[]);
+    assert_eq!(selected.as_deref(), Some("spec:listPets:default"));
+}
+
+/// "First declared 2xx" means exactly that — not "200". `createPets` declares
+/// only `201` alongside its `default`, so the 201 is the unconditional answer.
+#[test]
+fn the_unconditional_answer_is_the_first_2xx_even_when_it_is_not_200() {
+    let c = compile(PETSTORE, &opts()).expect("compiles");
+
+    let selected = first_match(&c.imposter, "POST", "/pets", &[], &[]);
+    assert_eq!(selected.as_deref(), Some("spec:createPets:201"));
+    assert_eq!(
+        stub_by_id(&c.imposter, "spec:createPets:201")["responses"][0]["is"]["statusCode"],
+        201
+    );
+}
+
+/// No 2xx anywhere: the first *declared* status answers. A declared 404 with its
+/// own body is more honest than compiling `default` to a fabricated 200, which is
+/// why the fallback is spec order rather than `default`.
+#[test]
+fn an_operation_with_no_2xx_falls_back_to_its_first_declared_status() {
+    let spec = br#"
+openapi: 3.0.3
+info: { title: t, version: '1' }
+paths:
+  /x:
+    get:
+      operationId: errorsOnly
+      responses:
+        '404': { description: declared first }
+        '500': { description: declared second }
+"#;
+    let c = compile(spec, &opts()).expect("compiles");
+
+    let selected = first_match(&c.imposter, "GET", "/x", &[], &[]);
+    assert_eq!(selected.as_deref(), Some("spec:errorsOnly:404"));
+    assert_eq!(
+        stub_by_id(&c.imposter, "spec:errorsOnly:404")["responses"][0]["is"]["statusCode"],
+        404
+    );
+}
+
+/// A `default`-only operation still answers unconditionally — now by falling
+/// through the preference rule rather than by being special-cased.
+#[test]
+fn a_default_only_operation_still_answers_unconditionally() {
+    let spec = br#"
+openapi: 3.0.3
+info: { title: t, version: '1' }
+paths:
+  /x:
+    get:
+      operationId: defaultOnly
+      responses:
+        default: { description: the only response }
+"#;
+    let c = compile(spec, &opts()).expect("compiles");
+
+    let selected = first_match(&c.imposter, "GET", "/x", &[], &[]);
+    assert_eq!(selected.as_deref(), Some("spec:defaultOnly:default"));
+}
+
+/// A `2XX` range counts as a success for the preference rule — the RFC now
+/// states this, so it is pinned rather than left to `is_success`'s reading of
+/// `openapiv3`'s leading-digit representation.
+#[test]
+fn a_2xx_range_counts_as_the_declared_success() {
+    let spec = br#"
+openapi: 3.0.3
+info: { title: t, version: '1' }
+paths:
+  /x:
+    get:
+      operationId: ranged
+      responses:
+        '404': { description: declared first }
+        '2XX': { description: a range, not a code }
+"#;
+    let c = compile(spec, &opts()).expect("compiles");
+
+    let selected = first_match(&c.imposter, "GET", "/x", &[], &[]);
+    assert_eq!(selected.as_deref(), Some("spec:ranged:2XX"));
+}
+
+/// Determinism is a shipped guarantee (§3.5, re-compiles must be diffable), and
+/// the reordering this issue introduces is the obvious place to break it.
+#[test]
+fn reordering_the_unconditional_response_stays_deterministic() {
+    let first = compile(PETSTORE, &opts()).expect("compiles");
+    let second = compile(PETSTORE, &opts()).expect("compiles");
+    assert_eq!(stub_ids(&first.imposter), stub_ids(&second.imposter));
+    assert_eq!(first.imposter, second.imposter);
 }
