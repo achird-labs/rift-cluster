@@ -1620,7 +1620,10 @@ fn split_scheme(uri: &str) -> (&str, &str) {
 ///
 /// A scheme this build knows nothing about is not an error here. Embedders
 /// register their own providers, so an unknown scheme is the node-local check
-/// the admin handler already makes before submitting.
+/// the admin handler already makes before submitting. A *known* scheme spelled
+/// in anything but its canonical lowercase form, however, is refused: the
+/// provider registry matches the lowercase spelling only, so such an op could
+/// never be pulled (#308).
 ///
 /// **No message here echoes the URI.** [`require_credential_free_uri`] runs
 /// first and guarantees the *authority* holds no credential, but it
@@ -1636,6 +1639,23 @@ fn require_well_formed_uri(uri: &str) -> Result<(), String> {
     // *disagree* about (#301).
     let (scheme, rest) = split_scheme(uri);
     let has_authority = rest.starts_with("//");
+
+    // RFC 3986 §3.1: schemes are case-insensitive on the wire, but the
+    // provider registry and `parse_git_uri` match the canonical lowercase
+    // form only. A non-lowercase spelling of a known scheme would skip the
+    // shape checks below and then fail provider lookup on every pull, so it
+    // is refused at admission rather than normalized — normalizing here and
+    // nowhere else is the two-parsers-disagree bug (#301) again. The message
+    // names only the canonical lowercase literal, never the input, keeping
+    // the no-echo rule above trivially intact.
+    if scheme.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lower = scheme.to_ascii_lowercase();
+        if matches!(lower.as_str(), "git+https" | "git+file" | "s3" | "registry") {
+            return Err(format!(
+                "source uri scheme must be lowercase: write `{lower}://…`"
+            ));
+        }
+    }
 
     match scheme {
         "git+https" | "git+file" => {
@@ -2855,8 +2875,38 @@ mod tests {
             "git+https://github.com/org/repo#main:imposters.json",
             "git+https://github.com/org/repo#v1.2.3:mocks/",
             "git+file:///srv/repos/mocks.git#main:imposters.json",
+            // uppercase outside the scheme is untouched by the #308 refusal
+            "git+https://Host/Org/Repo#Main:Path.json",
         ] {
             assert_eq!(validate(&source_put("mocks", uri)), Ok(()), "uri {uri}");
+        }
+    }
+
+    /// RFC 3986 §3.1 makes schemes case-insensitive, but the provider
+    /// registry (and upstream `SourceRef::scheme`) match the lowercase
+    /// spelling only. A non-lowercase spelling of a known scheme therefore
+    /// must be refused at admission — otherwise it skips every per-scheme
+    /// shape check above, commits, and then fails provider lookup on every
+    /// pull. The refusal names only the canonical lowercase scheme, never
+    /// the URI (issue #308). It runs before the per-scheme arms, so a URI
+    /// that is both mixed-case and mis-spelled (single-colon `Git+File:`)
+    /// gets the case refusal first — fixing the case then teaches the
+    /// spelling (#301).
+    #[test]
+    fn validate_refuses_a_non_lowercase_known_scheme() {
+        for uri in [
+            "GIT+HTTPS://host/o/r#main:p",
+            "Git+File:/srv/r.git#main:x",
+            "S3://bucket/key",
+            "REGISTRY://svc",
+            "git+HTTPS://host/o/r#main:p",
+        ] {
+            let err = validate(&source_put("mocks", uri)).expect_err("must be refused");
+            assert!(
+                err.contains("lowercase"),
+                "refusing {uri}: expected a lowercase-scheme refusal, got {err:?}"
+            );
+            assert!(!err.contains(uri), "the refusal echoed the uri: {err}");
         }
     }
 
@@ -3106,6 +3156,10 @@ mod tests {
             "git+https://oauth2:ghp_supersecret@github.com/o/r#main",
             // credentialed and names no key
             "s3://key-id:ghp_supersecret@bucket-only",
+            // credentialed and its scheme is not the canonical lowercase —
+            // hygiene runs first and parses the scheme case-insensitively,
+            // so the lowercase-scheme refusal (#308) never sees the secret
+            "GIT+HTTPS://oauth2:ghp_supersecret@github.com/o/r",
         ] {
             let err = validate(&source_put("mocks", uri)).expect_err("must be refused");
             assert!(
@@ -3115,6 +3169,13 @@ mod tests {
             assert!(
                 !err.contains(uri),
                 "the refusal echoed the credential-bearing uri: {err}"
+            );
+            // Pin *which* check fired, not just that nothing leaked: every
+            // shape refusal is also echo-free, so without this a reordering
+            // of the two checks would pass silently.
+            assert!(
+                err.contains("auth_ref"),
+                "expected the hygiene refusal, got a shape refusal: {err}"
             );
         }
     }
@@ -3146,6 +3207,11 @@ mod tests {
             "custom://host/thing",
             "scripted:whatever",
             "file:/tmp/x.json",
+            // the lowercase-scheme refusal (#308) applies to known schemes
+            // only — an unknown scheme stays permissive in any case, and in
+            // both the `://` and bare `scheme:` spellings
+            "MyScheme://host/x",
+            "MyScheme:/x",
         ] {
             assert_eq!(validate(&source_put("mocks", uri)), Ok(()), "uri {uri}");
         }
