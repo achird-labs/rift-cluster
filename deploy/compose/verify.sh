@@ -89,6 +89,55 @@ if [ "$leaders" -ne 1 ]; then
 fi
 echo "PASS: exactly 1 leader"
 
+# The observability overlay (#227) is not part of the default compose smoke:
+# it pulls two extra images and the default smoke has to stay dependency-free.
+# Gated on RIFT_OBSERVABILITY=1 so nothing below runs, and nothing above
+# changes, on a plain `deploy/compose/verify.sh`.
+if [ "${RIFT_OBSERVABILITY:-0}" = "1" ]; then
+  echo "--- RIFT_OBSERVABILITY=1: bringing up the observability overlay ---"
+  OBS_COMPOSE=(docker compose -f docker-compose.yml -f observability.overlay.yml)
+  # rift-1/2/3 are already up from the `up -d --build` above; this layers in
+  # only prometheus and grafana. `down -v --remove-orphans` in the cleanup
+  # trap still tears both of them down even though it only knows about
+  # docker-compose.yml -- that is exactly what --remove-orphans is for.
+  "${OBS_COMPOSE[@]}" up -d prometheus grafana
+
+  # Fixed dev-only credential, matching observability.overlay.yml's
+  # GF_SECURITY_ADMIN_PASSWORD. Not production guidance -- see that file.
+  GRAFANA_AUTH="admin:rift-observability-dev-only"
+
+  echo "--- asserting Prometheus scrapes 3/3 targets ---"
+  up_targets=0
+  for _ in $(seq 1 30); do
+    up_targets="$(curl -fsS --max-time 5 "http://127.0.0.1:19091/api/v1/targets" 2>/dev/null \
+      | grep -o '"health":"up"' | wc -l | tr -d ' ')"
+    [ "${up_targets:-0}" -eq 3 ] && break
+    sleep 2
+  done
+  if [ "${up_targets:-0}" -ne 3 ]; then
+    echo "FAIL: expected 3 up targets, got '${up_targets:-0}'"
+    curl -fsS --max-time 5 "http://127.0.0.1:19091/api/v1/targets" || true
+    exit 1
+  fi
+  echo "PASS: Prometheus reports 3/3 targets up"
+
+  echo "--- asserting Grafana serves the three dashboards ---"
+  for uid in rift-fleet-overview rift-latency-analytics rift-verification-plane; do
+    status=0
+    for _ in $(seq 1 30); do
+      status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+        -u "$GRAFANA_AUTH" "http://127.0.0.1:13000/api/dashboards/uid/${uid}" || echo 000)"
+      [ "$status" = "200" ] && break
+      sleep 2
+    done
+    if [ "$status" != "200" ]; then
+      echo "FAIL: dashboard uid '${uid}' answered ${status}, expected 200"
+      exit 1
+    fi
+  done
+  echo "PASS: Grafana serves 3/3 dashboards"
+fi
+
 # An imposter created on one node is the config-sync deliverable and does NOT
 # replicate yet (that lands with the config-sync work), so this only asserts
 # the admin API is live on every node — not that the imposter appears on all.

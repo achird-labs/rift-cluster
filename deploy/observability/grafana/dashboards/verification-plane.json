@@ -1,0 +1,254 @@
+{
+  "uid": "rift-verification-plane",
+  "title": "Rift Cluster / Verification Plane",
+  "tags": [
+    "rift-cluster"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Journal entries (fleet)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:journal_entries:sum",
+          "legendFormat": "entries",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Sum of rift_cluster_journal_entries{port} across the fleet."
+    },
+    {
+      "id": 2,
+      "title": "Journal eviction rate",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:journal_evictions:rate5m",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Rate of rift_cluster_journal_evictions_total, 5-minute window."
+    },
+    {
+      "id": 3,
+      "title": "Pull-on-miss checks",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rate(rift_cluster_pull_on_miss_checks_total[5m])",
+          "legendFormat": "checks/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "No recording rule exists for the pull-on-miss family yet, so this queries rift_cluster_pull_on_miss_checks_total directly. Rate of no-match requests the safety net inspected."
+    },
+    {
+      "id": 4,
+      "title": "Pull-on-miss lagging",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rate(rift_cluster_pull_on_miss_lagging_total[5m])",
+          "legendFormat": "lagging/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Raw metric (no recording rule yet). Rate of checks that found this node behind on replication."
+    },
+    {
+      "id": 5,
+      "title": "Pull-on-miss retries",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rate(rift_cluster_pull_on_miss_retries_total[5m])",
+          "legendFormat": "retries/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Raw metric (no recording rule yet). This is also the series that bounds the Latency Analytics dashboard's match-rate overcount."
+    },
+    {
+      "id": 6,
+      "title": "Journal families not yet registered",
+      "type": "text",
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### Not shown on this dashboard\n\nThe journal **partial-reads**, **merge-latency**, and **peer-pull-failure** panels are\ndeliberately absent. Their metric families \u2014\n`rift_cluster_journal_partial_reads_total`, `rift_cluster_journal_merge_seconds`, and\n`rift_cluster_journal_peer_pull_failures_total` \u2014 are not registered yet. They arrive\nwith issues #223 and #226.\n\nAn empty panel bound to a metric that does not exist would render as a silent\n\"No data\" that looks identical to a healthy-but-quiet system. That is worse than\nthis note: it invites reading \"no data\" as \"no problem.\" When #223/#226 land, add\nthe panels here and delete this note.\n"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    }
+  ],
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": []
+}

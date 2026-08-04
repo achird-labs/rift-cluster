@@ -1,0 +1,166 @@
+# Recording rules for the rift-cluster observability pack (issue #227,
+# RFC-003 SS5/SS6).
+#
+# The correctness core of this file is a single rule about *how* percentiles
+# are computed, so it gets said once, here, instead of once per rule below:
+#
+#   A percentile is ALWAYS computed by merging histogram buckets across
+#   series with `sum by (le) (...)` and then calling `histogram_quantile`
+#   ONCE on the merged buckets. It is NEVER computed by calling
+#   `histogram_quantile` per node and then averaging the three resulting
+#   numbers.
+#
+# Averaging per-node quantiles is not a rough approximation of the true
+# fleet quantile — it is a different, generally-wrong number with no defined
+# relationship to the real one, because quantiles do not commute with
+# averaging (a p99 is a nonlinear statistic; mean(f(x), f(y), f(z)) !=
+# f(mean(x,y,z)) for a nonlinear f). A slow node with few requests and a
+# fast node with many requests would each contribute one vote to the
+# average regardless of their share of fleet traffic, so the "fleet p99"
+# would silently stop meaning "the 99th percentile a request to this fleet
+# actually experiences" the moment traffic is not perfectly even across
+# nodes — which it never is. rules/tests/recording_test.yml pins exact
+# numbers for a deliberately skewed three-node scenario showing just how far
+# apart the two computations land (3500ms merged vs. ~1561.67ms averaged, on
+# identical input) — that gap is not a rounding difference, it is the
+# canonical observability lie this file exists to not tell.
+#
+# Each aggregation gets its OWN rule name: `rift:request_latency_ms:p99`
+# is fleet-wide, and the slices are `:p99:by_instance`, `:p99:by_method`,
+# `:p99:by_fault`. Prometheus would permit all four to share one name, since
+# the label sets they produce do not collide — but a shared name makes the
+# obvious query the wrong one. `rift:request_latency_ms:p99` with no filter
+# would then return the fleet series AND every per-node, per-method and
+# per-fault series at once, which renders a plausible chart that is simply
+# not the fleet p99. Distinct names make the bare selector mean exactly one
+# thing, and cost nothing but three suffixes.
+groups:
+  - name: rift-request-latency
+    rules:
+      # -- Fleet-wide: every node, every method, every fault_applied value,
+      # merged into one set of buckets before the single histogram_quantile
+      # call. This is the number "what latency does a request to this fleet
+      # see" actually means.
+      - record: rift:request_latency_ms:p50
+        expr: histogram_quantile(0.50, sum by (le) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+      - record: rift:request_latency_ms:p95
+        expr: histogram_quantile(0.95, sum by (le) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+      - record: rift:request_latency_ms:p99
+        expr: histogram_quantile(0.99, sum by (le) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+
+      # -- Per-node: buckets merged across method/fault_applied but kept
+      # separate per instance. Answers "is one node dragging the fleet
+      # number down", which the fleet-wide rule above cannot, by
+      # construction, ever show you.
+      - record: rift:request_latency_ms:p50:by_instance
+        expr: histogram_quantile(0.50, sum by (le, instance) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+      - record: rift:request_latency_ms:p95:by_instance
+        expr: histogram_quantile(0.95, sum by (le, instance) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+      - record: rift:request_latency_ms:p99:by_instance
+        expr: histogram_quantile(0.99, sum by (le, instance) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+
+      # -- Per-method: buckets merged across nodes/fault_applied but kept
+      # separate per HTTP method. A slow POST endpoint should not be able to
+      # hide inside a fleet number dominated by fast GETs.
+      - record: rift:request_latency_ms:p50:by_method
+        expr: histogram_quantile(0.50, sum by (le, method) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+      - record: rift:request_latency_ms:p95:by_method
+        expr: histogram_quantile(0.95, sum by (le, method) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+      - record: rift:request_latency_ms:p99:by_method
+        expr: histogram_quantile(0.99, sum by (le, method) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+
+      # -- Fault-applied split: isolates requests a configured fault
+      # actually delayed (`fault_applied` != "none") from clean ones, so an
+      # operator can tell "the fleet is slow" apart from "a chaos/fault rule
+      # is doing exactly what it was configured to do".
+      - record: rift:request_latency_ms:p50:by_fault
+        expr: histogram_quantile(0.50, sum by (le, fault_applied) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+      - record: rift:request_latency_ms:p95:by_fault
+        expr: histogram_quantile(0.95, sum by (le, fault_applied) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+      - record: rift:request_latency_ms:p99:by_fault
+        expr: histogram_quantile(0.99, sum by (le, fault_applied) (rate(rift_proxy_request_duration_ms_bucket[5m])))
+
+  - name: rift-upstream-latency
+    rules:
+      # Same bucket-merge treatment, applied to time spent waiting on the
+      # upstream rather than total proxy time (i.e. faults excluded — see
+      # rift_upstream_request_duration_ms's doc comment in
+      # vendor/rift/crates/rift-mock-core/src/extensions/metrics.rs). Only
+      # the fleet-wide triplet is provided: nothing under
+      # deploy/observability/ currently needs upstream latency sliced by
+      # method or node, and an untested, unused recording rule is a
+      # liability (silently wrong forever) rather than a convenience.
+      - record: rift:upstream_latency_ms:p50
+        expr: histogram_quantile(0.50, sum by (le) (rate(rift_upstream_request_duration_ms_bucket[5m])))
+      - record: rift:upstream_latency_ms:p95
+        expr: histogram_quantile(0.95, sum by (le) (rate(rift_upstream_request_duration_ms_bucket[5m])))
+      - record: rift:upstream_latency_ms:p99
+        expr: histogram_quantile(0.99, sum by (le) (rate(rift_upstream_request_duration_ms_bucket[5m])))
+
+  - name: rift-throughput
+    rules:
+      - record: rift:requests:rate1m
+        expr: sum(rate(rift_requests_total[1m]))
+
+      # `rift:match_rate:ratio5m` — the fraction of requests the fleet
+      # actually matched, over the last 5 minutes.
+      #
+      # THIS NUMBER READS SLIGHTLY HIGH. The numerator (unmatched requests)
+      # UNDERCOUNTS, and it does so structurally, not as a bug to be fixed
+      # here. `rift_requests_unmatched_total` is incremented at exactly one
+      # place: where the pull-on-miss safety net concludes a no-match is
+      # terminal (see REQUESTS_UNMATCHED's doc comment in
+      # crates/rift-cluster/src/metrics.rs). That net grants a no-match
+      # request AT MOST ONE retry and is never consulted again for that
+      # request — so a request that was retried by pull-on-miss and still
+      # missed the second time is invisible to this counter. It is not
+      # double-counted as unmatched, and it is not counted as matched
+      # either; it simply never reaches either counter. The result: this
+      # ratio is a slight over-estimate of the true match rate. Mind which
+      # quantity the retry rate bounds: it caps the undercount on the
+      # COUNTER, but the overstatement on THIS RATIO is that rate divided by
+      # the request rate. Cross-check with
+      #   sum(rate(rift_cluster_pull_on_miss_retries_total[5m]))
+      #     / sum(rate(rift_requests_total[5m]))
+      # which is dimensionless and directly comparable to this ratio, and is
+      # plotted beside the match-rate stat on the Latency Analytics
+      # dashboard. The un-normalised retry rate is not a bound on a 0..1
+      # ratio: at low traffic it understates the error badly. That is what
+      # makes the bias
+      # measurable instead of merely a caveat in a comment nobody reads at
+      # 3am. Closing this gap for real needs an upstream seam that reports a
+      # retry's outcome, which does not exist yet.
+      - record: rift:match_rate:ratio5m
+        expr: 1 - (sum(rate(rift_requests_unmatched_total[5m])) / sum(rate(rift_requests_total[5m])))
+
+  - name: rift-cluster-journal
+    rules:
+      # Deliberately restricted to the two journal families that are
+      # actually registered (`rift_cluster_journal_entries`,
+      # `rift_cluster_journal_evictions_total`). The partial-reads,
+      # merge-latency and peer-pull-failure journal metrics do not exist yet
+      # — they land with issues #223/#226 — and a recording rule over an
+      # unregistered metric would not fail loudly, it would just evaluate to
+      # an empty vector forever, which is a worse trap than the rule simply
+      # not existing. See the "Not shown on this dashboard" panel on
+      # verification-plane.json for the same reasoning applied to the panel
+      # side.
+      #
+      # `rift_cluster_journal_entries{port}` is one shard of the fleet
+      # journal per node (see its doc comment in
+      # crates/rift-cluster/src/metrics.rs) — summing across BOTH port and
+      # instance is what approximates the fleet total, which is the number
+      # worth a single number on a dashboard.
+      - record: rift:journal_entries:sum
+        expr: sum(rift_cluster_journal_entries)
+
+      # `reason` (`cap` | `age`) is kept, not summed away: the two reasons
+      # mean different things operationally — `cap` evictions mean the
+      # shard is running hot at `max(500, 10_000/N)` capacity and a
+      # verification read can legitimately miss an entry a test expected;
+      # `age` evictions are just normal retention working as designed. A
+      # single scalar rate would conflate "the journal is under real
+      # pressure" with "nothing interesting is happening", so the label
+      # stays.
+      - record: rift:journal_evictions:rate5m
+        expr: sum by (reason) (rate(rift_cluster_journal_evictions_total[5m]))

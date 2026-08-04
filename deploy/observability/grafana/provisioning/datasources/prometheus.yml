@@ -1,0 +1,19 @@
+# Provisions the single Prometheus datasource the three dashboards render
+# against. The UID is pinned to a fixed literal (`rift-prometheus`) rather
+# than left to Grafana's auto-generated one, because every panel in every
+# dashboard JSON references the datasource by UID — an auto-generated UID
+# would make the dashboard JSON depend on provisioning order and turn every
+# fresh `docker compose up` into a coin flip over whether the panels bind.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: rift-prometheus
+    type: prometheus
+    access: proxy
+    # Service name on the `rift` network, from observability.overlay.yml.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s

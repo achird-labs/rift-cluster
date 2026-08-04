@@ -287,10 +287,21 @@ impl<V: ClusterView + 'static> NoMatchInterceptor for PullOnMissInterceptor<V> {
             // the remaining budget. If the budget runs out anyway -- a leader
             // RPC that hangs past it -- we have not confirmed lag, so the
             // honest answer is the one the fleet would have given without us.
-            match tokio::time::timeout(PULL_ON_MISS_BUDGET, self.decide(deadline)).await {
-                Ok(directive) => directive,
-                Err(_) => NoMatchDirective::Proceed,
+            let directive =
+                match tokio::time::timeout(PULL_ON_MISS_BUDGET, self.decide(deadline)).await {
+                    Ok(directive) => directive,
+                    Err(_) => NoMatchDirective::Proceed,
+                };
+            // `Proceed` is the only outcome this seam can call a terminal miss.
+            // `RetryMatch` re-runs matching once and the seam is NOT consulted
+            // again, so a retry that missed a second time is counted nowhere —
+            // the known undercount documented on `REQUESTS_UNMATCHED`. Counting
+            // `RetryMatch` here instead would be worse: it would count the
+            // rescues too, which is the one thing match rate must not do.
+            if matches!(directive, NoMatchDirective::Proceed) {
+                metrics::request_unmatched();
             }
+            directive
         })
     }
 }
@@ -552,10 +563,68 @@ mod tests {
         assert_eq!(hook.on_no_match(ctx).await, NoMatchDirective::RetryMatch);
     }
 
+    /// `rift_requests_unmatched_total` counts the terminal miss and not the
+    /// rescue attempt (#227).
+    ///
+    /// The half this CAN prove: a `Proceed` increments, a `RetryMatch` does
+    /// not. The half no test here can prove is the documented undercount — the
+    /// seam allows one retry and is not consulted again, so a retry that missed
+    /// a second time never reaches this code and no assertion in this process
+    /// can observe it. That is a property of the seam, recorded on the metric's
+    /// own doc comment rather than pretended away here.
+    // The counter is process-global, so this has to hold the same lock the
+    // metrics tests take while it reads a baseline and asserts a delta —
+    // and it has to hold it across the `on_no_match` awaits, because the
+    // increment happens inside them. That is safe here and not the deadlock
+    // the lint guards against: the lock is only ever taken by tests, the
+    // other takers are synchronous (they block a thread, they do not await),
+    // and nothing this test awaits on wants the lock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn unmatched_counts_the_terminal_miss_but_not_the_retry() {
+        let _guard = crate::metrics::testing::counter_guard();
+        let ctx = || NoMatchContext {
+            port: 6001,
+            method: "GET",
+            path: "/anything",
+        };
+
+        let before = crate::metrics::testing::requests_unmatched_total();
+        assert_eq!(
+            with(FakeView::lagging()).on_no_match(ctx()).await,
+            NoMatchDirective::RetryMatch
+        );
+        assert_eq!(
+            crate::metrics::testing::requests_unmatched_total(),
+            before,
+            "a request sent back through the matcher is not yet a miss"
+        );
+
+        let caught_up = FakeView {
+            local: Some(9),
+            ..FakeView::lagging()
+        };
+        assert_eq!(
+            with(caught_up).on_no_match(ctx()).await,
+            NoMatchDirective::Proceed
+        );
+        assert_eq!(
+            crate::metrics::testing::requests_unmatched_total(),
+            before + 1,
+            "a `Proceed` is the miss the fleet actually answered with"
+        );
+    }
+
     /// The backstop returns `Proceed` rather than hanging when the inner
     /// decision overruns the budget.
     #[tokio::test]
+    // Same lock, same reasoning as the counter test below: this drives
+    // `on_no_match` to `Proceed`, which increments
+    // `rift_requests_unmatched_total`, so without the guard it lands inside
+    // that test's before/after window under `cargo test`'s parallelism.
+    #[allow(clippy::await_holding_lock)]
     async fn on_no_match_backstops_a_hanging_lookup() {
+        let _guard = crate::metrics::testing::counter_guard();
         struct Hangs;
         impl ClusterView for Hangs {
             fn is_leader(&self) -> bool {

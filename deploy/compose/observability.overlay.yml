@@ -1,0 +1,108 @@
+# Observability overlay for the 3-node compose (issue #227, RFC-003 SS5/SS6).
+#
+# Adds Prometheus and Grafana over the shipped topology, never baked into it:
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f deploy/compose/observability.overlay.yml up
+#
+# The 3-node compose stays dependency-free on its own — this overlay is what
+# turns it into "a fleet you can actually look at": Prometheus scrapes the
+# three metrics endpoints and evaluates the fleet recording/alert rules
+# (deploy/observability/prometheus/), Grafana renders the three dashboards
+# (deploy/observability/grafana/) against them.
+#
+# Both images are pinned to a specific tag, never `latest` — the same reason
+# every other image in this repo is pinned: a silent version bump on `up` is
+# not a thing this stack does to itself.
+#
+# Both services join the existing `rift` network (declared in
+# docker-compose.yml) rather than getting a network of their own: Prometheus
+# has to resolve rift-1/2/3 by service name to scrape them, and Grafana has
+# to resolve `prometheus` by service name for its datasource. Neither talks
+# to a published host port for that — the published ports below are for the
+# human on the other end of `docker compose up`, not for the containers.
+#
+# Host ports: rift-1/2/3's own metrics ports already occupy 19090/29090/39090
+# (one slot per node, prefixed by node number — see docker-compose.yml).
+# Prometheus and Grafana are fleet-wide singletons with no node number of
+# their own, so they get parked in that same "1"-prefixed block instead of
+# starting a new numbering scheme: Prometheus takes 19091, the next free slot
+# after rift-1's 19090, and Grafana takes 13000 — its own well-known default
+# port (3000) under the same "1" prefix. Neither collides with anything the
+# base compose file publishes.
+#
+# Grafana admin credentials below are FIXED, DEV-ONLY DEFAULTS.
+#
+#     THIS STACK IS A LOCAL/REFERENCE DEPLOYMENT, NOT PRODUCTION GUIDANCE.
+#
+# A real deployment injects its own admin credentials from a secret store —
+# exactly the same caveat as RIFT_CLUSTER_SECRET in docker-compose.yml, and
+# for the same reason: this file's job is to be readable and to work on a
+# laptop, not to model a production secrets pipeline.
+
+networks:
+  rift: {}
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: rift-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # Rule files live under the same mount as prometheus.yml
+      # (deploy/observability/prometheus/rules/), so no extra flag is needed
+      # beyond what prometheus.yml itself declares via rule_files.
+    volumes:
+      # Relative to `deploy/compose/`, NOT to this file — Compose resolves
+      # every relative path against the project directory, which is the
+      # directory of the *first* `-f` file. See the identical note on
+      # tests/cluster-chaos/compose/chaos.overlay.yml's toxiproxy mount.
+      - ../observability/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    networks:
+      - rift
+    ports:
+      - "19091:9090"   # Prometheus UI/API
+    depends_on:
+      rift-1:
+        condition: service_started
+      rift-2:
+        condition: service_started
+      rift-3:
+        condition: service_started
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: rift-grafana
+    environment:
+      # Fixed dev-only defaults — see the file header. Never use these
+      # outside a local/reference deployment.
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "rift-observability-dev-only"
+      # No signup/anonymous access: this is a single-admin local stack, not a
+      # multi-tenant one, and the point is to look at three dashboards, not
+      # to stand up a Grafana org.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      # Datasource + dashboard-provider YAML.
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboard JSON the provider above points at
+      # (deploy/observability/grafana/provisioning/dashboards/dashboards.yml
+      # -> options.path). Mounted separately from `provisioning/` because it
+      # is content the dashboards.yml provider reads at its own path, not
+      # provisioning config itself.
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - rift
+    ports:
+      - "13000:3000"   # Grafana UI
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-data: {}
+  grafana-data: {}

@@ -691,3 +691,62 @@ jobs:
 
             echo "ok[${release:0:8}…]: 2 services, seed ${seed}"
           done
+
+  # ---------------------------------------------------------------------------
+  # Observability pack (#227)
+  # ---------------------------------------------------------------------------
+  # Rules are code, so they are tested like code. Two distinct failures are in scope here and
+  # neither is visible by reading the YAML:
+  #
+  #   * a rule that is syntactically fine but arithmetically wrong — averaging per-node quantiles
+  #     instead of merging buckets is the classic one, and it produces a plausible number, so only
+  #     a test with pinned expectations catches it;
+  #   * a rule or panel naming a metric family nobody registers. That fails SILENTLY: the
+  #     expression returns no data forever, so the alert never fires and the absence reads as
+  #     health. `check-observability-families.sh` is the gate for exactly that.
+  #
+  # promtool comes from the pinned Prometheus image, so no new toolchain lands on the runner.
+  observability:
+    runs-on: ubuntu-latest
+    env:
+      PROM_IMAGE: prom/prometheus:v2.53.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: promtool check config
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w --entrypoint=/bin/promtool "$PROM_IMAGE" \
+            check config deploy/observability/prometheus/prometheus.yml
+
+      - name: promtool check rules
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w --entrypoint=/bin/promtool "$PROM_IMAGE" \
+            check rules deploy/observability/prometheus/rules/recording.yml \
+                        deploy/observability/prometheus/rules/alerts.yml
+
+      - name: promtool test rules
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w --entrypoint=/bin/promtool "$PROM_IMAGE" \
+            test rules deploy/observability/prometheus/rules/tests/recording_test.yml \
+                       deploy/observability/prometheus/rules/tests/alerts_test.yml
+
+      # The silent-failure gate. Run AFTER the promtool steps: a family name that does not exist is
+      # perfectly valid PromQL, so promtool passes it and only this catches it.
+      - name: No rule or panel may name an unregistered metric family
+        run: |
+          set -euo pipefail
+          bash scripts/check-observability-families.sh
+
+      # The overlay has to merge with the base compose and its mount paths have to resolve, which
+      # `config` proves without starting anything.
+      - name: The observability overlay composes
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/compose/docker-compose.yml \
+                         -f deploy/compose/observability.overlay.yml config -q
+          echo "PASS: overlay merges and its mounts resolve"

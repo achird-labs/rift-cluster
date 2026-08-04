@@ -1,0 +1,20 @@
+# Loads the three dashboard JSON files from the mounted dashboards directory
+# (deploy/observability/grafana/dashboards, mounted read-only in
+# observability.overlay.yml) rather than requiring anyone to click "import"
+# by hand. `allowUiUpdates: false` because the JSON in this repo is the
+# source of truth — an edit made in the running Grafana would be silently
+# discarded on the next container restart, which is a worse trap than simply
+# not offering the edit.
+apiVersion: 1
+
+providers:
+  - name: rift-cluster
+    orgId: 1
+    folder: "Rift Cluster"
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

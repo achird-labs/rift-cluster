@@ -1,0 +1,105 @@
+# Alerting rules for the rift-cluster observability pack (issue #227,
+# RFC-003 SS5/SS6).
+#
+# Every `for:` below is chosen relative to how the underlying series is
+# produced, not picked to "feel about right":
+#
+#   * The fleet gauges (members, insecure, no_principals, intents_pending,
+#     bind_failures, ...) are resampled on a 5 SECOND timer by the
+#     composition (`observe_node` in crates/rift-cluster/src/metrics.rs is
+#     polled every 5s — see that file's module comment). A `for:` shorter
+#     than three sample periods (15s) cannot distinguish "genuinely
+#     sustained" from "one scrape landed between two gauge refreshes and saw
+#     a transient value" — it would just be measuring scrape-vs-sample-timer
+#     aliasing and calling it an incident. 15s is therefore the floor for
+#     every alert below, not a suggestion.
+#   * Counters (barrier_timeouts_total, audit_export_failures_total, ...)
+#     are event-driven rather than sampled, so their `for:` windows are
+#     chosen to ride out a burst of individually-recoverable failures
+#     without paging on the first one, per alert below.
+#
+# Each alert's annotation says which of these two reasons applies and why
+# the specific window was chosen — not just that a window exists.
+groups:
+  - name: rift-cluster-alerts
+    rules:
+      - alert: RiftClusterNoLeader
+        expr: sum(rift_cluster_members{state="leader"}) == 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No leader elected in the rift cluster"
+          description: "No node in the fleet reports itself as leader for at least 15s (3x the 5s fleet-gauge sample timer — the minimum window that can tell a real leaderless gap apart from one scrape landing between two gauge refreshes). Every write-forwarding and barrier path depends on a leader existing; this is the single highest-severity condition this fleet can be in."
+
+      - alert: RiftClusterInsecure
+        expr: rift_cluster_insecure > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cluster port running without authentication"
+          description: "rift_cluster_insecure has read 1 for at least 5 minutes (well past the 15s fleet-gauge floor) — this is a standing configuration property, not a transient blip, so the long window exists only to avoid paging during the first few seconds after a deliberate restart with auth mid-rollout, not because the signal is noisy."
+
+      - alert: RiftClusterNoPrincipals
+        expr: rift_cluster_no_principals > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet has no principal defined (open admin plane)"
+          description: "rift_cluster_no_principals has read 1 for at least 5 minutes. Like RiftClusterInsecure, this is a standing fleet property (issue #161's open-admin-plane bypass made visible), so 5m is generous headroom over the 15s gauge floor rather than a response to flapping."
+
+      - alert: RiftClusterBarrierTimeouts
+        expr: sum(rate(rift_cluster_barrier_timeouts_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Read-after-write barriers timing out"
+          description: "Barriers have been timing out continuously for 5 minutes. A single barrier timeout is not unusual (a write still answers 2xx with a warning header on that path) — the 5m window exists to page only once timeouts are SUSTAINED rather than an isolated slow node catching up on one write."
+
+      - alert: RiftClusterIntentsStuck
+        expr: rift_cluster_intents_pending > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Admin write-intents not draining"
+          description: "The write-intent ledger has held a non-zero depth for 10 minutes. Intents are meant to be replayed to completion quickly (RFC-001's #9 ledger); one non-zero sample is a ledger doing its job mid-write, but 10 sustained minutes means replay has stalled — a much longer window than the 15s gauge floor because a briefly-parked intent recovering on its own is the expected common case, not an incident."
+
+      - alert: RiftClusterBindFailures
+        expr: rift_cluster_bind_failures > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Local engine cannot realize a committed config"
+          description: "rift_cluster_bind_failures has read 1 on at least one port for at least 1 minute (12x the 5s gauge floor — several engine-drive cycles, since the gauge is resampled after every drive per its doc comment, not on the plain 5s timer). This means a committed config exists that this node cannot serve; critical because it is a live serving gap on a specific port, not just a convergence lag."
+
+      - alert: RiftClusterAuditExportFailing
+        expr: sum(rate(rift_cluster_audit_export_failures_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit export sink rejecting shipped batches"
+          description: "Audit export attempts have been failing continuously for 5 minutes. The write path is unaffected either way (export runs from a background task, per its doc comment) so this is a warning, not a page-now — but sustained failure means the sink is down and the audit trail is falling behind in a way retention will eventually make unrecoverable, which is what RiftClusterAuditExportLagging below is the harder backstop for."
+
+      - alert: RiftClusterAuditExportLagging
+        expr: rift_cluster_audit_export_lag_revisions > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit export checkpoint falling behind applied revisions"
+          description: "The leader's audit export checkpoint has trailed the last applied revision by more than 1000 revisions for at least 5 minutes. 1000 is a coarse order-of-magnitude guard, not a derived SLO — the issue does not specify a target export lag, so this threshold exists to catch a sink that has clearly stopped keeping up rather than to promise a specific recovery-time bound; revisit it once real production export throughput is observed. Sustained lag risks crossing into RiftClusterAuditExportFailing's territory of unrecoverable loss once retention GCs the lagging span (see rift_cluster_audit_export_skipped_revisions_total's doc comment)."
+
+      - alert: RiftClusterSourceSchedulerDegraded
+        expr: sum(rate(rift_cluster_source_scheduler_read_failures_total[5m])) > 0 or max(rift_cluster_source_scheduler_corrupt_rows) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tracking-source scheduler cannot read or decode source rows"
+          description: "Either the leader's source-poll scheduler has been unable to read the source table, or it has held at least one corrupt row, continuously for 5 minutes. Either condition parks the affected source at its last-known poll cadence until the underlying row is fixed (see both metrics' doc comments in crates/rift-cluster/src/metrics.rs) — 5 minutes gives a transient table read blip time to clear before paging on it."

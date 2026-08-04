@@ -82,14 +82,36 @@ flowchart TB
 | `GET /_cluster/ops/:op_id` | intent state: pending / applied / failed (Chapter 4) |
 | `GET /_cluster/health` | rolled-up diagnostics |
 
-**Metrics that page** (Prometheus, served by the standard metrics port):
+**Metrics that page** (Prometheus, served by the standard metrics port).
+
+This list mixes families that exist today with families that were designed here
+and never registered. The distinction is not pedantry: an alert rule naming an
+unregistered family is not a loud failure but a silent one — the expression
+evaluates to no data forever, so the alert never fires and reads as health. The
+shipped alert pack in `deploy/observability/` therefore references only the
+first group, and `scripts/check-observability-families.sh` enforces that.
+
+*Registered, and alerted on by the shipped pack:*
+`rift_cluster_intents_pending` (stuck > minutes = quorum loss),
+`rift_cluster_insecure` (should be 0 everywhere, forever),
+`rift_cluster_members{state}`, `rift_cluster_barrier_timeouts_total`,
+`rift_cluster_bind_failures`, `rift_cluster_no_principals`, the
+`rift_cluster_audit_export_*` family, and
+`rift_cluster_source_scheduler_read_failures_total` /
+`rift_cluster_source_scheduler_corrupt_rows`.
+
+*Registered, but not alerted on:* `rift_cluster_flow_wal_lag_ops` (async
+durability backlog). It is on the dashboards and is a legitimate paging
+signal; nobody has yet chosen a threshold that is meaningful across
+deployments, and an alert with an arbitrary one trains people to ignore it.
+
+*Aspirational — designed, not registered, deliberately absent from the pack:*
 `rift_cluster_raft_leader_changes_total` (flapping = network trouble),
 `rift_cluster_applied_index_lag` per node (barrier stragglers),
 `rift_cluster_degraded_ops_total{feature}` (any nonzero during a strict test
-run is a finding), `rift_cluster_intents_pending` (stuck > minutes = quorum
-loss), `rift_cluster_flow_wal_lag_ops` (async durability backlog),
-`rift_cluster_bridge_rejected_total` (owner black-hole shedding),
-`rift_cluster_insecure` (should be 0 everywhere, forever).
+run is a finding), `rift_cluster_bridge_rejected_total` (owner black-hole
+shedding). Leader flapping is the sharpest of these and has no substitute today;
+`RiftClusterNoLeader` catches the outage but not the flap that preceded it.
 
 ## Runbooks (sketches; full versions ship with the harness)
 
