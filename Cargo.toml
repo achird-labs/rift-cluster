@@ -4,6 +4,10 @@ members = [
     "crates/rift-cluster-base",
     "crates/rift-cluster",
     "crates/rift-cluster-server",
+    # The OpenAPI → imposter-JSON compiler (RFC-004 §3.1, issue #277). A plain
+    # workspace member, unlike `rift-lint-wasm` below: it is host-native and
+    # dependency-light, so the normal lanes should build and test it.
+    "crates/rift-cluster-spec",
     # Container-tier chaos scenarios (issue #11). A workspace member so it is
     # type-checked and linted with everything else; the scenarios themselves are
     # `#[ignore]`d because they need a container runtime, so a plain `cargo test`
@@ -59,6 +63,21 @@ serde_json = "1.0"
 # same version rift-http-proxy and rift-mock-core already depend on, so the workspace resolves one
 # copy and embedding the contract adds no new supply-chain surface.
 serde_yaml = "0.9"
+# OpenAPI 3.0.x document model for the spec compiler (RFC-004 §3.1, issue #277). 3.0-only by
+# construction, which is the property the compiler wants: a 3.1 or Swagger 2.0 document cannot be
+# half-parsed into something plausible, it fails the version gate before this crate sees it.
+openapiv3 = "2.2"
+# `regex::escape` for the spec compiler's literal path segments. Escaping is the mitigation for
+# RFC-004 §8's regex-injection item, so it uses the same engine that will match the pattern rather
+# than a hand-rolled character class that could disagree with it. Already in the tree transitively.
+regex = "1.12"
+# `openapiv3` exposes its component tables as `IndexMap`; the spec compiler names that type in a
+# signature. Already in the tree transitively, pinned to the same major so one copy resolves.
+indexmap = "2"
+# Deterministic-generation invariants the compiler must hold over inputs no fixture enumerates:
+# regex escaping never widening a pattern, the stub order being a total order, and the synthesis
+# seed being stable. Dev-only.
+proptest = "1.11"
 # Test-only (issue #184). `EnumDiscriminants` + `EnumIter` make the route-parity gate's variant
 # coverage compiler-complete: without it, adding a `Terminated` variant forces a `contract_route`
 # arm but NOT an entry in the representative list the parity test actually compares, so a new route

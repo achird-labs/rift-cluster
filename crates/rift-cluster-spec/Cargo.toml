@@ -1,0 +1,29 @@
+[package]
+name = "rift-cluster-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure OpenAPI 3.0 → imposter-JSON compiler for spec-driven mocking (RFC-004)"
+
+# Deliberately depends on neither `rift-cluster-base` nor anything vendored — not even
+# `rift-types` (RFC-004 §3.1). The facade rule routes cluster crates to the engine through
+# `rift-cluster-base`, so emitting a typed `ImposterConfig` would drag the whole engine into what
+# is a text-to-text function. This crate emits the same JSON a client would `PUT`, and admission
+# (issue #278) parses it through the same gate as any other write.
+[dependencies]
+openapiv3 = { workspace = true }
+# The map type `openapiv3` exposes its component tables as; named here so this crate can spell that
+# type in a signature. Same version, so the workspace resolves one copy.
+indexmap = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

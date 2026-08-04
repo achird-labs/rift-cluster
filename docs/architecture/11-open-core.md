@@ -47,6 +47,7 @@ flowchart BT
     EE["rift-cluster-base — the facade<br/>re-exports crates + rift_cluster_base::seams"]
     CL["rift-cluster<br/>Raft, ring, RPC, stores, reconciler"]
     SV["rift-cluster-server (binary)<br/>CLI superset, composition"]
+    SP["rift-cluster-spec<br/>OpenAPI 3.0 → imposter JSON<br/><i>reaches nothing — see below</i>"]
 
     MC --> EE
     HP --> EE
@@ -54,8 +55,10 @@ flowchart BT
     EE --> CL
     EE --> SV
     CL --> SV
+    SP --> SV
 
     style EE fill:#fff3cd,stroke:#b8860b
+    style SP fill:#e7f5e7,stroke:#2d7a2d
 ```
 
 **`rift-cluster-base` is the single doorway.** It alone carries path dependencies into
@@ -65,6 +68,17 @@ resolve* — the boundary is enforced by Cargo, not by review vigilance. A
 compile-time test in `rift-cluster-base` (`seams_resolve`) names every re-exported seam,
 so an upstream rename breaks loudly at the facade with a one-line fix, instead
 of surfacing as a confusing error deep in cluster code.
+
+**A crate that needs no doorway is the cheapest kind.** `rift-cluster-spec` (RFC-004 §3.1,
+issue #277) compiles an OpenAPI 3.0 document into imposter JSON and depends on neither the
+facade nor anything vendored — not even `rift-types`. The alternative, emitting a typed
+`ImposterConfig`, was checked and rejected: under the facade rule "typed output" means a
+`rift-cluster-base` dependency, which drags the whole engine into what is a text-to-text
+function. Instead it emits the same JSON a client would `PUT`, and `rift-cluster-server`
+admits it through the gate every other write already passes. Type safety stays where it is
+load-bearing — at admission — and the compiler stays a pure function of `(spec bytes,
+options)` that golden files can pin. Read the arrow as *"produces JSON consumed by"*, not as
+a code dependency in the other direction.
 
 **One seam cannot be guarded that way, and gets its own tripwire.**
 `ServerBuilder::manager()` is all-or-nothing: injecting a manager replaces
