@@ -160,6 +160,53 @@ test.describe("stubs: the conflict flow", () => {
   });
 });
 
+/**
+ * The raw JSON pane — in the editor the console actually ships.
+ *
+ * `CodeEditor` loads Monaco through a dynamic import and renders a plain `<textarea>` fallback when
+ * that import does not resolve. Under jsdom it never resolves, so `stub-editor.test.tsx` — every
+ * one of its cases — drives the FALLBACK. Monaco itself has no coverage anywhere but here, which
+ * matters because it is what an operator types into: it owns its own buffer, auto-closes brackets
+ * and quotes, and reports its value through a change handler none of the jsdom tests exercise.
+ */
+test.describe("the stub JSON pane, in the editor the console ships", () => {
+  test("shows an existing stub's JSON, so the editor is really live", async ({ page }) => {
+    /*
+     * Non-vacuity guard for the case below. A Monaco that failed to mount renders nothing and the
+     * fallback textarea would answer a `toBeDisabled` check just as happily, so an error-path test
+     * on its own could pass against a broken editor.
+     */
+    const { imposters } = fixture();
+    await signIn(page, "editor");
+    await goToScreen(page, `/imposters/${imposters[0]}`);
+    await page.getByRole("button", { name: /edit get-order/i }).click();
+
+    await expect(page.getByTestId("stub-editor")).toBeVisible();
+    await expect(page.getByTestId("stub-json")).toContainText("get-order");
+  });
+
+  test("refuses unparseable JSON and disables the save rather than sending it", async ({ page }) => {
+    const { imposters } = fixture();
+    await signIn(page, "editor");
+    await goToScreen(page, `/imposters/${imposters[1]}`);
+    await page.getByRole("button", { name: /add stub/i }).click();
+    await expect(page.getByTestId("stub-editor")).toBeVisible();
+
+    // `fill()` cannot be used: Monaco's only <textarea> is a hidden readonly IME buffer, so
+    // Playwright resolves it and then waits forever for it to become editable. Real keystrokes are
+    // the only way in, and are what an operator does anyway.
+    await page.getByTestId("stub-json").click();
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.press("Delete");
+    await page.keyboard.type("{ not json");
+
+    await expect(page.getByTestId("stub-json-error")).toBeVisible();
+    // Saying so is only half. Leaving Save live would let a click fire a write the console has
+    // already decided is malformed, and the failure would surface as a server error instead.
+    await expect(page.getByRole("button", { name: /save stub/i })).toBeDisabled();
+  });
+});
+
 test.describe("front-door routes: pre-flight validation", () => {
   test("refuses a duplicate id at the point of typing", async ({ page }) => {
     await signIn(page, "editor");

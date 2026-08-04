@@ -106,6 +106,38 @@ test.describe("roles get the console their bindings allow", () => {
     await expect(page.getByRole("button", { name: /disable/i }).first()).toBeVisible();
   });
 
+  /*
+   * The imposter's own screen, which the cases above never reach: every other test that opens it
+   * signs in as `editor`, so `Add stub` and `Duplicate` have only ever been asserted PRESENT.
+   *
+   * Their absence is the whole of what a lesser role sees — there is no explanatory note, by
+   * design (RFC-006 §3 rule 3: hiding a control is presentation). That makes it worth pinning from
+   * both sides: an operator who cannot find the button and an operator for whom the button was
+   * wrongly hidden look identical from a bug report, and only a test tells them apart.
+   */
+  test("an operator gets no authoring controls on an imposter's own screen", async ({ page }) => {
+    const { imposters } = fixture();
+    await signIn(page, "operator");
+    await goToScreen(page, `/imposters/${imposters[0]}`);
+
+    // `imposter.lifecycle` yes, `imposter.write` no — so neither authoring control is drawn.
+    await expect(page.getByRole("button", { name: /add stub/i })).toHaveCount(0);
+    await expect(page.getByTestId("clone-imposter")).toHaveCount(0);
+    // The read it may do still works, so this is gating rather than a screen that failed to load.
+    await expect(page.getByTestId("detail-port")).toContainText(String(imposters[0]));
+  });
+
+  test("an editor gets those same controls", async ({ page }) => {
+    // The other half of the pair. Without it the assertions above would still pass if the controls
+    // stopped rendering for everybody.
+    const { imposters } = fixture();
+    await signIn(page, "editor");
+    await goToScreen(page, `/imposters/${imposters[0]}`);
+
+    await expect(page.getByRole("button", { name: /add stub/i })).toBeVisible();
+    await expect(page.getByTestId("clone-imposter")).toBeVisible();
+  });
+
   test("a tenant-admin reaches principals without a fleet-scoped tenant list", async ({ page }) => {
     /*
      * The lockout that shipped: the nav links to the admin screen with no tenant, and the only
