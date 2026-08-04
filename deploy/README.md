@@ -422,6 +422,58 @@ would fail the release rather than the first person to try it. `:latest` is
 promoted only after those smokes pass, so an untagged pull can never resolve to a
 build the smokes rejected — only the exact version tag exists before they run.
 
+## Image flavors
+
+Every tag above is actually two images (#270), selected by a `-static` suffix:
+
+| Flavor | Base | Tags | `git+` imposter sources | Shell | OS packages |
+|---|---|---|---|---|---|
+| default | `debian:bookworm-slim` | `vX.Y.Z`, `latest` | Yes | Yes | the usual Debian slim set |
+| `-static` | `FROM scratch` (musl) | `vX.Y.Z-static`, `latest-static` | No | No | zero |
+
+```sh
+docker pull ghcr.io/achird-labs/rift-cluster-server:vX.Y.Z-static
+```
+
+The static flavor trades the OS away entirely — no package manager, no libc dynamic loader, no
+shell, nothing but the binary, a CA bundle, and a passwd entry for its non-root user — for the
+narrowest attack surface this image can have. That trade is possible at all only because
+`git+https:`/`git+file:` imposter sourcing became a detected *capability* rather than a boot
+requirement: a static image with no git now boots and serves, logging exactly `git not found;
+git+ imposter sources disabled in this image` at WARN instead of refusing to start. Four real
+limitations follow from the same trade, worth knowing before picking it:
+
+- **No `git+` imposter sources.** A `git+https:` or `git+file:` declaration fails at declaration
+  time, not at boot, with:
+
+  > `git+https:` sources are unavailable: no `git` binary on PATH; install git, or use the
+  > default (non-static) image if this is `-static`
+
+  Use the default flavor for any node that declares one.
+
+- **No shell.** There is no `docker exec … sh` on this image — there is nothing to exec into.
+  This also rules it out for Kubernetes today: the StatefulSet's ordinal-0 bootstrap branch (the
+  founding node runs a different container command than the nodes that join it) is a shell
+  script baked into the container command, and a shell-less image cannot run it. **The default
+  flavor remains the recommended Kubernetes image** — the Helm chart's `image.repository`
+  defaults to it, with no `-static` option exposed.
+
+- **A different system allocator.** Neither flavor bundles mimalloc — this workspace takes
+  `rift-http-proxy` with `default-features = false` (root `Cargo.toml`), so upstream's
+  binary-only mimalloc default never reaches either image. What does differ is the C library
+  underneath: the static flavor uses **musl's** allocator, the default flavor **glibc's**. musl's
+  is markedly slower under allocation-heavy, highly concurrent load. Benchmark numbers therefore
+  do not transfer between flavors — that is an allocator difference, not a regression, but a
+  surprising one if the flavor switch is forgotten between runs.
+
+- **Mixed-flavor fleets are not supported.** Replicated *applies* never fetch — a follower
+  running the static flavor applies git-sourced bytes from its leader just fine, byte for byte,
+  the same as any other apply. But boot-time declarations, a `refresh-now` on whichever node
+  receives the call, and leader-only `tracking`-mode polls all fetch **locally**, on the node
+  that handles them — and in a fleet, that can be any node. So the rule is simple: **a fleet
+  that uses `git+` sources runs the default flavor everywhere**; mixing flavors is only safe for
+  a fleet that declares no `git+` source at all.
+
 ## Images and the upstream pin
 
 `--version` reports which open-source Rift is embedded, e.g.

@@ -913,6 +913,70 @@ async fn attach_data_plane(
     ))
 }
 
+/// Why a node with no `git` refuses a `git+` declaration, and what to do about it.
+///
+/// Rendered verbatim into the refusal, so it names the cause *and* the fix: an
+/// operator meeting this has typed a URI that is valid on a node with git, and
+/// "your image has no git" is not something they can infer from "unsupported
+/// scheme".
+///
+/// Phrased as the **observed fact** ("no `git` binary on PATH") rather than as
+/// the flavor ("this is the -static image"), because nothing here can actually
+/// tell the two apart. The degrade arm fires on any `ErrorKind::NotFound` from
+/// spawning `git` — which is the `-static` image, but is equally a derived
+/// image that removed git, or a node booted with a broken `PATH`. Telling a
+/// default-flavor operator to "use the default image" would be advice for a
+/// situation they are not in; naming the missing binary is true in every case,
+/// and the flavor hint stays as a conditional aside.
+///
+/// Two test copies of this text exist that the compiler cannot tie back here —
+/// `rift_cluster::sources::tests::NO_GIT` and an inline literal in
+/// `tests/sources_front.rs` — because both live outside this crate and this
+/// const is private. They assert on substrings, so a reword here does not break
+/// them loudly; it makes them assert less than they claim to. Change all three.
+const NO_GIT_REASON: &str = "no `git` binary on PATH; install git, or use the default (non-static) image if this is `-static`";
+
+/// Register `git+` according to what this host actually has (#270).
+///
+/// Split out from [`build_source_registry`] and handed the probe result rather
+/// than probing itself, so the three arms are unit-testable on a host that does
+/// have git — the absent arm is the one that ships in the `-static` image and
+/// would otherwise be exercised for the first time in production.
+///
+/// The arms are deliberately asymmetric:
+/// - **present** → register the provider, byte-identical to before.
+/// - **absent** → boot and serve, log once, register the schemes as
+///   unavailable. Losing `git+` must not cost an operator the other 99% of a
+///   mock fleet.
+/// - **unusable** → still refuse the boot. A broken git is a broken host, not a
+///   flavor without git, and degrading it would turn an operator's
+///   misconfiguration into a fleet that quietly never fetches.
+fn register_git_provider(
+    providers: &mut sources::SourceProviders,
+    resolver: &Arc<dyn sources::auth::CredentialResolver>,
+    probe: Result<(), sources::git::GitProbeError>,
+) -> anyhow::Result<()> {
+    match probe {
+        // `probed` rather than `new`: this function was *handed* the probe
+        // result, and re-running `git --version` here would spawn a second
+        // subprocess to re-learn what the caller already established.
+        Ok(()) => providers.register_credentialed(Arc::new(sources::git::GitSource::probed(
+            Arc::clone(resolver),
+        ))),
+        Err(sources::git::GitProbeError::NotFound(_)) => {
+            tracing::warn!(
+                schemes = ?sources::git::GIT_SCHEMES,
+                "git not found; git+ imposter sources disabled in this image"
+            );
+            providers.register_unavailable(sources::git::GIT_SCHEMES, NO_GIT_REASON)
+        }
+        // Every non-absent probe failure refuses the boot. Written as a
+        // catch-all rather than one arm per variant on purpose: a future probe
+        // failure mode must default to refusing, never to degrading.
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Every scheme a clustered node can fetch a source from: upstream's `file:`
 /// and `http(s):`, plus the cluster `git+https:`/`git+file:`, `s3:` and
 /// `registry:` providers (#136).
@@ -963,9 +1027,7 @@ fn build_source_registry(
     let resolver: Arc<dyn sources::auth::CredentialResolver> =
         Arc::new(sources::auth::StandardResolver::new(secrets_dir));
 
-    providers.register_credentialed(Arc::new(sources::git::GitSource::new(Arc::clone(
-        &resolver,
-    ))?))?;
+    register_git_provider(&mut providers, &resolver, sources::git::GitSource::probe())?;
 
     let s3_config = sources::s3::S3Config {
         endpoint: std::env::var("RIFT_S3_ENDPOINT").ok(),
@@ -1759,5 +1821,122 @@ mod tests {
             .expect("the leave completes")
             .expect("the serve task did not panic")
             .expect("a clean admin-plane stop is not an error");
+    }
+
+    // -- git as a detected capability (#270) --------------------------------
+    //
+    // The three arms are tested against a *supplied* probe result rather than a
+    // manipulated `PATH`, for two reasons: `PATH` is process-global and these
+    // tests run in parallel, and the arm that ships in the `-static` image is
+    // precisely the one no developer machine can reach by accident. The
+    // end-to-end proof that a real gitless image boots and serves is the
+    // release lane's static smoke; this is the proof that the decision it
+    // depends on is the right one in all three cases.
+
+    use std::sync::Arc;
+
+    use super::{register_git_provider, sources};
+
+    fn empty_providers() -> (
+        sources::SourceProviders,
+        Arc<dyn sources::auth::CredentialResolver>,
+    ) {
+        let resolver: Arc<dyn sources::auth::CredentialResolver> =
+            Arc::new(sources::auth::StandardResolver::new(None));
+        (sources::SourceProviders::default(), resolver)
+    }
+
+    #[test]
+    fn git_absent_still_composes_and_leaves_the_scheme_explained() {
+        let (mut providers, resolver) = empty_providers();
+
+        register_git_provider(
+            &mut providers,
+            &resolver,
+            Err(sources::git::GitProbeError::NotFound(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            ))),
+        )
+        .expect("a gitless image must compose, not refuse to boot");
+
+        assert_eq!(
+            providers.unavailable_schemes(),
+            vec!["git+file".to_owned(), "git+https".to_owned()],
+            "dropping the provider must not drop the schemes from view"
+        );
+        let refusal = providers
+            .scheme_refusal("git+https://example.com/r#main:m.json")
+            .expect("a git+ declaration is refused on a gitless node");
+        assert!(refusal.contains("no `git` binary on PATH"), "{refusal}");
+        assert!(
+            refusal.contains("use the default (non-static) image"),
+            "{refusal}"
+        );
+    }
+
+    /// Every non-absent probe failure refuses the boot — asserted per variant,
+    /// not just for a representative one. `NotFound` is the *only* arm allowed
+    /// to degrade, and a future variant that quietly joined the degrading side
+    /// is exactly the regression this issue exists to prevent.
+    #[test]
+    fn every_probe_failure_that_is_not_absence_refuses_the_boot() {
+        for probe_failure in [
+            sources::git::GitProbeError::ExitedUnsuccessfully {
+                status: "exit status: 127".to_owned(),
+                stderr: "git: command not usable".to_owned(),
+            },
+            // A git that is present but cannot be executed — not executable,
+            // or blocked by a sandbox. Distinct from absence, and must not be
+            // mistaken for it.
+            sources::git::GitProbeError::SpawnFailed(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )),
+        ] {
+            let label = probe_failure.to_string();
+            let (mut providers, resolver) = empty_providers();
+
+            let err = register_git_provider(&mut providers, &resolver, Err(probe_failure))
+                .expect_err(
+                    "a git that exists but does not work is a broken host, not a flavor without \
+                     git",
+                );
+
+            assert!(
+                err.to_string().contains("git --version"),
+                "the refusal must name the probe that failed: {err} (from {label})"
+            );
+            assert!(
+                providers.unavailable_schemes().is_empty(),
+                "a refused boot must not ALSO leave git+ registered as merely unavailable — that \
+                 would turn a hard misconfiguration into a soft one on any caller that ignored \
+                 the error (from {label})"
+            );
+        }
+    }
+
+    #[test]
+    fn git_present_registers_the_provider_exactly_as_before() {
+        if sources::git::GitSource::probe().is_err() {
+            // The default flavor's arm needs a real git. `provider_tests.rs`
+            // owns the unguarded assertion that CI has one, so a silent skip
+            // here cannot hide a gitless test environment.
+            return;
+        }
+        let (mut providers, resolver) = empty_providers();
+
+        register_git_provider(&mut providers, &resolver, Ok(())).expect("git is present");
+
+        assert!(providers.schemes().contains(&"git+https".to_owned()));
+        assert!(providers.schemes().contains(&"git+file".to_owned()));
+        assert!(
+            providers.unavailable_schemes().is_empty(),
+            "nothing is unavailable when git is present"
+        );
+        assert!(
+            providers
+                .scheme_refusal("git+https://example.com/r#main:m.json")
+                .is_none(),
+            "the default flavor must refuse nothing it refused before"
+        );
     }
 }

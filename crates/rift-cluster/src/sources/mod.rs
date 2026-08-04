@@ -58,7 +58,7 @@
 //! collides with `git+https:`'s own `#ref:path` fragment, and a side table keyed
 //! by URI races two sources that legitimately share one.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -175,6 +175,17 @@ pub trait CredentialedSource: Send + Sync {
 pub struct SourceProviders {
     upstream: SourceRegistry,
     credentialed: HashMap<String, Arc<dyn CredentialedSource>>,
+    /// Schemes this build *knows about* but cannot fetch, mapped to why.
+    ///
+    /// A third state beside served and unknown, added for the `-static` image
+    /// flavor (#270), which has no `git` binary and so cannot back `git+`. The
+    /// alternative — simply not registering the provider — is the silent
+    /// failure the source rules forbid: the scheme would vanish from every
+    /// listing and every refusal would blame the operator's spelling for an
+    /// image decision they never made. Registered-as-unavailable keeps the
+    /// scheme nameable, so a declaration is refused with the cause and the fix
+    /// instead of "no such scheme".
+    unavailable: BTreeMap<String, String>,
 }
 
 impl SourceProviders {
@@ -183,6 +194,7 @@ impl SourceProviders {
         Self {
             upstream,
             credentialed: HashMap::new(),
+            unavailable: BTreeMap::new(),
         }
     }
 
@@ -201,8 +213,61 @@ impl SourceProviders {
                      exactly one source"
                 );
             }
+            if self.unavailable.contains_key(*scheme) {
+                anyhow::bail!(
+                    "the `{scheme}:` scheme is both served and marked unavailable; a scheme is one \
+                     or the other"
+                );
+            }
             self.credentialed
                 .insert((*scheme).to_string(), provider.clone());
+        }
+        Ok(())
+    }
+
+    /// Record that `schemes` are known to this build but cannot be fetched by
+    /// it, and why.
+    ///
+    /// `reason` is operator-facing and must name both the cause and the fix —
+    /// it is rendered verbatim into the refusal a declaration gets.
+    ///
+    /// # Errors
+    /// If any of `schemes` is already served by a registered provider. Serving
+    /// and being unavailable are contradictory claims about the same scheme,
+    /// and resolving that quietly either way would produce exactly the
+    /// misleading answer this map exists to avoid.
+    pub fn register_unavailable(
+        &mut self,
+        schemes: &[&str],
+        reason: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        let reason = reason.into();
+        // Validated in full before anything is inserted. Interleaving the two
+        // would leave `self` holding the schemes checked so far when a later one
+        // bails — a half-registered provider set that still claims, by its own
+        // invariant, to be all-or-nothing. Callers abort the boot on this error
+        // today, which is the only reason that would not already be a bug.
+        for scheme in schemes {
+            if self.serves(scheme) {
+                anyhow::bail!(
+                    "the `{scheme}:` scheme is both served and marked unavailable; a scheme is one \
+                     or the other"
+                );
+            }
+            // Symmetric with `register_credentialed`'s refusal of a doubly-claimed
+            // scheme, and for the same reason: a second registration would
+            // silently replace the first one's reason, so whichever caller ran
+            // last would decide what operators are told.
+            if self.unavailable.contains_key(*scheme) {
+                anyhow::bail!(
+                    "the `{scheme}:` scheme is already marked unavailable; each scheme may be \
+                     explained exactly once"
+                );
+            }
+        }
+        for scheme in schemes {
+            self.unavailable
+                .insert((*scheme).to_string(), reason.clone());
         }
         Ok(())
     }
@@ -219,6 +284,47 @@ impl SourceProviders {
             .collect();
         schemes.sort();
         schemes
+    }
+
+    /// Every scheme this build knows but cannot fetch, sorted.
+    #[must_use]
+    pub fn unavailable_schemes(&self) -> Vec<String> {
+        self.unavailable.keys().cloned().collect()
+    }
+
+    /// The refusal `uri`'s scheme earns, or `None` if this build serves it.
+    ///
+    /// The single funnel for both declaration paths ([`SourcePuller::put`] and
+    /// [`SourcePuller::declare_and_pull`]) and for a stored record's
+    /// [`SourcePuller::pull`]. One function rather than three copies is what
+    /// makes "an unavailable scheme is never silently an unknown one" a
+    /// property of the type instead of a rule three call sites have to
+    /// remember — the restart-onto-a-static-image case reaches it through
+    /// `pull`, not through a declaration at all.
+    #[must_use]
+    pub fn scheme_refusal(&self, uri: &str) -> Option<String> {
+        let source_ref = SourceRef::new(uri);
+        let scheme = source_ref.scheme();
+        if self.serves(scheme) {
+            return None;
+        }
+        if let Some(reason) = self.unavailable.get(scheme) {
+            return Some(format!("`{scheme}:` sources are unavailable: {reason}"));
+        }
+        let mut msg = format!(
+            "no imposter source is registered for the `{scheme}:` scheme; this build serves: {}",
+            self.schemes().join(", ")
+        );
+        // Named even on the unknown-scheme path: an operator who typo'd
+        // `git+http:` on a static image needs to see that `git+https:` exists
+        // and why it is off, not a list that silently omits it.
+        if !self.unavailable.is_empty() {
+            msg.push_str(&format!(
+                "; unavailable in this build: {}",
+                self.unavailable_schemes().join(", ")
+            ));
+        }
+        Some(msg)
     }
 
     #[must_use]
@@ -372,6 +478,18 @@ impl SourcePuller {
         self.registry.schemes()
     }
 
+    /// The schemes this build knows but cannot fetch, sorted (#270).
+    #[must_use]
+    pub fn unavailable_schemes(&self) -> Vec<String> {
+        self.registry.unavailable_schemes()
+    }
+
+    /// The refusal `uri`'s scheme earns, or `None` if this build serves it.
+    #[must_use]
+    pub fn scheme_refusal(&self, uri: &str) -> Option<String> {
+        self.registry.scheme_refusal(uri)
+    }
+
     fn node(&self) -> Result<Arc<RaftNode>, PullError> {
         self.node
             .get()
@@ -402,7 +520,17 @@ impl SourcePuller {
             .ok_or_else(|| PullError::UnknownSource(id.to_owned()))?;
 
         let source_ref = SourceRef::new(record.uri.clone());
-        let scheme = source_ref.scheme().to_owned();
+
+        // Checked up front rather than inferred from a `None` fetch, because
+        // this is the path an *already-declared* source takes after a fleet
+        // restarts onto a `-static` image (#270). Its scheme was servable when
+        // the record was written and is not now, and "unavailable in this
+        // image, use the default flavor" is the only answer that points at the
+        // real cause — the unknown-scheme refusal would blame a URI that was
+        // correct when it was accepted.
+        if let Some(refusal) = self.scheme_refusal(&record.uri) {
+            return Err(PullError::BadRequest(refusal));
+        }
 
         // The credential *name* travels with the fetch; the secret is resolved
         // inside the provider and never returns here, so it cannot reach the
@@ -412,10 +540,12 @@ impl SourcePuller {
             .fetch(&source_ref, record.auth_ref.as_deref())
             .await
             .ok_or_else(|| {
-                PullError::BadRequest(format!(
-                    "no imposter source is registered for the `{scheme}:` scheme; this build \
-                     serves: {}",
-                    self.schemes().join(", ")
+                // Unreachable via the check above; `Internal` rather than
+                // `BadRequest` because reaching it would be a registry
+                // invariant break, not something the caller got wrong.
+                PullError::Internal(format!(
+                    "the `{}:` scheme passed the served check but resolved to no provider",
+                    source_ref.scheme()
                 ))
             })?
             .map_err(|e| PullError::Fetch {
@@ -574,13 +704,8 @@ impl SourcePuller {
         on_drift: OnDrift,
     ) -> Result<PullReport, PullError> {
         let node = self.node()?;
-        if !self.serves(uri) {
-            return Err(PullError::BadRequest(format!(
-                "no imposter source is registered for the `{}:` scheme (from {uri:?}); this build \
-                 serves: {}",
-                SourceRef::new(uri).scheme(),
-                self.schemes().join(", ")
-            )));
+        if let Some(refusal) = self.scheme_refusal(uri) {
+            return Err(PullError::BadRequest(format!("{refusal} (from {uri:?})")));
         }
         let request = mint(
             None,
@@ -659,12 +784,8 @@ impl SourcePuller {
         // validation: which schemes a node serves is per-node configuration,
         // so checking it inside `apply` would let two replicas disagree
         // about a committed op.
-        if !self.serves(&parsed.uri) {
-            return Err(PullError::BadRequest(format!(
-                "no imposter source is registered for the `{}:` scheme; this build serves: {}",
-                SourceRef::new(&parsed.uri).scheme(),
-                self.schemes().join(", ")
-            )));
+        if let Some(refusal) = self.scheme_refusal(&parsed.uri) {
+            return Err(PullError::BadRequest(refusal));
         }
         check_credential_use(self, parsed.auth_ref.as_deref(), &parsed.uri)
             .map_err(PullError::BadRequest)?;

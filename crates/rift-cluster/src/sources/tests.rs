@@ -322,3 +322,280 @@ fn a_bootstrap_id_is_always_a_valid_source_id() {
         );
     }
 }
+
+// -- unavailable schemes (#270) ---------------------------------------------
+//
+// The `-static` image flavor ships no `git` binary, so it cannot back `git+`.
+// The requirement is not merely that it boots: it is that the scheme stays
+// *nameable*. A provider that simply went unregistered would make an image
+// decision indistinguishable from an operator's typo — the silent failure the
+// source rules forbid.
+
+fn counting_upstream() -> SourceRegistry {
+    let mut upstream = SourceRegistry::new();
+    upstream
+        .register(Arc::new(CountingSource {
+            fetches: Arc::new(AtomicUsize::new(0)),
+            configs: vec![],
+            version: None,
+        }))
+        .expect("register the upstream scheme");
+    upstream
+}
+
+/// Must stay byte-identical to `compose.rs`'s private `NO_GIT_REASON`, which
+/// this crate cannot reach. The assertions below match on substrings, so a
+/// reword over there does not fail here loudly — it quietly makes these tests
+/// assert less than they claim. Change both.
+const NO_GIT: &str = "no `git` binary on PATH; install git, or use the default (non-static) image if this is `-static`";
+
+fn providers_with_git_unavailable() -> super::SourceProviders {
+    let mut providers = super::SourceProviders::new(counting_upstream());
+    providers
+        .register_unavailable(super::git::GIT_SCHEMES, NO_GIT)
+        .expect("git+ is unserved here, so it may be marked unavailable");
+    providers
+}
+
+#[test]
+fn an_unavailable_scheme_is_named_rather_than_missing() {
+    let providers = providers_with_git_unavailable();
+    assert!(
+        !providers.schemes().contains(&"git+https".to_owned()),
+        "an unavailable scheme is not a served one"
+    );
+    assert_eq!(
+        providers.unavailable_schemes(),
+        vec!["git+file".to_owned(), "git+https".to_owned()],
+        "both git schemes stay enumerable so a listing can say why they are off"
+    );
+}
+
+#[test]
+fn declaring_an_unavailable_scheme_names_the_cause_and_the_fix() {
+    let providers = providers_with_git_unavailable();
+    let refusal = providers
+        .scheme_refusal("git+https://example.com/repo#main:mocks.json")
+        .expect("a scheme this build cannot fetch is refused");
+
+    assert!(
+        refusal.contains("`git+https:` sources are unavailable"),
+        "the refusal must name the scheme: {refusal}"
+    );
+    assert!(
+        refusal.contains("no `git` binary on PATH"),
+        "the refusal must name the cause: {refusal}"
+    );
+    assert!(
+        refusal.contains("use the default (non-static) image"),
+        "the refusal must name the fix: {refusal}"
+    );
+    // The whole point of the unavailable map: this must NOT read as though the
+    // operator invented a scheme that does not exist.
+    assert!(
+        !refusal.contains("no imposter source is registered"),
+        "an unavailable scheme must never be reported as an unknown one: {refusal}"
+    );
+}
+
+/// `git+file:` reaches [`super::git::GitSource`] only in its `git+file://<path>`
+/// form, and the refusal funnel inherits exactly that.
+///
+/// Pinned here because **two scheme parsers disagree** about the single-colon
+/// spelling, which is a trap for anyone reading either one alone:
+/// upstream's `SourceRef::scheme` splits on `"://"` and calls
+/// `git+file:/srv/x` a `file:` URI, while this crate's
+/// `control::require_well_formed_uri` splits on `':'` and calls the same string
+/// `git+file` — so it is *validated* as git and then *routed* to `FileSource`.
+///
+/// That disagreement predates this issue and is identical on both image
+/// flavors (a git-present node routes it to `FileSource` too, and fails on a
+/// literal path). #270 neither causes it nor fixes it — filed separately — but
+/// the parse is asserted here so that a change to either parser fails a test
+/// instead of silently moving which provider a URI lands on.
+#[test]
+fn only_the_double_slash_git_file_spelling_routes_to_git() {
+    let providers = providers_with_git_unavailable();
+
+    let refusal = providers
+        .scheme_refusal("git+file:///srv/mocks.git#main:m.json")
+        .expect("the `//` form parses as git+file and is refused");
+    assert!(
+        refusal.contains("`git+file:` sources are unavailable"),
+        "{refusal}"
+    );
+
+    assert_eq!(
+        super::SourceRef::new("git+file:///srv/mocks.git#main:m.json").scheme(),
+        "git+file",
+        "the documented `//` spelling is what routes to the git provider"
+    );
+    assert_eq!(
+        super::SourceRef::new("git+file:/srv/mocks.git#main:m.json").scheme(),
+        "file",
+        "the single-colon spelling is a `file:` URI to the fetch path, whatever \
+         control-plane validation calls it"
+    );
+}
+
+#[test]
+fn an_unknown_scheme_refusal_still_names_what_is_unavailable() {
+    let providers = providers_with_git_unavailable();
+    let refusal = providers
+        .scheme_refusal("ftp://example.com/mocks.json")
+        .expect("ftp is served by nothing");
+
+    assert!(
+        refusal.contains("no imposter source is registered for the `ftp:` scheme"),
+        "{refusal}"
+    );
+    // An operator who typed `git+http:` on a static image lands here, and a
+    // list that quietly omitted `git+https:` would send them hunting for a
+    // spelling mistake instead of at the flavor.
+    assert!(
+        refusal.contains("unavailable in this build: git+file, git+https"),
+        "an unknown-scheme refusal must still disclose the disabled schemes: {refusal}"
+    );
+}
+
+#[test]
+fn a_served_scheme_earns_no_refusal() {
+    let providers = providers_with_git_unavailable();
+    assert!(
+        providers.scheme_refusal("counting://host/x.json").is_none(),
+        "marking git+ unavailable must not disturb the schemes this build does serve"
+    );
+}
+
+#[test]
+fn a_scheme_is_either_served_or_unavailable_never_both() {
+    let mut providers = super::SourceProviders::new(counting_upstream());
+    let err = providers
+        .register_unavailable(&["counting"], NO_GIT)
+        .expect_err("a scheme with a live provider may not also be marked unavailable");
+    assert!(
+        err.to_string()
+            .contains("both served and marked unavailable"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_scheme_may_not_be_explained_twice() {
+    let mut providers = providers_with_git_unavailable();
+    let err = providers
+        .register_unavailable(&["git+https"], "some other reason")
+        .expect_err("a second registration would silently replace the first one's reason");
+    assert!(
+        err.to_string().contains("already marked unavailable"),
+        "{err}"
+    );
+    assert!(
+        providers
+            .scheme_refusal("git+https://h/r#main:m.json")
+            .expect("still refused")
+            .contains("no `git` binary on PATH"),
+        "the original reason must survive a refused re-registration"
+    );
+}
+
+#[test]
+fn a_puller_refuses_an_unavailable_scheme_through_the_same_funnel() {
+    // Both declaration paths and `pull` route through `scheme_refusal`; this is
+    // the pass-through that carries it from the provider set to the puller the
+    // fronts actually hold.
+    let puller = SourcePuller::new(providers_with_git_unavailable());
+    let refusal = puller
+        .scheme_refusal("git+file:///srv/mocks#main:m.json")
+        .expect("refused");
+    assert!(
+        refusal.contains("`git+file:` sources are unavailable"),
+        "{refusal}"
+    );
+    assert_eq!(
+        puller.unavailable_schemes(),
+        vec!["git+file".to_owned(), "git+https".to_owned()]
+    );
+}
+
+/// The probe's own classification, exercised directly rather than through a
+/// hand-built error value.
+///
+/// This is the decision the whole `-static` flavor rests on: `NotFound` boots a
+/// node with `git+` disabled, and *every other* failure refuses the boot. A
+/// non-executable file is the cheap, sound way to produce the second case —
+/// POSIX answers `EACCES`, not `ENOENT` — with no `PATH` mutation and so no
+/// interference between parallel tests. Without this, nothing proves
+/// `probe_program` distinguishes them; the compose-arm tests are handed the
+/// answer.
+#[test]
+fn the_probe_calls_a_non_executable_file_unusable_not_absent() {
+    // `Cargo.toml` is present in the crate root at test time and is not
+    // executable — exactly the "a git exists but cannot be run" shape.
+    let err = super::git::GitSource::probe_program("./Cargo.toml")
+        .expect_err("a non-executable file is not a usable git");
+
+    assert!(
+        matches!(err, super::git::GitProbeError::SpawnFailed(_)),
+        "a present-but-unrunnable binary must NOT be classified as absent — that \
+         would boot a node with git+ silently disabled instead of refusing: {err:?}"
+    );
+}
+
+#[test]
+fn the_probe_calls_a_missing_binary_absent() {
+    let err = super::git::GitSource::probe_program("rift-no-such-binary-anywhere")
+        .expect_err("a missing binary is not a usable git");
+
+    assert!(
+        matches!(err, super::git::GitProbeError::NotFound(_)),
+        "absence is the one arm allowed to degrade, so it must be recognised: {err:?}"
+    );
+}
+
+/// The disjointness invariant is enforced from *both* registration functions;
+/// `a_scheme_is_either_served_or_unavailable_never_both` covers one direction,
+/// this covers the other. Worth testing separately because `scheme_refusal`
+/// consults `serves()` first, so a scheme that wrongly landed in both maps
+/// would produce **no symptom at all** there — it would simply read as served.
+#[test]
+fn a_scheme_already_unavailable_may_not_then_be_served() {
+    let mut providers = super::SourceProviders::new(counting_upstream());
+    providers
+        .register_unavailable(&["counting-2"], NO_GIT)
+        .expect("unserved, so it may be marked unavailable");
+
+    let err = providers
+        .register_credentialed(Arc::new(ClaimingSource {
+            schemes: &["counting-2"],
+        }))
+        .expect_err("a scheme marked unavailable may not also acquire a provider");
+    assert!(
+        err.to_string()
+            .contains("both served and marked unavailable"),
+        "{err}"
+    );
+}
+
+/// Claims a fixed scheme list and nothing else — enough to drive the
+/// registration guards without standing up a real provider.
+#[derive(Debug)]
+struct ClaimingSource {
+    schemes: &'static [&'static str],
+}
+
+impl super::CredentialedSource for ClaimingSource {
+    fn schemes(&self) -> &'static [&'static str] {
+        self.schemes
+    }
+
+    fn fetch_with_auth<'a>(
+        &'a self,
+        _r: &'a SourceRef,
+        _auth_ref: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<FetchedImposters>> + Send + 'a>,
+    > {
+        Box::pin(async { anyhow::bail!("ClaimingSource never fetches") })
+    }
+}
