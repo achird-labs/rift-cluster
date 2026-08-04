@@ -38,6 +38,58 @@ rift-cluster/
 
 ## Quick start
 
+Nothing here needs a checkout, a submodule or a Rust toolchain. Tagging `vX.Y.Z`
+publishes a multi-arch image and per-platform binaries, both carrying the web
+console.
+
+> **While this repository is private**, both the image and the raw file below are
+> too: `docker login ghcr.io` with a personal access token carrying `read:packages`
+> first, and fetch `cluster.yml` from a checkout or the release page rather than
+> `raw.githubusercontent.com`. Everything else on this page is unchanged. This
+> note goes away when the repo does.
+
+**A single node**, with the console and the probe endpoints:
+
+```sh
+docker run -p 2525:2525 -p 2526:2526 \
+  -e RIFT_CLUSTER=true \
+  -e RIFT_CLUSTER_BIND=127.0.0.1:4790 \
+  -e RIFT_CLUSTER_ALLOW_SOLO=true \
+  -e RIFT_CLUSTER_SECRET=local-dev-secret \
+  ghcr.io/achird-labs/rift-cluster-server:0.1.0
+
+curl -s localhost:2525/imposters          # admin API
+open http://localhost:2525/console        # the web console
+```
+
+A cluster of one, rather than the plain server, because **the console and the
+`/readyz` probe are part of the clustered composition**: with `--cluster` off
+this binary is the open-source server byte for byte, and the open-source server
+has neither. `docker run -p 2525:2525 <image>` on its own is perfectly valid and
+gives you exactly that — a Mountebank-compatible mock server on `:2525` — but
+`/console` answers `404`, nothing binds `2526`, and because the image's health
+check probes `2526` Docker will mark the container `unhealthy` while it serves
+happily. See [`deploy/README.md`](deploy/README.md#a-single-node) for the whole
+comparison.
+
+**A real 3-node cluster**, from the published image — one file, no clone:
+
+```sh
+curl -sSLO https://raw.githubusercontent.com/achird-labs/rift-cluster/master/deploy/compose/cluster.yml
+docker compose -f cluster.yml up -d
+
+curl -s localhost:12526/readyz            # rift-1 probes
+curl -s localhost:19090/metrics | grep rift_cluster
+```
+
+**Or a binary**, from the GitHub Release — see
+[*Installing from a release*](docs/rift-cluster-server.md#installing-from-a-release)
+for the checksum and macOS quarantine steps.
+
+## Building from source
+
+Only needed to develop RiftCluster itself; running it needs none of this.
+
 ```sh
 git clone --recurse-submodules git@github.com:achird-labs/rift-cluster.git
 cd rift-cluster
@@ -51,7 +103,7 @@ Run the cluster server — identical to the open-source `rift` without
 cargo run -p rift-cluster-server -- --port 2525 --datadir ./data
 ```
 
-Or run a real 3-node cluster:
+Or build and run a real 3-node cluster from this checkout:
 
 ```sh
 deploy/compose/verify.sh   # builds, starts 3 nodes, asserts they form one cluster

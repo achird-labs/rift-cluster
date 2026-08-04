@@ -54,6 +54,17 @@ jobs:
       - name: Chaos quarantine tags
         run: scripts/chaos-quarantine.sh check
 
+      # The static half of the pull-not-build proof (#269). Here rather than in
+      # `cluster-smoke` for the same reason as the step above — that job is
+      # path-filtered, and the criterion this enforces ("no quick start begins
+      # with a clone") is regressed by editing a README, which watches nothing.
+      #
+      # The other half of the script needs a published image and so can only run
+      # in the release lane; this half needs no daemon at all, which is what lets
+      # it run on every PR and keep `cluster.yml` from rotting between releases.
+      - name: Pull-not-build manifest and quick starts
+        run: deploy/compose/verify-pulled.sh --check
+
       # Same reasoning, one level up: `cluster-smoke`'s path filter decides
       # whether the chaos tier runs at all, and when it is wrong the tier is
       # skipped and the check goes green having tested nothing. It has to be
