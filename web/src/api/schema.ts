@@ -14,6 +14,7 @@ export interface paths {
         /**
          * List imposters (upstream, filtered to the caller's owned ports)
          * @description Proxied to the embedded engine's own admin API, which now binds every tenant's imposters in-process — this front filters the response body down to ports the caller's tenant owns before returning it, since the engine has no tenant concept of its own. Runs the same tenant-binding gate as every other route, so an unbound `X-Rift-Tenant` claim answers `404` (RFC-002 §8.4).
+         *     Each entry's `numberOfRequests` is then rewritten to the fleet sum (issue #223), the same decoration `getImposter` documents in full, fetched for every listed port in one round trip per peer. `Rift-Cluster-Partial` marks the rare case where a peer could not be reached in time.
          */
         get: operations["listImposters"];
         /**
@@ -48,7 +49,8 @@ export interface paths {
         };
         /**
          * Read one imposter (upstream)
-         * @description The body is upstream's own imposter detail, proxied verbatim. The `Rift-Cluster-Revision` header is the EE front's addition (C5): the exact `If-Match` token a conditional write on this imposter or its stubs will be judged against, read from the same applied record the precondition checks. Absent when the applied state holds no record to condition on. Only this single-imposter read carries it — the listing names no single conditionable record.
+         * @description The body is upstream's own imposter detail, proxied verbatim, except for one field: `numberOfRequests` is rewritten in place to the fleet sum (issue #223) — upstream's own value is this node's local G-counter slot only, fetched fleet-wide over the cluster RPC port under the same 2 s budget the merged journal read uses. `Rift-Cluster-Partial` marks the rare case where a peer could not be reached in time.
+         *     The `Rift-Cluster-Revision` header is the EE front's addition (C5): the exact `If-Match` token a conditional write on this imposter or its stubs will be judged against, read from the same applied record the precondition checks. Absent when the applied state holds no record to condition on. Only this single-imposter read carries it — the listing names no single conditionable record.
          */
         get: operations["getImposter"];
         put?: never;
@@ -208,17 +210,20 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List recorded requests for an imposter (upstream)
-         * @description Answers a **bare JSON array** of recorded requests, oldest first — not an envelope. Cursor metadata rides in the `x-rift-next-index` and `x-rift-truncated` response headers instead of the body, which is what keeps the array readable by clients written before cursoring existed.
-         *     `/imposters/{port}/requests` is an alias for this route: upstream `router.rs` maps both spellings to the same handler, so the two operations describe identical bytes and are kept identical here.
-         *     Node-local runtime state; not replicated (tracked by issue #16).
+         * List recorded requests for an imposter, merged across the fleet
+         * @description Without `since` **and** without `match`, the cluster front **terminates** this route (issue #223) rather than proxying: it merges this node's own writer shard with every other roster peer's, pulled live under a 2 s fleet-wide budget, and falls back to the last anti-entropy-cached copy of any peer that misses it. Answers a **bare JSON array** of recorded requests, ordered by each entry's own recorded timestamp (never a node-local arrival clock, which would let two nodes disagree about the order) — not an envelope. `matchOutcome` survives on every entry unchanged. Carries no `x-rift-next-index`/`x-rift-truncated`: a merged read has no single cursor that means the same thing on every shard, so it withholds both rather than publish one that would silently mislead a client into thinking it does.
+         *     With `since` **or** `match` present, this proxies to the local engine exactly as before #223 — `since` is a scalar cursor that cannot address a multi-writer merge, so that case is out of scope here and stays #225's; `match` is a predicate the merge-on-read path never evaluates at all, so terminating on it would silently answer with the *whole* fleet's requests instead of the caller's scoped subset, and turn a malformed filter's upstream `400` into a `200` with everything. Both proxy verbatim, leaving upstream's own clause parser and its existing error handling in charge either way. `x-rift-next-index`/`x-rift-truncated` are only ever emitted on that proxied path.
+         *     `/imposters/{port}/requests` is an alias: `classify` collapses both spellings onto the same handler, so the two operations describe identical bytes and are kept identical here. So are both spellings under `/admin/imposters/{port}/...` (issue #223 review): the alias `classify` already gave the imposter listing is extended here too, so a caller cannot get a different answer by spelling the path differently.
          */
         get: operations["listSavedRequests"];
         put?: never;
         post?: never;
         /**
-         * Clear recorded requests for an imposter (upstream)
-         * @description Clears the journal and answers the imposter's current state. Accepts `match` — and only `match`, not `since` — so a clear can be narrowed to the entries a filter selects; with no clause the whole journal is dropped. Aliased as `DELETE /imposters/{port}/requests`.
+         * Clear recorded requests for an imposter, fanned out to the fleet
+         * @description Terminates (issue #223 item 4): clears this node's own journal through the same local engine call as before, honouring `match` — and only `match`, never `since` — exactly as it always did.
+         *     **Without `match`**: best-effort fans an unconditional full clear out to every other roster peer over the cluster RPC port. **Explicitly transitional** — a peer missed by the fan-out (partition, crash, slower than the 2 s budget) keeps the deleted entries until #224 replaces this whole mechanism with a Raft-committed clear that converges by consensus; `Rift-Cluster-Partial` says whether every peer confirmed.
+         *     **With `match`** (issue #223 review, B3 — a design decision, not a gap): the clear stays **local-only** and is never fanned out. The wire fan-out has nowhere to carry a match predicate, so propagating a scoped clear as an unconditional full clear would over-delete whatever else that port holds on every other node — a different flow, a different tenant's traffic sharing the port. `Rift-Cluster-Partial` is stamped unconditionally in this case, not because a peer was unreachable but because the clear itself never reached them by design, so a client cannot mistake a scoped, local clear for a fleet-complete one.
+         *     Answers the imposter's current state either way. Aliased as `DELETE /imposters/{port}/requests`, and — issue #223 review — as both spellings under `/admin/imposters/{port}/...` too.
          */
         delete: operations["clearSavedRequests"];
         options?: never;
@@ -237,16 +242,16 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List matched requests for an imposter (upstream)
-         * @description The alias spelling of `GET /imposters/{port}/savedRequests` — upstream `router.rs` maps `["requests"]` and `["savedRequests"]` to the same handler, so this answers the identical body and headers. Declared in full rather than by reference because a generated client reads each operation independently.
-         *     Answers a **bare JSON array** of recorded requests, oldest first — not an envelope. Cursor metadata rides in the `x-rift-next-index` and `x-rift-truncated` response headers instead of the body.
+         * List matched requests for an imposter, merged across the fleet
+         * @description The alias spelling of `GET /imposters/{port}/savedRequests` — `classify` maps both spellings to the same handler, so this answers the identical body and headers. Declared in full rather than by reference because a generated client reads each operation independently.
+         *     Without `since` and without `match`, terminates as the fleet merge-on-read `savedRequests` documents in full; with either present, proxies to the local engine (`since` is #225's territory; `match` is a predicate the merge-on-read path never evaluates). See that operation's description for the whole contract, including why no cursor header is ever emitted on the merged path.
          */
         get: operations["listRequests"];
         put?: never;
         post?: never;
         /**
-         * Clear matched requests for an imposter (upstream)
-         * @description The alias spelling of `DELETE /imposters/{port}/savedRequests` — the same handler, so the same parameters, body and status codes.
+         * Clear matched requests for an imposter, fanned out to the fleet
+         * @description The alias spelling of `DELETE /imposters/{port}/savedRequests` — the same handler, so the same parameters, body, status codes and transitional fan-out contract.
          */
         delete: operations["clearRequests"];
         options?: never;
@@ -1715,6 +1720,8 @@ export interface components {
         XRiftNextIndex: number;
         /** @description Present, with the value `true`, when retention evicted entries the caller's `since` cursor had not yet read — the gap is unrecoverable and the client has silently missed requests. Emitted **only** when that is the case: there is no `false` form, so a client tests for the header's presence and never parses its value. */
         XRiftTruncated: true;
+        /** @description A fleet merge-on-read (issue #223) could not confirm every roster peer within its budget: the merged journal entries, the fleet `numberOfRequests` decoration on getImposter/listImposters, or the transitional clearSavedRequests/clearRequests fan-out. Emitted **only** when at least one peer was unreachable or too slow — there is no `false` form, exactly like `x-rift-truncated`, and a Ch.12 strict-mode gate asserts its absence on a fully healthy answer. Never means a peer's data was dropped from the answer: whatever the last anti-entropy pass cached for that peer still merges in, so this says "possibly missing something newer," never "missing that peer entirely." */
+        RiftClusterPartial: true;
     };
     pathItems: never;
 }
@@ -1735,6 +1742,7 @@ export interface operations {
             /** @description The caller's tenant's imposters. */
             200: {
                 headers: {
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1928,6 +1936,7 @@ export interface operations {
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2586,6 +2595,7 @@ export interface operations {
                 headers: {
                     "x-rift-next-index": components["headers"]["XRiftNextIndex"];
                     "x-rift-truncated": components["headers"]["XRiftTruncated"];
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2630,6 +2640,7 @@ export interface operations {
             /** @description Requests cleared; answers the imposter as it now stands. */
             200: {
                 headers: {
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2678,6 +2689,7 @@ export interface operations {
                 headers: {
                     "x-rift-next-index": components["headers"]["XRiftNextIndex"];
                     "x-rift-truncated": components["headers"]["XRiftTruncated"];
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -2722,6 +2734,7 @@ export interface operations {
             /** @description Requests cleared; answers the imposter as it now stands. */
             200: {
                 headers: {
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
