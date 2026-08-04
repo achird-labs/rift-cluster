@@ -16,10 +16,9 @@ The artifacts, in increasing order of how much they promise:
 
 One file and Docker. No clone, no submodule, no toolchain:
 
-> **While this repository is private** the raw URL below 404s and the image needs
-> credentials: `docker login ghcr.io` with a token carrying `read:packages`, and
-> take `cluster.yml` from a checkout or the release page. The rest is unchanged;
-> this note goes away when the repo does.
+> **No version has been tagged yet**, so the image and the raw URL below do not
+> exist. Until `v0.1.0` is cut, build from a checkout — `deploy/compose/verify.sh`
+> stands up the same 3-node cluster from source.
 
 ```sh
 curl -sSLO https://raw.githubusercontent.com/achird-labs/rift-cluster/master/deploy/compose/cluster.yml

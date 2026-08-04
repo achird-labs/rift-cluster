@@ -425,7 +425,7 @@ The imposter record (`StoredImposter`, `store.rs:122`) gains cluster-side
 fields `provenance: Option<{spec_id, digest}>` and `drifted: bool` — stored
 on the control-plane record only, invisible to the core config schema,
 exactly like RFC-002's `tenant` (§3.2 there; same open-core rule,
-`11-open-core.md`).
+`11-upstream-boundary.md`).
 
 Tenancy: every op carries `TenantId` like the existing set; until RFC-002
 lands, `validate` pins it to `default` exactly as `require_default_tenant`
