@@ -52,7 +52,7 @@ scripts/sync-upstream.sh
    "../rift-cluster-base" }`), never on `rift-mock-core` / `rift-http-proxy` directly.
    `rift-cluster-base` re-exports the core crates plus the upstream extension seams under
    `rift_cluster_base::seams`; keeping it the sole path means Cargo enforces the
-   open-core boundary instead of a convention nobody checks. Only `rift-cluster-base`
+   upstream boundary instead of a convention nobody checks. Only `rift-cluster-base`
    itself carries the vendored path deps (declared in `[workspace.dependencies]`
    at the root).
 3. Extend the core through those seams (flow store, sequencer, journal, proxy

@@ -5,6 +5,19 @@
 # that would break one of those arguments is called out below rather than left to be discovered.
 
 image:
+  # The DEFAULT (non-static) flavor, deliberately — do not point `tag` below at a `-static` tag.
+  #
+  # `-static` is the smaller, OS-less flavor (`FROM scratch`), so switching looks like a free win:
+  # zero OS packages, narrower CVE surface. It is not free here. Every pod's container command in
+  # this chart is `/bin/sh -c` — the ordinal-0 bootstrap branch is a shell script — and that command
+  # is on the pod template, so it is uniform across ordinals. A `-static` image therefore fails
+  # EVERY pod with a container exec error, not just the founding one. A `-static` fleet also serves
+  # no `git+https:`/`git+file:` imposter sources at all.
+  #
+  # The template refuses a `-static` tag at render time rather than letting you find this out at
+  # rollout. That guard reads `tag`, which is where the flavor is published (`vX.Y.Z-static`,
+  # `latest-static`) — mirroring the static image into a repository whose own NAME ends in
+  # `-static` is not something it can catch. See the image-flavors table in deploy/README.md.
   repository: ghcr.io/achird-labs/rift-cluster-server
   # Empty means "the chart's appVersion". Pinning a tag here is the normal thing to do in an
   # environment that cares about reproducibility; `latest` is deliberately not the default.

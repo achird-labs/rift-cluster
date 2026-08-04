@@ -56,8 +56,28 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app: rift-cluster-server
 {{- end -}}
 
+{{/*
+The container image, and the guard that the flavor can actually run this chart.
+
+The `-static` flavor is `FROM scratch`, and every pod's container command in this chart is
+`/bin/sh -c` (statefulset.yaml) — the ordinal-0 bootstrap branch is a shell script. That command
+sits on the pod template, so it is uniform across ordinals: a `-static` image does not degrade the
+founding node, it fails EVERY pod with a container exec error, and only at rollout. Refusing at
+render time turns that into a sentence at `helm install`, the same trade `rift-cluster.secretName`
+below makes.
+
+The effective tag is computed here, so an explicit `image.tag` is what gets checked; the default
+(`.Chart.AppVersion`) is a published chart version and can never carry the suffix.
+*/}}
 {{- define "rift-cluster.image" -}}
-{{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) -}}
+{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- if not (kindIs "string" $tag) -}}
+{{- fail "image.tag must be quoted. An unquoted YAML number (`tag: 1.2`) parses as a float, not a string — and quoting is the fix, not something the chart can do for you: coercing 1.10 back to a string would yield the tag `1.1`, which resolves to a different image than the one you asked for." -}}
+{{- end -}}
+{{- if hasSuffix "-static" $tag -}}
+{{- fail "image.tag: the `-static` flavor is FROM scratch — no shell — and this chart runs a shell script as EVERY pod's container command (the ordinal-0 bootstrap branch), so all pods would fail at exec. A -static fleet also serves no git+ imposter sources. Use the default flavor; see the image-flavors table in deploy/README.md." -}}
+{{- end -}}
+{{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
 
 {{/*

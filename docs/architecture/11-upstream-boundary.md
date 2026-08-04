@@ -1,8 +1,14 @@
-# Chapter 11 — The Open-Core Boundary
+# Chapter 11 — The Upstream Boundary
 
-RiftCluster is layered on an unmodified, Apache-2.0 Rift. That sentence is a
-product commitment, an engineering discipline, and a build-system invariant —
-this chapter covers all three.
+RiftCluster is layered on an unmodified, Apache-2.0 Rift. That sentence is an
+engineering discipline and a build-system invariant — this chapter covers both.
+
+> **Note (2026-08-04):** this chapter was written under an open-core model, where
+> the boundary also separated a free edition from a paid one. That split is
+> retired: everything is Apache-2.0, nothing is withheld, and there is no paid
+> edition. What survives is the *technical* boundary described here — which code
+> lives upstream, which stays in the cluster crates, and how Cargo enforces it.
+> That part was always the valuable half.
 
 ## The shape: seams upstream, brains cluster
 
