@@ -225,18 +225,153 @@
       "description": "Raw metric (no recording rule yet). This is also the series that bounds the Latency Analytics dashboard's match-rate overcount."
     },
     {
+      "id": 7,
+      "title": "Merged reads stamped partial",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:journal_partial_reads:rate5m",
+          "legendFormat": "partial reads/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Rate of merge-on-read answers stamped Rift-Cluster-Partial. Zero is the healthy steady state; this panel exists so that non-zero is seen rather than inferred from a response header nobody is watching. A sustained non-zero rate means a rostered peer is unreachable or over budget, and verification reads may be missing recent entries. Alerts as RiftJournalReadsDegraded after 10m."
+    },
+    {
+      "id": 8,
+      "title": "Journal merge latency (in-memory)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:journal_merge_seconds:p95",
+          "legendFormat": "p95",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:journal_merge_seconds:p99",
+          "legendFormat": "p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Duration of one in-memory k-way merge across this node's cached shards. NOT the peer fan-out: that is a separate phase with a ~2s budget and no histogram, so nothing here indicates budget pressure. The registered buckets top out at 0.5s because this is a sort over retained entries, not I/O. Read it as merge cost growing with shard count or entry volume."
+    },
+    {
+      "id": 9,
+      "title": "Peer pull failures by peer",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:journal_peer_pull_failures:rate5m",
+          "legendFormat": "peer {{peer}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Rate of failed anti-entropy journal pulls, kept per peer. The label is the diagnostic: one elevated line means one bad node, every line elevated means this node is partitioned from the fleet. Failures that do not degrade a read are the replica cache working, which is why this panel does not alert on its own."
+    },
+    {
       "id": 6,
-      "title": "Journal families not yet registered",
+      "title": "Proxy-claim families not yet registered",
       "type": "text",
       "gridPos": {
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 16
+        "y": 24
       },
       "options": {
         "mode": "markdown",
-        "content": "### Not shown on this dashboard\n\nThe journal **partial-reads**, **merge-latency**, and **peer-pull-failure** panels are\ndeliberately absent. Their metric families \u2014\n`rift_cluster_journal_partial_reads_total`, `rift_cluster_journal_merge_seconds`, and\n`rift_cluster_journal_peer_pull_failures_total` \u2014 are not registered yet. They arrive\nwith issues #223 and #226.\n\nAn empty panel bound to a metric that does not exist would render as a silent\n\"No data\" that looks identical to a healthy-but-quiet system. That is worse than\nthis note: it invites reading \"no data\" as \"no problem.\" When #223/#226 land, add\nthe panels here and delete this note.\n"
+        "content": "### Not shown on this dashboard\n\nThe **proxyOnce owner-claim** panels are deliberately absent. Their metric families arrive with issue #226 and are not registered yet.\n\nAn empty panel bound to a metric that does not exist renders as a silent \"No data\" that looks identical to a healthy-but-quiet system \u2014 worse than this note, because it invites reading \"no data\" as \"no problem.\" When #226 lands, add the panels here and delete this note.\n\nThe journal partial-read, merge-latency and peer-pull-failure panels this note used to cover landed with issue #319, once #223 registered their families.\n"
       },
       "fieldConfig": {
         "defaults": {},

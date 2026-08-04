@@ -118,16 +118,34 @@ Two different bounds, and the distinction matters:
   a 0.001 one), and at high traffic it is vacuous. The normalised expression
   is plotted next to the match-rate stat for exactly this cross-check.
 
-## Verification Plane: some panels are deliberately absent
+## Verification Plane: the journal panels, and what is still absent
 
-The Verification Plane dashboard does not have panels for journal
-partial-reads, merge latency, or peer-pull failures. Those metric families
-(`rift_cluster_journal_partial_reads_total`,
-`rift_cluster_journal_merge_seconds`,
-`rift_cluster_journal_peer_pull_failures_total`) are not registered yet —
-they arrive with issues #223 and #226. The dashboard has a text panel saying
-so in place of empty "No data" panels, which would be indistinguishable from
-a healthy-but-quiet system.
+Three panels cover merge-on-read's honesty signals (issue #319, once #223
+registered their families):
+
+| panel | rule | reads as |
+|---|---|---|
+| Merged reads stamped partial | `rift:journal_partial_reads:rate5m` | zero is healthy; sustained non-zero means a rostered peer is unreachable and verification reads may be missing recent entries |
+| Journal merge latency (in-memory) | `rift:journal_merge_seconds:p95` / `:p99` | merge cost growing with shard count or entry volume |
+| Peer pull failures by peer | `rift:journal_peer_pull_failures:rate5m` | one line elevated = one bad node; every line elevated = this node is partitioned |
+
+**The latency panel is not budget pressure.** `rift_cluster_journal_merge_seconds`
+times only the in-memory k-way merge over cached shards — the peer fan-out is a
+separate phase with a ~2 s budget and no histogram at all. The registered
+buckets top out at 0.5 s for exactly that reason. A panel or alert reading
+"approaching the budget" from this family would be reading it wrong.
+
+Only the partial-read rate alerts (`RiftJournalReadsDegraded`, `for: 10m`).
+Merge latency has no SLO to breach, and per-peer failures that do not degrade a
+read are the replica cache doing its job — alerting on either would be alerting
+on the system working. The 10 m window exists because transient partials during
+a rolling restart are `Rift-Cluster-Partial` behaving as designed; a shorter
+window pages on every deploy until someone mutes it.
+
+**Still absent:** the proxyOnce owner-claim panels. Those families arrive with
+issue #226 and are not registered yet, so the dashboard carries a text panel
+saying so rather than empty "No data" panels, which would be indistinguishable
+from a healthy-but-quiet system.
 
 ## Compose smoke
 

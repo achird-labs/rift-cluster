@@ -232,3 +232,132 @@ tests:
         exp_samples:
           - value: 230
             labels: 'rift:journal_entries:sum'
+
+  # -- The journal rules (issue #319) ------------------------------------
+  #
+  # These are the first counter-rate rules in this file to carry a unit test,
+  # so the shape is stated once here rather than per-case: six samples at 1m
+  # spacing (0 0 0 0 0 V) evaluated at 5m over a [5m] window. Unlike the
+  # bucket-merge proof above, `rate()`'s counter extrapolation does NOT cancel
+  # out for a bare rate — there is no ratio for it to divide away — so the
+  # pinned numbers below are Prometheus's extrapolated values, which land
+  # between V/300 (the naive per-window rate) and V/240 (the rate across the
+  # observed sample span). They are pinned to catch a rule being edited into a
+  # different aggregation, not to re-derive Prometheus's extrapolation
+  # constant.
+  - interval: 1m
+    input_series:
+      # Two nodes stamping partial reads; the rule sums across the fleet
+      # because "is the fleet answering degraded reads" is one question, not
+      # three.
+      - series: 'rift_cluster_journal_partial_reads_total{instance="rift-1"}'
+        values: '0 0 0 0 0 60'
+      - series: 'rift_cluster_journal_partial_reads_total{instance="rift-2"}'
+        values: '0 0 0 0 0 15'
+      # Peer pull failures keep `peer`: one elevated line means one bad node,
+      # every line elevated means this node is cut off from the fleet. Summing
+      # the label away would erase exactly that distinction.
+      - series: 'rift_cluster_journal_peer_pull_failures_total{instance="rift-1", peer="2"}'
+        values: '0 0 0 0 0 30'
+      - series: 'rift_cluster_journal_peer_pull_failures_total{instance="rift-3", peer="2"}'
+        values: '0 0 0 0 0 30'
+      - series: 'rift_cluster_journal_peer_pull_failures_total{instance="rift-1", peer="3"}'
+        values: '0 0 0 0 0 0'
+    promql_expr_test:
+      # Fleet-wide, instance summed away.
+      - expr: rift:journal_partial_reads:rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="rift:journal_partial_reads:rate5m"}'
+            value: 0.25
+      # `peer` survives, `instance` does not. Two nodes each failing to reach
+      # peer 2 at 0.1/s sum to 0.2/s — the value adds across observers rather
+      # than collapsing to "one bad peer", which is what makes this a rate of
+      # failed pulls and not a count of peers. Pinned so that reading stays
+      # explicit.
+      - expr: rift:journal_peer_pull_failures:rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="rift:journal_peer_pull_failures:rate5m", peer="2"}'
+            value: 0.2
+          - labels: '{__name__="rift:journal_peer_pull_failures:rate5m", peer="3"}'
+            value: 0
+
+  # Merge latency is the IN-MEMORY k-way merge over cached shards — not the
+  # peer fan-out, which is a different phase with its own budget and no
+  # histogram. The buckets top out at 0.5s for that reason. This case pins
+  # that the quantile is computed over le-merged buckets across instances, the
+  # same bucket-merge property the latency proof above establishes.
+  - interval: 1m
+    input_series:
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-1", le="0.0001"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-1", le="0.0005"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-1", le="0.001"}'
+        values: '0 0 0 0 0 90'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-1", le="0.005"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-1", le="0.01"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-1", le="0.05"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-1", le="0.1"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-1", le="0.5"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-1", le="+Inf"}'
+        values: '0 0 0 0 0 100'
+      # A SECOND instance is what makes this case test the merge at all. With
+      # one instance, `sum by (le)` and `sum by (le, instance)` produce the same
+      # single series, so a rule that failed to merge across nodes would pass
+      # unnoticed; with two, the un-merged form yields two series and the pinned
+      # single sample no longer matches.
+      #
+      # Note what this canNOT catch, so nobody adds instances hoping it will:
+      # `sum by (le)` vs `avg by (le)` is undetectable through a quantile at any
+      # number of instances. `avg` is `sum` divided by a constant that is the
+      # same for every `le`, and `histogram_quantile` only ever takes ratios
+      # between cumulative bucket counts — so the divisor cancels exactly the way
+      # this file's header describes `rate()`'s extrapolation constant cancelling.
+      # rift-2 is slower than rift-1 (nothing at or below 1ms), which is what
+      # moves the merged quantile away from either node's own.
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-2", le="0.0001"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-2", le="0.0005"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-2", le="0.001"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-2", le="0.005"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-2", le="0.01"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-2", le="0.05"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-2", le="0.1"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-2", le="0.5"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_cluster_journal_merge_seconds_bucket{instance="rift-2", le="+Inf"}'
+        values: '0 0 0 0 0 100'
+    promql_expr_test:
+      # Merged: 90 of 200 observations at or below 1ms, 200 at or below 5ms.
+      # p95 is rank 190, so it interpolates 100/110 of the way into the
+      # 1ms..5ms bucket -> 0.001 + 0.909... x 0.004. p99 is rank 198 -> 108/110.
+      # Pinned as the IEEE-754 doubles Prometheus produces, because promtool
+      # compares floats bit-for-bit; these also couple the file to the pinned
+      # PROM_IMAGE, as the pre-existing fixtures above already do.
+      - expr: rift:journal_merge_seconds:p95
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="rift:journal_merge_seconds:p95"}'
+            value: 4.636363636363636e-03
+      # 0.0046 in exact arithmetic (0.001 + 0.9 x 0.004); pinned as the IEEE-754
+      # double Prometheus actually produces, because promtool compares floats
+      # bit-for-bit and rounding it would make the test fail for a reason that
+      # has nothing to do with the rule.
+      - expr: rift:journal_merge_seconds:p99
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="rift:journal_merge_seconds:p99"}'
+            value: 4.927272727272727e-03

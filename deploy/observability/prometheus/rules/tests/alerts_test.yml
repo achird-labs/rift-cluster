@@ -7,6 +7,12 @@
 # simple instead of having to reproduce Prometheus's template rendering.
 rule_files:
   - ../alerts.yml
+  # Recording rules are loaded too, because an alert may be expressed over one
+  # (RiftJournalReadsDegraded fires on `rift:journal_partial_reads:rate5m`).
+  # Without this the alert's expression evaluates against an undefined series,
+  # returns nothing, and the test reports "never fires" — which reads exactly
+  # like a broken threshold rather than a missing input.
+  - ../recording.yml
 
 # The rule group's OWN evaluation cadence during this simulated walk — NOT
 # the same thing as a test's `interval:` below, which only spaces out the
@@ -107,3 +113,51 @@ tests:
       - eval_time: 4m
         alertname: RiftClusterBindFailures
         exp_alerts: [] # port healed — cleared
+
+  # -- RiftJournalReadsDegraded (issue #319) -----------------------------
+  #
+  # `for: 10m` is the whole design of this alert, so both halves are pinned:
+  # a burst of partial reads during a rolling restart is `Rift-Cluster-Partial`
+  # working as intended and must NOT page, while a sustained rate means a
+  # rostered peer is unreachable and merged reads are persistently degraded,
+  # which is operator-actionable. A shorter window would page on every deploy
+  # and the alert would be muted within a week.
+  - interval: 1m
+    input_series:
+      # A counter that keeps climbing: every scrape adds partial reads.
+      - series: 'rift_cluster_journal_partial_reads_total{instance="rift-1"}'
+        values: '0+60x20'
+    alert_rule_test:
+      # Pending, not firing, well inside the window.
+      - eval_time: 5m
+        alertname: RiftJournalReadsDegraded
+        exp_alerts: []
+      # Still inside the window at 10m — `for:` requires the condition to have
+      # held for the full duration before it fires.
+      - eval_time: 10m
+        alertname: RiftJournalReadsDegraded
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: RiftJournalReadsDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Fleet journal reads are persistently degraded"
+              description: "rift:journal_partial_reads:rate5m has been above zero for 10 minutes: merged savedRequests reads are being stamped Rift-Cluster-Partial, so a rostered peer is unreachable or over budget and verification reads may be missing recent entries. Transient partials during a rolling restart are by design and are why the window is 10m rather than shorter; a sustained rate is not. Check rift:journal_peer_pull_failures:rate5m to see which peer."
+
+  # The blip that must not page: partial reads for one scrape, then nothing.
+  - interval: 1m
+    input_series:
+      - series: 'rift_cluster_journal_partial_reads_total{instance="rift-1"}'
+        values: '0 0 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5'
+    alert_rule_test:
+      # Mid-window as well as after it: asserting only the late point would not
+      # show the alert never fired *during* the blip, only that it had cleared
+      # by then.
+      - eval_time: 7m
+        alertname: RiftJournalReadsDegraded
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: RiftJournalReadsDegraded
+        exp_alerts: []

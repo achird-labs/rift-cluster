@@ -164,3 +164,51 @@ groups:
       # stays.
       - record: rift:journal_evictions:rate5m
         expr: sum by (reason) (rate(rift_cluster_journal_evictions_total[5m]))
+
+      # -- Merge-on-read, the verification plane's honesty signals (#319) --
+      #
+      # These three families landed with #223 and were deliberately omitted
+      # from the pack #227 shipped, because at that time they were not yet
+      # registered and #227's acceptance criterion is that no rule or panel
+      # references an unregistered family. They are registered now
+      # (crates/rift-cluster/src/metrics.rs), so the omission has flipped from
+      # correct to a gap.
+
+      # `Rift-Cluster-Partial: true` is the user-visible symptom; this is its
+      # rate. Summed across instances on purpose: "is the fleet answering
+      # degraded reads" is one question. Zero is the healthy steady state, and
+      # the rule exists so that non-zero is *seen* rather than inferred from a
+      # header nobody is looking at.
+      - record: rift:journal_partial_reads:rate5m
+        expr: sum(rate(rift_cluster_journal_partial_reads_total[5m]))
+
+      # Total failed pulls per second, per unreachable peer. `peer` is kept and
+      # `instance` summed away: one elevated line names one peer the fleet is
+      # struggling to reach, and several elevated lines mean several peers are.
+      #
+      # Be precise about what summing `instance` away costs, since the obvious
+      # reading is wrong: the value ADDS across observers, so a peer that two
+      # nodes cannot reach reads twice as high as one that only one node cannot
+      # reach. That is deliberate — it is a rate of failed pulls, not a count of
+      # bad peers — but it means this rule cannot tell you "*this* node is cut
+      # off from everyone", because the reporting node is exactly what was summed
+      # away. Answering that needs the per-instance series, or `max by (peer)`.
+      - record: rift:journal_peer_pull_failures:rate5m
+        expr: sum by (peer) (rate(rift_cluster_journal_peer_pull_failures_total[5m]))
+
+      # `rift_cluster_journal_merge_seconds` times the IN-MEMORY k-way merge
+      # over this node's cached shards — explicitly NOT the peer fan-out. That
+      # matters for how these are read: the fan-out has a ~2s budget, this does
+      # not, and its buckets top out at 0.5s precisely because it is a sort
+      # over retained entries rather than I/O (see the registration's own
+      # comment). So the signal here is merge cost growing with shard count or
+      # entry volume, never "approaching the budget" — a panel or alert
+      # claiming budget pressure from this family would be reading it wrong.
+      #
+      # Bucket-merged across instances rather than averaged per node, for the
+      # reason this file's module comment gives at length: averaging
+      # percentiles is not a percentile.
+      - record: rift:journal_merge_seconds:p95
+        expr: histogram_quantile(0.95, sum by (le) (rate(rift_cluster_journal_merge_seconds_bucket[5m])))
+      - record: rift:journal_merge_seconds:p99
+        expr: histogram_quantile(0.99, sum by (le) (rate(rift_cluster_journal_merge_seconds_bucket[5m])))
