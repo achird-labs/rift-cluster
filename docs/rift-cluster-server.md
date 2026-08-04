@@ -426,12 +426,15 @@ the server — a tenant admin is never sent another tenant's rows.
 - Every replicated **write** — including one that was **refused**. A refusal is a
   committed decision, and its row is often the one you want.
 - **Reads are not audited.** Neither are the mutating operations served over the
-  *proxy* path (`POST /imposters/:port/scenarios/:id/reset`,
-  `DELETE …/savedRequests`, flow-state clears): they are forwarded to the
-  embedded core admin and never become replicated ops, so a log-derived stream
-  cannot see them. This is a **known gap** — auditing them means putting them on
-  consensus, which is a future slice. Do not read their absence as "it did not
-  happen".
+  *proxy* path (`POST /imposters/:port/scenarios/:id/reset`, flow-state
+  clears): they are forwarded to the embedded core admin and never become
+  replicated ops, so a log-derived stream cannot see them. This is a **known
+  gap** — auditing them means putting them on consensus, which is a future
+  slice. Do not read their absence as "it did not happen". `DELETE
+  …/savedRequests` moved out of this bucket in issue #223: it still commits no
+  `ControlOp` (so it is still unaudited, and still a gap), but it no longer
+  proxies — see *Merge-on-read: the fleet request journal* below for what it
+  does instead.
 - A fleet-wide delete records the **tenant whose imposters were destroyed** and
   `"resource": "*"`.
 
@@ -902,9 +905,13 @@ Under `--cluster`, the public admin address is served by a thin front: the
 config-mutating routes (`POST/PUT/DELETE /imposters`, `DELETE
 /imposters/:port`, stub CRUD, and `POST /imposters/:port/{enable,disable}`)
 become replicated control ops committed through the Raft leader — submitted on
-any node, forwarded automatically — and everything else (reads, scenario
-state, recorded requests) is reverse-proxied to the local engine unchanged. A
-pause replicates and survives restarts (upstream #817): it applies in place on
+any node, forwarded automatically — and most everything else (reads, scenario
+state) is reverse-proxied to the local engine unchanged. The recorded-request
+journal is the one read that is neither: `GET …/savedRequests`/`…/requests`
+with no `since` is a fleet-wide merge-on-read rather than a proxy, and its
+`DELETE` best-effort fans out to every peer — see *Merge-on-read: the fleet
+request journal* below. A pause replicates and survives restarts (upstream
+#817): it applies in place on
 every node, so the paused imposter's scenario state is intact on resume. A 2xx from a mutating route
 means the write is durable on a majority and, with the default
 `--cluster-write-barrier=ready-nodes`, applied on every Ready node; if the
@@ -979,6 +986,101 @@ it.
 A node is not Ready until its `cluster-reconciled` gate opens: its applied
 state has caught up to the leader's and its imposters are bound (or their
 failures reported on `GET /_cluster/imposters`).
+
+## Merge-on-read: the fleet request journal (issue #223)
+
+Issue #222 gave every node its own writer shard of the recorded-request
+journal, keyed `(node_id, seq, clear_gen)`. This is the read half: `GET
+/imposters/:port/savedRequests` and its alias `.../requests`, **with no
+`since` and no `match`**, no longer proxy to the local engine — the front
+terminates them as a fleet-wide merge instead, and `numberOfRequests` on `GET
+/imposters/:port` and the listing becomes the fleet sum rather than one
+node's slot. Both spellings also answer identically under the
+`/admin/imposters/:port/...` alias (issue #223 review): `classify` already
+gave the imposter *listing* that treatment, and the savedRequests route now
+gets it too, so a caller cannot get a different answer — cursor header
+included — by spelling the path differently.
+
+**Why terminate instead of decorating the proxied body**, the way the
+imposter listing's tenant filter does: a merged response must carry no
+`x-rift-next-index` — proxying first and then stripping a cursor header
+upstream just set is the fragile direction, and the issue's acceptance
+criteria pin the classification flipping outright.
+
+**The mechanics.** A merge pulls this node's own shard plus every other
+roster voter's, concurrently, under a single **2 s total** budget — a slow
+peer eats into every other peer's share of that budget rather than adding to
+it. Any peer that errors, answers something unparseable, or is still
+outstanding when the budget expires stamps the response
+`Rift-Cluster-Partial: true`; a fully healthy answer carries no such header
+at all — never `false` — which is what a Ch.12 strict-mode gate asserts.
+**Partial never means a peer's entries vanished**: whatever the last
+anti-entropy pass (every 5 s by default, itself fanned out concurrently
+under its own 2 s budget) cached for that peer still merges in, so the
+header says "possibly missing something newer," not "this peer was
+skipped." Entries are ordered by each one's own recorded timestamp, never
+a node-local arrival clock — the latter would let two nodes disagree about
+the merged order, which is exactly the property the issue's acceptance
+criteria require they do not. Every peer pull failure — errored, unparseable,
+or lost to the budget — is logged and counted on
+`rift_cluster_journal_peer_pull_failures_total{peer}`, so an operator can
+tell a partition (self-healing) from a decode failure from version skew
+(will not self-heal) apart, rather than seeing only the aggregate partial
+rate. The replica cache this warms is bounded by the same per-shard cap the
+local journal enforces on itself, and folds a peer's reply in by `seq`
+rather than appending it, so it cannot grow past what a fleet's worth of
+shards should hold or double-count an entry a race redelivered.
+
+**`since` or `match` still proxies.** A scalar cursor cannot address a
+multi-writer merge — whose `since` would it be? — so a request carrying
+`?since=` falls straight through to the local engine, today's cursor
+semantics unchanged (`x-rift-next-index`/`x-rift-truncated` and all).
+`?match=` proxies for a different but equally hard reason (issue #223
+review, B1): the merge-on-read path never evaluates a match predicate at
+all, so terminating on it would silently answer with the *whole* fleet's
+requests instead of the caller's scoped subset, and would turn a malformed
+filter's upstream `400` into a `200` with everything. Proxying leaves
+upstream's own clause parser, and its existing error handling, in charge of
+both cases. Cursoring a merged read is tracked separately (issue #225);
+until then, a client that wants the fleet view reads without a cursor and
+re-reads for freshness, same as any other merge-on-read.
+
+**`DELETE savedRequests`/`.../requests` is explicitly transitional, and a
+`match`-scoped clear never fans out at all.** Without `?match=`, it clears
+this node's own journal exactly as before, then best-effort fans an
+*unconditional full* clear out to every other roster voter over the cluster
+RPC port. A peer missed by the fan-out keeps the deleted entries in its own
+shard and in this node's replica cache of it until it is retried or
+re-observed; the response is stamped partial in that case. Every receiving
+peer also drops its own replica-cache copies of `port` for every node it has
+cached (issue #223 review, B2) — clearing only *that peer's own* writer
+shard left every other node's stale, pre-clear cache of it untouched, which
+is what let a fully successful clear still resurrect the deleted entries via
+anti-entropy forever, unstamped, on every peer.
+
+**With `?match=`**, the clear stays local-only and is **never** fanned out
+(issue #223 review, B3 — a design decision, not a gap still to close): the
+wire fan-out has nowhere to carry a match predicate, so propagating a scoped
+clear as an unconditional full clear would over-delete whatever else that
+port holds on every other node. The response is stamped
+`Rift-Cluster-Partial: true` unconditionally in this case — not because a
+peer was unreachable, but because the clear itself never reached them by
+design, so a client cannot mistake a scoped, local clear for a fleet-complete
+one.
+
+Issue #224 replaces this whole mechanism
+with a Raft-committed clear that bumps a `clear_gen` the merge already
+honours (pinned at `0` today, a no-op until then) so a clear converges by
+consensus instead of a best-effort broadcast a partition can simply outlast,
+and can carry a real predicate so a scoped clear stops needing this
+local-only carve-out.
+
+**`numberOfRequests`** on `GET /imposters/:port` and the listing is rewritten
+in place from the fleet's G-counter slots (`/_cluster/journal/counts`), one
+round trip per peer for every listed port at once — the same 2 s budget and
+`Rift-Cluster-Partial` contract as the merged entries read, but no separate
+metric family: it is a body decoration on an otherwise-proxied response, not
+a termination.
 
 ## The clustered front door (#131)
 
@@ -1623,12 +1725,17 @@ C4 ships the app shell, a read-only imposter list and detail with
 enable/disable, and the cluster view. Four behaviours are worth knowing as an
 operator, because each is a deliberate refusal to round a fact off:
 
-- **Everything on screen is one node's answer.** `/imposters` is served by
-  whichever node the browser reached, and `/_fleet/*` is that node reporting on
-  itself. The screens say so rather than presenting either as fleet-wide. There
-  is no client-side fan-out and merge: that would reinvent the verification
-  plane without its cursors or gap repair, producing a merged view with no way
-  to know what it missed (#147 is where the merged journal actually lands).
+- **Everything on screen is one node's answer, except the request journal.**
+  `/imposters` is served by whichever node the browser reached, and
+  `/_fleet/*` is that node reporting on itself. The screens say so rather than
+  presenting either as fleet-wide, and there is no *client-side* fan-out and
+  merge anywhere — that would reinvent the verification plane without its
+  cursors or gap repair, producing a merged view with no way to know what it
+  missed. The one exception is server-side: issue #223 landed the merged
+  journal (see *Merge-on-read* above), so `numberOfRequests` and a
+  `savedRequests` read are already the fleet's answer, stamped
+  `Rift-Cluster-Partial` when the merge could not be sure of it — the console
+  does not need to, and must not, merge those itself.
 - **An empty list is not the same claim as an empty tenant.** When the answering
   node is degraded — not ready, draining, isolated, leaderless, or **evicted
   from the voter set** — the empty state says the tenant *cannot be confirmed*

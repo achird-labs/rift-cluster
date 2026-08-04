@@ -195,6 +195,74 @@ impl Router {
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty() && self.prefix_routes.is_empty()
     }
+
+    /// Fold `other`'s routes into `self`.
+    ///
+    /// Exists because a handful of route builders (`journal_routes`, `flow_routes`) build their
+    /// own table from `Router::new()` rather than accepting a `base: Router` to extend — each is a
+    /// self-contained subsystem's whole surface, and taking a base would let one subsystem's
+    /// builder observe another's routes for no reason. `merge` is how the composition root brings
+    /// two such self-contained tables together into the one `Router` a `NodeConfig` can hold,
+    /// without either builder needing to know the other exists.
+    ///
+    /// `other` wins on an exact-path collision, the same "later registration replaces earlier"
+    /// contract [`Self::route`] documents — but never on a *prefix* collision: prefix routes are
+    /// additive, so two subsystems that each claim a prefix keep both rather than one silently
+    /// dropping.
+    #[must_use]
+    pub fn merge(mut self, other: Router) -> Self {
+        self.routes.extend(other.routes);
+        self.prefix_routes.extend(other.prefix_routes);
+        self
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn handler(body: Vec<u8>) -> HandlerFuture {
+        Box::pin(async move { Ok(body) })
+    }
+
+    fn prefix_handler(_suffix: String, body: Vec<u8>) -> HandlerFuture {
+        Box::pin(async move { Ok(body) })
+    }
+
+    #[test]
+    fn merge_folds_both_tables_routes_and_prefixes() {
+        let a = Router::new()
+            .route("GET", "/a", Arc::new(handler))
+            .route_prefix("GET", "/prefix-a/", Arc::new(prefix_handler));
+        let b = Router::new()
+            .route("GET", "/b", Arc::new(handler))
+            .route_prefix("GET", "/prefix-b/", Arc::new(prefix_handler));
+
+        let merged = a.merge(b);
+        assert!(merged.lookup("GET", "/a").is_some());
+        assert!(merged.lookup("GET", "/b").is_some());
+        assert!(merged.lookup_prefix("GET", "/prefix-a/x").is_some());
+        assert!(merged.lookup_prefix("GET", "/prefix-b/x").is_some());
+        assert_eq!(merged.len(), 4);
+    }
+
+    #[test]
+    fn merge_lets_the_argument_win_an_exact_path_collision() {
+        let winner: Arc<dyn Handler> = Arc::new(handler);
+        let loser: Arc<dyn Handler> = Arc::new(handler);
+        let a = Router::new().route("GET", "/x", Arc::clone(&loser));
+        let b = Router::new().route("GET", "/x", Arc::clone(&winner));
+
+        let merged = a.merge(b);
+        assert_eq!(merged.len(), 1, "the colliding path is one route, not two");
+        let found = merged.lookup("GET", "/x").expect("route present");
+        assert!(
+            Arc::ptr_eq(found, &winner),
+            "merge's argument must win an exact-path collision, matching `route`'s own contract"
+        );
+    }
 }
 
 #[cfg(test)]

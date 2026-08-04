@@ -74,16 +74,17 @@ use rift_cluster::control::{
     self, ControlOp, ControlRequest, PreconditionTarget, StubEdit, StubEditScript,
 };
 use rift_cluster::decorate::{
-    HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_REVISION, HEADER_WARNINGS,
+    HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION, HEADER_WARNINGS,
 };
+use rift_cluster::stores::JournalNet;
 use rift_cluster::{
     ControlOutcome, ControlResponse, FLEET_SCOPE, NodeError, PullError, RaftNode,
     SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId,
 };
 use rift_cluster_base::seams::{
-    ErrorKind, ImposterConfig, RiftScriptConfig, RouteTable, SCOPE_HEADER, ScriptBaseDir, Stub,
-    classify as classify_upstream, config_uses_script_surface, error_response_typed,
-    resolve_scripts, resolve_stub_scripts, validate_stub, validate_stubs,
+    ErrorKind, ImposterConfig, RecordedRequest, RiftScriptConfig, RouteTable, SCOPE_HEADER,
+    ScriptBaseDir, Stub, classify as classify_upstream, config_uses_script_surface,
+    error_response_typed, resolve_scripts, resolve_stub_scripts, validate_stub, validate_stubs,
 };
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -110,6 +111,12 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// the client gets the `timeout` error shape. Distinct from the barrier
 /// timeout, which begins after the commit and degrades to a warning.
 const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Total budget for a merge-on-read fan-out to every other roster peer (issue #223): the merged
+/// journal read, its `numberOfRequests` decoration, and the transitional `DELETE savedRequests`
+/// fan-out all share it. Bounded so one slow or unreachable peer degrades an answer to
+/// `Rift-Cluster-Partial: true` rather than hanging the client on it.
+const JOURNAL_PEER_BUDGET: Duration = Duration::from_secs(2);
 
 type FrontBody = BoxBody<Bytes, hyper::Error>;
 
@@ -154,6 +161,10 @@ pub struct FrontConfig {
     /// `GET /admin/sources` (issue #239) — the last poll error per source is
     /// deliberately node-local state, reachable only through it.
     pub puller: Arc<SourcePuller>,
+    /// This node's view of the fleet request journal (issue #223): the merged read, the
+    /// `numberOfRequests` decoration, and the transitional `DELETE savedRequests` fan-out all
+    /// reach the fleet through it.
+    pub journal_net: Arc<JournalNet>,
 }
 
 /// A bound, serving admin front.
@@ -272,6 +283,8 @@ struct FrontState {
     readiness: Arc<Readiness>,
     /// See [`FrontConfig::puller`].
     puller: Arc<SourcePuller>,
+    /// See [`FrontConfig::journal_net`].
+    journal_net: Arc<JournalNet>,
     /// Streams proxied requests through unchanged (SSE included).
     proxy: Client<hyper_util::client::legacy::connect::HttpConnector, Incoming>,
     /// Issues the internal re-reads mutation responses are rendered from.
@@ -301,6 +314,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         export_status: config.export_status,
         readiness: config.readiness,
         puller: config.puller,
+        journal_net: config.journal_net,
         proxy: Client::builder(TokioExecutor::new()).build_http(),
         fetch: Client::builder(TokioExecutor::new()).build_http(),
     });
@@ -400,6 +414,16 @@ pub(crate) enum Terminated {
     ReplaceStubById(u16, String),
     DeleteStubById(u16, String),
     SetEnabled(u16, bool),
+    /// `GET /imposters/{port}/requests|savedRequests` with **no `?since=`** (issue #223): a
+    /// fleet-wide merge-on-read rather than a proxy. With `since` present the read stays proxied —
+    /// a scalar cursor cannot address a multi-writer merge, so that half of the route is #225's
+    /// territory and `classify` falls it straight through.
+    ReadSavedRequests(u16),
+    /// `DELETE` on the same two paths (issue #223 item 4). Explicitly transitional: clears this
+    /// node locally through the existing proxy path, then best-effort fans the same clear out to
+    /// every other roster peer — see [`rift_cluster::stores::JournalNet::clear_peers`]'s doc for
+    /// why, and #224 for what replaces it.
+    ClearSavedRequests(u16),
     /// Whole-table replace of the front door's route table (issue #131).
     /// There is no upstream `/front-door/routes` to proxy to (U-11's admin
     /// CRUD was deferred), so this is provided here, not there.
@@ -467,7 +491,9 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::DeleteStubAt(port, _)
         | Terminated::ReplaceStubById(port, _)
         | Terminated::DeleteStubById(port, _)
-        | Terminated::SetEnabled(port, _) => Some(*port),
+        | Terminated::SetEnabled(port, _)
+        | Terminated::ReadSavedRequests(port)
+        | Terminated::ClearSavedRequests(port) => Some(*port),
         Terminated::Create
         | Terminated::ReplaceAllImposters
         | Terminated::DeleteAllImposters
@@ -502,6 +528,8 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::ReplaceStubById(_, _)
         | Terminated::DeleteStubById(_, _)
         | Terminated::SetEnabled(_, _)
+        | Terminated::ReadSavedRequests(_)
+        | Terminated::ClearSavedRequests(_)
         | Terminated::PutRoutes
         | Terminated::DeleteRoute(_)
         // Resource routes: the id names a record *within* the caller's
@@ -512,6 +540,32 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::SourcePut
         | Terminated::SourceDelete(_)
         | Terminated::SourcePull(_) => None,
+    }
+}
+
+/// `GET|DELETE .../requests|savedRequests`, once `port` is already known — shared by the
+/// canonical `/imposters/{port}/...` match arm and the `/admin/imposters/{port}/...` alias in
+/// [`classify`], so the two spellings cannot silently drift apart the way they did before issue
+/// #223's review (Important: the alias proxied local-only while the canonical path terminated).
+fn terminated_saved_requests(
+    method: &Method,
+    query: Option<&str>,
+    port: u16,
+) -> Option<Terminated> {
+    match *method {
+        // With `since` **or** `match` present, this falls through to the proxy instead of
+        // terminating (issue #223 review, B1 — the design decision this mirrors the existing
+        // `since` exception for): `since` is a scalar cursor that cannot address a multi-writer
+        // merge (#225's territory), and `match` is a predicate the merge-on-read path never
+        // evaluates at all — terminating on a `?match=`-scoped request would silently answer with
+        // the *whole* fleet's requests instead of the caller's scoped subset, and would turn a
+        // malformed filter's upstream `400` into a `200` with everything. Proxying leaves
+        // upstream's own clause parser and its existing error handling in charge of both.
+        Method::GET if !has_query_param(query, "since") && !has_query_param(query, "match") => {
+            Some(Terminated::ReadSavedRequests(port))
+        }
+        Method::DELETE => Some(Terminated::ClearSavedRequests(port)),
+        _ => None,
     }
 }
 
@@ -586,6 +640,22 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
             _ => None,
         };
     }
+    // The savedRequests alias under `/admin/imposters/` (issue #223 review, Important):
+    // upstream's own `/admin/imposters/` prefix is otherwise reserved for flow-state inspection
+    // (`classify_admin_flow_state` in the vendored authorizer), but this front's own
+    // merge-on-read read and clear fan-out terminate the identical two verbs the canonical
+    // `/imposters/{port}/...` spelling does. `is_imposter_listing` already treats both spellings
+    // of the *listing* alike; without this, the two spellings disagreed about the very same
+    // imposter's requests — the canonical path terminated (fleet-merged, honestly partial), the
+    // alias silently proxied local-only with yesterday's `x-rift-next-index` and no partial
+    // header at all.
+    if let Some(rest) = path.strip_prefix("/admin/imposters/") {
+        let segments: Vec<&str> = rest.split('/').collect();
+        if let [port_str, "requests" | "savedRequests"] = segments.as_slice() {
+            let port: u16 = port_str.parse().ok()?;
+            return terminated_saved_requests(method, query, port);
+        }
+    }
     let rest = path.strip_prefix("/imposters/")?;
     let segments: Vec<&str> = rest.split('/').collect();
     let port: u16 = segments.first()?.parse().ok()?;
@@ -593,6 +663,9 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
         [_] if *method == Method::DELETE => Some(Terminated::DeleteImposter(port)),
         [_, "enable"] if *method == Method::POST => Some(Terminated::SetEnabled(port, true)),
         [_, "disable"] if *method == Method::POST => Some(Terminated::SetEnabled(port, false)),
+        // Both spellings are one handler upstream (`router.rs` maps `["requests"]` and
+        // `["savedRequests"]` identically), so they classify identically here too (issue #223).
+        [_, "requests" | "savedRequests"] => terminated_saved_requests(method, query, port),
         [_, "stubs"] => match *method {
             Method::POST => Some(Terminated::AddStub(port)),
             Method::PUT => Some(Terminated::ReplaceStubs(port)),
@@ -613,6 +686,22 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
         }
         _ => None,
     }
+}
+
+/// Whether `query` names `name` at all — a bare `name` with no `=value` still counts, because it
+/// is the *presence* of the parameter that matters at this classifier (not what it says): with
+/// either `since` or `match` present, the merge-on-read route falls through to the proxy instead
+/// of terminating (issue #223 review, B1 — generalised from the `since`-only `has_since_param`
+/// this replaces).
+///
+/// Raw and case-sensitive, with **no** percent-decoding — deliberately mirroring upstream's own
+/// `query_pairs` key semantics, so this classifier and the proxy target it falls through to agree
+/// on what counts as "the parameter is present" for the identical query string.
+fn has_query_param(query: Option<&str>, name: &str) -> bool {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .any(|pair| pair == name || pair.split_once('=').is_some_and(|(key, _)| key == name))
 }
 
 /// Map a terminated route to the action that authorizes it (RFC-002 §4.1).
@@ -639,6 +728,13 @@ fn action_for(kind: &Terminated) -> Action {
         Terminated::ReplaceStubById(_, _) => Action::StubWrite,
         Terminated::DeleteStubById(_, _) => Action::StubWrite,
         Terminated::SetEnabled(_, _) => Action::LifecycleToggle,
+        // Exactly upstream's own mapping for these two paths (`imposter_action` in the vendored
+        // `authz.rs`, via `principal::map_action`): GET reads fold onto `ImposterRead` regardless
+        // of route, and DELETE has its own action shared with `savedProxyResponses`. Reusing them
+        // rather than minting new ones keeps the audit action name identical to what the same
+        // route was authorized under before it terminated here.
+        Terminated::ReadSavedRequests(_) => Action::ImposterRead,
+        Terminated::ClearSavedRequests(_) => Action::SavedRequestsClear,
         // The front-door route table (issue #131) predates RFC-002 and has no
         // action of its own in its closed §4.1 list. Treated as an ordinary
         // imposter-tier config write pending a dedicated action.
@@ -906,9 +1002,21 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                     } else {
                         None
                     };
+                    // `numberOfRequests` decoration (issue #223): the single-imposter read and the
+                    // listing both carry it, and upstream's own answer is this node's local
+                    // G-counter slot only — cloned ahead of `proxy`'s move of `state`, same as
+                    // `degraded`/`token` above, since the fleet total is asked for only after the
+                    // loopback has already answered.
+                    let number_of_requests = (list_read
+                        || (req.method() == Method::GET && is_single_imposter_read(&path)))
+                    .then(|| Arc::clone(&state.journal_net));
                     let mut response = proxy(state, req, Some(&tenant)).await;
                     if let Some(owned) = owned {
                         response = filter_imposter_list(response, &owned).await;
+                    }
+                    if let Some(net) = number_of_requests {
+                        response =
+                            decorate_number_of_requests(response, &net, JOURNAL_PEER_BUDGET).await;
                     }
                     if let Some(reason) = degraded {
                         set_header(&mut response, HEADER_BIND_FAILURES, &reason);
@@ -1735,12 +1843,21 @@ fn imposter_read_token(
 
 /// Whether `path` is exactly the single-imposter read, `/imposters/{port}` — the one proxied read
 /// whose response carries a conditionable record's revision.
+///
+/// Also matches the `/admin/imposters/{port}` alias (issue #223 review, Important): the
+/// collection listing already answers identically under both spellings (see
+/// [`is_imposter_listing`]), and leaving this one unaware of the alias is exactly how it and the
+/// listing ended up disagreeing about the very same imposter — the listing's `numberOfRequests`
+/// fleet-decorated, the single-imposter alias silently answering this node's local count alone.
 fn is_single_imposter_read(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
     let mut segments = path.trim_start_matches('/').split('/');
-    segments.next() == Some("imposters")
-        && segments.next().is_some_and(|p| p.parse::<u16>().is_ok())
-        && segments.next().is_none()
+    match segments.next() {
+        Some("imposters") => {}
+        Some("admin") if segments.next() == Some("imposters") => {}
+        _ => return false,
+    }
+    segments.next().is_some_and(|p| p.parse::<u16>().is_ok()) && segments.next().is_none()
 }
 
 /// Drop every entry from an imposter listing whose port `owned` does not contain.
@@ -1768,6 +1885,114 @@ fn narrow_imposter_listing(
             .is_some_and(|port| owned.contains(&port))
     });
     serde_json::to_vec(&doc).map_err(|e| format!("re-encoding the filtered imposter listing: {e}"))
+}
+
+/// Rewrite `numberOfRequests` to the fleet sum on a proxied imposter read (issue #223): after #222
+/// bound the engine to `ClusterJournal`, upstream's own answer is this node's local G-counter slot
+/// only, real but partial — the fleet total is `fleet_count`'s job, fetched over
+/// `/_cluster/journal/counts` under `budget` via [`JournalNet::fleet_counts`]. Runs on both shapes
+/// upstream answers: the listing's array (already narrowed to `owned` by
+/// [`filter_imposter_list`], so only ports the caller can see are ever asked about) and the
+/// single-imposter object.
+///
+/// **Fails closed**, exactly like [`narrow_imposter_listing`]: a body that is not what the
+/// tenancy filter already required refuses rather than passing the un-decorated original through —
+/// a `numberOfRequests` this node cannot vouch for is worse than a 500 that says so.
+async fn decorate_number_of_requests(
+    response: Response<FrontBody>,
+    net: &JournalNet,
+    budget: Duration,
+) -> Response<FrontBody> {
+    let (parts, body) = response.into_parts();
+    if !parts.status.is_success() {
+        return Response::from_parts(parts, body);
+    }
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return internal(&format!(
+                "reading the imposter body to decorate numberOfRequests: {e}"
+            ));
+        }
+    };
+    match rewrite_number_of_requests(&bytes, net, budget).await {
+        Ok((rewritten, partial)) => {
+            let mut response =
+                buffered_response(parts.status, Bytes::from(rewritten), json_content_type())
+                    .unwrap_or_else(|response| response);
+            if partial {
+                set_header(&mut response, HEADER_PARTIAL, "true");
+            }
+            response
+        }
+        Err(e) => internal(&e),
+    }
+}
+
+/// Collect every `port` the body names, ask the fleet for each one's slot in one round trip per
+/// peer, and rewrite `numberOfRequests` in place — `imposters[].numberOfRequests` for the listing,
+/// the one object's field for the single-imposter read.
+async fn rewrite_number_of_requests(
+    bytes: &[u8],
+    net: &JournalNet,
+    budget: Duration,
+) -> Result<(Vec<u8>, bool), String> {
+    let mut doc: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
+        format!("the imposter body was not JSON, so numberOfRequests could not be decorated: {e}")
+    })?;
+    let is_listing = doc.get("imposters").and_then(|v| v.as_array()).is_some();
+
+    let ports: Vec<u16> = if is_listing {
+        doc["imposters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("port").and_then(serde_json::Value::as_u64))
+            .filter_map(|p| u16::try_from(p).ok())
+            .collect()
+    } else {
+        doc.get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .into_iter()
+            .collect()
+    };
+    // Nothing to decorate — an empty listing, or a body this shouldn't have run against at all —
+    // is not a failure; it just re-encodes unchanged.
+    if ports.is_empty() {
+        return serde_json::to_vec(&doc)
+            .map(|body| (body, false))
+            .map_err(|e| e.to_string());
+    }
+
+    let (totals, partial) = net.fleet_counts(&ports, budget).await;
+    let rewrite_entry = |entry: &mut serde_json::Value| {
+        let Some(port) = entry
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+        else {
+            return;
+        };
+        if let Some(total) = totals.get(&port)
+            && let Some(map) = entry.as_object_mut()
+        {
+            map.insert("numberOfRequests".to_owned(), serde_json::json!(total));
+        }
+    };
+    if is_listing {
+        if let Some(array) = doc.get_mut("imposters").and_then(|v| v.as_array_mut()) {
+            for entry in array {
+                rewrite_entry(entry);
+            }
+        }
+    } else {
+        rewrite_entry(&mut doc);
+    }
+
+    serde_json::to_vec(&doc)
+        .map(|body| (body, partial))
+        .map_err(|e| format!("re-encoding the decorated imposter body: {e}"))
 }
 
 fn local_bind_failure(state: &FrontState, params: &[(&'static str, String)]) -> Option<String> {
@@ -1937,6 +2162,16 @@ async fn terminate(
             )
             .await;
         }
+        // Neither is a `ControlOp`: a merge-on-read has nothing to commit, and the transitional
+        // clear (issue #223 item 4, #224's territory once it lands) fans out over the cluster RPC
+        // port rather than the Raft log. Both return here for the same reason the source surface
+        // does — none of the `If-Match`/`_rift.script`/loopback-render machinery below applies.
+        Terminated::ReadSavedRequests(port) => {
+            return terminate_read_saved_requests(&state, port).await;
+        }
+        Terminated::ClearSavedRequests(port) => {
+            return terminate_clear_saved_requests(&state, req, port, &tenant).await;
+        }
         _ => {}
     }
 
@@ -2011,6 +2246,87 @@ async fn terminate(
         Ok(response) => response,
         Err(response) => response,
     }
+}
+
+/// `GET /imposters/{port}/requests|savedRequests` with no `?since=` and no `?match=` (issue
+/// #223): the fleet-wide merge-on-read `classify` terminated this route for. `merge_shards`'s 15
+/// gate tests already prove the convergence properties; this is purely turning the outcome into
+/// the bytes and header the openapi contract pins — a bare JSON array of `RecordedRequest`,
+/// `matchOutcome` intact on every entry because it rides inside `RecordedRequest` untouched, and
+/// no cursor header at all (the withheld-cursor convention: a merged read has no single index
+/// that means the same thing on every shard, so it must not look like it does).
+async fn terminate_read_saved_requests(state: &Arc<FrontState>, port: u16) -> Response<FrontBody> {
+    let outcome = state
+        .journal_net
+        .merge_read(port, JOURNAL_PEER_BUDGET)
+        .await;
+    let requests: Vec<&RecordedRequest> =
+        outcome.entries.iter().map(|entry| &entry.request).collect();
+    match serde_json::to_vec(&requests) {
+        Ok(bytes) => {
+            let mut response =
+                buffered_response(StatusCode::OK, Bytes::from(bytes), json_content_type())
+                    .unwrap_or_else(|response| response);
+            if outcome.partial {
+                set_header(&mut response, HEADER_PARTIAL, "true");
+            }
+            response
+        }
+        // Fails closed like `narrow_imposter_listing`: a body this node cannot encode must not
+        // become a 200 with nothing in it, which would read as "no requests ever recorded" to
+        // whatever is asserting against this.
+        Err(e) => internal(&format!("encoding the merged journal read: {e}")),
+    }
+}
+
+/// `DELETE /imposters/{port}/requests|savedRequests` (issue #223 item 4): clear this node's own
+/// journal through the same proxy path the route used before it classified here — the local
+/// engine's clear already resets its own request count and honours `?match=`, and nothing about
+/// that needs to change — then best-effort fan the same clear out to every other roster peer,
+/// **unless `?match=` narrowed this clear**.
+///
+/// Design decision (issue #223 review, B3): a `?match=` clear stays **local-only**. The wire
+/// [`rift_cluster::stores::ClearReq`] carries only a port — there is nowhere on it to carry a
+/// match predicate — so fanning a scoped clear out over that wire would land on every peer as an
+/// *unconditional full* clear, over-deleting whatever else that port holds on every other node
+/// (a different flow, a different tenant's traffic sharing the port). That is strictly worse than
+/// not fanning out at all, so this clear is knowingly not fleet-wide and says so:
+/// `Rift-Cluster-Partial: true` is stamped unconditionally — not because a peer was unreachable,
+/// but because the clear itself never reached them by design — so a client cannot mistake a
+/// scoped, local clear for a fleet-complete one. #224 replaces the whole mechanism with a
+/// Raft-committed clear that can carry a real predicate; until then this is what keeps the
+/// dishonest case (peers silently keeping their own copies of what looked like a full delete)
+/// from ever answering unstamped.
+///
+/// See [`rift_cluster::stores::JournalNet::clear_peers`]'s doc for what "best-effort" means on the
+/// unscoped path this falls back to.
+async fn terminate_clear_saved_requests(
+    state: &Arc<FrontState>,
+    req: Request<Incoming>,
+    port: u16,
+    tenant: &TenantId,
+) -> Response<FrontBody> {
+    let scoped = has_query_param(req.uri().query(), "match");
+    let mut response = proxy(Arc::clone(state), req, Some(tenant)).await;
+    if !response.status().is_success() {
+        // Only fan out (or stamp partial for) a clear the local engine actually performed: a
+        // 404/409/etc. here means nothing was cleared on this node either, and propagating "clear
+        // this port" to peers, or claiming a scoped-but-honest partial, regardless would attach
+        // fan-out side effects to a request that never actually cleared anything locally.
+        return response;
+    }
+    if scoped {
+        set_header(&mut response, HEADER_PARTIAL, "true");
+        return response;
+    }
+    if state
+        .journal_net
+        .clear_peers(port, JOURNAL_PEER_BUDGET)
+        .await
+    {
+        set_header(&mut response, HEADER_PARTIAL, "true");
+    }
+    response
 }
 
 /// One terminated mutation: what to commit, and how to answer afterwards.
@@ -3132,6 +3448,15 @@ async fn build_mutation(
         Terminated::SourcePut | Terminated::SourceDelete(_) | Terminated::SourcePull(_) => Err(
             internal("source writes are served by terminate_source_write, not build_mutation"),
         ),
+        // Same shape again: neither is a `ControlOp` at all — the merged read has nothing to
+        // commit, and the transitional clear fans out over the cluster RPC port rather than the
+        // Raft log — and both divert to their own `terminate_*` handler before this is reached.
+        Terminated::ReadSavedRequests(_) => Err(internal(
+            "the merged journal read is served by terminate_read_saved_requests, not build_mutation",
+        )),
+        Terminated::ClearSavedRequests(_) => Err(internal(
+            "the journal clear fan-out is served by terminate_clear_saved_requests, not build_mutation",
+        )),
     }
 }
 
@@ -3774,6 +4099,12 @@ mod tests {
             (Method::DELETE, "/imposters/4545/stubs/by-id/a"),
             (Method::POST, "/imposters/4545/enable"),
             (Method::POST, "/imposters/4545/disable"),
+            // Issue #223: the fleet merge-on-read (no `?since=`) and the transitional clear
+            // fan-out. Both spellings, since they are one handler behind two paths.
+            (Method::GET, "/imposters/4545/requests"),
+            (Method::GET, "/imposters/4545/savedRequests"),
+            (Method::DELETE, "/imposters/4545/savedRequests"),
+            (Method::DELETE, "/imposters/4545/requests"),
         ];
         for (method, path) in terminated {
             assert!(
@@ -3787,8 +4118,6 @@ mod tests {
         let proxied = [
             (Method::GET, "/imposters"),
             (Method::GET, "/imposters/4545"),
-            (Method::DELETE, "/imposters/4545/savedRequests"),
-            (Method::DELETE, "/imposters/4545/requests"),
             (Method::POST, "/imposters/4545/verify"),
             (Method::PUT, "/imposters/4545/scenarios/checkout/state"),
             (Method::POST, "/imposters/4545/scenarios/reset"),
@@ -3803,6 +4132,89 @@ mod tests {
                 "{method} {path} must proxy"
             );
         }
+
+        // `?since=` is a scalar cursor that cannot address a multi-writer merge (#225's
+        // territory): with it present, the read must fall straight through to the proxy — the
+        // regression this route's design most easily loses, since its no-cursor sibling above now
+        // terminates.
+        assert!(
+            classify(&Method::GET, "/imposters/4545/requests", Some("since=3")).is_none(),
+            "GET .../requests?since=3 must still proxy"
+        );
+
+        // Issue #223 review, B1: `?match=` is the same exception as `?since=` — a scoped
+        // predicate the merge-on-read path never evaluates, so terminating on it would silently
+        // widen the answer to the whole fleet's requests. Both spellings, both query forms
+        // (`match=...` and a bare `match`), must fall through to the proxy exactly like `since`.
+        for query in ["match=flow_id%3Drun-7", "match"] {
+            assert!(
+                classify(&Method::GET, "/imposters/4545/requests", Some(query)).is_none(),
+                "GET .../requests?{query} must still proxy"
+            );
+            assert!(
+                classify(&Method::GET, "/imposters/4545/savedRequests", Some(query)).is_none(),
+                "GET .../savedRequests?{query} must still proxy"
+            );
+        }
+        // `since` and `match` together must still fall through — either one alone is enough.
+        assert!(
+            classify(
+                &Method::GET,
+                "/imposters/4545/savedRequests",
+                Some("since=3&match=flow_id%3Drun-7")
+            )
+            .is_none(),
+            "GET .../savedRequests?since=3&match=... must still proxy"
+        );
+        // `?match=` on the DELETE, unlike the GET, still terminates — B3's design decision is
+        // that a scoped clear stays local-only (and stamps partial), not that it stops
+        // terminating; `classify` has no query-based exception on the DELETE arm.
+        assert!(
+            classify(
+                &Method::DELETE,
+                "/imposters/4545/savedRequests",
+                Some("match=flow_id%3Drun-7")
+            )
+            .is_some(),
+            "DELETE .../savedRequests?match=... must still terminate"
+        );
+
+        // Issue #223 review, Important: the `/admin/imposters/{port}/...` alias must terminate
+        // identically to the canonical `/imposters/{port}/...` spelling for both verbs — the same
+        // "both spellings, one handler" treatment `is_imposter_listing` already gives the
+        // collection listing, extended to the two-verb savedRequests route.
+        for (method, path) in [
+            (Method::GET, "/admin/imposters/4545/requests"),
+            (Method::GET, "/admin/imposters/4545/savedRequests"),
+            (Method::DELETE, "/admin/imposters/4545/requests"),
+            (Method::DELETE, "/admin/imposters/4545/savedRequests"),
+        ] {
+            assert!(
+                classify(&method, path, None).is_some(),
+                "{method} {path} (admin alias) must terminate"
+            );
+        }
+        assert!(
+            classify(
+                &Method::GET,
+                "/admin/imposters/4545/savedRequests",
+                Some("since=3")
+            )
+            .is_none(),
+            "GET admin-alias .../savedRequests?since=3 must still proxy"
+        );
+        // The admin alias is scoped to the savedRequests/requests shape — flow-state inspection
+        // and any other unrecognized suffix under this prefix stay this front's non-concern and
+        // fall through exactly as before this fix.
+        assert!(
+            classify(
+                &Method::DELETE,
+                "/admin/imposters/4545/flow-state/flow-9",
+                None
+            )
+            .is_none(),
+            "DELETE .../flow-state/... must not be captured by the new alias arm"
+        );
 
         // An unparseable port is not this surface's route at all.
         assert!(classify(&Method::DELETE, "/imposters/not-a-port", None).is_none());
@@ -4025,6 +4437,7 @@ mod tests {
                 puller: Arc::new(SourcePuller::new(
                     rift_cluster_base::seams::SourceRegistry::default(),
                 )),
+                journal_net: JournalNet::new(rift_cluster::stores::ClusterJournal::new(1)),
             },
             &node,
         )

@@ -142,7 +142,11 @@ pub struct ShardEntry {
     pub request: RecordedRequest,
     /// Monotonic arrival time, for the age cap only. Not part of the merge key and not
     /// the ordering key a merge uses — that is the request's own recorded timestamp.
-    recorded_at_millis: u64,
+    ///
+    /// `pub(crate)` so [`super::journal_net`] can build entries for the merge tests. Deliberately
+    /// not `pub`: the value is a *local* clock reading, meaningless on any other node, which is
+    /// why the wire form omits it entirely.
+    pub(crate) recorded_at_millis: u64,
 }
 
 /// This node's shard of one port, as a peer merge consumes it (issue #223).
@@ -307,6 +311,26 @@ impl ClusterJournal {
         self.cap_cache.store(cap, Ordering::Relaxed);
         self.cap_refreshed_at.store(now, Ordering::Relaxed);
         cap
+    }
+
+    /// This writer's own node id — the one every entry this journal appends is
+    /// stamped with. Fixed at construction (see the struct doc), so this reads
+    /// the same before and after [`Self::bind`]; issue #223's network layer
+    /// needs it to build its own [`super::journal_net::ShardSlice`] without
+    /// waiting on a `RaftNode` that may not exist yet.
+    #[must_use]
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Every port this node has ever recorded to or noted a request for.
+    ///
+    /// Issue #223's anti-entropy pull needs this to know which ports to ask
+    /// peers about; nothing before it needed a port registry, since each port
+    /// is otherwise addressed directly by callers who already know it.
+    #[must_use]
+    pub(crate) fn known_ports(&self) -> Vec<u16> {
+        self.ports.read().keys().copied().collect()
     }
 
     /// This node's shard of `port`, from `since_seq` exclusive (0 for everything).

@@ -18,8 +18,8 @@ use arc_swap::ArcSwap;
 use rift_cluster::audit_export::{AuditExporter, ExportContext, ExportStatus};
 use rift_cluster::sources;
 use rift_cluster::stores::{
-    ClusterJournal, ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, FlowShard, ShardConfig,
-    flow_routes,
+    ClusterJournal, ClusteredFlowStoreProvider, DEFAULT_ANTI_ENTROPY_INTERVAL, FlowBindConfig,
+    FlowNet, FlowShard, JournalNet, ShardConfig, flow_routes, journal_routes, spawn_anti_entropy,
 };
 use rift_cluster::{
     Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, OnDrift,
@@ -528,6 +528,10 @@ pub async fn start_with_runtimes(
     // already carry this writer's real id: `(node_id, seq, clear_gen)` is the key #223
     // merges on, and a placeholder there is wrong data, not a late label.
     let request_journal = ClusterJournal::new(identity.node_id());
+    // The front door's half of the fleet request journal (issue #223): wraps the same
+    // `request_journal` the manager writes through, so the merge-on-read the front serves and the
+    // writer shard the manager appends to can never be two different journals under the hood.
+    let journal_net = JournalNet::new(Arc::clone(&request_journal));
 
     let manager = match cluster_manager(
         &cli,
@@ -583,7 +587,12 @@ pub async fn start_with_runtimes(
             secret: cluster.secret,
             // Seeded with the flow routes: the registry ships empty and the state
             // backends register their own endpoints (its design contract), and the
-            // operator surface layers its routes on top.
+            // operator surface layers its routes on top. `journal_routes` is folded in
+            // with `merge` rather than nested in the same chain: unlike `flow_routes`,
+            // `cluster_api::routes` and `sources::routes`, it builds its own table from
+            // scratch instead of accepting a base to extend (issue #223's network layer,
+            // #147/#152's Phase 4a, predates this composition and its own signature is
+            // frozen), so this is the seam that brings the two tables together.
             routes: sources::routes(
                 cluster_api::routes(
                     flow_routes(Arc::clone(&flow_net)),
@@ -591,7 +600,8 @@ pub async fn start_with_runtimes(
                     Arc::clone(&readiness),
                 ),
                 Arc::clone(&puller),
-            ),
+            )
+            .merge(journal_routes(Arc::clone(&journal_net))),
             engine: Some(Arc::clone(&manager)),
             audit_retention_secs: cli.cluster.cluster_audit_retention,
             snapshot_log_entries: cli.cluster.cluster_snapshot_log_entries,
@@ -662,6 +672,18 @@ pub async fn start_with_runtimes(
     // this lands the journal sizes shards as a single voter, which over-retains rather
     // than evicting entries an early request might still be asserted on.
     request_journal.bind(&node);
+    // The journal net's own late-bound node slot (issue #223), same "infallible and
+    // immediate" shape as the line above — `slices_for`/`merge_read`/`fleet_counts` all
+    // work with no roster to ask until this runs, exactly as `request_journal` does before
+    // its own `bind`. The anti-entropy loop goes on the ambient runtime, like the source
+    // scheduler and the audit exporter just above (never a bare `Runtime` of its own, #120):
+    // unlike the flow bridge, this net owns no runtime of its own to spawn it on instead.
+    journal_net.bind(&node);
+    spawn_anti_entropy(
+        &journal_net,
+        &tokio::runtime::Handle::current(),
+        DEFAULT_ANTI_ENTROPY_INTERVAL,
+    );
 
     if let Err(e) = flow_net.bind(&node, FlowBindConfig::default()) {
         source_scheduler.abort();
@@ -687,6 +709,7 @@ pub async fn start_with_runtimes(
         Arc::clone(&manager),
         front_door_routes,
         Arc::clone(&puller),
+        Arc::clone(&journal_net),
         Arc::clone(&export_status),
     )
     .await
@@ -723,6 +746,7 @@ pub async fn start_with_runtimes(
 /// Join the cluster, then compose and start the open-source data plane on top of
 /// the running node. Split out so a failure anywhere in it lands on one cleanup
 /// path in [`start_with_runtimes`].
+#[allow(clippy::too_many_arguments)]
 async fn attach_data_plane(
     mut cli: EeCli,
     node: &Arc<RaftNode>,
@@ -730,6 +754,7 @@ async fn attach_data_plane(
     manager: Arc<ImposterManager>,
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
     puller: Arc<SourcePuller>,
+    journal_net: Arc<JournalNet>,
     export_status: Arc<ExportStatus>,
 ) -> anyhow::Result<(
     RunningServer,
@@ -874,6 +899,7 @@ async fn attach_data_plane(
             export_status: Some(export_status),
             readiness: Arc::clone(readiness),
             puller: Arc::clone(&puller),
+            journal_net: Arc::clone(&journal_net),
         },
         node,
     )

@@ -430,6 +430,44 @@ lazy_static! {
         JOURNAL_EVICTIONS.with_label_values(&["cap"]);
     static ref JOURNAL_EVICTIONS_AGE: IntCounter =
         JOURNAL_EVICTIONS.with_label_values(&["age"]);
+
+    /// `rift_cluster_journal_partial_reads_total` — merge-on-read answers
+    /// (issue #223) the caller had to stamp `Rift-Cluster-Partial: true`
+    /// because a roster peer's shard could not be pulled into the replica
+    /// cache in time. Touched by the merge's caller, not by `merge_shards`
+    /// itself — the merge only carries the bit its caller already decided.
+    static ref JOURNAL_PARTIAL_READS: IntCounter = register_int_counter!(
+        "rift_cluster_journal_partial_reads_total",
+        "Fleet journal merge-on-read answers stamped partial"
+    )
+    .expect("rift_cluster_journal_partial_reads_total registers once");
+
+    /// `rift_cluster_journal_merge_seconds` — wall-clock of one k-way merge
+    /// across a port's cached shards (issue #223). Buckets stay well under a
+    /// request deadline: the merge is an in-memory sort over however many
+    /// shards this node has cached, not I/O.
+    static ref JOURNAL_MERGE: Histogram = register_histogram!(
+        "rift_cluster_journal_merge_seconds",
+        "Duration of one fleet journal merge-on-read",
+        vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+    )
+    .expect("rift_cluster_journal_merge_seconds registers once");
+
+    /// `rift_cluster_journal_peer_pull_failures_total{peer}` — a fleet journal RPC to `peer`
+    /// (issue #223) that came back without a usable reply or confirmation, including a peer the
+    /// transport's own health tracking has already given up on and one lost to a caller's budget
+    /// rather than outright errored. Covers every caller that dials a peer over this journal's
+    /// wire, not just `anti_entropy_tick`: the merge-on-read pull (`pull_since_budgeted`), the
+    /// fleet count fan-out (`fleet_counts`) and the clear fan-out (`clear_peers`) all touch it too
+    /// (review fix for B5 — before this, the one path that produces a user-visible
+    /// `Rift-Cluster-Partial` produced no metric at all). `peer` is a roster node id, so
+    /// cardinality tracks fleet size, never request traffic.
+    static ref JOURNAL_PEER_PULL_FAILURES: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_journal_peer_pull_failures_total",
+        "Anti-entropy journal pulls that failed, by peer",
+        &["peer"]
+    )
+    .expect("rift_cluster_journal_peer_pull_failures_total registers once");
 }
 
 /// The retained-depth gauge for one port, resolved once so the recording path never
@@ -449,6 +487,20 @@ pub(crate) fn note_journal_evictions(by_cap: usize, by_age: usize) {
     if by_age > 0 {
         JOURNAL_EVICTIONS_AGE.inc_by(by_age as u64);
     }
+}
+
+pub(crate) fn journal_partial_read() {
+    JOURNAL_PARTIAL_READS.inc();
+}
+
+pub(crate) fn journal_merge_observed(elapsed: std::time::Duration) {
+    JOURNAL_MERGE.observe(elapsed.as_secs_f64());
+}
+
+/// `peer` is the roster node id as a string — a closed, fleet-sized set at
+/// the call site, not request-controlled.
+pub(crate) fn journal_peer_pull_failure(peer: &str) {
+    JOURNAL_PEER_PULL_FAILURES.with_label_values(&[peer]).inc();
 }
 
 /// One write handed toward the leader (per hop).

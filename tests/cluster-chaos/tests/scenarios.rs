@@ -4859,3 +4859,283 @@ async fn c27_tenancy_isolates_ownership_but_not_the_data_plane() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #223 AC3 — merge-on-read partition honesty, at smoke level.
+//
+// Deliberately *not* numbered `cNN`. #228 reserves C28-C30 for the verification
+// plane's in-anger tier, and **C29 is this property done properly**: partition
+// mid-spray, assert `rift_cluster_journal_partial_reads_total` moved, measure
+// the 2 s budget rather than bounding it. #223's own acceptance criterion says
+// so in as many words — "the full in-anger scenario is #228's; this slice lands
+// a smoke-level version" — so taking a C number here would squat on #228's
+// numbering for a weaker test.
+//
+// What this one is for: #223 ships the merge, and the merge's central honesty
+// claim is that a degraded read says it is degraded. Landing that claim with no
+// container-tier assertion at all would leave it proven only in-process, where
+// no real network can be cut.
+//
+// It needs no new overlay, which is worth recording because #228's design notes
+// predict one ("a scenario asserting `Rift-Cluster-Partial` on data reads needs
+// a published port overlay"). It does not: traffic goes through the front-door
+// overlay's already-published per-node listeners, and the merged read is an
+// *admin* call, on a port the base file already publishes. Imposter data ports
+// stay unpublished.
+// ---------------------------------------------------------------------------
+
+/// The journal imposter's port, and the front-door prefix that reaches it.
+/// 6700 sits clear of every other scenario's data port (6300 pull-on-miss, 6400
+/// flow-state, 6500/6501 tenancy, 6600 sources origin, 6001/6002 C4).
+const JOURNAL_IMPOSTER_PORT: u16 = 6700;
+const JOURNAL_ROUTE_PREFIX: &str = "/journal";
+
+/// A merged `savedRequests` read: the set of recorded paths, and whether the
+/// response was stamped `Rift-Cluster-Partial: true`.
+///
+/// `get_data_plane` rather than `get_json` because the header *is* half the
+/// assertion and `get_json` drops headers. It is pointed at the admin port here
+/// rather than a data port — the helper is a plain GET-with-headers against any
+/// published port, and the merged read is an admin call.
+async fn merged_saved_requests(
+    admin: u16,
+) -> anyhow::Result<(std::collections::BTreeSet<String>, bool)> {
+    let (status, headers, body) = get_data_plane(
+        admin,
+        &format!("/imposters/{JOURNAL_IMPOSTER_PORT}/savedRequests"),
+    )
+    .await?;
+    if status != 200 {
+        anyhow::bail!("merged savedRequests answered {status}: {body}");
+    }
+    // Upstream answers a bare array; the cluster front may wrap it. The set of
+    // paths is the contract either way.
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let entries = parsed
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            parsed
+                .get("requests")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default();
+    let paths = entries
+        .iter()
+        .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    let partial = headers
+        .get("rift-cluster-partial")
+        .and_then(|value| value.to_str().ok())
+        == Some("true");
+    Ok((paths, partial))
+}
+
+/// Drive `count` requests through node `index`'s **own** front door.
+///
+/// Per-node front doors are what make the shards genuinely distinct. Every node
+/// serves imposter 6700 in-process (the front door dispatches to the local
+/// `ImposterManager`, never a socket — RFC-001 §7.4.6), so a request through
+/// rift-2's listener is recorded in rift-2's writer shard and nowhere else.
+/// Spraying one published port instead would put every entry on one node and
+/// the merge would be asserted against a single shard.
+async fn drive_journal_traffic(index: usize, tag: &str, count: usize) -> anyhow::Result<()> {
+    for n in 0..count {
+        let (status, _, body) = get_data_plane(
+            FRONT_DOOR_HOST_PORTS[index],
+            &format!("{JOURNAL_ROUTE_PREFIX}/{tag}-{n}"),
+        )
+        .await?;
+        if status != 200 {
+            anyhow::bail!("node {index} front door answered {status} for {tag}-{n}: {body}");
+        }
+    }
+    Ok(())
+}
+
+/// #223 AC3 (smoke): a partition is declared on both sides, and heals cleanly.
+///
+/// Three properties, in the order the acceptance criterion states them:
+/// 1. a healthy fleet's merged read is **not** stamped — the standing gate;
+/// 2. under partition **both** sides still answer, within budget, stamped
+///    `Rift-Cluster-Partial: true` — never hang, never silently short;
+/// 3. on heal the stamp clears and the two sides' sets converge.
+///
+/// Property 2's "within budget" is asserted by the read *completing*:
+/// `get_data_plane`'s client timeout is 10 s and the merge's own peer budget is
+/// far below it, so a read that waited on the unreachable peer would surface as
+/// a client timeout rather than as a stamped 200. Measuring the budget properly
+/// is C29's job (#228).
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn journal_partition_is_declared_on_both_sides_and_heals() {
+    let cluster = Cluster::up_with_overlays(&["chaos.overlay.yml", "front-door.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("a leader settles");
+
+    // Partition a follower, not the leader: isolating the leader is a different
+    // scenario (the majority elects a new one) and would change what the
+    // minority side is even able to answer.
+    let minority_index = (0..NODES.len())
+        .find(|index| *index != leader)
+        .expect("a non-leader exists");
+    let minority = &NODES[minority_index];
+    let majority: Vec<usize> = (0..NODES.len())
+        .filter(|index| *index != minority_index)
+        .collect();
+
+    // `recordRequests` is mandatory: `Imposter::record_request` returns early
+    // without it, so every shard would stay empty and every assertion below
+    // would compare empty sets and pass.
+    let (status, body) = put_imposter_config(
+        NODES[majority[0]].admin,
+        &serde_json::json!({
+            "port": JOURNAL_IMPOSTER_PORT,
+            "protocol": "http",
+            "recordRequests": true,
+            "stubs": [{
+                "responses": [{ "is": { "statusCode": 200, "body": "journal" } }]
+            }]
+        }),
+    )
+    .await
+    .expect("admin write");
+    assert_eq!(status, 201, "the journal imposter must be created: {body}");
+    wait_converged(u64::from(JOURNAL_IMPOSTER_PORT), CONVERGE_TIMEOUT)
+        .await
+        .expect("the imposter converges fleet-wide before any traffic");
+
+    let (status, body) = put_routes(
+        NODES[majority[0]].admin,
+        &serde_json::json!({
+            "routes": [{
+                "id": "journal",
+                "match": { "path_prefix": JOURNAL_ROUTE_PREFIX },
+                "target": { "port": JOURNAL_IMPOSTER_PORT },
+            }],
+        }),
+    )
+    .await
+    .expect("route write");
+    assert_eq!(status, 200, "the front-door route must be accepted: {body}");
+
+    // Poll every node's own front door until the replicated route dispatches
+    // there — a route write is a control op, so the other two nodes learn it
+    // through the log rather than from the call above.
+    for (index, front_door) in FRONT_DOOR_HOST_PORTS.iter().enumerate() {
+        let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+        loop {
+            if let Ok((200, _, _)) = get_data_plane(
+                *front_door,
+                &format!("{JOURNAL_ROUTE_PREFIX}/ready-{index}"),
+            )
+            .await
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node {index}'s front door never began dispatching the replicated route"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    // Uneven and distinctly tagged: an even split would not catch a merge that
+    // returned one shard three times.
+    for (index, tag, count) in [(0, "a", 2), (1, "b", 3), (2, "c", 1)] {
+        drive_journal_traffic(index, tag, count)
+            .await
+            .unwrap_or_else(|e| panic!("driving node {index}'s front door: {e}"));
+    }
+
+    // Property 1 — the standing gate: nothing is wrong, so nothing is stamped.
+    let (whole, partial) = merged_saved_requests(NODES[majority[0]].admin)
+        .await
+        .expect("the healthy fleet answers a merged read");
+    assert!(
+        !partial,
+        "a healthy fleet must not stamp a merged read partial: {whole:?}"
+    );
+    assert_eq!(
+        whole.len(),
+        9,
+        "every shard must be present before anything is broken: {whole:?}"
+    );
+
+    cluster
+        .partition(minority.name)
+        .expect("cut the minority off");
+
+    // `mgmt` must keep the isolated node assertable from the host, or property
+    // 2's minority half cannot be observed at all. Fail specifically rather
+    // than as a confusing timeout inside the assertion below.
+    wait_admin_reachable(minority.admin_via_mgmt, Duration::from_secs(30))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} must stay assertable over `mgmt` while partitioned ({e})",
+                minority.name
+            )
+        });
+
+    // Property 2 — both sides answer, and both say they are degraded. The
+    // minority cannot reach the other two; the majority cannot reach it.
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let majority_side = merged_saved_requests(NODES[majority[0]].admin).await;
+        let minority_side = merged_saved_requests(minority.admin_via_mgmt).await;
+        if let (Ok((_, true)), Ok((_, true))) = (&majority_side, &minority_side) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both sides must answer a partitioned read stamped partial; \
+             majority={majority_side:?} minority={minority_side:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    cluster.heal(minority).expect("heal the partition");
+    for node in &NODES {
+        wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("{} did not reconverge on 3 voters: {e}", node.name));
+    }
+
+    // Property 3 — the stamp clears and the sets converge. Polled together, not
+    // separately: "unstamped" and "agrees with everyone" are one claim, and
+    // asserting them in sequence would let a run pass on an unstamped read that
+    // was still missing the healed node's entries.
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let reads: Vec<_> = {
+            let mut collected = Vec::new();
+            for node in &NODES {
+                collected.push(merged_saved_requests(node.admin).await);
+            }
+            collected
+        };
+        let settled = reads.iter().all(|read| matches!(read, Ok((_, false))))
+            && reads
+                .iter()
+                .filter_map(|read| read.as_ref().ok())
+                .map(|(paths, _)| paths)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == 1;
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "after heal every node must answer the same unstamped set: {reads:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
