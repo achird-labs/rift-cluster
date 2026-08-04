@@ -626,6 +626,49 @@ describe("the write is conditioned on the revision the read handed over", () => 
     const disabled = (await screen.findByTestId("stub-not-addressable")) as HTMLElement;
     expect(disabled.textContent).toMatch(/no id/i);
     expect((screen.getByRole("button", { name: /^edit$/i }) as HTMLButtonElement).disabled).toBe(true);
+
+    // The reason is on screen — under the table, not inside the Actions cell.
+    const note = screen.getByTestId("stub-idless-note");
+    expect(note.textContent).toMatch(/no by-id address/i);
+    expect(disabled.querySelector("button")!.getAttribute("aria-describedby")).toBe(
+      "stub-idless-note",
+    );
+  });
+
+  it("keeps the Actions cell to a short marker rather than a paragraph", async () => {
+    // The regression: two sentences rendered per row forced the Actions column to hold a paragraph,
+    // growing the row to roughly 200px and wrapping the buttons beside it mid-word.
+    stubFleet({ read: () => ({ json: imposter([IDLESS]), revision: "default:4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+
+    const cell = (await screen.findByTestId("stub-not-addressable")) as HTMLElement;
+    expect(cell.textContent).not.toMatch(/overwrite a different stub/i);
+    expect(cell.textContent!.trim().length).toBeLessThan(20);
+  });
+
+  it("explains it once, however many stubs lack an id", async () => {
+    stubFleet({ read: () => ({ json: imposter([IDLESS, IDLESS, IDLESS]), revision: "default:4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+
+    expect(await screen.findAllByTestId("stub-not-addressable")).toHaveLength(3);
+    expect(screen.getAllByTestId("stub-idless-note")).toHaveLength(1);
+  });
+
+  it("says nothing about it when every stub is addressable", async () => {
+    stubFleet({ read: () => ({ json: imposter([MODELLED]), revision: "default:4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("editor") });
+
+    await screen.findByTestId("stub-row-0");
+    expect(screen.queryByTestId("stub-idless-note")).toBeNull();
+  });
+
+  it("does not explain a control a viewer was never offered", async () => {
+    // No Actions column for a viewer, so the note would answer a question they never asked.
+    stubFleet({ read: () => ({ json: imposter([IDLESS]), revision: "default:4545@7" }) });
+    renderInApp(<ImposterDetail port={PORT} />, { whoami: whoamiWith("viewer") });
+
+    await screen.findByTestId("stub-row-0");
+    expect(screen.queryByTestId("stub-idless-note")).toBeNull();
   });
 });
 
