@@ -1521,31 +1521,24 @@ fn require_source_id(id: &str) -> Result<(), String> {
 /// is a path: upstream's `SourceRef::scheme` routes a `file:` prefix and a bare
 /// path to the local file provider, so an `@` there is a filename character.
 ///
-/// The scheme is parsed properly rather than by searching for `://` anywhere in
-/// the string, because "anywhere" finds the wrong one:
-/// `s3:key@bucket/p?endpoint=https://minio.local` would have its *query* read
-/// as the authority, see no `@`, and admit a credential into the log. Parsing
-/// from the front means the delimiter has to be where a scheme delimiter
-/// actually is.
+/// The scheme is parsed properly — via [`split_scheme`] — rather than by
+/// searching for `://` anywhere in the string, because "anywhere" finds the
+/// wrong one: in a URI like `s3:key@bucket/p?endpoint=https://minio.local` the
+/// *query* would be read as the authority, see no `@`, and admit a credential
+/// into the log. Parsing from the front means the delimiter has to be where a
+/// scheme delimiter actually is. (That particular URI is now refused earlier,
+/// by the `s3` shape check — but the reasoning is what
+/// [`require_well_formed_uri`] was missing until #301, and it is the reason
+/// both functions share one parse.)
 fn require_credential_free_uri(uri: &str) -> Result<(), String> {
     let uri = uri.trim();
     if uri.is_empty() {
         return Err("source uri must not be empty".to_owned());
     }
-    let scheme_len = uri
-        .find(':')
-        .filter(|end| {
-            // RFC 3986: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
-            let scheme = &uri[..*end];
-            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        })
-        .map_or(0, |end| end + 1);
+    let (scheme, rest) = split_scheme(uri);
     // Everything before the first `/` (or query/fragment) of the hier-part,
     // and only when the hier-part actually opens with `//`.
-    let Some(hier) = uri[scheme_len..].strip_prefix("//") else {
+    let Some(hier) = rest.strip_prefix("//") else {
         // No authority to carry a credential: `file:…`, `s3:key@bucket/p`, and
         // bare paths all address something local or opaque, never a host this
         // node would authenticate to.
@@ -1560,9 +1553,58 @@ fn require_credential_free_uri(uri: &str) -> Result<(), String> {
         );
     }
     if authority.is_empty() {
+        // `file:///path` and `git+file:///path` are the standard spellings of a
+        // *local* URL — RFC 8089 gives them an explicitly empty authority.
+        // There is no host to name and none this node could authenticate to, so
+        // refusing them here rejected the only correct way to write them: it
+        // left `git+file:` with no admissible spelling at all once the
+        // single-colon form is refused below (#301). Schemes that really do
+        // address a host keep the refusal.
+        // Pinned to the schemes actually known to mean "local", not a
+        // `*+file` suffix heuristic: this is a security classifier, and a
+        // naming convention is the wrong thing to have deciding that an
+        // embedder's future `webdav+file:` needs no host. Case-SENSITIVE for
+        // the same reason every other scheme comparison on this path is —
+        // `require_well_formed_uri`'s `match`, the provider registry, and
+        // `parse_git_uri`'s `strip_prefix`. Folding case would admit
+        // `GIT+FILE:///…`, which matches no shape check and no provider:
+        // committed to the log and unfetchable forever.
+        if matches!(scheme, "file" | "git+file") {
+            return Ok(());
+        }
         return Err(format!("source uri {uri:?} names no host"));
     }
     Ok(())
+}
+
+/// The scheme, and everything after its colon — parsed **once**, so the two
+/// admission checks can never disagree about the same URI.
+///
+/// They used to. [`require_credential_free_uri`] anchored the scheme to the
+/// first colon whose prefix satisfies the RFC 3986 grammar, while
+/// [`require_well_formed_uri`] took whatever preceded the first `"://"`
+/// *anywhere* in the string. So `git+file:/x#main:a://b` — a single-colon git
+/// URI, exactly the shape #301 refuses — yielded the scheme
+/// `"git+file:/x#main:a"`, matched no arm, and fell through the permissive
+/// unknown-scheme catch-all into the replicated log, where every pull then
+/// failed forever. Two parsers disagreeing about one URI is the whole subject
+/// of #301; having it happen twice in one file was not defensible.
+///
+/// Returns an empty scheme when the URI has no grammar-valid one, leaving the
+/// whole string as the rest — which is what makes a scheme-less `//host/path`
+/// still present its authority to the credential check.
+fn split_scheme(uri: &str) -> (&str, &str) {
+    match uri.find(':').filter(|end| {
+        // RFC 3986: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+        let scheme = &uri[..*end];
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    }) {
+        Some(end) => (&uri[..end], &uri[end + 1..]),
+        None => ("", uri),
+    }
 }
 
 /// Per-scheme URI *shape* checks for the cluster providers (#136), so a URI
@@ -1591,10 +1633,12 @@ fn require_credential_free_uri(uri: &str) -> Result<(), String> {
 /// actionable to the operator who wrote the URI, and cannot leak.
 fn require_well_formed_uri(uri: &str) -> Result<(), String> {
     let uri = uri.trim();
-    let scheme = match uri.split_once("://") {
-        Some((scheme, _)) => scheme,
-        None => uri.split_once(':').map_or("", |(scheme, _)| scheme),
-    };
+    // Whether an authority followed the scheme is itself a fact the git arm
+    // needs: the fetch path's parser (upstream `SourceRef::scheme`) splits on
+    // `"://"`, so a `git+` URI written with a bare colon is one the two parsers
+    // *disagree* about (#301).
+    let (scheme, rest) = split_scheme(uri);
+    let has_authority = rest.starts_with("//");
 
     // RFC 3986 §3.1: schemes are case-insensitive on the wire, but the
     // provider registry and `parse_git_uri` match the canonical lowercase
@@ -1602,19 +1646,32 @@ fn require_well_formed_uri(uri: &str) -> Result<(), String> {
     // shape checks below and then fail provider lookup on every pull, so it
     // is refused at admission rather than normalized — normalizing here and
     // nowhere else is the two-parsers-disagree bug (#301) again. The message
-    // names only the canonical lowercase literal: the raw scheme is not
-    // grammar-validated at this point, so echoing it could echo a credential.
+    // names only the canonical lowercase literal, never the input, keeping
+    // the no-echo rule above trivially intact.
     if scheme.bytes().any(|b| b.is_ascii_uppercase()) {
         let lower = scheme.to_ascii_lowercase();
         if matches!(lower.as_str(), "git+https" | "git+file" | "s3" | "registry") {
             return Err(format!(
-                "source uri scheme must be lowercase: write `{lower}:`"
+                "source uri scheme must be lowercase: write `{lower}://…`"
             ));
         }
     }
 
     match scheme {
         "git+https" | "git+file" => {
+            // The disagreement, refused rather than resolved. Upstream routes
+            // `git+file:/srv/r.git` to the `file:` provider, which opens the
+            // whole string as a path and fails with a not-found naming a path
+            // nobody wrote — after this function has called it a well-formed
+            // git source. Admitting one canonical spelling makes the ambiguity
+            // unrepresentable in the replicated log instead of merely
+            // differently-routed, and the refusal teaches the shape.
+            if !has_authority {
+                return Err(format!(
+                    "source uri uses the single-colon `{scheme}:` form, which the fetch path \
+                     routes to the `file:` provider: write `{scheme}://…`"
+                ));
+            }
             let git_shape = format!("write `{scheme}://host/org/repo#<ref>:<path>`");
             let (before_fragment, fragment) = uri
                 .split_once('#')
@@ -2817,7 +2874,7 @@ mod tests {
         for uri in [
             "git+https://github.com/org/repo#main:imposters.json",
             "git+https://github.com/org/repo#v1.2.3:mocks/",
-            "git+file:/srv/repos/mocks.git#main:imposters.json",
+            "git+file:///srv/repos/mocks.git#main:imposters.json",
             // uppercase outside the scheme is untouched by the #308 refusal
             "git+https://Host/Org/Repo#Main:Path.json",
         ] {
@@ -2831,7 +2888,10 @@ mod tests {
     /// must be refused at admission — otherwise it skips every per-scheme
     /// shape check above, commits, and then fails provider lookup on every
     /// pull. The refusal names only the canonical lowercase scheme, never
-    /// the URI (issue #308).
+    /// the URI (issue #308). It runs before the per-scheme arms, so a URI
+    /// that is both mixed-case and mis-spelled (single-colon `Git+File:`)
+    /// gets the case refusal first — fixing the case then teaches the
+    /// spelling (#301).
     #[test]
     fn validate_refuses_a_non_lowercase_known_scheme() {
         for uri in [
@@ -2850,6 +2910,125 @@ mod tests {
         }
     }
 
+    // -- issue #301: the two scheme parsers must not disagree ------------------
+
+    /// The defect this closes: upstream's `SourceRef::scheme` splits on `"://"`
+    /// and calls `git+file:/srv/r.git` a **`file:`** URI, while this function's
+    /// bare-colon fallback calls the same string **`git+file`**. So the
+    /// single-colon spelling was validated as git and then fetched by
+    /// `FileSource`, which opened the literal string as a path and failed with
+    /// a not-found naming a path nobody wrote — after the control plane had
+    /// just called it well-formed.
+    ///
+    /// Refusing at admission makes the ambiguous URI unrepresentable in the
+    /// replicated log, rather than leaving it merely differently-routed.
+    #[test]
+    fn validate_rejects_the_single_colon_git_spelling() {
+        for (uri, expected) in [
+            ("git+file:/srv/r.git#main:m.json", "git+file://"),
+            ("git+https:host/org/repo#main:m.json", "git+https://"),
+        ] {
+            let err = validate(&source_put("mocks", uri))
+                .expect_err("the single-colon spelling must be refused at admission");
+            assert!(
+                err.contains(expected),
+                "refusing {uri}: expected the message to name {expected:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// A `://` later in the URI must not be mistaken for the authority.
+    ///
+    /// The two admission checks used to derive the scheme differently — one
+    /// grammar-anchored, one "whatever precedes the first `://` anywhere" — so
+    /// a single-colon git URI carrying a `://` in its ref or path produced a
+    /// garbage scheme, matched no arm, and slipped through the unknown-scheme
+    /// catch-all into the log, to fail every pull forever. Both now share
+    /// `split_scheme`, which is the only reason the refusal above is total.
+    #[test]
+    fn a_later_double_slash_cannot_satisfy_the_authority_requirement() {
+        for uri in [
+            "git+file:/x#main:a://b",
+            "git+file:/srv/r.git#main:https://example.com/x",
+            "git+https:host/o/r#main:a://b",
+        ] {
+            let err = validate(&source_put("mocks", uri))
+                .expect_err("a `://` in the fragment is not an authority");
+            assert!(
+                err.contains("single-colon"),
+                "refusing {uri}: expected the spelling refusal, got {err:?}"
+            );
+        }
+    }
+
+    /// The other half of #301, and the reason the refusal above does not simply
+    /// leave `git+file:` unusable.
+    ///
+    /// [`require_credential_free_uri`] runs first and refused *any* empty
+    /// authority as "names no host" — but `file:///path` is RFC 8089's standard
+    /// spelling of a local URL, whose authority is empty by design. So the
+    /// documented `git+file://` form was already refused at admission before
+    /// this issue, and refusing the single-colon form as well would have left
+    /// the scheme with no admissible spelling at all. A host is a *shape*
+    /// concern belonging to the per-scheme checks, not to credential hygiene:
+    /// an empty authority cannot carry a credential, which is all that function
+    /// is for.
+    #[test]
+    fn validate_accepts_the_empty_authority_of_a_local_url() {
+        for uri in [
+            "git+file:///srv/repos/mocks.git#main:imposters.json",
+            "file:///srv/mocks/imposters.json",
+        ] {
+            assert_eq!(validate(&source_put("mocks", uri)), Ok(()), "uri {uri}");
+        }
+        // Schemes that really do address a host keep the refusal.
+        for uri in ["s3:///key", "registry://"] {
+            assert!(
+                validate(&source_put("mocks", uri)).is_err(),
+                "an empty authority must still be refused for {uri}"
+            );
+        }
+        // And so does a non-canonical case. Every other scheme comparison on
+        // this path is case-sensitive, so folding case here would admit a URI
+        // that then matches no shape check and no provider — committed, and
+        // unfetchable forever.
+        for uri in [
+            "FILE:///srv/mocks/imposters.json",
+            "GIT+FILE:///srv/repos/mocks.git#main:imposters.json",
+        ] {
+            assert!(
+                validate(&source_put("mocks", uri)).is_err(),
+                "an uppercase scheme must not be exempted: {uri}"
+            );
+        }
+        // And an empty authority is still no excuse for a credential.
+        assert!(
+            validate(&source_put(
+                "mocks",
+                "git+file://u:p@/srv/r.git#main:m.json"
+            ))
+            .is_err(),
+            "a credential-bearing authority must still be refused"
+        );
+    }
+
+    /// The refusal must teach the shape without quoting the URI back. The
+    /// function's doc states this rule for the whole family: these strings are
+    /// rendered to the caller *and* into the admission log, and
+    /// `require_credential_free_uri` deliberately permits a token in a query
+    /// string, so echoing the URI would leak it.
+    #[test]
+    fn the_single_colon_refusal_does_not_echo_the_uri() {
+        let uri = "git+https:host/org/repo?token=hunter2#main:m.json";
+        let err = validate(&source_put("mocks", uri)).expect_err("must be refused");
+        assert!(
+            !err.contains("hunter2"),
+            "refusal leaked the query string: {err}"
+        );
+        assert!(!err.contains(uri), "refusal echoed the whole uri: {err}");
+        assert!(err.contains("git+https://"), "{err}");
+    }
+
     // -- issue #136 review, B1: the git argument-injection refusal is
     // mirrored at admission, not only at fetch time ---------------------------
 
@@ -2863,7 +3042,16 @@ mod tests {
             "git+file:--upload-pack=/tmp/pwn.sh#main:x",
         ))
         .expect_err("an option-shaped remote must be refused at admission");
-        assert!(err.contains("option"), "{err}");
+        // Since #301 this is caught one rule earlier, by the single-colon
+        // refusal, and the message names the spelling rather than the option.
+        // The shape is only *writable* in the single-colon form — with the `//`
+        // spelling the remote always begins `//`, so it can never start with
+        // `-` — which is why `check_remote`'s own guard is proven directly in
+        // `sources::tests` instead of through admission.
+        assert!(
+            err.contains("git+file://"),
+            "an option-shaped remote must still never reach the log: {err}"
+        );
     }
 
     /// Same class of bug in the ref position: `git fetch <remote>
@@ -2883,7 +3071,12 @@ mod tests {
     /// when a node's `git.rs` fetch happens to notice it.
     #[test]
     fn validate_refuses_a_git_transport_helper_remote() {
-        let err = validate(&source_put("mocks", "git+file:ext::sh -c whoami#main:x"))
+        // Written in the `//` spelling deliberately: `::` is the one
+        // `check_remote` guard that survives it (the remote becomes
+        // `//ext::sh -c whoami`, which still contains `::`), so this keeps
+        // exercising the real guard through admission rather than being
+        // short-circuited by the #301 spelling refusal.
+        let err = validate(&source_put("mocks", "git+file://ext::sh -c whoami#main:x"))
             .expect_err("a transport helper remote must be refused at admission");
         assert!(err.contains("transport"), "{err}");
     }
@@ -2896,7 +3089,12 @@ mod tests {
         for uri in ["git+file:relative/path#main:x", "git+file:relative#main:x"] {
             let err = validate(&source_put("mocks", uri))
                 .expect_err("a relative git+file: remote must be refused");
-            assert!(err.contains("absolute"), "{uri}: {err}");
+            // As with the option-shaped remote above: since #301 the spelling
+            // rule refuses these first, and a relative remote is only writable
+            // in the single-colon form (the `//` spelling always yields a
+            // `//`-prefixed, hence absolute, remote). `check_remote`'s
+            // absolute-path guard is proven directly in `sources::tests`.
+            assert!(err.contains("git+file://"), "{uri}: {err}");
         }
     }
 
