@@ -237,6 +237,34 @@ lazy_static! {
     )
     .expect("rift_cluster_pull_on_miss_retries_total registers once");
 
+    /// `rift_requests_unmatched_total` — requests the fleet answered with a
+    /// no-match, the denominator half of the match-rate the dashboards plot.
+    ///
+    /// **This undercounts, deliberately and by a known amount.** It is
+    /// incremented where the pull-on-miss net concludes `Proceed`, which is the
+    /// only point in this process that is certainly a terminal miss. The seam
+    /// grants at most ONE retry and is not consulted again, so a request that
+    /// was retried and missed a second time is invisible here — exactly the
+    /// blind spot [`PULL_ON_MISS_RETRIES`] above refuses to guess at. Match rate
+    /// derived from this therefore reads slightly HIGH.
+    ///
+    /// The error is measurable rather than merely acknowledged, but mind which
+    /// quantity is bounded: the undercount *on this counter* is at most
+    /// `rate(rift_cluster_pull_on_miss_retries_total)`, since every missed retry
+    /// is a retry. The overstatement *on a match-rate ratio* is that same
+    /// quantity divided by the request rate — the un-normalised retry rate is
+    /// not a bound on a 0..1 ratio at all. Closing the gap needs an upstream
+    /// seam that reports the retry's outcome.
+    ///
+    /// Named `rift_requests_*`, not `rift_cluster_*`: it counts a property of
+    /// the request stream that the engine owns, and sits beside upstream's
+    /// `rift_requests_total` it is divided by.
+    static ref REQUESTS_UNMATCHED: IntCounter = register_int_counter!(
+        "rift_requests_unmatched_total",
+        "Requests answered with a no-match (undercounts by retried-then-missed requests)"
+    )
+    .expect("rift_requests_unmatched_total registers once");
+
     /// `rift_cluster_flow_fsync_seconds` — how long a durable flow-state commit
     /// took. Buckets start at 100µs (an SSD's floor) and reach 1s, because the
     /// number worth seeing is the tail: `Sync` writes wait on this, so its p99
@@ -554,6 +582,32 @@ pub(crate) fn pull_on_miss_retry() {
     PULL_ON_MISS_RETRIES.inc();
 }
 
+/// Record a terminal no-match. See [`REQUESTS_UNMATCHED`] for why a retried
+/// request that missed again does not reach this.
+pub(crate) fn request_unmatched() {
+    REQUESTS_UNMATCHED.inc();
+}
+
+/// Counter access for tests in sibling modules.
+///
+/// The counters are process-global, so any test that reads a baseline, mutates,
+/// and asserts a delta races every other such test under `cargo test`'s default
+/// parallelism. They all have to take the *same* lock, which is why it lives
+/// here rather than in one module's test scope.
+#[cfg(test)]
+pub(crate) mod testing {
+    static COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Recovers from poisoning so one panicking test does not cascade.
+    pub(crate) fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn requests_unmatched_total() -> u64 {
+        super::REQUESTS_UNMATCHED.get()
+    }
+}
+
 pub(crate) fn config_applied(port: u16, revision: u64) {
     CONFIG_REVISION
         .with_label_values(&[&port.to_string()])
@@ -680,7 +734,6 @@ pub fn snapshot() -> Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     /// Read a gauge back out of the *global* registry the metrics server serves,
     /// rather than off the handle — that round trip is the thing under test, and
@@ -701,17 +754,9 @@ mod tests {
             .map(|metric| metric.get_gauge().get_value())
     }
 
-    // The counters are process-global, so tests that read a baseline, mutate,
-    // and assert an exact delta race each other under `cargo test`'s default
-    // parallelism (one test's increment lands inside another's before/after
-    // window). Serialize exactly those tests through this lock; the recover
-    // ignores poisoning so one panicking test doesn't cascade into failures in
-    // the rest.
-    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
-
-    fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
-        COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    // Tests in sibling modules touch these same process-global counters, so the
+    // lock has to be shared with them rather than private to this scope.
+    use super::testing::counter_guard;
 
     fn failures_for(snapshot: &Snapshot, reason: &str) -> u64 {
         snapshot
@@ -885,6 +930,7 @@ mod tests {
         pull_on_miss_check();
         pull_on_miss_lagging();
         pull_on_miss_retry();
+        request_unmatched();
         flow_fsync_observed(std::time::Duration::from_micros(200));
         flow_wal_lag(4);
         flow_adoption("empty");
@@ -907,6 +953,7 @@ mod tests {
             "rift_cluster_pull_on_miss_checks_total",
             "rift_cluster_pull_on_miss_lagging_total",
             "rift_cluster_pull_on_miss_retries_total",
+            "rift_requests_unmatched_total",
             "rift_cluster_intents_parked_total",
             "rift_cluster_intents_replayed_total",
             "rift_cluster_intents_pending",

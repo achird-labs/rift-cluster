@@ -1,0 +1,109 @@
+# promtool unit tests for ../alerts.yml
+# (`promtool test rules deploy/observability/prometheus/rules/tests/*.yml`).
+#
+# Annotation text below is copied verbatim from alerts.yml and must be kept
+# in sync with it by hand — these are plain strings (no Go templating), a
+# deliberate choice in alerts.yml so this kind of exact-match test stays
+# simple instead of having to reproduce Prometheus's template rendering.
+rule_files:
+  - ../alerts.yml
+
+# The rule group's OWN evaluation cadence during this simulated walk — NOT
+# the same thing as a test's `interval:` below, which only spaces out the
+# synthetic input samples. `for:` state (pending -> firing) only advances on
+# a rule-group evaluation, so this has to be at least as fine as the
+# tightest `for:` window under test (RiftClusterNoLeader's 15s) or that
+# alert would never be evaluated finely enough to be observed transitioning
+# into firing within this file's timeline. 15s evenly divides every other
+# alert's `for:` window here (1m, 5m) too, so one file-wide setting serves
+# all three scenarios below.
+evaluation_interval: 15s
+
+tests:
+  # -- RiftClusterNoLeader: fires on synthetic leader loss, clears on
+  # recovery. `for: 15s` is the tightest window in alerts.yml, so this test
+  # runs at 15s resolution — the same granularity the rule itself needs to
+  # even be evaluable.
+  - interval: 15s
+    input_series:
+      # t=0s,15s: leader present. t=30s..60s: leader lost (sustained past
+      # the 15s `for:` window). t=75s onward: leader restored.
+      - series: 'rift_cluster_members{state="leader", instance="rift-1"}'
+        values: '1 1 0 0 0 1 1'
+    alert_rule_test:
+      - eval_time: 15s
+        alertname: RiftClusterNoLeader
+        exp_alerts: []
+      - eval_time: 30s
+        alertname: RiftClusterNoLeader
+        exp_alerts: [] # condition just became true; `for: 15s` not yet elapsed (pending)
+      - eval_time: 45s
+        alertname: RiftClusterNoLeader
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No leader elected in the rift cluster"
+              description: "No node in the fleet reports itself as leader for at least 15s (3x the 5s fleet-gauge sample timer — the minimum window that can tell a real leaderless gap apart from one scrape landing between two gauge refreshes). Every write-forwarding and barrier path depends on a leader existing; this is the single highest-severity condition this fleet can be in."
+      - eval_time: 60s
+        alertname: RiftClusterNoLeader
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No leader elected in the rift cluster"
+              description: "No node in the fleet reports itself as leader for at least 15s (3x the 5s fleet-gauge sample timer — the minimum window that can tell a real leaderless gap apart from one scrape landing between two gauge refreshes). Every write-forwarding and barrier path depends on a leader existing; this is the single highest-severity condition this fleet can be in."
+      - eval_time: 75s
+        alertname: RiftClusterNoLeader
+        exp_alerts: [] # leader restored — cleared immediately, no lingering "for" state
+
+  # -- RiftClusterInsecure: fires after a sustained 5m of
+  # rift_cluster_insecure=1, clears on recovery.
+  #
+  # -- RiftClusterBindFailures: fires after a sustained 1m of
+  # rift_cluster_bind_failures=1 on a specific port, clears on recovery,
+  # and (unlike the two rules above) its expr has no aggregation, so its
+  # port/instance labels pass straight through to the alert.
+  #
+  # Both share one `tests:` entry at 1m resolution: 1m evenly divides both
+  # rules' `for:` windows (5m and 1m), so this is precise enough for either
+  # without needing 15s-level granularity here.
+  - interval: 1m
+    input_series:
+      - series: 'rift_cluster_insecure{instance="rift-1"}'
+        values: '0 0 1 1 1 1 1 1 0'
+      - series: 'rift_cluster_bind_failures{instance="rift-1", port="9090"}'
+        values: '0 0 1 1 0'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: RiftClusterInsecure
+        exp_alerts: [] # true since t=2m, but only 4m elapsed — still pending
+      - eval_time: 7m
+        alertname: RiftClusterInsecure
+        exp_alerts:
+          - exp_labels:
+              instance: rift-1
+              severity: warning
+            exp_annotations:
+              summary: "Cluster port running without authentication"
+              description: "rift_cluster_insecure has read 1 for at least 5 minutes (well past the 15s fleet-gauge floor) — this is a standing configuration property, not a transient blip, so the long window exists only to avoid paging during the first few seconds after a deliberate restart with auth mid-rollout, not because the signal is noisy."
+      - eval_time: 8m
+        alertname: RiftClusterInsecure
+        exp_alerts: [] # secured again — cleared
+
+      - eval_time: 2m
+        alertname: RiftClusterBindFailures
+        exp_alerts: [] # true since t=2m, `for: 1m` not yet elapsed — pending
+      - eval_time: 3m
+        alertname: RiftClusterBindFailures
+        exp_alerts:
+          - exp_labels:
+              instance: rift-1
+              port: "9090"
+              severity: critical
+            exp_annotations:
+              summary: "Local engine cannot realize a committed config"
+              description: "rift_cluster_bind_failures has read 1 on at least one port for at least 1 minute (12x the 5s gauge floor — several engine-drive cycles, since the gauge is resampled after every drive per its doc comment, not on the plain 5s timer). This means a committed config exists that this node cannot serve; critical because it is a live serving gap on a specific port, not just a convergence lag."
+      - eval_time: 4m
+        alertname: RiftClusterBindFailures
+        exp_alerts: [] # port healed — cleared

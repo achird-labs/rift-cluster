@@ -1,0 +1,234 @@
+# promtool unit tests for ../recording.yml
+# (`promtool test rules deploy/observability/prometheus/rules/tests/*.yml`).
+#
+# The first test group below is not a coverage checkbox — it is the proof
+# for recording.yml's central claim. Three synthetic nodes are built with
+# deliberately different latency distributions (rift-1 fast, rift-2 medium,
+# rift-3 has a long slow tail) and the test pins BOTH numbers: the correct
+# bucket-merged `rift:request_latency_ms:p99` and the naive average of the
+# three per-node p99s. They are not close (3500ms vs. ~1561.67ms on the
+# SAME underlying data) — see recording.yml's module comment for why that
+# gap is not a rounding difference.
+#
+# All bucket series below share one deliberate shape: five samples of 0
+# (t=1m..4m at 1-minute spacing) followed by one jump to the target
+# cumulative count at t=5m, then evaluated at eval_time: 5m with a [5m]
+# `rate()` window. This is not arbitrary — it is what makes the pinned
+# numbers exact rather than approximate: `rate()`'s counter-extrapolation
+# math multiplies every bucket's value by the SAME scalar, because that
+# scalar is a function of the sample TIMESTAMPS only (identical across every
+# le/instance series here), never of the bucket VALUES. `histogram_quantile`
+# only ever computes ratios and interpolation fractions between cumulative
+# bucket counts, so a uniform scalar applied to all of them cancels out
+# completely and the quantile is exact regardless of `rate()`'s internal
+# extrapolation constant. The same cancellation is why the hand-derived
+# expected numbers below did not require reverse-engineering Prometheus's
+# extrapolation algorithm to get right.
+rule_files:
+  - ../recording.yml
+
+evaluation_interval: 1m
+
+tests:
+  # -- The bucket-merge proof --------------------------------------------
+  - interval: 1m
+    input_series:
+      # rift-1: fast node. Nearly everything answered in <=10ms.
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="1"}'
+        values: '0 0 0 0 0 500'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="5"}'
+        values: '0 0 0 0 0 950'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="10"}'
+        values: '0 0 0 0 0 990'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="25"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="50"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="100"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="250"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="500"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="1000"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="2500"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="5000"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-1", method="GET", fault_applied="none", le="+Inf"}'
+        values: '0 0 0 0 0 1000'
+
+      # rift-2: medium node. Spread across the whole 1-250ms range.
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="1"}'
+        values: '0 0 0 0 0 50'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="5"}'
+        values: '0 0 0 0 0 200'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="10"}'
+        values: '0 0 0 0 0 400'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="25"}'
+        values: '0 0 0 0 0 700'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="50"}'
+        values: '0 0 0 0 0 900'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="100"}'
+        values: '0 0 0 0 0 980'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="250"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="500"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="1000"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="2500"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="5000"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-2", method="GET", fault_applied="none", le="+Inf"}'
+        values: '0 0 0 0 0 1000'
+
+      # rift-3: the slow node. A long tail: 30% of requests land past 1s,
+      # 5% past 2.5s. This is the node that makes averaging quantiles lie —
+      # it has the same request volume as the other two, so a fleet p99
+      # cannot legitimately ignore its tail the way a per-node average does.
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="1"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="5"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="10"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="25"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="50"}'
+        values: '0 0 0 0 0 0'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="100"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="250"}'
+        values: '0 0 0 0 0 300'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="500"}'
+        values: '0 0 0 0 0 500'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="1000"}'
+        values: '0 0 0 0 0 700'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="2500"}'
+        values: '0 0 0 0 0 950'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="5000"}'
+        values: '0 0 0 0 0 1000'
+      - series: 'rift_proxy_request_duration_ms_bucket{instance="rift-3", method="GET", fault_applied="none", le="+Inf"}'
+        values: '0 0 0 0 0 1000'
+
+    promql_expr_test:
+      # The correct answer: buckets merged across all three nodes BEFORE
+      # histogram_quantile runs once. The bare name is unambiguous because
+      # the slices carry their own names (`:by_instance` and friends), so
+      # nothing else can match this selector.
+      - expr: 'rift:request_latency_ms:p50'
+        eval_time: 5m
+        exp_samples:
+          # Exact value is 475/31 = 15.3225806451612903... — pinned to the
+          # float64 histogram_quantile()/rate() actually produce (a few ULP
+          # off the mathematically exact fraction from rate()'s own internal
+          # extrapolation arithmetic, which does not affect correctness: see
+          # this file's header on why that arithmetic cancels for ratios).
+          - value: 15.322580645161285
+            labels: 'rift:request_latency_ms:p50'
+      - expr: 'rift:request_latency_ms:p95'
+        eval_time: 5m
+        exp_samples:
+          # Exact value is 1900; pinned to the float64 actually produced.
+          - value: 1899.9999999999993
+            labels: 'rift:request_latency_ms:p95'
+      - expr: 'rift:request_latency_ms:p99'
+        eval_time: 5m
+        exp_samples:
+          - value: 3500
+            labels: 'rift:request_latency_ms:p99'
+
+      # The per-node rule has its own name and reproduces each node's own
+      # p99, computed the same bucket-merge way but with only that node's
+      # buckets in the sum.
+      - expr: 'rift:request_latency_ms:p99:by_instance{instance="rift-1"}'
+        eval_time: 5m
+        exp_samples:
+          - value: 10
+            labels: 'rift:request_latency_ms:p99:by_instance{instance="rift-1"}'
+      - expr: 'rift:request_latency_ms:p99:by_instance{instance="rift-2"}'
+        eval_time: 5m
+        exp_samples:
+          - value: 175
+            labels: 'rift:request_latency_ms:p99:by_instance{instance="rift-2"}'
+      - expr: 'rift:request_latency_ms:p99:by_instance{instance="rift-3"}'
+        eval_time: 5m
+        exp_samples:
+          # Exact value is 4500; pinned to the float64 actually produced.
+          - value: 4500.000000000001
+            labels: 'rift:request_latency_ms:p99:by_instance{instance="rift-3"}'
+
+      # THE PROOF: averaging those three per-node p99s gives ~1561.67ms.
+      # The correct, bucket-merged fleet p99 asserted above is 3500ms — more
+      # than double. Both numbers are pinned as separate, machine-checked
+      # assertions rather than one of them being asserted "not equal": if
+      # anyone ever changes recording.yml to average per-node quantiles
+      # instead of merging buckets, this exact value (1561.6666...) is what
+      # `rift:request_latency_ms:p99` would start reporting instead of
+      # 3500, and it is provably the wrong number for this input.
+      - expr: 'avg(rift:request_latency_ms:p99:by_instance)'
+        eval_time: 5m
+        exp_samples:
+          # Exact value is 4685/3 = 1561.6666...; pinned to the float64
+          # actually produced by averaging the three (also float64) per-node
+          # p99s above.
+          - value: 1561.666666666667
+            labels: '{}'
+
+      # Free coverage: with only one method ("GET") and one fault_applied
+      # value ("none") in the synthetic data, those slices necessarily
+      # equal the fleet-wide total — confirming the by-method and
+      # by-fault_applied rules merge buckets the same way, not just the
+      # by-instance rule.
+      - expr: 'rift:request_latency_ms:p99:by_method{method="GET"}'
+        eval_time: 5m
+        exp_samples:
+          - value: 3500
+            labels: 'rift:request_latency_ms:p99:by_method{method="GET"}'
+      - expr: 'rift:request_latency_ms:p99:by_fault{fault_applied="none"}'
+        eval_time: 5m
+        exp_samples:
+          - value: 3500
+            labels: 'rift:request_latency_ms:p99:by_fault{fault_applied="none"}'
+
+  # -- rift:match_rate:ratio5m --------------------------------------------
+  # A ratio of two rate()s over the identical window and identical sample
+  # timestamps: rate()'s extrapolation scalar is a function of timestamps
+  # only, so it is the same for numerator and denominator and cancels
+  # exactly in the division. 5 unmatched out of 100 total is pinned as
+  # exactly 0.95, not an approximation.
+  - interval: 1m
+    input_series:
+      - series: 'rift_requests_total{method="GET", status="200", instance="rift-1"}'
+        values: '0 0 0 0 0 100'
+      - series: 'rift_requests_unmatched_total{instance="rift-1"}'
+        values: '0 0 0 0 0 5'
+    promql_expr_test:
+      - expr: rift:match_rate:ratio5m
+        eval_time: 5m
+        exp_samples:
+          - value: 0.95
+            labels: 'rift:match_rate:ratio5m'
+
+  # -- rift:journal_entries:sum -------------------------------------------
+  # A plain gauge sum, not a rate() — no extrapolation involved, so this is
+  # exact by construction. Two nodes, two ports each.
+  - interval: 1m
+    input_series:
+      - series: 'rift_cluster_journal_entries{instance="rift-1", port="9090"}'
+        values: '120'
+      - series: 'rift_cluster_journal_entries{instance="rift-1", port="9091"}'
+        values: '30'
+      - series: 'rift_cluster_journal_entries{instance="rift-2", port="9090"}'
+        values: '80'
+      - series: 'rift_cluster_journal_entries{instance="rift-2", port="9091"}'
+        values: '0'
+    promql_expr_test:
+      - expr: rift:journal_entries:sum
+        eval_time: 0m
+        exp_samples:
+          - value: 230
+            labels: 'rift:journal_entries:sum'

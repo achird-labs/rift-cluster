@@ -1,0 +1,403 @@
+{
+  "uid": "rift-latency-analytics",
+  "title": "Rift Cluster / Latency Analytics",
+  "tags": [
+    "rift-cluster"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Fleet request latency (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:request_latency_ms:p50",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:request_latency_ms:p95",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:request_latency_ms:p99",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Fleet-wide percentiles merged at the histogram-bucket level (RFC-003 SS5) \u2014 never averaged from per-node quantiles. See the recording rules in deploy/observability/prometheus/rules/recording.yml."
+    },
+    {
+      "id": 2,
+      "title": "p99 by node",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:request_latency_ms:p99:by_instance",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Same p99 recording rule, sliced to the series that carry an instance label \u2014 the per-node variant of the fleet rule above."
+    },
+    {
+      "id": 3,
+      "title": "p99 by method",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:request_latency_ms:p99:by_method",
+          "legendFormat": "{{method}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "p99 recording rule sliced to the series that carry a method label."
+    },
+    {
+      "id": 4,
+      "title": "p99, fault-applied vs clean",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:request_latency_ms:p99:by_fault",
+          "legendFormat": "fault_applied={{fault_applied}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "p99 recording rule sliced to the series that carry a fault_applied label, isolating requests a configured fault delayed from the ones it did not."
+    },
+    {
+      "id": 5,
+      "title": "Upstream latency (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:upstream_latency_ms:p50",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:upstream_latency_ms:p95",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:upstream_latency_ms:p99",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Upstream-call latency, same bucket-merge treatment as the proxy-side percentiles above."
+    },
+    {
+      "id": 6,
+      "title": "Request rate",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:requests:rate1m",
+          "legendFormat": "req/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Fleet request rate, 1-minute window."
+    },
+    {
+      "id": 7,
+      "title": "Match rate",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:match_rate:ratio5m",
+          "legendFormat": "match rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Reads slightly HIGH: the underlying unmatched counter misses requests that were retried by pull-on-miss and missed again, so a retried-then-still-unmatched request is not counted as unmatched here. The undercount is bounded by rate(rift_cluster_pull_on_miss_retries_total[5m]) \u2014 see the Verification Plane dashboard for that series."
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Match-rate overstatement ceiling",
+      "description": "How much `rift:match_rate:ratio5m` above may be reading HIGH. The unmatched counter misses requests that pull-on-miss retried and that then missed again, so match rate is optimistic by at most this much. Normalised by request rate deliberately: the raw retry rate bounds the undercount on the COUNTER, not the error on a 0..1 RATIO, and at low traffic the un-normalised figure understates the error badly.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(rate(rift_cluster_pull_on_miss_retries_total[5m])) / sum(rate(rift_requests_total[5m]))",
+          "legendFormat": "max overstatement"
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": []
+}

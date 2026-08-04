@@ -1,0 +1,52 @@
+# Prometheus config for the rift-cluster observability pack (issue #227,
+# RFC-003 SS5/SS6).
+#
+# One `rift-cluster` job scrapes all three compose nodes directly, by their
+# docker-compose service names, rather than through any service discovery
+# mechanism. This is a fixed three-node demo/dev fleet (see
+# deploy/compose/docker-compose.yml) that never scales itself, so a static
+# target list is the honest shape — it adds zero moving parts and does not
+# pretend to a topology this stack does not have.
+#
+# The 5s scrape interval is not an arbitrary "fast enough" choice: it matches
+# the fleet gauges' own sampling timer. `observe_node` in
+# crates/rift-cluster/src/metrics.rs is polled by the composition on a 5s
+# timer (see that file's module comment — the gauges are sampled, not
+# pushed, because nothing calls into this crate when leadership or
+# membership changes). Scraping slower than 5s would silently alias stale
+# gauge samples as if they were fresh; scraping faster would just re-read
+# the same value and waste cycles. 5s is the cadence the data actually
+# changes at.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+# Every rift:*.yml file under rules/ is loaded — recording.yml and
+# alerts.yml. rules/tests/ is deliberately NOT matched by this glob: those
+# files are promtool unit-test fixtures (`promtool test rules`), not rules
+# for a running server to evaluate, and loading them here would make the
+# server try to evaluate `tests:`/`input_series:` keys as if they were rule
+# groups.
+rule_files:
+  - rules/*.yml
+
+scrape_configs:
+  - job_name: rift-cluster
+    scrape_interval: 5s
+    static_configs:
+      - targets:
+          - rift-1:9090
+          - rift-2:9090
+          - rift-3:9090
+    relabel_configs:
+      # Prometheus defaults the `instance` label to `__address__`
+      # (host:port). The port here is always 9090 — every node's metrics
+      # port, per the docker-compose service definitions — so it carries no
+      # information and only clutters every legend and alert with
+      # "rift-1:9090" instead of "rift-1". Stripping it is what lets a panel
+      # legend read `{{instance}}` and get back the plain compose service
+      # name a human actually reasons about.
+      - source_labels: [__address__]
+        regex: '(.*):\d+'
+        target_label: instance
+        replacement: '${1}'
