@@ -12,6 +12,21 @@
 #
 # A checkout without the submodule fails at `cargo build` with a missing-path
 # dependency rather than silently producing a binary without the engine in it.
+#
+# Two published FLAVORS (#270), selected with `--target`:
+#
+#   `runtime`        (default, last stage — what a bare `docker build` with no
+#                     `--target` produces) — `debian:bookworm-slim`, carries `git` so
+#                     `git+https:`/`git+file:` imposter sources work.
+#   `runtime-static` (`-static` tag suffix) — `FROM scratch`, a musl binary and nothing
+#                     else: no shell, no package manager, no git. Smaller and a narrower
+#                     attack surface, at the cost of `git+` sources — see `deploy/README.md`'s
+#                     image-flavors table for the full trade-off.
+#
+# `runtime` stays the LAST stage in this file on purpose: `cluster-smoke` and every local
+# `docker build -f deploy/Dockerfile .` pass no `--target`, and a bare build resolves to
+# whichever stage is last. Moving `runtime` up to make room for the static stages would
+# silently change what those untargeted builds produce.
 
 # ---------------------------------------------------------------------------
 # Console wasm — `rift-lint` compiled for the browser
@@ -168,17 +183,160 @@ COPY --from=web /src/web/dist ./web/dist
 RUN cargo build --locked --release -p rift-cluster-server --features console
 
 # ---------------------------------------------------------------------------
+# Builder — static (musl)
+# ---------------------------------------------------------------------------
+# Produces the binary for `runtime-static` below (#270). This is a NATIVE-arch musl build, not
+# a cross-compile: the release lane builds each architecture on its own runner (`ubuntu-latest`
+# for amd64, `ubuntu-24.04-arm` for arm64 — see `.github/workflows/release.yml`'s `image` job
+# matrix), so on every build that matters `TARGETARCH` names the host the build is already
+# running on. Cross-compiling a musl target from a foreign host is its own can of worms (linker
+# selection, `.cargo/config.toml` target overrides); native builds side-step it entirely rather
+# than solving it.
+FROM rust:1.92-slim-bookworm AS builder-static
+
+# `musl-tools`/`musl-dev` alongside the same `build-essential pkg-config git` the default
+# `builder` installs above — `ring` still needs a C toolchain regardless of libc, and `git` is
+# here for the identical reason: rift-cluster-base's build script shells out to it to read the
+# vendored submodule's pin for `--version`. `ca-certificates` is also installed here, but not
+# for this stage's own build — it exists so `runtime-static` below has a CA bundle to COPY,
+# since scratch has no package manager to fetch one with.
+#
+# None of this says anything about the RUNTIME stage that consumes this builder's output:
+# `git` being installed here is a build-time need, not a claim about what ships. See
+# `runtime-static` for what actually ends up in the image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config git musl-tools musl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Same `case` pattern as the wasm stage's TARGETARCH switch above, and the same rule: an
+# unrecognized value is a hard failure, never a silent default. This stage is only ever reached
+# via an explicit `--target runtime-static` build under buildx with a `platforms` set (the
+# release lane's `image` job matrix), so TARGETARCH is always populated by the time this runs —
+# unlike the wasm stage, which also has to work under a plain `docker build` with no buildx
+# platform at all.
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) triple="x86_64-unknown-linux-musl" ;; \
+      arm64) triple="aarch64-unknown-linux-musl" ;; \
+      *) echo "no musl target for TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    echo "$triple" > /musl_triple; \
+    rustup target add "$triple"
+
+WORKDIR /src
+COPY . .
+
+# Same reasoning as `builder` above: no git history in the build context, so the pin is passed
+# in rather than discovered.
+ARG RIFT_UPSTREAM_VERSION
+ENV RIFT_UPSTREAM_VERSION=${RIFT_UPSTREAM_VERSION}
+
+# The console bundle is flavor-neutral — rust-embed puts the bytes in the binary regardless of
+# libc — so this flavor consumes the exact same `web` stage output as the default builder
+# rather than rebuilding it.
+COPY --from=web /src/web/dist ./web/dist
+
+RUN set -eux; \
+    triple="$(cat /musl_triple)"; \
+    cargo build --locked --release -p rift-cluster-server --features console --target "$triple"
+
+# `COPY --from=` cannot interpolate a shell variable, and the triple is only known at build
+# time (it depends on TARGETARCH). So the binary is staged to a fixed, triple-independent path
+# here — in the one stage that actually knows the triple — rather than asking `runtime-static`'s
+# COPY to resolve one.
+RUN set -eux; \
+    triple="$(cat /musl_triple)"; \
+    cp "target/${triple}/release/rift-cluster-server" /rift-cluster-server-static
+
+# A minimal `/etc/passwd`/`/etc/group` carrying only the `rift` user, generated here because
+# `runtime-static` is `FROM scratch` and has no shell to run `useradd` with. Numeric uid/gid
+# 10001 — the same identity the default flavor's `useradd --uid 10001` produces below — so the
+# two flavors are interchangeable from an orchestrator's point of view (the same non-root uid
+# in a `securityContext`, etc).
+RUN set -eux; \
+    printf 'rift:x:10001:10001:rift:/var/lib/rift:/sbin/nologin\n' > /etc/passwd.rift; \
+    printf 'rift:x:10001:\n' > /etc/group.rift
+
+# The data and cluster-state directories are the only paths the process writes — same as
+# `runtime` below. Created and chowned here, numerically, because scratch has no NSS to resolve
+# `rift` against `/etc/passwd` at COPY time even though it will at container runtime.
+RUN mkdir -p /var/lib/rift && chown 10001:10001 /var/lib/rift
+
+# ---------------------------------------------------------------------------
+# Runtime — static (scratch)
+# ---------------------------------------------------------------------------
+# The `-static` flavor's whole reason to exist (#270): zero OS packages, zero shell, zero attack
+# surface beyond the binary itself. `FROM scratch` has no package manager, no libc dynamic
+# loader, no coreutils — nothing but what is explicitly COPYed in below.
+#
+# This is possible now, and was not before #270's Rust half: `git+https:`/`git+file:` imposter
+# sourcing used to be probed with `git --version` at startup and treated a missing git as a
+# reason to refuse to boot, which would have made a gitless scratch image fail before it ever
+# served a request. It is now a detected CAPABILITY instead of a boot requirement — the server
+# boots and serves, logs exactly `git not found; git+ imposter sources disabled in this image`
+# at WARN, and the two `git+` schemes fail at DECLARATION time (`` `git+https:` sources are
+# unavailable: no `git` binary on PATH; install git, or use the default (non-static) image if this is `-static` ``) rather than at
+# boot. See `runtime` below for the flavor that keeps git and pays for it in image size and
+# package surface instead.
+FROM scratch AS runtime-static
+
+COPY --from=builder-static /rift-cluster-server-static /usr/local/bin/rift-cluster-server
+
+# Outbound TLS (proxied imposters, HTTPS config sources) needs a CA bundle even with no git and
+# no package manager to fetch one from at runtime. `builder-static` installed `ca-certificates`
+# purely to produce this file for the COPY below.
+COPY --from=builder-static /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+COPY --from=builder-static /etc/passwd.rift /etc/passwd
+COPY --from=builder-static /etc/group.rift /etc/group
+
+COPY --from=builder-static --chown=10001:10001 /var/lib/rift /var/lib/rift
+
+USER 10001:10001
+WORKDIR /var/lib/rift
+
+# Same ports, same reasoning as `runtime` below.
+EXPOSE 2525 2526 4790 9090
+
+# Same healthcheck as `runtime` below: the binary's own `healthcheck` subcommand, needing no
+# shell to exec — which is exactly why this flavor can carry a healthcheck at all.
+#
+# Absolute paths here, unlike `runtime` below, and not as a style preference. A `FROM scratch`
+# image config carries no `PATH` at all: `dockerd` injects a default one when the config omits
+# it, so a bare `rift-cluster-server` resolves under Docker — but that injection is the daemon's
+# behaviour, not part of the OCI config, and a bare name is therefore one runtime away from
+# `exec: executable file not found in $PATH`. The default flavor gets its `PATH` from
+# `debian:bookworm-slim`'s own config and has no such dependency.
+# No `--url`, matching `runtime` below: the subcommand resolves its own target from the mode
+# (#297) — the probe listener's `/healthz` when clustered, the admin API's `/health` otherwise.
+# Passing an explicit probe URL here would make this flavor the only one that reports `unhealthy`
+# for an un-clustered container, which is the behaviour #299 just removed.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/rift-cluster-server", "healthcheck"]
+
+ENTRYPOINT ["/usr/local/bin/rift-cluster-server"]
+
+# ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
+# This MUST remain the last stage in the file: `cluster-smoke` and every local
+# `docker build -f deploy/Dockerfile .` build with no `--target`, which resolves to whichever
+# stage is last. The two static stages above are inserted BEFORE this one for exactly that
+# reason — appending them after `runtime` would silently change what an untargeted build
+# produces.
 FROM debian:bookworm-slim AS runtime
 
 # ca-certificates is needed for outbound TLS (proxied imposters, HTTPS config
 # sources). `git` is needed by the `git+https:`/`git+file:` imposter source
-# (#136), which shells out to it rather than linking libgit2 — and which probes
-# `git --version` at startup, so a runtime image without it would refuse to
-# boot rather than fail later. Nothing else is installed on purpose — in
-# particular no curl: the health check below execs the binary's own
-# `healthcheck` subcommand, which is exactly why upstream put it in the binary.
+# (#136), which shells out to it rather than linking libgit2. This — the
+# default — flavor ships git, so `git+` sources work exactly as before; the
+# `-static` flavor (`runtime-static` above) does not, and declaring a `git+`
+# source against it fails at declaration time rather than at boot — see that
+# stage's comment and `deploy/README.md`'s image-flavors table. Nothing else
+# is installed on purpose — in particular no curl: the health check below
+# execs the binary's own `healthcheck` subcommand, which is exactly why
+# upstream put it in the binary.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \

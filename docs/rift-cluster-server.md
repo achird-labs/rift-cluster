@@ -1326,10 +1326,26 @@ serve, listing the ones it can.
 
 Notes that matter in practice:
 
-- **`git+…` needs a `git` binary.** These providers shell out rather than
-  linking libgit2 or `gitoxide`, and the binary is probed at **startup**, so an
-  image without `git` refuses to boot instead of failing on the first pull. The
-  shipped `deploy/Dockerfile` installs it.
+- **`git+…` needs a `git` binary, and it is a detected capability.** These
+  providers shell out rather than linking libgit2 or `gitoxide`, and the binary
+  is probed once at **startup**. What happens next depends on *how* the probe
+  fails:
+  - **No `git` at all** — the node boots and serves normally, logs
+    `git not found; git+ imposter sources disabled in this image` at WARN, and
+    registers `git+https:`/`git+file:` as **unavailable**. Declaring one then
+    fails at declaration time with ``​`git+https:` sources are unavailable: no
+    git in this image — use the default (non-static) image``, and the schemes
+    stay listed as unavailable rather than silently vanishing. This is what
+    lets the `-static` image flavor exist at all (see `deploy/README.md`).
+  - **A `git` that is present but does not work** — the node still **refuses to
+    boot**, as before. That is a broken host rather than an image built without
+    git, and it is owed a loud failure.
+
+  The default `deploy/Dockerfile` runtime installs `git`, so the default flavor
+  behaves exactly as it always has. A fleet that uses `git+` sources should run
+  the default flavor on **every** node: followers apply git-sourced bytes from
+  the log without fetching, but boot-time declarations, refresh-now on the
+  receiving node, and leader-only tracking polls all fetch locally.
 - **`<path>` may be a file or a directory.** A directory parses every file under
   it and merges them; a port declared by two documents is an error naming both,
   never a silent last-one-wins.

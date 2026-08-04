@@ -661,3 +661,154 @@ async fn a_credential_bearing_uri_is_refused_before_it_ever_reaches_the_log() {
 
     fixture.server.shutdown().await;
 }
+
+// -- git as a detected capability, end to end (#270) -------------------------
+
+/// AC2, on **both** declaration paths at once.
+///
+/// The unit tests prove `scheme_refusal` builds the right message; this proves
+/// the message actually reaches a caller through the two entry points an
+/// operator can reach — boot-time `--imposters`/`RIFT_IMPOSTERS`
+/// (`declare_and_pull`) and the admin `PUT` (`put`) — rather than through one
+/// of them while the other still answers the generic unknown-scheme refusal.
+///
+/// The puller is built over a provider set with `git+` marked unavailable and
+/// bound to the fixture's real node, because the composed server under test is
+/// running on a host that *does* have git: the `-static` condition cannot be
+/// produced by composing normally, only by constructing the state composition
+/// would have reached.
+#[tokio::test]
+async fn a_git_declaration_on_a_gitless_node_is_refused_with_the_cause_and_the_fix() {
+    let fixture = start().await;
+    let node = fixture.server.node().expect("clustered");
+
+    let mut providers = rift_cluster::sources::SourceProviders::default();
+    providers
+        .register_unavailable(
+            rift_cluster::sources::git::GIT_SCHEMES,
+            "no `git` binary on PATH; install git, or use the default (non-static) image if this is `-static`",
+        )
+        .expect("git+ is unserved in this provider set");
+
+    let puller = rift_cluster::sources::SourcePuller::new(providers);
+    puller.bind(node).expect("bind the puller to the node");
+
+    let uri = "git+https://example.com/repo#main:mocks.json";
+
+    // Path 1 — boot-time declaration.
+    let boot = puller
+        .declare_and_pull("from-boot", uri, OnDrift::Fail)
+        .await
+        .expect_err("a gitless node must refuse a git+ source at declaration time");
+    let boot = boot.to_string();
+
+    // Path 2 — admin PUT.
+    let body = serde_json::json!({ "id": "from-admin", "uri": uri }).to_string();
+    let admin = puller
+        .put(TenantId::default(), body.as_bytes(), None)
+        .await
+        .expect_err("the admin path must refuse it too");
+    let admin = admin.to_string();
+
+    for (path, refusal) in [("declare_and_pull", &boot), ("put", &admin)] {
+        assert!(
+            refusal.contains("`git+https:` sources are unavailable"),
+            "{path} must name the scheme: {refusal}"
+        );
+        assert!(
+            refusal.contains("no `git` binary on PATH"),
+            "{path} must name the cause: {refusal}"
+        );
+        assert!(
+            refusal.contains("use the default (non-static) image"),
+            "{path} must name the fix: {refusal}"
+        );
+        assert!(
+            !refusal.contains("no imposter source is registered"),
+            "{path} must not report an unavailable scheme as an unknown one: {refusal}"
+        );
+    }
+
+    // Nothing was stored: a refused declaration must not leave a source record
+    // behind for the poll scheduler to retry forever.
+    assert!(
+        node.source(DEFAULT_TENANT, "from-boot")
+            .expect("read local state")
+            .is_none(),
+        "a refused boot declaration must store nothing"
+    );
+    assert!(
+        node.source(DEFAULT_TENANT, "from-admin")
+            .expect("read local state")
+            .is_none(),
+        "a refused admin declaration must store nothing"
+    );
+}
+
+/// The restart-onto-a-static-image case, which is the one that motivated
+/// checking the scheme in `pull` at all.
+///
+/// A `git+https:` source was declared while the fleet ran the default flavor,
+/// so the record is already in the replicated log — no declaration is involved
+/// any more. The node then comes back on a `-static` image. Every later
+/// `pull` of that record (a `refresh-now`, a tracking poll) must say the
+/// scheme is unavailable *in this image*, not that the URI names an unknown
+/// scheme: the URI was correct when it was accepted, and blaming it would send
+/// the operator to fix the one thing that is not wrong.
+#[tokio::test]
+async fn pulling_an_already_declared_git_source_on_a_gitless_node_blames_the_image() {
+    let fixture = start().await;
+    let node = fixture.server.node().expect("clustered");
+
+    // Seeded straight into the log, exactly as a default-flavor node would
+    // have left it — deliberately NOT through the puller under test, which
+    // would refuse it.
+    let mut op_id = 9_000u128;
+    seed(
+        node,
+        &mut op_id,
+        ControlOp::SourcePut {
+            tenant: TenantId::default(),
+            id: "declared-before-the-restart".to_owned(),
+            uri: "git+https://example.com/repo#main:mocks.json".to_owned(),
+            mode: SourceMode::Pinned,
+            auth_ref: None,
+            on_drift: OnDrift::Overwrite,
+            poll_secs: None,
+        },
+    )
+    .await;
+
+    let mut providers = rift_cluster::sources::SourceProviders::default();
+    providers
+        .register_unavailable(
+            rift_cluster::sources::git::GIT_SCHEMES,
+            "no `git` binary on PATH; install git, or use the default (non-static) image if this is `-static`",
+        )
+        .expect("git+ is unserved in this provider set");
+    let puller = rift_cluster::sources::SourcePuller::new(providers);
+    puller.bind(node).expect("bind the puller to the node");
+
+    let err = puller
+        .pull(DEFAULT_TENANT, "declared-before-the-restart", None)
+        .await
+        .expect_err("a stored git+ source cannot be pulled on a gitless node")
+        .to_string();
+
+    assert!(
+        err.contains("`git+https:` sources are unavailable"),
+        "pull must name the scheme: {err}"
+    );
+    assert!(
+        err.contains("no `git` binary on PATH"),
+        "pull must name the cause: {err}"
+    );
+    assert!(
+        !err.contains("no imposter source is registered"),
+        "the record's scheme was servable when it was written; it must not now read as unknown: {err}"
+    );
+    assert!(
+        !err.contains("unknown source"),
+        "the record exists — only its scheme is unavailable: {err}"
+    );
+}

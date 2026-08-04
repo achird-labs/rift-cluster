@@ -4,8 +4,18 @@
 //!
 //! ```text
 //! git+https://host/org/repo#<ref>:<path>
-//! git+file:<local-path>#<ref>:<path>
+//! git+file://<absolute-local-path>#<ref>:<path>
 //! ```
+//!
+//! The `//` in the `git+file:` form is required, not decorative. The fetch path
+//! resolves a scheme with upstream's `SourceRef::scheme`, which splits on
+//! `"://"` — so `git+file:/srv/repo.git#…`, with one colon and no slashes,
+//! is a **`file:` URI** as far as routing is concerned and never reaches this
+//! provider, even though `control::require_well_formed_uri` splits on `':'` and
+//! validates it as `git+file`. Those two parsers disagreeing predates this
+//! module and is the same on every image flavor; it is pinned by
+//! `only_the_double_slash_git_file_spelling_routes_to_git` in `tests.rs` so that
+//! changing either one fails loudly.
 //!
 //! `<ref>` is anything `git fetch` accepts as a refspec (a branch, a tag, a raw
 //! sha); `<path>` is a path inside that ref's tree, either a single document or
@@ -41,9 +51,19 @@
 //! on the leader's fetch path needs — `gix` pulls in a large pure-Rust tree,
 //! `git2` pulls in libgit2 via C bindings — and the subprocess's one real
 //! downside, "the binary might not be installed", is turned into a clean
-//! **construction-time** error: [`GitSource::new`] probes `git --version` so a
-//! missing binary fails composition, not a first pull deep into a running
-//! fleet.
+//! **construction-time** error: [`GitSource::probe`] runs `git --version` so a
+//! missing binary is discovered at composition, not on a first pull deep into a
+//! running fleet.
+//!
+//! The probe's two failure modes are kept apart on purpose, because composition
+//! answers them differently (#270). *Absent* (`ErrorKind::NotFound`) is a
+//! property of the image — the `-static` flavor has no git and must still boot
+//! and serve, with `git+` registered as an unavailable scheme. *Present but
+//! unusable* is a broken host: it still refuses the boot, exactly as before,
+//! because an operator who shipped a git and a `git+` source is owed the loud
+//! failure rather than a fleet that quietly stops fetching. Telling the two
+//! apart by matching on an error *string* would make that distinction one
+//! wording change away from collapsing, so it is a typed [`GitProbeError`].
 //!
 //! ## Auth
 //!
@@ -125,6 +145,46 @@ const GIT_SAFETY_FLAGS: &[&str] = &[
     "http.followRedirects=false",
 ];
 
+/// The schemes [`GitSource`] claims.
+///
+/// Shared rather than written twice: composition registers exactly this set as
+/// *unavailable* when there is no git to back it (#270), and a list that drifted
+/// from [`CredentialedSource::schemes`] would leave a scheme that is neither
+/// served nor explained — the silent disappearance this whole path exists to
+/// prevent.
+pub const GIT_SCHEMES: &[&str] = &["git+https", "git+file"];
+
+/// Why `git --version` did not establish a usable git.
+///
+/// Typed because composition treats the two arms differently — see the module
+/// docs. Absent is a flavor property; unusable is a broken host.
+#[derive(Debug, thiserror::Error)]
+pub enum GitProbeError {
+    /// No `git` on `PATH`.
+    #[error("git+https:/git+file: sources require a `git` binary on PATH; none was found")]
+    NotFound(#[source] std::io::Error),
+
+    /// A `git` that could not be executed for some reason other than being
+    /// absent — not executable, blocked by a sandbox.
+    ///
+    /// Distinct from [`Self::ExitedUnsuccessfully`] because this one has a real
+    /// underlying [`std::io::Error`] worth keeping in the `source()` chain,
+    /// while a clean spawn that exited non-zero has no underlying error at all.
+    /// Flattening both into one stringly variant would throw that chain away
+    /// for the only case that has one.
+    #[error("`git --version` could not be run")]
+    SpawnFailed(#[source] std::io::Error),
+
+    /// A `git` that ran but did not answer `--version` successfully.
+    #[error("`git --version` exited with {status}: {stderr}")]
+    ExitedUnsuccessfully {
+        /// The child's exit status, rendered.
+        status: String,
+        /// Trimmed stderr, for the operator.
+        stderr: String,
+    },
+}
+
 /// `git+https:` / `git+file:` imposter source.
 ///
 /// Carries no secret material: the resolver is consulted fresh on every fetch,
@@ -155,7 +215,7 @@ impl GitSource {
     ///
     /// # Errors
     /// If `git --version` cannot be run, or exits unsuccessfully.
-    pub fn new(resolver: Arc<dyn CredentialResolver>) -> anyhow::Result<Self> {
+    pub fn new(resolver: Arc<dyn CredentialResolver>) -> Result<Self, GitProbeError> {
         Self::with_timeout(resolver, GIT_TIMEOUT)
     }
 
@@ -168,27 +228,83 @@ impl GitSource {
     pub fn with_timeout(
         resolver: Arc<dyn CredentialResolver>,
         timeout: Duration,
-    ) -> anyhow::Result<Self> {
-        let output = std::process::Command::new("git")
+    ) -> Result<Self, GitProbeError> {
+        Self::probe()?;
+        Ok(Self::probed_with_timeout(resolver, timeout))
+    }
+
+    /// Build a source for a caller that has *already* run [`Self::probe`] and
+    /// acted on the result.
+    ///
+    /// Infallible by construction, which is the point: composition probes once
+    /// to decide between registering the provider and registering the schemes
+    /// as unavailable (#270), and re-probing here would spawn a second
+    /// `git --version` to re-learn an answer the caller already has. There is
+    /// no correctness risk in the gap — a git that disappears between the two
+    /// would surface as a failed fetch, exactly as it does for a git that
+    /// disappears at any other point after boot.
+    #[must_use]
+    pub fn probed(resolver: Arc<dyn CredentialResolver>) -> Self {
+        Self::probed_with_timeout(resolver, GIT_TIMEOUT)
+    }
+
+    /// As [`Self::probed`], with an explicit per-invocation timeout.
+    #[must_use]
+    pub fn probed_with_timeout(resolver: Arc<dyn CredentialResolver>, timeout: Duration) -> Self {
+        Self { resolver, timeout }
+    }
+
+    /// Ask this host whether it has a usable `git`, without building a source.
+    ///
+    /// Composition calls this first so it can act on *which* failure it got
+    /// (#270) — a source cannot carry that distinction, because on the absent
+    /// arm there is no source to build.
+    ///
+    /// # Errors
+    /// [`GitProbeError::NotFound`] if there is no `git` on `PATH`;
+    /// [`GitProbeError::Unusable`] if one exists but `--version` did not
+    /// succeed.
+    pub fn probe() -> Result<(), GitProbeError> {
+        Self::probe_program("git")
+    }
+
+    /// [`Self::probe`] against an arbitrary program name.
+    ///
+    /// The seam exists so the *classification* can be tested directly. Which
+    /// arm a failure lands in is the whole decision this issue turns on —
+    /// `NotFound` boots a node with `git+` disabled, everything else refuses
+    /// the boot — and a `PATH`-based test of that cannot be sound, because
+    /// `PATH` is process-global and these tests run in parallel. Naming the
+    /// program instead is deterministic and touches no shared state.
+    pub(super) fn probe_program(program: &str) -> Result<(), GitProbeError> {
+        let output = match std::process::Command::new(program)
             .arg("--version")
             .output()
-            .context(
-                "git+https:/git+file: sources require a `git` binary on PATH; none was found",
-            )?;
+        {
+            Ok(output) => output,
+            // Only "no such binary" is the flavor signal. Every other spawn
+            // failure — a git that is present but not executable, EACCES under
+            // a restrictive sandbox — is a host that is broken rather than a
+            // host that was built without git, and must not be waved through as
+            // a capability the image merely lacks.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(GitProbeError::NotFound(e));
+            }
+            Err(e) => return Err(GitProbeError::SpawnFailed(e)),
+        };
         if !output.status.success() {
-            anyhow::bail!(
-                "`git --version` exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            return Err(GitProbeError::ExitedUnsuccessfully {
+                status: output.status.to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
         }
-        Ok(Self { resolver, timeout })
+        Ok(())
     }
 }
 
 impl CredentialedSource for GitSource {
     fn schemes(&self) -> &'static [&'static str] {
-        &["git+https", "git+file"]
+        GIT_SCHEMES
     }
 
     fn fetch_with_auth<'a>(

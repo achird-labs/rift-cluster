@@ -207,10 +207,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `target` is the Dockerfile stage; `flavor` names the digest artifact and cache scope
+          # so `image-manifest` can tell the two sets apart. The tag suffix itself lives in
+          # `image-manifest`, which owns tagging entirely. Two flavors (#270): the
+          # default `debian-slim`-based runtime (unchanged), and `-static`, a `FROM scratch` musl
+          # build with no OS at all — see `deploy/Dockerfile`'s header comment and
+          # `deploy/README.md`'s image-flavors table for what each carries and gives up.
           - runner: ubuntu-latest
             platform: linux/amd64
+            flavor: default
+            target: runtime
           - runner: ubuntu-24.04-arm
             platform: linux/arm64
+            flavor: default
+            target: runtime
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            flavor: static
+            target: runtime-static
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            flavor: static
+            target: runtime-static
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -238,24 +256,47 @@ jobs:
         with:
           context: .
           file: deploy/Dockerfile
+          target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
           build-args: |
             RIFT_UPSTREAM_VERSION=${{ steps.pin.outputs.version }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          # Scoped per platform AND per flavor. `runtime` and `runtime-static` diverge from
+          # `builder` onward (musl target, different apt packages), so a scope shared across
+          # flavors would let one flavor's layers evict the other's on every push — turning a
+          # cache that should always hit into one that flips a coin.
+          cache-from: type=gha,scope=${{ matrix.platform }}-${{ matrix.flavor }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}-${{ matrix.flavor }}
 
       # The digest is the only thing this job produces that the merge needs. Passed as a file named
       # after itself rather than as an output, because outputs cannot be collected across a matrix.
+      # The `sha256:` prefix is stripped here and re-added by the `printf` in
+      # `image-manifest`, which is not a round-trip for its own sake: the action's
+      # `digest` output is `sha256:<hex>`, so touching it verbatim produced a file
+      # named `sha256:<hex>` and the manifest step's `@sha256:%s` then built
+      # `…@sha256:sha256:<hex>` — an invalid reference `imagetools create` refuses.
+      # This never surfaced because `image-manifest` has never actually run: it is
+      # `needs: [guard, image]`, and every release run so far skipped both. #270 is
+      # the first change to depend on it (twice — the `-static` tag its smoke,
+      # no-git and Trivy gates all pull is created there), so it had to be fixed
+      # rather than inherited.
       - name: Export the digest
         run: |
           set -euo pipefail
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
 
+      # Named per flavor, not just per job-index. `image-manifest` builds TWO separate manifest
+      # lists, one per flavor, and downloads its inputs with `pattern: digest-<flavor>-*` into a
+      # per-flavor directory. A flat `digest-${{ strategy.job-index }}` name (the old scheme, fine
+      # when there was one flavor) would let `download-artifact`'s `merge-multiple: true` fuse all
+      # four digests into one directory with no way to tell which two belong to which flavor —
+      # silently producing a manifest list that mixes a `runtime` digest with a `runtime-static`
+      # one under a single tag.
       - uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ strategy.job-index }}
+          name: digest-${{ matrix.flavor }}-${{ strategy.job-index }}
           path: /tmp/digests/*
           retention-days: 1
 
@@ -271,10 +312,20 @@ jobs:
       # workspace version, and builds nothing.
       - uses: actions/checkout@v4
 
+      # Two directories, not one — see the `image` job's digest-naming comment. A flat
+      # `pattern: digest-*` + `merge-multiple: true` here would fuse both flavors' digests into
+      # one directory, and the manifest built from it would mix a `runtime` digest with a
+      # `runtime-static` one under a single tag.
       - uses: actions/download-artifact@v4
         with:
-          path: /tmp/digests
-          pattern: digest-*
+          path: /tmp/digests/default
+          pattern: digest-default-*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests/static
+          pattern: digest-static-*
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
@@ -288,12 +339,25 @@ jobs:
       # The version tag only. `:latest` is deliberately NOT applied here — it is promoted at the
       # end of this job, after the smoke steps have proven the tag actually serves (#296). The
       # version tag itself cannot wait: the smokes pull the image by it.
-      - name: Create the manifest list
-        working-directory: /tmp/digests
+      - name: Create the manifest list (default flavor)
+        working-directory: /tmp/digests/default
         run: |
           set -euo pipefail
           # shellcheck disable=SC2046
           docker buildx imagetools create -t "${IMAGE}:${{ needs.guard.outputs.version }}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      # Same shape and the same discipline as the default flavor above: the version tag now
+      # because the static smokes pull by it, and `latest-static` only at the end of the job once
+      # they have passed (#296's rule applies per flavor — a discoverable tag must not survive a
+      # red smoke, and `-static` has its own smokes). `latest-static` rather than hijacking
+      # `latest`, so an implicit pull never silently switches flavor.
+      - name: Create the manifest list (static flavor)
+        working-directory: /tmp/digests/static
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          docker buildx imagetools create -t "${IMAGE}:${{ needs.guard.outputs.version }}-static" \
             $(printf "${IMAGE}@sha256:%s " *)
 
       # The published artifact, exercised as an operator would get it — pulled by tag, not the local
@@ -338,6 +402,207 @@ jobs:
             *'<div id="root"'*) echo "PASS: published image serves the console" ;;
             *) echo "FAIL: published image served no console SPA shell" >&2; exit 1 ;;
           esac
+
+      # The static flavor's own smoke, against the real published artifact (#270). Same shape as
+      # the default-flavor smoke above — `--version`, boot, `/console` — plus the two assertions
+      # that are the whole point of publishing a second flavor: the git-capability WARN actually
+      # fires, and the image really has no git in it (checked in the next two steps, since neither
+      # needs a running container).
+      #
+      # Distinct container name (`smoke-static`, not `smoke`) and distinct host ports (`22525`/
+      # `22526`, not `12525`/`12526`): the step above already tore its own container down via its
+      # `trap` by the time this one starts, but a port collision here would fail this step for a
+      # reason that has nothing to do with the static flavor — the exact hazard the `trap` on the
+      # quick-start step below is also there to avoid.
+      - name: Smoke the published image (static flavor)
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}:${{ needs.guard.outputs.version }}-static"
+          docker pull "$ref"
+
+          echo "--- version ---"
+          banner="$(docker run --rm "$ref" --version)"
+          echo "$banner"
+          case "$banner" in
+            *"rift unknown"*) echo "FAIL: published static image does not carry the upstream pin" >&2; exit 1 ;;
+          esac
+
+          echo "--- console ---"
+          docker run -d --name smoke-static -p 22525:2525 \
+            -e RIFT_CLUSTER=true \
+            -e RIFT_CLUSTER_BIND=0.0.0.0:4790 \
+            -e RIFT_CLUSTER_BIND_PUBLIC_OK=true \
+            -e RIFT_CLUSTER_ADVERTISE=127.0.0.1:4790 \
+            -e RIFT_CLUSTER_ALLOW_SOLO=true \
+            -e RIFT_CLUSTER_SECRET=smoke \
+            -e RIFT_CLUSTER_PROBE_BIND=0.0.0.0:2526 \
+            -e RIFT_CLUSTER_STATE_DIR=/var/lib/rift/_cluster \
+            "$ref"
+          trap 'docker logs smoke-static || true; docker rm -f smoke-static >/dev/null 2>&1 || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://127.0.0.1:22525/console/ >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          # Same reasoning as the default flavor's console check: asserted on the SPA shell, not
+          # the status.
+          body="$(curl -fsS --max-time 5 http://127.0.0.1:22525/console/)"
+          case "$body" in
+            *'<div id="root"'*) echo "PASS: published static image serves the console" ;;
+            *) echo "FAIL: published static image served no console SPA shell" >&2; exit 1 ;;
+          esac
+
+          echo "--- git capability degraded loudly, not silently ---"
+          # The direct proof that #270's capability detection did its job on the REAL published
+          # artifact, not just in a unit test: this image has no git (confirmed in the next step),
+          # yet it just booted and served `/console` above — which only happens because the
+          # missing-git case now logs and continues instead of refusing to start.
+          logs="$(docker logs smoke-static 2>&1)"
+          case "$logs" in
+            *"git not found; git+ imposter sources disabled in this image"*)
+              echo "PASS: static image logs the git-capability warning" ;;
+            *)
+              echo "FAIL: static image did not log the git-capability warning" >&2
+              echo "$logs" >&2
+              exit 1 ;;
+          esac
+
+          echo "--- docker healthcheck reaches healthy (AC1) ---"
+          # A distinct code path from the `/console/` curl above: the HEALTHCHECK
+          # execs the binary's own `healthcheck` subcommand against /healthz.
+          # Without this, a regression in that subcommand — or a scratch image
+          # that cannot exec it at all, which is the flavor-specific risk, since
+          # there is no shell and no PATH — ships whenever `/console` still
+          # answers. AC1 names the healthcheck explicitly, so it is asserted
+          # rather than inferred from the container still running.
+          health=""
+          for _ in $(seq 1 30); do
+            health="$(docker inspect -f '{{.State.Health.Status}}' smoke-static 2>/dev/null || echo unknown)"
+            [ "$health" = "healthy" ] && break
+            [ "$health" = "unhealthy" ] && break
+            sleep 2
+          done
+          if [ "$health" != "healthy" ]; then
+            echo "FAIL: static container health is '${health}', expected 'healthy'" >&2
+            exit 1
+          fi
+          echo "PASS: static image reports docker health 'healthy'"
+
+          echo "--- a git+ declaration is refused with the documented text (AC2) ---"
+          # The refusal string is quoted verbatim by `deploy/README.md`, by
+          # `docs/rift-cluster-server.md` and by this Dockerfile's own comment.
+          # Unit tests assert it on a hand-built provider set; nothing until here
+          # asserts that the shipped binary in the shipped image actually emits
+          # it. `RIFT_IMPOSTERS` takes the boot declaration path, so the failure
+          # is the container refusing to start — which is the documented
+          # behaviour, hence `|| true` on the run and the assertion on the log.
+          set +e
+          decl="$(docker run --rm \
+            -e RIFT_CLUSTER=true \
+            -e RIFT_CLUSTER_BIND=0.0.0.0:4790 \
+            -e RIFT_CLUSTER_BIND_PUBLIC_OK=true \
+            -e RIFT_CLUSTER_ADVERTISE=127.0.0.1:4790 \
+            -e RIFT_CLUSTER_ALLOW_SOLO=true \
+            -e RIFT_CLUSTER_SECRET=smoke \
+            -e RIFT_CLUSTER_STATE_DIR=/var/lib/rift/_cluster \
+            -e 'RIFT_IMPOSTERS=git+https://example.com/repo#main:mocks.json' \
+            "$ref" 2>&1)"
+          set -e
+          echo "$decl"
+          case "$decl" in
+            *"\`git+https:\` sources are unavailable"*)
+              echo "PASS: the shipped static image refuses git+ with the documented refusal" ;;
+            *)
+              echo "FAIL: the static image did not emit the documented git+ refusal" >&2
+              exit 1 ;;
+          esac
+
+      # No `docker exec ... sh` here — scratch has no shell, which is the very property under
+      # test. `docker create` never starts the container, so this works even though nothing in a
+      # scratch-based image can be exec'd into; `export` then materializes its filesystem as a
+      # tar stream to grep. Matching `(^|/)git$` rather than a bare `git` substring: it must not
+      # false-positive on something like a hypothetical `legit` or `gitignore` entry.
+      #
+      # `export` and `tar` are separate statements rather than stages of the `if` condition's
+      # pipeline, and that is load-bearing rather than style. `set -e` is suspended inside an `if`
+      # condition, and `grep` — the rightmost stage — exits 1 both when it matched nothing AND
+      # when it got no input because an earlier stage died. So `if docker export | tar | grep`
+      # prints PASS when the export fails (stale cid, daemon restart, disk full) exactly as it
+      # does when the image genuinely has no git: the gate whose whole job is catching a git
+      # binary in the gitless image would be the thing hiding one. Split out, `set -e` aborts on
+      # a failed export or tar, and PASS can only be reached when both succeeded and grep looked
+      # at a real file list. The file-list line count is echoed for the same reason — a plausible
+      # count is the cheap tell that the tar really was read.
+      - name: The static image contains no git binary
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}:${{ needs.guard.outputs.version }}-static"
+          cid="$(docker create "$ref")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+
+          docker export "$cid" > /tmp/static-rootfs.tar
+          tar -tf /tmp/static-rootfs.tar > /tmp/static-rootfs-files.txt
+          entries="$(wc -l < /tmp/static-rootfs-files.txt)"
+          echo "entries in the static image filesystem: ${entries}"
+          # A floor, not decoration: "grep found no git" is only meaningful over
+          # a file list that actually describes an image. A degenerate export
+          # that yielded two entries would otherwise satisfy the grep below for
+          # the wrong reason. The real list is dozens of entries (binary, CA
+          # bundle, passwd/group, the data dir); 10 is comfortably under that and
+          # comfortably over any truncation.
+          if [ "$entries" -lt 10 ]; then
+            echo "FAIL: static image exported only ${entries} entries; the export looks truncated" >&2
+            exit 1
+          fi
+
+          if grep -qE '(^|/)git$' /tmp/static-rootfs-files.txt; then
+            echo "FAIL: static image contains a git executable" >&2
+            grep -nE '(^|/)git$' /tmp/static-rootfs-files.txt >&2
+            exit 1
+          fi
+          echo "PASS: static image contains no git binary"
+
+      - name: Scan the static image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ needs.guard.outputs.version }}-static
+          format: json
+          output: /tmp/trivy-static.json
+          scanners: vuln
+          # Needed to get a package inventory back at all rather than just vulnerability matches:
+          # a package with no known CVE would otherwise never appear in the report, which is
+          # exactly backwards for a check whose job is counting packages, not vulnerabilities.
+          list-all-pkgs: true
+
+      # AC4, checked on the artifact rather than left as a claim in prose. Parses Trivy's own
+      # package inventory instead of eyeballing a rendered table — the class of "looks empty,
+      # isn't" mistake a machine check exists to catch. Absence of an `os-pkgs` Result entirely
+      # (the expected shape for a scratch image with no package database at all) counts as zero,
+      # same as a present Result with an empty package list.
+      - name: The static image carries zero OS packages (AC4)
+        run: |
+          set -euo pipefail
+          expected="${IMAGE}:${{ needs.guard.outputs.version }}-static"
+
+          # Zero is the answer this gate wants to hear, which is precisely why it must first
+          # establish that the answer is about the right artifact. A report that scanned nothing,
+          # or scanned some other ref, also says zero — so the count is only trusted after Trivy's
+          # own `ArtifactName` is confirmed to be the tag just published.
+          actual="$(jq -r '.ArtifactName // empty' /tmp/trivy-static.json)"
+          if [ "$actual" != "$expected" ]; then
+            echo "FAIL: Trivy report is for '${actual:-<none>}', expected '${expected}'" >&2
+            echo "The zero-package count below would be meaningless." >&2
+            exit 1
+          fi
+
+          os_pkg_count="$(jq '[.Results[]? | select(.Class == "os-pkgs") | (.Packages // [])[]] | length' /tmp/trivy-static.json)"
+          echo "OS packages found: ${os_pkg_count} (scanned ${actual})"
+          if [ "$os_pkg_count" -ne 0 ]; then
+            echo "FAIL: static image carries ${os_pkg_count} OS package(s); expected zero" >&2
+            jq '[.Results[]? | select(.Class == "os-pkgs")]' /tmp/trivy-static.json >&2
+            exit 1
+          fi
+          echo "PASS: static image carries zero OS packages"
 
       # The quick start in `deploy/README.md`, run as written (#269). The step
       # above proves one published container serves a console; this proves the
@@ -386,12 +651,21 @@ jobs:
       # `docker pull` with no tag can therefore never resolve to a build the smokes rejected. The
       # promotion re-points at the already-pushed manifest, so both tags name the same platform
       # manifests and layers.
+      #
+      # Both flavors are promoted here, together and last. `latest-static` is held to exactly the
+      # same rule as `latest` (#270): it aliases a version tag whose own smokes — console, docker
+      # health, the git-absent WARN, the documented `git+` refusal, no git binary, zero OS
+      # packages — have all passed. Promoting it at manifest-creation time instead would leave a
+      # discoverable `latest-static` pointing at a build this job went on to reject, which is the
+      # exact failure #296 removed for the default flavor.
       - name: Promote latest
         if: needs.guard.outputs.prerelease == 'false'
         run: |
           set -euo pipefail
           docker buildx imagetools create -t "${IMAGE}:latest" \
             "${IMAGE}:${{ needs.guard.outputs.version }}"
+          docker buildx imagetools create -t "${IMAGE}:latest-static" \
+            "${IMAGE}:${{ needs.guard.outputs.version }}-static"
 
   # ---------------------------------------------------------------------------
   # Binaries → GitHub Release
