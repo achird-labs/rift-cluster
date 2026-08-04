@@ -224,6 +224,55 @@ describe("every rendered cell comes from the declared column table", () => {
   });
 });
 
+describe("an imposter with no name", () => {
+  // `name` is optional on `POST /imposters`, and imported configs and imposter sources routinely
+  // omit it. The name cell is the list's ONLY route to the detail screen, so a nameless imposter
+  // that renders an unlinked `—` is unreachable: no stub editing, no recording panel, no export,
+  // and a row that silently ignores clicks with nothing on screen to say why.
+  const NAMELESS = {
+    imposters: [{ port: 4545, protocol: "http", recordRequests: false, enabled: true, stubs: [{}] }],
+  };
+
+  it("still links through to the detail screen", async () => {
+    stubFetch({
+      "/imposters": { json: NAMELESS },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+
+    const cell = await screen.findByTestId("imposter-name-4545");
+    const link = cell.closest("a");
+    expect(link).not.toBeNull();
+    expect(link!.getAttribute("href")).toBe("#/imposters/4545");
+  });
+
+  it("labels the cell as unnamed rather than unknown, and names the port for a screen reader", async () => {
+    stubFetch({
+      "/imposters": { json: NAMELESS },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+
+    const cell = await screen.findByTestId("imposter-name-4545");
+    // `—` is "the response did not tell us"; this imposter genuinely has no name, and a link
+    // labelled `—` announces as nothing.
+    expect(cell.textContent).toBe("(unnamed)");
+    expect(cell.closest("a")!.getAttribute("aria-label")).toBe(
+      "Open unnamed imposter on port 4545",
+    );
+  });
+
+  it("leaves a named imposter's link unlabelled, since its text already names it", async () => {
+    stubFetch({ "/imposters": { json: TWO }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+
+    const cell = await screen.findByTestId("imposter-name-4545");
+    expect(cell.closest("a")!.getAttribute("aria-label")).toBeNull();
+  });
+});
+
 describe("dense tables (200 imposters, 40-character names, narrow window)", () => {
   it("truncates a long name for display but keeps the whole value reachable", async () => {
     const long = "checkout-service-integration-sandbox-eu-1";

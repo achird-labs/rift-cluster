@@ -43,6 +43,7 @@ import {
   ErrorNote,
   Truncated,
   UNKNOWN,
+  UNNAMED,
   UnconfirmedNote,
 } from "../components/primitives.tsx";
 import {
@@ -665,16 +666,42 @@ function Row({
   );
 }
 
-/** The name cell is the one field the list renders differently: it links through to the detail. */
-function nameLink(imposter: Imposter): (name: string) => ReactNode {
+/**
+ * The name cell is the one field the list renders differently: it links through to the detail.
+ *
+ * It is also the **only** route to that screen — no other cell is clickable — so the absent-name
+ * case has to stay linked. `name` is optional on `POST /imposters`, and imported configs and
+ * imposter sources routinely omit it, so a nameless imposter is an ordinary thing to have rather
+ * than a malformed one. Falling back to a bare `—` here (which is what the shared field renderer
+ * does when no render prop is passed) left those rows with nothing to click and no way to reach
+ * their stubs, recording panel or export.
+ *
+ * The port is deliberately not reused as the label — it already has its own column — so the cell
+ * says what is actually true of the imposter and the link carries the port for a screen reader.
+ */
+function nameLink(imposter: Imposter): (name: string | undefined) => ReactNode {
   return (name) => {
-    const cell = (
-      <Truncated value={name} testId={`imposter-name-${imposter.port ?? "unnamed"}`} />
-    );
-    return imposter.port === undefined ? (
+    const port = imposter.port;
+    const testId = `imposter-name-${port ?? "unnamed"}`;
+    const cell =
+      name === undefined ? (
+        <span className="muted" data-testid={testId}>
+          {UNNAMED}
+        </span>
+      ) : (
+        <Truncated value={name} testId={testId} />
+      );
+    // Still no link without a port: every detail route is `#/imposters/{port}`, so there is
+    // nowhere to send them — the same reason the row's checkbox and actions are withheld.
+    return port === undefined ? (
       cell
     ) : (
-      <a href={toHash({ screen: "imposter", port: imposter.port })}>{cell}</a>
+      <a
+        href={toHash({ screen: "imposter", port })}
+        aria-label={name === undefined ? `Open unnamed imposter on port ${port}` : undefined}
+      >
+        {cell}
+      </a>
     );
   };
 }

@@ -27,6 +27,13 @@ export function assertNever(value: never): never {
  *
  * `name` takes a render prop because the list links it to the detail screen and the detail screen
  * has nowhere to link to — the only difference between the two, so it is the only thing passed in.
+ *
+ * The prop receives `string | undefined` rather than `string`, and is consulted **before** the
+ * absent-name placeholder. That ordering is the whole point: `name` is optional on the wire, and
+ * this cell is the list's only route to the detail screen. Rendering `—` here without asking the
+ * caller first is what stranded every nameless imposter — no stub editing, no recording panel, no
+ * export, and a row that silently ignored clicks. A caller with nowhere to link still passes no
+ * prop and still gets the placeholder.
  */
 export function ImposterField({
   imposter,
@@ -35,7 +42,7 @@ export function ImposterField({
 }: {
   imposter: Imposter;
   field: ImposterColumn["key"];
-  renderName?: (name: string) => ReactNode;
+  renderName?: (name: string | undefined) => ReactNode;
 }): ReactNode {
   switch (field) {
     case "port":
@@ -45,8 +52,8 @@ export function ImposterField({
     case "protocol":
       return imposter.protocol ?? UNKNOWN;
     case "name":
-      if (imposter.name === undefined) return <span className="muted">{UNKNOWN}</span>;
-      return renderName === undefined ? imposter.name : renderName(imposter.name);
+      if (renderName !== undefined) return renderName(imposter.name);
+      return imposter.name === undefined ? <span className="muted">{UNKNOWN}</span> : imposter.name;
     case "stubs":
       // Absent `stubs` is "this response did not include them", which is not the same fact as an
       // imposter with zero stubs — so it renders as unknown rather than 0.

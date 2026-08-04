@@ -6,6 +6,17 @@ import { ApiError } from "../api/client.ts";
 export const UNKNOWN = "—";
 
 /**
+ * An imposter that carries no name, which is a legal thing to be — `name` is optional on
+ * `POST /imposters`.
+ *
+ * Distinct from [`UNKNOWN`] on purpose: `—` says "this response did not tell us", while this says
+ * "the imposter genuinely has no name". The list needs the difference because it renders the cell
+ * as the link to the detail screen, and a link labelled `—` is neither clickable-looking nor
+ * announceable.
+ */
+export const UNNAMED = "(unnamed)";
+
+/**
  * A long value shown at a width a dense table can hold, with the whole value on the title.
  *
  * 34 characters is the prototype's measured cut: it clears a 40-character imposter name's
