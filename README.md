@@ -1,95 +1,42 @@
 # RiftCluster
 
-**Apache-2.0.** Distributed clustering for [Rift](https://github.com/achird-labs/rift) —
-an embedded Raft control plane, HRW flow-state ownership, and a server binary that
-composes them with the Rift core.
+**Distributed clustering for [Rift](https://github.com/achird-labs/rift)** — an embedded Raft
+control plane, HRW flow-state ownership, and a server binary that composes them with the Rift core.
+Apache-2.0.
 
-The Rift core is vendored read-only as a git submodule under
-[`vendor/rift`](vendor/rift), and the cluster crates are layered on top under
-[`crates/`](crates). **The split is a build boundary, not a licence one** — both
-repositories are Apache-2.0 and nothing here is withheld from the core.
+Rift is a Mountebank-compatible mock server. RiftCluster makes a *fleet* of them behave like one:
+configuration replicates through Raft, imposters and flow state have a defined owner, verification
+reads merge across nodes instead of answering for whichever node you happened to reach, and the
+whole thing runs with no external datastore.
 
-> **Status: Phase 1.** What ships is the control plane, flow-state ownership,
-> snapshot transfer and the durability modes. Later phases in `docs/` are design,
-> not documentation of running code — and any performance figure in them is a
-> design envelope rather than a measurement. Rift's measured benchmarks live in
-> the [core repo](https://github.com/achird-labs/rift), with the harness, host,
-> version and date attached to every number.
+## Why a cluster
 
-```
-rift-cluster/
-├── Cargo.toml                  # workspace: cluster crates; vendor/rift excluded
-├── vendor/rift/                # git submodule → achird-labs/rift (read-only core)
-├── crates/
-│   ├── rift-cluster-base/      # facade: core crates + the upstream extension seams
-│   ├── rift-cluster/           # distributed clustering (control plane, membership)
-│   └── rift-cluster-server/    # the binary: core server + cluster backends
-├── deploy/
-│   ├── Dockerfile              # the rift-cluster-server image
-│   ├── compose/                # a real 3-node cluster, with a verify script
-│   └── k8s/                    # StatefulSet + Services + probes
-├── scripts/
-│   ├── sync-upstream.sh    # bump vendor/rift to upstream master
-│   └── upstream-pr.sh      # open a cross-repo PR against public Rift
-└── .github/workflows/
-    ├── ci.yml              # fmt + clippy + test (with submodule)
-    └── sync-upstream.yml   # daily submodule bump → PR
-```
+A single mock server is easy. A fleet behind a load balancer is where mocking quietly stops being
+correct — and each of these is a thing RiftCluster is built to fix:
 
-## Quick start
+- **Config drift.** You `PUT` an imposter, the LB routes it to one node, and the other two never
+  hear about it. Here, writes go through Raft and every node converges.
+- **Per-node verification.** `GET /imposters/:port/requests` returns whatever *that* node saw, so
+  assertions pass or fail depending on routing. Here, reads merge across the fleet — and say so
+  honestly when a merge is incomplete rather than silently under-reporting.
+- **Stateful mocking that isn't.** Scenarios and flow state live in one process, so a
+  sequence-dependent mock breaks the moment traffic spreads. Here, state has an owner.
+- **No external dependencies.** No Redis, no Postgres, no ZooKeeper. Clustering is embedded — the
+  operational surface is the binary and its data directory.
 
-Nothing here needs a checkout, a submodule or a Rust toolchain. Tagging `vX.Y.Z`
-publishes a multi-arch image and per-platform binaries, both carrying the web
-console.
+## Status
 
-> **While this repository is private**, both the image and the raw file below are
-> too: `docker login ghcr.io` with a personal access token carrying `read:packages`
-> first, and fetch `cluster.yml` from a checkout or the release page rather than
-> `raw.githubusercontent.com`. Everything else on this page is unchanged. This
-> note goes away when the repo does.
+**Pre-release.** The control plane, flow-state ownership, snapshot transfer, durability modes,
+multi-tenancy, the web console and the container/Kubernetes deployment path are in `master`. No
+version has been tagged yet, so **there is no published image or binary to pull** — build from
+source (below) is currently the only way to run it.
 
-**A single node**, with the console and the probe endpoints:
+Documents under `docs/` describe design as well as shipped behavior, and the two are not always the
+same thing. Any performance figure in them is a design envelope, not a measurement; Rift's measured
+benchmarks live in the [core repo](https://github.com/achird-labs/rift) with harness, host, version
+and date attached to every number.
 
-```sh
-docker run -p 2525:2525 -p 2526:2526 \
-  -e RIFT_CLUSTER=true \
-  -e RIFT_CLUSTER_BIND=127.0.0.1:4790 \
-  -e RIFT_CLUSTER_ALLOW_SOLO=true \
-  -e RIFT_CLUSTER_SECRET=local-dev-secret \
-  ghcr.io/achird-labs/rift-cluster-server:0.1.0
-
-curl -s localhost:2525/imposters          # admin API
-open http://localhost:2525/console        # the web console
-```
-
-A cluster of one, rather than the plain server, because **the console and the
-`/readyz` probe are part of the clustered composition**: with `--cluster` off
-this binary is the open-source server byte for byte, and the open-source server
-has neither. `docker run -p 2525:2525 <image>` on its own is perfectly valid and
-gives you exactly that — a Mountebank-compatible mock server on `:2525` — but
-`/console` answers `404` and nothing binds `2526`. The image's health check
-follows the mode (un-clustered, it probes the admin API instead of the probe
-port), so the container is `healthy` either way. See
-[`deploy/README.md`](deploy/README.md#a-single-node) for the whole comparison,
-including the one `--api-key` caveat.
-
-**A real 3-node cluster**, from the published image — one file, no clone:
-
-```sh
-curl -sSLO https://raw.githubusercontent.com/achird-labs/rift-cluster/master/deploy/compose/cluster.yml
-docker compose -f cluster.yml up -d
-
-curl -s localhost:12526/readyz            # rift-1 probes
-curl -s localhost:19090/metrics | grep rift_cluster
-```
-
-**Or a binary**, from the GitHub Release — see
-[*Installing from a release*](docs/rift-cluster-server.md#installing-from-a-release)
-for the checksum and macOS quarantine steps.
-
-## Building from source
-
-Only needed to develop RiftCluster itself; running it needs none of this.
+## Build and run
 
 ```sh
 git clone --recurse-submodules git@github.com:achird-labs/rift-cluster.git
@@ -97,39 +44,54 @@ cd rift-cluster
 cargo check --workspace
 ```
 
-Run the cluster server — identical to the open-source `rift` without
-`--cluster`, a cluster node with it:
+The `--recurse-submodules` matters: the Rift core is vendored under `vendor/rift` and the build
+needs it.
+
+**A single node.** Without `--cluster` this binary is the open-source Rift server, byte for byte:
 
 ```sh
 cargo run -p rift-cluster-server -- --port 2525 --datadir ./data
+curl -s localhost:2525/imposters
 ```
 
-Or build and run a real 3-node cluster from this checkout:
+**A real 3-node cluster**, built and verified from the checkout:
 
 ```sh
 deploy/compose/verify.sh   # builds, starts 3 nodes, asserts they form one cluster
 ```
 
-See [`docs/rift-cluster-server.md`](docs/rift-cluster-server.md) for its flags, startup
-guards, probes and the `/_cluster/*` operator surface,
-[`deploy/README.md`](deploy/README.md) for containers and Kubernetes, and
-[`docs/dev-workflow.md`](docs/dev-workflow.md) for syncing the core, adding
-features, and the cross-repo PR flow.
+The web console and the `/readyz` probe are part of the *clustered* composition — with `--cluster`
+off, `/console` answers `404` and nothing binds the probe port. That is deliberate, not a missing
+feature: the un-clustered binary is the open-source server and the open-source server has neither.
+[`deploy/README.md`](deploy/README.md#a-single-node) has the full comparison.
 
-## Crate layout
+## Documentation
 
-The vendored core publishes its engine as **`rift-mock-core`** and its server layer
-as **`rift-http-proxy`**. Cluster crates never depend on either directly:
-`rift-cluster-base` re-exports both, along with the upstream extension seams
-(`rift_cluster_base::seams`) that cluster backends implement. Depending only on
-`rift-cluster-base` is what keeps that boundary checkable by Cargo rather than by
-convention — it is a dependency-hygiene rule, not a licence one.
+| | |
+|---|---|
+| [`docs/rift-cluster-server.md`](docs/rift-cluster-server.md) | The binary: flags, startup guards, probes, the `/_cluster/*` operator surface |
+| [`deploy/README.md`](deploy/README.md) | Containers, Compose, Kubernetes, Helm |
+| [`docs/architecture/`](docs/architecture/README.md) | How it works, in 15 chapters — topology, control plane, read/write paths, flow state, verification, tenancy, durability, operations, testing |
+| [`docs/adr/`](docs/adr) · [`docs/rfc/`](docs/rfc) | Why it works that way: the decision record and the design proposals behind each milestone |
+| [`docs/dev-workflow.md`](docs/dev-workflow.md) | Syncing the vendored core, adding features, the cross-repo PR flow |
 
-## Licensing
+## How the repository is organised
 
-**Apache-2.0** — see [`LICENSE`](LICENSE). The vendored core under `vendor/rift`
-is Apache-2.0 too, so the whole tree is under one licence.
+The Rift core is vendored read-only as a git submodule under [`vendor/rift`](vendor/rift); the
+cluster crates layer on top under [`crates/`](crates). **That split is a build boundary, not a
+licence one** — both repositories are Apache-2.0 and nothing here is withheld from the core.
 
-This repo previously carried a commercial licence as the proprietary half of an
-open-core split. That split is closed: there is no paid edition, no withheld
-feature set, and no plan for either.
+The vendored core publishes its engine as `rift-mock-core` and its server layer as
+`rift-http-proxy`. Cluster crates never depend on either directly: `rift-cluster-base` re-exports
+both along with the upstream extension seams (`rift_cluster_base::seams`) that cluster backends
+implement. Depending only on `rift-cluster-base` keeps that boundary checkable by Cargo rather than
+by convention.
+
+## Licence
+
+**Apache-2.0** — see [`LICENSE`](LICENSE). The vendored core is Apache-2.0 too, so the whole tree is
+under one licence.
+
+This repository previously carried a commercial licence as the proprietary half of an open-core
+split. That split is closed: there is no paid edition, no withheld feature set, and no plan for
+either. Some documents under `docs/` still describe the old boundary and are being brought into line.
