@@ -47,6 +47,12 @@ pub const HEADER_WARNINGS: &str = "rift-cluster-warnings";
 /// affected reads are *proxied*, and the core admin phase decorates with `req_port: None`, so no
 /// annotation scope downstream can know which imposter the response is about.
 pub const HEADER_BIND_FAILURES: &str = "rift-cluster-bind-failures";
+/// A fleet merge-on-read (the journal entries read, its `numberOfRequests` decoration, or the
+/// transitional clear fan-out — issue #223) could not confirm every roster peer within its budget.
+/// Set directly by the front for the same reason as the three above — there is no per-request
+/// annotation scope for a read this journal-net-specific — and additively: a Ch.12 strict-mode gate
+/// asserts the header's *absence* on a fully healthy answer, so this must never be stamped `false`.
+pub const HEADER_PARTIAL: &str = "rift-cluster-partial";
 
 /// Translates `cluster.*` annotations into `Rift-Cluster-*` response headers.
 #[derive(Debug, Clone, Default)]

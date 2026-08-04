@@ -16,9 +16,20 @@
 pub mod flow;
 pub mod flow_config;
 pub mod journal;
+pub mod journal_net;
 pub mod shard;
 
 pub use flow::{ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, flow_routes};
 pub use flow_config::{ContextScope, FlowConfig, ReadConsistency};
 pub use journal::{ClusterJournal, JournalConfig, ShardEntry, ShardRead};
+// Trimmed to what is used outside this module (issue #223 review): the wire types, `ShardSlice`,
+// `merge_shards` and `fleet_count` are consumed only by this module's own `JournalNet` and its
+// `mod tests` (which see ancestor-private items regardless of what is re-exported here). Every
+// caller outside `rift-cluster` reaches the fleet journal through `JournalNet`'s own methods, so
+// naming the wire shapes or the pure merge function itself here would advertise internals nothing
+// legitimately calls. `MergeOutcome` stays out of this list for the same "not used outside" reason
+// even though its own declaration stays `pub` — see its doc for why it cannot be `pub(crate)`.
+pub use journal_net::{
+    DEFAULT_ANTI_ENTROPY_INTERVAL, JournalNet, journal_routes, spawn_anti_entropy,
+};
 pub use shard::{Durability, FlowShard, ShardConfig, ShardError, Versioned};

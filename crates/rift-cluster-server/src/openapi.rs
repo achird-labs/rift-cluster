@@ -293,6 +293,17 @@ mod parity {
             Terminated::SetEnabled(_, false) => {
                 RouteKey::new(&Method::POST, "/imposters/{port}/disable")
             }
+            // One spelling per representative, same as the `SetEnabled` pair above — except here
+            // the two spellings are true aliases of *one* variant (`classify` cannot tell which
+            // path a `ReadSavedRequests`/`ClearSavedRequests` came from, by design: it is one
+            // handler either way), so `contract_route` can only publish one of the two real paths.
+            // `SAVED_REQUESTS_ALIAS_ROUTES` below covers the other.
+            Terminated::ReadSavedRequests(_) => {
+                RouteKey::new(&Method::GET, "/imposters/{port}/savedRequests")
+            }
+            Terminated::ClearSavedRequests(_) => {
+                RouteKey::new(&Method::DELETE, "/imposters/{port}/savedRequests")
+            }
             Terminated::PutRoutes => RouteKey::new(&Method::PUT, "/front-door/routes"),
             Terminated::DeleteRoute(_) => {
                 RouteKey::new(&Method::DELETE, "/front-door/routes/{routeId}")
@@ -373,6 +384,8 @@ mod parity {
             Terminated::DeleteStubById(4545, "s-1".to_owned()),
             Terminated::SetEnabled(4545, true),
             Terminated::SetEnabled(4545, false),
+            Terminated::ReadSavedRequests(4545),
+            Terminated::ClearSavedRequests(4545),
             Terminated::PutRoutes,
             Terminated::DeleteRoute("svc".to_owned()),
             Terminated::Tenancy(Route::TenantCreate),
@@ -401,6 +414,18 @@ mod parity {
         ]
     }
 
+    /// The `.../requests` alias half of `ReadSavedRequests`/`ClearSavedRequests` (issue #223).
+    ///
+    /// `classify` collapses both spellings onto the same `Terminated` variant — one handler, two
+    /// paths, exactly as upstream's own `router.rs` already treats them — so `contract_route` can
+    /// publish only the `savedRequests` spelling per representative. This is the other, kept as a
+    /// declared table for the same reason [`HANDLE_DIRECT_ROUTES`] is: there is no second variant
+    /// to hang a compile-time tripwire on, because there is no second variant at all.
+    const SAVED_REQUESTS_ALIAS_ROUTES: [(&str, &str); 2] = [
+        ("GET", "/imposters/{port}/requests"),
+        ("DELETE", "/imposters/{port}/requests"),
+    ];
+
     /// Every operation this crate terminates: the write surface plus the reads `handle` answers itself.
     pub(crate) fn ee_served_routes() -> BTreeSet<RouteKey> {
         terminated_representatives()
@@ -410,6 +435,14 @@ mod parity {
                 path: (*path).to_owned(),
                 method: (*method).to_owned(),
             }))
+            .chain(
+                SAVED_REQUESTS_ALIAS_ROUTES
+                    .iter()
+                    .map(|(method, path)| RouteKey {
+                        path: (*path).to_owned(),
+                        method: (*method).to_owned(),
+                    }),
+            )
             .collect()
     }
 
@@ -433,10 +466,11 @@ mod parity {
             ("GET", "/imposters/{port}/stubs"),
             ("GET", "/imposters/{port}/stubs/{stubIndex}"),
             ("GET", "/imposters/{port}/stubs/by-id/{stubId}"),
-            ("GET", "/imposters/{port}/savedRequests"),
-            ("DELETE", "/imposters/{port}/savedRequests"),
-            ("GET", "/imposters/{port}/requests"),
-            ("DELETE", "/imposters/{port}/requests"),
+            // NOT `savedRequests`/`requests` (GET+DELETE): issue #223 terminates the no-`since`
+            // GET as a fleet merge-on-read and the DELETE as a transitional peer fan-out — see
+            // `ee_served_routes`'s `SAVED_REQUESTS_ALIAS_ROUTES`. `?since=` still proxies, but a
+            // `RouteKey` carries no query, so that exception lives in the contract's prose, not
+            // in a second entry here.
             ("POST", "/imposters/{port}/verify"),
             ("DELETE", "/imposters/{port}/savedProxyResponses"),
             ("GET", "/imposters/{port}/scenarios"),
@@ -726,6 +760,7 @@ mod tests {
             "Rift-Cluster-Revision",
             "Rift-Cluster-Op-Id",
             "X-Rift-Tenant",
+            "Rift-Cluster-Partial",
         ] {
             assert!(
                 rendered.contains(header),
@@ -761,7 +796,11 @@ mod tests {
             .and_then(|c| c.get("headers"))
             .and_then(serde_json::Value::as_object)
             .expect("components.headers");
-        for header in ["RiftClusterRevision", "RiftClusterOpId"] {
+        for header in [
+            "RiftClusterRevision",
+            "RiftClusterOpId",
+            "RiftClusterPartial",
+        ] {
             assert!(
                 response_headers.contains_key(header),
                 "components.headers.{header} is missing"
