@@ -309,7 +309,28 @@ Implemented and passing: `test_config_sync_converges`, `test_node_rejoin`,
 `c24_rbac_enforcement_is_identical_through_any_node`,
 `c25_key_revocation_survives_a_partition`,
 `c26_audit_chain_survives_a_full_cluster_restart`,
-`c27_tenancy_isolates_ownership_but_not_the_data_plane`.
+`c27_tenancy_isolates_ownership_but_not_the_data_plane`,
+`journal_partition_is_declared_on_both_sides_and_heals`.
+
+`journal_partition_is_declared_on_both_sides_and_heals` is the one implemented
+scenario with **no `cNN` number**, deliberately. Issue #223's acceptance criteria
+ask for a smoke-level partition assertion and say in as many words that "the full
+in-anger scenario is #228's"; #228 reserves C28–C30 for the verification plane and
+its **C29 is this same property done properly** — partitioned mid-spray, asserting
+`rift_cluster_journal_partial_reads_total` moved, and *measuring* the 2 s budget
+rather than bounding it. Taking a number here would have squatted on that for a
+weaker test. When C29 lands, this one is redundant and should be deleted rather
+than kept alongside it.
+
+It also needs no new overlay, which is worth recording because #228's design notes
+predict one ("a scenario asserting `Rift-Cluster-Partial` on data reads needs a
+published port overlay"). It does not: traffic goes through `front-door.overlay.yml`'s
+already-published per-node listeners, and the merged read is an *admin* call on a
+port the base file already publishes. Imposter data ports stay unpublished.
+
+| scenario | asserts | vacuity guard |
+|---|---|---|
+| `journal_partition_is_declared_on_both_sides_and_heals` | a healthy fleet's merged `savedRequests` read is **not** stamped; under `partition()` **both** sides still answer, stamped `Rift-Cluster-Partial: true`, rather than hanging or silently shortening; on heal the stamp clears and all three nodes' sets converge | no mutation story yet — this one was written green rather than as a defect reproduction. Its guard against vacuity is the `whole.len() == 9` assertion before the partition: 2+3+1 requests driven through three *different* front doors plus one readiness probe each, so it only holds if the three writer shards are genuinely distinct **and** the merge combined them. A fleet recording everything on one node fails it |
 
 `c5_rolling_restart_never_stops_accepting_writes` was committed **failing**, as
 the reproduction for a real defect this tier found (#72): a node that gracefully
