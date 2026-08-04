@@ -1425,6 +1425,14 @@ pub(crate) fn is_loopback_http(uri: &str) -> bool {
 /// carve-out [`is_loopback_http`] defines. An audit stream names who did what
 /// to which tenant; shipping it in cleartext is not a trade-off an operator
 /// should be able to make by typing one fewer character.
+///
+/// Every arm below recognises its scheme by a lowercase prefix test, so a
+/// *known* scheme spelled otherwise is refused with a targeted message rather
+/// than the generic one (issue #313). RFC 3986 §3.1 makes schemes
+/// case-insensitive on the wire, so without that the refusal quotes back the
+/// very schemes the operator believes they wrote — and `HTTP://127.0.0.1`
+/// misses [`is_loopback_http`] for the same reason, refusing a *permitted*
+/// sink as cleartext.
 fn require_audit_sink_uri(uri: &str) -> Result<(), String> {
     let uri = uri.trim();
     if uri.starts_with("https://") {
@@ -1444,6 +1452,40 @@ fn require_audit_sink_uri(uri: &str) -> Result<(), String> {
             ),
         };
     }
+    // Refused, not normalized: lowercasing here and nowhere else would put this
+    // checker and the transport factory on different spellings, which is the
+    // two-parsers-disagree bug (#301) in a new place. The message names only the
+    // canonical lowercase literal, never the input, keeping the no-echo rule
+    // above intact.
+    //
+    // A mixed-case scheme whose lowercase form would *still* be refused — say
+    // `HTTP://evil.example` — is told about the case first and meets the
+    // cleartext refusal on the next attempt. That teaching sequence is the same
+    // one #312 established for source URIs, and is why this check does not try
+    // to predict whether the corrected URI would pass.
+    let (scheme, rest) = split_scheme(uri);
+    if scheme.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lower = scheme.to_ascii_lowercase();
+        // `http` is the one known scheme that lowercasing alone does not make
+        // admissible — only a loopback host may use cleartext. Hinting at the
+        // case for a remote `HTTP://` would replace an accurate, terminal
+        // message ("cleartext is refused") with a detour to the same refusal,
+        // so the hint is offered only where the corrected URI would actually be
+        // accepted. `https` and `s3` need no such test: for them lowercasing is
+        // either the whole fix or the next refusal is about shape, which is the
+        // teaching sequence #312 established.
+        let worth_hinting = match lower.as_str() {
+            "https" | "s3" => true,
+            "http" => is_loopback_http(&format!("{lower}:{rest}")),
+            _ => false,
+        };
+        if worth_hinting {
+            return Err(format!(
+                "an audit sink scheme must be lowercase: write `{lower}://…`"
+            ));
+        }
+    }
+
     Err(
         "an audit sink uri must be https:// (webhook, JSON lines) or s3:// (bucket, batched \
          objects); http:// is refused because an audit stream must not cross the network in \
@@ -2737,6 +2779,93 @@ mod tests {
 
         let err = validate(&sink_put("s3://bucket")).expect_err("an s3 sink needs a key prefix");
         assert!(err.contains("<bucket>/<key-prefix>"), "{err}");
+    }
+
+    /// RFC 3986 §3.1 makes schemes case-insensitive, but every arm of
+    /// `require_audit_sink_uri` recognises its scheme with a lowercase prefix
+    /// test. A mixed-case spelling of a *known* scheme therefore falls through
+    /// to the generic refusal, which quotes the very schemes the operator
+    /// believes they wrote (issue #313).
+    ///
+    /// `HTTP://127.0.0.1` is the case that makes this more than cosmetic:
+    /// `is_loopback_http` misses it for the same reason, so a sink that is
+    /// **permitted** in lowercase is refused with the cleartext-danger
+    /// message — wrong twice, since nothing about a loopback sink crosses a
+    /// network.
+    ///
+    /// The refusal names only the canonical lowercase literal, never the URI:
+    /// the file's standing no-echo rule, inherited from #312.
+    #[test]
+    fn an_audit_sink_scheme_must_be_lowercase() {
+        // The expected literal is pinned per case, not merely "contains
+        // lowercase": a message hardcoded to one scheme would satisfy a
+        // contains-check for all four while telling the `S3://` operator to
+        // write `https://`, which is worse than the generic refusal it replaced.
+        for (uri, want) in [
+            ("S3://bucket/audit-prefix", "`s3://"),
+            ("HTTPS://collector.example/audit", "`https://"),
+            ("Https://collector.example/audit", "`https://"),
+            ("HTTP://127.0.0.1:9000/audit", "`http://"),
+        ] {
+            let err = validate(&sink_put(uri)).expect_err("a mixed-case known scheme is refused");
+            assert!(
+                err.contains("lowercase"),
+                "refusing {uri}: expected a lowercase-scheme refusal, got {err:?}"
+            );
+            assert!(
+                err.contains(want),
+                "refusing {uri}: expected the hint to name {want}…`, got {err:?}"
+            );
+            assert!(!err.contains(uri), "the refusal echoed the uri: {err}");
+        }
+
+        // An *unknown* scheme in uppercase keeps the generic refusal. Telling
+        // the operator to try lowercase would be a lie: `ftp` is not a sink
+        // scheme in any spelling, and the hint would send them in circles.
+        let err = validate(&sink_put("FTP://host/audit")).expect_err("ftp is not a sink scheme");
+        assert!(
+            !err.contains("lowercase"),
+            "an unknown scheme must not be told to try lowercase: {err}"
+        );
+        assert!(
+            err.contains("cleartext"),
+            "expected the generic sink refusal: {err}"
+        );
+
+        // A *remote* uppercase `HTTP://` is the asymmetric case: unlike `https`
+        // and `s3`, lowercasing does not make it admissible, so the accurate
+        // cleartext refusal must survive rather than being displaced by a hint
+        // that leads back to it.
+        let err = validate(&sink_put("HTTP://collector.example/audit"))
+            .expect_err("remote cleartext is refused in any spelling");
+        assert!(
+            !err.contains("lowercase"),
+            "a remote HTTP:// must keep the accurate cleartext refusal: {err}"
+        );
+        assert!(err.contains("cleartext"), "{err}");
+    }
+
+    /// Credential hygiene runs before the scheme check, and must keep winning
+    /// when the URI is *both* credential-bearing and mixed-case — the ordering
+    /// #312 pinned for source URIs (`validate_rejects_embedded_credentials_in_a_source_uri`)
+    /// and which nothing pinned on the sink path until now. Without this, a
+    /// reordering of the two checks would leak a token into the admission log
+    /// silently, since every refusal on this path is echo-free and the tests
+    /// would all still pass.
+    #[test]
+    fn sink_credential_hygiene_wins_over_the_scheme_case_check() {
+        let err = validate(&sink_put(
+            "HTTPS://oauth2:ghp_supersecret@collector.example/audit",
+        ))
+        .expect_err("a credential-bearing sink uri is refused");
+        assert!(
+            !err.contains("ghp_supersecret"),
+            "the refusal echoed the secret: {err}"
+        );
+        assert!(
+            err.contains("auth_ref"),
+            "expected the hygiene refusal, got the scheme-case refusal: {err}"
+        );
     }
 
     #[test]
