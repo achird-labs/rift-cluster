@@ -53,7 +53,7 @@ macOS, with one `SHA256SUMS` covering all of them:
 
 ```
 curl -sSLO https://github.com/achird-labs/rift-cluster/releases/download/vX.Y.Z/SHA256SUMS
-curl -sSLO https://github.com/achird-labs/rift-cluster/releases/download/vX.Y.Z/rift-cluster-server-vX.Y.Z-<target>.tar.gz
+curl -sSLO https://github.com/achird-labs/rift-cluster/releases/download/vX.Y.Z/rift-cluster-server-X.Y.Z-<target>.tar.gz
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
@@ -62,6 +62,41 @@ per platform, not just on the one the lane happens to build first. A build that
 silently shipped consoleless is the specific failure
 `scripts/check-console-embed.sh` exists to catch, so checking one of four would
 have read like coverage while leaving three unverified.
+
+Then unpack and run it:
+
+```
+tar -xzf rift-cluster-server-X.Y.Z-<target>.tar.gz
+./rift-cluster-server --port 2525 --datadir ./data
+```
+
+**On macOS the binaries are unsigned and unnotarised**, so Gatekeeper quarantines
+anything downloaded through a browser and the first run is refused with a dialog
+rather than an error you can read. Stated here rather than omitted, because the
+alternative is a user concluding the download is broken:
+
+```
+xattr -d com.apple.quarantine ./rift-cluster-server
+```
+
+`curl` does not set the quarantine attribute, so a download made with the command
+above needs none of this. Signing is not currently part of the release lane; if
+that changes, this paragraph goes away rather than being softened.
+
+**The console and the probe endpoints need `--cluster`.** They are part of the
+clustered composition, so the command above — the open-source server, byte for
+byte — answers `404` at `/console` and binds nothing on the probe port. For a
+single node with both, run a cluster of one:
+
+```
+./rift-cluster-server --port 2525 --datadir ./data \
+  --cluster --cluster-bind 127.0.0.1:4790 --cluster-allow-solo \
+  --cluster-secret-file ./cluster-secret \
+  --cluster-probe-bind 127.0.0.1:2526
+```
+
+The container form of the same thing, and the `unhealthy` it explains, are in
+`deploy/README.md` → *A single node*.
 
 ## Identifying a build
 

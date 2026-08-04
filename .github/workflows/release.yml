@@ -259,6 +259,11 @@ jobs:
       packages: write
     runs-on: ubuntu-latest
     steps:
+      # For `deploy/compose/cluster.yml` and `verify-pulled.sh`, which the quick-start
+      # smoke below runs. No submodules: that script reads two compose files and the
+      # workspace version, and builds nothing.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
@@ -328,6 +333,48 @@ jobs:
             *'<div id="root"'*) echo "PASS: published image serves the console" ;;
             *) echo "FAIL: published image served no console SPA shell" >&2; exit 1 ;;
           esac
+
+      # The quick start in `deploy/README.md`, run as written (#269). The step
+      # above proves one published container serves a console; this proves the
+      # *documented* three-node file actually forms a cluster on the tag that was
+      # just pushed — readiness on all three, exactly one leader read from
+      # `rift_cluster_members`, and the console on every node.
+      #
+      # It has to live here and nowhere else. `cluster.yml` names a published
+      # image, so no PR lane can run it: before this job the tag does not exist.
+      # `verify-pulled.sh --check` covers what is checkable without one, on every
+      # PR; this is the half that needs the artifact to be real.
+      #
+      # The previous step's `trap` has already removed the `smoke` container by
+      # the time this shell starts — which matters, because it published 12525
+      # and so does `cluster.yml`'s rift-1.
+      - name: Smoke the published quick start (3-node cluster.yml)
+        run: |
+          set -euo pipefail
+          version='${{ needs.guard.outputs.version }}'
+
+          if [ '${{ needs.guard.outputs.prerelease }}' = 'true' ]; then
+            # An rc publishes `0.1.0-rc.1` while the pin is `0.1.0`, so they cannot
+            # match by construction. Pass the tag in — this still proves the image
+            # and the topology, just not the literal default.
+            echo "prerelease: verifying against ${version} rather than the pin"
+            RIFT_CLUSTER_VERSION="$version" deploy/compose/verify-pulled.sh
+          else
+            # A real release runs it **as written**, with no override, so the tag a
+            # reader gets by curling `cluster.yml` is the tag this step pulled.
+            # Overriding here would leave the file's own default the one thing the
+            # release lane never exercises — and a pin naming a tag that was never
+            # pushed fails for the first reader instead of for us.
+            pinned="$(sed -n 's|.*rift-cluster-server:\${RIFT_CLUSTER_VERSION:-\([^}]*\)}.*|\1|p' \
+              deploy/compose/cluster.yml | head -1)"
+            if [ "$pinned" != "$version" ]; then
+              echo "cluster.yml pins '${pinned}' but this release publishes '${version}'" >&2
+              echo "The documented quick start would fail with 'manifest unknown'." >&2
+              exit 1
+            fi
+            echo "pin ${pinned} matches the published tag; running the quick start as written"
+            deploy/compose/verify-pulled.sh
+          fi
 
   # ---------------------------------------------------------------------------
   # Binaries → GitHub Release
