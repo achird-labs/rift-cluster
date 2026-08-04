@@ -67,10 +67,11 @@ A cluster of one, rather than the plain server, because **the console and the
 this binary is the open-source server byte for byte, and the open-source server
 has neither. `docker run -p 2525:2525 <image>` on its own is perfectly valid and
 gives you exactly that — a Mountebank-compatible mock server on `:2525` — but
-`/console` answers `404`, nothing binds `2526`, and because the image's health
-check probes `2526` Docker will mark the container `unhealthy` while it serves
-happily. See [`deploy/README.md`](deploy/README.md#a-single-node) for the whole
-comparison.
+`/console` answers `404` and nothing binds `2526`. The image's health check
+follows the mode (un-clustered, it probes the admin API instead of the probe
+port), so the container is `healthy` either way. See
+[`deploy/README.md`](deploy/README.md#a-single-node) for the whole comparison,
+including the one `--api-key` caveat.
 
 **A real 3-node cluster**, from the published image — one file, no clone:
 

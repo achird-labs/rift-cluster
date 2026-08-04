@@ -11,6 +11,7 @@ use rift_cluster_base::seams::Commands;
 use rift_cluster_server::bootstrap;
 use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose;
+use rift_cluster_server::probes;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 
@@ -26,7 +27,21 @@ fn main() -> anyhow::Result<()> {
     match cli.oss.command.clone() {
         Some(Commands::Script { action }) => return script_cli::dispatch(action),
         Some(Commands::Healthcheck { url, timeout }) => {
-            return healthcheck::dispatch(url, &cli.oss.host, cli.oss.port, timeout);
+            // With no --url, the target follows the mode (#297): this parse
+            // read the same RIFT_* environment the server's own did, and
+            // healthcheck_url double-checks a "no" against the node itself,
+            // because cluster flags given as command-line arguments never
+            // reach a healthcheck exec's environment. Passing Some makes
+            // dispatch's own host/port fallback unreachable by construction.
+            let url = url.unwrap_or_else(|| {
+                probes::healthcheck_url(
+                    cli.cluster.cluster,
+                    cli.cluster.cluster_probe_bind,
+                    &cli.oss.host,
+                    cli.oss.port,
+                )
+            });
+            return healthcheck::dispatch(Some(url), &cli.oss.host, cli.oss.port, timeout);
         }
         _ => {}
     }

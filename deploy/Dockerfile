@@ -200,7 +200,15 @@ EXPOSE 2525 2526 4790 9090
 # Liveness only. Readiness is the orchestrator's business (`/readyz`), and a
 # container health check that failed on not-ready would restart a node that is
 # merely still joining — the exact failure /healthz exists to prevent.
+#
+# No --url: the subcommand derives its target itself (#297) — the probe
+# listener's /healthz when RIFT_CLUSTER is set, or when a probe listener turns
+# out to be bound anyway (a node clustered purely by command-line arguments
+# shows this exec no environment), and the admin API's /health otherwise. An
+# un-clustered container is therefore healthy while it serves, and an
+# overridden RIFT_CLUSTER_PROBE_BIND keeps the probe pointed where the
+# listener actually bound.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-    CMD ["rift-cluster-server", "healthcheck", "--url", "http://127.0.0.1:2526/healthz"]
+    CMD ["rift-cluster-server", "healthcheck"]
 
 ENTRYPOINT ["rift-cluster-server"]
