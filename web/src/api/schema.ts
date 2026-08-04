@@ -1041,7 +1041,10 @@ export interface components {
             recordRequests: boolean;
             /** @default true */
             enabled: boolean;
+            /** @description The stubs themselves. Present on a single-imposter read; the list projection omits it and sends `stubCount` instead, so a client that reads only this field sees nothing on the list screen. */
             stubs?: components["schemas"]["Stub"][];
+            /** @description How many stubs this imposter has, on the list projection (`GET /imposters`), where the `stubs` array is omitted. Absent on a single-imposter read, which carries `stubs` instead. A client wanting a count for both shapes reads `stubs.length` when the array is there and falls back to this — neither field alone covers both responses. */
+            stubCount?: number;
         } & {
             [key: string]: unknown;
         };

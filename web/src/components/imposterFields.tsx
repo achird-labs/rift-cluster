@@ -19,6 +19,17 @@ export function assertNever(value: never): never {
 }
 
 /**
+ * How many stubs this imposter has, or `null` when the response did not say.
+ *
+ * Exported so the contract test can assert both projections resolve, and because "which field
+ * carries the count" is exactly the kind of detail a second caller would get subtly wrong.
+ */
+export function stubCountOf(imposter: Imposter): number | null {
+  if (imposter.stubs !== undefined) return imposter.stubs.length;
+  return imposter.stubCount ?? null;
+}
+
+/**
  * One imposter field, rendered the same way wherever it appears.
  *
  * Shared by the list and the detail screen deliberately: two copies would let the same value read
@@ -54,10 +65,26 @@ export function ImposterField({
     case "name":
       if (renderName !== undefined) return renderName(imposter.name);
       return imposter.name === undefined ? <span className="muted">{UNKNOWN}</span> : imposter.name;
+    /*
+     * Both keys, one rendering. `ImposterField` is exhaustive over every field the schema declares
+     * (that is what `assertNever` below enforces), so documenting `stubCount` in the contract makes
+     * it a case this switch must answer even though `IMPOSTER_COLUMNS` names only `stubs`. Giving
+     * it the same answer is the honest one: they are two encodings of a single fact, and a column
+     * declared against either should show the same number.
+     */
+    case "stubCount":
     case "stubs":
-      // Absent `stubs` is "this response did not include them", which is not the same fact as an
-      // imposter with zero stubs — so it renders as unknown rather than 0.
-      return <Ident>{imposter.stubs === undefined ? UNKNOWN : imposter.stubs.length}</Ident>;
+      /*
+       * Two fields carry this, and which one arrives depends on the response: a single-imposter
+       * read sends `stubs`, the LIST projection omits the array and sends `stubCount`. Reading
+       * only `stubs` therefore rendered `—` for every row on the list screen — the one screen the
+       * column exists for — while the count sat unread in the same payload.
+       *
+       * `stubs.length` first, because when the array is present it is the thing itself rather than
+       * a number about it. Absent both is still `—`, and that part is unchanged: "this response
+       * did not include them" is not the same fact as an imposter with zero stubs.
+       */
+      return <Ident>{stubCountOf(imposter) ?? UNKNOWN}</Ident>;
     case "recordRequests":
       return imposter.recordRequests ? (
         <Status tone="ok" label="recording" />

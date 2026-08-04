@@ -3758,8 +3758,21 @@ components:
           default: true
         stubs:
           type: array
+          description: >
+            The stubs themselves. Present on a single-imposter read; the list
+            projection omits it and sends `stubCount` instead, so a client that
+            reads only this field sees nothing on the list screen.
           items:
             $ref: '#/components/schemas/Stub'
+        stubCount:
+          type: integer
+          description: >
+            How many stubs this imposter has, on the list projection
+            (`GET /imposters`), where the `stubs` array is omitted. Absent on a
+            single-imposter read, which carries `stubs` instead. A client
+            wanting a count for both shapes reads `stubs.length` when the array
+            is there and falls back to this — neither field alone covers both
+            responses.
       additionalProperties: true
 
     Stub:
