@@ -30,6 +30,59 @@ describe("imposter list", () => {
     expect(screen.getAllByText("https").length).toBeGreaterThan(0);
   });
 
+  /*
+   * The list projection, as the fleet actually sends it: `stubCount`, no `stubs` array.
+   *
+   * Every other fixture in this file hands the list a `stubs` array, which no real
+   * `GET /imposters` response carries — which is exactly why a Stubs column that read only
+   * `stubs` passed its tests and rendered `—` for every row against a live cluster.
+   */
+  const LIST_SHAPE = {
+    imposters: [
+      { port: 4545, protocol: "http", name: "billing", recordRequests: false, enabled: true, stubCount: 3 },
+      { port: 4546, protocol: "http", name: "empty", recordRequests: false, enabled: true, stubCount: 0 },
+      { port: 4547, protocol: "http", name: "silent", recordRequests: false, enabled: true },
+    ],
+  };
+
+  it("counts stubs from stubCount on the list, where there is no stubs array", async () => {
+    stubFetch({
+      "/imposters": { json: LIST_SHAPE },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+
+    const billing = within(await screen.findByTestId("imposter-row-4545"));
+    expect(billing.getByText("3")).toBeTruthy();
+  });
+
+  it("shows zero stubs as 0, not as unknown", async () => {
+    stubFetch({
+      "/imposters": { json: LIST_SHAPE },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+
+    // The absent-vs-zero distinction this column already cared about, now reachable: `0 ?? UNKNOWN`
+    // must stay `0`, which a truthiness check would have turned into `—`.
+    const empty = within(await screen.findByTestId("imposter-row-4546"));
+    expect(empty.getByText("0")).toBeTruthy();
+  });
+
+  it("still says unknown when the response carries neither stubs nor stubCount", async () => {
+    stubFetch({
+      "/imposters": { json: LIST_SHAPE },
+      "/_fleet/members": { status: 404 },
+      "/_fleet/health": { status: 404 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+
+    const silent = within(await screen.findByTestId("imposter-row-4547"));
+    expect(silent.getByText("—")).toBeTruthy();
+  });
+
   it("says whose view this is, and does not claim the tenant is empty", async () => {
     // A console that says "no imposters" is asserting a fleet-wide fact from one node's answer.
     stubFetch({ "/imposters": { json: { imposters: [] } }, "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } });
