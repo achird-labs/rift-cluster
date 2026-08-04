@@ -23,6 +23,13 @@ name: Release
 # **Nothing publishes on an unverified build.** Every publishing job also needs `console-release`,
 # which is where `check-console-embed.sh` proves the bundle is genuinely inside the binary. A red
 # verification cannot be followed by a green push.
+#
+# **And nothing discoverable survives a red smoke** (#296). The GitHub Release, the binary
+# tarballs, the chart and `:latest` all sit behind `image-manifest`, whose smoke steps pull the
+# published tag back and prove it serves; `:latest` is promoted only after they pass. The one
+# deliberate exception is the version tag itself: it must exist before the quick-start smoke can
+# pull it (`cluster.yml` is verified as written), so a red run can leave `vX.Y.Z` on GHCR — but
+# that run is red, nothing else ships, and re-running the fixed release re-points the same tag.
 on:
   push:
     tags: ["v*"]
@@ -278,17 +285,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `latest` only for a real release — see the guard's `prerelease` output for why.
+      # The version tag only. `:latest` is deliberately NOT applied here — it is promoted at the
+      # end of this job, after the smoke steps have proven the tag actually serves (#296). The
+      # version tag itself cannot wait: the smokes pull the image by it.
       - name: Create the manifest list
         working-directory: /tmp/digests
         run: |
           set -euo pipefail
-          tags=(-t "${IMAGE}:${{ needs.guard.outputs.version }}")
-          if [ "${{ needs.guard.outputs.prerelease }}" = "false" ]; then
-            tags+=(-t "${IMAGE}:latest")
-          fi
           # shellcheck disable=SC2046
-          docker buildx imagetools create "${tags[@]}" \
+          docker buildx imagetools create -t "${IMAGE}:${{ needs.guard.outputs.version }}" \
             $(printf "${IMAGE}@sha256:%s " *)
 
       # The published artifact, exercised as an operator would get it — pulled by tag, not the local
@@ -375,6 +380,18 @@ jobs:
             echo "pin ${pinned} matches the published tag; running the quick start as written"
             deploy/compose/verify-pulled.sh
           fi
+
+      # `latest` only for a real release — see the guard's `prerelease` output for why — and only
+      # now, after both smokes have passed on the version tag it aliases (#296). An implicit
+      # `docker pull` with no tag can therefore never resolve to a build the smokes rejected. The
+      # promotion re-points at the already-pushed manifest, so both tags name the same platform
+      # manifests and layers.
+      - name: Promote latest
+        if: needs.guard.outputs.prerelease == 'false'
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "${IMAGE}:latest" \
+            "${IMAGE}:${{ needs.guard.outputs.version }}"
 
   # ---------------------------------------------------------------------------
   # Binaries → GitHub Release

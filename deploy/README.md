@@ -410,7 +410,9 @@ published image is smoke-tested after the push: pulled back by tag and asked for
 stack** and put through the same trio `verify.sh` asserts. That last step is what
 makes the quick start at the top of this file a tested path rather than a
 plausible one; a `cluster.yml` that named a tag the lane had not actually pushed
-would fail the release rather than the first person to try it.
+would fail the release rather than the first person to try it. `:latest` is
+promoted only after those smokes pass, so an untagged pull can never resolve to a
+build the smokes rejected — only the exact version tag exists before they run.
 
 ## Images and the upstream pin
 
