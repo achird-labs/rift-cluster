@@ -448,9 +448,27 @@ function StubTable({
       </tbody>
     </table>
       </div>
+      {/*
+        Once, under the table — not once per row. Gated on `mayWrite` as well as on the stubs
+        themselves: a viewer has no Actions column at all, so an explanation of why a button they
+        cannot see is disabled would be answering a question they never asked.
+      */}
+      {mayWrite && stubs.some((stub) => stub.id === undefined) ? (
+        <p className="hint" id={IDLESS_NOTE_ID} data-testid={IDLESS_NOTE_ID}>
+          {IDLESS_REASON}
+        </p>
+      ) : null}
     </section>
   );
 }
+
+/** Why an id-less stub cannot be edited by id. Shown once under the table, not once per row. */
+const IDLESS_REASON =
+  "This stub has no id, so there is no by-id address for it. Editing it by position could " +
+  "overwrite a different stub if another editor inserts one first.";
+
+/** Ties each inert Edit button to the single explanation below the table, for assistive tech. */
+const IDLESS_NOTE_ID = "stub-idless-note";
 
 /**
  * The write controls for one stub.
@@ -459,6 +477,12 @@ function StubTable({
  * index-addressed fallback: an index is a position, so an index-addressed write racing a concurrent
  * insert or delete replaces a different stub and answers `200`. Refusing to offer the action is the
  * only honest option — the fix is to give the stub an id, which is a change to the stub.
+ *
+ * The reason itself lives under the table rather than in this cell. It is two sentences and it is
+ * identical for every id-less stub, so rendering it per row forced the Actions column to hold a
+ * paragraph: the row grew to roughly 200px and the buttons beside it wrapped mid-word. The cell
+ * keeps a short `no id` marker and points at the shared note through `aria-describedby`, so the
+ * explanation is still one tab-stop away for a screen reader and still on screen for everyone else.
  */
 function StubActions({
   port,
@@ -475,13 +499,16 @@ function StubActions({
   if (stubId === undefined) {
     return (
       <span data-testid="stub-not-addressable">
-        <button className="btn sm" type="button" disabled>
+        <button
+          className="btn sm"
+          type="button"
+          disabled
+          title={IDLESS_REASON}
+          aria-describedby={IDLESS_NOTE_ID}
+        >
           Edit
         </button>{" "}
-        <span className="muted">
-          This stub has no id, so there is no by-id address for it. Editing it by position could
-          overwrite a different stub if another editor inserts one first.
-        </span>
+        <span className="muted">no id</span>
       </span>
     );
   }
