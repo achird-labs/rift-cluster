@@ -553,6 +553,33 @@ jobs:
           fi
           echo "PASS: refused, as it should"
 
+      # Same shape, different guard. The `-static` flavor is FROM scratch and this chart runs
+      # `/bin/sh -c` as every pod's container command, so a `-static` tag renders a StatefulSet
+      # whose pods all fail at exec — at rollout, with a bare container error. The chart refuses
+      # at render time instead, and this step is what keeps that refusal from being deleted.
+      #
+      # Matched on output, not exit status alone, for the same reason as the secret guard above:
+      # a template syntax error would otherwise score as a PASS.
+      #
+      # The needle is the guard's own prose, NOT `-static`. `-static` is a substring of the tag this
+      # step injects, so any future validation that echoes `image.tag` back in its error would match
+      # it and score a PASS with the flavor guard deleted. `FROM scratch` can only come from here.
+      - name: A chart pointed at the -static flavor must refuse to render
+        run: |
+          set -euo pipefail
+          if helm template r deploy/helm/rift-cluster \
+               --set clusterSecret.existingSecret=ci \
+               --set image.tag=1.2.3-static >/dev/null 2>/tmp/static-flavor.err; then
+            echo "FAIL: the chart rendered with a -static image tag" >&2
+            exit 1
+          fi
+          if ! grep -q 'FROM scratch' /tmp/static-flavor.err; then
+            echo "FAIL: the chart refused, but not because of the flavor guard:" >&2
+            cat /tmp/static-flavor.err >&2
+            exit 1
+          fi
+          echo "PASS: refused, as it should"
+
       # Rendered to a FILE rather than piped: kubeconform reading a pipe reports "0 resources found"
       # and exits 0, which is a summary that looks like a pass and checks nothing. A file also leaves
       # the rendered manifest inspectable in the log when a case fails.

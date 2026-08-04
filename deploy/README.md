@@ -348,6 +348,12 @@ could quietly break while still emitting valid YAML:
   authentication would be worse than the manifest it replaces. The refusal
   *reason* is matched too, not just the exit status — otherwise an unrelated
   template syntax error would score as a pass on the security guard.
+- **A chart pointed at the `-static` flavor must refuse to render.** That image is
+  `FROM scratch` and every pod's container command here is a shell script, so a
+  `-static` tag renders a StatefulSet whose pods all fail at exec — at rollout,
+  with a bare container error and nothing naming the cause. The refusal *reason*
+  is matched on the guard's own prose rather than on `-static`, which is also a
+  substring of the tag the check injects and so would match for the wrong reason.
 - **`terminationGracePeriodSeconds` stays `2 × leaveTimeoutSeconds + 10`.** The
   manifest states "raise them together, never one alone" in a comment; the chart
   derives it, and CI checks the derivation at three values. Hard-coding it back
@@ -452,11 +458,13 @@ limitations follow from the same trade, worth knowing before picking it:
   Use the default flavor for any node that declares one.
 
 - **No shell.** There is no `docker exec … sh` on this image — there is nothing to exec into.
-  This also rules it out for Kubernetes today: the StatefulSet's ordinal-0 bootstrap branch (the
-  founding node runs a different container command than the nodes that join it) is a shell
-  script baked into the container command, and a shell-less image cannot run it. **The default
-  flavor remains the recommended Kubernetes image** — the Helm chart's `image.repository`
-  defaults to it, with no `-static` option exposed.
+  This also rules it out for Kubernetes today: the StatefulSet runs `/bin/sh -c` as its container
+  command, with the ordinal-0 bootstrap branch inside the script it passes. That command lives on
+  the pod template, so it is uniform across ordinals — a shell-less image does not merely break the
+  founding node, it fails **every** pod with a container exec error. **The default flavor remains
+  the recommended Kubernetes image** — the Helm chart's `image.repository` defaults to it, with no
+  `-static` option exposed, and the chart **refuses to render** if `image.tag` is pointed at a
+  `-static` tag, so this is a message from `helm install` rather than a discovery at rollout.
 
 - **A different system allocator.** Neither flavor bundles mimalloc — this workspace takes
   `rift-http-proxy` with `default-features = false` (root `Cargo.toml`), so upstream's
