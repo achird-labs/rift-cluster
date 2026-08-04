@@ -712,6 +712,8 @@ jobs:
       PROM_IMAGE: prom/prometheus:v2.53.0
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: promtool check config
         run: |
