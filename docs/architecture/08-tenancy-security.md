@@ -38,7 +38,7 @@ barrier, so one tenant's write burst *does* queue behind another's; ADR-001's
 single Raft log is the price of authorization data that is strongly consistent
 (RFC-002 §3.1). The OSS config schema never learns the field — tenancy is stored
 on the control-plane record and injected/stripped at the API boundary, keeping
-the open-core line clean.
+the upstream boundary clean.
 
 > **Design of record: [RFC-002](../rfc/RFC-002-multi-tenancy-and-rbac.md).** This
 > chapter is the architectural overview; the RFC carries the normative model,

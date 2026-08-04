@@ -19,7 +19,7 @@ cannot give you is:
 4. **Config ergonomics** — `POST /imposters` against *any* node, and the whole
    fleet serves it.
 
-The distributed edition (RiftCluster) delivers these as an **open-core product**:
+RiftCluster delivers these as a **layered build**:
 the open-source engine is unmodified and unaware of clustering; every cluster
 behavior enters through eight generic extension seams that were upstreamed
 first (`achird-labs/rift#311–#318` — pluggable flow store with CAS, response

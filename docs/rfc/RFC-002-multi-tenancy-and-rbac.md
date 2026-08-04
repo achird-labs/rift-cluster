@@ -140,7 +140,7 @@ leader cannot change authorization, and that is deliberate.
 stored on the control-plane record — the state machine keys configs by
 `(tenant, port)` — and injected or stripped at the API boundary. The
 open-source config schema is untouched and upstream never learns the field. This
-follows the same open-core rule as everything else in `docs/architecture/11-open-core.md`:
+follows the same open-core rule as everything else in `docs/architecture/11-upstream-boundary.md`:
 cluster and tenancy vocabulary does not cross into `rift-mock-core`.
 
 Two consequences that are easy to get wrong:
