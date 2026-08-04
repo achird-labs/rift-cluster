@@ -1320,7 +1320,7 @@ serve, listing the ones it can.
 | `file:` | `file:/srv/mocks.json` | *(none — always re-applied)* | n/a |
 | `http:` / `https:` | `https://host/imposters.json` | the `ETag` | n/a — use `registry:` for a token-authenticated endpoint |
 | `git+https:` | `git+https://host/org/repo#<ref>:<path>` | the **commit sha** | a token, sent as an `Authorization: Basic` git `http.extraHeader` |
-| `git+file:` | `git+file:/srv/repo.git#<ref>:<path>` | the **commit sha** | as above (rarely needed for a local mirror) |
+| `git+file:` | `git+file:///srv/repo.git#<ref>:<path>` | the **commit sha** | as above (rarely needed for a local mirror) |
 | `s3:` | `s3://bucket/key` | the `ETag`, unquoted | `<access-key-id>:<secret-access-key>`, signed with SigV4 |
 | `registry:` | `registry://<service-id>[,…]` | a SHA-256 of the responses | a token, sent as `Authorization: Bearer` |
 
@@ -1367,16 +1367,26 @@ replicated log, so the `git+` schemes are constrained tightly — at **admission
 so a URI no node should ever fetch never reaches the log at all, and again in the
 provider:
 
+- A `git+` URI must be written with `//` after the scheme — `git+file://…`, not
+  `git+file:…`. The single-colon spelling is **refused at admission**, because
+  the fetch path's scheme parser splits on `://` and would route it to the
+  `file:` provider, which opens the whole string as a path: a source the control
+  plane had just called a well-formed git remote fails with a not-found naming a
+  path nobody wrote. One admissible spelling per scheme is what keeps the two
+  parsers from disagreeing.
 - A remote or ref beginning with `-` is **refused**. `git`'s option parser
-  permutes, so `git+file:--upload-pack=/tmp/x.sh#main:y` would otherwise be
-  parsed as an *option* and run `/tmp/x.sh` as the rift process on every node
-  that pulls it. This is the reason the two checks exist at all.
+  permutes, so a remote like `--upload-pack=/tmp/x.sh` would otherwise be parsed
+  as an *option* and run `/tmp/x.sh` as the rift process on every node that pulls
+  it. This is the reason the two checks exist at all. For **refs** this is an
+  admission check; for **remotes** it now bites in the provider, since the `//`
+  spelling above leaves every admissible `git+file:` remote starting with `/`.
 - A remote containing `::` is **refused** — that is the `<helper>::<target>`
   transport syntax, whose purpose is running a command as the transport.
   `protocol.ext.allow=never` is also set on every invocation, so it is two
-  independent gates rather than one.
+  independent gates rather than one. This one still bites at admission.
 - A `git+file:` remote must be an **absolute path**; a `git+https:` remote must
-  parse as an `https` URL with a host.
+  parse as an `https` URL with a host. The `git+file:` half is enforced in the
+  provider rather than at admission, for the same reason as the `-` rule.
 - A ref must look like a ref: `[A-Za-z0-9._/+-]`, no `..`, no leading `/`.
 
 Three more properties of the git subprocess worth knowing operationally:

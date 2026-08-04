@@ -436,6 +436,55 @@ fn only_the_double_slash_git_file_spelling_routes_to_git() {
         "the single-colon spelling is a `file:` URI to the fetch path, whatever \
          control-plane validation calls it"
     );
+
+    // #301: the two parsers can no longer *silently* disagree, because the
+    // spelling they disagree about is refused before it can be committed. This
+    // assertion is what keeps the disagreement above from being re-opened by a
+    // change to either parser without a test failing.
+    let err = crate::control::validate(&source_put_op("git+file:/srv/mocks.git#main:m.json"))
+        .expect_err("control-plane validation must refuse the single-colon spelling");
+    assert!(err.contains("git+file://"), "{err}");
+}
+
+/// A `SourcePut` carrying `uri`, for asserting what control-plane validation
+/// does with a spelling this module has just pinned the *routing* of.
+fn source_put_op(uri: &str) -> crate::control::ControlOp {
+    crate::control::ControlOp::SourcePut {
+        tenant: crate::control::TenantId::default(),
+        id: "mocks".to_owned(),
+        uri: uri.to_owned(),
+        mode: crate::control::SourceMode::Pinned,
+        auth_ref: None,
+        on_drift: crate::control::OnDrift::Overwrite,
+        poll_secs: None,
+    }
+}
+
+/// The two `check_remote` guards that the `//` spelling leaves vacuous.
+///
+/// A `git+file:` remote is whatever follows `git+file:` — so for the only
+/// spelling #301 now admits it always begins `//`, which can neither start with
+/// `-` nor be relative. Those two guards therefore stop being reachable through
+/// admission, and this is where they keep being proven. They still matter:
+/// `parse_git_uri` calls `check_remote` at fetch time on whatever a stored op
+/// holds, and the guards are the reason "a URI may name a corpus" does not
+/// become "a URI may run a command as the rift process, fleet-wide".
+#[test]
+fn check_remote_refuses_option_shaped_and_relative_file_remotes() {
+    let err = super::git::check_remote("--upload-pack=/tmp/pwn.sh", true)
+        .expect_err("a remote git would read as an option must be refused");
+    assert!(err.to_string().contains("option"), "{err}");
+
+    let err = super::git::check_remote("relative/path", true)
+        .expect_err("a relative git+file: remote must be refused");
+    assert!(err.to_string().contains("absolute"), "{err}");
+
+    let err = super::git::check_remote("ext::sh -c whoami", true)
+        .expect_err("a transport helper remote must be refused");
+    assert!(err.to_string().contains("transport"), "{err}");
+
+    super::git::check_remote("///srv/mocks.git", true)
+        .expect("the `//` spelling's remote is what a legal git+file: uri yields");
 }
 
 #[test]
