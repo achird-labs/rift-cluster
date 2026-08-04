@@ -5139,3 +5139,42 @@ async fn journal_partition_is_declared_on_both_sides_and_heals() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
+
+/// The observability runtime lane's assertions are opt-in, and the opt-in is a
+/// single workflow line (issue #316).
+///
+/// `verify.sh` gates its Prometheus and Grafana assertions on
+/// `[ "${RIFT_OBSERVABILITY:-0}" = "1" ]` and otherwise runs the plain 3-node
+/// smoke and exits 0. So dropping that `env:` line — or typo'ing the value to
+/// `"true"` — leaves a job that still passes, on the same PRs, having asserted
+/// nothing about Prometheus or Grafana. That is precisely the fail-green shape
+/// #316 was filed to remove, relocated from "the script is never invoked" to
+/// "the script is invoked with its assertions switched off", and nothing else
+/// in the tree would notice.
+///
+/// Pinned the same way `the_chaos_runner_expands_skips_as_an_array` pins the
+/// chaos runner: read the workflow text and assert the load-bearing literal.
+#[test]
+fn the_observability_runtime_lane_actually_enables_its_assertions() {
+    let ci = read_workflow("ci.yml");
+    let job = ci
+        .split("observability-runtime:")
+        .nth(1)
+        .expect("ci.yml has no observability-runtime job");
+
+    assert!(
+        job.contains("deploy/compose/verify.sh"),
+        "the lane must invoke verify.sh — it is where the runtime assertions live"
+    );
+    assert!(
+        job.contains(r#"RIFT_OBSERVABILITY: "1""#),
+        "verify.sh checks `${{RIFT_OBSERVABILITY:-0}} = 1`; without exactly that \
+         value the lane runs the plain smoke and asserts nothing about \
+         Prometheus or Grafana while still going green"
+    );
+    assert!(
+        job.contains("--job observability"),
+        "the lane must use its own watched set; defaulting to cluster-smoke's \
+         would run it on every cluster source change"
+    );
+}

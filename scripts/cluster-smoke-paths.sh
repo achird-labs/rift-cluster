@@ -118,6 +118,38 @@ CLUSTER_SMOKE_EXACT='vendor/rift|Cargo\.lock|scripts/chaos-quarantine\.sh|script
 PARITY_PREFIXES='^(crates/rift-cluster-server/|\.github/)'
 PARITY_EXACT='vendor/rift|Cargo\.lock'
 
+# The `observability-runtime` job (issue #316): brings the fleet up under
+# `observability.overlay.yml` and runs `verify.sh`'s runtime assertions —
+# Prometheus scraping 3/3 targets, Grafana serving every provisioned dashboard.
+#
+# Narrow on purpose. The whole tier that keeps this honest is *static* and runs
+# on every PR (`promtool check/test`, the families gate, `compose config -q`);
+# this job exists only for the two properties no static check can reach, and it
+# pays a full stack bring-up to reach them. So the watched set is the pack, the
+# overlay, and the machinery that carries the assertions — nothing else.
+#
+#   * `deploy/observability/` — the dashboards, datasource provisioning and
+#     rules the runtime assertions are about.
+#   * `observability.overlay.yml` — what publishes Prometheus and Grafana at
+#     all; a port or mount change here breaks the assertions and nothing static
+#     would notice.
+#   * `verify.sh` — it *is* the assertions (issue #316 exists because this file
+#     was never invoked by CI). Watched for the reason cluster-smoke watches
+#     `chaos-quarantine.sh`: break it and the job passes having asserted
+#     nothing. Fails green, which is worse than failing red.
+#   * `check-observability-families.sh` — the static half of the same gate.
+#   * this file — same self-referential reason as cluster-smoke's entry.
+#
+# `.github/` is deliberately excluded, matching cluster-smoke's stance and for
+# the identical reason: this job is expensive, and taxing every unrelated CI
+# tweak with it trains people to route around the gate. `--self-test` running
+# unconditionally in `build` is the compensating control.
+#
+# `deploy/` at large is NOT the prefix — that is cluster-smoke's set. The base
+# compose file cannot change what Prometheus scrapes or Grafana provisions.
+OBSERVABILITY_PREFIXES='^(deploy/observability/)'
+OBSERVABILITY_EXACT='deploy/compose/observability\.overlay\.yml|deploy/compose/verify\.sh|scripts/check-observability-families\.sh|scripts/cluster-smoke-paths\.sh'
+
 # Resolves `--job NAME` to the prefix/exact pair `decide` matches against, into
 # the globals `watched_prefixes`/`watched_exact`. Not run inside `$(...)`: an
 # unknown job must fail the whole script (see the grep-error handling below for
@@ -134,8 +166,12 @@ select_job() {
       watched_prefixes="$PARITY_PREFIXES"
       watched_exact="$PARITY_EXACT"
       ;;
+    observability)
+      watched_prefixes="$OBSERVABILITY_PREFIXES"
+      watched_exact="$OBSERVABILITY_EXACT"
+      ;;
     *)
-      printf 'cluster-smoke-paths: unknown --job %s (want: cluster-smoke, parity)\n' "$1" >&2
+      printf 'cluster-smoke-paths: unknown --job %s (want: cluster-smoke, parity, observability)\n' "$1" >&2
       exit 2
       ;;
   esac
@@ -318,6 +354,35 @@ false|parity|docs/rift-cluster-server.md
 false|parity|web/src/App.tsx
 # Nothing changed at all.
 false|parity|
+# --- observability (issue #316) --------------------------------------------
+# The pack itself: dashboards, recording/alert rules, their promtool tests.
+true|observability|deploy/observability/grafana/dashboards/fleet-overview.json
+true|observability|deploy/observability/prometheus/rules/alerts.yml
+# The overlay that boots Prometheus and Grafana beside the fleet.
+true|observability|deploy/compose/observability.overlay.yml
+# The job's own machinery, watched for the reason cluster-smoke watches
+# `chaos-quarantine.sh`: `verify.sh` *carries* the runtime assertions this job
+# exists to run, so breaking it fails green — the job passes having asserted
+# nothing.
+true|observability|deploy/compose/verify.sh
+true|observability|scripts/check-observability-families.sh
+true|observability|scripts/cluster-smoke-paths.sh
+# The prefix boundary — `deploy/observability/` ends in a slash, so a
+# similarly-named sibling is not it. The #93 shape, pinned for a third job.
+false|observability|deploy/observability-notes.md
+# `deploy/` at large belongs to cluster-smoke's watched set, not this one: the
+# base compose file cannot change what Prometheus scrapes or what Grafana
+# provisions.
+false|observability|deploy/compose/docker-compose.yml
+# Registering a metric family is checked by the *static* families gate, which
+# runs on every PR. It cannot change scrape targets or dashboard provisioning,
+# so it does not warrant a full stack bring-up.
+false|observability|crates/rift-cluster/src/metrics.rs
+# The same `.github/` stance as cluster-smoke and for the same reason: this job
+# costs a full stack bring-up, and taxing every unrelated CI tweak with it is
+# how a gate trains people to route around it. `--self-test` running in `build`
+# is the compensating control.
+false|observability|.github/workflows/ci.yml
 CASES
 
   echo
@@ -329,7 +394,8 @@ CASES
   echo "FAIL: ${failures}/${total} path cases wrong."
   echo
   echo "This table is the specification of which changes run each path-gated"
-  echo "job (cluster-smoke, parity). A case failing here means some filter"
+  echo "job (cluster-smoke, parity, observability). A case failing here means"
+  echo "some filter"
   echo "would skip (or run) a change class it should not — and a wrongly-"
   echo "skipped job is a green check that tested nothing. Fix the patterns,"
   echo "not the table, unless the change class genuinely no longer warrants"

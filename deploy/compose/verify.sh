@@ -109,14 +109,28 @@ if [ "${RIFT_OBSERVABILITY:-0}" = "1" ]; then
   echo "--- asserting Prometheus scrapes 3/3 targets ---"
   up_targets=0
   for _ in $(seq 1 30); do
+    # `|| true` is load-bearing under this script's `set -euo pipefail`. On the
+    # first poll Prometheus has not completed a scrape, so `grep` matches
+    # nothing and exits 1; `pipefail` promotes that to the pipeline, the
+    # assignment fails, and `set -e` kills the script *before* the retry loop
+    # can retry and before the FAIL branch below can print. The symptom is the
+    # worst kind: the run dies straight after the header with no diagnostic at
+    # all. `wc -l` still emits `0` for empty input, so the rescued value is the
+    # honest count. The Grafana loop below was already written this way
+    # (`|| echo 000`); this one was not, and nothing noticed because until
+    # issue #316 no CI lane ever ran this block.
     up_targets="$(curl -fsS --max-time 5 "http://127.0.0.1:19091/api/v1/targets" 2>/dev/null \
-      | grep -o '"health":"up"' | wc -l | tr -d ' ')"
+      | grep -o '"health":"up"' | wc -l | tr -d ' ' || true)"
     [ "${up_targets:-0}" -eq 3 ] && break
     sleep 2
   done
   if [ "${up_targets:-0}" -ne 3 ]; then
     echo "FAIL: expected 3 up targets, got '${up_targets:-0}'"
     curl -fsS --max-time 5 "http://127.0.0.1:19091/api/v1/targets" || true
+    # Dumped here, not by the caller: `trap cleanup EXIT` above runs
+    # `compose down` on every exit path, so by the time any wrapper could ask
+    # for logs the containers are already gone and it gets silence.
+    "${OBS_COMPOSE[@]}" logs --tail=100 prometheus || true
     exit 1
   fi
   echo "PASS: Prometheus reports 3/3 targets up"
@@ -132,6 +146,10 @@ if [ "${RIFT_OBSERVABILITY:-0}" = "1" ]; then
     done
     if [ "$status" != "200" ]; then
       echo "FAIL: dashboard uid '${uid}' answered ${status}, expected 200"
+      # Same reason as the Prometheus branch: the EXIT trap tears the stack
+      # down, so logs have to be taken before it fires. A provisioning error is
+      # only ever visible in Grafana's own log.
+      "${OBS_COMPOSE[@]}" logs --tail=100 grafana || true
       exit 1
     fi
   done
