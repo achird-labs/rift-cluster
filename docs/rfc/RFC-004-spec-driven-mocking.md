@@ -189,7 +189,8 @@ precedes `/users/{id}`, and the deterministic sort keeps re-compiles
 diffable (§3.5).
 
 **Response synthesis.** For each operation, one stub per declared status
-code, in spec order, default response first:
+code, in spec order, with `default` trailing them — the unconditional one
+aside, which sorts last for the reason given below:
 
 1. **Spec examples first** — `example` / `examples` on the response media
    type, verbatim.
@@ -200,11 +201,36 @@ code, in spec order, default response first:
    with `null` at the floor, `additionalProperties` renders nothing.
 
 The response is a plain `is` response: `statusCode`, `Content-Type` from
-the media type key, body. Non-default status codes are reachable the
-WireMock way — the first (default) stub answers unconditionally; the
-per-status stubs above carry an extra discriminating predicate
-`{ "equals": { "headers": { "X-Rift-Spec-Status": "404" } } }` so a test can
-opt into any declared error without editing the imposter.
+the media type key, body.
+
+**Which response answers unconditionally.** The **first declared 2xx**, falling
+back to the first declared response when the operation declares none. A `2XX`
+range counts as a 2xx for this rule, taken in the position it is declared —
+OpenAPI gives an explicit code precedence over a range when *serving* that code,
+but this rule is about which response a bare request gets, not about resolution.
+Every
+other status — `default` included — carries a discriminating predicate
+`{ "equals": { "headers": { "X-Rift-Spec-Status": "404" } } }`, so a test can
+opt into any declared response without editing the imposter. The unconditional
+stub is emitted **last**, because its predicates are a strict subset of the
+others' and first-match-wins would otherwise let it shadow them.
+
+> **Deviation history (issue #314).** This paragraph originally read "the first
+> (default) stub answers unconditionally". That is implementable and was
+> implemented, but `default` names no status of its own, so it compiles to
+> `statusCode: 200` carrying whatever body it declares. For the common shape —
+> a spec whose `default` is an error envelope — the out-of-the-box mock
+> answered a bare request with **200 and an error body**: a success status
+> wrapping an error, which is the shape client code fails to notice. Preferring
+> a declared success fixes that while keeping every status reachable.
+>
+> Two alternatives were rejected. *Lowest numeric status wins* discards spec
+> order, which this section otherwise treats as the author's only ordering
+> signal. *Synthesising an error-shaped status for `default`* (say `502`)
+> invents a status the spec never declared, which is a larger lie than 200 —
+> and §3.6's inspector already owns that classification. An operation declaring
+> only `default` therefore still compiles to 200, because its author declared
+> nothing better.
 
 **Deterministic stub ids.** Every generated stub carries
 `id: "spec:<operation_id>:<status>"`. The engine's stub ids are exactly the

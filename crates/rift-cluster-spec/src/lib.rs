@@ -100,14 +100,27 @@ impl StatusKey {
         }
     }
 
-    /// The status code the stub actually serves. A `default` response names no code; it is the
-    /// operation's unconditional answer, so it serves 200.
+    /// The status code the stub actually serves. A `default` response names no code, so it serves
+    /// 200 — which is why it is not eligible as the unconditional answer; see [`plan_responses`].
     #[must_use]
     pub fn http_status(&self) -> u16 {
         match self {
             Self::Default => 200,
             Self::Code(code) => *code,
             Self::Range(leading) => leading.saturating_mul(100),
+        }
+    }
+
+    /// Whether this key names a 2xx outcome, and so can serve as the operation's unconditional
+    /// answer — see [`plan_responses`] for why that matters.
+    ///
+    /// `Default` is deliberately not a success: it declares no status of its own.
+    #[must_use]
+    pub(crate) fn is_success(&self) -> bool {
+        match self {
+            Self::Default => false,
+            Self::Code(code) => (200..300).contains(code),
+            Self::Range(leading) => *leading == 2,
         }
     }
 }
@@ -558,8 +571,17 @@ fn resolve_response<'a>(
     }
 }
 
-/// `default` first — it is the stub that answers unconditionally — then declared statuses in spec
-/// order.
+/// Declared statuses in spec order, then `default`, and finally the response that answers
+/// *unconditionally* moved to the front — [`emit`] treats index 0 as the stub that carries no
+/// discriminator.
+///
+/// The unconditional answer is the **first declared 2xx**, falling back to the first declared
+/// response when the operation declares none (issue #314). RFC-004 §3.2 originally specified
+/// `default` first, and that is what made a bare request to a spec with a `default` error answer
+/// `200` carrying the error body: `default` names no status, so [`StatusKey::http_status`] serves
+/// it as 200. Preferring a declared success makes the out-of-the-box mock answer the common
+/// request usefully, and every status — `default` included — stays reachable through its
+/// `X-Rift-Spec-Status` discriminator.
 ///
 /// `$ref`'d responses are resolved rather than skipped: `'404': { $ref: '#/components/responses/
 /// NotFound' }` is an ordinary way to write a spec, and dropping it would leave the status with no
@@ -570,6 +592,16 @@ fn plan_responses(
     schema_budget: &mut usize,
 ) -> Result<Vec<PlannedResponse>, CompileError> {
     let mut out = Vec::new();
+    for (code, response) in &operation.responses.responses {
+        let response = resolve_response(response, components)?;
+        let status = match code {
+            StatusCode::Code(code) => StatusKey::Code(*code),
+            StatusCode::Range(leading) => StatusKey::Range(*leading),
+        };
+        out.push(plan_response(status, response, components, schema_budget));
+    }
+    // `default` trails the declared codes rather than leading them: `openapiv3` holds it in its own
+    // field, so it has no position among them to preserve, and it is the least specific answer.
     if let Some(default) = &operation.responses.default {
         let response = resolve_response(default, components)?;
         out.push(plan_response(
@@ -579,13 +611,15 @@ fn plan_responses(
             schema_budget,
         ));
     }
-    for (code, response) in &operation.responses.responses {
-        let response = resolve_response(response, components)?;
-        let status = match code {
-            StatusCode::Code(code) => StatusKey::Code(*code),
-            StatusCode::Range(leading) => StatusKey::Range(*leading),
-        };
-        out.push(plan_response(status, response, components, schema_budget));
+
+    // Move-to-front, not swap: every other stub is selected by its own discriminator so their
+    // relative order cannot affect matching, but keeping it stable keeps re-compiles diffable
+    // (§3.5). No 2xx at all leaves the list untouched, so index 0 is the first declared status —
+    // a declared error with its own body, which is more honest than compiling `default` to a
+    // fabricated 200.
+    if let Some(index) = out.iter().position(|planned| planned.status.is_success()) {
+        let unconditional = out.remove(index);
+        out.insert(0, unconditional);
     }
     Ok(out)
 }
@@ -687,9 +721,12 @@ fn emit(
     let mut stub_ids = Vec::new();
     // Mountebank matches first-match-wins, and this stub carries no discriminator — its predicates
     // are a strict subset of every other stub's for this operation. Emitted first it would shadow
-    // all of them, so the `X-Rift-Spec-Status` opt-in of RFC-004 §3.2 could never select anything
-    // and, for an operation with a `default` response, the mock would answer the *error* body on
-    // the happy path. It is therefore held back and appended last, as the catch-all.
+    // all of them, so the `X-Rift-Spec-Status` opt-in of RFC-004 §3.2 could never select anything.
+    // It is therefore held back and appended last, as the catch-all.
+    //
+    // *Which* response this is comes from `plan_responses`, which puts the first declared 2xx at
+    // index 0 (issue #314). Position and identity are separate decisions: this one is about
+    // reachability of the discriminated stubs, that one about which answer a bare request gets.
     let mut unconditional: Option<(String, Value)> = None;
 
     for (index, planned) in plan.responses.iter().enumerate() {
