@@ -1530,6 +1530,12 @@ fn require_source_id(id: &str) -> Result<(), String> {
 /// by the `s3` shape check — but the reasoning is what
 /// [`require_well_formed_uri`] was missing until #301, and it is the reason
 /// both functions share one parse.)
+///
+/// **No message here echoes the URI.** The same rule
+/// [`require_well_formed_uri`] states for the shape family holds here, and
+/// for a sharper reason: this function *deliberately permits* a token in a
+/// query string, so its own refusals are the ones most likely to be holding
+/// a secret when they fire (#309).
 fn require_credential_free_uri(uri: &str) -> Result<(), String> {
     let uri = uri.trim();
     if uri.is_empty() {
@@ -1572,7 +1578,13 @@ fn require_credential_free_uri(uri: &str) -> Result<(), String> {
         if matches!(scheme, "file" | "git+file") {
             return Ok(());
         }
-        return Err(format!("source uri {uri:?} names no host"));
+        // Shape description only, never the URI: this fires on exactly the
+        // inputs whose query string — where a token is deliberately permitted
+        // — would ride an echo into the 400 body and the admission log (#309).
+        return Err(
+            "source uri opens an authority (`//`) but names no host: write `<scheme>://<host>/…`"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -3027,6 +3039,31 @@ mod tests {
         );
         assert!(!err.contains(uri), "refusal echoed the whole uri: {err}");
         assert!(err.contains("git+https://"), "{err}");
+    }
+
+    /// Same rule, hygiene side (issue #309): the "names no host" refusal fires
+    /// on an empty authority — exactly the shape whose *query string* the
+    /// hygiene check deliberately leaves alone, so a token there would ride an
+    /// echo into the 400 body and the admission log. This was the one refusal
+    /// in `require_credential_free_uri` that echoed its input.
+    #[test]
+    fn the_names_no_host_refusal_does_not_echo_the_uri() {
+        for uri in [
+            "s3:///key?token=hunter2",
+            "git+https://#main:x?token=hunter2",
+        ] {
+            let err = validate(&source_put("mocks", uri)).expect_err("must be refused");
+            assert!(
+                !err.contains("hunter2"),
+                "refusal leaked the query string: {err}"
+            );
+            assert!(!err.contains(uri), "refusal echoed the whole uri: {err}");
+            // "opens an authority" pins *this* refusal: `sources::git` has an
+            // echo-free "names no host" of its own that a reordering could
+            // reach for the git row.
+            assert!(err.contains("opens an authority"), "{err}");
+            assert!(err.contains("names no host"), "{err}");
+        }
     }
 
     // -- issue #136 review, B1: the git argument-injection refusal is
