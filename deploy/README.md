@@ -72,13 +72,21 @@ a reader of a quick start would reasonably expect:
 | `/imposters` (admin API) | `200` | `200` |
 | `/console` | **`404`** | `200` |
 | `/readyz`, `/healthz` on `2526` | **nothing bound** | `200` |
-| `docker ps` health | **`unhealthy`** | `healthy` |
+| `docker ps` health | `healthy` | `healthy` |
 
 Both the console and the probe listener hang off the clustered composition, so
-with `--cluster` off neither exists. The `unhealthy` follows from the same fact
-rather than being a separate problem: the image's `HEALTHCHECK` probes
-`http://127.0.0.1:2526/healthz`, and nothing is listening there — the container
-serves correctly the entire time Docker is calling it unhealthy.
+with `--cluster` off neither exists. The health check follows the mode rather
+than assuming one: the image's `HEALTHCHECK` runs the built-in `healthcheck`
+subcommand with no URL, and the subcommand finds its target itself — the probe
+listener's `/healthz` when `RIFT_CLUSTER` is set *or* a probe listener turns
+out to be bound anyway (a node clustered purely by command-line arguments
+shows the healthcheck exec no environment), and the admin API's `/health`
+otherwise (#297). A bare `docker run` is therefore `healthy` while `/console`
+still answers `404`, and both facts are by design. One caveat travels with the
+fallback: `/health` sits behind `--api-key` like the rest of the admin API, so
+an un-clustered container started with `RIFT_APIKEY` reports `unhealthy`. For
+that shape, run the cluster of one above — its probe listener is deliberately
+unauthenticated — or disable the image's `HEALTHCHECK`.
 
 Each of the four is load-bearing. `--cluster` turns the composition on;
 `--cluster-secret` authenticates the cluster port and has no default;

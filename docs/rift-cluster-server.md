@@ -95,8 +95,9 @@ single node with both, run a cluster of one:
   --cluster-probe-bind 127.0.0.1:2526
 ```
 
-The container form of the same thing, and the `unhealthy` it explains, are in
-`deploy/README.md` → *A single node*.
+The container form of the same thing is in `deploy/README.md` → *A single
+node* — including why a bare `docker run` still reports `healthy` (#297): the
+image's health check follows the mode instead of assuming the probe port.
 
 ## Identifying a build
 
@@ -1548,6 +1549,15 @@ recompiling the crate leaves the old assets embedded. The release lane covers
 this by asserting the finished binary contains the current build's content-hashed
 asset name (`scripts/check-console-embed.sh embedded`); if you are iterating
 locally, use a debug build, where `rust-embed` reads from disk instead.
+
+Carrying the console is necessary but not sufficient: serving it also needs
+**`--cluster` at runtime**. `/console` is mounted on the clustered admin front,
+and with the master switch off this binary is deliberately the open-source
+server byte for byte — no extra listener, no extra route (CI's `parity` job
+asserts exactly that). A console-carrying binary without `--cluster` therefore
+answers `404` at `/console` **by design**, not by defect (#297). §*Installing
+from a release* above shows the cluster-of-one invocation that turns it on, and
+`deploy/README.md` → *A single node* has the container-flavoured comparison.
 
 Serving is read-only and **unauthenticated**, deliberately: the console shell is
 the login UI (RFC-006 §5.3), so requiring a credential to fetch the page that
