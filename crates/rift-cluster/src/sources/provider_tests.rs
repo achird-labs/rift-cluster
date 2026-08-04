@@ -239,8 +239,12 @@ fn temp_git_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
     (dir, sha)
 }
 
+/// The `//` spelling, which since #301 is the only one control-plane admission
+/// accepts — so the provider corpus fetches through the shape an operator can
+/// actually commit. `repo` is absolute, so the remote comes out `///srv/…`;
+/// git resolves that to the same path (POSIX collapses three leading slashes).
 fn git_uri(repo: &Path, git_ref: &str, path: &str) -> String {
-    format!("git+file:{}#{git_ref}:{path}", repo.display())
+    format!("git+file://{}#{git_ref}:{path}", repo.display())
 }
 
 /// Skip a git test when no `git` binary is available, rather than failing for a
