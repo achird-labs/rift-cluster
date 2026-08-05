@@ -1,3 +1,4 @@
+import { Fragment } from "react";
 import type { ReactNode } from "react";
 
 import { ApiError } from "../api/client.ts";
@@ -159,7 +160,11 @@ function MemberValue({
     case "last_applied":
       return <Ident>{view.lastApplied ?? UNKNOWN}</Ident>;
     case "voters":
-      return <Ident>{view.voters.join(", ")}</Ident>;
+      return (
+        <Ident>
+          <IdList ids={view.voters} />
+        </Ident>
+      );
     case "is_leader":
       return view.isLeader ? (
         <Status tone="ok" label="this node is the leader" />
@@ -167,6 +172,31 @@ function MemberValue({
         <Status tone="idle" label="follower" />
       );
   }
+}
+
+/**
+ * A comma-separated list of node ids that never breaks *inside* an id.
+ *
+ * `ids.join(", ")` produces a single text node, so the browser wraps it wherever it happens to fit
+ * — and a raft node id is a 19-digit number, so on a narrow tile that lands mid-digit. The reader
+ * then sees `334214098283493100` on one line and `0` on the next, which is not a hard-to-read id:
+ * it is two plausible ids that do not exist. This is the one value on the screen where a line break
+ * changes what it says.
+ *
+ * Each id therefore gets its own `nowrap` element and the separator stays outside it, so a wrap can
+ * still happen between ids — which is what keeps a three-voter list from overflowing its tile.
+ */
+function IdList({ ids }: { ids: readonly (string | number)[] }): ReactNode {
+  return (
+    <>
+      {ids.map((id, index) => (
+        <Fragment key={String(id)}>
+          {index === 0 ? null : ", "}
+          <span className="nobreak">{id}</span>
+        </Fragment>
+      ))}
+    </>
+  );
 }
 
 function HealthValue({
@@ -182,14 +212,16 @@ function HealthValue({
     case "ring":
       return (
         <Ident>
-          epoch {view.ringEpoch} · {view.ringMembers.join(", ")}
+          epoch {view.ringEpoch} · <IdList ids={view.ringMembers} />
         </Ident>
       );
     case "pending_gates":
       return view.pendingGates.length === 0 ? (
         <span className="muted">none</span>
       ) : (
-        <Ident>{view.pendingGates.join(", ")}</Ident>
+        <Ident>
+          <IdList ids={view.pendingGates} />
+        </Ident>
       );
     case "isolated":
       return view.isolated ? (

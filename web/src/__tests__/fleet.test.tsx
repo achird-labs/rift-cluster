@@ -31,6 +31,69 @@ describe("cluster screen against a 3-node fleet", () => {
     expect(screen.getByTestId("fleet-applied").textContent).toContain("412");
   });
 
+  describe("node ids are never split across a line break", () => {
+    /*
+     * A raft node id is a 19-digit number. Joined into one text node, a comma-separated list of them
+     * wraps wherever it happens to fit — mid-digit on a narrow tile — and the reader sees
+     * `334214098283493100` above `0`: two plausible ids that do not exist. This is the one value on
+     * the screen where a line break changes what it *says*, not just how it looks.
+     *
+     * jsdom computes no layout, so the wrap itself is not observable here. What is observable is the
+     * mechanism that permits it: whether each id is its own unbreakable element, or one run of text.
+     */
+    const REALISTIC = {
+      "/_fleet/members": {
+        json: {
+          node_id: 3481475601826307600,
+          is_leader: true,
+          current_leader: 3481475601826307600,
+          last_applied: 30,
+          voters: [3342140982834931000, 3481475601826307600, 17445687154000630000],
+        },
+      },
+      "/_fleet/health": {
+        json: {
+          ready: true,
+          state: "ready",
+          pending_gates: [],
+          isolated: false,
+          ring: { m_idx: 7, members: [3342140982834931000, 3481475601826307600, 17445687154000630000] },
+        },
+      },
+    };
+
+    it("gives every voter its own unbreakable element", async () => {
+      stubFetch(REALISTIC);
+      renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+
+      const cell = await screen.findByTestId("fleet-voters");
+      expect(cell.querySelectorAll(".nobreak")).toHaveLength(3);
+    });
+
+    it("gives every ring member its own unbreakable element", async () => {
+      stubFetch(REALISTIC);
+      renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+
+      const cell = await screen.findByTestId("fleet-ring-epoch");
+      expect(cell.querySelectorAll(".nobreak")).toHaveLength(3);
+      // The epoch is prose around the list, not a member — it must not be wrapped as an id.
+      expect(cell.textContent).toContain("epoch 7");
+    });
+
+    it("still separates them with a comma a line may break at", async () => {
+      // The separators stay OUTSIDE the unbreakable spans on purpose: a list that cannot break at
+      // all overflows its tile instead, which trades one rendering bug for another.
+      stubFetch(REALISTIC);
+      renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+
+      const cell = await screen.findByTestId("fleet-voters");
+      expect(cell.textContent).toContain("3342140982834931000, 3481475601826307600");
+      for (const span of cell.querySelectorAll(".nobreak")) {
+        expect(span.textContent).not.toContain(",");
+      }
+    });
+  });
+
   it("labels the reading as this node's own view, never the fleet's", async () => {
     // `/_fleet/*` is one node answering about itself; presenting it as the fleet's state is the
     // vacuous-test equivalent the issue calls out.

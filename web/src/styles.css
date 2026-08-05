@@ -143,6 +143,19 @@ code,
   font-variant-numeric: tabular-nums;
 }
 
+/*
+ * A value that must never be split across lines.
+ *
+ * For raft node ids specifically: they are 19-digit numbers, and a comma-separated list of them
+ * joined into one text node wraps wherever it happens to fit — mid-digit on a narrow tile. The
+ * result reads as two plausible ids that do not exist, so the break changes what the value says
+ * rather than merely how it looks. Applied per id, with the separators left outside, so a list can
+ * still wrap between its entries instead of overflowing.
+ */
+.nobreak {
+  white-space: nowrap;
+}
+
 /* Section and field headings: the one place small-caps monospace is used as a label. */
 .eyebrow {
   font: 600 10px/1 var(--mono);
