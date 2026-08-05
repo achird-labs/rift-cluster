@@ -58,6 +58,9 @@ tempfile = "3"
 libc.workspace = true
 
 [dev-dependencies]
+# Round-trip and rejection invariants for the vector cursor token (#225): the codec is
+# pure logic over inputs no fixture enumerates, which is exactly what this is for.
+proptest.workspace = true
 # Streaming request bodies, to prove the body cap holds without a declared length.
 futures-lite = "2"
 # Captures `tracing` output so the journal's warn-once-per-fill-up guard is testable.

@@ -2652,6 +2652,7 @@ dependencies = [
  "openraft",
  "parking_lot",
  "prometheus",
+ "proptest",
  "rand 0.8.6",
  "redb",
  "reqwest",

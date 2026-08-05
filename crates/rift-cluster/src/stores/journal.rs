@@ -1100,6 +1100,111 @@ mod tests {
 
     // ---- AC2: the merge key and the watermark ----------------------------------------
 
+    // ---- Vector cursors (issue #225) --------------------------------------------------
+    //
+    // A scalar cursor cannot address a multi-writer merge: "index 500" names a position in
+    // whose shard? The token carries a position per shard plus the clear generation it was
+    // issued under, so a walk is gapless and duplicate-free *per shard* across membership
+    // changes and clears alike.
+
+    #[test]
+    fn a_cursor_round_trips_through_its_token() {
+        let cursor = JournalCursor {
+            gen: 7,
+            pos: [(1u64, 10u64), (2, 0), (9, u64::MAX)].into_iter().collect(),
+        };
+        let token = cursor.encode();
+        assert_eq!(
+            JournalCursor::decode(&token).expect("round trip"),
+            cursor,
+            "a token must decode to exactly the cursor that issued it"
+        );
+    }
+
+    #[test]
+    fn a_token_is_opaque_and_url_safe() {
+        // Opaque is a contract, not an aesthetic: clients must not parse it, and it travels in a
+        // query string and an SSE `id:` line, so it cannot carry `+`, `/` or `=`.
+        let token = JournalCursor {
+            gen: u64::MAX,
+            pos: [(u64::MAX, u64::MAX)].into_iter().collect(),
+        }
+        .encode();
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "token must be unpadded base64url: {token}"
+        );
+        assert!(
+            !token.contains(char::is_whitespace),
+            "a token with whitespace would not survive an SSE id: line"
+        );
+    }
+
+    #[test]
+    fn an_empty_cursor_round_trips() {
+        // The first read of a port issues a cursor with no shard positions at all.
+        let empty = JournalCursor {
+            gen: 0,
+            pos: BTreeMap::new(),
+        };
+        assert_eq!(JournalCursor::decode(&empty.encode()).expect("round trip"), empty);
+    }
+
+    #[test]
+    fn a_malformed_token_is_rejected_rather_than_defaulted() {
+        // Defaulting a bad cursor to "start from 0" would silently replay the whole journal;
+        // defaulting it to "current" would silently skip entries. Both are worse than a 400.
+        for bad in [
+            "not base64!!",
+            "",
+            "Zm9v",                       // valid base64url, not our JSON
+            "eyJ2Ijo5OTksImdlbiI6MCwicG9zIjp7fX0", // well-formed but version 999
+        ] {
+            assert!(
+                JournalCursor::decode(bad).is_err(),
+                "must reject {bad:?} rather than silently choosing a position"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_scalar_cursor_is_read_as_this_nodes_position() {
+        // Any bare u64 a client holds predates the merged read (which has issued no cursor at
+        // all until now), so it can only have come from a proxied per-node read of THIS node.
+        let cursor = JournalCursor::decode_or_legacy("42", 7).expect("a scalar is accepted");
+        assert_eq!(cursor.pos.get(&7).copied(), Some(42));
+        assert_eq!(
+            cursor.pos.len(),
+            1,
+            "every other shard starts at 0 — the client has provably seen none of them"
+        );
+        assert_eq!(cursor.gen, 0, "a legacy cursor predates clear generations");
+    }
+
+    #[test]
+    fn decode_or_legacy_still_rejects_what_is_neither() {
+        assert!(JournalCursor::decode_or_legacy("-1", 7).is_err());
+        assert!(JournalCursor::decode_or_legacy("not base64!!", 7).is_err());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn any_cursor_survives_a_round_trip(
+            generation in proptest::prelude::any::<u64>(),
+            pairs in proptest::collection::vec(
+                (proptest::prelude::any::<u64>(), proptest::prelude::any::<u64>()),
+                0..8,
+            ),
+        ) {
+            let cursor = JournalCursor { gen: generation, pos: pairs.into_iter().collect() };
+            let decoded = JournalCursor::decode(&cursor.encode())
+                .expect("an encoded cursor always decodes");
+            proptest::prop_assert_eq!(decoded, cursor);
+        }
+    }
+
     #[test]
     fn every_entry_carries_the_merge_key() {
         let j = bound(3, 7);
