@@ -63,16 +63,26 @@ pub struct MergeOutcome {
 /// any order is admissible and the only thing that matters — that every node picks the *same* one
 /// — still holds. Parsing to an instant would buy nothing and cost a dependency on every read.
 ///
-/// Three filters run before the sort, each with a convergence reason:
+/// Four filters run before the sort, each with a convergence reason:
 /// - **dedup on `(node_id, seq, clear_gen)`** — the same entry reaches a reader twice (own shard
 ///   and a replica) and must appear once;
 /// - **eviction floor** — an entry is dropped when its *originating* node has evicted through its
 ///   seq, using the highest watermark any slice reports for that node. A replica that has not yet
 ///   learned of an eviction would otherwise keep resurrecting entries the origin has dropped, and
 ///   the two nodes would disagree about the visible set forever;
-/// - **clear generation** — an entry stamped with a generation older than the port's current one
-///   is cleared. Pinned to 0 everywhere until #224 bumps it, so this is a no-op today; it is
-///   honoured from day one so #224 is a producer change rather than a reader change.
+/// - **port clear generation** — an entry stamped with a `clear_gen` older than the port's
+///   current one (the highest any slice reports) is dropped;
+/// - **space clear generation** — independently, an entry is dropped when its `space_gen` is
+///   older than the highest generation any slice reports for that entry's `flow_id`. Built as a
+///   fleet-wide `HashMap<space, max generation>` rather than compared per-slice: a generation
+///   known to only one peer must still clear every other peer's entries for that space (#224),
+///   the same reason the port threshold above is a fleet-wide max rather than a per-slice one.
+///
+/// The two generations are independent components, not one collapsed stamp, and the port one
+/// always wins: it is checked first and short-circuits, so a port-wide clear drops an entry
+/// even when that entry's `space_gen` is numerically higher than the space threshold (an
+/// earlier scoped teardown of the same space, before the wider clear). Folding them into a
+/// single `max(port_gen, space_gen)` stamp would defeat exactly that case.
 #[must_use]
 pub(crate) fn merge_shards(slices: &[ShardSlice], partial: bool) -> MergeOutcome {
     // The port's live generation is the highest any shard reports. #224 raises it through the
@@ -83,11 +93,30 @@ pub(crate) fn merge_shards(slices: &[ShardSlice], partial: bool) -> MergeOutcome
         .max()
         .unwrap_or(0);
 
+    // Same idea, per space: the generation a merge honours for `flow_id` is the highest any
+    // slice reports for it, not just what the entry's own origin has learned.
+    let mut space_gen_floor: HashMap<&str, u64> = HashMap::new();
+    for slice in slices {
+        for (space, generation) in &slice.read.space_gens {
+            space_gen_floor
+                .entry(space.as_str())
+                .and_modify(|floor| *floor = (*floor).max(*generation))
+                .or_insert(*generation);
+        }
+    }
+
     let mut entries: Vec<ShardEntry> = Vec::new();
     let mut seen: std::collections::HashSet<(NodeId, u64, u64)> = std::collections::HashSet::new();
     for slice in slices {
         for entry in &slice.read.entries {
             if entry.clear_gen < current_gen {
+                continue;
+            }
+            let space_floor = space_gen_floor
+                .get(entry.flow_id.as_str())
+                .copied()
+                .unwrap_or(0);
+            if entry.space_gen < space_floor {
                 continue;
             }
             if entry.seq <= evicted_through(slices, entry.node_id) {
@@ -163,6 +192,7 @@ pub(crate) struct SinceReply {
     pub entries: Vec<WireEntry>,
     pub evicted_below_seq: u64,
     pub clear_gen: u64,
+    pub space_gens: Vec<(String, u64)>,
     pub count_slot: u64,
 }
 
@@ -179,14 +209,6 @@ pub(crate) struct CountsReply {
     pub slots: Vec<(u16, u64)>,
 }
 
-/// `POST /_cluster/journal/clear` — issue #223's transitional `DELETE savedRequests` fan-out: drop
-/// this node's own shard of `port` (see [`JournalNet::clear_peers`]'s doc for the whole mechanism,
-/// and why it is explicitly a placeholder for #224).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ClearReq {
-    pub port: u16,
-}
-
 /// A [`ShardEntry`] as it crosses the wire.
 ///
 /// A distinct type rather than serde derives on `ShardEntry` itself: the in-memory entry carries
@@ -198,6 +220,7 @@ pub(crate) struct WireEntry {
     pub node_id: NodeId,
     pub seq: u64,
     pub clear_gen: u64,
+    pub space_gen: u64,
     pub flow_id: String,
     pub request: rift_cluster_base::seams::RecordedRequest,
 }
@@ -208,7 +231,6 @@ pub(crate) struct WireEntry {
 
 const SINCE_PATH: &str = "/_cluster/journal/since";
 const COUNTS_PATH: &str = "/_cluster/journal/counts";
-const CLEAR_PATH: &str = "/_cluster/journal/clear";
 
 /// How often a node pulls every roster peer's journal shard into its replica
 /// cache. Mirrors `FlowNet`'s cadence (#126): a missed push (there is no push
@@ -317,6 +339,7 @@ impl JournalNet {
             entries: Vec::new(),
             evicted_below_seq: 0,
             clear_gen: 0,
+            space_gens: Vec::new(),
             count_slot: 0,
         });
 
@@ -334,6 +357,7 @@ impl JournalNet {
 
         cached.evicted_below_seq = reply.evicted_below_seq;
         cached.clear_gen = reply.clear_gen;
+        cached.space_gens = reply.space_gens;
         cached.count_slot = reply.count_slot;
 
         // Drop everything the watermark just adopted already covers — resurrecting it would
@@ -727,96 +751,6 @@ impl JournalNet {
         }
         (totals(&per_port), partial)
     }
-
-    /// `DELETE savedRequests`'s fan-out half (issue #223 item 4): tell every other roster voter to
-    /// drop its own shard of `port`, best-effort. The caller owns the *local* clear — the front
-    /// reuses its existing proxy to the local engine for that, since #222 made that engine's
-    /// journal this same `ClusterJournal` — this only reaches the others.
-    ///
-    /// **Explicitly transitional.** #224 replaces this whole mechanism with a Raft-committed clear
-    /// that bumps `clear_gen` (the field `merge_shards` already honours, pinned at 0 until then) so
-    /// a clear converges by consensus instead of a best-effort broadcast a partitioned peer can
-    /// simply miss forever. Two simplifications fall out of that and stay until #224 lands: a peer
-    /// missed by the fan-out keeps the deleted entries in its own local shard and in this node's
-    /// replica cache of it (which is exactly what the caller's `Rift-Cluster-Partial` reports), and
-    /// the wire clear is unconditionally a *full* clear — the `?match=` narrowing a local clear
-    /// honours is not propagated, because there is nowhere on this wire to carry a match predicate.
-    ///
-    /// Returns whether any peer was unreachable or missed `budget`.
-    ///
-    /// Failure handling mirrors [`Self::pull_since_budgeted`] (issue #223 review, B5): a peer
-    /// that did not confirm is logged at `warn` with the real error and counted by
-    /// [`crate::metrics::journal_peer_pull_failure`] rather than silently folded into `partial`,
-    /// and the budget-expiry sweep counts a peer whose confirmation was still outstanding when
-    /// `budget` ran out the same way.
-    #[must_use]
-    pub async fn clear_peers(&self, port: u16, budget: Duration) -> bool {
-        let Some(node) = self.node() else {
-            return false;
-        };
-        let peers: Vec<NodeId> = node
-            .ring()
-            .members()
-            .iter()
-            .copied()
-            .filter(|&id| id != node.id())
-            .collect();
-        if peers.is_empty() {
-            return false;
-        }
-
-        let mut set = tokio::task::JoinSet::new();
-        for peer in peers.iter().copied() {
-            let node = Arc::clone(&node);
-            set.spawn(async move {
-                let outcome = async {
-                    let body = serde_json::to_vec(&ClearReq { port }).map_err(|e| e.to_string())?;
-                    node.call_member(peer, "POST", CLEAR_PATH, body)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    Ok::<(), String>(())
-                }
-                .await;
-                (peer, outcome)
-            });
-        }
-
-        let mut partial = false;
-        let mut answered: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-        let drained = tokio::time::timeout(budget, async {
-            while let Some(joined) = set.join_next().await {
-                match joined {
-                    Ok((peer, Ok(()))) => {
-                        answered.insert(peer);
-                        // Best-effort mirror of the fresh state: this peer's entries are gone, so
-                        // this node's cache of it should stop claiming otherwise rather than wait
-                        // out a full anti-entropy interval to notice independently.
-                        self.replicas.write().remove(&(peer, port));
-                    }
-                    Ok((peer, Err(e))) => {
-                        answered.insert(peer);
-                        tracing::warn!(peer, port, error = %e, "journal clear fan-out: peer did not confirm");
-                        crate::metrics::journal_peer_pull_failure(&peer.to_string());
-                        partial = true;
-                    }
-                    Err(e) => {
-                        tracing::warn!(port, error = %e, "journal clear fan-out: peer task panicked");
-                        partial = true;
-                    }
-                }
-            }
-        })
-        .await;
-        if drained.is_err() {
-            partial = true;
-            set.abort_all();
-            for &peer in peers.iter().filter(|peer| !answered.contains(peer)) {
-                tracing::warn!(peer, port, "journal clear fan-out: peer lost to budget");
-                crate::metrics::journal_peer_pull_failure(&peer.to_string());
-            }
-        }
-        partial
-    }
 }
 
 /// Start the anti-entropy loop on `handle`. Holds only a `Weak<JournalNet>` —
@@ -843,6 +777,7 @@ fn to_wire(entry: &ShardEntry) -> WireEntry {
         node_id: entry.node_id,
         seq: entry.seq,
         clear_gen: entry.clear_gen,
+        space_gen: entry.space_gen,
         flow_id: entry.flow_id.clone(),
         request: entry.request.clone(),
     }
@@ -857,19 +792,19 @@ fn from_wire(entry: WireEntry) -> ShardEntry {
         node_id: entry.node_id,
         seq: entry.seq,
         clear_gen: entry.clear_gen,
+        space_gen: entry.space_gen,
         flow_id: entry.flow_id,
         request: entry.request,
         recorded_at_millis: 0,
     }
 }
 
-/// The wire surface: three POST routes on the cluster port, matching
+/// The wire surface: two POST routes on the cluster port, matching
 /// [`super::flow::flow_routes`]'s shape.
 #[must_use]
 pub fn journal_routes(net: Arc<JournalNet>) -> Router {
     let since_net = Arc::clone(&net);
-    let counts_net = Arc::clone(&net);
-    let clear_net = net;
+    let counts_net = net;
 
     Router::new()
         .route(
@@ -889,6 +824,7 @@ pub fn journal_routes(net: Arc<JournalNet>) -> Router {
                         entries: read.entries.iter().map(to_wire).collect(),
                         evicted_below_seq: read.evicted_below_seq,
                         clear_gen: read.clear_gen,
+                        space_gens: read.space_gens,
                         count_slot: read.count_slot,
                     };
                     serde_json::to_vec(&reply).map_err(|e| RpcError::Handler(e.to_string()))
@@ -915,41 +851,6 @@ pub fn journal_routes(net: Arc<JournalNet>) -> Router {
                         .collect();
                     serde_json::to_vec(&CountsReply { slots })
                         .map_err(|e| RpcError::Handler(e.to_string()))
-                })
-            }),
-        )
-        .route(
-            "POST",
-            CLEAR_PATH,
-            Arc::new(move |body: Vec<u8>| -> HandlerFuture {
-                let net = Arc::clone(&clear_net);
-                Box::pin(async move {
-                    let req: ClearReq = serde_json::from_slice(&body)
-                        .map_err(|e| RpcError::Handler(format!("journal/clear decode: {e}")))?;
-                    // `RequestJournal::clear`, the same trait method upstream's own `DELETE
-                    // savedRequests` handler calls locally — this route just lets a peer trigger it
-                    // remotely, transitionally, until #224 replaces the whole mechanism.
-                    net.journal
-                        .clear(req.port)
-                        .map_err(|e| RpcError::Handler(e.to_string()))?;
-                    // Half of the fix is not enough (issue #223 review, B2): `ClusterJournal::clear`
-                    // only empties *this* node's own writer shard of `port` — it leaves `seq` and
-                    // `evicted_below_seq` untouched, so it advances no watermark `merge_shards`'
-                    // eviction filter could use to drop a replica's pre-clear copy. Left alone, this
-                    // node's own `replicas` cache of every *other* peer's shard of `port` — populated
-                    // by earlier anti-entropy pulls — would keep resurrecting entries those peers are
-                    // clearing for the identical reason, forever, with no `Rift-Cluster-Partial` to
-                    // show for it (every peer "succeeded"). The initiator already forgets a
-                    // successfully-cleared peer's cache entry in `clear_peers`; this is that same
-                    // forgetting on the *receiving* side, for every peer this node has cached, not
-                    // just the initiator — the fan-out reaches every fleet member for the same clear,
-                    // so whichever node a cached copy belonged to is clearing its own shard for the
-                    // same reason, and the next anti-entropy tick refreshes with the post-clear
-                    // (empty) truth rather than the stale one this drops.
-                    net.replicas
-                        .write()
-                        .retain(|(_, cached_port), _| *cached_port != req.port);
-                    Ok(Vec::new())
                 })
             }),
         )
@@ -1352,6 +1253,7 @@ mod tests {
             node_id: 2,
             seq: 9,
             clear_gen: 0,
+            space_gen: 0,
             flow_id: "f".into(),
             request: req_at("2026-01-01T00:00:00Z", "/x"),
         };
