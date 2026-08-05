@@ -4380,9 +4380,14 @@ components:
       required: [nodeId, pollErrors]
       properties:
         nodeId:
-          type: integer
-          format: int64
-          description: The cluster node that answered this request.
+          type: string
+          description: >
+            The cluster node that answered this request. A **string**, not an
+            integer, for the same reason as `FleetMembers.node_id`: a raft id
+            is a `u64`, JSON numbers are IEEE-754 doubles wherever the reader
+            is JavaScript, and every id above 2^53-1 is silently rounded on
+            the way in. This endpoint was missed when the fleet projections
+            were fixed, and went on reporting a node that does not exist.
         pollErrors:
           type: object
           additionalProperties:
