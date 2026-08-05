@@ -87,7 +87,7 @@ use rift_cluster_base::seams::{
     ScriptBaseDir, Stub, classify as classify_upstream, config_uses_script_surface,
     error_response_typed, resolve_scripts, resolve_stub_scripts, validate_stub, validate_stubs,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -448,6 +448,25 @@ pub(crate) enum Terminated {
     /// `ClearSavedRequests` commit above. Not routed through `build_mutation` — there is no
     /// loopback path to `FetchAfter`/`Captured` render from; the response is the proxy's own.
     SpaceTeardown(u16, String),
+    /// `POST /admin/imposters/{port}/try` (issue #335): send a sample request to this imposter and
+    /// hand back what it answered, so an operator can tell whether a stub matches without leaving
+    /// the console.
+    ///
+    /// Terminates here because there is nothing to proxy to — no upstream route serves this, and
+    /// the imposter is reached as a *client* rather than as an admin API. It is also the one
+    /// endpoint on this front that makes the **server originate outbound HTTP on a caller's
+    /// behalf**, so its containment is structural rather than configurable:
+    ///
+    /// - the route names a **port, never a URL or host** — the host is hardcoded loopback, so
+    ///   there is no parameter through which a caller could aim it elsewhere;
+    /// - the port must be one of the caller's own tenant's imposters, which
+    ///   [`addressed_port`] delegates to the ownership gate in [`authorize_action`] — so an
+    ///   unknown port and another tenant's port answer the identical RFC-002 §8.4 `404` and this
+    ///   cannot be used to map which ports exist;
+    /// - the scheme comes from the imposter's own configured `protocol`, not from the caller;
+    /// - redirects are **never** followed ([`try_client`]), because following one is the only way
+    ///   the exchange could leave the loopback port the two rules above pinned it to.
+    TryImposter(u16),
     /// Whole-table replace of the front door's route table (issue #131).
     /// There is no upstream `/front-door/routes` to proxy to (U-11's admin
     /// CRUD was deferred), so this is provided here, not there.
@@ -519,7 +538,12 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::ReadSavedRequests(port)
         | Terminated::ClearSavedRequests(port)
         | Terminated::ClearSavedProxyResponses(port)
-        | Terminated::SpaceTeardown(port, _) => Some(*port),
+        | Terminated::SpaceTeardown(port, _)
+        // Issue #335: this is not merely *a* tenant check for the try endpoint, it is the **only**
+        // one. Returning the port here is what makes an unknown port and another tenant's port
+        // answer the same §8.4 404 — and what stops the endpoint dialling a port the caller does
+        // not own. A handler-local re-check would be a second copy of this rule, free to drift.
+        | Terminated::TryImposter(port) => Some(*port),
         Terminated::Create
         | Terminated::ReplaceAllImposters
         | Terminated::DeleteAllImposters
@@ -558,6 +582,7 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::ClearSavedRequests(_)
         | Terminated::ClearSavedProxyResponses(_)
         | Terminated::SpaceTeardown(_, _)
+        | Terminated::TryImposter(_)
         | Terminated::PutRoutes
         | Terminated::DeleteRoute(_)
         // Resource routes: the id names a record *within* the caller's
@@ -684,6 +709,18 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
         if let [port_str, "requests" | "savedRequests"] = segments.as_slice() {
             let port: u16 = port_str.parse().ok()?;
             return terminated_saved_requests(method, query, port);
+        }
+        // `POST /admin/imposters/{port}/try` (issue #335). Deliberately only under the `/admin/`
+        // prefix and not the canonical `/imposters/` one: the canonical prefix is Mountebank's
+        // published imposter surface, where `{port}/try` would read as a resource upstream might
+        // one day define, while `/admin/imposters/` is already this front's own EE-only namespace
+        // (flow-state, and the savedRequests alias above).
+        if let [port_str, "try"] = segments.as_slice() {
+            if *method != Method::POST {
+                return None;
+            }
+            let port: u16 = port_str.parse().ok()?;
+            return Some(Terminated::TryImposter(port));
         }
     }
     let rest = path.strip_prefix("/imposters/")?;
@@ -812,6 +849,12 @@ fn action_for(kind: &Terminated) -> Action {
         // this terminated): a space teardown is the Operator-tier "disturb" sibling of
         // `FlowStateClear`, distinguished by the canonical (non-`/admin/imposters/`) prefix.
         Terminated::SpaceTeardown(_, _) => Action::SpaceTeardown,
+        // Issue #335. Not `ImposterRead`, despite the caller only wanting to look: a try is a
+        // write in *effect* — it advances scenario state, appends to the request log and can
+        // trigger proxyOnce recording — which is the Operator-tier "disturb" shape. See
+        // `Action::ImposterTry`'s own doc for why it is a distinct variant rather than a ride on
+        // an existing one.
+        Terminated::TryImposter(_) => Action::ImposterTry,
         // The front-door route table (issue #131) predates RFC-002 and has no
         // action of its own in its closed §4.1 list. Treated as an ordinary
         // imposter-tier config write pending a dedicated action.
@@ -2239,6 +2282,11 @@ async fn terminate(
             )
             .await;
         }
+        // A try commits nothing — its whole result is what the imposter answered — so it returns
+        // here for the same reason the source surface does.
+        Terminated::TryImposter(port) => {
+            return terminate_try_imposter(&node, req, port, &tenant).await;
+        }
         // A merge-on-read has nothing to commit, so it returns here for the same reason the
         // source surface does — none of the `If-Match`/`_rift.script`/loopback-render machinery
         // below applies.
@@ -3130,6 +3178,460 @@ fn source_write_error(e: PullError) -> Response<FrontBody> {
     }
 }
 
+/// Total budget for one try exchange (issue #335) — connect, send, and read the response.
+///
+/// A fixed constant rather than a knob. A stub whose `wait` behaviour deliberately exceeds this is
+/// curl's job: making the budget configurable would turn a diagnosis affordance into a way to pin
+/// an admin worker open for as long as the caller likes.
+const TRY_BUDGET: Duration = Duration::from_secs(10);
+
+/// Most of an imposter's response body a try reads back (issue #335).
+///
+/// This is a diagnosis surface, not a transfer surface — past a megabyte nobody is reading the
+/// body to find out whether a stub matched. Exceeding it sets `truncated` rather than failing:
+/// a cut answer still answers the question that was asked.
+const TRY_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// One header of a try request or response.
+///
+/// A list of these rather than a map, in both directions: HTTP permits a repeated header name, a
+/// mock exists to reproduce exactly what a system under test sends and receives, and a map would
+/// silently drop one of a repeated pair.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct TryHeader {
+    name: String,
+    value: String,
+}
+
+/// The sample request a caller wants sent (issue #335).
+///
+/// **Carries no host, scheme or port.** That is the containment, not an omission: the only
+/// addressing input is the `{port}` in the route, which [`addressed_port`] has already proven
+/// belongs to the caller's tenant, and the scheme comes from that imposter's own configured
+/// protocol. There is deliberately no field here through which a caller could aim the server
+/// somewhere else.
+///
+/// `deny_unknown_fields` because a misspelt `header`/`headers` would otherwise silently send a
+/// request without them and leave the operator reading a mismatch they did not cause.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TryRequest {
+    method: String,
+    path: String,
+    #[serde(default)]
+    headers: Vec<TryHeader>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// What the imposter answered (issue #335).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TryResponse {
+    status: u16,
+    headers: Vec<TryHeader>,
+    body: String,
+    /// `true` when the body was not valid UTF-8 and replacement characters were substituted.
+    /// Skipped when false so a client can tell "decoded cleanly" from "decoded with loss" without
+    /// having the bytes to compare.
+    #[serde(skip_serializing_if = "is_false")]
+    body_lossy: bool,
+    /// The same, for header *values*.
+    ///
+    /// Its own flag rather than folding into `body_lossy`, and not omitted on the grounds that
+    /// non-UTF-8 header values are rare: this is a mock server with fault injection, so serving
+    /// deliberately malformed header bytes is a thing an operator does **on purpose** — and the
+    /// header they garbled is exactly the one they are then staring at in the console. Silence
+    /// here would be the same defect `body_lossy` exists to prevent, in the place it is most
+    /// likely to be encountered deliberately.
+    #[serde(skip_serializing_if = "is_false")]
+    headers_lossy: bool,
+    /// `true` when the body hit [`TRY_MAX_RESPONSE_BYTES`] and what is reported is a prefix.
+    #[serde(skip_serializing_if = "is_false")]
+    truncated: bool,
+    elapsed_ms: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` hands us a reference.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Why a try produced no exchange at all.
+///
+/// Kept separate from the imposter's own answer on purpose: the imposter replying `502` and the
+/// endpoint being unable to reach it are different facts, and collapsing them would leave a
+/// console unable to say which of the two an operator is looking at.
+#[derive(Debug)]
+enum TryFailure {
+    /// [`TRY_BUDGET`] expired. Renders `504`.
+    Timeout,
+    /// The dial or the exchange failed. Renders `502`.
+    Unreachable(String),
+    /// The caller's own envelope was unusable — an invalid method token, a path that will not
+    /// form a URL. Renders `400`.
+    BadRequest(String),
+}
+
+/// The one client every try goes through.
+///
+/// Built once and shared, and every containment property this endpoint claims is a property of
+/// *this builder*:
+///
+/// - **`redirect::Policy::none()`** — following a redirect is the only way an exchange pinned to a
+///   loopback port could end up somewhere else, so it is structurally off rather than a
+///   configuration a future change could flip.
+/// - **`danger_accept_invalid_certs(true)`** — scoped to this client and nothing else. An https
+///   imposter serves a self-signed certificate; refusing it would make the endpoint useless for
+///   exactly the https stubs an operator needs to poke, and the connection never leaves the box.
+///   This client is only ever pointed at `127.0.0.1` on a port the caller's tenant owns, so there
+///   is no remote peer whose identity this could be failing to check.
+fn try_client() -> Result<&'static reqwest::Client, &'static str> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        // Borrowed rather than cloned, matching `openapi::contract`'s own cached-`Result` shape:
+        // the error lives as long as the `OnceLock`, so there is nothing to own.
+        .map_err(String::as_str)
+}
+
+/// Resolve the URL a try will actually dial, and **prove** it did not leave the imposter.
+///
+/// The caller supplies only a path, and [`terminate_try_imposter`] has already refused one that
+/// does not start with `/` — so concatenating cannot introduce an authority, because the authority
+/// in `base` is terminated by that very first slash. That is the argument. This function does not
+/// rest on it.
+///
+/// After parsing, the host and port are compared against `base`'s own, and a mismatch is refused.
+/// The reasoning above is about URL grammar, and URL grammar is exactly the kind of thing that is
+/// *nearly* always what you think it is: `//evil.com/`, a `\` some parsers fold to `/`, a `@` in
+/// the wrong place, or a future refactor to `Url::join` (which resolves `//evil.com/` as
+/// protocol-relative and **would** change the host) each turn a safe argument into an unsafe one
+/// without touching this line. The post-condition costs one comparison and converts "this cannot
+/// happen" into "this is checked".
+fn try_target(base: &str, path: &str) -> Result<reqwest::Url, TryFailure> {
+    let expected = reqwest::Url::parse(base)
+        .map_err(|e| TryFailure::Unreachable(format!("imposter base {base:?} is unusable: {e}")))?;
+    let url = reqwest::Url::parse(&format!("{base}{path}"))
+        .map_err(|e| TryFailure::BadRequest(format!("{path:?} is not a usable path: {e}")))?;
+    if url.host_str() != expected.host_str()
+        || url.port_or_known_default() != expected.port_or_known_default()
+        || url.scheme() != expected.scheme()
+    {
+        return Err(TryFailure::BadRequest(format!(
+            "{path:?} does not stay on the imposter: it resolves to {}, not {}",
+            url.origin().ascii_serialization(),
+            expected.origin().ascii_serialization()
+        )));
+    }
+    Ok(url)
+}
+
+/// Send `spec` to `base` and read back what came out.
+///
+/// Split from [`terminate_try_imposter`] so the exchange's own rules — the budget, the body cap,
+/// lossy decoding, and that a `3xx` comes back rather than being chased — are testable against a
+/// canned server in milliseconds, without standing up a cluster. `budget` and `cap` are parameters
+/// for that reason only; production passes [`TRY_BUDGET`] and [`TRY_MAX_RESPONSE_BYTES`].
+async fn perform_try(
+    client: &reqwest::Client,
+    base: &str,
+    spec: &TryRequest,
+    budget: Duration,
+    cap: usize,
+) -> Result<TryResponse, TryFailure> {
+    let method = reqwest::Method::from_bytes(spec.method.as_bytes()).map_err(|e| {
+        TryFailure::BadRequest(format!("{:?} is not an HTTP method: {e}", spec.method))
+    })?;
+    let url = try_target(base, &spec.path)?;
+    let mut request = client.request(method, url.clone());
+    for header in &spec.headers {
+        request = request.header(&header.name, &header.value);
+    }
+    if let Some(body) = &spec.body {
+        // Cloned because `spec` is borrowed: `perform_try` is called once per manual button press,
+        // so one copy of a hand-authored sample body is not worth taking the whole `TryRequest` by
+        // value and making every test site hand over ownership.
+        request = request.body(body.clone());
+    }
+
+    let started = std::time::Instant::now();
+    // One budget over the whole exchange — connect, send, *and* the body read below. A
+    // `Client::timeout` would not cover a peer that answers headers promptly and then dribbles the
+    // body, which is exactly the shape a `wait` behaviour produces.
+    let exchange = tokio::time::timeout(budget, async {
+        let response = client
+            .execute(request.build().map_err(|e| {
+                TryFailure::BadRequest(format!("{url:?} is not a usable request: {e}"))
+            })?)
+            .await
+            .map_err(|e| TryFailure::Unreachable(e.to_string()))?;
+
+        let status = response.status().as_u16();
+        let mut headers_lossy = false;
+        let headers: Vec<TryHeader> = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                // A header a mock chose to send in non-UTF-8 bytes is still worth reporting — the
+                // lossy rendering is the diagnosis and dropping the header would hide it — but the
+                // substitution is recorded so the console can say the bytes were not what it shows.
+                let value = String::from_utf8_lossy(value.as_bytes());
+                headers_lossy |= matches!(value, std::borrow::Cow::Owned(_));
+                TryHeader {
+                    name: name.as_str().to_owned(),
+                    value: value.into_owned(),
+                }
+            })
+            .collect();
+
+        // Read chunk by chunk and stop at the cap, rather than buffering the whole body and
+        // slicing it: `bytes()` on a multi-gigabyte response would hold all of it in the admin
+        // process before the cap ever applied.
+        let mut response = response;
+        let mut collected: Vec<u8> = Vec::new();
+        let mut truncated = false;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let room = cap.saturating_sub(collected.len());
+                    // `>`, not `>=`. A chunk that exactly fills the remaining room dropped
+                    // nothing, so it must not raise `truncated` — a body of exactly `cap` bytes is
+                    // complete, and reporting it as cut would send an operator looking for content
+                    // that was never missing. If more does follow, the next iteration sees
+                    // `room == 0` and flags it then, which is the moment loss actually happens.
+                    if chunk.len() > room {
+                        collected.extend_from_slice(&chunk[..room]);
+                        truncated = true;
+                        break;
+                    }
+                    collected.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => return Err(TryFailure::Unreachable(e.to_string())),
+            }
+        }
+
+        Ok((status, headers, headers_lossy, collected, truncated))
+    })
+    .await
+    .map_err(|_| TryFailure::Timeout)??;
+
+    let (status, headers, headers_lossy, collected, truncated) = exchange;
+    let body = String::from_utf8_lossy(&collected);
+    let body_lossy = matches!(body, std::borrow::Cow::Owned(_));
+    Ok(TryResponse {
+        status,
+        headers,
+        headers_lossy,
+        body: body.into_owned(),
+        body_lossy,
+        truncated,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
+/// Is this imposter's configured bind host one the try may reach on loopback (issue #335)?
+///
+/// An imposter may be pinned to a single interface (`{"port":4545,"host":"10.0.0.5"}`). Then
+/// `127.0.0.1:4545` is **not** that imposter — it is whatever else happens to be there, or
+/// nothing — so a try must refuse rather than dial.
+///
+/// The configured host is used as a *predicate*, never as the dial target. Reading it as an
+/// address would be strictly worse than the bug it fixes: `host` is caller-writable through
+/// `POST /imposters`, so dialling it would hand an Editor the arbitrary-URL parameter this
+/// endpoint's whole design exists to withhold. Loopback stays hardcoded; this only decides
+/// whether loopback is *right*.
+///
+/// An absent host means the imposter binds all interfaces, which includes loopback.
+fn imposter_is_on_loopback(config: &serde_json::Value) -> bool {
+    match config.get("host").and_then(serde_json::Value::as_str) {
+        None => true,
+        Some(host) => {
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+        }
+    }
+}
+
+/// Which scheme to dial an imposter on, read from its own stored config (issue #335).
+///
+/// The whole point is that this is derived, never supplied: [`TryRequest`] has no scheme field
+/// and refuses unknown ones, so a caller cannot talk the server into `https`-ing something that
+/// is not, nor into downgrading one that is.
+///
+/// Anything that is not `"https"` is `http`, including a config with no `protocol` at all.
+/// `control::validate` → `validate_replicable_config` (`rift-cluster/src/control.rs`) refuses any
+/// protocol outside `{http, https}` at the raft-apply gate, so this reads an already-validated
+/// value rather than re-validating one — and the fallback is to the *non-privileged* scheme, so a
+/// hypothetical write path that bypassed that gate would fail a handshake rather than silently
+/// present something as secure.
+fn scheme_for_config(config: &serde_json::Value) -> &'static str {
+    if config.get("protocol").and_then(serde_json::Value::as_str) == Some("https") {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+/// `POST /admin/imposters/{port}/try` (issue #335).
+///
+/// The tenant check is **not** here, and must not be added here: `addressed_port` routes this
+/// variant through the ownership gate in [`authorize_action`], so by the time this runs the port
+/// is known to be one of `tenant`'s imposters and an unknown or other-tenant port has already
+/// answered the fixed §8.4 `404`. A second copy of that rule in this function is a copy free to
+/// drift from the one every other port-addressed route is held to.
+async fn terminate_try_imposter(
+    node: &Arc<RaftNode>,
+    req: Request<Incoming>,
+    port: u16,
+    tenant: &TenantId,
+) -> Response<FrontBody> {
+    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        // `Limited`'s error covers a genuine I/O failure (a reset connection, a malformed chunked
+        // stream) as well as the size cap, so the underlying error is carried through rather than
+        // collapsed into a hardcoded "too large" that would be untrue for the other half — the
+        // same shape every other body-collect site on this front uses.
+        Err(e) => {
+            return typed_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorKind::RequestTooLarge,
+                &format!("admin request body refused: {e}"),
+            );
+        }
+    };
+    let spec: TryRequest = match parse(&body) {
+        Ok(spec) => spec,
+        Err(response) => return response,
+    };
+    if !spec.path.starts_with('/') {
+        return typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            "path must start with '/': this endpoint addresses an imposter by port, and an \
+             absolute-form target would be a way to name a different host",
+        );
+    }
+
+    // The scheme is the imposter's own, never the caller's. `get_imposter` is also what makes this
+    // safe to read at all: it is keyed by the authorized tenant, so it cannot reach a config the
+    // ownership gate would have refused.
+    let config = match node.get_imposter(tenant.as_str(), port) {
+        Ok(Some(config)) => match serde_json::from_str::<serde_json::Value>(&config) {
+            Ok(config) => config,
+            Err(e) => return internal(&format!("reading imposter {port}'s config: {e}")),
+        },
+        // The ownership gate already passed, so the config disappearing between there and here
+        // means it was deleted in between. That is a genuine not-found, and it renders through the
+        // same §8.4 body every other refusal on this port does.
+        Ok(None) => return tenant_boundary_not_found(),
+        Err(e) => return internal(&e.to_string()),
+    };
+    let scheme = scheme_for_config(&config);
+
+    // **The socket check, and it is load-bearing.** Everything above proves the caller's tenant
+    // owns the imposter *record* on this port. It does not prove that this node's engine is what
+    // is listening on `127.0.0.1:{port}` — and those two facts are decoupled on purpose: a
+    // `PutImposter` whose bind fails still commits and still reads back
+    // (`bind_failure_does_not_fail_apply`), because a bind failure must not wedge the replicated
+    // log.
+    //
+    // Without this gate that gap is an escalation, not an edge case. An Editor holds both
+    // `ImposterWrite` and `ImposterTry`, so they could create an imposter on a port already held
+    // by something else on this box — the metrics listener, the probe listener, the cluster RPC
+    // port — and then use the try to send a request of their choosing to it and read the reply.
+    // Every containment property this endpoint claims is downstream of "the thing on that socket
+    // is the imposter you own"; this is where that is actually established.
+    //
+    // The positive form (`is_locally_bound`) is required: `bind_failure(..).is_none()` is also
+    // true for a port this node serves nothing on, which is precisely the dangerous case.
+    //
+    // **Residual, stated rather than hidden.** This proves the engine holds *a* listener for the
+    // port, not that the listener answering `127.0.0.1:{port}` is that one. An imposter binds
+    // `0.0.0.0` by default, and BSD accepts that alongside an existing `127.0.0.1:{port}` socket —
+    // so on macOS a process holding the more specific address still wins the connection while
+    // `is_bound()` reports true. On Linux the colliding bind is refused and this gate catches it.
+    // Closing the BSD case properly means dialling the socket the engine actually owns, which
+    // needs an upstream accessor for an imposter's bound address that `rift-mock-core` does not
+    // expose today (`Imposter` tracks only `serve_handles`). Filed as a follow-up rather than
+    // approximated here — a heuristic that guessed would read as a guarantee.
+    if !node.is_locally_bound(port) || !imposter_is_on_loopback(&config) {
+        return typed_error(
+            StatusCode::BAD_GATEWAY,
+            ErrorKind::BackendUnavailable,
+            &format!(
+                "imposter {port} is not bound on this node's loopback interface, so nothing was \
+                 sent: a try only ever reaches an imposter this node is actually serving"
+            ),
+        );
+    }
+
+    let client = match try_client() {
+        Ok(client) => client,
+        Err(e) => return internal(&format!("building the try client: {e}")),
+    };
+    let base = format!("{scheme}://127.0.0.1:{port}");
+
+    render_try_outcome(
+        perform_try(client, &base, &spec, TRY_BUDGET, TRY_MAX_RESPONSE_BYTES).await,
+        port,
+    )
+}
+
+/// Turn a try's outcome into the response the caller sees.
+///
+/// Split from [`terminate_try_imposter`] so the **status mapping itself** is testable without a
+/// cluster. That mapping is the part of this endpoint most able to break silently: swapping
+/// `GATEWAY_TIMEOUT` and `BAD_GATEWAY` here compiles, and every test below the `TryFailure` level
+/// still passes, while a console starts telling operators their mock is unreachable when it was
+/// merely slow.
+///
+/// The split it encodes is the design's central one: the *imposter's* answer — including its own
+/// `4xx`/`5xx` — is a **successful try** and rides inside a `200`, while a failure of the endpoint
+/// to reach or complete the exchange is a `502`/`504`. Conflating the two would leave a client
+/// unable to tell "the mock said 502" from "the mock could not be reached".
+fn render_try_outcome(outcome: Result<TryResponse, TryFailure>, port: u16) -> Response<FrontBody> {
+    match outcome {
+        Ok(outcome) => match serde_json::to_vec(&outcome) {
+            Ok(rendered) => {
+                buffered_response(StatusCode::OK, Bytes::from(rendered), json_content_type())
+                    .unwrap_or_else(|response| response)
+            }
+            Err(e) => internal(&format!("rendering the try result: {e}")),
+        },
+        Err(TryFailure::Timeout) => typed_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            ErrorKind::Timeout,
+            &format!(
+                "the imposter did not answer within {}s",
+                TRY_BUDGET.as_secs()
+            ),
+        ),
+        Err(TryFailure::Unreachable(why)) => typed_error(
+            StatusCode::BAD_GATEWAY,
+            ErrorKind::BackendUnavailable,
+            &format!("could not reach the imposter on port {port}: {why}"),
+        ),
+        Err(TryFailure::BadRequest(why)) => {
+            typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &why)
+        }
+    }
+}
+
 /// Serve one RFC-002 §5 tenancy route (issue #162): read from local applied
 /// state, or commit one `ControlOp` and answer for it.
 ///
@@ -3724,6 +4226,12 @@ async fn build_mutation(
         // as the source writes and the tenancy surface above.
         Terminated::SpaceTeardown(_, _) => Err(internal(
             "space teardown is served by terminate_space_teardown, not build_mutation",
+        )),
+        // A try commits nothing — it is an outbound exchange whose whole result is the response
+        // body. Diverts to `terminate_try_imposter` in `terminate`, same shape as the source
+        // writes, the tenancy surface and the space teardown above.
+        Terminated::TryImposter(_) => Err(internal(
+            "a try is served by terminate_try_imposter, not build_mutation",
         )),
     }
 }
@@ -4631,6 +5139,53 @@ mod tests {
         }
     }
 
+    /// The try surface (issue #335): exactly `POST /admin/imposters/{port}/try`, and nothing
+    /// adjacent to it.
+    ///
+    /// The negative half carries the weight. This is the one route that makes the server dial
+    /// out, so every shape that is *not* it must fall through to the proxy rather than be
+    /// generously accepted — a classifier that also matched, say, the canonical `/imposters/`
+    /// prefix or a `GET` would widen a deliberately narrow capability by accident.
+    #[test]
+    fn classify_terminates_exactly_the_try_surface() {
+        assert!(matches!(
+            classify(&Method::POST, "/admin/imposters/4545/try", None),
+            Some(Terminated::TryImposter(4545))
+        ));
+        // A query string is not part of the match — the sample's own query rides in the body's
+        // `path`, so anything here is ignored rather than making the route miss.
+        assert!(matches!(
+            classify(&Method::POST, "/admin/imposters/4545/try", Some("x=1")),
+            Some(Terminated::TryImposter(4545))
+        ));
+
+        for (method, path) in [
+            // Read verbs do not try. A try mutates (scenario state, the request log, proxy
+            // recordings), so it is POST-only; anything else falls through.
+            (Method::GET, "/admin/imposters/4545/try"),
+            (Method::PUT, "/admin/imposters/4545/try"),
+            (Method::DELETE, "/admin/imposters/4545/try"),
+            // Not on the canonical Mountebank-published prefix — see `classify`'s own comment.
+            (Method::POST, "/imposters/4545/try"),
+            // A port that is not a port.
+            (Method::POST, "/admin/imposters/notaport/try"),
+            (Method::POST, "/admin/imposters/70000/try"),
+            (Method::POST, "/admin/imposters//try"),
+            // Neighbouring and deeper shapes.
+            (Method::POST, "/admin/imposters/4545/try/again"),
+            (Method::POST, "/admin/imposters/4545/tryout"),
+            (Method::POST, "/admin/imposters/4545"),
+        ] {
+            assert!(
+                !matches!(
+                    classify(&method, path, None),
+                    Some(Terminated::TryImposter(_))
+                ),
+                "{method} {path} must not classify as a try"
+            );
+        }
+    }
+
     /// The source inspection surface (issue #239): the two reads terminate,
     /// everything else on the path falls through to the proxy and answers
     /// upstream's own 404/405.
@@ -5361,6 +5916,675 @@ mod tests {
             let response =
                 parse_if_match(bad, None).expect_err(&format!("{bad:?} must be refused"));
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    /// Issue #335's exchange rules, against a canned server rather than a cluster.
+    ///
+    /// These are the properties that make the endpoint containable — the budget, the body cap,
+    /// and above all that a redirect is *returned* rather than chased — and every one of them is
+    /// a property of `perform_try` alone. Driving them through a real imposter would need a stub
+    /// per case, a `wait` behaviour that made the timeout test take ten real seconds, and no way
+    /// at all to serve deliberately invalid UTF-8.
+    mod try_exchange {
+        use super::*;
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// A server that accepts one connection, reads the request head, then writes `response`
+        /// verbatim. Yields the address and what the request looked like on the wire.
+        async fn canned(response: Vec<u8>) -> (SocketAddr, JoinHandle<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let handle = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                // Read until the head is complete. A body may follow; the tests that care about
+                // one send it in the same burst, so this sees it too.
+                loop {
+                    let n = socket.read(&mut buf).await.expect("read");
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket.write_all(&response).await.expect("write");
+                socket.flush().await.expect("flush");
+                String::from_utf8_lossy(&seen).into_owned()
+            });
+            (addr, handle)
+        }
+
+        fn head(status: &str, extra: &str, body_len: usize) -> String {
+            format!("HTTP/1.1 {status}\r\nContent-Length: {body_len}\r\n{extra}\r\n")
+        }
+
+        fn spec(method: &str, path: &str) -> TryRequest {
+            TryRequest {
+                method: method.to_owned(),
+                path: path.to_owned(),
+                headers: Vec::new(),
+                body: None,
+            }
+        }
+
+        /// **The production client, deliberately** — not a lookalike built here.
+        ///
+        /// The redirect policy is a property of `try_client`'s builder, so a test that
+        /// constructed its own `Policy::none()` client would prove only that *it* does not follow
+        /// redirects, while a change to the real builder sailed through green. Using the shipped
+        /// client is what makes `a_redirect_is_returned_not_followed` a gate on the containment
+        /// rather than on the test's own setup.
+        fn client() -> &'static reqwest::Client {
+            try_client().expect("the try client builds")
+        }
+
+        const CAP: usize = TRY_MAX_RESPONSE_BYTES;
+        const BUDGET: Duration = Duration::from_secs(5);
+
+        /// The containment property with the most weight behind it: a `3xx` comes back as data.
+        ///
+        /// Following it is the *only* way an exchange pinned to a loopback port by the route and
+        /// the ownership gate could end up talking to something else — a mock is free to answer
+        /// `Location: http://169.254.169.254/`, and a client that chased it would have turned a
+        /// "send a request to a mock you can already see" endpoint into a general-purpose SSRF.
+        #[tokio::test]
+        async fn a_redirect_is_returned_not_followed() {
+            let elsewhere = "http://169.254.169.254/latest/meta-data/";
+            let (addr, server) =
+                canned(head("302 Found", &format!("Location: {elsewhere}\r\n"), 0).into_bytes())
+                    .await;
+
+            let outcome = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/anything"),
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect("a redirect is an answer, not a failure");
+
+            assert_eq!(outcome.status, 302, "the redirect itself is the result");
+            let location = outcome
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("location"))
+                .expect("the Location header rides back to the caller");
+            assert_eq!(
+                location.value, elsewhere,
+                "the caller sees where it pointed; the server does not go there"
+            );
+            // The canned server serves exactly one connection, so a followed redirect would have
+            // had to dial a second host — this is what proves nothing was chased.
+            server.await.expect("the one and only exchange");
+        }
+
+        /// The imposter's own failure status is a *successful* try. Conflating it with the
+        /// endpoint's own `502` would leave a console unable to tell "the mock answered 502" from
+        /// "the mock could not be reached".
+        #[tokio::test]
+        async fn an_imposter_error_status_is_a_successful_try() {
+            let body = "{\"error\":\"deliberate\"}";
+            let (addr, _server) = canned(
+                format!("{}{body}", head("503 Service Unavailable", "", body.len())).into_bytes(),
+            )
+            .await;
+
+            let outcome = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/boom"),
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect("the exchange happened, so it succeeded");
+
+            assert_eq!(outcome.status, 503);
+            assert_eq!(outcome.body, body);
+            assert!(!outcome.truncated);
+            assert!(!outcome.body_lossy);
+        }
+
+        /// The cap cuts the body and says so. Silence here would be the worst outcome: an
+        /// operator comparing a truncated body against what they expected would read the cut as a
+        /// mismatch in the mock.
+        #[tokio::test]
+        async fn an_oversized_response_body_is_truncated_and_flagged() {
+            let cap = 1024;
+            let body = "x".repeat(cap * 3);
+            let (addr, _server) =
+                canned(format!("{}{body}", head("200 OK", "", body.len())).into_bytes()).await;
+
+            let outcome = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/big"),
+                BUDGET,
+                cap,
+            )
+            .await
+            .expect("a big body is still an answer");
+
+            assert!(outcome.truncated, "the cut must be declared");
+            assert_eq!(
+                outcome.body.len(),
+                cap,
+                "exactly the cap is kept, not the whole body"
+            );
+        }
+
+        /// A mock may serve bytes that are not text. Reporting them lossily is right — a base64
+        /// side-channel would complicate every client for a rare case — but doing so *silently*
+        /// would show an operator replacement characters the mock never sent.
+        #[tokio::test]
+        async fn a_non_utf8_body_is_flagged_lossy() {
+            let invalid = [0xffu8, 0xfe, 0xfd];
+            let mut response = head("200 OK", "", invalid.len()).into_bytes();
+            response.extend_from_slice(&invalid);
+            let (addr, _server) = canned(response).await;
+
+            let outcome = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/binary"),
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect("non-text is still an answer");
+
+            assert!(
+                outcome.body_lossy,
+                "replacement happened and the caller must be told"
+            );
+            assert!(outcome.body.contains('\u{fffd}'));
+        }
+
+        /// A clean body must *not* be flagged, or the flag means nothing.
+        #[tokio::test]
+        async fn a_clean_body_is_not_flagged_lossy_or_truncated() {
+            let body = "plain text";
+            let (addr, _server) =
+                canned(format!("{}{body}", head("200 OK", "", body.len())).into_bytes()).await;
+
+            let outcome = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/plain"),
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect("answered");
+
+            assert!(!outcome.body_lossy);
+            assert!(!outcome.truncated);
+            assert_eq!(outcome.body, body);
+        }
+
+        /// The budget covers a peer that answers its head promptly and then stalls — which is
+        /// exactly the shape a `wait` behaviour produces, and exactly what a `Client::timeout`
+        /// alone would not bound.
+        #[tokio::test]
+        async fn a_stalled_body_still_hits_the_budget() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let _server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                // A complete head promising a body, then nothing at all.
+                socket
+                    .write_all(head("200 OK", "", 1024).as_bytes())
+                    .await
+                    .expect("write head");
+                socket.flush().await.expect("flush");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+
+            let failure = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/slow"),
+                Duration::from_millis(150),
+                CAP,
+            )
+            .await
+            .expect_err("the budget must expire");
+
+            assert!(
+                matches!(failure, TryFailure::Timeout),
+                "a stall is a timeout (→504), not an unreachable peer (→502): {failure:?}"
+            );
+        }
+
+        /// A port nothing is listening on is the endpoint's own failure, not the imposter's — so
+        /// it must not arrive as a `200` carrying some invented status.
+        #[tokio::test]
+        async fn an_unreachable_port_is_a_failure_not_a_result() {
+            // Bind and drop: the port is real, freshly unused, and refuses immediately.
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            drop(listener);
+
+            let failure = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/nobody-home"),
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect_err("nothing answered");
+
+            assert!(
+                matches!(failure, TryFailure::Unreachable(_)),
+                "a refused dial is unreachable (→502), not a timeout (→504): {failure:?}"
+            );
+        }
+
+        /// The method, path, headers and body reach the imposter as the caller wrote them — the
+        /// endpoint is a conduit, and a stub that matches on any of them must see the real thing.
+        #[tokio::test]
+        async fn the_caller_s_own_request_is_what_arrives() {
+            let (addr, server) = canned(head("200 OK", "", 0).into_bytes()).await;
+
+            let outcome = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &TryRequest {
+                    method: "PATCH".to_owned(),
+                    path: "/orders/7?status=open".to_owned(),
+                    headers: vec![
+                        TryHeader {
+                            name: "X-Trace".to_owned(),
+                            value: "abc".to_owned(),
+                        },
+                        // A repeated name is why headers are a list, not a map.
+                        TryHeader {
+                            name: "X-Trace".to_owned(),
+                            value: "def".to_owned(),
+                        },
+                    ],
+                    body: Some("{\"qty\":2}".to_owned()),
+                },
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect("answered");
+            assert_eq!(outcome.status, 200);
+
+            let seen = server.await.expect("the server recorded the request");
+            assert!(
+                seen.starts_with("PATCH /orders/7?status=open "),
+                "method and target arrive verbatim, query included: {seen:?}"
+            );
+            assert!(seen.contains("x-trace: abc"), "{seen:?}");
+            assert!(
+                seen.contains("x-trace: def"),
+                "both values of a repeated header survive: {seen:?}"
+            );
+            assert!(seen.contains("{\"qty\":2}"), "{seen:?}");
+        }
+
+        /// An unusable method token is the caller's mistake (`400`), not the imposter's failure
+        /// (`502`) — and it must be caught before anything is dialled.
+        #[tokio::test]
+        async fn an_invalid_method_token_is_a_bad_request() {
+            let failure = perform_try(
+                client(),
+                "http://127.0.0.1:1",
+                &spec("GET SPACE", "/x"),
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect_err("not a method");
+
+            assert!(matches!(failure, TryFailure::BadRequest(_)), "{failure:?}");
+        }
+
+        /// **No path can steer the exchange off the imposter.**
+        ///
+        /// The route pins the host and port, and this is the only other caller-controlled input
+        /// that participates in building the URL — so if anything here could move the origin, the
+        /// whole containment argument collapses and the endpoint becomes a general-purpose SSRF
+        /// with an authorization check in front of it.
+        ///
+        /// Each of these is a real technique against naive URL assembly, not a hypothetical:
+        /// `//host` is protocol-relative and is exactly what `Url::join` would resolve away from
+        /// the base; `@` re-reads what precedes it as userinfo when it lands before the first
+        /// slash; `\` is folded to `/` by some parsers; a control character can attempt request
+        /// splitting. Every one must either stay on the loopback origin or be refused — never
+        /// silently retargeted.
+        #[test]
+        fn no_path_can_move_the_exchange_off_the_imposter() {
+            let base = "http://127.0.0.1:4545";
+            for hostile in [
+                "//evil.com/",
+                "//evil.com:80/x",
+                "/\\/evil.com/",
+                "/@evil.com/",
+                "/..//evil.com",
+                "/x?next=http://evil.com",
+                "/x#//evil.com",
+                "/\r\nHost: evil.com",
+                "/\u{0000}",
+                "/%2f%2fevil.com",
+                "/x\tHTTP/1.1",
+            ] {
+                match try_target(base, hostile) {
+                    Ok(url) => {
+                        assert_eq!(
+                            url.origin().ascii_serialization(),
+                            "http://127.0.0.1:4545",
+                            "{hostile:?} was accepted but left the imposter's origin"
+                        );
+                    }
+                    // Refusing is equally correct — what must not happen is a *different* origin
+                    // being dialled.
+                    Err(TryFailure::BadRequest(_)) => {}
+                    Err(other) => panic!("{hostile:?} failed for the wrong reason: {other:?}"),
+                }
+            }
+        }
+
+        /// The ordinary paths an operator actually sends still work — otherwise the check above
+        /// could be satisfied by refusing everything.
+        #[test]
+        fn an_ordinary_path_survives_the_origin_check() {
+            for good in ["/", "/orders", "/orders/7?status=open&q=a+b", "/a%20b"] {
+                let url = try_target("http://127.0.0.1:4545", good)
+                    .unwrap_or_else(|e| panic!("{good:?} must be usable: {e:?}"));
+                assert_eq!(url.origin().ascii_serialization(), "http://127.0.0.1:4545");
+            }
+            // And the https base keeps its scheme rather than being normalised to the http one.
+            let url = try_target("https://127.0.0.1:4545", "/x").expect("https base is usable");
+            assert_eq!(url.scheme(), "https");
+        }
+
+        /// The scheme is derived from the imposter's stored config and from nothing else.
+        ///
+        /// `TryRequest` has no scheme field and `deny_unknown_fields`, so this function is the
+        /// only input to the decision — which is what stops a caller downgrading an `https`
+        /// imposter or aiming `https` at a plain one.
+        #[test]
+        fn the_scheme_comes_from_the_imposters_own_protocol() {
+            let config = |raw: &str| serde_json::from_str::<serde_json::Value>(raw).expect("json");
+            assert_eq!(
+                scheme_for_config(&config(r#"{"port":4545,"protocol":"https"}"#)),
+                "https"
+            );
+            assert_eq!(
+                scheme_for_config(&config(r#"{"port":4545,"protocol":"http"}"#)),
+                "http"
+            );
+            // `control::validate` refuses anything outside http/https at write time, so a config
+            // reaching here without a usable protocol is not a case to guess about — it dials
+            // plain, which is what every imposter this fleet can actually hold is.
+            assert_eq!(scheme_for_config(&config(r#"{"port":4545}"#)), "http");
+        }
+
+        /// The configured bind host decides **whether loopback is the right target**, and is never
+        /// itself dialled.
+        ///
+        /// The distinction is the whole point: `host` is caller-writable through `POST /imposters`,
+        /// so treating it as an address would hand an Editor exactly the arbitrary-target
+        /// parameter this endpoint withholds. An imposter pinned to a real interface is refused,
+        /// not chased.
+        #[test]
+        fn only_a_loopback_bound_imposter_is_reachable_by_a_try() {
+            let config = |raw: &str| serde_json::from_str::<serde_json::Value>(raw).expect("json");
+            // Absent host = all interfaces, which includes loopback.
+            assert!(imposter_is_on_loopback(&config(r#"{"port":4545}"#)));
+            for ok in [
+                r#"{"host":"127.0.0.1"}"#,
+                r#"{"host":"localhost"}"#,
+                r#"{"host":"::1"}"#,
+                r#"{"host":"0.0.0.0"}"#,
+                r#"{"host":"127.0.0.5"}"#,
+            ] {
+                assert!(imposter_is_on_loopback(&config(ok)), "{ok}");
+            }
+            for refused in [
+                r#"{"host":"10.0.0.5"}"#,
+                r#"{"host":"169.254.169.254"}"#,
+                r#"{"host":"example.com"}"#,
+                r#"{"host":"192.168.1.1"}"#,
+            ] {
+                assert!(
+                    !imposter_is_on_loopback(&config(refused)),
+                    "{refused} must refuse the try rather than have loopback dialled on its behalf"
+                );
+            }
+        }
+
+        /// A caller cannot smuggle in addressing of its own. The envelope is closed, so a `host`,
+        /// `scheme` or `url` field is a `400` rather than something silently ignored — the
+        /// silent version would let a client believe it had aimed the request somewhere it had
+        /// not.
+        #[test]
+        fn the_envelope_refuses_any_addressing_field() {
+            for smuggled in [
+                r#"{"method":"GET","path":"/x","scheme":"https"}"#,
+                r#"{"method":"GET","path":"/x","host":"example.com"}"#,
+                r#"{"method":"GET","path":"/x","url":"http://example.com/"}"#,
+                r#"{"method":"GET","path":"/x","port":9999}"#,
+            ] {
+                assert!(
+                    serde_json::from_str::<TryRequest>(smuggled).is_err(),
+                    "{smuggled} must be refused, not quietly ignored"
+                );
+            }
+            assert!(
+                serde_json::from_str::<TryRequest>(r#"{"method":"GET","path":"/x"}"#).is_ok(),
+                "the legal minimum still parses"
+            );
+        }
+
+        /// The optional flags are absent when false, so `bodyLossy`/`headersLossy`/`truncated`
+        /// mean something when a client sees them at all.
+        #[test]
+        fn the_optional_flags_are_omitted_when_false() {
+            let clean = TryResponse {
+                status: 200,
+                headers: Vec::new(),
+                headers_lossy: false,
+                body: "ok".to_owned(),
+                body_lossy: false,
+                truncated: false,
+                elapsed_ms: 3,
+            };
+            let rendered = serde_json::to_string(&clean).expect("renders");
+            assert!(!rendered.contains("bodyLossy"), "{rendered}");
+            assert!(!rendered.contains("headersLossy"), "{rendered}");
+            assert!(!rendered.contains("truncated"), "{rendered}");
+            assert!(rendered.contains("\"elapsedMs\":3"), "{rendered}");
+
+            let flagged = TryResponse {
+                body_lossy: true,
+                headers_lossy: true,
+                truncated: true,
+                ..clean
+            };
+            let rendered = serde_json::to_string(&flagged).expect("renders");
+            assert!(rendered.contains("\"bodyLossy\":true"), "{rendered}");
+            assert!(rendered.contains("\"headersLossy\":true"), "{rendered}");
+            assert!(rendered.contains("\"truncated\":true"), "{rendered}");
+        }
+
+        /// **The status mapping**, which nothing else in this file gates.
+        ///
+        /// Every other try test stops at the `TryFailure` variant. That leaves the translation
+        /// from variant to HTTP status — the last step before an operator sees anything — proven
+        /// only by reading it. Swapping `GATEWAY_TIMEOUT` and `BAD_GATEWAY` compiles and keeps all
+        /// of them green, while the console starts reporting a slow mock as an unreachable one.
+        ///
+        /// The `200` arm is the design's central claim and is asserted here rather than assumed:
+        /// the imposter's own `503` is a *successful* try, so the endpoint answers `200` and the
+        /// `503` rides in the payload.
+        #[test]
+        fn every_outcome_maps_to_the_status_the_contract_publishes() {
+            let answered = TryResponse {
+                status: 503,
+                headers: Vec::new(),
+                headers_lossy: false,
+                body: "mock said no".to_owned(),
+                body_lossy: false,
+                truncated: false,
+                elapsed_ms: 4,
+            };
+            let ok = render_try_outcome(Ok(answered), 4545);
+            assert_eq!(
+                ok.status(),
+                StatusCode::OK,
+                "the imposter's own 5xx is a successful try — the endpoint answers 200"
+            );
+
+            assert_eq!(
+                render_try_outcome(Err(TryFailure::Timeout), 4545).status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "a budget expiry is 504, never 502"
+            );
+            assert_eq!(
+                render_try_outcome(Err(TryFailure::Unreachable("refused".into())), 4545).status(),
+                StatusCode::BAD_GATEWAY,
+                "a failed dial is 502, never 504"
+            );
+            assert_eq!(
+                render_try_outcome(Err(TryFailure::BadRequest("nope".into())), 4545).status(),
+                StatusCode::BAD_REQUEST,
+                "the caller's own malformed envelope is 400 — not the imposter's fault"
+            );
+        }
+
+        /// A body that is *exactly* the cap dropped nothing, so it must not be flagged.
+        ///
+        /// This was a real off-by-one (`>=` where `>` belonged): a complete body reported as cut
+        /// is the same class of harm as a cut one reported as complete — it sends an operator
+        /// hunting for content that was never missing.
+        #[tokio::test]
+        async fn a_body_exactly_at_the_cap_is_complete_not_truncated() {
+            let cap = 512;
+            let body = "y".repeat(cap);
+            let (addr, _server) =
+                canned(format!("{}{body}", head("200 OK", "", body.len())).into_bytes()).await;
+
+            let outcome = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/exact"),
+                BUDGET,
+                cap,
+            )
+            .await
+            .expect("answered");
+
+            assert_eq!(outcome.body.len(), cap);
+            assert!(
+                !outcome.truncated,
+                "nothing was dropped, so nothing may be declared dropped"
+            );
+        }
+
+        /// Header values get the same honesty the body does.
+        ///
+        /// A mock that injects a malformed header is doing so deliberately — that is what fault
+        /// injection is for — and the console renders these values verbatim, so an unflagged
+        /// substitution shows the operator characters the mock never sent.
+        #[tokio::test]
+        async fn a_non_utf8_header_value_is_flagged_lossy() {
+            let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Sig: ".to_vec();
+            response.extend_from_slice(&[0xff, 0xfe]);
+            response.extend_from_slice(b"\r\n\r\n");
+            let (addr, _server) = canned(response).await;
+
+            let outcome = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/hdr"),
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect("answered");
+
+            assert!(
+                outcome.headers_lossy,
+                "the substitution in X-Sig must be declared: {:?}",
+                outcome.headers
+            );
+            assert!(
+                !outcome.body_lossy,
+                "the body was clean — the two flags must not be conflated"
+            );
+        }
+
+        /// And clean headers are not flagged, or the flag says nothing.
+        #[tokio::test]
+        async fn clean_headers_are_not_flagged_lossy() {
+            let (addr, _server) = canned(head("200 OK", "X-Sig: abc\r\n", 0).into_bytes()).await;
+
+            let outcome = perform_try(
+                client(),
+                &format!("http://{addr}"),
+                &spec("GET", "/hdr"),
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect("answered");
+
+            assert!(!outcome.headers_lossy);
+        }
+
+        /// The `https` scheme reaches a TLS handshake rather than dying in the client builder.
+        ///
+        /// `rift-cluster-server` gets `reqwest` from the workspace pin **for its `rustls-tls`
+        /// feature**; without a TLS backend compiled in, every https try would fail identically
+        /// for a reason that has nothing to do with the imposter. Dialling a dead port and
+        /// requiring the failure to be a *connection* failure is what distinguishes "the feature
+        /// is wired" from "https is silently impossible" — the latter would otherwise only be
+        /// discovered by the first operator with an https stub.
+        #[tokio::test]
+        async fn an_https_try_reaches_the_transport_rather_than_failing_to_build() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            drop(listener);
+
+            let failure = perform_try(
+                client(),
+                &format!("https://{addr}"),
+                &spec("GET", "/x"),
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect_err("nothing is listening");
+
+            let TryFailure::Unreachable(why) = &failure else {
+                panic!("an https dial must fail as unreachable, not as {failure:?}");
+            };
+            assert!(
+                !why.contains("TLS backend") && !why.contains("unknown scheme"),
+                "https failed before the transport — the TLS feature is not compiled in: {why}"
+            );
+        }
+
+        /// The published budget and cap are the ones the handler actually uses. Both are quoted
+        /// verbatim in the OpenAPI description a client reads, so drift here is drift in a
+        /// contract, not a constant.
+        #[test]
+        fn the_published_limits_are_the_enforced_ones() {
+            assert_eq!(TRY_BUDGET, Duration::from_secs(10));
+            assert_eq!(TRY_MAX_RESPONSE_BYTES, 1024 * 1024);
         }
     }
 }

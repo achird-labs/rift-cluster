@@ -56,6 +56,18 @@ pub enum Action {
     SpaceTeardown,
     FlowStateRead,
     FlowStateClear,
+    /// Ask the server to send a sample request to one of this tenant's
+    /// imposters (issue #335).
+    ///
+    /// Its own variant rather than a ride on `ImposterRead`, for two reasons.
+    /// It is not a read in *effect* — a try advances scenario state, appends to
+    /// the request log and can trigger proxyOnce recording, which is the
+    /// "disturb" shape that puts it in the Operator arm beside
+    /// [`Action::ScenarioReset`]. And it is the first action under which the
+    /// server originates outbound HTTP on a caller's behalf, so an audit record
+    /// (`as_str`) has to be able to say that is what happened rather than
+    /// naming it as an ordinary read.
+    ImposterTry,
     SourceRead,
     VerifyRun,
     StreamSubscribe,
@@ -70,7 +82,7 @@ impl Action {
     ///
     /// Kept beside the enum so the two cannot drift: `every_action_is_listed`
     /// fails if a variant is added without extending this.
-    pub const ALL: [Action; 20] = [
+    pub const ALL: [Action; 21] = [
         Action::ImposterRead,
         Action::ImposterWrite,
         Action::ImposterDelete,
@@ -85,6 +97,7 @@ impl Action {
         Action::SpaceTeardown,
         Action::FlowStateRead,
         Action::FlowStateClear,
+        Action::ImposterTry,
         Action::SourceRead,
         Action::VerifyRun,
         Action::StreamSubscribe,
@@ -111,6 +124,7 @@ impl Action {
             Action::SpaceTeardown => "space.teardown",
             Action::FlowStateRead => "flowState.read",
             Action::FlowStateClear => "flowState.clear",
+            Action::ImposterTry => "imposter.try",
             Action::SourceRead => "source.read",
             Action::VerifyRun => "verify.run",
             Action::StreamSubscribe => "stream.subscribe",
@@ -170,6 +184,7 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                         | Action::ScenarioReset
                         | Action::SpaceTeardown
                         | Action::FlowStateClear
+                        | Action::ImposterTry
                 )
         }
         Role::Editor => {
@@ -312,8 +327,8 @@ mod tests {
     fn every_action_is_listed_in_all() {
         assert_eq!(
             Action::ALL.len(),
-            20,
-            "RFC-002 §4.1 defines 20 actions; ALL must carry every one"
+            21,
+            "RFC-002 §4.1 defines 21 actions; ALL must carry every one"
         );
         let unique: std::collections::BTreeSet<_> = Action::ALL.iter().collect();
         assert_eq!(unique.len(), Action::ALL.len(), "ALL contains a duplicate");
@@ -346,6 +361,7 @@ mod tests {
             Action::ScenarioReset,
             Action::SpaceTeardown,
             Action::FlowStateClear,
+            Action::ImposterTry,
         ];
         let editor_adds = [
             Action::ImposterWrite,
@@ -468,6 +484,40 @@ mod tests {
         assert!(!role_allows(Role::Editor, Action::AuditRead));
         assert!(role_allows(Role::TenantAdmin, Action::AuditRead));
         assert!(role_allows(Role::FleetAdmin, Action::AuditRead));
+    }
+
+    /// Issue #335: a try is an Operator power, not a Viewer one.
+    ///
+    /// Pinned on its own rather than left to the matrix above, because the
+    /// pressure to move it is real and specific: the affordance is most useful
+    /// to a Viewer diagnosing why a stub will not match, and the sibling
+    /// `Copy curl` button (#334) *is* offered to every role. The line being
+    /// held is that a Viewer may compose a request, but may not have the
+    /// **server originate one on their behalf** — a try mutates scenario state,
+    /// the request log, and proxy recordings. Widening this to Viewer is a
+    /// deliberate decision to be argued, not a refactor to be made quietly.
+    #[test]
+    fn a_try_is_an_operator_power_not_a_viewer_read() {
+        assert!(
+            !role_allows(Role::Viewer, Action::ImposterTry),
+            "a Viewer gets the curl button (#334), not a server-originated send"
+        );
+        for role in [
+            Role::Operator,
+            Role::Editor,
+            Role::TenantAdmin,
+            Role::FleetAdmin,
+        ] {
+            assert!(
+                role_allows(role, Action::ImposterTry),
+                "{role:?} must be able to try a stub"
+            );
+        }
+        assert_eq!(
+            Action::ImposterTry.as_str(),
+            "imposter.try",
+            "the audit slug is a published contract (#163 consumes it)"
+        );
     }
 
     /// Deny by default: an unbound principal is refused everything, and the

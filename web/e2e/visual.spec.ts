@@ -85,12 +85,15 @@ test.describe("component baselines", () => {
     });
   });
 
-  test("the request log scope strip", async ({ page }) => {
-    const { imposters } = fixture();
-    await signIn(page, "editor");
-    await goToScreen(page, `/requests/${imposters[0]}`);
-    await expect(page.getByTestId("request-scope-label")).toHaveScreenshot("request-scope.png");
-  });
+  /*
+   * The request log's scope strip had a baseline here until #147 H. It is deliberately gone rather
+   * than re-pointed: the strip is now a **partial-merge-only** element — it renders when the
+   * server stamps `Rift-Cluster-Partial`, and not otherwise — and this fixture is a live
+   * single-node server whose merges always reach every node. There is no state it can drive that
+   * shows the strip, so any baseline taken here would be a screenshot of an element that no longer
+   * exists. The strip's presence, absence and copy are asserted instead in
+   * `src/__tests__/requestLog.test.tsx`, which can drive the header directly.
+   */
 
   test("the scenarios scope strip", async ({ page }) => {
     /*

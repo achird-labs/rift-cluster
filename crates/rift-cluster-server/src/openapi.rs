@@ -310,6 +310,9 @@ mod parity {
             Terminated::SpaceTeardown(_, _) => {
                 RouteKey::new(&Method::DELETE, "/imposters/{port}/spaces/{flowId}")
             }
+            Terminated::TryImposter(_) => {
+                RouteKey::new(&Method::POST, "/admin/imposters/{port}/try")
+            }
             Terminated::PutRoutes => RouteKey::new(&Method::PUT, "/front-door/routes"),
             Terminated::DeleteRoute(_) => {
                 RouteKey::new(&Method::DELETE, "/front-door/routes/{routeId}")
@@ -394,6 +397,7 @@ mod parity {
             Terminated::ClearSavedRequests(4545),
             Terminated::ClearSavedProxyResponses(4545),
             Terminated::SpaceTeardown(4545, "flow-1".to_owned()),
+            Terminated::TryImposter(4545),
             Terminated::PutRoutes,
             Terminated::DeleteRoute("svc".to_owned()),
             Terminated::Tenancy(Route::TenantCreate),

@@ -29,6 +29,11 @@ const EXPECTED: Record<Capability, Role[]> = {
   // anyway: `authz.rs` grants them from separate arms, so the day one moves this table is what
   // fails rather than a delete button quietly appearing for a role the server refuses.
   "imposter.delete": ["editor", "tenant-admin", "fleet-admin"],
+  // `Action::ImposterTry` (#335). Operator-tier, and the row most likely to be "corrected" by
+  // someone reasoning from the UI rather than from `authz.rs`: the Send button *looks* like a
+  // read. It is not — a try mutates scenario state, the request log and proxy recordings — and a
+  // Viewer who widened this row would get a button whose every call answers 403.
+  "imposter.try": ["operator", "editor", "tenant-admin", "fleet-admin"],
   // `Action::SourceRead`. Viewer, alongside `ImposterRead` — its own action server-side rather
   // than a wire-folding onto it, transcribed as its own row for the same reason `imposter.delete`
   // above gets one: the day the grant moves is what this row exists to catch.

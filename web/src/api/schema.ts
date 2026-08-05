@@ -431,6 +431,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/imposters/{port}/try": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send a sample request to this imposter and return what it answered
+         * @description Terminates. The console's **Send** button: it lets an operator find out whether a stub matches without leaving the admin origin, which a browser cannot do on its own — the console is served from the admin port, an imposter answers on its own, and a mock sends no CORS headers, so an in-page `fetch` is blocked for essentially every stub.
+         *
+         *     This is the one admin route that makes the **server originate outbound HTTP on a caller's behalf**, so its containment is structural rather than configurable:
+         *
+         *     * It names a **port, never a URL or host** — the host is hardcoded
+         *       loopback and is not a parameter.
+         *
+         *     * The port must be an imposter in the caller's own tenant. An
+         *       unknown port and another tenant's port answer the identical
+         *       RFC-002 §8.4 `404`, so this cannot be used to map which ports
+         *       exist.
+         *
+         *     * The scheme comes from the imposter's own configured `protocol`,
+         *       never from the caller. For an `https` imposter the client accepts
+         *       the imposter's self-signed certificate — the connection never
+         *       leaves the box.
+         *
+         *     * **Redirects are never followed.** A `3xx` is returned like any
+         *       other answer, `Location` header and all. Following one is the only
+         *       way this exchange could reach somewhere other than the loopback
+         *       port the rules above pinned it to.
+         *
+         *
+         *     Requires `imposter.try` (Operator and up). A try is not read-only in effect — it advances scenario state, appends to the request log and can trigger proxy recording — which is why it sits with the other Operator "disturb" actions rather than with `imposter.read`. A Viewer diagnosing a stub uses the console's `Copy curl` button instead, which needs no server surface.
+         *
+         *     The exchange is bounded: **10 seconds** total (connect and exchange), and at most **1 MiB** of the imposter's response body is read back, after which `truncated` is `true`. This is a diagnosis surface, not a transfer surface.
+         */
+        post: operations["tryImposter"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/imposters/{port}/flow-state/{flowId}": {
         parameters: {
             query?: never;
@@ -1142,6 +1190,44 @@ export interface components {
             predicateIndex?: number;
         } & {
             [key: string]: unknown;
+        };
+        /** @description The sample request to send. Deliberately carries no host, scheme or port: those come from the imposter named in the path, which is what confines this endpoint to a mock the caller can already see. */
+        TryRequest: {
+            /**
+             * @description The HTTP method to send. Any token the imposter's own router might match, not a fixed enum — a mock exists to answer whatever the system under test sends it, including methods this API has no opinion about.
+             * @example GET
+             */
+            method: string;
+            /**
+             * @description Path and query string, as one string, starting with `/`. This is `Sample.target` from the console's own curl derivation.
+             * @example /orders?status=open
+             */
+            path: string;
+            /** @description Sent as given, in order, and repeats are preserved — a list rather than a map because a request may legitimately carry the same header name twice and a map would silently drop one. */
+            headers?: components["schemas"]["TryHeader"][];
+            /** @description Request body, verbatim. Omit for a bodyless request. */
+            body?: string;
+        };
+        TryHeader: {
+            name: string;
+            value: string;
+        };
+        /** @description What the imposter answered. */
+        TryResponse: {
+            /** @description The imposter's own status. A `4xx`/`5xx` here is a *successful* try — the endpoint still answered `200`. */
+            status: number;
+            /** @description The imposter's response headers, repeats preserved. */
+            headers: components["schemas"]["TryHeader"][];
+            /** @description The response body, decoded as UTF-8. See `bodyLossy` — a mock may legitimately serve bytes that are not text, and this field is a string so that the common case needs no base64 round-trip. */
+            body: string;
+            /** @description Present and `true` when the body was not valid UTF-8 and replacement characters were substituted. Absent otherwise, so a client can tell "decoded cleanly" from "decoded with loss" without comparing bytes it does not have. */
+            bodyLossy?: boolean;
+            /** @description The same, for header *values*. Its own flag rather than folded into `bodyLossy`: a mock with fault injection may serve malformed header bytes deliberately, and the header an operator garbled on purpose is exactly the one they are then reading back. */
+            headersLossy?: boolean;
+            /** @description Present and `true` when the imposter's body exceeded the 1 MiB read cap and `body` is a prefix. Absent otherwise. */
+            truncated?: boolean;
+            /** @description Wall-clock milliseconds for the exchange, measured at the server. Includes connect and the body read; excludes admin-side authorization. */
+            elapsedMs: number;
         };
         RouteTable: {
             routes?: components["schemas"]["Route"][];
@@ -3164,6 +3250,79 @@ export interface operations {
                 };
             };
             413: components["responses"]["PayloadTooLarge"];
+        };
+    };
+    tryImposter: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TryRequest"];
+            };
+        };
+        responses: {
+            /** @description The exchange completed. **The imposter's own `4xx`/`5xx` arrives here too** — that is a successful try, with the imposter's status in `status`. Only failures of the endpoint itself (the dial, the budget) are non-`200`, so a client never has to guess whether a `502` came from the mock or from the attempt to reach it. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TryResponse"];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No such imposter for this tenant, or owned by another tenant — byte-identical either way (RFC-002 §8.4). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The try envelope exceeded the admin plane's request body limit. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            /** @description The imposter's port could not be reached, **or** this node is not the one serving it on loopback — a committed imposter config does not by itself mean this node bound the port, and a try never dials a socket it cannot attribute to the imposter. Distinct from a `200` carrying the imposter's own `502`: this one means the exchange never happened. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            503: components["responses"]["Unavailable"];
+            /** @description The 10-second budget expired before the imposter answered. */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     clearFlowState: {

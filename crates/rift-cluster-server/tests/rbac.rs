@@ -594,6 +594,301 @@ async fn in_tenant_insufficient_role_is_403_not_404() {
     server.shutdown().await;
 }
 
+/// Issue #335, at the wire: the try endpoint reaches a real imposter, and only for someone who
+/// may and only for a port they own.
+///
+/// Everything about the *exchange* is unit-tested against a canned server in `admin_front`. What
+/// can only be proved here is the part that involves a real cluster: that the route classifies,
+/// authorizes, resolves the imposter's own port, and comes back with what that imposter actually
+/// served — and that a Viewer and a foreign port do not get there at all.
+#[tokio::test]
+async fn a_try_reaches_the_imposter_only_for_a_role_and_a_port_that_may() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    // A real imposter in `default` with two stubs, both seeded at config time. The `/boom` stub
+    // must come **first**: the catch-all below it has no predicates, so it matches everything and
+    // would shadow anything placed after it.
+    let port = reserve_port();
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: serde_json::from_value(json!({
+                "port": port,
+                "protocol": "http",
+                "stubs": [
+                    {
+                        "id": "boom",
+                        "predicates": [{ "equals": { "path": "/boom" } }],
+                        "responses": [{ "is": { "statusCode": 503, "body": "down" } }],
+                    },
+                    { "id": "a", "responses": [{ "is": { "statusCode": 200, "body": "hi" } }] },
+                ],
+            }))
+            .expect("config parses"),
+        },
+    )
+    .await;
+    op_id += 1;
+
+    let operator =
+        seed_bound_principal(node, &mut op_id, "try-operator", "default", Role::Operator).await;
+    let viewer =
+        seed_bound_principal(node, &mut op_id, "try-viewer", "default", Role::Viewer).await;
+
+    let envelope = json!({ "method": "GET", "path": "/anything" });
+
+    // The happy path: the imposter's own answer comes back, inside a 200.
+    let allowed = Seen::of(
+        client
+            .post(format!("http://{admin}/admin/imposters/{port}/try"))
+            .header("authorization", &operator)
+            .json(&envelope)
+            .send()
+            .await
+            .expect("try as operator"),
+    )
+    .await;
+    assert_eq!(
+        allowed.status, 200,
+        "an Operator may try an imposter in its own tenant: {allowed}"
+    );
+    let body = allowed.json();
+    assert_eq!(
+        body["status"], 200,
+        "the imposter's own status rides in the payload: {allowed}"
+    );
+    assert_eq!(
+        body["body"], "hi",
+        "and its body is what `minimal_imposter` serves — proving the exchange really happened \
+         against the imposter on its own port, not against some default: {allowed}"
+    );
+    assert!(
+        body["elapsedMs"].is_number(),
+        "the timing an operator judges a stub by must be present: {allowed}"
+    );
+
+    // The design's central split, asserted at the wire rather than only at `perform_try`: the
+    // imposter answering `503` is a *successful* try. The endpoint still says `200` and the `503`
+    // rides in the payload, so a client can tell "the mock said 503" from "the mock could not be
+    // reached" (which is the endpoint's own `502`).
+    let mock_failed = Seen::of(
+        client
+            .post(format!("http://{admin}/admin/imposters/{port}/try"))
+            .header("authorization", &operator)
+            .json(&json!({ "method": "GET", "path": "/boom" }))
+            .send()
+            .await
+            .expect("try the 503 stub"),
+    )
+    .await;
+    assert_eq!(
+        mock_failed.status, 200,
+        "the endpoint succeeded — only the mock failed: {mock_failed}"
+    );
+    assert_eq!(
+        mock_failed.json()["status"],
+        503,
+        "the imposter's own status must ride in the payload: {mock_failed}"
+    );
+
+    // A Viewer gets the curl button (#334), never a server-originated send.
+    let refused = Seen::of(
+        client
+            .post(format!("http://{admin}/admin/imposters/{port}/try"))
+            .header("authorization", &viewer)
+            .json(&envelope)
+            .send()
+            .await
+            .expect("try as viewer"),
+    )
+    .await;
+    assert_eq!(
+        refused.status, 403,
+        "a Viewer is refused as forbidden — they are in the tenant, so 404 would be a lie: \
+         {refused}"
+    );
+    assert!(
+        refused.body.contains("imposter.try"),
+        "the refusal names the action it lacked: {refused}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #335, the escalation this endpoint most needs to not have: **owning the record is not
+/// owning the socket.**
+///
+/// A `PutImposter` whose bind fails still commits and still reads back — deliberately, so a bind
+/// failure cannot wedge the replicated log (`bind_failure_does_not_fail_apply`). So a tenant can
+/// hold a committed config for a port that some *other* process on this box is listening on.
+///
+/// Without the `is_locally_bound` gate that gap is a privilege escalation, not a curiosity: an
+/// Editor holds both `ImposterWrite` and `ImposterTry`, so they could claim a port already held by
+/// an internal listener — the metrics endpoint, the probe listener, the cluster RPC port — and
+/// then use the try to send a request of their choosing to it and read the reply back through the
+/// admin API. Every other containment property here is downstream of this one.
+///
+/// The test stands a plain listener on a port first, commits an imposter for it (which succeeds,
+/// and must), then tries it. Nothing may be dialled.
+#[tokio::test]
+async fn a_try_will_not_dial_a_port_this_node_never_bound() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    // Something else is already on this port — standing in for the metrics/probe/RPC listeners an
+    // attacker would actually be reaching for. Held for the whole test.
+    //
+    // Bound to `0.0.0.0`, deliberately, because that is what the imposter manager itself binds
+    // (`config.host.unwrap_or("0.0.0.0")`) and it is the only spelling whose collision is refused
+    // on every platform. A `127.0.0.1` squatter is *not* equivalent: BSD accepts a `0.0.0.0` bind
+    // alongside it, so the imposter would bind successfully, `is_bound()` would be true, and the
+    // more-specific socket would quietly win the loopback connection — a real residual hole, but a
+    // different one, recorded against this issue rather than papered over by a weaker squatter.
+    let squatter = std::net::TcpListener::bind("0.0.0.0:0").expect("bind the squatter");
+    let port = squatter.local_addr().expect("addr").port();
+
+    // The commit succeeds even though the bind cannot. That is the documented behaviour, and it is
+    // exactly what makes the gate necessary — so assert it rather than assuming it.
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: serde_json::from_value(minimal_imposter(port)).expect("config parses"),
+        },
+    )
+    .await;
+    op_id += 1;
+    assert_eq!(
+        node.owning_tenant(port).expect("read"),
+        Some(TenantId::default()),
+        "the record committed despite the bind failing — if this ever stops being true, the gate \
+         under test is still correct but this test no longer proves anything"
+    );
+
+    let operator =
+        seed_bound_principal(node, &mut op_id, "squat-op", "default", Role::Operator).await;
+
+    let seen = Seen::of(
+        client
+            .post(format!("http://{admin}/admin/imposters/{port}/try"))
+            .header("authorization", &operator)
+            .json(&json!({ "method": "GET", "path": "/metrics" }))
+            .send()
+            .await
+            .expect("try the squatted port"),
+    )
+    .await;
+
+    assert_eq!(
+        seen.status, 502,
+        "a port this node never bound must be refused, not dialled: {seen}"
+    );
+    assert!(
+        seen.body.contains("not bound"),
+        "and the refusal must say why: {seen}"
+    );
+    // The squatter never accepted a connection, which is the real assertion — the status above
+    // could in principle be reached by dialling and failing.
+    squatter
+        .set_nonblocking(true)
+        .expect("non-blocking for the accept probe");
+    assert!(
+        squatter.accept().is_err(),
+        "the try connected to a socket this tenant does not actually own"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #335: the endpoint must not become a port scanner.
+///
+/// The containment claim is that a try can only reach an imposter the caller can already see, and
+/// that "not yours" is indistinguishable from "not there". If the two 404s differed by so much as
+/// a header, sweeping the port range would map which ports other tenants hold — with the added
+/// sting that this is the one endpoint that would then *dial* them.
+#[tokio::test]
+async fn an_unknown_and_a_foreign_port_are_the_same_404_to_a_try() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    // A real imposter, owned by `default`.
+    let owned_by_default = reserve_port();
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: serde_json::from_value(minimal_imposter(owned_by_default))
+                .expect("config parses"),
+        },
+    )
+    .await;
+    op_id += 1;
+
+    seed(node, op_id, tenant_put("acme", "Acme Corp")).await;
+    op_id += 1;
+    // Genuinely bound to `acme`, and genuinely holds `imposter.try` there.
+    let acme = seed_bound_principal(node, &mut op_id, "acme-op", "acme", Role::Operator).await;
+
+    let envelope = json!({ "method": "GET", "path": "/anything" });
+    let try_as_acme = |port: u16| {
+        client
+            .post(format!("http://{admin}/admin/imposters/{port}/try"))
+            .header("authorization", &acme)
+            .header("x-rift-tenant", "acme")
+            .json(&envelope)
+            .send()
+    };
+
+    // A port that belongs to another tenant...
+    let foreign = Seen::of(try_as_acme(owned_by_default).await.expect("foreign port")).await;
+    // ...and one that belongs to nobody at all.
+    let unknown = Seen::of(try_as_acme(reserve_port()).await.expect("unknown port")).await;
+
+    assert_eq!(foreign.status, 404, "another tenant's port: {foreign}");
+    assert_eq!(unknown.status, 404, "a port nobody holds: {unknown}");
+    assert_eq!(
+        foreign.body, unknown.body,
+        "a caller must not be able to tell an existing port from an absent one by body: \
+         {foreign} vs {unknown}"
+    );
+    assert_eq!(
+        headers_excluding_date(&foreign),
+        headers_excluding_date(&unknown),
+        "nor by headers: {foreign} vs {unknown}"
+    );
+
+    server.shutdown().await;
+}
+
 /// An unauthenticated request to a path nothing classifies must still `401`,
 /// never `404` — a `404` there would make the admin plane an unauthenticated
 /// route-existence oracle (RFC-002 §4.3, mirroring upstream's own
