@@ -656,6 +656,13 @@ impl Tail {
         tail.headers = String::from_utf8_lossy(&tail.raw[..split]).into_owned();
         tail.raw.drain(..split + 4);
         tail.decode();
+        // Headers arriving does not mean the first frame has. Whether `hello` rides the same TCP
+        // segment as the response head is a scheduling accident — it did under `--test-threads=1`
+        // and did not under `3` — so wait for it here rather than letting every caller race it.
+        // Bounded and non-fatal: an error response (a refused `Last-Event-ID`) legitimately
+        // carries no frames at all, and those callers only read `headers`.
+        tail.until(Duration::from_secs(10), |t| !t.events.is_empty())
+            .await;
         tail
     }
 

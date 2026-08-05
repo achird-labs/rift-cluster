@@ -167,6 +167,28 @@ pub struct MergeSince {
     pub truncated: bool,
 }
 
+/// One entry of a live tail, with the cursor a client resumes from if this is the last event it
+/// receives (issue #348).
+#[derive(Debug, Clone)]
+pub struct TailEvent {
+    pub entry: ShardEntry,
+    pub id: JournalCursor,
+}
+
+/// One drain of a live tail — [`JournalNet::tail_page`]'s answer.
+#[derive(Debug, Clone)]
+pub struct TailPage {
+    /// In emission order: each shard in its own seq order, interleaved across shards by timestamp.
+    pub events: Vec<TailEvent>,
+    /// The position to hold after this drain. Adopted even when `events` is empty, because it also
+    /// covers ranges the shards no longer hold.
+    pub next: JournalCursor,
+    /// The merged view is currently short — both senses of [`MergeOutcome::partial`].
+    pub partial: bool,
+    /// Retention dropped entries this reader had not reached.
+    pub truncated: bool,
+}
+
 /// [`merge_shards`], resumed from a vector cursor — the merged read a `?since=` token addresses.
 ///
 /// The merge itself is unchanged and still does all the convergence work; this adds exactly
@@ -290,7 +312,7 @@ pub(crate) fn merge_shards_since(
 /// guarantee a stream can actually keep, since a merged page's order is not stable across reads
 /// anyway (a peer that becomes reachable contributes entries older than everything already sent).
 #[must_use]
-pub fn stream_order(entries: Vec<ShardEntry>) -> Vec<ShardEntry> {
+fn stream_order(entries: Vec<ShardEntry>) -> Vec<ShardEntry> {
     let mut by_shard: BTreeMap<NodeId, std::collections::VecDeque<ShardEntry>> = BTreeMap::new();
     for entry in entries {
         by_shard.entry(entry.node_id).or_default().push_back(entry);
@@ -338,7 +360,7 @@ pub fn stream_order(entries: Vec<ShardEntry>) -> Vec<ShardEntry> {
 /// clear generation, applied inside [`merge_shards`]) — it exists to keep the token monotone, and
 /// the drain's page-level [`MergeSince::next`] brings it current at every page boundary.
 #[must_use]
-pub fn advanced_by(cursor: &JournalCursor, entry: &ShardEntry) -> JournalCursor {
+fn advanced_by(cursor: &JournalCursor, entry: &ShardEntry) -> JournalCursor {
     let mut next = cursor.clone();
     next.pos
         .entry(entry.node_id)
@@ -661,6 +683,48 @@ impl JournalNet {
             self.tick_partial(port),
             cursor,
         )
+    }
+
+    /// One drain of a live tail (issue #348): the entries to emit, each already carrying the
+    /// token that belongs on its SSE `id:` line, plus the page token and the honesty bits.
+    ///
+    /// This exists so the ordering rule and the token fold stay *inside* this module. Both are
+    /// merge internals — they operate on `ShardEntry` and on a cursor's per-shard positions — and
+    /// this file's export policy is that a caller outside the crate reaches the fleet journal
+    /// through `JournalNet`'s methods rather than through its wire shapes. A front door that had
+    /// to call `stream_order` and then fold `advanced_by` itself would be re-implementing the
+    /// walk's most subtle invariant at the call site, where the next caller is free to get it
+    /// wrong.
+    #[must_use]
+    pub fn tail_page(&self, port: u16, cursor: &JournalCursor) -> TailPage {
+        let page = self.merge_cached_since(port, Some(cursor));
+        let ordered = stream_order(page.entries);
+        let last = ordered.len().saturating_sub(1);
+
+        let mut running = cursor.clone();
+        let mut events = Vec::with_capacity(ordered.len());
+        for (index, entry) in ordered.into_iter().enumerate() {
+            running = advanced_by(&running, &entry);
+            // The last event of a page carries the page token rather than the running fold. They
+            // agree about everything delivered; the page token additionally covers what the shards
+            // hold but did not surface — evicted or cleared ranges — which is what makes a
+            // quiescent stream's last `id:` equal to what a cursor read would answer. Every
+            // earlier event keeps the fold, so a disconnect part-way through a page still resumes
+            // with no gap and no repeat.
+            let id = if index == last {
+                page.next.clone()
+            } else {
+                running.clone()
+            };
+            events.push(TailEvent { entry, id });
+        }
+
+        TailPage {
+            events,
+            next: page.next,
+            partial: page.partial,
+            truncated: page.truncated,
+        }
     }
 
     /// [`Self::slices_for`], but each shard carries only the entries **above** that shard's

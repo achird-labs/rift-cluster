@@ -39,7 +39,7 @@ pub use proxy::{ClusterProxyStore, ProxyBindConfig, ProxyNet, proxy_routes, prox
 // legitimately calls. `MergeOutcome` stays out of this list for the same "not used outside" reason
 // even though its own declaration stays `pub` — see its doc for why it cannot be `pub(crate)`.
 pub use journal_net::{
-    DEFAULT_ANTI_ENTROPY_INTERVAL, JournalNet, advanced_by, journal_routes, spawn_anti_entropy,
-    stream_order,
+    DEFAULT_ANTI_ENTROPY_INTERVAL, JournalNet, TailEvent, TailPage, journal_routes,
+    spawn_anti_entropy,
 };
 pub use shard::{Durability, FlowShard, ShardConfig, ShardError, Versioned};

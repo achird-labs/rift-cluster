@@ -77,7 +77,7 @@ use rift_cluster::decorate::{
     HEADER_BIND_FAILURES, HEADER_NEXT_INDEX, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION,
     HEADER_TRUNCATED, HEADER_WARNINGS,
 };
-use rift_cluster::stores::{JournalCursor, JournalNet, advanced_by, stream_order};
+use rift_cluster::stores::{JournalCursor, JournalNet};
 use rift_cluster::{
     ControlOutcome, ControlResponse, FLEET_SCOPE, NodeError, PullError, RaftNode,
     SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId,
@@ -2648,7 +2648,7 @@ fn terminate_stream_saved_requests(
         loop {
             if drain_now {
                 drain_now = false;
-                let page = journal_net.merge_cached_since(port, Some(&cursor));
+                let page = journal_net.tail_page(port, &cursor);
 
                 if page.truncated {
                     // Upstream's `lagged` means "there is a gap; reconcile by polling", which is
@@ -2675,25 +2675,12 @@ fn terminate_stream_saved_requests(
                     }
                 }
 
-                // `stream_order`, not the merge's own order: a per-event resumption token is only
-                // sound over a sequence that is per-shard seq-ascending, and the merge sorts by a
-                // request timestamp that can invert two of one shard's seqs. See its doc — folding
-                // over the raw order loses the lower seq permanently.
-                let entries = stream_order(page.entries);
-                let last = entries.len().saturating_sub(1);
-                for (index, entry) in entries.iter().enumerate() {
-                    cursor = advanced_by(&cursor, entry);
-                    // The final event of a drain carries the page's own token instead of the
-                    // running fold. The two agree about everything delivered; the page token
-                    // additionally covers what the shards hold but did not surface (evicted or
-                    // cleared ranges), which is exactly what makes a quiescent stream's last `id:`
-                    // equal to what a cursor read would answer. Mid-drain events keep the fold, so
-                    // a disconnect part-way through still resumes without a gap or a repeat.
-                    let id = if index == last {
-                        page.next.encode()
-                    } else {
-                        cursor.encode()
-                    };
+                // Emission order and the per-event token both come from `tail_page`: they are
+                // one rule (a token is only sound over a per-shard seq-ascending sequence) and it
+                // lives with the walk, not here.
+                for event in &page.events {
+                    let entry = &event.entry;
+                    let id = event.id.encode();
 
                     let mut data = serde_json::json!({
                         "port": port,
@@ -5845,6 +5832,50 @@ mod tests {
         (status, headers, body)
     }
 
+    /// Open the merged tail and return whatever frames arrive in a short window. Raw socket
+    /// rather than an HTTP client because the body never ends — a client that waits for
+    /// completion would wait forever.
+    async fn stream_frames(front: &AdminFront, last_event_id: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let addr = front.local_addr();
+        let resume = last_event_id
+            .map(|id| format!("Last-Event-ID: {id}\r\n"))
+            .unwrap_or_default();
+        let mut socket = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the front");
+        socket
+            .write_all(
+                format!(
+                    "GET /imposters/{CURSOR_TEST_PORT}/savedRequests/stream HTTP/1.1\r\n\
+                     Host: {addr}\r\nAccept: text/event-stream\r\n{resume}\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write the stream request");
+
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Read until the first drain has plainly happened (a `request` or `lagged` frame), or the
+        // window closes — an idle stream legitimately sends nothing more than `hello`.
+        while std::time::Instant::now() < deadline {
+            let mut buf = [0_u8; 8192];
+            match tokio::time::timeout(Duration::from_millis(300), socket.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(read)) => seen.extend_from_slice(&buf[..read]),
+                Ok(Err(e)) => panic!("the stream connection failed mid-read: {e}"),
+                Err(_) => {}
+            }
+            let text = String::from_utf8_lossy(&seen);
+            if text.contains("event: lagged") || text.contains("event: request") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
     fn header_of(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
         headers
             .get(name)
@@ -6010,6 +6041,59 @@ mod tests {
     /// aborted. A panic in the loop left the node a zombie cluster member —
     /// public admin dead, still a Raft voter, `/readyz` still 200 — and nothing
     /// waiting on it, so `serve_until` never returned. An abort that `shutdown`
+    /// The `lagged` half of issue #348's honesty rule: retention overtaking a reader is
+    /// **announced**, not quietly skipped over.
+    ///
+    /// Worth an end-to-end test rather than trusting the flag: `truncated` is computed by the
+    /// merge and the stream just forwards it, so the only thing that can break here is the
+    /// forwarding — which no unit test of the merge would ever notice. Uses the same tiny
+    /// retention cap `eviction_stamps_the_truncation_header_on_a_stale_cursor` does, so eviction
+    /// is immediate and deterministic instead of ten thousand recordings away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eviction_past_a_resuming_reader_is_announced_as_lagged() {
+        let journal = rift_cluster::stores::ClusterJournal::with_parts(
+            1,
+            rift_cluster::stores::JournalConfig {
+                fleet_capacity: 2,
+                min_shard_cap: 2,
+                ..Default::default()
+            },
+            Arc::new(rift_cluster::stores::journal::MonotonicClock::default()),
+        );
+        let (front, _node, journal, _dir) = test_front_over(journal).await;
+
+        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
+        let (_, headers, _) = read_requests(&front, None).await;
+        let early = header_of(&headers, HEADER_NEXT_INDEX).expect("a cursor");
+
+        // Push past the cap, so the shard's watermark climbs above where `early` points and the
+        // entries that reader had not reached are gone for good.
+        for path in ["/bb", "/ccc", "/dddd", "/eeeee"] {
+            RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded(path));
+        }
+
+        let body = stream_frames(&front, Some(&early)).await;
+        assert!(
+            body.contains("event: lagged"),
+            "a reader whose position predates the eviction watermark must be told, not silently \
+             served the remainder as though nothing were missing: {body}"
+        );
+        assert!(
+            body.contains("\"truncated\": true") || body.contains("\"truncated\":true"),
+            "the lagged frame says what was lost: {body}"
+        );
+
+        // The vacuity guard: a reader that has missed nothing must NOT be told it lagged, or the
+        // assertion above would pass on a stream that cries wolf on every connection.
+        let (_, headers, _) = read_requests(&front, None).await;
+        let current = header_of(&headers, HEADER_NEXT_INDEX).expect("a cursor");
+        let body = stream_frames(&front, Some(&current)).await;
+        assert!(
+            !body.contains("event: lagged"),
+            "an up-to-date reader has no hole and must not be told it has one: {body}"
+        );
+    }
+
     /// did not request takes byte-for-byte the same path as a panic unwind:
     /// the drop guard runs and classifies it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
