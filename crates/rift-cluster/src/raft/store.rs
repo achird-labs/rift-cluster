@@ -7984,8 +7984,7 @@ mod tests {
             .read_config(DEFAULT_TENANT, 8080)
             .expect("read config")
             .expect("imposter present");
-        let config: ImposterConfig =
-            serde_json::from_str(&config_json).expect("config parses");
+        let config: ImposterConfig = serde_json::from_str(&config_json).expect("config parses");
         assert_eq!(
             config.stubs.len(),
             2,
