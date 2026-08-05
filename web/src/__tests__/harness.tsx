@@ -33,6 +33,13 @@ export type Reply = ({ json: unknown; status?: number } | { status: number; json
  * A fetch double keyed by the *path* the console asks for, so a test states the fleet's answers
  * rather than the order of calls. An unmatched path is a hard failure: a screen quietly reaching
  * for a route the test never modelled is exactly the drift these tests exist to catch.
+ *
+ * Matching is exact first, then falls back to the path with its query string stripped — so a test
+ * that only cares about a route's *base* answer (most of them) does not have to enumerate every
+ * `?since=` cursor the request log might send, while a test that DOES care about a specific cursored
+ * URL (the server-cursor tests) can still model that exact string and have it win over the fallback.
+ * The failure-on-unmatched-path behaviour is unchanged: a path that matches neither is still a hard
+ * failure, not a silent 404.
  */
 /** One call as it was actually sent, for tests that assert on the verb or the payload. */
 export type SentRequest = {
@@ -61,7 +68,7 @@ export function stubFetch(routes: Record<string, Reply>): {
         // the caller passed a `Headers`, an array of pairs, or an object literal.
         headers: Object.fromEntries(new Headers(init?.headers).entries()),
       });
-      const reply = routes[path];
+      const reply = routes[path] ?? routes[path.split("?")[0] ?? path];
       if (reply === undefined) {
         return Promise.reject(new Error(`test stub has no reply for ${path}`));
       }

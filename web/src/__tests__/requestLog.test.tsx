@@ -66,35 +66,98 @@ afterEach(() => {
   setTabVisibility("visible");
 });
 
-describe("degraded-mode label (RFC-006 §11 exit criterion)", () => {
-  // The criterion says a test that only checks the rows would pass on the lying version, so this
-  // asserts the scope label itself and the node it names.
-  it("names the node in scope and how many nodes it does not represent", async () => {
+describe("the merged journal (#147 H — the epic's exit criterion)", () => {
+  // #189 shipped this screen deliberately per-node-labelled and said the label would disappear on
+  // its own once the merged journal landed. The epic's words: "M3 does not close with the console
+  // still saying per-node." So the assertion is that the element is **absent**, not that its text
+  // changed — an empty-but-present label would satisfy a weaker test and still say nothing true.
+  it("renders no scope label at all when the merge reached every node", async () => {
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
     renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
 
-    // Waits for the fleet reading to land: until it does the label correctly declines to name a
-    // node, and asserting on that first render would test the pending state instead of the fact.
-    await waitFor(() =>
-      expect(screen.getByTestId("request-scope-label").textContent).toContain("node 3"),
-    );
-    const label = screen.getByTestId("request-scope-label");
-    expect(label.textContent).toContain("2 other");
-    expect(label.textContent).toMatch(/one node/i);
+    // Wait for the rows, so this cannot pass merely by asserting on a screen that has not
+    // rendered yet — the failure mode a bare `queryByTestId` null-check invites.
+    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
+    expect(screen.queryByTestId("request-scope-label")).toBeNull();
   });
 
-  it("says a single-node fleet is the whole fleet rather than crying wolf", async () => {
+  // A one-voter fleet used to get its own "this node is the whole fleet" copy. It is now simply a
+  // complete merge like any other, so it must be label-free too rather than keeping a special case.
+  it("renders no scope label on a single-node fleet either", async () => {
     stubFetch({ ...SINGLE_NODE, [REQUESTS]: { json: [recorded()] } });
     renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
 
-    await waitFor(() =>
-      expect(screen.getByTestId("request-scope-label").textContent).toMatch(/whole fleet/i),
-    );
+    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
+    expect(screen.queryByTestId("request-scope-label")).toBeNull();
   });
 
-  // A principal below fleet-admin is refused `/_fleet/*`, so the node cannot be named. Saying
-  // nothing would present a per-node log as if its coverage were settled.
-  it("still says the view is per-node when the fleet projection is refused", async () => {
+  // The label does not vanish — it changes meaning, from "this is one node" to "this merge was
+  // incomplete". Same testid, same role: the plumbing is what #189 built for this handover.
+  it("shows the partial-merge label when the server stamps Rift-Cluster-Partial", async () => {
+    stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: { json: [recorded()], headers: { "rift-cluster-partial": "true" } },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    const label = await screen.findByTestId("request-scope-label");
+    expect(label.getAttribute("role")).toBe("status");
+    // Says the merge was incomplete, and says nothing about "one node" — the copy this slice
+    // deletes must not survive by being reused here.
+    expect(label.textContent).toMatch(/incomplete|could not be reached|may be missing/i);
+    expect(label.textContent).not.toMatch(/one node/i);
+    expect(label.textContent).not.toMatch(/whole fleet/i);
+  });
+
+  /*
+   * The other half of the criterion, and the half a regression would actually hit: "peer back →
+   * label gone **without user action**". Asserting only that the label appears would be satisfied
+   * by an implementation that latches it on forever — coverage held in a ref, or OR-ed with a
+   * stale value — and an operator would go on being told the merge is incomplete long after it
+   * healed. Coverage has to be derived fresh from each response, and only a poll-driven
+   * disappearance proves it is.
+   */
+  it("drops the partial label on its own once the merge reaches every node again", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let partial = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const path = typeof input === "string" ? input : input.toString();
+        if (path === "/_fleet/members") {
+          return Promise.resolve(
+            new Response(JSON.stringify(THREE_NODE["/_fleet/members"].json), { status: 200 }),
+          );
+        }
+        if (path === "/_fleet/health") {
+          return Promise.resolve(
+            new Response(JSON.stringify(THREE_NODE["/_fleet/health"].json), { status: 200 }),
+          );
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify([recorded()]), {
+            status: 200,
+            headers: partial ? { "rift-cluster-partial": "true" } : {},
+          }),
+        );
+      }),
+    );
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    await screen.findByTestId("request-scope-label");
+
+    // The peer comes back. No click, no reload — just the next poll.
+    partial = false;
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS * 2 + 100);
+
+    await waitFor(() => expect(screen.queryByTestId("request-scope-label")).toBeNull());
+    vi.useRealTimers();
+  });
+
+  // Coverage now comes from the response, not from fleet topology — so a principal refused
+  // `/_fleet/*` gets the same complete-merge answer as anyone else, rather than a per-node label.
+  // This is the test that proves the topology inference is really gone rather than merely unused.
+  it("does not fall back to a per-node label when the fleet projection is refused", async () => {
     stubFetch({
       "/_fleet/members": { status: 404, json: { message: "not found" } },
       "/_fleet/health": { status: 404, json: { message: "not found" } },
@@ -102,9 +165,346 @@ describe("degraded-mode label (RFC-006 §11 exit criterion)", () => {
     });
     renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("editor") });
 
-    const label = await screen.findByTestId("request-scope-label");
-    expect(label.textContent).toMatch(/one node/i);
-    expect(label.textContent).not.toMatch(/whole fleet/i);
+    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
+    expect(screen.queryByTestId("request-scope-label")).toBeNull();
+  });
+});
+
+describe("the per-node copy is gone from the source, not just from the screen", () => {
+  /*
+   * A grep-level assertion, in the suite, on purpose (an explicit acceptance criterion).
+   *
+   * Every other test here proves the label is not *rendered* in the states it exercises. None of
+   * them can prove the strings are gone: a branch left behind for some state nobody wrote a test
+   * for would keep saying "One node's traffic" and the suite would stay green. Reading the source
+   * is the only assertion that closes that, and the criterion asks for exactly it — "so a
+   * regression cannot ship silently".
+   */
+  it("no longer contains the per-node strings anywhere in web/src", async () => {
+    const { readdir, readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+
+    async function sources(dir: string): Promise<string[]> {
+      const found: string[] = [];
+      for (const item of await readdir(dir, { withFileTypes: true })) {
+        const full = join(dir, item.name);
+        if (item.isDirectory()) found.push(...(await sources(full)));
+        else if (/\.(ts|tsx)$/.test(item.name)) found.push(full);
+      }
+      return found;
+    }
+
+    // This file necessarily names the strings in order to assert they are absent, so it is the one
+    // exemption — and it is exempted by path rather than by a looser pattern, so a *new* file
+    // reintroducing the copy is still caught.
+    const self = join("src", "__tests__", "requestLog.test.tsx");
+    const files = (await sources("src")).filter((path) => !path.endsWith(self));
+
+    /*
+     * The two label *sentences*, not the loose words. "whole fleet" on its own appears in
+     * unrelated prose that this slice has no business deleting — the audit endpoint's "a
+     * FleetAdmin sees the whole fleet's rows" in the generated `schema.ts`, and similar in
+     * `fleetView.ts` / `Sources.tsx`. Matching those would make this assertion fail for reasons
+     * that have nothing to do with the request log, and the usual repair for a noisy guard is to
+     * loosen it until it stops meaning anything. Anchoring on the exact copy keeps it strict
+     * where it matters: either sentence reappearing anywhere under `src` fails this test.
+     */
+    const offenders: string[] = [];
+    for (const file of files) {
+      const text = await readFile(file, "utf8");
+      if (/One node's traffic|This node is the whole fleet/i.test(text)) offenders.push(file);
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe("server cursor replaces client-side slicing", () => {
+  // The screen used to refetch the whole journal every 2 s and slice it locally. The cursor #225
+  // added makes each poll a delta fetch: send back the token the last response issued.
+  it("sends the issued cursor as ?since= on the next poll", async () => {
+    // `shouldAdvanceTime` so the fetch double's promises still settle while the clock is driven
+    // manually — the idiom the polling tests below already use.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { requests } = stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: {
+        json: [recorded()],
+        headers: { "x-rift-next-index": "eyJ2IjoxfQ" },
+      },
+      [`${REQUESTS}?since=eyJ2IjoxfQ`]: {
+        json: [recorded({ path: "/v1/payments/second" })],
+        headers: { "x-rift-next-index": "eyJ2IjoyfQ" },
+      },
+      // Stubbed explicitly so a third poll gets an empty delta. Without it the harness's
+      // query-stripping fallback would answer the *baseline* page, appending a duplicate row and
+      // making the assertions below flake on timing rather than on behaviour.
+      [`${REQUESTS}?since=eyJ2IjoyfQ`]: { json: [], headers: { "x-rift-next-index": "eyJ2IjoyfQ" } },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
+
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS + 1);
+
+    await waitFor(() =>
+      expect(requests.some((sent) => sent.path === `${REQUESTS}?since=eyJ2IjoxfQ`)).toBe(true),
+    );
+    // The delta is appended, not swapped in: the first page's row must still be on screen, or the
+    // "incremental" poll has silently become a destructive one.
+    expect(await screen.findByText("/v1/payments/second")).toBeTruthy();
+    expect(screen.getByText("/v1/payments/status")).toBeTruthy();
+  });
+
+  /*
+   * The cursor accumulates rows across polls, which makes "the journal got *smaller*" the case it
+   * can silently get wrong — and the clear button is on this very screen.
+   *
+   * A clear invalidates the query, but an invalidation is just a refetch: it re-runs the same
+   * `queryFn`, which still holds the cursor issued before the clear. That poll asks
+   * `?since=<pre-clear token>`, is correctly told there is nothing after it, and appends an empty
+   * delta to rows the server has already thrown away. The operator clears the log and watches
+   * every entry stay exactly where it was.
+   */
+  it("re-reads from the start after a clear instead of resuming the pre-clear cursor", async () => {
+    const { requests } = stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: { json: [recorded()], headers: { "x-rift-next-index": "eyJ2IjoxfQ" } },
+      [`${REQUESTS}?since=eyJ2IjoxfQ`]: { json: [], headers: { "x-rift-next-index": "eyJ2IjoxfQ" } },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("clear-requests"));
+    await user.click(screen.getByTestId("confirm-destructive"));
+
+    /*
+     * Asserted on the *request*, not on the rendered rows, because the fetch double serves one
+     * fixed journal: it cannot go empty the way a real server does after a DELETE, so a
+     * rows-disappeared assertion would be testing the stub rather than the screen. The defect is
+     * upstream of the rendering anyway — what went wrong was which URL the post-clear read asked
+     * for. Resuming `?since=<pre-clear token>` gets an empty delta appended to rows the server has
+     * just discarded, and the log never empties on screen no matter what the server says.
+     */
+    await waitFor(() => {
+      const deleted = requests.findIndex((sent) => sent.method === "DELETE");
+      expect(deleted).toBeGreaterThanOrEqual(0);
+      const after = requests.slice(deleted + 1).filter((sent) => sent.method === "GET");
+      expect(after.some((sent) => sent.path === REQUESTS)).toBe(true);
+    });
+  });
+
+  /*
+   * A blip in the middle of a cursored walk. The accumulation makes this the case worth pinning:
+   * a failed poll discards the rows *and* the cursor, so what matters is that recovery is a
+   * genuine restart rather than a resume from a cursor whose rows are gone — that would append
+   * the delta to nothing and show a journal missing its beginning.
+   *
+   * Blanking to "unknown" on a failed read is the screen's existing, deliberate contract (an
+   * unreadable log is not an empty one), so this asserts recovery, not that the rows survive.
+   */
+  it("restarts the walk from the beginning after a failed poll, losing and duplicating nothing", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let mode: "ok" | "down" = "ok";
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const path = typeof input === "string" ? input : input.toString();
+        if (path.startsWith("/_fleet/")) {
+          const json =
+            path === "/_fleet/members"
+              ? THREE_NODE["/_fleet/members"].json
+              : THREE_NODE["/_fleet/health"].json;
+          return Promise.resolve(new Response(JSON.stringify(json), { status: 200 }));
+        }
+        seen.push(path);
+        if (mode === "down") return Promise.resolve(new Response("{}", { status: 503 }));
+        // A cursored read answers the **delta**, which here is empty — the one row was already
+        // handed over by the uncursored read that issued the cursor. Serving the row again to a
+        // `?since=` poll would be the fake contradicting the endpoint it stands in for, and the
+        // duplicate it produced would look exactly like the accumulation bug this test hunts.
+        const body = path.includes("?since=") ? [] : [recorded()];
+        return Promise.resolve(
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "x-rift-next-index": "eyJ2IjoxfQ" },
+          }),
+        );
+      }),
+    );
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
+
+    mode = "down";
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS * 2 + 100);
+    mode = "ok";
+    seen.length = 0;
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS * 2 + 100);
+
+    // The recovery read is uncursored — a resume would ask for entries after a token whose rows
+    // the failure already threw away.
+    await waitFor(() => expect(seen.some((path) => path === REQUESTS)).toBe(true));
+    // And exactly one row is on screen, not two: the restart replaced rather than appended.
+    await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBe(1));
+    vi.useRealTimers();
+  });
+
+  /*
+   * The contract's own warning, made a test: "Concatenating pages is not a globally sorted stream —
+   * a peer that becomes reachable between pages contributes entries older than everything already
+   * returned" (`openapi-ee.yaml`, the `x-rift-next-index` description). That is the degraded-fan-out
+   * moment the partial label announces, so a blind append puts a chronological screen out of order
+   * exactly when an operator is leaning on it to find "the call I just made".
+   */
+  it("re-sorts an appended delta rather than trusting page order", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let served = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const path = typeof input === "string" ? input : input.toString();
+        if (path.startsWith("/_fleet/")) {
+          const json =
+            path === "/_fleet/members"
+              ? THREE_NODE["/_fleet/members"].json
+              : THREE_NODE["/_fleet/health"].json;
+          return Promise.resolve(new Response(JSON.stringify(json), { status: 200 }));
+        }
+        served += 1;
+        // Page 2 is the peer coming back: its entry is OLDER than page 1's.
+        const body =
+          served === 1
+            ? [recorded({ path: "/v1/late", timestamp: "2026-07-31T10:00:09Z" })]
+            : [recorded({ path: "/v1/early", timestamp: "2026-07-31T10:00:01Z" })];
+        return Promise.resolve(
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "x-rift-next-index": `tok-${served}` },
+          }),
+        );
+      }),
+    );
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    expect(await screen.findByText("/v1/late")).toBeTruthy();
+
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS + 100);
+    await screen.findByText("/v1/early");
+
+    await waitFor(() => {
+      const shown = screen.getAllByTestId("request-row").map((row) => row.textContent ?? "");
+      const early = shown.findIndex((text) => text.includes("/v1/early"));
+      const late = shown.findIndex((text) => text.includes("/v1/late"));
+      expect(early).toBeGreaterThanOrEqual(0);
+      expect(late).toBeGreaterThanOrEqual(0);
+      expect(early).toBeLessThan(late);
+    });
+    vi.useRealTimers();
+  });
+
+  /*
+   * The accumulation has to reconcile with the fleet eventually, or this screen quietly becomes a
+   * museum. The server stamps a cursor on every 200, so nothing ever *asks* it to re-baseline: a
+   * clear issued from another tab, the CLI or an SDK regresses no token and sets no `truncated`,
+   * and evicted rows likewise just stop being mentioned. Both leave rows on screen forever unless
+   * the client periodically re-reads the whole thing.
+   */
+  it("drops the cursor periodically so the list re-baselines against the fleet", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const asked: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const path = typeof input === "string" ? input : input.toString();
+        if (path.startsWith("/_fleet/")) {
+          const json =
+            path === "/_fleet/members"
+              ? THREE_NODE["/_fleet/members"].json
+              : THREE_NODE["/_fleet/health"].json;
+          return Promise.resolve(new Response(JSON.stringify(json), { status: 200 }));
+        }
+        asked.push(path);
+        return Promise.resolve(
+          new Response(JSON.stringify(path.includes("?since=") ? [] : [recorded()]), {
+            status: 200,
+            headers: { "x-rift-next-index": "tok" },
+          }),
+        );
+      }),
+    );
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    expect(await screen.findByText("/v1/payments/status")).toBeTruthy();
+
+    // Well past the re-baseline threshold.
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS * 40 + 100);
+
+    await waitFor(() => {
+      // More than the very first read asked without a cursor: the walk re-baselined at least once.
+      const uncursored = asked.filter((path) => !path.includes("?since=")).length;
+      expect(uncursored).toBeGreaterThan(1);
+    });
+    vi.useRealTimers();
+  });
+
+  // The honesty bit. Quiet, but present — a reader who lost entries to retention must not think
+  // the gap is the system under test never having called the mock.
+  it("surfaces a notice when the server stamps x-rift-truncated", async () => {
+    stubFetch({
+      ...THREE_NODE,
+      [REQUESTS]: {
+        json: [recorded()],
+        headers: { "x-rift-truncated": "true" },
+      },
+    });
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+
+    expect(
+      await screen.findByText(/evicted|older entries/i, {}, { timeout: 2000 }),
+    ).toBeTruthy();
+  });
+
+  /*
+   * The gap the notice describes is permanent; the header announcing it is not. The server sets
+   * `x-rift-truncated` on the single read whose position predates the shard watermark — the next
+   * poll presents a position above it and the header is simply absent. Taking the notice from the
+   * latest response alone would erase it after one 2 s tick while the hole it warned about is
+   * still sitting in the middle of the rows on screen, which is a swallowed warning on the one
+   * screen built to keep "incomplete" and "empty" apart.
+   */
+  it("keeps the truncation notice after the header stops being sent", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let first = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const path = typeof input === "string" ? input : input.toString();
+        if (path.startsWith("/_fleet/")) {
+          const json =
+            path === "/_fleet/members"
+              ? THREE_NODE["/_fleet/members"].json
+              : THREE_NODE["/_fleet/health"].json;
+          return Promise.resolve(new Response(JSON.stringify(json), { status: 200 }));
+        }
+        const headers: Record<string, string> = { "x-rift-next-index": "tok" };
+        if (first) headers["x-rift-truncated"] = "true";
+        first = false;
+        return Promise.resolve(
+          new Response(JSON.stringify(path.includes("?since=") ? [] : [recorded()]), {
+            status: 200,
+            headers,
+          }),
+        );
+      }),
+    );
+    renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
+    expect(await screen.findByText(/evicted|older entries/i)).toBeTruthy();
+
+    // Two further polls, neither carrying the header.
+    await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS * 2 + 100);
+
+    expect(screen.queryByText(/evicted|older entries/i)).not.toBeNull();
+    vi.useRealTimers();
   });
 });
 
@@ -137,12 +537,15 @@ describe("a busy imposter", () => {
     stubFetch({ ...THREE_NODE, [REQUESTS]: { json: many } });
     renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
 
-    await screen.findByTestId("request-scope-label");
+    // Synchronises on a row, not on the scope label: #229 deletes that label for a complete
+    // merge, so waiting for it here would hang forever on the very state this suite now expects.
     await waitFor(() => expect(screen.getAllByTestId("request-row").length).toBeGreaterThan(0));
     expect(screen.getAllByTestId("request-row").length).toBeLessThanOrEqual(50);
-    // The total is phrased per-node so it cannot be read as a fleet figure.
+    // The total is now a plain fleet figure. #189 qualified it "this node" precisely because it
+    // was one node's count; #147 H makes it the merge's, so the qualifier would be a false one —
+    // and the sweep of per-node copy this slice performs is what removes it.
     expect(screen.getByTestId("request-total").textContent).toContain("2500");
-    expect(screen.getByTestId("request-total").textContent).toMatch(/this node/i);
+    expect(screen.getByTestId("request-total").textContent).not.toMatch(/this node/i);
   });
 });
 
@@ -462,7 +865,8 @@ describe("polling (RFC-006 §6)", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { calls } = stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
     renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
-    await screen.findByTestId("request-scope-label");
+    // Waits for the first load via a row — the scope label is gone on a complete merge (#229).
+    await screen.findByTestId("request-row");
 
     const before = calls.filter((path) => path === REQUESTS).length;
     await vi.advanceTimersByTimeAsync(REQUEST_POLL_INTERVAL_MS * 3 + 100);
@@ -473,7 +877,8 @@ describe("polling (RFC-006 §6)", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { calls } = stubFetch({ ...THREE_NODE, [REQUESTS]: { json: [recorded()] } });
     renderInApp(<RequestLog port={PORT} />, { whoami: whoamiWith("fleet-admin") });
-    await screen.findByTestId("request-scope-label");
+    // Waits for the first load via a row — the scope label is gone on a complete merge (#229).
+    await screen.findByTestId("request-row");
 
     setTabVisibility("hidden");
     const whileHidden = calls.filter((path) => path === REQUESTS).length;

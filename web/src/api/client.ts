@@ -254,6 +254,60 @@ export async function apiGetWithRevision<T = unknown>(
 }
 
 /**
+ * The three headers a merge-on-read fan-out stamps on a fleet journal read (#147 D/H, #225):
+ * `admin_front.rs::terminate_read_saved_requests` and `decorate.rs`'s `HEADER_*` constants are the
+ * source of truth for the names and the additive-only convention documented on `MergedRead`.
+ */
+export const PARTIAL_HEADER = "Rift-Cluster-Partial";
+export const NEXT_INDEX_HEADER = "x-rift-next-index";
+export const TRUNCATED_HEADER = "x-rift-truncated";
+
+/** A read of a fleet-wide merge, plus the three facts only the response headers carry. */
+export type MergedRead<T> = {
+  data: T;
+  /**
+   * From `Rift-Cluster-Partial`. The header is additive-only — stamped `true` or not stamped at
+   * all, never `false` — because upstream's own clients already test against that shape, so
+   * presence is the whole signal: a merge that reached every node in its budget carries no header.
+   */
+  partial: boolean;
+  /**
+   * From `x-rift-next-index`, the opaque vector token for the next `?since=` poll, verbatim.
+   * `null` when the response carried none — a real answer meaning "no cursor offered", never a
+   * fabricated default a caller could mistake for "resume from the start".
+   */
+  next: string | null;
+  /**
+   * From `x-rift-truncated`, additive-only like `partial`: retention evicted entries the reader's
+   * cursor had not reached yet, so the merge this response describes is missing rows a slower poll
+   * would have caught in time.
+   */
+  truncated: boolean;
+};
+
+/**
+ * `apiGet`, plus the three merge-only facts a fleet-wide journal read stamps as headers rather than
+ * folding into the body — the body stays the same bare `RecordedRequest[]` a single node always
+ * served, so an older client (or a proxy that strips unknown headers) still gets a readable answer,
+ * just without the coverage and paging information this type exists to carry.
+ *
+ * Beside `apiGetWithRevision` rather than folded into `apiGet` for the same reason that one is: the
+ * one caller that needs merge facts (`useRequestLog`) is not the ninety that just want a body.
+ */
+export async function apiGetMerged<T = unknown>(
+  path: ApiPath | (string & {}),
+  options?: RequestOptions,
+): Promise<MergedRead<T>> {
+  const { response, body } = await request("GET", path, undefined, options);
+  return {
+    data: body as T,
+    partial: response.headers.get(PARTIAL_HEADER) !== null,
+    next: response.headers.get(NEXT_INDEX_HEADER),
+    truncated: response.headers.get(TRUNCATED_HEADER) !== null,
+  };
+}
+
+/**
  * Send a mutation, reporting **whether it actually landed**.
  *
  * The `SendResult` is deliberately not unwrapped here. Only 14 of the admin routes can answer

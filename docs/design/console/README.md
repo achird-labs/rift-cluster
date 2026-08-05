@@ -123,10 +123,13 @@ reads. A sparkline would imply history the API does not have, which is RFC-006 �
 UI-only") applied to charts. The single chart is magnitude-by-identity over `numberOfRequests` — a
 value the imposter body genuinely carries — and it is labelled *this node, not a fleet total*.
 
-**The request log's scope selector never collapses.** Per-node is the fact that screen must keep in
-front of the reader, so the node in scope and the count of nodes *not* represented sit permanently
-above the table rather than in a dismissible banner. When the merged journal arrives (#147) the label
-drops and the shape stays — that is the convergence RFC-006 §4 promises.
+**The request log's scope label appears only for an incomplete merge.** #147 H landed the convergence
+RFC-006 §4 promised: the screen reads the fleet's already-merged journal rather than one node's own,
+so there is no per-node fact left to keep permanently in front of the reader, and the old
+never-collapsing strip is gone with it. What survives is the one case an operator still needs told to
+them before trusting a result — the merge's own `Rift-Cluster-Partial` header, stamped when the
+fan-out could not reach every node inside its budget — and the label renders, undismissable, exactly
+then.
 
 **The console never fans out and merges client-side.** That would reinvent the verification plane
 without its cursors or gap repair, producing a merged view with no way to know what it missed.
