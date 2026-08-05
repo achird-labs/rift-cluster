@@ -900,10 +900,15 @@ pub struct RedbStateMachine {
     /// refusal that names no single port). This is node status, not replicated
     /// state — every replica has its own bind outcomes.
     apply_failures: Arc<Mutex<BTreeMap<u16, String>>>,
-    /// This node's local request journal, late-bound (issue #224): `apply`/`install_snapshot`
-    /// push a committed clear generation into it via [`ClusterJournal::set_clear_gen`] so this
-    /// replica's own shards start dropping pre-clear entries immediately, without waiting for a
-    /// caller to read `sm_journal_gens` back out.
+    /// This node's local request journal, late-bound (issue #224): `apply` pushes a committed
+    /// clear generation into it via [`ClusterJournal::set_clear_gen`], and `install_snapshot`
+    /// via [`ClusterJournal::reset_clear_gen`] — the monotone guard the apply path needs is
+    /// exactly the guard install must *not* have (see that method's doc) — so this replica's
+    /// own shards start dropping pre-clear entries immediately, without waiting for a caller to
+    /// read `sm_journal_gens` back out. `reconcile_engine` covers the third case, a cold start:
+    /// nothing re-delivers past `JournalClearGen` entries once openraft resumes from
+    /// `last_applied_log`, so a freshly built journal is rehydrated from `sm_journal_gens`
+    /// directly, the same way that method already rehydrates the engine and routes handle.
     ///
     /// `OnceLock<Weak<_>>`, mirroring `ClusterJournal`'s own late-bound `Voters::Node` slot (and
     /// `FlowNet`'s node slot): the journal is built in `compose.rs` before the Raft node exists
@@ -1856,6 +1861,16 @@ impl RedbStateMachine {
     /// *new* entries onto the engine, so a restarted node must run this once to
     /// materialize what its tables already hold. A no-op without an engine;
     /// engine-side failures land in [`Self::apply_failures`] as usual.
+    ///
+    /// Also rehydrates the local [`ClusterJournal`]'s clear generations from `sm_journal_gens`
+    /// (issue #224, Blocker 2). The generation lives in two places: durably in redb, and in the
+    /// process-local journal that stamps every appended entry. A restart rebuilds only the
+    /// latter from scratch — openraft resumes replay from `last_applied_log`, so the
+    /// `JournalClearGen` entries that built the durable rows are never re-applied, and nothing
+    /// else re-primes the in-memory copy. Without this, a restarted node's `clear_gen` silently
+    /// reads back as `0` — "never cleared" — and every subsequent request it records is stamped
+    /// as pre-clear, resurrecting it fleet-wide the moment a merge runs, with no error and no
+    /// metric. A no-op without a bound journal, same as the engine drive above.
     #[allow(clippy::result_large_err)]
     pub async fn reconcile_engine(&self) -> StorageResult<()> {
         // Both tables read fresh, in one call: a restart's local `ImposterManager`
@@ -1895,6 +1910,36 @@ impl RedbStateMachine {
             AttributedAction::unattributed(routes_action),
         ])
         .await;
+
+        // Blocker 2: rehydrate this node's local journal from the durable generations table —
+        // see this method's doc for why nothing else does. Gated on a bound journal before
+        // opening the table at all, matching every other late-bound handle's "missing is a
+        // benign no-op" contract in this file.
+        if let Some(journal) = self.journal.get().and_then(Weak::upgrade) {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let table = read_txn
+                .open_table(SM_JOURNAL_GENS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            for item in table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (_tenant, port, space_key) = key.value();
+                // `set_clear_gen`, not `reset_clear_gen`: this is priming a journal that starts
+                // at 0, not correcting one that may be ahead the way a snapshot install must —
+                // the monotone guard is harmless here and keeps this call sharing the apply
+                // path's contract rather than install's.
+                journal.set_clear_gen(
+                    port,
+                    decode_journal_gen_space_key(space_key).as_deref(),
+                    value.value(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -3587,6 +3632,16 @@ impl RedbStateMachine {
                 // the next time this op's effect is asked about through it).
                 if let Some(journal) = journal {
                     journal.set_clear_gen(*port, space.as_deref(), next);
+                    // Blocker 1 (issue #224): a *port-wide* clear used to reach the engine
+                    // directly (`DELETE savedRequests` -> `ClusterJournal::clear`), which is
+                    // what zeroed `numberOfRequests`. Now that the same clear is a generation
+                    // bump committed through Raft, nothing else zeroes it — so this node zeros
+                    // its own count slot right here, on apply. A space-scoped bump must NOT do
+                    // this: `clear_flow`/`retain` deliberately preserve the count for a scoped
+                    // deletion, and a scoped `JournalClearGen` has to match that.
+                    if space.is_none() {
+                        journal.zero_count(*port);
+                    }
                 }
                 Ok(Ok(Vec::new()))
             }
@@ -4578,8 +4633,15 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             // module doc: entries key on `(node_id, seq, clear_gen)`, nothing tenant-shaped), so
             // only `port`/`space`/`generation` travel across this boundary; `tenant` stays behind
             // in `sm_journal_gens`, which is the source of truth `journal_gen` reads back from.
+            //
+            // `reset_clear_gen`, not `set_clear_gen` (Non-blocker 1): the durable table was just
+            // cleared and reinserted from this exact payload, unconditionally, because a
+            // generation this node still held could be higher than what the fleet now agrees on
+            // — `set_clear_gen`'s `fetch_max` cannot lower to match, and leaving it high would
+            // let one node's forgotten-but-not-really clear silently win the fleet-wide max a
+            // merge computes, dropping every other node's entries.
             for (_tenant, port, space, generation) in &payload.journal_gens {
-                journal.set_clear_gen(*port, space.as_deref(), *generation);
+                journal.reset_clear_gen(*port, space.as_deref(), *generation);
             }
         }
 
@@ -4636,7 +4698,8 @@ mod tests {
     use super::{SESSION_KEY_ROW, SM_PRINCIPALS_TABLE, SM_SESSION_KEY_TABLE};
     use crate::control::hash_api_key;
     use rift_cluster_base::seams::{
-        CompiledRoutes, ImposterConfig, ImposterManager, Route, RouteMatch, RouteTable, RouteTarget,
+        CompiledRoutes, ImposterConfig, ImposterManager, RecordedRequest, RequestJournal,
+        ResponseMode, Route, RouteMatch, RouteTable, RouteTarget,
     };
     use serde_json::json;
     use tempfile::TempDir;
@@ -7339,6 +7402,174 @@ mod tests {
             sm.journal_gen(DEFAULT_TENANT, 8080, None)
                 .expect("read gen"),
             0
+        );
+    }
+
+    /// Blocker 1: before this feature, an unscoped `DELETE savedRequests` proxied to the
+    /// engine's `ClusterJournal::clear`, which zeroed the count slot behind `numberOfRequests`.
+    /// The op now commits as a generation bump instead, so nothing else zeroes it — this pins
+    /// that the apply path does the zeroing itself, for a port-wide clear.
+    #[tokio::test]
+    async fn a_port_wide_clear_resets_the_fleet_count() {
+        let journal = ClusterJournal::new(1);
+        let (_td, sm) = fresh_sm(None).await;
+        let mut sm = sm.with_journal(&journal);
+        journal.note_request(8080);
+        journal.note_request(8080);
+        assert_eq!(
+            journal.read_shard_since(8080, 0).count_slot,
+            2,
+            "counted before the clear"
+        );
+
+        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
+
+        assert_eq!(
+            journal.read_shard_since(8080, 0).count_slot,
+            0,
+            "a port-wide clear applying through Raft must zero this node's own count slot"
+        );
+    }
+
+    /// Blocker 1's other half: a space-scoped bump must leave the count alone, matching
+    /// `clear_flow`/`retain`'s existing contract that a scoped deletion never resets the total.
+    #[tokio::test]
+    async fn a_space_scoped_clear_leaves_the_count_alone() {
+        let journal = ClusterJournal::new(1);
+        let (_td, sm) = fresh_sm(None).await;
+        let mut sm = sm.with_journal(&journal);
+        journal.note_request(8080);
+        journal.note_request(8080);
+
+        apply_one(&mut sm, 1, journal_clear(1, 8080, Some("f"))).await;
+
+        assert_eq!(
+            journal.read_shard_since(8080, 0).count_slot,
+            2,
+            "a space-scoped bump must not touch the count slot"
+        );
+    }
+
+    /// Blocker 2: the generation lives in `sm_journal_gens` (durable) and in the process-local
+    /// journal (rebuilt from scratch on every restart). Simulates a cold start — apply clears
+    /// against an sm with no journal bound (as if this were a previous process's commits, now
+    /// only durable), then bind a *fresh* journal the way a restarted process would and run the
+    /// same reconcile the compose cold-start loop calls once caught up to the leader.
+    #[tokio::test]
+    async fn clear_generations_are_rehydrated_after_a_restart() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
+        apply_one(&mut sm, 2, journal_clear(2, 8080, Some("f"))).await;
+
+        let journal = ClusterJournal::new(1);
+        let sm = sm.with_journal(&journal);
+        assert_eq!(
+            journal.read_shard_since(8080, 0).clear_gen,
+            0,
+            "a fresh journal starts at generation 0, exactly the dangerous default this test \
+             must not observe after reconcile"
+        );
+
+        sm.reconcile_engine().await.expect("reconcile");
+
+        let shard = journal.read_shard_since(8080, 0);
+        assert_eq!(
+            shard.clear_gen, 1,
+            "the port-wide generation must be rehydrated from sm_journal_gens on cold start"
+        );
+        assert_eq!(
+            shard.space_gens,
+            vec![("f".to_owned(), 1)],
+            "a space-scoped generation must be rehydrated too"
+        );
+
+        // And a fresh append is stamped with the rehydrated generation, not 0 — the whole
+        // point of rehydrating before anything else can record.
+        journal.record_indexed(
+            8080,
+            "f",
+            RecordedRequest {
+                mode: ResponseMode::Text,
+                request_from: "t".into(),
+                method: "GET".into(),
+                path: "/after-restart".into(),
+                query: Default::default(),
+                headers: Default::default(),
+                body: None,
+                timestamp: "t".into(),
+                match_outcome: None,
+            },
+        );
+        let stamped = journal.read_shard_since(8080, 0).entries;
+        assert_eq!(stamped.len(), 1);
+        assert_eq!(
+            (stamped[0].clear_gen, stamped[0].space_gen),
+            (1, 1),
+            "a post-restart append must be stamped with the rehydrated generations, not 0"
+        );
+    }
+
+    /// Non-blocker 1: `install_snapshot` clears and reinserts `sm_journal_gens` from the
+    /// payload precisely because a generation this node still holds can be *higher* than what
+    /// the fleet now agrees on — a stale leader that cleared, was partitioned, and rejoined by
+    /// snapshot from a peer that never saw it. The live journal must follow the durable table
+    /// down too, or this node's stuck-high generation silently wins the fleet-wide max a merge
+    /// computes and drops every other node's entries.
+    #[tokio::test]
+    async fn installing_a_snapshot_lowers_a_live_generation_that_is_ahead() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
+        let snapshot: Snapshot<TypeConfig> = sm.build_snapshot().await.expect("build snapshot");
+
+        let journal = ClusterJournal::new(1);
+        journal.set_clear_gen(8080, None, 99);
+        assert_eq!(journal.read_shard_since(8080, 0).clear_gen, 99);
+
+        let (_td2, restored) = fresh_sm(None).await;
+        let mut restored = restored.with_journal(&journal);
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install snapshot");
+
+        assert_eq!(
+            journal.read_shard_since(8080, 0).clear_gen,
+            1,
+            "install_snapshot must be able to LOWER a live generation that outran the fleet's \
+             agreed value — set_clear_gen's fetch_max cannot do this"
+        );
+    }
+
+    /// Non-blocker 2: `journal_generations_survive_a_snapshot_install` above never binds a
+    /// journal (`fresh_sm(None)` both sides), so it only ever exercised the durable table — the
+    /// loop that pushes into the *live* journal never ran in any test. This sibling binds one on
+    /// both the source and the installing state machine and asserts the live journal actually
+    /// received the generations, port-wide and space-scoped.
+    #[tokio::test]
+    async fn a_snapshot_install_pushes_generations_into_the_bound_live_journal() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
+        apply_one(&mut sm, 2, journal_clear(2, 8080, Some("f"))).await;
+        let snapshot: Snapshot<TypeConfig> = sm.build_snapshot().await.expect("build snapshot");
+
+        let journal = ClusterJournal::new(1);
+        let (_td2, restored) = fresh_sm(None).await;
+        let mut restored = restored.with_journal(&journal);
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install snapshot");
+
+        let shard = journal.read_shard_since(8080, 0);
+        assert_eq!(
+            shard.clear_gen, 1,
+            "install_snapshot must push the port-wide generation into the live journal, not \
+             just the durable table"
+        );
+        assert_eq!(
+            shard.space_gens,
+            vec![("f".to_owned(), 1)],
+            "and the space-scoped generation too"
         );
     }
 

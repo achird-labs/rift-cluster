@@ -381,15 +381,23 @@ impl ClusterJournal {
     /// Apply a clear generation bump for `port` (issue #224): `space: None` raises the port's
     /// own generation, which every subsequent append is stamped with regardless of space;
     /// `Some(space)` raises only that space's. This is *applied* Raft state — the state
-    /// machine calls it when `ControlOp::JournalClearGen` commits, never a caller working
-    /// ahead of consensus — so it must be monotone per key: a late or re-delivered apply
-    /// carrying a lower generation than what is already stamped is ignored rather than
-    /// un-clearing a port a newer entry already committed.
+    /// machine calls it from the apply path when `ControlOp::JournalClearGen` commits, never a
+    /// caller working ahead of consensus — so it must be monotone per key: a late or
+    /// re-delivered apply carrying a lower generation than what is already stamped is ignored
+    /// rather than un-clearing a port a newer entry already committed. Apply is strictly
+    /// increasing per key by construction (each commit stores `current + 1`), so this guard
+    /// only ever fires against a duplicate or out-of-order redelivery, never a legitimate one.
+    ///
+    /// This monotonicity is specific to the apply path. [`Self::reset_clear_gen`] is the other
+    /// caller of this generation — snapshot install — and deliberately does *not* go through
+    /// here: a fleet's agreed-on generation can be *lower* than what this node still holds, and
+    /// `fetch_max` structurally cannot express that.
     ///
     /// Creates the port's shard if this is the first thing ever recorded against it — a clear
     /// can commit before any append does. Touches nothing else: `seq`, `evicted_below_seq`,
     /// the entries and the count slot stay exactly as `record_indexed` and the deletion
-    /// methods left them, because losing entries is not this method's job.
+    /// methods left them, because losing entries is not this method's job. See
+    /// [`Self::zero_count`] for the one apply-path case that *does* touch the count slot.
     pub fn set_clear_gen(&self, port: u16, space: Option<&str>, generation: u64) {
         let shard = self.shard(port);
         match space {
@@ -404,6 +412,52 @@ impl ClusterJournal {
                     .or_insert(generation);
             }
         }
+    }
+
+    /// Set `port`'s clear generation (or `port`'s `space`) to exactly `generation`, regardless
+    /// of what is currently stamped (issue #224, Non-blocker 1). The one caller allowed to
+    /// *lower* it: `install_snapshot` clears and reinserts `sm_journal_gens` from the payload
+    /// because a generation this node still holds could be higher than what the fleet has since
+    /// agreed on (a stale leader that cleared, was partitioned, and rejoined by snapshot from a
+    /// peer that never saw that clear) — and the live journal must follow the durable table
+    /// down, not just up, or this one node's stuck-high generation would silently win the
+    /// fleet-wide max a merge computes, dropping every other node's entries from the read.
+    ///
+    /// Never call this from the apply path — [`Self::set_clear_gen`]'s `fetch_max` is what keeps
+    /// a duplicate or re-delivered apply from un-clearing a port a newer entry already
+    /// committed, and this method has no such guard.
+    pub fn reset_clear_gen(&self, port: u16, space: Option<&str>, generation: u64) {
+        let shard = self.shard(port);
+        match space {
+            None => shard.clear_gen.store(generation, Ordering::SeqCst),
+            Some(space) => {
+                shard
+                    .space_gens
+                    .write()
+                    .insert(space.to_string(), generation);
+            }
+        }
+    }
+
+    /// Zero this node's G-counter slot for `port` (issue #224, Blocker 1). A **port-wide**
+    /// clear now commits through Raft as a generation bump rather than a call into the local
+    /// engine, so nothing else zeroes `numberOfRequests` — before this feature, the unscoped
+    /// `DELETE savedRequests` proxied straight to [`Self::clear`], which does. The apply path
+    /// calls this only for `space: None`; a space-scoped bump must leave the count alone,
+    /// matching [`Self::clear_flow`]'s and `retain`'s existing contract that a scoped deletion
+    /// never resets the total.
+    ///
+    /// Deliberately a separate operation from [`Self::set_clear_gen`], not folded into it:
+    /// `set_clear_gen` is also called by cold-start rehydration and (via
+    /// [`Self::reset_clear_gen`]) snapshot install, and re-zeroing the count on either of those
+    /// would erase real, already-committed traffic the fleet never asked to forget — only a
+    /// *newly applied* port-wide clear should ever zero it.
+    ///
+    /// Each node zeros its own slot as it applies, independently — a fleet sum taken mid-apply
+    /// can therefore differ transiently across nodes by apply lag, same as any other
+    /// per-node-on-apply projection in this state machine.
+    pub fn zero_count(&self, port: u16) {
+        self.shard(port).count.store(0, Ordering::SeqCst);
     }
 
     fn shard(&self, port: u16) -> Arc<PortShard> {

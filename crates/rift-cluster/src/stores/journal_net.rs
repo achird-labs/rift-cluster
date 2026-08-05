@@ -1117,7 +1117,10 @@ mod tests {
     /// clear it. They are separate components precisely so this cannot happen.
     #[test]
     fn a_port_bump_drops_entries_carrying_a_higher_space_generation() {
-        let mut scoped = slice(1, vec![entry_space(1, 1, 0, 5, "flow-a", "2026-01-01T00:00:01Z")]);
+        let mut scoped = slice(
+            1,
+            vec![entry_space(1, 1, 0, 5, "flow-a", "2026-01-01T00:00:01Z")],
+        );
         scoped.read.space_gens = vec![("flow-a".to_owned(), 5)];
         scoped.read.clear_gen = 1;
 
@@ -1159,8 +1162,14 @@ mod tests {
     /// the map is fleet state, not per-shard state.
     #[test]
     fn a_space_generation_from_any_slice_applies_to_every_slice() {
-        let stale = slice(1, vec![entry_space(1, 1, 0, 0, "flow-a", "2026-01-01T00:00:01Z")]);
-        let mut knows = slice(2, vec![entry_space(2, 1, 0, 2, "flow-a", "2026-01-01T00:00:02Z")]);
+        let stale = slice(
+            1,
+            vec![entry_space(1, 1, 0, 0, "flow-a", "2026-01-01T00:00:01Z")],
+        );
+        let mut knows = slice(
+            2,
+            vec![entry_space(2, 1, 0, 2, "flow-a", "2026-01-01T00:00:02Z")],
+        );
         knows.read.space_gens = vec![("flow-a".to_owned(), 2)];
 
         let merged = merge_shards(&[stale, knows], false);
