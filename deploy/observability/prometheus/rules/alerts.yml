@@ -118,6 +118,18 @@ groups:
       # during a rolling restart are `Rift-Cluster-Partial` working exactly as
       # designed, and a shorter window would page on every deploy until someone
       # muted the alert.
+      #
+      # There are now TWO causes, and #349 makes the second one SUSTAINED rather
+      # than transient — which is why the "a sustained rate is not by design"
+      # line that used to be in the description below had to go. A node that
+      # crashed and restarted keeps stamping partial for as long as its peers
+      # still cache entries of the shard it lost, and on a port that goes quiet
+      # after the restart that is indefinite: the replica cache has no age-based
+      # eviction, so it only lets go once the restarted node records `shard_cap`
+      # NEW entries on that port. The stamp is honest — those entries really are
+      # gone — but an operator paged by it must be told to check for a recent
+      # restart before hunting a partition, or the runbook sends them after a
+      # network fault that is not there.
       - alert: RiftJournalReadsDegraded
         expr: rift:journal_partial_reads:rate5m > 0
         for: 10m
@@ -125,7 +137,7 @@ groups:
           severity: warning
         annotations:
           summary: "Fleet journal reads are persistently degraded"
-          description: "rift:journal_partial_reads:rate5m has been above zero for 10 minutes: merged savedRequests reads are being stamped Rift-Cluster-Partial, so a rostered peer is unreachable or over budget and verification reads may be missing recent entries. Transient partials during a rolling restart are by design and are why the window is 10m rather than shorter; a sustained rate is not. Check rift:journal_peer_pull_failures:rate5m to see which peer."
+          description: "rift:journal_partial_reads:rate5m has been above zero for 10 minutes: merged savedRequests reads are being stamped Rift-Cluster-Partial. Two causes, and they need different responses. (1) A rostered peer is unreachable or over budget, so reads may be missing recent entries that will arrive once it returns — check rift:journal_peer_pull_failures:rate5m to see which peer. (2) A node crashed and restarted, and its peers still cache entries of the shard it lost, which are gone for good rather than late (#349); this one is expected after a restart and clears only once that node records shard_cap new entries on the port, so on a quiet port it persists. Rule out a recent restart before investigating a partition."
 
       # The recording plane's one alert (#347).
       #

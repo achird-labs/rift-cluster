@@ -44,9 +44,17 @@ pub(crate) struct ShardSlice {
 #[derive(Debug, Clone)]
 pub struct MergeOutcome {
     pub entries: Vec<ShardEntry>,
-    /// At least one roster peer was unreachable or over budget, so recent entries may be
-    /// missing. Renders as `Rift-Cluster-Partial: true`. Never means "a peer was omitted
-    /// entirely" — that peer's replica-cache entries still merge in.
+    /// This answer may be missing entries, for either of two reasons. Renders as
+    /// `Rift-Cluster-Partial: true`.
+    ///
+    /// * **Reachability** — a roster peer was unreachable, unparseable or over budget, so
+    ///   entries newer than the last successful pull may be missing.
+    /// * **Content** (issue #349) — this node is a crash-restarted writer, and a peer still
+    ///   caches entries of *our own* shard that we lost with the process. Those entries are
+    ///   gone here for good, not merely late.
+    ///
+    /// Neither ever means "a peer was omitted entirely" — that peer's replica-cache entries
+    /// still merge in.
     pub partial: bool,
 }
 
@@ -333,6 +341,14 @@ pub(crate) struct SinceReq {
     pub port: u16,
     /// Exclusive: `0` asks for the whole shard.
     pub from: u64,
+    /// Who is asking, so the responder can answer [`SinceReply::asker_cached_min`] (issue #349).
+    ///
+    /// `#[serde(default)]` for fleet skew: an older node omits it and decodes to node 0, which is
+    /// not a real node id, so the responder finds no cache for it and reports "nothing" — the
+    /// pre-#349 behaviour exactly. A decode failure is already counted as a pull failure, so the
+    /// skew path was load-bearing before this field and is unchanged by it.
+    #[serde(default)]
+    pub asker: NodeId,
 }
 
 /// A peer's answer: its own shard only, never its replicas of anyone else's.
@@ -347,6 +363,34 @@ pub(crate) struct SinceReply {
     pub clear_gen: u64,
     pub space_gens: Vec<(String, u64)>,
     pub count_slot: u64,
+    /// The **lowest** seq this responder still caches belonging to the ASKER's shard of this
+    /// port; `0` when it caches none (seqs are 1-based). Issue #349.
+    ///
+    /// This is the one datum a restarted writer needs to know it is answering short. It does not
+    /// violate the acyclicity contract above: that forbids forwarding a peer's *entries*, and
+    /// this forwards a single scalar about the asker's OWN shard, back to the only node that can
+    /// interpret it.
+    ///
+    /// Why the minimum and not the maximum: once the boot floor is in place (#351) the restarted
+    /// node's floor sits above every pre-crash seq, so a max-comparison goes permanently false
+    /// while the answer is still short. And once a peer caches a mix of pre- and post-crash
+    /// entries, the max exceeds the floor while the old entries are still missing. The minimum is
+    /// the only scalar that stays truthful for the whole divergence window.
+    ///
+    /// **This stamp does not time out, and on a quiet port it does not clear.** The replica cache
+    /// has no age-based eviction: it shrinks only when the origin's watermark advances, when the
+    /// cache's own cap drops entries, or when the cache is trimmed to a newly adopted watermark.
+    /// A restarted writer's fresh shard reports `evicted_below_seq: 0`, so the first two need it
+    /// to record `shard_cap` *new* entries on that port before the peer's cached minimum rises
+    /// above the boot floor. A port that goes quiet after the restart — a redeployed pod that is
+    /// not receiving traffic — keeps the stamp indefinitely.
+    ///
+    /// That is the honest answer, because the condition it reports is itself permanent: those
+    /// entries are not late, they are gone. But it makes a restarted node a *sustained* source of
+    /// `Rift-Cluster-Partial`, which is not what `RiftJournalReadsDegraded`'s runbook used to
+    /// assume, and that alert's description was corrected alongside this change.
+    #[serde(default)]
+    pub asker_cached_min: u64,
 }
 
 /// `POST /_cluster/journal/counts` — G-counter slots for a set of ports in one round trip.
@@ -601,6 +645,86 @@ impl JournalNet {
         cached.read.entries = entries;
     }
 
+    /// The lowest seq this node still caches of `asker`'s shard of `port` **that a merge would
+    /// actually surface**; 0 if none.
+    ///
+    /// The responder half of issue #349 — see [`SinceReply::asker_cached_min`].
+    ///
+    /// The generation filter is not optional decoration, it is what stops a false positive. A
+    /// `clear` does not purge anything from this cache: [`ClusterJournal::clear`] empties only
+    /// the origin's own deque and deliberately leaves its watermark alone, `set_clear_gen` raises
+    /// a generation and touches nothing else, and [`Self::merge_reply`]'s trim is by watermark,
+    /// not by generation. Cleared entries therefore sit here indefinitely at their original low
+    /// seqs, invisible to every merged read on every node — and reporting one of those as
+    /// `asker_cached_min` would tell a restarted asker it had lost an entry that no reader can
+    /// see anyway, stamping `Rift-Cluster-Partial` on a fleet where nothing is missing and every
+    /// node agrees.
+    ///
+    /// So the filter mirrors [`merge_shards`]'s exactly: an entry counts only if its `clear_gen`
+    /// is at the port's live generation and its `space_gen` is at that space's. Both floors are
+    /// the highest any shard reports, for the reason `merge_shards` gives — #224 raises them
+    /// through the Raft log, so a lagging shard is behind, never ahead.
+    #[must_use]
+    pub(crate) fn asker_cached_min(&self, asker: NodeId, port: u16) -> u64 {
+        // Read the local shard's generations before taking the replica lock, so the two locks are
+        // never held at once.
+        let local = self.journal.read_shard_since(port, u64::MAX);
+        let replicas = self.replicas.read();
+        let Some(cached) = replicas.get(&(asker, port)) else {
+            return 0;
+        };
+
+        let mut current_gen = local.clear_gen;
+        let mut space_floor: HashMap<&str, u64> = HashMap::new();
+        for (space, generation) in &local.space_gens {
+            space_floor.insert(space.as_str(), *generation);
+        }
+        for ((_, replica_port), replica) in replicas.iter() {
+            if *replica_port != port {
+                continue;
+            }
+            current_gen = current_gen.max(replica.read.clear_gen);
+            for (space, generation) in &replica.read.space_gens {
+                space_floor
+                    .entry(space.as_str())
+                    .and_modify(|floor| *floor = (*floor).max(*generation))
+                    .or_insert(*generation);
+            }
+        }
+
+        cached
+            .read
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.clear_gen >= current_gen
+                    && entry.space_gen
+                        >= space_floor
+                            .get(entry.flow_id.as_str())
+                            .copied()
+                            .unwrap_or(0)
+            })
+            .map(|entry| entry.seq)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Whether `cached_min`, as reported by a peer about THIS node's shard of `port`, names an
+    /// entry a crash took from us.
+    ///
+    /// The asker half of issue #349. `cached_min == 0` means the peer caches nothing of ours, so
+    /// there is nothing to be short of. Otherwise the question is whether that seq predates this
+    /// boot: #351 guarantees every seq at or below the boot floor was issued by a previous boot,
+    /// and a peer only ever caches what we actually served it, so a cached seq in that range is
+    /// necessarily an entry this process no longer holds.
+    ///
+    /// Note this is one-directional on purpose. It answers "am I missing something the fleet
+    /// still has", never "is the peer stale" — a peer caching seqs ABOVE our floor is simply
+    /// holding entries we also hold, which is the steady state and must not stamp.
+    pub(crate) fn lost_to_crash(&self, cached_min: u64, port: u16) -> bool {
+        cached_min > 0 && cached_min <= self.journal.boot_floor(port)
+    }
+
     /// One pass of the anti-entropy pull (issue #223): for every port this
     /// node knows and every other roster voter, ask what changed since the
     /// highest seq already cached for that `(peer, port)`, and merge the
@@ -642,8 +766,9 @@ impl JournalNet {
                 let from = self.replicas.read().get(&(peer, port)).map_or(0, |cached| {
                     cached.read.entries.iter().map(|e| e.seq).max().unwrap_or(0)
                 });
+                let asker = node.id();
                 set.spawn(async move {
-                    let body = match serde_json::to_vec(&SinceReq { port, from }) {
+                    let body = match serde_json::to_vec(&SinceReq { port, from, asker }) {
                         Ok(body) => body,
                         Err(e) => {
                             tracing::error!(
@@ -788,11 +913,18 @@ impl JournalNet {
     /// into every other peer's share of the budget rather than serialising the wait, which is what
     /// lets a 2 s budget survive a fleet bigger than a couple of nodes.
     ///
-    /// Returns whether the read this call backs should be marked partial: any peer that errored,
-    /// answered something unparseable, or was still outstanding when the budget ran out. A peer
-    /// that misses this call keeps whatever the replica cache already held for it — `slices_for`
-    /// reads that cache regardless of how this returns — so partial only ever means "possibly
-    /// missing entries newer than the last successful pull," never "this peer's history vanished."
+    /// Returns whether the read this call backs should be marked partial. Two distinct
+    /// conditions set it, and conflating them is how the second one went unnoticed until #349:
+    ///
+    /// * **Reachability** — any peer that errored, answered something unparseable, or was still
+    ///   outstanding when the budget ran out. A peer that misses this call keeps whatever the
+    ///   replica cache already held for it (`slices_for` reads that cache regardless of how this
+    ///   returns), so this sense means "possibly missing entries newer than the last successful
+    ///   pull," never "this peer's history vanished."
+    /// * **Content** — a peer answered successfully and reported that it still caches entries of
+    ///   THIS node's own shard at or below our boot floor (#351). That is a crash-restarted
+    ///   writer discovering the entries it lost, so here the answer really is short, and stays
+    ///   short until the peers' caches evict that range.
     ///
     /// Every failure is logged at `warn` with `peer`, `port` and the real `error`, and counted by
     /// [`crate::metrics::journal_peer_pull_failure`] — issue #223 review, B5. Before this, the
@@ -825,10 +957,11 @@ impl JournalNet {
             let from = self.replicas.read().get(&(peer, port)).map_or(0, |cached| {
                 cached.read.entries.iter().map(|e| e.seq).max().unwrap_or(0)
             });
+            let asker = node.id();
             set.spawn(async move {
                 let outcome = async {
-                    let body =
-                        serde_json::to_vec(&SinceReq { port, from }).map_err(|e| e.to_string())?;
+                    let body = serde_json::to_vec(&SinceReq { port, from, asker })
+                        .map_err(|e| e.to_string())?;
                     let reply = node
                         .call_member(peer, "POST", SINCE_PATH, body)
                         .await
@@ -847,7 +980,26 @@ impl JournalNet {
                 match joined {
                     Ok((peer, Ok(reply))) => {
                         answered.insert(peer);
+                        // Read before the move: `merge_reply` takes `reply` by value.
+                        let cached_min = reply.asker_cached_min;
                         self.merge_reply(peer, port, reply);
+                        // The second thing `partial` can mean (issue #349). Every other arm here
+                        // is about REACHABILITY — a peer we could not ask. This one is about
+                        // CONTENT: the peer answered fine, and its answer reveals that it still
+                        // holds entries of OUR shard that we no longer do.
+                        //
+                        // `<=` the boot floor is what makes that inference exact rather than a
+                        // guess: #351 guarantees every seq at or below the floor was issued by a
+                        // previous boot, and a peer only caches what we actually served it. So a
+                        // cached seq in that range is, by construction, an entry this process
+                        // lost when it crashed — our merged answer is short, and the standing
+                        // gate in 12-testing.md says a short answer must say so.
+                        //
+                        // It clears when the peers' caches finally carry that range away, which
+                        // needs `shard_cap` new recordings on this port — NOT on a timer, and
+                        // not at all on a port that goes quiet. See the field's doc: the
+                        // condition is permanent, so the stamp is too.
+                        partial |= self.lost_to_crash(cached_min, port);
                     }
                     Ok((peer, Err(e))) => {
                         answered.insert(peer);
@@ -1080,12 +1232,19 @@ pub fn journal_routes(net: Arc<JournalNet>) -> Router {
                     // third node's watermark as if it had observed it itself,
                     // which is exactly what `SinceReply`'s contract forbids.
                     let read = net.journal.read_shard_since(req.port, req.from);
+                    // What we still hold OF THE ASKER'S shard, so a restarted asker can tell that
+                    // it is answering short (issue #349). One map lookup under the same read lock
+                    // the merge already takes; entries are seq-sorted, so the minimum is the
+                    // front. Not entries, just a scalar about the asker's own shard — see the
+                    // field's doc for why that does not breach the acyclicity contract.
+                    let asker_cached_min = net.asker_cached_min(req.asker, req.port);
                     let reply = SinceReply {
                         entries: read.entries.iter().map(to_wire).collect(),
                         evicted_below_seq: read.evicted_below_seq,
                         clear_gen: read.clear_gen,
                         space_gens: read.space_gens,
                         count_slot: read.count_slot,
+                        asker_cached_min,
                     };
                     serde_json::to_vec(&reply).map_err(|e| RpcError::Handler(e.to_string()))
                 })
@@ -1230,6 +1389,7 @@ mod tests {
                 clear_gen: 0,
                 space_gens: Vec::new(),
                 count_slot: 0,
+                asker_cached_min: 0,
             }
         }
 
@@ -2123,5 +2283,238 @@ mod tests {
         let slices = vec![slice(1, vec![entry(1, 1, "2026-01-01T00:00:01Z")])];
         assert!(merge_shards_since(&slices, true, None).partial);
         assert!(!merge_shards_since(&slices, false, None).partial);
+    }
+
+    /// Issue #349 — a crash-restarted writer stamps `Rift-Cluster-Partial` instead of quietly
+    /// answering short.
+    ///
+    /// The two halves are tested separately because the drain loop that joins them
+    /// (`pull_since_budgeted`) needs a bound `RaftNode` and real RPC, which only the
+    /// compose-level suites have. What is provable here is exactly what the loop composes: what
+    /// a responder reports, and what an asker concludes from it.
+    ///
+    /// The composed behaviour is covered end-to-end by **C28**
+    /// (`c28_fleet_journal_is_exact_under_node_kill`, `tests/cluster-chaos/tests/scenarios.rs`),
+    /// which lands a real 3-node SIGKILL-and-restart and asserts the victim answers short and
+    /// STAMPED while the survivors stay complete and unstamped. That scenario arrived with #228
+    /// after this work began, and its phase-3 assertion — written to pin the unstamped answer as
+    /// a documented gap — is flipped by this change, in this PR.
+    mod restart_partial_stamp {
+        use super::*;
+
+        const ASKER: NodeId = 3;
+        const PORT: u16 = 7070;
+
+        /// A journal with durable floors under `dir`, so `boot_floor` is a real value rather
+        /// than the always-0 an ephemeral journal reports.
+        fn net_over(dir: &std::path::Path) -> Arc<JournalNet> {
+            JournalNet::new(
+                ClusterJournal::with_state_dir(1, dir).expect("journal over a state dir"),
+            )
+        }
+
+        fn reply_of(asker: NodeId, seqs: std::ops::RangeInclusive<u64>) -> SinceReply {
+            SinceReply {
+                entries: seqs
+                    .map(|seq| to_wire(&entry(asker, seq, "2026-01-01T00:00:00Z")))
+                    .collect(),
+                evicted_below_seq: 0,
+                clear_gen: 0,
+                space_gens: Vec::new(),
+                count_slot: 0,
+                asker_cached_min: 0,
+            }
+        }
+
+        #[test]
+        fn a_responder_reports_the_lowest_seq_it_caches_of_the_asker() {
+            let net = JournalNet::new(ClusterJournal::new(1));
+            // Positive control: nothing cached yet, so nothing to report.
+            assert_eq!(net.asker_cached_min(ASKER, PORT), 0);
+
+            net.merge_reply(ASKER, PORT, reply_of(ASKER, 4..=9));
+            assert_eq!(
+                net.asker_cached_min(ASKER, PORT),
+                4,
+                "the minimum, not the maximum -- see SinceReply::asker_cached_min"
+            );
+            // A different node, and a different port, are separate questions.
+            assert_eq!(net.asker_cached_min(ASKER + 1, PORT), 0);
+            assert_eq!(net.asker_cached_min(ASKER, PORT + 1), 0);
+        }
+
+        #[test]
+        fn the_gap_is_stamped_when_a_peer_still_holds_what_the_crash_took() {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            // Boot once and record, so a floor is persisted; then "crash" and come back.
+            {
+                let first = ClusterJournal::with_state_dir(1, dir.path()).expect("first boot");
+                first.record_indexed(PORT, "f", req_at("t", "/pre"));
+            }
+            let net = net_over(dir.path());
+            let floor = net.journal.boot_floor(PORT);
+            assert!(
+                floor > 0,
+                "positive control: the restart really has a floor"
+            );
+
+            // A peer reports caching one of our pre-crash entries.
+            assert!(
+                net.lost_to_crash(1, PORT),
+                "seq 1 is at or below the boot floor {floor}, so it is an entry we lost"
+            );
+        }
+
+        #[test]
+        fn no_stamp_in_steady_state() {
+            // The regression that would matter most: a false positive here degrades every read
+            // in a healthy fleet, and the strict-mode standing gate would start failing.
+            let net = JournalNet::new(ClusterJournal::new(1));
+            assert_eq!(net.journal.boot_floor(PORT), 0, "first boot has no floor");
+            assert!(!net.lost_to_crash(0, PORT), "nothing cached of ours");
+            assert!(
+                !net.lost_to_crash(1, PORT),
+                "a first boot can have lost nothing"
+            );
+            assert!(!net.lost_to_crash(u64::MAX, PORT));
+        }
+
+        #[test]
+        fn a_peer_holding_only_post_restart_entries_does_not_stamp() {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            {
+                let first = ClusterJournal::with_state_dir(1, dir.path()).expect("first boot");
+                first.record_indexed(PORT, "f", req_at("t", "/pre"));
+            }
+            let net = net_over(dir.path());
+            let floor = net.journal.boot_floor(PORT);
+
+            assert!(net.lost_to_crash(floor, PORT), "at the floor is still lost");
+            assert!(
+                !net.lost_to_crash(floor + 1, PORT),
+                "above the floor is an entry from THIS boot, which we also hold"
+            );
+        }
+
+        #[test]
+        fn the_stamp_clears_itself_once_the_peer_evicts_the_old_range() {
+            // The divergence window is bounded by the peers' caches, not latched forever.
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            {
+                let first = ClusterJournal::with_state_dir(1, dir.path()).expect("first boot");
+                first.record_indexed(PORT, "f", req_at("t", "/pre"));
+            }
+            let net = net_over(dir.path());
+            let floor = net.journal.boot_floor(PORT);
+
+            // While the peer still caches seq 1 of ours, we are short and say so.
+            assert!(net.lost_to_crash(1, PORT));
+            // Once eviction has carried its cached minimum past our floor, we are not.
+            assert!(!net.lost_to_crash(floor + 5, PORT));
+        }
+
+        #[test]
+        fn a_reply_from_an_older_node_decodes_without_the_new_fields() {
+            // Fleet skew: both fields are `#[serde(default)]`, so a node that predates #349
+            // still parses. A decode failure here would be counted as a pull failure and stamp
+            // partial for the wrong reason entirely.
+            let old_wire = r#"{"entries":[],"evicted_below_seq":0,"clear_gen":0,
+                               "space_gens":[],"count_slot":0}"#;
+            let reply: SinceReply =
+                serde_json::from_str(old_wire).expect("an older reply must still decode");
+            assert_eq!(
+                reply.asker_cached_min, 0,
+                "absent reads as 'caches nothing'"
+            );
+
+            let old_req = r#"{"port":7070,"from":0}"#;
+            let req: SinceReq =
+                serde_json::from_str(old_req).expect("an older request must still decode");
+            assert_eq!(req.asker, 0);
+
+            // And node 0 is not a real node id, so an old asker gets the pre-#349 answer.
+            let net = JournalNet::new(ClusterJournal::new(1));
+            net.merge_reply(ASKER, PORT, reply_of(ASKER, 1..=3));
+            assert_eq!(net.asker_cached_min(req.asker, req.port), 0);
+        }
+
+        #[test]
+        fn a_cleared_entry_in_a_peers_cache_does_not_stamp() {
+            // The false positive that matters most. `clear` purges nothing from a replica
+            // cache -- the origin empties its own deque, the generation rises, and cleared
+            // entries are filtered at READ time -- so a peer keeps holding them at their
+            // original low seqs forever. Reporting one of those would stamp partial on a
+            // fleet where every node's merged read is identical and nothing is missing.
+            let net = JournalNet::new(ClusterJournal::new(1));
+
+            // The peer caches three of the asker's entries, all at clear generation 0.
+            net.merge_reply(ASKER, PORT, reply_of(ASKER, 1..=3));
+            // Positive control FIRST: while they are live, they are reported.
+            assert_eq!(
+                net.asker_cached_min(ASKER, PORT),
+                1,
+                "control: an uncleared entry is reported"
+            );
+
+            // Now the port is cleared fleet-wide. #224 raises the generation through Raft, so
+            // every node -- including this responder -- sees it.
+            net.journal.set_clear_gen(PORT, None, 1);
+            assert_eq!(
+                net.asker_cached_min(ASKER, PORT),
+                0,
+                "a cleared entry is invisible to every merge, so it is not something the \
+                 asker lost -- reporting it would stamp partial with nothing missing"
+            );
+
+            // An entry recorded after the clear is live again, and is reported again.
+            let mut fresh = reply_of(ASKER, 9..=9);
+            for wire in &mut fresh.entries {
+                wire.clear_gen = 1;
+            }
+            fresh.clear_gen = 1;
+            net.merge_reply(ASKER, PORT, fresh);
+            assert_eq!(net.asker_cached_min(ASKER, PORT), 9);
+        }
+
+        #[test]
+        fn a_scope_cleared_entry_does_not_stamp_either() {
+            // Same shape one level down: `clear_flow` bumps a space generation rather than the
+            // port's, and `merge_shards` filters on it identically.
+            let net = JournalNet::new(ClusterJournal::new(1));
+            let mut reply = reply_of(ASKER, 1..=2);
+            for wire in &mut reply.entries {
+                wire.flow_id = "space-a".into();
+            }
+            net.merge_reply(ASKER, PORT, reply);
+            assert_eq!(net.asker_cached_min(ASKER, PORT), 1, "control");
+
+            net.journal.set_clear_gen(PORT, Some("space-a"), 1);
+            assert_eq!(
+                net.asker_cached_min(ASKER, PORT),
+                0,
+                "a scope-cleared entry is as invisible as a port-cleared one"
+            );
+        }
+
+        #[test]
+        fn the_new_fields_are_carried_on_the_wire() {
+            // Round-trip, so a field that stops serializing fails here rather than silently
+            // disabling the stamp across the whole fleet.
+            let mut reply = reply_of(ASKER, 1..=2);
+            reply.asker_cached_min = 42;
+            let round: SinceReply =
+                serde_json::from_slice(&serde_json::to_vec(&reply).expect("encode"))
+                    .expect("decode");
+            assert_eq!(round.asker_cached_min, 42);
+
+            let req = SinceReq {
+                port: PORT,
+                from: 5,
+                asker: ASKER,
+            };
+            let round: SinceReq =
+                serde_json::from_slice(&serde_json::to_vec(&req).expect("encode")).expect("decode");
+            assert_eq!(round.asker, ASKER);
+        }
     }
 }

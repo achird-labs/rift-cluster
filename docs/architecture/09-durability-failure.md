@@ -58,6 +58,7 @@ Defaults shown; `local` overrides exist per feature and stamp
 | proxyOnce claim | signature owner | `503` | Duplicate upstream side-effects are worse than a failed mock call |
 | Journal append / count | — (always local) | unaffected | Mergeable by design |
 | Journal / count read | all peers | merge of reachable shards + `Rift-Cluster-Partial: true` | Partial-and-says-so beats blocked |
+| Journal read **from a crash-restarted writer** | all peers | merge, still `Rift-Cluster-Partial: true` while peers cache entries of its own lost shard (#349) | The entries are gone for good, not late — a knowingly short answer must say so |
 | Admin config read | — (local applied state) | served, possibly behind; revision comparable | Staleness is measurable, not hidden |
 
 ## Scenario walkthroughs
