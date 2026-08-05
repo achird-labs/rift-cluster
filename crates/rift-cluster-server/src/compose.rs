@@ -543,7 +543,28 @@ pub async fn start_with_runtimes(
     // `start_with_front_door_routes` returns. An entry recorded in that window must
     // already carry this writer's real id: `(node_id, seq, clear_gen)` is the key #223
     // merges on, and a placeholder there is wrong data, not a late label.
-    let request_journal = ClusterJournal::new(identity.node_id());
+    // Built with the state directory, not bare: the shard's seq counter is the one piece
+    // of journal state that must outlive a crash (issue #351). Entries stay volatile --
+    // that is Ch.7's decision and is unchanged -- but `node_id` is stable across restarts,
+    // so a counter restarting at 0 would re-issue `(node_id, seq)` keys the fleet still
+    // holds in its replica caches and still addresses with live cursors.
+    let request_journal = match ClusterJournal::with_state_dir(identity.node_id(), &state_dir) {
+        Ok(journal) => journal,
+        Err(e) => {
+            // Shutdown-then-return, not `?`: `ProbeListener` has no `Drop`, and dropping
+            // its `JoinHandle` does not abort the task -- only `shutdown()` does, which is
+            // what actually releases the port. A bare `?` here would leave the probe
+            // listener bound and `/readyz` answering after the start failed. The binary
+            // would get away with it (process exit frees the port), but the test suites
+            // drive `start_with_runtimes` in-process, where the listener outlives the
+            // error. Every other fallible step in this window does the same.
+            probes.shutdown().await;
+            return Err(anyhow::Error::new(e).context(format!(
+                "reading the journal seq floors from {}",
+                state_dir.display()
+            )));
+        }
+    };
     // The front door's half of the fleet request journal (issue #223): wraps the same
     // `request_journal` the manager writes through, so the merge-on-read the front serves and the
     // writer shard the manager appends to can never be two different journals under the hood.

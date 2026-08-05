@@ -6,8 +6,16 @@
 //! **its own shard** and reads merge (issue #223).
 //!
 //! What lives here is only the local half: the shard, its writer-local caps, and the
-//! read surface a peer merge consumes. There is no RPC, no peer pull and no disk —
-//! journal entries are test-run-scoped and volatile by design (Ch.7, Ch.9's matrix).
+//! read surface a peer merge consumes. There is no RPC and no peer pull, and journal
+//! entries are test-run-scoped and volatile by design (Ch.7, Ch.9's matrix).
+//!
+//! There is one small piece of disk, and only one: the per-port **seq floor**
+//! ([`super::journal_seq`], issue #351). Entries are not persisted and never will be;
+//! the counter that numbers them is, because `node_id` is durable and so `(node_id,
+//! seq)` is an identity the rest of the fleet keeps referring to — in replica caches
+//! and in live cursors — after a crash. Reissuing those keys is wrong data rather than
+//! lost data, which is a different thing from the volatility decision and is why it
+//! gets a different answer.
 //!
 //! Entries are keyed `(node_id, seq, clear_gen)`:
 //!
@@ -32,6 +40,7 @@
 
 use crate::raft::NodeId;
 use crate::raft::node::RaftNode;
+use crate::stores::journal_seq::SeqFloors;
 use parking_lot::RwLock;
 use prometheus::Gauge;
 use rift_cluster_base::seams::{
@@ -339,10 +348,28 @@ struct PortShard {
     entries: RwLock<VecDeque<ShardEntry>>,
     /// This node's G-counter slot. Counts every request, recorded body or not.
     count: AtomicU64,
-    /// Last seq handed out; 1-based, so 0 reads as "nothing recorded yet". Never reset —
-    /// not by eviction, not by `clear`/`clear_flow`/`retain` — which is what keeps a
-    /// cursor held across any of them valid.
+    /// Last seq handed out; 1-based, so 0 reads as "nothing recorded yet" on a first
+    /// boot. Never reset — not by eviction, not by `clear`/`clear_flow`/`retain` — which
+    /// is what keeps a cursor held across any of them valid.
+    ///
+    /// Across a *restart* it is not reset either, but nor does it start from 0: it starts
+    /// at [`Self::boot_floor`], the durable floor this port had reached before the crash
+    /// (issue #351). `node_id` is stable across restarts, so a counter that restarted at 0
+    /// would re-issue `(node_id, seq)` keys the fleet still holds in its replica caches and
+    /// still addresses with live cursors — silently replacing entries in merge dedup and
+    /// silently withholding them from any walker positioned above the reused seq.
     seq: AtomicU64,
+    /// The highest seq this shard may hand out before another durable reservation is
+    /// required. Always at or above `seq`; see [`super::journal_seq::SeqFloors`] for why
+    /// this is block-allocated rather than written per append.
+    durable_floor: AtomicU64,
+    /// The value `durable_floor` held at shard creation, i.e. the boundary between "seqs
+    /// a previous boot could have used" and "seqs only this boot can use".
+    ///
+    /// Read-only after construction. Issue #349 needs exactly this to tell a peer's cached
+    /// entry of ours apart from one we still hold: a cached seq at or below the boot floor
+    /// is, by construction, an entry this node lost to the crash.
+    boot_floor: u64,
     /// Highest seq dropped by *retention pressure* (cap or age). Deliberate deletions
     /// never touch it: losing entries you asked to delete is not a hole in your view.
     evicted_below_seq: AtomicU64,
@@ -365,11 +392,13 @@ struct PortShard {
 }
 
 impl PortShard {
-    fn new(port: u16) -> Self {
+    fn new(port: u16, boot_floor: u64) -> Self {
         Self {
             entries: RwLock::new(VecDeque::new()),
             count: AtomicU64::new(0),
-            seq: AtomicU64::new(0),
+            seq: AtomicU64::new(boot_floor),
+            durable_floor: AtomicU64::new(boot_floor),
+            boot_floor,
             evicted_below_seq: AtomicU64::new(0),
             clear_gen: AtomicU64::new(0),
             space_gens: RwLock::new(HashMap::new()),
@@ -402,9 +431,18 @@ pub struct ClusterJournal {
     cap_refreshed_at: AtomicU64,
     clock: Arc<dyn Clock>,
     config: JournalConfig,
+    /// Durable per-port seq high-waters (issue #351). Ephemeral unless the journal was
+    /// built with a state directory, in which case a crash-restarted writer resumes
+    /// strictly above every seq the previous boot could have handed out.
+    seq_floors: SeqFloors,
 }
 
 impl ClusterJournal {
+    /// A journal with **no** durable seq floors.
+    ///
+    /// Correct for embedders and tests, which have no state directory and no restart to
+    /// survive. A clustered node wants [`Self::with_state_dir`] instead — without it a
+    /// crash-restart re-issues `(node_id, seq)` keys the fleet still holds (issue #351).
     #[must_use]
     pub fn new(node_id: NodeId) -> Arc<Self> {
         Self::with_parts(
@@ -414,8 +452,35 @@ impl ClusterJournal {
         )
     }
 
+    /// A journal whose seq floors persist under `state_dir`, so cursor identity survives
+    /// a crash-restart (issue #351).
+    ///
+    /// Fails if the floor file exists but does not parse. That is deliberately fatal:
+    /// see [`SeqFloors::load`] — starting from 0 over a damaged floor file is exactly the
+    /// seq reuse the floors exist to prevent.
+    pub fn with_state_dir(
+        node_id: NodeId,
+        state_dir: &std::path::Path,
+    ) -> std::io::Result<Arc<Self>> {
+        Ok(Self::assemble(
+            node_id,
+            JournalConfig::default(),
+            Arc::new(MonotonicClock::default()),
+            SeqFloors::load(state_dir)?,
+        ))
+    }
+
     #[must_use]
     pub fn with_parts(node_id: NodeId, config: JournalConfig, clock: Arc<dyn Clock>) -> Arc<Self> {
+        Self::assemble(node_id, config, clock, SeqFloors::ephemeral())
+    }
+
+    fn assemble(
+        node_id: NodeId,
+        config: JournalConfig,
+        clock: Arc<dyn Clock>,
+        seq_floors: SeqFloors,
+    ) -> Arc<Self> {
         Arc::new(Self {
             node_id,
             ports: RwLock::new(HashMap::new()),
@@ -424,7 +489,37 @@ impl ClusterJournal {
             cap_refreshed_at: AtomicU64::new(0),
             clock,
             config,
+            seq_floors,
         })
+    }
+
+    /// The seq boundary between this boot and any previous one for `port`.
+    ///
+    /// Every seq at or below this value was handed out (or reserved) before the current
+    /// process started; everything above it belongs to this boot.
+    ///
+    /// Capturing it is this issue's job even though its consumer is the next one: the
+    /// value has to be read at shard construction, because `durable_floor` advances
+    /// during the run and nothing later can recover where this boot began. Issue #349
+    /// reads it to tell a peer's cached entry of ours that the crash took from us
+    /// (`cached_seq <= boot_floor`) apart from one we still hold, which is what lets a
+    /// restarted writer stamp `Rift-Cluster-Partial` honestly.
+    ///
+    /// Hence the scoped allow: exercised by this module's tests, unreferenced in a lib
+    /// build until #349 lands. Scoped rather than blanket so it starts warning again if
+    /// #349 changes shape and leaves this stranded.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn boot_floor(&self, port: u16) -> u64 {
+        // Deliberately NOT `self.shard(port).boot_floor`: #349 asks this about ports named
+        // by a *peer's* cached entries, which this node may never have served, and
+        // `shard()` inserts on a miss — so the obvious spelling would allocate a
+        // `PortShard` (RwLock, HashMap, Prometheus gauge) per probe. For a live shard the
+        // two agree; for an untouched port the persisted floor IS its boot floor.
+        self.ports
+            .read()
+            .get(&port)
+            .map_or_else(|| self.seq_floors.floor(port), |shard| shard.boot_floor)
     }
 
     /// Attach the node whose applied membership sizes the shard cap.
@@ -632,11 +727,15 @@ impl ClusterJournal {
         if let Some(shard) = self.ports.read().get(&port) {
             return Arc::clone(shard);
         }
+        // The floor is read here, at first touch of the port, rather than eagerly for
+        // every persisted port at startup: shards are created lazily and a node that
+        // never serves a port has no counter to protect.
+        let boot_floor = self.seq_floors.floor(port);
         Arc::clone(
             self.ports
                 .write()
                 .entry(port)
-                .or_insert_with(|| Arc::new(PortShard::new(port))),
+                .or_insert_with(|| Arc::new(PortShard::new(port, boot_floor))),
         )
     }
 
@@ -767,6 +866,33 @@ impl RequestJournal for ClusterJournal {
             // which would make the cursor cut skip entries and the binary search in
             // `attach_match` unsound.
             let seq = shard.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            // The durability invariant (issue #351): never hand out a seq above the floor
+            // already on disk, so a crash-restart resumes strictly above everything this
+            // boot could have used. Inside the lock on purpose — a reservation racing the
+            // assignment could let a seq escape above an unpersisted floor, which is the
+            // one ordering that reintroduces the collision. The cost lands once per
+            // `SEQ_FLOOR_SLACK` appends, so blocking the deque for that write is a
+            // per-2^20-requests event, not a hot-path one.
+            if seq > shard.durable_floor.load(Ordering::SeqCst) {
+                let (reserved, persisted) = self.seq_floors.reserve_through(port, seq);
+                shard.durable_floor.store(reserved, Ordering::SeqCst);
+                if let Err(e) = persisted {
+                    // Not swallowed, and not fatal. The entries this numbers are volatile
+                    // by design, so refusing to record would turn a durability failure
+                    // into a total outage of the thing the node exists to do. What is
+                    // lost is crash-safety of the counter until the disk recovers, which
+                    // is worth an error-level line every time it happens — and it can
+                    // only happen once per reserved block, so this cannot become a log
+                    // storm on a persistently bad disk.
+                    tracing::error!(
+                        port,
+                        seq,
+                        error = %e,
+                        "could not persist the journal seq floor; a crash before it \
+                         recovers may reuse seqs and corrupt cursor identity"
+                    );
+                }
+            }
             entries.push_back(ShardEntry {
                 node_id: self.node_id,
                 seq,
@@ -1790,5 +1916,206 @@ mod tests {
             }
             Ok(())
         });
+    }
+
+    // -- Durable seq floors across a crash-restart (issue #351) ---------------
+    //
+    // "Restart" here means constructing a second `ClusterJournal` over the same state
+    // directory while the first is simply dropped. That is the right model: a SIGKILL
+    // runs no destructor and flushes nothing, so a clean-shutdown path would be testing
+    // a code path the crash case never takes.
+
+    fn restarted(dir: &std::path::Path, node_id: NodeId) -> Arc<ClusterJournal> {
+        ClusterJournal::with_state_dir(node_id, dir).expect("journal over state dir")
+    }
+
+    #[test]
+    fn a_first_boot_starts_at_one_and_persists_its_floor() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let j = restarted(dir.path(), 1);
+        assert_eq!(j.boot_floor(8080), 0, "nothing persisted yet");
+        assert_eq!(j.record_indexed(8080, "f", req("/a")), Some(1));
+
+        // The floor is on disk now, so a restart cannot re-issue seq 1.
+        let after = restarted(dir.path(), 1);
+        assert!(
+            after.boot_floor(8080) >= 1,
+            "boot floor {} must cover the seq already handed out",
+            after.boot_floor(8080)
+        );
+    }
+
+    #[test]
+    fn a_restarted_writer_never_reuses_a_seq() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let first = restarted(dir.path(), 1);
+        let pre: Vec<u64> = (0..5)
+            .map(|i| {
+                first
+                    .record_indexed(8080, "f", req(&format!("/pre{i}")))
+                    .expect("recorded")
+            })
+            .collect();
+        drop(first);
+
+        let second = restarted(dir.path(), 1);
+        let post: Vec<u64> = (0..5)
+            .map(|i| {
+                second
+                    .record_indexed(8080, "f", req(&format!("/post{i}")))
+                    .expect("recorded")
+            })
+            .collect();
+
+        // Positive control first, per this module's convention: prove the pre-crash seqs
+        // were real before asserting anything about their absence from the post set.
+        assert_eq!(pre, vec![1, 2, 3, 4, 5]);
+        for seq in &post {
+            assert!(
+                *seq > *pre.last().expect("pre is non-empty"),
+                "post-restart seq {seq} collides with the pre-crash range {pre:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_port_keeps_its_own_floor_across_a_restart() {
+        // A single shared counter would be correct-but-wasteful here; a per-port floor
+        // that leaked across ports would be silently wrong. Pin the per-port shape.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let first = restarted(dir.path(), 1);
+        assert_eq!(first.record_indexed(8080, "f", req("/a")), Some(1));
+        assert_eq!(first.record_indexed(9090, "f", req("/a")), Some(1));
+        drop(first);
+
+        let second = restarted(dir.path(), 1);
+        let a = second.record_indexed(8080, "f", req("/b")).expect("8080");
+        let b = second.record_indexed(9090, "f", req("/b")).expect("9090");
+        assert!(
+            a > 1 && b > 1,
+            "both ports resume above their own pre-crash seq"
+        );
+        // 8081 was never touched before the crash, so it is a first boot for that port.
+        assert_eq!(second.record_indexed(8081, "f", req("/c")), Some(1));
+    }
+
+    #[test]
+    fn a_cursor_held_across_a_restart_sees_every_new_entry_exactly_once() {
+        // The cursor contract is what this issue is really about: a walker positioned at
+        // the pre-crash high-water must receive every post-restart entry, none withheld
+        // by `entry.seq > position` and none delivered twice.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let first = restarted(dir.path(), 1);
+        for i in 0..3 {
+            first.record_indexed(8080, "f", req(&format!("/pre{i}")));
+        }
+        let cursor_position = first
+            .read_shard_since(8080, 0)
+            .entries
+            .last()
+            .expect("entries")
+            .seq;
+        drop(first);
+
+        let second = restarted(dir.path(), 1);
+        for i in 0..4 {
+            second.record_indexed(8080, "f", req(&format!("/post{i}")));
+        }
+
+        let delivered: Vec<u64> = second
+            .read_shard_since(8080, 0)
+            .entries
+            .iter()
+            .filter(|e| e.seq > cursor_position)
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(
+            delivered.len(),
+            4,
+            "every post-restart entry reaches the walker"
+        );
+        let unique: std::collections::BTreeSet<u64> = delivered.iter().copied().collect();
+        assert_eq!(unique.len(), delivered.len(), "no seq delivered twice");
+    }
+
+    #[test]
+    fn merging_a_pre_crash_read_with_the_post_restart_shard_collides_on_nothing() {
+        // The other corruption site: a survivor's replica cache still holds the pre-crash
+        // entries under `(node_id, seq)`. If the reborn writer reuses those keys, merge
+        // dedup drops one of the two by identity and an entry silently vanishes.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let first = restarted(dir.path(), 7);
+        for i in 0..3 {
+            first.record_indexed(8080, "f", req(&format!("/pre{i}")));
+        }
+        let cached = first.read_shard_since(8080, 0).entries;
+        drop(first);
+
+        let second = restarted(dir.path(), 7);
+        for i in 0..3 {
+            second.record_indexed(8080, "f", req(&format!("/post{i}")));
+        }
+        let live = second.read_shard_since(8080, 0).entries;
+
+        assert_eq!(
+            cached.len(),
+            3,
+            "positive control: the cache really holds three"
+        );
+        assert_eq!(live.len(), 3);
+        let keys: std::collections::BTreeSet<(NodeId, u64)> = cached
+            .iter()
+            .chain(live.iter())
+            .map(|e| (e.node_id, e.seq))
+            .collect();
+        assert_eq!(
+            keys.len(),
+            6,
+            "all six entries must have distinct (node_id, seq) merge keys"
+        );
+    }
+
+    #[test]
+    fn allocation_never_outruns_what_is_durable() {
+        // The invariant, stated directly: whatever seq has been handed out, a restart
+        // right now resumes strictly above it.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let j = restarted(dir.path(), 1);
+        let mut highest = 0;
+        for i in 0..50 {
+            highest = j
+                .record_indexed(8080, "f", req(&format!("/{i}")))
+                .expect("recorded");
+            let observer = restarted(dir.path(), 1);
+            assert!(
+                observer.boot_floor(8080) >= highest,
+                "durable floor {} trails the handed-out seq {highest}",
+                observer.boot_floor(8080)
+            );
+        }
+        assert_eq!(highest, 50, "positive control: 50 appends really happened");
+    }
+
+    #[test]
+    fn a_journal_without_a_state_dir_behaves_exactly_as_before() {
+        // Embedders and the whole existing test suite take this path. It must keep
+        // starting at 1 -- the pre-#351 behaviour -- rather than acquiring a floor.
+        let j = journal();
+        assert_eq!(j.record_indexed(8080, "f", req("/a")), Some(1));
+        assert_eq!(j.record_indexed(8080, "f", req("/b")), Some(2));
+        assert_eq!(j.boot_floor(8080), 0);
+    }
+
+    #[test]
+    fn a_corrupt_floor_file_stops_the_journal_from_starting() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("journal-seq-floors"), "8080=garbage\n").expect("write");
+        // Matched rather than `expect_err`ed: the Ok arm carries an `Arc<ClusterJournal>`,
+        // which is not `Debug`, and deriving Debug on the whole journal to satisfy a test
+        // assertion would be the tail wagging the dog.
+        match ClusterJournal::with_state_dir(1, dir.path()) {
+            Ok(_) => panic!("a corrupt floor file must not silently start from zero"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+        }
     }
 }
