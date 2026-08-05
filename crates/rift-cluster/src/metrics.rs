@@ -318,6 +318,39 @@ lazy_static! {
     )
     .expect("rift_cluster_flow_reads_total registers once");
 
+    /// `rift_cluster_proxy_claims_total{outcome}` — proxyOnce claim answers as the data
+    /// plane saw them (#226). `granted` = this request won the right to record;
+    /// `inflight` = a concurrent winner exists (this request proxies without recording);
+    /// `already_recorded` = replay. `granted` exceeding recordings over time means claims
+    /// are being released — see the releases counter for why.
+    static ref PROXY_CLAIMS: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_proxy_claims_total",
+        "proxyOnce claim outcomes, as answered to this node's data plane",
+        &["outcome"]
+    )
+    .expect("rift_cluster_proxy_claims_total registers once");
+
+    /// `rift_cluster_proxy_claim_releases_total{reason}` — owner-side claim releases
+    /// (#226). `upstream_failure` = the winner's upstream call failed; `deadline` = a
+    /// Pending claim ran out its TTL (a crashed or wedged winner); `publish_failure` = the
+    /// recording's Raft publication failed or was refused, so the claim was freed to keep
+    /// the signature retryable. A persistently non-zero `publish_failure` is the label
+    /// worth alerting on: recordings are being attempted and not landing.
+    static ref PROXY_CLAIM_RELEASES: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_proxy_claim_releases_total",
+        "Owner-side proxyOnce claim releases, by reason",
+        &["reason"]
+    )
+    .expect("rift_cluster_proxy_claim_releases_total registers once");
+
+    /// `rift_cluster_proxy_recordings_total` — recordings this node successfully
+    /// committed to the fleet (proxyOnce completions and proxyAlways merges).
+    static ref PROXY_RECORDINGS: IntCounter = register_int_counter!(
+        "rift_cluster_proxy_recordings_total",
+        "Proxy recordings committed to consensus by this node"
+    )
+    .expect("rift_cluster_proxy_recordings_total registers once");
+
     /// `rift_cluster_cas_conflicts_total{reason}` — owner-side refusals of
     /// a flow write. `cas` = compare-and-set lost to the current value;
     /// `fence` = the op carried a stale membership index (`m_idx`) and was
@@ -622,6 +655,21 @@ pub(crate) fn source_scheduler_read_failure() {
 
 pub(crate) fn flow_conflict(reason: &str) {
     FLOW_CAS_CONFLICTS.with_label_values(&[reason]).inc();
+}
+
+/// `outcome` ∈ `granted` / `inflight` / `already_recorded` — closed at the call sites.
+pub(crate) fn proxy_claim(outcome: &str) {
+    PROXY_CLAIMS.with_label_values(&[outcome]).inc();
+}
+
+/// `reason` ∈ `upstream_failure` / `deadline` / `publish_failure` — closed at the call
+/// sites.
+pub(crate) fn proxy_claim_release(reason: &str) {
+    PROXY_CLAIM_RELEASES.with_label_values(&[reason]).inc();
+}
+
+pub(crate) fn proxy_recording() {
+    PROXY_RECORDINGS.inc();
 }
 
 pub(crate) fn pull_on_miss_check() {

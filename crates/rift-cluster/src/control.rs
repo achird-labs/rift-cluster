@@ -8,7 +8,7 @@
 //! that can differ per node (port binds, listener state) lives in the engine
 //! drive *after* apply, never here.
 
-use rift_cluster_base::seams::{ImposterConfig, RouteTable, Stub};
+use rift_cluster_base::seams::{ImposterConfig, RecordedResponse, RouteTable, Stub};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -646,6 +646,65 @@ pub enum ControlOp {
         port: u16,
         space: Option<String>,
     },
+    /// One `proxyOnce`/`proxyAlways` recording, as consensus fact (#226, Ch.7 §proxyOnce).
+    ///
+    /// Carries **both** the replayable response and — when predicate generation built one —
+    /// the recorded stub, in a single op. Deliberately not two ops riding one front-door
+    /// `Mutation`: the front door commits mutation ops one log entry at a time, so a two-op
+    /// shape would make "recorded but stub-less" representable across a crash between them.
+    /// One op, one apply transaction: the marker row and the stub mutation land together or
+    /// not at all.
+    ///
+    /// The stub's insertion position is resolved **at apply**, against the then-current stub
+    /// list (see [`RecordedStubPlacement`]), for the same reason upstream's
+    /// `insert_or_append_proxy_stub` re-locates under its write lock: a position computed by
+    /// the submitter can go stale between submission and commit.
+    ProxyRecorded {
+        tenant: TenantId,
+        port: u16,
+        /// The claim key: hex `xxh64` of the request signature's canonical JSON — the same
+        /// rendering the proxy store's HRW key uses, minus the port prefix (the row is
+        /// already port-keyed).
+        sig_hash: String,
+        /// The replayable recorded response. Stored on consensus so `lookup()` answers from
+        /// any node's applied state: for a stub-less proxyOnce recording this is the replay
+        /// source *forever*, not just during a replication window.
+        resp: RecordedResponse,
+        stub: Option<RecordedStub>,
+    },
+    /// Delete every recorded-proxy marker for a port (#226) — the clustered half of
+    /// `DELETE /imposters/:port/savedProxyResponses`. Recorded *stubs* are imposter config
+    /// and are deleted through the stub-edit surfaces; this op clears the claim table so
+    /// signatures record afresh.
+    ProxyRecordedClear {
+        tenant: TenantId,
+        port: u16,
+    },
+}
+
+/// The stub half of a [`ControlOp::ProxyRecorded`]: the generated stub plus everything its
+/// apply-time placement depends on. Grouped so an op cannot carry a placement without a stub
+/// or vice versa.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordedStub {
+    pub stub: Box<Stub>,
+    pub placement: RecordedStubPlacement,
+    /// `proxy.to` of the proxy stub the recording came from — the anchor
+    /// [`placement`](Self::placement) is resolved against at apply.
+    pub proxy_to: String,
+}
+
+/// Where a recorded stub lands relative to its proxy stub — the engine's own semantics
+/// (upstream `StubPlacement`, rift#911), mirrored here so the wire format is ours.
+///
+/// `BeforeProxy` (proxyOnce): the recording matches first next time. `AfterProxyMerging`
+/// (proxyAlways): the proxy keeps running; responses merge into an existing stub with
+/// structurally equal non-empty predicates (upstream #611) instead of duplicating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RecordedStubPlacement {
+    BeforeProxy,
+    AfterProxyMerging,
 }
 
 /// The fleet's session-signing key, as applied state (issue #185).
@@ -913,7 +972,9 @@ impl ControlOp {
             | ControlOp::AuditSinkDelete { tenant }
             | ControlOp::AuditCheckpointPut { tenant, .. }
             | ControlOp::SessionKeyPut { tenant, .. }
-            | ControlOp::JournalClearGen { tenant, .. } => tenant,
+            | ControlOp::JournalClearGen { tenant, .. }
+            | ControlOp::ProxyRecorded { tenant, .. }
+            | ControlOp::ProxyRecordedClear { tenant, .. } => tenant,
         }
     }
 
@@ -936,6 +997,12 @@ impl ControlOp {
     pub fn audit_action(&self) -> Option<&'static str> {
         Some(match self {
             ControlOp::AuditCheckpointPut { .. } => return None,
+            // The second op that opts out, for the same "the silence is a decision" reason:
+            // a recording is data-plane behavior — a proxied request the engine chose to
+            // record — with no administrative principal behind it, and under proxyAlways it
+            // commits once per proxied request. Auditing it would flood the stream that
+            // exists to carry administrative intent with traffic-rate noise (#226).
+            ControlOp::ProxyRecorded { .. } => return None,
             ControlOp::PutImposter { .. } => "imposter.write",
             ControlOp::PatchStubs { .. } => "stub.write",
             ControlOp::DeleteImposter { .. } | ControlOp::DeleteAll { .. } => "imposter.delete",
@@ -968,6 +1035,10 @@ impl ControlOp {
             // had no log entry to attribute one to. Named identically to `authz::Action::SavedRequestsClear`'s
             // own `as_str()`, matching every other action string here.
             ControlOp::JournalClearGen { .. } => "savedRequests.clear",
+            // The clustered half of `DELETE .../savedProxyResponses` — gated by the same
+            // `authz::Action::SavedRequestsClear` as the journal clear above, so it carries
+            // the same name in the stream (#226).
+            ControlOp::ProxyRecordedClear { .. } => "savedRequests.clear",
         })
     }
 
@@ -980,7 +1051,9 @@ impl ControlOp {
                 .map_or_else(|| AUDIT_RESOURCE_ALL.to_owned(), |port| port.to_string()),
             ControlOp::PatchStubs { port, .. }
             | ControlOp::DeleteImposter { port, .. }
-            | ControlOp::SetEnabled { port, .. } => port.to_string(),
+            | ControlOp::SetEnabled { port, .. }
+            | ControlOp::ProxyRecorded { port, .. }
+            | ControlOp::ProxyRecordedClear { port, .. } => port.to_string(),
             // A whole-scope op names no single object. Wildcard rather than an
             // empty string so a reader never has to guess whether the field was
             // omitted or the op really did address everything.
@@ -1408,6 +1481,49 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
                      clear, it is an unaddressed one"
                         .to_owned(),
                 );
+            }
+            Ok(())
+        }
+        // Shallow for the same reason as `JournalClearGen`: whether the port's imposter
+        // exists — and whether a proxy stub with `proxy_to` is still in it — are apply-time
+        // questions against the then-current tables.
+        ControlOp::ProxyRecorded {
+            tenant,
+            port,
+            sig_hash,
+            resp,
+            stub,
+        } => {
+            require_real_tenant(tenant)?;
+            if *port == 0 {
+                return Err("port must be non-zero: 0 addresses no imposter".to_owned());
+            }
+            if sig_hash.is_empty() || hex_decode(sig_hash).is_none() {
+                return Err("sigHash must be a non-empty hex string".to_owned());
+            }
+            // The same defence-in-depth bound `SourcePullResult` draws, for the same
+            // reason: a recorded body becomes a log entry every replica carries.
+            if resp.body.len() > MAX_SOURCE_PAYLOAD_BYTES {
+                return Err(format!(
+                    "recorded response body exceeds the {MAX_SOURCE_PAYLOAD_BYTES}-byte log \
+                     entry bound"
+                ));
+            }
+            if let Some(recorded) = stub
+                && recorded.proxy_to.is_empty()
+            {
+                return Err(
+                    "proxyTo must not be empty: placement is resolved against the proxy \
+                     stub it names"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
+        ControlOp::ProxyRecordedClear { tenant, port } => {
+            require_real_tenant(tenant)?;
+            if *port == 0 {
+                return Err("port must be non-zero: 0 addresses no imposter to clear".to_owned());
             }
             Ok(())
         }
@@ -2059,7 +2175,13 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget<'_>> {
         // revision: it commits unconditionally, like `AuditCheckpointPut`'s `max` does, so two
         // concurrent clears compose rather than one losing an optimistic-concurrency race the
         // op was never meant to run.
-        | ControlOp::JournalClearGen { .. } => None,
+        | ControlOp::JournalClearGen { .. }
+        // A recording is submitted by the engine's claim owner, not by an
+        // optimistic-concurrency client; its placement is resolved at apply against the
+        // then-current stubs, which is the property a stored-revision precondition would
+        // re-introduce a race against. The clear follows `JournalClearGen`'s reasoning.
+        | ControlOp::ProxyRecorded { .. }
+        | ControlOp::ProxyRecordedClear { .. } => None,
     }
 }
 

@@ -1156,6 +1156,25 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// The applied proxy-recording marker for `(tenant, port, sig_hash)` (#226): the
+    /// recorded-response JSON, or `None` when the signature was never recorded (or was
+    /// cleared). Answers from local applied state without leadership — the property that
+    /// lets a post-handoff claim owner say `AlreadyRecorded` with no in-memory trace.
+    ///
+    /// # Errors
+    ///
+    /// Storage I/O.
+    pub fn proxy_recorded(
+        &self,
+        tenant: &str,
+        port: u16,
+        sig_hash: &str,
+    ) -> Result<Option<String>, NodeError> {
+        self.sm_reader
+            .proxy_recorded_resp(tenant, port, sig_hash)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// Last engine side-effect failure per port (0 = set-level): the ports whose
     /// committed config the local engine could not realize (e.g. a bind
     /// failure). Empty on a healthy node.

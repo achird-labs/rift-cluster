@@ -156,7 +156,7 @@ stateDiagram-v2
     [*] --> Unclaimed
     Unclaimed --> Pending : try_claim → token<br/>(winner calls upstream)
     Pending --> Recorded : complete(token) —<br/>only AFTER the recorded stub's<br/>config write is acknowledged
-    Pending --> Unclaimed : release(token) on upstream failure<br/>· or deadline expiry (2× upstream timeout)
+    Pending --> Unclaimed : release(token) on upstream failure<br/>· or deadline expiry (fixed TTL, default 60 s)
     Recorded --> [*] : replicated fact —<br/>all future hits replay locally
 
     note right of Pending
@@ -176,7 +176,13 @@ Two ordering subtleties carry the correctness:
   Chapter 4 write path, while the claim lives at the `(port, signature)`
   owner. `Pending → Recorded` transitions only after the config write is
   acknowledged; if that write fails, the claim releases and the signature
-  stays retryable. "Recorded but stub-less" is unrepresentable.
+  stays retryable. "Recorded but stub-less" is unrepresentable — and by
+  construction, not by discipline: the recorded stub and the Recorded marker
+  ride **one** committed op (`ProxyRecorded`), applied in one state-machine
+  transaction, because the front door's multi-op mutations commit one log
+  entry at a time and a two-op shape would open a crash window between them.
+  The stub's insertion position is resolved at apply against the then-current
+  stub list, mirroring the engine's own re-locate-under-the-write-lock rule.
 - **Why not a simple replicated set?** A pure grow-only claim set cannot
   express *release*: a failed upstream call would either resurrect its claim on
   every merge or wedge the signature forever. The Pending/Recorded split — with
@@ -184,7 +190,16 @@ Two ordering subtleties carry the correctness:
   exactly-once success and retryable failure.
 
 Recordings themselves (multi-response proxy modes) append through the config
-write path like any stub mutation, so they inherit R1/R3/R4 wholesale.
+write path like any stub mutation, so they inherit R1/R3/R4 wholesale —
+`proxyAlways` merges into the existing recorded stub at apply (the upstream
+#611 structural-equality rule, reproduced deterministically in the state
+machine). A `proxyOnce` recording with **no** predicate generators produces no
+stub at all; its replayable response is stored in the same committed op, so
+`lookup()` answers from any node's applied state forever — that row, not a
+config stub, is the replay source for the stub-less case. The claim deadline
+is a fixed TTL rather than a per-imposter derivation because the recording
+seam (U-16) deliberately carries no timeout context; it only needs to sit
+comfortably above any upstream call the engine would wait for.
 
 ## What this plane deliberately does not promise
 

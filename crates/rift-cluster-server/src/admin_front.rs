@@ -431,6 +431,14 @@ pub(crate) enum Terminated {
     ///   engine, always stamped `Rift-Cluster-Partial: true`, never a Raft write. See
     ///   `terminate_clear_saved_requests`'s own doc for why this half was deliberately left alone.
     ClearSavedRequests(u16),
+    /// `DELETE /imposters/{port}/savedProxyResponses` (issue #226): a Raft-committed
+    /// `ControlOp::ProxyRecordedClear` — the proxy-recording sibling of the unscoped
+    /// `ClearSavedRequests` commit above, for the same reason: pre-#226 this proxied to
+    /// one node's in-process store, which cleared nothing the fleet's claim table holds.
+    /// Recorded *stubs* stay, deliberately — they are imposter config, deleted through
+    /// the stub-edit surfaces; this clears the exactly-once markers so signatures record
+    /// afresh. GET on the same path stays proxied: the listing is upstream's own surface.
+    ClearSavedProxyResponses(u16),
     /// `DELETE /imposters/{port}/spaces/{flow}` (issue #224): a space teardown has two
     /// independent halves. The *flow-state* half — already clustered via `ClusteredFlowStore` —
     /// stays exactly what it was: proxied to the local engine, untouched by this issue. The
@@ -529,6 +537,7 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::SetEnabled(port, _)
         | Terminated::ReadSavedRequests(port)
         | Terminated::ClearSavedRequests(port)
+        | Terminated::ClearSavedProxyResponses(port)
         | Terminated::SpaceTeardown(port, _)
         // Issue #335: this is not merely *a* tenant check for the try endpoint, it is the **only**
         // one. Returning the port here is what makes an unknown port and another tenant's port
@@ -571,6 +580,7 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::SetEnabled(_, _)
         | Terminated::ReadSavedRequests(_)
         | Terminated::ClearSavedRequests(_)
+        | Terminated::ClearSavedProxyResponses(_)
         | Terminated::SpaceTeardown(_, _)
         | Terminated::TryImposter(_)
         | Terminated::PutRoutes
@@ -723,6 +733,12 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
         // Both spellings are one handler upstream (`router.rs` maps `["requests"]` and
         // `["savedRequests"]` identically), so they classify identically here too (issue #223).
         [_, "requests" | "savedRequests"] => terminated_saved_requests(method, query, port),
+        // Only the DELETE terminates (issue #226): the clear must purge the fleet's
+        // replicated claim markers, which no proxied engine call can reach. GET stays
+        // proxied — the recorded-responses listing is upstream's own surface.
+        [_, "savedProxyResponses"] if *method == Method::DELETE => {
+            Some(Terminated::ClearSavedProxyResponses(port))
+        }
         // `DELETE /imposters/{port}/spaces/{flow}` (issue #224): exactly the two-segment shape
         // upstream's own router matches for `ImposterRoute::Space` (`["spaces", flow_id]` —
         // `SpaceStubs`'s three-segment `["spaces", flow_id, "stubs"]` is a different route and a
@@ -824,6 +840,10 @@ fn action_for(kind: &Terminated) -> Action {
         // route was authorized under before it terminated here.
         Terminated::ReadSavedRequests(_) => Action::ImposterRead,
         Terminated::ClearSavedRequests(_) => Action::SavedRequestsClear,
+        // The same action upstream authorizes the identical route under (see the comment
+        // above): the proxied path already landed on `SavedRequestsClear`, and terminating
+        // must not rename what the same call is gated and audited as.
+        Terminated::ClearSavedProxyResponses(_) => Action::SavedRequestsClear,
         // Exactly upstream's own mapping for this shape (`principal::map_action`'s
         // `has_space && !is_flow_state` arm, the proxied path's identical route used before
         // this terminated): a space teardown is the Operator-tier "disturb" sibling of
@@ -4177,6 +4197,23 @@ async fn build_mutation(
             // Byte-identical to what upstream's own `handle_clear_requests` answers with
             // (`handle_get(port, ...)`, the imposter's own `GET` representation) — a re-render,
             // not a canned message, is what "re-render the imposter as upstream does" means here.
+            render: Render::FetchAfter {
+                path: format!("/imposters/{port}"),
+                status: StatusCode::OK,
+            },
+        }),
+        // The proxy-recording sibling of the clear above (issue #226): one committed op
+        // deletes the port's exactly-once markers fleet-wide, and every node's stale
+        // completion-cache entries retire against the applied state (`completed_lookup`'s
+        // revision check) — no fan-out, nothing a partitioned peer can miss forever.
+        Terminated::ClearSavedProxyResponses(port) => Ok(Mutation {
+            ops: vec![ControlOp::ProxyRecordedClear {
+                tenant: tenant.clone(),
+                port,
+            }],
+            port: Some(port),
+            // Same re-render upstream's own clear answers with, for the same reason as
+            // `ClearSavedRequests` above.
             render: Render::FetchAfter {
                 path: format!("/imposters/{port}"),
                 status: StatusCode::OK,

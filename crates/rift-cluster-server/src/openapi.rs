@@ -304,6 +304,9 @@ mod parity {
             Terminated::ClearSavedRequests(_) => {
                 RouteKey::new(&Method::DELETE, "/imposters/{port}/savedRequests")
             }
+            Terminated::ClearSavedProxyResponses(_) => {
+                RouteKey::new(&Method::DELETE, "/imposters/{port}/savedProxyResponses")
+            }
             Terminated::SpaceTeardown(_, _) => {
                 RouteKey::new(&Method::DELETE, "/imposters/{port}/spaces/{flowId}")
             }
@@ -392,6 +395,7 @@ mod parity {
             Terminated::SetEnabled(4545, false),
             Terminated::ReadSavedRequests(4545),
             Terminated::ClearSavedRequests(4545),
+            Terminated::ClearSavedProxyResponses(4545),
             Terminated::SpaceTeardown(4545, "flow-1".to_owned()),
             Terminated::TryImposter(4545),
             Terminated::PutRoutes,
@@ -480,7 +484,10 @@ mod parity {
             // `RouteKey` carries no query, so that exception lives in the contract's prose, not
             // in a second entry here.
             ("POST", "/imposters/{port}/verify"),
-            ("DELETE", "/imposters/{port}/savedProxyResponses"),
+            // `savedProxyResponses` DELETE is gone from this table (issue #226): it terminates
+            // as `ControlOp::ProxyRecordedClear` — a proxied clear could never purge the
+            // fleet's replicated claim markers. `Terminated::ClearSavedProxyResponses` in
+            // `ee_served_routes` covers it now; the GET listing was never declared here.
             ("GET", "/imposters/{port}/scenarios"),
             ("PUT", "/imposters/{port}/scenarios/{scenarioName}/state"),
             ("POST", "/imposters/{port}/scenarios/reset"),

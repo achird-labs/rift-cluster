@@ -18,8 +18,9 @@ use arc_swap::ArcSwap;
 use rift_cluster::audit_export::{AuditExporter, ExportContext, ExportStatus};
 use rift_cluster::sources;
 use rift_cluster::stores::{
-    ClusterJournal, ClusteredFlowStoreProvider, DEFAULT_ANTI_ENTROPY_INTERVAL, FlowBindConfig,
-    FlowNet, FlowShard, JournalNet, ShardConfig, flow_routes, journal_routes, spawn_anti_entropy,
+    ClusterJournal, ClusterProxyStore, ClusteredFlowStoreProvider, DEFAULT_ANTI_ENTROPY_INTERVAL,
+    FlowBindConfig, FlowNet, FlowShard, JournalNet, ProxyBindConfig, ProxyNet, ShardConfig,
+    flow_routes, journal_routes, proxy_routes, spawn_anti_entropy,
 };
 use rift_cluster::{
     Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, OnDrift,
@@ -548,12 +549,17 @@ pub async fn start_with_runtimes(
     // writer shard the manager appends to can never be two different journals under the hood.
     let journal_net = JournalNet::new(Arc::clone(&request_journal));
 
+    // The proxy-claim subsystem (#226): created before the manager for the same reason
+    // `flow_net` is — the manager build takes the store handle, and the node binds in later.
+    let proxy_net = ProxyNet::new();
+
     let manager = match cluster_manager(
         &cli,
         accept_runtimes,
         Arc::clone(&pull_on_miss),
         Arc::clone(&flow_net),
         Arc::clone(&request_journal),
+        Arc::clone(&proxy_net),
     ) {
         Ok(manager) => Arc::new(manager),
         Err(e) => {
@@ -616,7 +622,8 @@ pub async fn start_with_runtimes(
                 ),
                 Arc::clone(&puller),
             )
-            .merge(journal_routes(Arc::clone(&journal_net))),
+            .merge(journal_routes(Arc::clone(&journal_net)))
+            .merge(proxy_routes(Arc::clone(&proxy_net))),
             engine: Some(Arc::clone(&manager)),
             audit_retention_secs: cli.cluster.cluster_audit_retention,
             snapshot_log_entries: cli.cluster.cluster_snapshot_log_entries,
@@ -651,6 +658,13 @@ pub async fn start_with_runtimes(
     // principal can change at any moment a `PrincipalPut` commits.
     sample_no_principals(&node);
     pull_on_miss.bind(&node);
+    if let Err(e) = proxy_net.bind(&node, ProxyBindConfig::default()) {
+        probes.shutdown().await;
+        if let Err(e) = node.shutdown().await {
+            tracing::error!(error = %e, "cluster node shutdown reported an error");
+        }
+        return Err(anyhow::Error::new(e).context("starting the proxy-claim bridge"));
+    }
     if let Err(e) = puller.bind(&node) {
         probes.shutdown().await;
         if let Err(e) = node.shutdown().await {
@@ -1357,6 +1371,7 @@ fn cluster_manager(
     pull_on_miss: Arc<PullOnMissInterceptor>,
     flow_net: Arc<FlowNet>,
     request_journal: Arc<ClusterJournal>,
+    proxy_net: Arc<ProxyNet>,
 ) -> anyhow::Result<ImposterManager> {
     let default_cert = cli
         .oss
@@ -1399,7 +1414,14 @@ fn cluster_manager(
         // a per-imposter private journal behind a round-robin LB answers `savedRequests`
         // with whatever fraction of the traffic happened to land here, for every imposter
         // rather than only the ones that opted in.
-        .with_request_journal(request_journal))
+        .with_request_journal(request_journal)
+        // The fleet's proxyOnce exactly-once gate (#226): every imposter on a cluster node
+        // claims through the HRW owner and publishes recorded stubs via consensus, so N
+        // nodes make one upstream call per `(port, signature)` instead of up to N. Same
+        // off-switch as the flow store: the `--cluster`-off path never reaches this
+        // function, so single-node keeps the upstream per-imposter `LocalProxyStore`
+        // byte-identical.
+        .with_proxy_store(Arc::new(ClusterProxyStore::new(proxy_net))))
 }
 
 /// Replay parked intents (issue #9 R4): drain whenever a leader (re)appears —

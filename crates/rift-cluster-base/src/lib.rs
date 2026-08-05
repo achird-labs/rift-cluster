@@ -46,9 +46,14 @@ pub mod seams {
     /// only path into the core.
     pub use rift_mock_core::imposter::{MatchOutcome, RecordedRequest, ResponseMode};
 
-    /// Proxy recordings and the `proxyOnce` record-once claim gate.
+    /// Proxy recordings and the `proxyOnce` record-once claim gate. The
+    /// publication half (`StubPlacement`, `StubPublication`, the recorded
+    /// types) is what a *publishing* store (#226, upstream #910/#911) consumes:
+    /// `complete()` hands it the built stub, and `publishes_stubs()` makes the
+    /// store the sole publisher.
     pub use rift_mock_core::recording::{
         ClaimOutcome, ClaimToken, LocalProxyStore, ProxyRecordingStore, ProxyStoreError,
+        RecordedResponse, RequestSignature, StubPlacement, StubPublication,
     };
 
     /// The last-chance hook consulted when a request matched no stub, before
@@ -137,7 +142,7 @@ pub mod seams {
     /// The config types a replicated control op carries (ADR-001 §4.1): the
     /// imposter config itself, the stub type its edit scripts address, and the
     /// error the engine reports when an apply side-effect fails.
-    pub use rift_mock_core::imposter::{ImposterConfig, ImposterError, Stub};
+    pub use rift_mock_core::imposter::{ImposterConfig, ImposterError, Stub, StubResponse};
 
     /// The per-imposter flow-state block, and the passthrough map a
     /// provider-supplied store reads its own options out of (upstream #845).
