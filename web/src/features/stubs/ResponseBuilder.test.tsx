@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ResponseBuilder, describeResponseList } from "./ResponseBuilder.tsx";
 import { FAULT_KINDS } from "./behaviors.ts";
-import { type ResponseModel, blankResponse, renderResponses } from "./responses.ts";
+import { type ResponseModel, blankResponse, renderResponses, projectResponses } from "./responses.ts";
 
 afterEach(cleanup);
 
@@ -143,7 +143,12 @@ describe("AC2 — arbitrary headers, with Content-Type no longer special-cased",
     const { last } = mount([response(200), response(500)]);
 
     await user.click(screen.getByRole("button", { name: "Add header to response 2" }));
-    await user.type(screen.getByRole("textbox", { name: "Header 1 name for response 2" }), "Location");
+    // The row arrives NAMED. A blank one cannot survive `renderHeaders`, which drops empty names —
+    // see `nextHeaderName`. The operator replaces the placeholder rather than filling a void.
+    const name = screen.getByRole("textbox", { name: "Header 1 name for response 2" });
+    expect((name as HTMLInputElement).value).toBe("X-New-Header");
+    await user.clear(name);
+    await user.type(name, "Location");
     await user.type(screen.getByRole("textbox", { name: "Header 1 value for response 2" }), "/there");
 
     const items = last();
@@ -167,13 +172,13 @@ describe("AC2 — arbitrary headers, with Content-Type no longer special-cased",
     expect(last()?.[0]?.headers).toEqual([{ name: "X-Trace", value: "1", multi: false }]);
   });
 
-  it("does not rewrite an untouched header when a second, still-unnamed row is added", async () => {
+  it("does not rewrite an untouched header when more rows are added", async () => {
     /*
      * The collision latch. The document is re-rendered and re-projected on every keystroke, so two
      * rows sharing a name become one JSON array — correct, that IS a multi-value header — and
-     * re-projection then marks both rows `multi`. Clicking "Add header" gives the new row an empty
-     * name, so without care two clicks put two rows under `""`, and separating them again leaves
-     * the *pre-existing, untouched* header permanently rewritten from `"1"` to `["1"]`.
+     * re-projection then marks both rows `multi`. Added rows are now uniquely named, which removes
+     * the collision at its source; this pins that two clicks give two distinct rows and leave the
+     * pre-existing header alone, rather than merging under a shared name.
      */
     const user = userEvent.setup();
     const { last } = mount([
@@ -184,7 +189,34 @@ describe("AC2 — arbitrary headers, with Content-Type no longer special-cased",
     await user.click(screen.getByRole("button", { name: "Add header to response 1" }));
 
     const rendered = renderResponses(last() ?? []) as { is: { headers: Record<string, unknown> } }[];
-    expect(rendered[0]?.is.headers).toEqual({ A: "1" });
+    expect(rendered[0]?.is.headers).toEqual({
+      A: "1",
+      "X-New-Header": "",
+      "X-New-Header-2": "",
+    });
+  });
+
+  it("survives the round trip the editor actually performs", async () => {
+    /*
+     * The case every other test in this file missed, and the reason the button shipped broken.
+     *
+     * This harness feeds `onChange` straight back as props, so a blank row persists here — in the
+     * editor it does not. There, the JSON text is the source of truth: `renderResponses` runs,
+     * `renderHeaders` drops empty names, and the form is re-projected from that JSON. A row that
+     * cannot survive `render → project` never appears on screen at all, however well it behaves in
+     * a component test.
+     */
+    const user = userEvent.setup();
+    const { last } = mount([response(200)]);
+
+    await user.click(screen.getByRole("button", { name: "Add header to response 1" }));
+
+    const rendered = renderResponses(last() ?? []);
+    const reprojected = projectResponses({ responses: rendered });
+    expect(reprojected.kind).toBe("responses");
+    expect(reprojected.kind === "responses" ? reprojected.items[0]?.headers : []).toEqual([
+      { name: "X-New-Header", value: "", multi: false },
+    ]);
   });
 
   it("edits a Content-Type header through the same rows as any other header", async () => {
