@@ -6,8 +6,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 publish = false
+rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -30,4 +30,8 @@ tokio.workspace = true
 rift-cluster = { path = "../../crates/rift-cluster" }
 
 [dev-dependencies]
+# C12's vacuity guard parses the two clock extremes' `Date` headers; httpdate
+# is the single-purpose parser for exactly that format (issue #228). Dev-only:
+# integration tests link dev-dependencies, and the harness lib never needs it.
+httpdate = "1"
 tokio.workspace = true

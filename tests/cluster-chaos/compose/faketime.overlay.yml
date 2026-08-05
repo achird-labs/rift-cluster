@@ -1,0 +1,48 @@
+# Overlay: skew each node's clock ±5 s with libfaketime (issue #228, C12).
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/chaos.overlay.yml \
+#                    -f tests/cluster-chaos/compose/front-door.overlay.yml \
+#                    -f tests/cluster-chaos/compose/faketime.overlay.yml up
+#
+# Why libfaketime and not the clock itself: the containers share the host
+# kernel's clock, so there is nothing per-container to set — the only way one
+# node can disagree with another about the time is to lie to that node's
+# process, which is exactly what an LD_PRELOAD of libfaketime does and exactly
+# the failure clock-skew chaos exists to simulate. This sits beside the "why
+# not toxiproxy" rationale in the README: both are cases where the honest
+# fault needs a different tool than the obvious one.
+#
+# The `runtime-faketime` build target is the production `runtime` stage plus
+# the library (deploy/Dockerfile) — selected only here, so no shipped image
+# ever carries a clock-lying preload. The spread is deliberately the ±5 s the
+# Ch.12 plan table names for C12: far beyond real NTP drift, small enough that
+# TLS and Raft election timers keep working.
+#
+# FAKETIME's leading "+"/"-" means an offset from the true clock, applied at
+# every call — not a frozen instant.
+services:
+  rift-1:
+    build:
+      target: runtime-faketime
+    environment:
+      LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+      FAKETIME: "+5"
+      # Cache disabled so every clock read reflects the offset immediately;
+      # the default 10 s cache would let a freshly-started process serve true
+      # time long enough to blur what the scenario is measuring.
+      FAKETIME_NO_CACHE: "1"
+  rift-2:
+    build:
+      target: runtime-faketime
+    environment:
+      LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+      FAKETIME: "+0"
+      FAKETIME_NO_CACHE: "1"
+  rift-3:
+    build:
+      target: runtime-faketime
+    environment:
+      LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+      FAKETIME: "-5"
+      FAKETIME_NO_CACHE: "1"
