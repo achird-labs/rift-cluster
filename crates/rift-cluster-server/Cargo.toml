@@ -35,6 +35,15 @@ rift-cluster-base = { path = "../rift-cluster-base" }
 rift-cluster = { path = "../rift-cluster" }
 
 clap = { version = "4.5", features = ["derive", "env"] }
+# The try endpoint (#335) dials a loopback imposter as a client. Deliberately
+# `workspace` rather than a local feature set: the workspace pins exactly one
+# `reqwest` configuration so the binary carries one TLS backend (see the root
+# manifest's own note), and `rustls-tls` from that pin is what lets the try
+# client reach an `https` imposter at all. This crate previously named
+# `reqwest` only under `[dev-dependencies]`; the crate itself was already in
+# the shipped tree via `rift-cluster`, so promoting it here adds no new
+# dependency, only the right feature set.
+reqwest.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
@@ -72,9 +81,9 @@ tempfile = "3"
 # covers every one (issue #184). Dev-only: the derives are `cfg_attr(test, ...)`, so nothing here
 # reaches the shipped binary.
 strum.workspace = true
-# Drives the composed admin API / probe listeners over real HTTP, the way an
-# operator, a load balancer and the upstream integration suites all do.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# `reqwest` (which drives the composed admin API / probe listeners over real
+# HTTP, the way an operator, a load balancer and the upstream integration
+# suites all do) is a real dependency as of #335 — see `[dependencies]`.
 # Reads `rift_cluster_no_principals` straight off the global registry
 # `rift_cluster::metrics` registers into — the same technique that crate's own
 # tests use, and the reason the workspace pins one `prometheus` version.

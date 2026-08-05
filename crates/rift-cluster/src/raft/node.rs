@@ -1176,6 +1176,14 @@ impl RaftNode {
         self.sm_reader.bind_failure(port)
     }
 
+    /// Is this node's engine actually holding `port`'s socket? See
+    /// [`RedbStateMachine::is_locally_bound`] — and use **this**, never `bind_failure(..).is_none()`,
+    /// before treating `127.0.0.1:port` as this imposter.
+    #[must_use]
+    pub fn is_locally_bound(&self, port: u16) -> bool {
+        self.sm_reader.is_locally_bound(port)
+    }
+
     /// `(tenant, port)` for every port this node has a committed config for,
     /// fleet-wide, ascending. Like [`Self::get_imposter`], this answers from
     /// applied local state. Fleet-wide and not tenant-scoped on purpose — it

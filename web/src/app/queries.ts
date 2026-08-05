@@ -34,6 +34,7 @@ import {
   stubByIdPath,
   stubsPath,
   tenantPath,
+  tryImposterPath,
 } from "../api/paths.ts";
 import type { components } from "../api/schema.ts";
 import { type AuditRow, auditPage, readAuditRows } from "../features/admin/audit.ts";
@@ -59,6 +60,9 @@ import { useSession } from "./session.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
 type Stub = components["schemas"]["Stub"];
+/** The try envelope and its answer, both straight off the contract (#335). */
+export type TrySpec = components["schemas"]["TryRequest"];
+export type TryResult = components["schemas"]["TryResponse"];
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
 type RouteTable = components["schemas"]["RouteTable"];
@@ -256,6 +260,32 @@ export function usePullSource(): UseMutationResult<SourcePullReport, Error, { id
       return readPullReport(applied(sent));
     },
     onSettled: () => client.invalidateQueries({ queryKey: ["sources"] }),
+  });
+}
+
+/**
+ * Send a sample request to an imposter and hand back what it answered — `POST
+ * /admin/imposters/{port}/try` (#335).
+ *
+ * `applied()` rather than a `CommitOutcome`: this is not a cluster write and has nothing to
+ * converge, so there is no parked case to model — the endpoint either performed the exchange or
+ * failed, and both answers are immediate.
+ *
+ * **No `invalidateQueries`, deliberately.** A try really does disturb server state (the request
+ * log gains an entry, a scenario may advance), so refreshing the caches would be defensible — but
+ * it would also mean pressing Send silently re-fetches the imposter and its stub table underneath
+ * the response panel the operator is trying to read. The request log is polled on its own screen
+ * and will show the entry there; what an operator wants here is the answer holding still.
+ */
+export function useTryStub(
+  port: number,
+): UseMutationResult<TryResult, Error, { request: TrySpec }> {
+  const { tenant } = useSession();
+  return useMutation({
+    mutationFn: async ({ request }) => {
+      const sent = await apiSend<TryResult>("POST", tryImposterPath(port), request, { tenant });
+      return applied(sent);
+    },
   });
 }
 

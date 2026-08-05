@@ -1614,6 +1614,123 @@ paths:
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
 
+  /admin/imposters/{port}/try:
+    parameters:
+      - $ref: '#/components/parameters/Port'
+    post:
+      operationId: tryImposter
+      summary: Send a sample request to this imposter and return what it answered
+      description: >
+        Terminates. The console's **Send** button: it lets an operator find
+        out whether a stub matches without leaving the admin origin, which a
+        browser cannot do on its own — the console is served from the admin
+        port, an imposter answers on its own, and a mock sends no CORS
+        headers, so an in-page `fetch` is blocked for essentially every stub.
+
+
+        This is the one admin route that makes the **server originate
+        outbound HTTP on a caller's behalf**, so its containment is
+        structural rather than configurable:
+
+
+        * It names a **port, never a URL or host** — the host is hardcoded
+          loopback and is not a parameter.
+
+        * The port must be an imposter in the caller's own tenant. An
+          unknown port and another tenant's port answer the identical
+          RFC-002 §8.4 `404`, so this cannot be used to map which ports
+          exist.
+
+        * The scheme comes from the imposter's own configured `protocol`,
+          never from the caller. For an `https` imposter the client accepts
+          the imposter's self-signed certificate — the connection never
+          leaves the box.
+
+        * **Redirects are never followed.** A `3xx` is returned like any
+          other answer, `Location` header and all. Following one is the only
+          way this exchange could reach somewhere other than the loopback
+          port the rules above pinned it to.
+
+
+        Requires `imposter.try` (Operator and up). A try is not read-only in
+        effect — it advances scenario state, appends to the request log and
+        can trigger proxy recording — which is why it sits with the other
+        Operator "disturb" actions rather than with `imposter.read`. A
+        Viewer diagnosing a stub uses the console's `Copy curl` button
+        instead, which needs no server surface.
+
+
+        The exchange is bounded: **10 seconds** total (connect and
+        exchange), and at most **1 MiB** of the imposter's response body is
+        read back, after which `truncated` is `true`. This is a diagnosis
+        surface, not a transfer surface.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TryRequest'
+      responses:
+        '200':
+          description: >
+            The exchange completed. **The imposter's own `4xx`/`5xx` arrives
+            here too** — that is a successful try, with the imposter's
+            status in `status`. Only failures of the endpoint itself (the
+            dial, the budget) are non-`200`, so a client never has to guess
+            whether a `502` came from the mock or from the attempt to reach
+            it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TryResponse'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            No such imposter for this tenant, or owned by another tenant —
+            byte-identical either way (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The try envelope exceeded the admin plane's request body limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          description: >
+            The imposter's port could not be reached, **or** this node is not
+            the one serving it on loopback — a committed imposter config does
+            not by itself mean this node bound the port, and a try never dials
+            a socket it cannot attribute to the imposter. Distinct from a `200`
+            carrying the imposter's own `502`: this one means the exchange
+            never happened.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          description: The 10-second budget expired before the imposter answered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /admin/imposters/{port}/flow-state/{flowId}:
     parameters:
       - $ref: '#/components/parameters/Port'
@@ -4002,6 +4119,99 @@ components:
           type: integer
           description: Present only when `reason` is `failedPredicate`.
       additionalProperties: true
+
+    TryRequest:
+      type: object
+      description: >
+        The sample request to send. Deliberately carries no host, scheme or
+        port: those come from the imposter named in the path, which is what
+        confines this endpoint to a mock the caller can already see.
+      required: [method, path]
+      properties:
+        method:
+          type: string
+          description: >
+            The HTTP method to send. Any token the imposter's own router
+            might match, not a fixed enum — a mock exists to answer whatever
+            the system under test sends it, including methods this API has
+            no opinion about.
+          example: GET
+        path:
+          type: string
+          description: >
+            Path and query string, as one string, starting with `/`. This is
+            `Sample.target` from the console's own curl derivation.
+          example: /orders?status=open
+        headers:
+          type: array
+          description: >
+            Sent as given, in order, and repeats are preserved — a list
+            rather than a map because a request may legitimately carry the
+            same header name twice and a map would silently drop one.
+          items:
+            $ref: '#/components/schemas/TryHeader'
+        body:
+          type: string
+          description: Request body, verbatim. Omit for a bodyless request.
+      additionalProperties: false
+
+    TryHeader:
+      type: object
+      required: [name, value]
+      properties:
+        name:
+          type: string
+        value:
+          type: string
+      additionalProperties: false
+
+    TryResponse:
+      type: object
+      description: What the imposter answered.
+      required: [status, headers, body, elapsedMs]
+      properties:
+        status:
+          type: integer
+          description: >
+            The imposter's own status. A `4xx`/`5xx` here is a *successful*
+            try — the endpoint still answered `200`.
+        headers:
+          type: array
+          description: The imposter's response headers, repeats preserved.
+          items:
+            $ref: '#/components/schemas/TryHeader'
+        body:
+          type: string
+          description: >
+            The response body, decoded as UTF-8. See `bodyLossy` — a mock
+            may legitimately serve bytes that are not text, and this field
+            is a string so that the common case needs no base64 round-trip.
+        bodyLossy:
+          type: boolean
+          description: >
+            Present and `true` when the body was not valid UTF-8 and
+            replacement characters were substituted. Absent otherwise, so a
+            client can tell "decoded cleanly" from "decoded with loss"
+            without comparing bytes it does not have.
+        headersLossy:
+          type: boolean
+          description: >
+            The same, for header *values*. Its own flag rather than folded
+            into `bodyLossy`: a mock with fault injection may serve malformed
+            header bytes deliberately, and the header an operator garbled on
+            purpose is exactly the one they are then reading back.
+        truncated:
+          type: boolean
+          description: >
+            Present and `true` when the imposter's body exceeded the 1 MiB
+            read cap and `body` is a prefix. Absent otherwise.
+        elapsedMs:
+          type: integer
+          description: >
+            Wall-clock milliseconds for the exchange, measured at the
+            server. Includes connect and the body read; excludes admin-side
+            authorization.
+      additionalProperties: false
 
     RouteTable:
       type: object

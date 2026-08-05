@@ -195,8 +195,26 @@ A closed enum, one per route class:
 `ImposterRead` · `ImposterWrite` · `ImposterDelete` · `StubWrite` ·
 `LifecycleToggle` · `SavedRequestsRead` · `SavedRequestsClear` · `ScenarioRead` ·
 `ScenarioWrite` · `ScenarioReset` · `SpaceStubWrite` · `SpaceTeardown` ·
-`FlowStateRead` · `FlowStateClear` · `SourceRead` · `VerifyRun` ·
+`FlowStateRead` · `FlowStateClear` · `ImposterTry` · `SourceRead` · `VerifyRun` ·
 `StreamSubscribe` · `TenantManage` · `AuditRead` · `ClusterAdmin`
+
+`ImposterTry` (issue #335) authorizes `POST /admin/imposters/{port}/try` — the
+console's "send a sample request to this stub" affordance, and the **only**
+action under which the server originates outbound HTTP on a caller's behalf.
+
+It sits at `Operator`, with the other reads-that-mutate, rather than with
+`ImposterRead`: a try advances scenario state, appends to the request log and
+can trigger proxy recording. A `Viewer` diagnosing a stub gets the console's
+`Copy curl` button instead, which answers the same question without the server
+acting for them — that line is worth keeping crisp precisely because this is
+the first capability of its kind.
+
+Because it is the first, its containment is part of the action's definition
+rather than an implementation detail: the route names a **port, never a URL or
+host**; the port must be an imposter in the caller's own tenant *and* one this
+node is actually serving on loopback (a committed config does not prove the
+socket, so ownership alone is not sufficient); the scheme comes from the
+imposter's own `protocol`; and redirects are never followed.
 
 `SourceRead` (issue #239) covers the read-only source inspection surface
 (`GET /admin/sources`, `GET /admin/sources/{id}`). It sits with the other
@@ -223,7 +241,7 @@ convenience at a time. Adding a route means adding an action here.
 | Role | Grants |
 |---|---|
 | `Viewer` | all `*Read` + `StreamSubscribe`, in-tenant |
-| `Operator` | Viewer + `LifecycleToggle`, `SavedRequestsClear`, `ScenarioReset`, `SpaceTeardown`, `FlowStateClear` |
+| `Operator` | Viewer + `LifecycleToggle`, `SavedRequestsClear`, `ScenarioReset`, `SpaceTeardown`, `FlowStateClear`, `ImposterTry` |
 | `Editor` | Operator + `ImposterWrite`, `ImposterDelete`, `StubWrite`, `SpaceStubWrite`, `ScenarioWrite`, `VerifyRun` |
 | `TenantAdmin` | Editor + `TenantManage` (principals and bindings **within** the tenant) |
 | `FleetAdmin` (only on tenant `"*"`) | everything in every tenant, plus `ClusterAdmin`: `/_cluster/*`, all-tenant `DELETE /imposters`, tenant CRUD, and `PrincipalPut`/`PrincipalDelete` (§3) |
@@ -536,8 +554,9 @@ with the thing it audits is worse than none.
 **Reads are not audited in v1.** A stated non-goal, on log volume: the data plane
 alone would dwarf every administrative event, and an audit log nobody can afford
 to keep is an audit log nobody keeps. Reads-that-mutate (`ScenarioReset`,
-`SavedRequestsClear`, `FlowStateClear`) are writes by this definition and *are*
-audited.
+`SavedRequestsClear`, `FlowStateClear`, `ImposterTry`) are writes by this
+definition and *are* audited — `ImposterTry` most of all, since it is the one
+action that makes the server originate traffic for someone.
 
 ## 10. Phasing
 
