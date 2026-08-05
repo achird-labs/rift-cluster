@@ -163,6 +163,35 @@ export function hasCatchAll(stubs: unknown): boolean {
 }
 
 /**
+ * The position of the first stub that actually **shadows** a later one, or `null` (issue #336).
+ *
+ * Two differences from [`hasCatchAll`], and both are the point:
+ *
+ * - It returns the **index**, because a space's stub table is addressed by position — there is no
+ *   `by-id` route for that collection — so "stub 0 is swallowing your traffic" is the only form of
+ *   the sentence an operator can act on.
+ * - It requires something to actually be shadowed. A predicate-less stub that is *last* matches
+ *   everything and shadows nothing; warning about it would be crying wolf on the single most
+ *   ordinary shape there is, a space-wide default with nothing after it. `hasCatchAll` answers a
+ *   different question — "would a stub appended *now* be shadowed" — where being last is exactly
+ *   what matters, which is why this is a sibling rather than a rewrite of it.
+ *
+ * Same defensive container handling as `hasCatchAll`: the list comes off the wire.
+ */
+export function shadowingStubIndex(stubs: unknown): number | null {
+  if (!Array.isArray(stubs)) return null;
+  const matchesEverything = (stub: unknown): boolean => {
+    if (typeof stub !== "object" || stub === null || Array.isArray(stub)) return false;
+    const predicates = (stub as Record<string, unknown>).predicates;
+    if (predicates === undefined) return true;
+    return Array.isArray(predicates) && predicates.length === 0;
+  };
+  const at = stubs.findIndex(matchesEverything);
+  // `at === stubs.length - 1` is the not-shadowing case above.
+  return at !== -1 && at < stubs.length - 1 ? at : null;
+}
+
+/**
  * What the row's edit action should be, from the match outcome alone.
  *
  * A matched request's useful verb is not "make a new stub" — one already answered it — it is "open

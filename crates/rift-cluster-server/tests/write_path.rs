@@ -3224,3 +3224,116 @@ async fn the_imposter_read_hands_the_editor_its_if_match_token() {
 
     server.shutdown().await;
 }
+
+/// Issue #336, through the EE front: a body that is not a stub must be refused, and must leave
+/// nothing behind.
+///
+/// The fix itself is upstream (`handle_add_space_stub`), and this route is **proxied** rather than
+/// terminated here — which is exactly why it needs a test on this side. "The EE front inherits the
+/// upstream fix" is an assumption about the proxy path, not a fact the upstream suite can check:
+/// upstream tests the handler behind its own admin API, while a client of *this* binary reaches it
+/// through `admin_front`'s proxy, the RBAC gate and the tenancy resolution. A vendor bump that
+/// silently stopped forwarding this route, or an EE-side interception that pre-empted it, would
+/// leave upstream green and this broken.
+///
+/// The harm was never the status code. A vacuous stub has no predicates (so it matches everything
+/// in its space, shadowing the stubs that were meant to answer), no responses, and no id (so the
+/// console cannot address it to delete it) — recovery was tearing the space down. So the assertion
+/// that matters is the last one: nothing was installed.
+///
+/// Derived from the QA harness parity case `a space-scoped stub is reachable`, which is what
+/// surfaced this originally.
+#[tokio::test]
+async fn a_space_stub_body_that_is_not_a_stub_is_refused_through_the_front() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+
+    let port = reserve_port();
+    let created = Seen::of(
+        client
+            .post(format!("http://{admin}/imposters"))
+            .json(&minimal_imposter(port))
+            .send()
+            .await
+            .expect("create the imposter"),
+    )
+    .await;
+    assert_eq!(created.status, 201, "seeding the imposter: {created}");
+    assert!(
+        wait_served(port, "from-a").await,
+        "the imposter must be live before its space routes mean anything"
+    );
+
+    let space_stubs = format!("http://{admin}/imposters/{port}/spaces/qa-flow/stubs");
+    let post = |body: &'static str| {
+        client
+            .post(&space_stubs)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+    };
+
+    // The exact body from the report.
+    let garbage = Seen::of(
+        post(r#"{"complete":"nonsense","zzz":123}"#)
+            .await
+            .expect("post"),
+    )
+    .await;
+    assert_eq!(
+        garbage.status, 400,
+        "a non-stub body must be refused, not answered 201 with a catch-all installed: {garbage}"
+    );
+
+    // The envelope mistake — posting the *imposter-level* route's documented shape here. This is
+    // how the bug is actually reached, so the error names it rather than describing a shape.
+    let enveloped = Seen::of(
+        post(r#"{"stub":{"predicates":[],"responses":[]}}"#)
+            .await
+            .expect("post"),
+    )
+    .await;
+    assert_eq!(enveloped.status, 400, "{enveloped}");
+    assert!(
+        enveloped.body.contains("envelope"),
+        "the envelope mistake must be named through the front too, not flattened to a generic \
+         shape error by the proxy: {enveloped}"
+    );
+
+    // The assertion that actually encodes the harm: neither refusal left a stub behind.
+    let listed = Seen::of(
+        client
+            .get(&space_stubs)
+            .send()
+            .await
+            .expect("list the space's stubs"),
+    )
+    .await;
+    assert_eq!(listed.status, 200, "{listed}");
+    assert_eq!(
+        listed.json()["stubs"].as_array().map(Vec::len),
+        Some(0),
+        "a refused body must install nothing — an id-less, predicate-less stub here would shadow \
+         the space and could not be deleted from the console: {listed}"
+    );
+
+    // And the rule is about shape, not emptiness: an explicitly authored space-wide default is
+    // still legal Mountebank semantics and must still be accepted.
+    let legal = Seen::of(
+        post(r#"{"predicates":[],"responses":[{"is":{"statusCode":204}}]}"#)
+            .await
+            .expect("post"),
+    )
+    .await;
+    assert_eq!(
+        legal.status, 201,
+        "an explicit empty-predicate stub must still be accepted: {legal}"
+    );
+
+    server.shutdown().await;
+}

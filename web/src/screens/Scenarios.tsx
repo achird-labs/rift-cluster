@@ -15,6 +15,7 @@ import {
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
+import { shadowingStubIndex } from "../features/requests/stubFromRequest.ts";
 import {
   ABSENT_ENTRY_CAVEAT,
   SPACE_STUB_CAVEAT,
@@ -446,6 +447,30 @@ function SpaceBody({
           <p className="muted" data-testid="space-stub-caveat">
             {SPACE_STUB_CAVEAT}
           </p>
+          {/*
+            Issue #336's companion. A predicate-less stub matching everything is correct Mountebank
+            semantics — it is a legitimate space-wide default — so this is a *warning*, not an error,
+            and nothing here refuses it.
+
+            What it must not be is invisible. Such a stub shadows every stub below it in this space,
+            and the table above renders positions rather than ids, so "why is my other stub not
+            answering" has no visible cause without this sentence. The imposter's own stub list
+            already says this (`RequestLog`'s `stub-shadow-warning`); a space's list is exactly
+            where it was missing, and is also where #336 could silently install one.
+          */}
+          {shadowingStubIndex(space.stubs) !== null ? (
+            <div className="banner warn" data-testid="space-stub-shadow-warning" role="status">
+              <span className="b-glyph" aria-hidden="true">
+                &#9650;
+              </span>
+              <div>
+                Stub <Ident>{shadowingStubIndex(space.stubs)}</Ident> declares no predicates, so it
+                matches every request in this space and the stubs after it never answer. That is
+                valid — an empty predicate list is a space-wide default — but if a later stub is not
+                firing, this is why.
+              </div>
+            </div>
+          ) : null}
           <div className="scroll-x">
             <table className="dense" data-testid="space-stubs">
               <thead>
