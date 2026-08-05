@@ -11,6 +11,10 @@
 //! dependency hygiene, not for a licence boundary — there no longer is one.
 
 pub use rift_http_proxy;
+/// The imposter linter. Re-exported here for the same reason as everything else in this crate:
+/// the MCP server's `lint` tool runs it in-process, and reaching `vendor/rift` directly from
+/// `rift-cluster-server` is exactly what the facade exists to prevent.
+pub use rift_lint;
 pub use rift_mock_core;
 pub use rift_types;
 
