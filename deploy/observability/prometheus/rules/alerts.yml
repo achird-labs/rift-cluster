@@ -103,3 +103,26 @@ groups:
         annotations:
           summary: "Tracking-source scheduler cannot read or decode source rows"
           description: "Either the leader's source-poll scheduler has been unable to read the source table, or it has held at least one corrupt row, continuously for 5 minutes. Either condition parks the affected source at its last-known poll cadence until the underlying row is fixed (see both metrics' doc comments in crates/rift-cluster/src/metrics.rs) — 5 minutes gives a transient table read blip time to clear before paging on it."
+
+      # The verification plane's one alert (#319).
+      #
+      # Deliberately the only one of the three journal signals that pages.
+      # Merge latency has no SLO to breach, and per-peer pull failures that do
+      # not degrade a read are the replica cache doing its job — alerting on
+      # either would be alerting on "the system is working". A sustained
+      # partial-read rate is the one state that is both operator-visible and
+      # operator-actionable: a rostered peer is unreachable, so verification
+      # reads may be missing recent entries.
+      #
+      # `for: 10m` is a counter window, not a gauge one: transient partials
+      # during a rolling restart are `Rift-Cluster-Partial` working exactly as
+      # designed, and a shorter window would page on every deploy until someone
+      # muted the alert.
+      - alert: RiftJournalReadsDegraded
+        expr: rift:journal_partial_reads:rate5m > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet journal reads are persistently degraded"
+          description: "rift:journal_partial_reads:rate5m has been above zero for 10 minutes: merged savedRequests reads are being stamped Rift-Cluster-Partial, so a rostered peer is unreachable or over budget and verification reads may be missing recent entries. Transient partials during a rolling restart are by design and are why the window is 10m rather than shorter; a sustained rate is not. Check rift:journal_peer_pull_failures:rate5m to see which peer."

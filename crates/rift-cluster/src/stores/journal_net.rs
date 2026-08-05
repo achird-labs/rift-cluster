@@ -492,8 +492,19 @@ impl JournalNet {
     /// `merge_shards` stays a function of its inputs alone.
     #[must_use]
     pub async fn merge_read(&self, port: u16, budget: Duration) -> MergeOutcome {
-        let start = std::time::Instant::now();
         let partial = self.pull_since_budgeted(port, budget).await;
+        // Timed from *after* the fan-out, not around it (issue #319). The
+        // histogram's own registration calls this "an in-memory sort … not I/O"
+        // and sizes its buckets to top out at 0.5 s on that basis, but the timer
+        // started before `pull_since_budgeted` — a network phase bounded by a 2 s
+        // budget. So the metric contradicted both its doc and its buckets, and
+        // p95/p99 pinned flat at 0.5 s exactly when the fan-out was degrading,
+        // because `histogram_quantile` returns the highest finite bucket bound
+        // once a quantile lands in `+Inf`. The panel went blind at the moment it
+        // mattered. Measuring the fan-out against its budget is a real want, but
+        // it is a different series with different buckets — #228's C29 asks for
+        // exactly that, and reusing this one for it is what broke it.
+        let start = std::time::Instant::now();
         let outcome = merge_shards(&self.slices_for(port), partial);
         crate::metrics::journal_merge_observed(start.elapsed());
         if outcome.partial {
