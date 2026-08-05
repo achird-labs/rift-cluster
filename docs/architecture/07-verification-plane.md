@@ -153,8 +153,31 @@ they pin the *allocation* property (a restart never reissues a seq), not the
 walk, which the three rules above already cover.
 
 What the floor does **not** restore is the entries themselves. Those are still
-gone, per the volatility decision in Ch.9; a restarted writer's merged reads
-are therefore short, and saying so honestly is issue #349's.
+gone, per the volatility decision in Ch.9, so a restarted writer's merged reads
+really are short — and it **says so** (issue #349).
+
+The asymmetry that makes this necessary: a merged read asks each peer for that
+peer's *own* writer shard, never for the asker's shard back, because a peer
+relaying replicas is what would make the merge cyclic. So entries whose writer
+crashed survive only in the survivors' replica caches, and the restarted node
+cannot pull them home even in principle. Left alone, its merged reads would
+converge on a smaller set than its peers' — permanently, until eviction — with
+nothing anywhere saying the answers disagree.
+
+So the restarted writer stamps `Rift-Cluster-Partial` while any peer still
+caches entries of its shard at or below its boot floor. One scalar carries it:
+a peer answering a shard pull reports the lowest seq it holds *of the asker's*
+shard, and the asker compares that against its floor. Every seq at or below the
+floor was issued by a previous boot, and a peer only caches what this node
+actually served it, so a cached seq in that range is exactly an entry the crash
+took. No extra round trip — the pull that computes reachability already visits
+every peer. The stamp clears itself as those caches evict the old range, which
+bounds the divergence window rather than latching on it.
+
+This is the second thing `Rift-Cluster-Partial` can mean, and the two are worth
+keeping distinct: reachability partial says "entries newer than my last
+successful pull may be missing, and will arrive"; content partial says "entries
+I used to hold are gone here for good."
 
 A bare `u64` is accepted for the upgrade window and read as `{this_node: seq}`:
 before #225 a merged read issued no cursor at all, so any scalar a client holds
@@ -230,8 +253,15 @@ comfortably above any upstream call the engine would wait for.
 ## What this plane deliberately does not promise
 
 Journal entries are **test-run-scoped**: bounded buffers for in-run assertion,
-volatile across full-cluster restarts (Chapter 9's matrix, with the segment-file
+volatile across full-cluster restarts *and* across a single node's crash, which
+costs that node its own shard (Chapter 9's matrix, with the segment-file
 extension path noted if that ever changes). And under partition, verification
 reads are *partial and say so* rather than blocking — a test harness that needs
 strict completeness asserts `Rift-Cluster-Partial` is absent, which the chaos
 suite does in anger.
+
+That strict-completeness assertion is why the honesty has to be exact in both
+directions. A stamp that fires when nothing is wrong would fail every strict
+harness on a healthy fleet; a stamp that stays silent when a restarted writer
+is answering short lets the harness assert completeness against an answer that
+is not complete. Both halves are pinned by tests (#349).

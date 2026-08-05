@@ -498,17 +498,13 @@ impl ClusterJournal {
     /// Every seq at or below this value was handed out (or reserved) before the current
     /// process started; everything above it belongs to this boot.
     ///
-    /// Capturing it is this issue's job even though its consumer is the next one: the
-    /// value has to be read at shard construction, because `durable_floor` advances
-    /// during the run and nothing later can recover where this boot began. Issue #349
-    /// reads it to tell a peer's cached entry of ours that the crash took from us
-    /// (`cached_seq <= boot_floor`) apart from one we still hold, which is what lets a
-    /// restarted writer stamp `Rift-Cluster-Partial` honestly.
+    /// The value has to be captured at shard construction, because `durable_floor` advances
+    /// during the run and nothing later can recover where this boot began.
     ///
-    /// Hence the scoped allow: exercised by this module's tests, unreferenced in a lib
-    /// build until #349 lands. Scoped rather than blanket so it starts warning again if
-    /// #349 changes shape and leaves this stranded.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// [`super::journal_net::JournalNet::pull_since_budgeted`] is the consumer (issue #349):
+    /// a peer reporting that it caches an entry of ours at or below this floor is reporting,
+    /// exactly, an entry the crash took from us — which is what lets a restarted writer stamp
+    /// `Rift-Cluster-Partial` instead of answering short in silence.
     #[must_use]
     pub(crate) fn boot_floor(&self, port: u16) -> u64 {
         // Deliberately NOT `self.shard(port).boot_floor`: #349 asks this about ports named

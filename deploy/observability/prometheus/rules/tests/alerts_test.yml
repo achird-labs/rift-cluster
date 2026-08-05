@@ -144,7 +144,7 @@ tests:
               severity: warning
             exp_annotations:
               summary: "Fleet journal reads are persistently degraded"
-              description: "rift:journal_partial_reads:rate5m has been above zero for 10 minutes: merged savedRequests reads are being stamped Rift-Cluster-Partial, so a rostered peer is unreachable or over budget and verification reads may be missing recent entries. Transient partials during a rolling restart are by design and are why the window is 10m rather than shorter; a sustained rate is not. Check rift:journal_peer_pull_failures:rate5m to see which peer."
+              description: "rift:journal_partial_reads:rate5m has been above zero for 10 minutes: merged savedRequests reads are being stamped Rift-Cluster-Partial. Two causes, and they need different responses. (1) A rostered peer is unreachable or over budget, so reads may be missing recent entries that will arrive once it returns — check rift:journal_peer_pull_failures:rate5m to see which peer. (2) A node crashed and restarted, and its peers still cache entries of the shard it lost, which are gone for good rather than late (#349); this one is expected after a restart and clears only once that node records shard_cap new entries on the port, so on a quiet port it persists. Rule out a recent restart before investigating a partition."
 
   # The blip that must not page: partial reads for one scrape, then nothing.
   - interval: 1m
