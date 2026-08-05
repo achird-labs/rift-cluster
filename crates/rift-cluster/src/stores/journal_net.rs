@@ -2293,10 +2293,12 @@ mod tests {
     /// compose-level suites have. What is provable here is exactly what the loop composes: what
     /// a responder reports, and what an asker concludes from it.
     ///
-    /// The composed behaviour has **no end-to-end coverage yet**. C28 is reserved by #228 and
-    /// not implemented — `tests/cluster-chaos/tests/scenarios.rs` and that suite's README both
-    /// list C28-C30 as reserved. When #228 lands, its C28 is where a real 3-node kill-and-restart
-    /// asserts the stamp; saying so here rather than implying it already exists.
+    /// The composed behaviour is covered end-to-end by **C28**
+    /// (`c28_fleet_journal_is_exact_under_node_kill`, `tests/cluster-chaos/tests/scenarios.rs`),
+    /// which lands a real 3-node SIGKILL-and-restart and asserts the victim answers short and
+    /// STAMPED while the survivors stay complete and unstamped. That scenario arrived with #228
+    /// after this work began, and its phase-3 assertion — written to pin the unstamped answer as
+    /// a documented gap — is flipped by this change, in this PR.
     mod restart_partial_stamp {
         use super::*;
 

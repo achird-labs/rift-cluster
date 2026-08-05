@@ -5166,10 +5166,18 @@ async fn c28_fleet_journal_is_exact_under_node_kill() {
     // entries: a merged read asks each peer for that peer's OWN writer shard,
     // never for the asker's lost shard back, so entries whose writer crashed
     // live on only in the survivors' caches — Ch.7's volatility contract
-    // applied to one node. That its short answer is UNSTAMPED while
-    // disagreeing with the survivors is a real honesty gap this scenario
-    // documents and pins as-is; #349 carries the design call rather than
-    // papering it over with a weaker assertion.
+    // applied to one node.
+    //
+    // The victim's short answer is STAMPED PARTIAL (#349). When this scenario
+    // was written the answer was short and unstamped, and it pinned that as a
+    // documented honesty gap rather than papering over it; #349 closed the gap
+    // by having a peer report the lowest seq it still caches of the ASKER's
+    // shard, which the asker compares against the durable boot floor #351
+    // gave it. So the two halves of this phase now assert different things on
+    // purpose: the survivors are complete and unstamped, the victim is short
+    // and says so. A victim that answered short and unstamped would be the
+    // original defect; one that answered the full set would mean the entries
+    // came back, which the volatility contract says they do not.
     cluster.start(victim.name).expect("restart the victim");
     for node in &NODES {
         wait_voters(node, 3.0, CONVERGE_TIMEOUT)
@@ -5196,20 +5204,22 @@ async fn c28_fleet_journal_is_exact_under_node_kill() {
             collected
         };
         let settled = reads.iter().all(|(index, read)| {
-            let want = if *index == victim_index {
-                &victim_expected
-            } else {
-                &expected
-            };
-            matches!(read, Ok((paths, false)) if paths == want)
+            let victim = *index == victim_index;
+            let want = if victim { &victim_expected } else { &expected };
+            // The victim stamps partial and the survivors do not — see the note
+            // above. Asserting the flag per node rather than a single shared
+            // value is the whole point: `false` everywhere was the pre-#349
+            // defect, and `true` everywhere would mean the survivors had gone
+            // degraded too, which nothing here should cause.
+            matches!(read, Ok((paths, partial)) if paths == want && *partial == victim)
         });
         if settled {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "after restart the survivors must answer the exact set and the victim \
-             the set minus its lost shard, all unstamped: {reads:?}"
+            "after restart the survivors must answer the exact set unstamped, and the \
+             victim the set minus its lost shard stamped partial (#349): {reads:?}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -6103,15 +6113,22 @@ async fn c30_vector_cursor_walk_survives_membership_change() {
     };
 
     // Round 3: the victim returns, and the walk continues over the
-    // **survivors'** new traffic only. Not the victim's: its journal was
-    // process memory, so a crash-restart reuses sequence numbers from 1 —
-    // colliding with its own cached pre-kill history in the walk's
-    // `(node_id, seq)` identity. That is a real defect this scenario found on
-    // its first in-anger run (duplicate delivery of a survivor-era path),
-    // filed as #351 for a design fix; what the cursor contract can honestly
-    // promise today is that surviving writers stay gapless and
-    // duplicate-free through the membership change, and that the victim's
-    // already-walked history never re-delivers.
+    // **survivors'** new traffic.
+    //
+    // The defect this scenario found on its first in-anger run — a
+    // crash-restart reusing sequence numbers from 1, colliding with its own
+    // cached pre-kill history in the walk's `(node_id, seq)` identity, and
+    // delivering a survivor-era path twice — was filed as #351 and **is
+    // fixed**: a restarted writer now resumes above a durable per-port seq
+    // floor, so its post-restart seqs sit strictly above every position a
+    // held cursor could carry. This comment previously described that as an
+    // open defect; it is not, as of `75a8692`.
+    //
+    // What is asserted below is still scoped to the survivors, and that is
+    // now a *conservative* assertion rather than a forced one. Extending it
+    // to require the victim's post-restart entries to arrive on the same walk
+    // is the natural follow-up, and needs its own compose run to land safely
+    // rather than being widened here on inference.
     cluster
         .start(NODES[victim_index].name)
         .expect("restart the victim");
