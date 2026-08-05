@@ -339,9 +339,17 @@ mod tests {
     /// The half a "renders as a string" assertion alone would miss: the string has to parse BACK.
     #[test]
     fn the_rendered_string_round_trips_to_the_same_u64() {
-        for id in [0_u64, 1, 9_007_199_254_740_993, 3_342_140_982_834_931_156, u64::MAX] {
+        for id in [
+            0_u64,
+            1,
+            9_007_199_254_740_993,
+            3_342_140_982_834_931_156,
+            u64::MAX,
+        ] {
             let rendered = node_id(id);
-            let text = rendered.as_str().expect("a node id renders as a JSON string");
+            let text = rendered
+                .as_str()
+                .expect("a node id renders as a JSON string");
             assert_eq!(text.parse::<u64>().expect("and parses back"), id);
         }
     }
