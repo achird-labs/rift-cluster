@@ -38,7 +38,8 @@ use rift_cluster_base::seams::{
     JournalEntry, JournalRead, JournalReadSince, MAX_RECORDED_REQUESTS, MatchOutcome,
     RecordedRequest, RequestJournal,
 };
-use std::collections::{HashMap, VecDeque};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -173,6 +174,136 @@ pub struct ShardRead {
     pub space_gens: Vec<(String, u64)>,
     /// This node's G-counter slot — summed across shards to answer `numberOfRequests`.
     pub count_slot: u64,
+}
+
+/// A reader's position across every writer's shard of one port (issue #225) — what a merged
+/// `?since=` read hands back and takes in, instead of one scalar index.
+///
+/// A scalar cursor cannot address a multi-writer merge: "index 500" names a position in
+/// *whose* shard? So this carries a position **per shard**, keyed by the writer's [`NodeId`],
+/// plus the clear generation (issue #224) the cursor was issued under — a merge needs both to
+/// know which entries a reader has already consumed and which generation's worth of clears it
+/// has already accounted for.
+///
+/// `pos` is a [`BTreeMap`], not a `HashMap`: the same cursor must [`Self::encode`] to the same
+/// bytes every time, and a `HashMap`'s iteration order is not stable across processes (or even
+/// two runs of the same process, under the default hasher) — an unstable order would make the
+/// token an unreliable cache key and a flaky value to assert on in a test.
+///
+/// The token [`Self::encode`] produces is opaque **by contract**, not merely by convention: a
+/// client must round-trip it, never parse it. That is what leaves this format free to change
+/// shape behind the version tag it carries — [`Self::decode`] rejects any version it does not
+/// recognize — without breaking a client that only ever passed the string back unmodified.
+///
+/// A malformed or unrecognized token is always an error, never a defaulted position:
+/// defaulting to `0` would silently replay the entire journal, and defaulting to "current"
+/// would silently skip every entry recorded since the token went stale. Both are
+/// wrong-but-quiet, so [`Self::decode`] and [`Self::decode_or_legacy`] refuse instead of
+/// guessing — see [`CursorError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalCursor {
+    /// The port's clear generation (issue #224) at the moment this cursor was issued — not
+    /// at the moment it is read back. A merge compares the two to tell whether a clear landed
+    /// in between and, if so, which entries it is entitled to have dropped.
+    pub generation: u64,
+    /// `node_id -> that shard's seq the reader has consumed`, exclusive — the same convention
+    /// [`ClusterJournal::read_shard_since`]'s `since_seq` uses. A shard absent from the map
+    /// has contributed nothing to this cursor yet, which reads identically to a position of 0.
+    pub pos: BTreeMap<NodeId, u64>,
+}
+
+/// On-wire shape of an encoded [`JournalCursor`]. Kept as its own type rather than deriving
+/// (de)serialization on [`JournalCursor`] directly: the version tag belongs to the *encoding*,
+/// not the cursor itself, so a future format change is a change to this struct (or a
+/// replacement for it behind a new [`CURSOR_TOKEN_VERSION`]) and never touches what callers of
+/// [`JournalCursor`] hold.
+#[derive(Debug, Serialize, Deserialize)]
+struct CursorPayload {
+    v: u32,
+    #[serde(rename = "gen")]
+    generation: u64,
+    pos: BTreeMap<NodeId, u64>,
+}
+
+/// The only payload version this build knows how to read. [`JournalCursor::decode`] rejects
+/// every other value rather than guessing at what an unfamiliar shape means — the gate this
+/// buys is exercised directly by issue #225's malformed-token test.
+const CURSOR_TOKEN_VERSION: u32 = 1;
+
+/// Why a vector cursor token was refused (issue #225).
+///
+/// Each variant is a distinct, named reason rather than one catch-all string: the front door
+/// (a later issue) maps this to a typed 400, and an operator chasing a client's "cursor
+/// rejected" report needs to know whether the token was mangled in transit, was never one of
+/// ours, or names a format version this node does not speak — three different fixes.
+#[derive(Debug, thiserror::Error)]
+pub enum CursorError {
+    /// Not valid unpadded base64url — truncated, edited by hand, or never one of ours.
+    #[error("cursor token is not valid base64url: {0}")]
+    Encoding(#[from] base64::DecodeError),
+    /// Valid base64, but the decoded bytes are not a [`CursorPayload`].
+    #[error("cursor token does not decode to a cursor payload: {0}")]
+    Payload(#[from] serde_json::Error),
+    /// A well-formed payload this node does not know how to read: it decoded, but its
+    /// version is not [`CURSOR_TOKEN_VERSION`]. Rejected rather than guessed at — a version
+    /// this build has never seen could mean anything about the shape that follows it.
+    #[error("cursor token version {0} is not supported by this node")]
+    UnsupportedVersion(u32),
+}
+
+impl JournalCursor {
+    /// Encode this cursor as a versioned, opaque, unpadded base64url token — safe inside a
+    /// query string and an SSE `id:` line, both of which forbid `+`, `/`, `=`, and whitespace.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        use base64::Engine as _;
+
+        let payload = CursorPayload {
+            v: CURSOR_TOKEN_VERSION,
+            generation: self.generation,
+            pos: self.pos.clone(),
+        };
+        // `CursorPayload`'s fields are all JSON primitives — two integers and a u64-keyed
+        // map, which serde_json renders as string keys — so serialization cannot fail here.
+        // The fallback exists only so this infallible, `String`-returning method never needs
+        // `.unwrap()`/`.expect()`: if it were ever somehow hit, the result is a token that
+        // fails to decode, not one that decodes to a wrong-but-plausible cursor.
+        let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Decode a token [`Self::encode`] produced. Rejects malformed base64, bytes that are not
+    /// a [`CursorPayload`], and a payload whose version this build does not recognize — see
+    /// [`CursorError`] and this type's doc comment for why none of these fall back to a
+    /// default position.
+    pub fn decode(token: &str) -> Result<Self, CursorError> {
+        use base64::Engine as _;
+
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token)?;
+        let payload: CursorPayload = serde_json::from_slice(&bytes)?;
+        if payload.v != CURSOR_TOKEN_VERSION {
+            return Err(CursorError::UnsupportedVersion(payload.v));
+        }
+        Ok(Self {
+            generation: payload.generation,
+            pos: payload.pos,
+        })
+    }
+
+    /// Decode `token`, accepting one legacy shape alongside [`Self::decode`]'s: a bare `u64`.
+    /// That can only have come from a pre-#223 client, proxied straight to `this_node`'s own
+    /// scalar `?since=` — the merged read did not exist yet to have issued anything else. It
+    /// is read as `{this_node: that_seq}` at generation 0 (clear generations postdate every such
+    /// client); every other shard starts at 0 because a client holding a bare scalar has
+    /// provably never seen any of them.
+    pub fn decode_or_legacy(token: &str, this_node: NodeId) -> Result<Self, CursorError> {
+        if let Ok(seq) = token.parse::<u64>() {
+            let mut pos = BTreeMap::new();
+            pos.insert(this_node, seq);
+            return Ok(Self { generation: 0, pos });
+        }
+        Self::decode(token)
+    }
 }
 
 #[derive(Debug)]
@@ -1110,7 +1241,7 @@ mod tests {
     #[test]
     fn a_cursor_round_trips_through_its_token() {
         let cursor = JournalCursor {
-            gen: 7,
+            generation: 7,
             pos: [(1u64, 10u64), (2, 0), (9, u64::MAX)].into_iter().collect(),
         };
         let token = cursor.encode();
@@ -1126,7 +1257,7 @@ mod tests {
         // Opaque is a contract, not an aesthetic: clients must not parse it, and it travels in a
         // query string and an SSE `id:` line, so it cannot carry `+`, `/` or `=`.
         let token = JournalCursor {
-            gen: u64::MAX,
+            generation: u64::MAX,
             pos: [(u64::MAX, u64::MAX)].into_iter().collect(),
         }
         .encode();
@@ -1146,10 +1277,13 @@ mod tests {
     fn an_empty_cursor_round_trips() {
         // The first read of a port issues a cursor with no shard positions at all.
         let empty = JournalCursor {
-            gen: 0,
+            generation: 0,
             pos: BTreeMap::new(),
         };
-        assert_eq!(JournalCursor::decode(&empty.encode()).expect("round trip"), empty);
+        assert_eq!(
+            JournalCursor::decode(&empty.encode()).expect("round trip"),
+            empty
+        );
     }
 
     #[test]
@@ -1159,7 +1293,7 @@ mod tests {
         for bad in [
             "not base64!!",
             "",
-            "Zm9v",                       // valid base64url, not our JSON
+            "Zm9v",                                // valid base64url, not our JSON
             "eyJ2Ijo5OTksImdlbiI6MCwicG9zIjp7fX0", // well-formed but version 999
         ] {
             assert!(
@@ -1180,7 +1314,10 @@ mod tests {
             1,
             "every other shard starts at 0 — the client has provably seen none of them"
         );
-        assert_eq!(cursor.gen, 0, "a legacy cursor predates clear generations");
+        assert_eq!(
+            cursor.generation, 0,
+            "a legacy cursor predates clear generations"
+        );
     }
 
     #[test]
@@ -1198,7 +1335,7 @@ mod tests {
                 0..8,
             ),
         ) {
-            let cursor = JournalCursor { gen: generation, pos: pairs.into_iter().collect() };
+            let cursor = JournalCursor { generation, pos: pairs.into_iter().collect() };
             let decoded = JournalCursor::decode(&cursor.encode())
                 .expect("an encoded cursor always decodes");
             proptest::prop_assert_eq!(decoded, cursor);
