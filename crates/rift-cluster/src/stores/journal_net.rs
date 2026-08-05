@@ -412,12 +412,43 @@ const ANTI_ENTROPY_BUDGET: Duration = Duration::from_secs(2);
 /// shard, not just the ones it happens to hold. That is what lets
 /// [`Self::slices_for`] answer a merge with no network hop on the read path;
 /// the hop happens ahead of time, in [`Self::anti_entropy_tick`].
+/// One peer's cached shard, plus what **this cache** threw away (issue #340).
+///
+/// The extra field exists because two different things can make an entry unavailable, and only one
+/// of them is the origin's business:
+///
+/// - `read.evicted_below_seq` is the **origin's** watermark, adopted wholesale on every merge. It
+///   says what the peer itself no longer holds.
+/// - `dropped_below_seq` is **this cache's own**, raised when [`JournalNet::merge_reply`] discards
+///   low entries under [`shard_cap`] pressure. The origin still has them; this node does not.
+///
+/// Before this existed, the cap-pressure drop raised nothing at all, so a reader walked *past* the
+/// discarded range while `evicted_through` — reading only the origin's watermark — reported the
+/// range as present. The entries were simply absent from the merged view and `x-rift-truncated`
+/// stayed `false`. With a cursor (issue #225) that is permanent for the walk: the reader's position
+/// has already advanced beyond them.
+///
+/// Kept as a separate field rather than folded into `read.evicted_below_seq` by making that
+/// adoption monotone. A peer that restarts legitimately reports a *lower* watermark along with
+/// fresh low seqs; a sticky origin watermark would make the retain in `merge_reply` discard that
+/// peer's entire new shard on arrival. The origin's field stays exactly as the origin reports it,
+/// and the two are combined only where a reader is told what is missing.
+///
+/// [`shard_cap`]: super::journal::ClusterJournal::shard_cap
+struct CachedShard {
+    read: ShardRead,
+    /// Highest seq this cache itself dropped under cap pressure, inclusive. Monotone: only ever
+    /// raised, and only for seqs this cache actually held and discarded — never adopted from the
+    /// wire.
+    dropped_below_seq: u64,
+}
+
 pub struct JournalNet {
     journal: Arc<ClusterJournal>,
     /// Every peer's shard of every port this node has pulled, keyed by whose
     /// it is and which port. [`Self::anti_entropy_tick`] is the only writer;
     /// [`Self::slices_for`] is the only reader outside of it.
-    replicas: RwLock<HashMap<(NodeId, u16), ShardRead>>,
+    replicas: RwLock<HashMap<(NodeId, u16), CachedShard>>,
     /// Late-bound, exactly like `FlowNet`'s node slot: the journal (and this
     /// net) is built before the `RaftNode` exists. `Weak` so the anti-entropy
     /// loop can never keep the node alive past shutdown.
@@ -471,9 +502,20 @@ impl JournalNet {
                 .read()
                 .iter()
                 .filter(|((_, replica_port), _)| *replica_port == port)
-                .map(|((node_id, _), read)| ShardSlice {
+                .map(|((node_id, _), cached)| ShardSlice {
                     node_id: *node_id,
-                    read: read.clone(),
+                    // The presented watermark is the **max** of what the origin evicted and what
+                    // this cache dropped (issue #340). This one line is the whole read-side fix:
+                    // `evicted_through`, `merge_shards_since`'s truncation check and its cursor
+                    // advance all read `evicted_below_seq`, so raising it here makes every one of
+                    // them honest about a cap-pressure drop with no change of their own.
+                    read: ShardRead {
+                        evicted_below_seq: cached
+                            .read
+                            .evicted_below_seq
+                            .max(cached.dropped_below_seq),
+                        ..cached.read.clone()
+                    },
                 }),
         );
         slices
@@ -503,17 +545,21 @@ impl JournalNet {
     /// [`shard_cap`]: super::journal::ClusterJournal::shard_cap
     fn merge_reply(&self, peer: NodeId, port: u16, reply: SinceReply) {
         let mut replicas = self.replicas.write();
-        let cached = replicas.entry((peer, port)).or_insert_with(|| ShardRead {
-            entries: Vec::new(),
-            evicted_below_seq: 0,
-            clear_gen: 0,
-            space_gens: Vec::new(),
-            count_slot: 0,
+        let cached = replicas.entry((peer, port)).or_insert_with(|| CachedShard {
+            read: ShardRead {
+                entries: Vec::new(),
+                evicted_below_seq: 0,
+                clear_gen: 0,
+                space_gens: Vec::new(),
+                count_slot: 0,
+            },
+            dropped_below_seq: 0,
         });
 
         // Fold the existing cache and the new reply together, keyed on `seq` — a repeat entry
         // (the race above, or a peer that re-sends unchanged history) simply overwrites itself.
         let mut by_seq: HashMap<u64, ShardEntry> = cached
+            .read
             .entries
             .drain(..)
             .map(|entry| (entry.seq, entry))
@@ -523,15 +569,17 @@ impl JournalNet {
             by_seq.insert(entry.seq, entry);
         }
 
-        cached.evicted_below_seq = reply.evicted_below_seq;
-        cached.clear_gen = reply.clear_gen;
-        cached.space_gens = reply.space_gens;
-        cached.count_slot = reply.count_slot;
+        cached.read.evicted_below_seq = reply.evicted_below_seq;
+        cached.read.clear_gen = reply.clear_gen;
+        cached.read.space_gens = reply.space_gens;
+        cached.read.count_slot = reply.count_slot;
 
-        // Drop everything the watermark just adopted already covers — resurrecting it would
-        // only be undone again by `merge_shards`'s own eviction filter at read time, at the cost
-        // of holding it here indefinitely.
-        by_seq.retain(|&seq, _| seq > cached.evicted_below_seq);
+        // Drop everything either watermark already covers — the origin's (just adopted) and this
+        // cache's own (issue #340). Folding `dropped_below_seq` in here matters: without it, a
+        // refill that starts from a low `from` would resurrect entries the presented watermark
+        // already declares gone, and the merged view would flip-flop between having them and not.
+        let floor = cached.read.evicted_below_seq.max(cached.dropped_below_seq);
+        by_seq.retain(|&seq, _| seq > floor);
 
         let mut entries: Vec<ShardEntry> = by_seq.into_values().collect();
         entries.sort_by_key(|entry| entry.seq);
@@ -542,10 +590,15 @@ impl JournalNet {
         let cap = self.journal.shard_cap();
         if entries.len() > cap {
             let drop = entries.len() - cap;
+            // Record what is being discarded *before* discarding it (issue #340). The origin still
+            // holds these; this node will not re-fetch them, because both pull paths compute their
+            // `from` as the max cached seq and so never look below this point again. Raising the
+            // cache's own watermark is what turns a silent hole into a declared one.
+            cached.dropped_below_seq = cached.dropped_below_seq.max(entries[drop - 1].seq);
             entries.drain(0..drop);
         }
 
-        cached.entries = entries;
+        cached.read.entries = entries;
     }
 
     /// One pass of the anti-entropy pull (issue #223): for every port this
@@ -586,8 +639,8 @@ impl JournalNet {
         for &peer in &peers {
             for &port in &ports {
                 let node = Arc::clone(&node);
-                let from = self.replicas.read().get(&(peer, port)).map_or(0, |read| {
-                    read.entries.iter().map(|e| e.seq).max().unwrap_or(0)
+                let from = self.replicas.read().get(&(peer, port)).map_or(0, |cached| {
+                    cached.read.entries.iter().map(|e| e.seq).max().unwrap_or(0)
                 });
                 set.spawn(async move {
                     let body = match serde_json::to_vec(&SinceReq { port, from }) {
@@ -769,8 +822,8 @@ impl JournalNet {
         let mut set = tokio::task::JoinSet::new();
         for peer in peers.iter().copied() {
             let node = Arc::clone(&node);
-            let from = self.replicas.read().get(&(peer, port)).map_or(0, |read| {
-                read.entries.iter().map(|e| e.seq).max().unwrap_or(0)
+            let from = self.replicas.read().get(&(peer, port)).map_or(0, |cached| {
+                cached.read.entries.iter().map(|e| e.seq).max().unwrap_or(0)
             });
             set.spawn(async move {
                 let outcome = async {
@@ -889,7 +942,10 @@ impl JournalNet {
             for &peer in &peers {
                 for &port in ports {
                     if let Some(cached) = replicas.get(&(peer, port)) {
-                        slots.insert((peer, port), (cached.count_slot, cached.clear_gen));
+                        slots.insert(
+                            (peer, port),
+                            (cached.read.count_slot, cached.read.clear_gen),
+                        );
                     }
                 }
             }
@@ -1130,6 +1186,170 @@ mod tests {
             flow_id: flow_id.to_owned(),
             request: req_at(timestamp, &format!("/p{seq}")),
             recorded_at_millis: 0,
+        }
+    }
+
+    /// Issue #340: what the replica cache throws away under cap pressure must be *declared*.
+    ///
+    /// These drive a real [`JournalNet`] rather than hand-built slices, because the defect lives in
+    /// the seam between `merge_reply` (which drops) and `slices_for` (which presents) — the pure
+    /// merge functions were never wrong, and testing them again would prove nothing.
+    mod cache_drop_watermark {
+        use super::*;
+        use crate::stores::journal::JournalConfig;
+
+        const PEER: NodeId = 7;
+        const PORT: u16 = 4545;
+        /// The cap every test here works against. Unbound, `shard_cap()` reads as one voter, so it
+        /// is `max(min_shard_cap, fleet_capacity / 1)` — i.e. exactly `fleet_capacity`. That makes
+        /// the cap controllable without reaching for `bind_fixed_voters`, which is private to
+        /// `journal.rs`.
+        const CAP: usize = 4;
+
+        fn net() -> Arc<JournalNet> {
+            let journal = ClusterJournal::with_parts(
+                1,
+                JournalConfig {
+                    fleet_capacity: CAP,
+                    min_shard_cap: 1,
+                    ..JournalConfig::default()
+                },
+                Arc::new(crate::stores::journal::MonotonicClock::default()),
+            );
+            assert_eq!(journal.shard_cap(), CAP, "the fixture must control the cap");
+            JournalNet::new(journal)
+        }
+
+        /// A reply carrying `seqs`, with the origin declaring nothing evicted.
+        fn reply(seqs: std::ops::RangeInclusive<u64>, evicted_below_seq: u64) -> SinceReply {
+            SinceReply {
+                entries: seqs
+                    .map(|seq| to_wire(&entry(PEER, seq, "2026-01-01T00:00:00Z")))
+                    .collect(),
+                evicted_below_seq,
+                clear_gen: 0,
+                space_gens: Vec::new(),
+                count_slot: 0,
+            }
+        }
+
+        fn peer_slice(net: &JournalNet) -> ShardSlice {
+            net.slices_for(PORT)
+                .into_iter()
+                .find(|slice| slice.node_id == PEER)
+                .expect("the peer's cached shard is presented")
+        }
+
+        /// The core of the fix: a drop this cache made is visible in what it presents.
+        ///
+        /// Before, `merge_reply` discarded the lowest seqs and raised nothing — `evicted_below_seq`
+        /// was only ever assigned from the *origin's* watermark, which says what the peer no longer
+        /// holds, not what this cache threw away.
+        #[test]
+        fn an_over_cap_drop_raises_the_presented_watermark() {
+            let net = net();
+            // Two more than the cap, so seqs 1 and 2 are dropped.
+            net.merge_reply(PEER, PORT, reply(1..=(CAP as u64 + 2), 0));
+
+            let slice = peer_slice(&net);
+            assert_eq!(
+                slice.read.entries.len(),
+                CAP,
+                "the cap is still enforced: {:?}",
+                slice.read.entries.iter().map(|e| e.seq).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                slice.read.evicted_below_seq, 2,
+                "seqs 1 and 2 were dropped by this cache, so the presented watermark must cover \
+                 them — the origin still holds them, but this node no longer does"
+            );
+        }
+
+        /// The scenario the issue asks to pin, end to end.
+        ///
+        /// A reader whose cursor sits below the dropped range walks *past* it — `merge_shards_since`
+        /// advances the position to the max seq held. That advance is fine; doing it in silence is
+        /// not, because with a cursor (#225) those entries are skipped permanently for that walk.
+        /// `x-rift-truncated` is the mechanism that exists to say so, and before this fix it stayed
+        /// `false` because `evicted_through` could only see the origin's watermark.
+        #[test]
+        fn a_cursored_walk_over_a_dropped_range_declares_truncation() {
+            let net = net();
+            net.merge_reply(PEER, PORT, reply(1..=(CAP as u64 + 2), 0));
+
+            let slices = net.slices_for(PORT);
+            // Positioned below the hole: this reader has seen nothing from the peer yet.
+            let cursor = JournalCursor {
+                generation: 0,
+                pos: [(PEER, 0u64)].into_iter().collect(),
+            };
+
+            let merged = merge_shards_since(&slices, false, Some(&cursor));
+            assert!(
+                merged.truncated,
+                "entries 1-2 are gone from this node and the reader stepped over them — that must \
+                 be declared, not silent"
+            );
+            assert!(
+                merged.next.pos.get(&PEER).copied().unwrap_or(0) >= CAP as u64 + 2,
+                "and the cursor still advances past the hole rather than stalling on it"
+            );
+        }
+
+        /// The origin's watermark is adopted wholesale, but it must not *lower* what this cache
+        /// already declared gone.
+        ///
+        /// This is why `dropped_below_seq` is a separate field rather than a monotone
+        /// `evicted_below_seq`: a restarted peer legitimately reports a lower watermark with fresh
+        /// low seqs, and making the origin's field sticky would make the retain discard that peer's
+        /// entire new shard. The origin's value stays exactly what the origin says; the *presented*
+        /// value is the max of the two.
+        #[test]
+        fn a_lower_origin_watermark_does_not_lower_the_presented_one() {
+            let net = net();
+            net.merge_reply(PEER, PORT, reply(1..=(CAP as u64 + 2), 0));
+            assert_eq!(peer_slice(&net).read.evicted_below_seq, 2);
+
+            // A later reply that evicts nothing at all must not un-declare the earlier drop.
+            net.merge_reply(PEER, PORT, reply(5..=6, 0));
+            assert!(
+                peer_slice(&net).read.evicted_below_seq >= 2,
+                "the cache's own drop is monotone — the origin cannot talk it back down"
+            );
+        }
+
+        /// A baseline (uncursored) read is a snapshot and can never be truncated. Existing
+        /// doctrine, restated here because raising a watermark is exactly the change most likely to
+        /// break it — and a header that cried wolf on the most common read there is would be worse
+        /// than the silence this fix removes.
+        #[test]
+        fn a_baseline_read_is_still_untruncated_after_a_drop() {
+            let net = net();
+            net.merge_reply(PEER, PORT, reply(1..=(CAP as u64 + 2), 0));
+
+            let merged = merge_shards_since(&net.slices_for(PORT), false, None);
+            assert!(
+                !merged.truncated,
+                "a baseline read is a snapshot — it has no position to have stepped over"
+            );
+        }
+
+        /// The cap is not exceeded by a refill either: a later reply starting below the drop must
+        /// not resurrect entries the presented watermark already declares gone, or the merged view
+        /// would flip-flop between having them and not.
+        #[test]
+        fn a_low_refill_does_not_resurrect_dropped_entries() {
+            let net = net();
+            net.merge_reply(PEER, PORT, reply(1..=(CAP as u64 + 2), 0));
+            // A refill from zero — what a `from = 0` pull would deliver.
+            net.merge_reply(PEER, PORT, reply(1..=2, 0));
+
+            let slice = peer_slice(&net);
+            let seqs: Vec<u64> = slice.read.entries.iter().map(|e| e.seq).collect();
+            assert!(
+                seqs.iter().all(|&seq| seq > 2),
+                "entries at or below the cache's own watermark must stay gone: {seqs:?}"
+            );
         }
     }
 
