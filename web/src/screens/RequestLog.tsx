@@ -2,20 +2,13 @@ import { type ReactNode, useState } from "react";
 
 import type { components } from "../api/schema.ts";
 import { ApiError } from "../api/client.ts";
-import type { FleetReadState } from "../app/fleetView.ts";
-import {
-  useClearRequests,
-  useFleetView,
-  useImposter,
-  useImposters,
-  useRequestLog,
-} from "../app/queries.ts";
+import { useClearRequests, useImposter, useImposters, useRequestLog } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
-import { coverageFor, describeCoverage, headerValues, page } from "../features/requests/source.ts";
+import { describeCoverage, headerValues, page } from "../features/requests/source.ts";
 import {
   type FieldSelection,
   defaultSelection,
@@ -37,23 +30,9 @@ export function RequestLog({ port }: { port: number | null }): ReactNode {
   return <Log key={port} port={port} />;
 }
 
-/**
- * The fleet reading, as the three-way fact it is.
- *
- * A failed `/_fleet/*` read is not the same as not having asked, and neither is the same as a
- * reading — `coverageFor` needs all three to avoid claiming coverage it cannot support.
- */
-function useFleetReadState(): FleetReadState {
-  const fleet = useFleetView({ polled: false });
-  if (fleet.isSuccess) return { kind: "read", view: fleet.data };
-  if (fleet.isError) return { kind: "unavailable" };
-  return { kind: "not-asked" };
-}
-
 function Log({ port }: { port: number }): ReactNode {
   const [offset, setOffset] = useState(0);
   const log = useRequestLog(port);
-  const coverage = coverageFor(useFleetReadState());
   const { can } = useSession();
   const clear = useClearRequests();
   const [confirming, setConfirming] = useState(false);
@@ -124,7 +103,7 @@ function Log({ port }: { port: number }): ReactNode {
               data-testid="clear-requests"
               onClick={() => setConfirming(true)}
             >
-              Clear this node&rsquo;s log
+              Clear this imposter&rsquo;s log
             </button>
           </>
         ) : null}
@@ -137,11 +116,11 @@ function Log({ port }: { port: number }): ReactNode {
       {confirming ? (
         <Confirm
           testId="confirm-clear-requests"
-          title="Clear this node's recorded requests?"
+          title="Clear this imposter's recorded requests?"
           body={
             <>
-              This empties what <b>this node</b> recorded for imposter {port}. Other nodes keep
-              their own logs, and nothing restores these rows.
+              This empties the recorded requests for imposter {port} <b>fleet-wide</b> — the clear
+              commits through Raft to every node, and nothing restores these rows.
             </>
           }
           confirmLabel="Clear log"
@@ -155,22 +134,37 @@ function Log({ port }: { port: number }): ReactNode {
       ) : null}
 
       {/*
-       * A permanent scope strip, not a dismissible banner — and deliberately the most prominent
-       * thing on the screen after the title. Per-node is the fact this screen must keep in front of
-       * the reader: an operator uses it to decide whether their system under test called the mock,
-       * and one node's log answers that only for one node. When the merged journal lands (#147) the
-       * label drops and this shape stays.
+       * A permanent strip, not a dismissible banner, for exactly one fact: a merge that could not
+       * reach every node before answering. It renders only in that case — a complete merge (the
+       * ordinary case) says nothing here, because a permanent label with nothing wrong to report
+       * trains operators to stop reading it before the day it matters. See `describeCoverage`.
        */}
-      <div className="scope" data-testid="request-scope-label" role="status">
-        <span className="eyebrow">Scope</span>
-        <span className="pill accent">
-          <span className="g" aria-hidden="true">
-            ◈
+      {log.isSuccess && log.data.kind === "rows" && log.data.coverage.kind === "partial" ? (
+        <div className="scope" data-testid="request-scope-label" role="status">
+          <span className="eyebrow">Scope</span>
+          <span className="pill accent">
+            <span className="g" aria-hidden="true">
+              ◈
+            </span>
+            partial merge
           </span>
-          this node only
-        </span>
-        <span className="coverage">{describeCoverage(coverage)}</span>
-      </div>
+          <span className="coverage">{describeCoverage()}</span>
+        </div>
+      ) : null}
+
+      {log.isSuccess && log.data.kind === "rows" && log.data.truncated ? (
+        // The honesty bit for retention racing the poll: a reader who lost entries to eviction must
+        // not read a shorter table as the mock simply having received fewer calls.
+        <div className="banner warn" data-testid="request-truncated-notice" role="status">
+          <span className="b-glyph" aria-hidden="true">
+            &#9650;
+          </span>
+          <div>
+            Older entries were evicted before this merge could include them. Some earlier requests
+            may be missing from what is shown below.
+          </div>
+        </div>
+      ) : null}
 
       {mayWriteStubs && editing !== null && !editorReady ? (
         <div className="banner warn" data-testid="stub-gone" role="status">
@@ -255,7 +249,7 @@ function Rows({
   if (state.kind === "unknown") {
     /*
      * The distinction the issue calls the most important on this screen. An empty table here would
-     * tell an operator their system under test never called the mock, when in fact this node simply
+     * tell an operator their system under test never called the mock, when in fact the merge simply
      * could not answer.
      */
     return (
@@ -264,7 +258,7 @@ function Rows({
           ■
         </span>
         <div>
-          <strong>This node&rsquo;s log is unknown, not empty.</strong>
+          <strong>This imposter&rsquo;s log is unknown, not empty.</strong>
           <p>
             It could not be read, so nothing here says whether requests arrived. {state.reason}
           </p>
@@ -280,15 +274,17 @@ function Rows({
       <Empty
         testId="request-log-empty"
         title="No requests recorded for this imposter"
-        body="This node answered. Nothing has called the imposter since its log was last cleared."
+        body="The merge answered. Nothing has called the imposter since its log was last cleared."
       />
     );
   }
 
   /*
-   * Clamp before paging. The journal shrinks under the 2s poll — retention truncates it, and
-   * `DELETE /imposters/:port/requests` empties it outright — so an offset that was valid a tick ago
-   * can point past the end, which would render an empty table for an imposter that has traffic.
+   * Clamp before paging. The list this pages over can shrink between ticks — a fleet-wide clear
+   * empties it outright, and the periodic re-baseline in `useRequestLog` replaces the accumulated
+   * rows with whatever the fleet still retains, which is smaller whenever retention has evicted
+   * since. Either way an offset that was valid a tick ago can point past the end, which would
+   * render an empty table for an imposter that has traffic.
    */
   const clamped = Math.min(offset, Math.max(0, state.rows.length - 1));
   const start = Math.floor(clamped / PAGE_SIZE) * PAGE_SIZE;
@@ -346,7 +342,7 @@ function Rows({
             Next
           </button>
           <span className="count" data-testid="request-total">
-            {first}–{last} of {view.total} on this node
+            {first}–{last} of {view.total}
           </span>
         </nav>
       </section>

@@ -109,7 +109,7 @@ adds no header logic of its own beyond sending the selection.
 |---|---|---|
 | **Imposters** — list, per-imposter detail, enable/disable; filter/sort/bulk (#252) | `GET/POST/DELETE /imposters*` (terminated routes — `classify()` at `admin_front.rs:435`, the `Terminated` enum at `:351`; reads proxied to the engine). Filtering and sorting are **client-side** over the list already fetched — no query parameter is added, because `GET /imposters` returns the tenant's whole set and a server-side filter would give "what is in this list" a second source of truth. Bulk actions are **N calls, not a batch endpoint**: one request per imposter, reported per item (see below) | v1, bulk #252 |
 | **Stub editor** — form ⟷ raw JSON, monaco, lint-on-save | stub CRUD incl. by-id routes (`admin_front.rs:378-395`); lint via `rift-lint` in-browser (§4.1) | v1 |
-| **Request log** — recorded requests, match diagnostics | v1: `GET /imposters/:port/requests` per node, labelled **per-node view**; converges to the doc-07 merged journal when the verification plane ships, same screen, no redesign | v1 (degraded) |
+| **Request log** — recorded requests, match diagnostics | v1 read `GET /imposters/:port/requests` per node and labelled it **per-node view**. #147 H landed the promised convergence: the same route now answers the fleet's **merged** journal (doc-07), paged with the server's opaque `?since=` vector cursor, and the per-node label is deleted — a label renders only for an incomplete merge (`Rift-Cluster-Partial`). Same screen, no redesign, exactly as promised | v1 → merged (#147 H) |
 | **Cluster** — members, leader, ring epoch, readiness, pending ops | §5.2's admin-port fleet reads (projection of `cluster_api.rs:63-191`) | v1 |
 | **Front-door routes** — table editor | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` (`admin_front.rs:348-360,405,419-438`) | v1 |
 | **Tenants / principals / roles / tokens / audit** | RFC-002 §5 admin surface + `GET /admin/audit` | with RFC-002 T3/T4 |
@@ -523,7 +523,7 @@ C1–C3 are strictly ordered; C4+ and M1+ parallelize.
 | **M2 — MCP writes** | write tools with idempotency-from-call-id, `expected_revision`/409 shape, `{parked, op_id}` + `op_status` | Retry-after-timeout dedups (one commit); conflict returns structured rebase error |
 | **M3 — MCP scoping** | `whoami`-driven tool registration, audit attribution verified end-to-end | Viewer key exposes no write tools; MCP write appears in audit as its principal |
 | **C8 — scenarios & state** (#232) | scenario states per space, space stubs and teardown, flow-state entries; seven capabilities transcribed into `rbac.ts` | Every control gated on the action `map_action` actually returns; unreadable ≠ empty on all three panels |
-| **v2 (follow-ups, not this RFC)** | SSE cache invalidation (§6); specs screen (RFC-004); merged-journal request log (doc-07); OIDC session minting; MCP HTTP transport | — |
+| **v2 (follow-ups, not this RFC)** | SSE cache invalidation (§6); specs screen (RFC-004); OIDC session minting; MCP HTTP transport. (The merged-journal request log listed here has since landed — #147 H) | — |
 
 The scenario/state screens were listed here as a v2 follow-up "with RFC-005",
 and that was a scheduling error rather than a dependency: the routes they read
