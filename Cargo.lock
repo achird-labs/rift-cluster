@@ -2675,6 +2675,7 @@ version = "0.1.0"
 dependencies = [
  "hyper",
  "rift-http-proxy",
+ "rift-lint",
  "rift-mock-core",
  "rift-types",
  "serde_json",
@@ -2781,6 +2782,16 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "rift-lint"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

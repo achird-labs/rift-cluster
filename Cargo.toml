@@ -40,6 +40,9 @@ rust-version = "1.92"
 # resolves against vendor/rift/Cargo.toml.
 rift-types = { path = "vendor/rift/crates/rift-types" }
 rift-mock-core = { path = "vendor/rift/crates/rift-mock-core" }
+# The linter the console's wasm pane already wraps. Consumed through `rift-cluster-base` like every
+# other vendored crate — the MCP `lint` tool runs it in-process, dry-run, with no network.
+rift-lint = { path = "vendor/rift/crates/rift-lint", default-features = false }
 # The server layer (ServerBuilder, metrics server, gateway dispatch) that the
 # cluster binary composes instead of forking `main.rs`. Taken without the
 # binary-only `mimalloc` default; the feature list mirrors rift-mock-core's
@@ -67,6 +70,9 @@ serde_yaml = "0.9"
 # construction, which is the property the compiler wants: a 3.1 or Swagger 2.0 document cannot be
 # half-parsed into something plausible, it fails the version gate before this crate sees it.
 openapiv3 = "2.2"
+# Official Rust MCP SDK, for the `rift-cluster-server mcp` stdio subcommand (RFC-006 §8.1, #292).
+# `transport-io` is stdio; no HTTP/SSE transport is enabled, so the process opens no listening port.
+rmcp = { version = "3.1.0", default-features = false, features = ["server", "macros", "transport-io"] }
 # `regex::escape` for the spec compiler's literal path segments. Escaping is the mitigation for
 # RFC-004 §8's regex-injection item, so it uses the same engine that will match the pattern rather
 # than a hand-rolled character class that could disagree with it. Already in the tree transitively.
