@@ -460,6 +460,18 @@ impl ClusterJournal {
         self.shard(port).count.store(0, Ordering::SeqCst);
     }
 
+    /// This node's currently-live **port** clear generation for `port` (issue #224) — never
+    /// a space generation, which has no single value to report here. Reads the atomic
+    /// directly rather than going through [`Self::read_shard_since`], which would pay for
+    /// walking (and cloning) the deque to build a `ShardRead` this caller only wants one
+    /// field of; [`super::journal_net::journal_routes`]'s counts handler is the caller, and
+    /// it needs this alongside [`RequestJournal::count`] to answer `numberOfRequests`
+    /// generation-aware (see [`super::journal_net::fleet_count`]).
+    #[must_use]
+    pub(crate) fn clear_gen(&self, port: u16) -> u64 {
+        self.shard(port).clear_gen.load(Ordering::SeqCst)
+    }
+
     fn shard(&self, port: u16) -> Arc<PortShard> {
         if let Some(shard) = self.ports.read().get(&port) {
             return Arc::clone(shard);

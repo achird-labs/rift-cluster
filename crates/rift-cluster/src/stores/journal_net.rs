@@ -149,22 +149,56 @@ fn evicted_through(slices: &[ShardSlice], node: NodeId) -> u64 {
         .unwrap_or(0)
 }
 
-/// `numberOfRequests` for one port: the sum of every node's G-counter slot.
+/// `numberOfRequests` for one port: the sum of every node's G-counter slot **at the port's
+/// current clear generation** (issue #224).
+///
+/// Each item is `(slot, clear_gen)` — a node's count alongside the port generation it was
+/// reported at. The fleet's current generation is the highest any item reports, exactly the
+/// rule [`merge_shards`] uses for its own `current_gen`, and a slot reported at an older
+/// generation is dropped from the sum rather than added to it.
+///
+/// That exclusion, not a zero, is the reader's half of the invariant [`merge_shards`]'s port
+/// filter already gives the entries: [`super::journal::ClusterJournal::zero_count`] zeroes a
+/// node's *own* slot the instant *that node* applies the clear, but a peer that has not yet
+/// applied it still reports its pre-clear slot until its own apply catches up. Summing that
+/// stale slot in the meantime would answer a non-zero COUNT for the exact generation whose
+/// ENTRIES the merge has already emptied — the two halves of one response disagreeing about
+/// whether the clear happened yet. Dropping the slot instead keeps a reader's COUNT and
+/// ENTRIES answering the same generation the moment the reader itself has learned of the bump,
+/// with no coordination on the write side and no waiting for the laggard to catch up.
+///
+/// Only the **port** generation gates the sum. A `(slot, clear_gen)` pair never carries a
+/// `space_gen` — there is no per-space slot to begin with — so a space-scoped clear, which
+/// deliberately leaves `numberOfRequests` untouched (`clear_flow`/`retain`'s existing
+/// contract, matched by the apply path's own `space.is_none()` guard around `zero_count`), has
+/// nothing here that could affect it.
 ///
 /// A G-counter sums rather than maxes: each node only ever increments its own slot, so the fleet
 /// total is the sum, and a missing peer understates it (which is what `partial` declares) rather
 /// than corrupting it. The sum saturates because an overstated count is a bad answer, while a
 /// wrapped one is a wrong answer that looks plausible.
 ///
-/// Takes bare slots rather than [`ShardSlice`]s so that the summation the gate tests pin is the
-/// one that actually serves requests. [`JournalNet::fleet_counts`] answers production's
-/// `numberOfRequests` from `/_cluster/journal/counts` replies, which carry only slots and never
-/// full shards (see its doc); a `&[ShardSlice]` signature would therefore have forced it to
-/// re-implement this fold independently — which is exactly what issue #223's review caught, with
-/// the resulting dead-code lint on this function as the tell.
+/// Takes `(slot, clear_gen)` pairs rather than [`ShardSlice`]s so that the summation the gate
+/// tests pin is the one that actually serves requests. [`JournalNet::fleet_counts`] answers
+/// production's `numberOfRequests` from `/_cluster/journal/counts` replies, which carry only
+/// `(port, slot, clear_gen)` triples and never full shards (see [`CountsReply`]'s doc); a
+/// `&[ShardSlice]` signature would therefore have forced it to re-implement this fold
+/// independently — which is exactly what issue #223's review caught, with the resulting
+/// dead-code lint on this function as the tell. A caller that already holds full
+/// [`ShardSlice`]s (the gate tests below) maps `.read.count_slot` / `.read.clear_gen` into the
+/// same pair rather than inventing a parallel fold of its own.
 #[must_use]
-pub(crate) fn fleet_count(slots: impl IntoIterator<Item = u64>) -> u64 {
-    slots.into_iter().fold(0u64, u64::saturating_add)
+pub(crate) fn fleet_count(slots: impl IntoIterator<Item = (u64, u64)>) -> u64 {
+    let slots: Vec<(u64, u64)> = slots.into_iter().collect();
+    let current_gen = slots
+        .iter()
+        .map(|&(_, generation)| generation)
+        .max()
+        .unwrap_or(0);
+    slots
+        .into_iter()
+        .filter(|&(_, generation)| generation >= current_gen)
+        .fold(0u64, |sum, (slot, _)| sum.saturating_add(slot))
 }
 
 // ---------------------------------------------------------------------------
@@ -204,9 +238,14 @@ pub(crate) struct CountsReq {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CountsReply {
-    /// `(port, this node's slot)`. A list rather than a map: JSON object keys are strings, and a
-    /// `u16` round-tripping through one is a decode failure waiting to happen.
-    pub slots: Vec<(u16, u64)>,
+    /// `(port, this node's slot, this node's port clear generation)`. A list rather than a
+    /// map: JSON object keys are strings, and a `u16` round-tripping through one is a decode
+    /// failure waiting to happen. The generation rides alongside the slot — never a
+    /// `space_gen`, which has no single fleet-wide meaning here — so [`JournalNet::fleet_counts`]
+    /// can gate a peer's slot by it the same way [`fleet_count`] gates every slot (issue #224):
+    /// a slot from a shard still behind the port's current generation must be excluded from the
+    /// sum, not summed and quietly wrong.
+    pub slots: Vec<(u16, u64, u64)>,
 }
 
 /// A [`ShardEntry`] as it crosses the wire.
@@ -633,12 +672,15 @@ impl JournalNet {
     }
 
     /// `numberOfRequests` for a batch of ports (issue #223): the same budgeted, concurrent fan-out
-    /// as [`Self::merge_read`], but over `/_cluster/journal/counts` — a peer's G-counter slot for
-    /// every listed port in one round trip, not the full shard a merged read needs. Reuses no
-    /// cache: `CountsReply` carries only slots, not entries, so folding it into `slices_for`'s
-    /// `ShardRead` cache would mean fabricating the rest of the shape. The seed-from-cache and
-    /// sum-with-`fleet_count`'s-semantics steps below give the identical partial-honesty contract
-    /// without it.
+    /// as [`Self::merge_read`], but over `/_cluster/journal/counts` — a peer's G-counter slot and
+    /// port clear generation for every listed port in one round trip, not the full shard a merged
+    /// read needs. Reuses no cache: `CountsReply` carries only slots and generations, not entries,
+    /// so folding it into `slices_for`'s `ShardRead` cache would mean fabricating the rest of the
+    /// shape. The seed-from-cache and sum-with-`fleet_count`'s-semantics steps below give the
+    /// identical partial-honesty contract without it — including the generation gate (issue #224):
+    /// a peer whose reply (or cached last-known state) is still behind the port's current
+    /// generation contributes nothing to the sum, the same as it would contribute no entries to
+    /// [`Self::merge_read`].
     ///
     /// Failure handling mirrors [`Self::pull_since_budgeted`] (issue #223 review, B5): every
     /// `Err` is logged at `warn` with the real error and counted by
@@ -647,16 +689,23 @@ impl JournalNet {
     /// because it was aborted rather than errored.
     #[must_use]
     pub async fn fleet_counts(&self, ports: &[u16], budget: Duration) -> (HashMap<u16, u64>, bool) {
-        // Slots are collected per port and folded through `fleet_count` at the end, rather than
-        // accumulated by a second `saturating_add` written independently here: production's
-        // `numberOfRequests` and the mutation-verified gate tests must exercise the *same*
-        // summation, or a mutation to one is invisible to the other (issue #223 review, B7).
-        // Seeded with this node's own slot; peers' slots are appended below.
-        let mut per_port: HashMap<u16, Vec<u64>> = ports
+        // Slots are collected per port as `(slot, clear_gen)` pairs and folded through
+        // `fleet_count` at the end, rather than accumulated by a second `saturating_add`
+        // written independently here: production's `numberOfRequests` and the
+        // mutation-verified gate tests must exercise the *same* summation, or a mutation to
+        // one is invisible to the other (issue #223 review, B7) — and, since #224, the same
+        // generation gate too. Seeded with this node's own slot and generation; peers' pairs
+        // are appended below.
+        let mut per_port: HashMap<u16, Vec<(u64, u64)>> = ports
             .iter()
-            .map(|&port| (port, vec![self.journal.count(port)]))
+            .map(|&port| {
+                (
+                    port,
+                    vec![(self.journal.count(port), self.journal.clear_gen(port))],
+                )
+            })
             .collect();
-        let totals = |per_port: &HashMap<u16, Vec<u64>>| -> HashMap<u16, u64> {
+        let totals = |per_port: &HashMap<u16, Vec<(u64, u64)>>| -> HashMap<u16, u64> {
             per_port
                 .iter()
                 .map(|(&port, slots)| (port, fleet_count(slots.iter().copied())))
@@ -676,16 +725,17 @@ impl JournalNet {
             return (totals(&per_port), false);
         }
 
-        // Seeded from the replica cache first — anti-entropy's last known slot — so a peer that
-        // misses this call's budget still contributes what is known rather than vanishing from the
-        // sum: the same "partial never means omitted" contract `merge_read` upholds for entries.
-        let mut slots: HashMap<(NodeId, u16), u64> = HashMap::new();
+        // Seeded from the replica cache first — anti-entropy's last known slot and the
+        // generation it was reported at — so a peer that misses this call's budget still
+        // contributes what is known rather than vanishing from the sum: the same "partial
+        // never means omitted" contract `merge_read` upholds for entries.
+        let mut slots: HashMap<(NodeId, u16), (u64, u64)> = HashMap::new();
         {
             let replicas = self.replicas.read();
             for &peer in &peers {
                 for &port in ports {
                     if let Some(cached) = replicas.get(&(peer, port)) {
-                        slots.insert((peer, port), cached.count_slot);
+                        slots.insert((peer, port), (cached.count_slot, cached.clear_gen));
                     }
                 }
             }
@@ -717,8 +767,8 @@ impl JournalNet {
                 match joined {
                     Ok((peer, Ok(reply))) => {
                         answered.insert(peer);
-                        for (port, slot) in reply.slots {
-                            slots.insert((peer, port), slot);
+                        for (port, slot, clear_gen) in reply.slots {
+                            slots.insert((peer, port), (slot, clear_gen));
                         }
                     }
                     Ok((peer, Err(e))) => {
@@ -839,15 +889,16 @@ pub fn journal_routes(net: Arc<JournalNet>) -> Router {
                 Box::pin(async move {
                     let req: CountsReq = serde_json::from_slice(&body)
                         .map_err(|e| RpcError::Handler(format!("journal/counts decode: {e}")))?;
-                    // `RequestJournal::count`, not `read_shard_since(port,
-                    // u64::MAX)`: both skip cloning the shard (the `since`
-                    // filter admits nothing at `u64::MAX`), but `count` reads
-                    // the atomic slot directly instead of walking the deque
-                    // to confirm that.
+                    // `RequestJournal::count` and `ClusterJournal::clear_gen`, not
+                    // `read_shard_since(port, u64::MAX)`: both skip cloning the shard (the
+                    // `since` filter admits nothing at `u64::MAX`), but reading the two atomics
+                    // directly instead of walking the deque is what confirms that without the
+                    // clone in the first place. The generation rides alongside the slot so a
+                    // reader can gate a stale peer's slot out of `numberOfRequests` (issue #224).
                     let slots = req
                         .ports
                         .iter()
-                        .map(|&port| (port, net.journal.count(port)))
+                        .map(|&port| (port, net.journal.count(port), net.journal.clear_gen(port)))
                         .collect();
                     serde_json::to_vec(&CountsReply { slots })
                         .map_err(|e| RpcError::Handler(e.to_string()))
@@ -1234,7 +1285,13 @@ mod tests {
         let mut b = slice(2, vec![]);
         b.read.count_slot = 100;
 
-        assert_eq!(fleet_count([a, b].iter().map(|s| s.read.count_slot)), 1_000);
+        // A caller holding full `ShardSlice`s (the shape `slices_for` produces) maps both
+        // fields straight through rather than inventing a parallel fold — see `fleet_count`'s
+        // own doc for why that is exactly the shape it takes.
+        assert_eq!(
+            fleet_count([a, b].iter().map(|s| (s.read.count_slot, s.read.clear_gen))),
+            1_000
+        );
     }
 
     /// A pathological slot pair must not wrap to a small number — an overstated count is a bad
@@ -1247,9 +1304,33 @@ mod tests {
         b.read.count_slot = 5;
 
         assert_eq!(
-            fleet_count([a, b].iter().map(|s| s.read.count_slot)),
+            fleet_count([a, b].iter().map(|s| (s.read.count_slot, s.read.clear_gen))),
             u64::MAX
         );
+    }
+
+    /// #224: a shard still reporting the pre-clear generation must not contribute its slot to
+    /// the sum — summing it would answer a non-zero COUNT for the exact generation whose
+    /// ENTRIES `merge_shards`'s port filter has already emptied, the two halves of one response
+    /// disagreeing about whether the clear happened.
+    #[test]
+    fn fleet_count_drops_slots_from_a_superseded_generation() {
+        let superseded = (7, 0);
+        let current = (3, 1);
+
+        assert_eq!(
+            fleet_count([superseded, current]),
+            3,
+            "only the current-generation slot is counted"
+        );
+    }
+
+    /// Today every shard pins generation 0, and the sum must still count every slot — the
+    /// same no-op guarantee `generation_zero_everywhere_drops_nothing` pins for `merge_shards`,
+    /// at this function's own layer.
+    #[test]
+    fn fleet_count_sums_every_slot_at_the_current_generation() {
+        assert_eq!(fleet_count([(900, 0), (100, 0)]), 1_000);
     }
 
     // ---- wire contract ---------------------------------------------------------------
@@ -1281,10 +1362,10 @@ mod tests {
     #[test]
     fn counts_reply_round_trips_port_keys_as_integers() {
         let reply = CountsReply {
-            slots: vec![(4545, 12), (8080, 0)],
+            slots: vec![(4545, 12, 0), (8080, 0, 1)],
         };
         let json = serde_json::to_string(&reply).expect("CountsReply serializes");
         let back: CountsReply = serde_json::from_str(&json).expect("CountsReply round-trips");
-        assert_eq!(back.slots, vec![(4545, 12), (8080, 0)]);
+        assert_eq!(back.slots, vec![(4545, 12, 0), (8080, 0, 1)]);
     }
 }
