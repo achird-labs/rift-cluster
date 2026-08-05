@@ -68,6 +68,9 @@ x-node: &node
   build:
     context: ../..
     dockerfile: deploy/Dockerfile
+    # Pinned because the Dockerfile's last stage is the chaos suite's
+    # faketime flavor (issue #228); untargeted builds would select it.
+    target: runtime
     args:
       RIFT_UPSTREAM_VERSION: "${RIFT_UPSTREAM_VERSION:-}"
   environment: &node-env
@@ -97,6 +100,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/Dockerfile
+      # Same pin as x-node above (issue #228).
+      target: runtime
       args:
         RIFT_UPSTREAM_VERSION: "${RIFT_UPSTREAM_VERSION:-}"
     container_name: sources-demo-origin

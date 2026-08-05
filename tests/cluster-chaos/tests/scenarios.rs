@@ -319,6 +319,45 @@ fn compose_files() -> Vec<std::path::PathBuf> {
     files
 }
 
+/// Every compose `build:` against `deploy/Dockerfile` must pin a `target:`
+/// (issue #228). The Dockerfile's last stage is now the chaos suite's
+/// `runtime-faketime` — it builds `FROM runtime`, so it cannot precede it —
+/// which means an untargeted build silently produces the clock-lying flavor
+/// instead of the production image. That flip actually shipped once, one file
+/// away from the compose that was fixed; this is the tripwire that makes
+/// appending a stage safe forever.
+///
+/// The check is a per-file count heuristic — `target:` lines at least as
+/// numerous as `dockerfile: deploy/Dockerfile` lines — rather than a YAML
+/// parse, matching the workflow-literal style of the sibling meta-tests; a
+/// false pass would need a file to pair an untargeted build with an unrelated
+/// surplus `target:`, which no honest compose file has a reason to contain.
+#[test]
+fn every_dockerfile_build_site_pins_a_target() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = compose_files();
+    let demos = root.join("../../deploy/compose");
+    for entry in std::fs::read_dir(&demos).unwrap_or_else(|e| panic!("read deploy/compose: {e}")) {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_some_and(|ext| ext == "yml") && !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    for path in files {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let builds = text.matches("dockerfile: deploy/Dockerfile").count();
+        let targets = text.matches("target:").count();
+        assert!(
+            targets >= builds,
+            "{}: {builds} build(s) against deploy/Dockerfile but only {targets} `target:` \
+             pin(s) — an untargeted build now produces the faketime flavor, not the \
+             production image",
+            path.display()
+        );
+    }
+}
+
 fn read_compose(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
@@ -4859,31 +4898,6 @@ async fn c27_tenancy_isolates_ownership_but_not_the_data_plane() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Issue #223 AC3 — merge-on-read partition honesty, at smoke level.
-//
-// Deliberately *not* numbered `cNN`. #228 reserves C28-C30 for the verification
-// plane's in-anger tier, and **C29 is this property done properly**: partition
-// mid-spray, assert `rift_cluster_journal_partial_reads_total` moved, measure
-// the 2 s budget rather than bounding it. #223's own acceptance criterion says
-// so in as many words — "the full in-anger scenario is #228's; this slice lands
-// a smoke-level version" — so taking a C number here would squat on #228's
-// numbering for a weaker test.
-//
-// What this one is for: #223 ships the merge, and the merge's central honesty
-// claim is that a degraded read says it is degraded. Landing that claim with no
-// container-tier assertion at all would leave it proven only in-process, where
-// no real network can be cut.
-//
-// It needs no new overlay, which is worth recording because #228's design notes
-// predict one ("a scenario asserting `Rift-Cluster-Partial` on data reads needs
-// a published port overlay"). It does not: traffic goes through the front-door
-// overlay's already-published per-node listeners, and the merged read is an
-// *admin* call, on a port the base file already publishes. Imposter data ports
-// stay unpublished.
-// ---------------------------------------------------------------------------
-
 /// The journal imposter's port, and the front-door prefix that reaches it.
 /// 6700 sits clear of every other scenario's data port (6300 pull-on-miss, 6400
 /// flow-state, 6500/6501 tenancy, 6600 sources origin, 6001/6002 C4).
@@ -4933,6 +4947,18 @@ async fn merged_saved_requests(
     Ok((paths, partial))
 }
 
+/// The fleet-wide `numberOfRequests` for the journal imposter, as one node
+/// reports it (issue #223: a per-node G-counter slot summed on read).
+async fn journal_number_of_requests(admin: u16) -> anyhow::Result<u64> {
+    let (status, body) = get_json(admin, &format!("/imposters/{JOURNAL_IMPOSTER_PORT}")).await?;
+    if status != 200 {
+        anyhow::bail!("imposter read answered {status}");
+    }
+    body.get("numberOfRequests")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("imposter body carries no numberOfRequests: {body}"))
+}
+
 /// Drive `count` requests through node `index`'s **own** front door.
 ///
 /// Per-node front doors are what make the shards genuinely distinct. Every node
@@ -4955,45 +4981,14 @@ async fn drive_journal_traffic(index: usize, tag: &str, count: usize) -> anyhow:
     Ok(())
 }
 
-/// #223 AC3 (smoke): a partition is declared on both sides, and heals cleanly.
-///
-/// Three properties, in the order the acceptance criterion states them:
-/// 1. a healthy fleet's merged read is **not** stamped — the standing gate;
-/// 2. under partition **both** sides still answer, within budget, stamped
-///    `Rift-Cluster-Partial: true` — never hang, never silently short;
-/// 3. on heal the stamp clears and the two sides' sets converge.
-///
-/// Property 2's "within budget" is asserted by the read *completing*:
-/// `get_data_plane`'s client timeout is 10 s and the merge's own peer budget is
-/// far below it, so a read that waited on the unreachable peer would surface as
-/// a client timeout rather than as a stamped 200. Measuring the budget properly
-/// is C29's job (#228).
-#[tokio::test]
-#[ignore = "needs a container runtime"]
-async fn journal_partition_is_declared_on_both_sides_and_heals() {
-    let cluster = Cluster::up_with_overlays(&["chaos.overlay.yml", "front-door.overlay.yml"])
-        .await
-        .expect("fleet comes up");
-    let leader = wait_single_leader(CONVERGE_TIMEOUT)
-        .await
-        .expect("a leader settles");
-
-    // Partition a follower, not the leader: isolating the leader is a different
-    // scenario (the majority elects a new one) and would change what the
-    // minority side is even able to answer.
-    let minority_index = (0..NODES.len())
-        .find(|index| *index != leader)
-        .expect("a non-leader exists");
-    let minority = &NODES[minority_index];
-    let majority: Vec<usize> = (0..NODES.len())
-        .filter(|index| *index != minority_index)
-        .collect();
-
-    // `recordRequests` is mandatory: `Imposter::record_request` returns early
-    // without it, so every shard would stay empty and every assertion below
-    // would compare empty sets and pass.
+/// The C28–C30/C12 journal fixture: the recording imposter, the front-door
+/// route, and the wait until every node's own front door dispatches it —
+/// shared because four scenarios repeat it verbatim. (The #223 smoke scenario
+/// that pioneered this setup was deleted when C29 landed, exactly as its own
+/// README note directed: C29 is the same property measured properly.)
+async fn journal_fixture(admin: u16) {
     let (status, body) = put_imposter_config(
-        NODES[majority[0]].admin,
+        admin,
         &serde_json::json!({
             "port": JOURNAL_IMPOSTER_PORT,
             "protocol": "http",
@@ -5011,7 +5006,7 @@ async fn journal_partition_is_declared_on_both_sides_and_heals() {
         .expect("the imposter converges fleet-wide before any traffic");
 
     let (status, body) = put_routes(
-        NODES[majority[0]].admin,
+        admin,
         &serde_json::json!({
             "routes": [{
                 "id": "journal",
@@ -5024,9 +5019,6 @@ async fn journal_partition_is_declared_on_both_sides_and_heals() {
     .expect("route write");
     assert_eq!(status, 200, "the front-door route must be accepted: {body}");
 
-    // Poll every node's own front door until the replicated route dispatches
-    // there — a route write is a control op, so the other two nodes learn it
-    // through the log rather than from the call above.
     for (index, front_door) in FRONT_DOOR_HOST_PORTS.iter().enumerate() {
         let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
         loop {
@@ -5045,36 +5037,1249 @@ async fn journal_partition_is_declared_on_both_sides_and_heals() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
+}
 
-    // Uneven and distinctly tagged: an even split would not catch a merge that
-    // returned one shard three times.
-    for (index, tag, count) in [(0, "a", 2), (1, "b", 3), (2, "c", 1)] {
+/// The paths [`journal_fixture`]'s own readiness probes record, present in
+/// every scenario's expected set. Kept as a function of the same loop rather
+/// than a magic `3`: the probes ARE recorded requests (`recordRequests` is on),
+/// and a scenario that forgot them would chase a phantom off-by-three.
+fn fixture_probe_paths() -> std::collections::BTreeSet<String> {
+    (0..NODES.len())
+        .map(|index| format!("{JOURNAL_ROUTE_PREFIX}/ready-{index}"))
+        .collect()
+}
+
+/// C28 (#228): the fleet journal is exact under node kill —
+/// `test_journal_merge_exact` in anger, the RFC-003 §6 M3 exit bar's "under
+/// node kill" clause.
+///
+/// Refinement against the implemented merge semantics (issue #223): the merge's
+/// roster is the **applied membership**, so a SIGKILLed node — which by
+/// definition never left — keeps every merged read honestly stamped
+/// `Rift-Cluster-Partial: true`: its replica-cached entries still merge in, but
+/// the cache *could* be stale and the stamp says so. "No partial once the
+/// roster settles" therefore means: once the node is back. The scenario
+/// asserts all three phases:
+/// 1. kill a follower → every survivor still answers **exactly N** (the dead
+///    writer's entries served from replica caches), stamped partial;
+/// 2. fleet `numberOfRequests == N` on every survivor throughout;
+/// 3. restart the node → the stamp clears; the survivors keep the exact N,
+///    and the victim converges on N minus its own lost shard — its journal
+///    was memory and merged reads never hand a writer its shard back. Pinned
+///    as-is with the honesty gap (short answer, no stamp) filed as #349.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c28_fleet_journal_is_exact_under_node_kill() {
+    let cluster = Cluster::up_with_overlays(&["chaos.overlay.yml", "front-door.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("a leader settles");
+    journal_fixture(NODES[leader].admin).await;
+
+    // Uneven, distinctly tagged spray through every node's own front door —
+    // the worst LB (no affinity), and the shape that catches a merge serving
+    // one shard three times.
+    let sprays = [(0usize, "a", 4usize), (1, "b", 7), (2, "c", 2)];
+    for (index, tag, count) in sprays {
+        drive_journal_traffic(index, tag, count)
+            .await
+            .unwrap_or_else(|e| panic!("driving node {index}'s front door: {e}"));
+    }
+    let mut expected = fixture_probe_paths();
+    for (_, tag, count) in sprays {
+        for n in 0..count {
+            expected.insert(format!("{JOURNAL_ROUTE_PREFIX}/{tag}-{n}"));
+        }
+    }
+
+    // Wait until the spray is fully merged and unstamped **on every node** —
+    // the healthy-fleet standing gate, and the cache warmer: a node's replica
+    // cache of its peers' shards fills as a side effect of its own
+    // merge-on-read pulls, so polling only one node would leave the others'
+    // caches cold and the kill would (correctly!) expose them as missing the
+    // dead shard.
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let mut settled = true;
+        let mut last = None;
+        for node in &NODES {
+            let read = merged_saved_requests(node.admin).await;
+            settled &= matches!(&read, Ok((paths, false)) if *paths == expected);
+            last = Some((node.name, read));
+        }
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the healthy fleet never converged on the sprayed set everywhere: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Kill a follower with SIGKILL: no drain, no leave — its shard now exists
+    // only in the survivors' replica caches.
+    let victim_index = (0..NODES.len())
+        .find(|index| *index != leader)
+        .expect("a non-leader exists");
+    let victim = &NODES[victim_index];
+    cluster.kill(victim.name).expect("kill the follower");
+    let survivors: Vec<usize> = (0..NODES.len())
+        .filter(|index| *index != victim_index)
+        .collect();
+
+    // Every survivor answers exactly N — dead shard included, from cache —
+    // and says partial, because a cached shard is honest about possibly
+    // lagging its unreachable writer. The fleet count is polled in the same
+    // loop rather than asserted one-shot after it: the summed G-counter can
+    // converge a beat behind the merged set, and "set exact" and "count
+    // exact" are one claim about the same moment.
+    let expected_count = expected.len() as u64;
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let mut settled = true;
+        let mut last = None;
+        for index in survivors.iter().copied() {
+            let read = merged_saved_requests(NODES[index].admin).await;
+            let count = journal_number_of_requests(NODES[index].admin).await;
+            settled &= matches!(&read, Ok((paths, true)) if *paths == expected)
+                && count.as_ref().is_ok_and(|count| *count == expected_count);
+            last = Some((index, read, count));
+        }
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a survivor never served the exact set and count from cache under kill: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // The roster settles the only way it can after a SIGKILL: the node comes
+    // back (`start` — retained disk, though the journal is memory and dies
+    // with the process). The stamp clears everywhere; the *survivors* keep
+    // the exact set, because their replica caches hold the victim's lost
+    // shard. The victim itself converges on the set minus its own pre-kill
+    // entries: a merged read asks each peer for that peer's OWN writer shard,
+    // never for the asker's lost shard back, so entries whose writer crashed
+    // live on only in the survivors' caches — Ch.7's volatility contract
+    // applied to one node. That its short answer is UNSTAMPED while
+    // disagreeing with the survivors is a real honesty gap this scenario
+    // documents and pins as-is; #349 carries the design call rather than
+    // papering it over with a weaker assertion.
+    cluster.start(victim.name).expect("restart the victim");
+    for node in &NODES {
+        wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("{} did not reconverge on 3 voters: {e}", node.name));
+    }
+    let victim_lost: std::collections::BTreeSet<String> = {
+        let (_, tag, count) = sprays[victim_index];
+        let mut lost: std::collections::BTreeSet<String> = (0..count)
+            .map(|n| format!("{JOURNAL_ROUTE_PREFIX}/{tag}-{n}"))
+            .collect();
+        lost.insert(format!("{JOURNAL_ROUTE_PREFIX}/ready-{victim_index}"));
+        lost
+    };
+    let victim_expected: std::collections::BTreeSet<String> =
+        expected.difference(&victim_lost).cloned().collect();
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let reads: Vec<_> = {
+            let mut collected = Vec::new();
+            for (index, node) in NODES.iter().enumerate() {
+                collected.push((index, merged_saved_requests(node.admin).await));
+            }
+            collected
+        };
+        let settled = reads.iter().all(|(index, read)| {
+            let want = if *index == victim_index {
+                &victim_expected
+            } else {
+                &expected
+            };
+            matches!(read, Ok((paths, false)) if paths == want)
+        });
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "after restart the survivors must answer the exact set and the victim \
+             the set minus its lost shard, all unstamped: {reads:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// C12 (#228, reserved in Ch.12): clears are exact under ±5 s clock skew —
+/// `test_journal_clear`'s adversarial form, on the `faketime.overlay.yml`
+/// fleet (rift-1 believes +5 s, rift-3 believes −5 s).
+///
+/// The invariant is *zero timestamp consultation*: a clear is a replicated
+/// generation bump (issue #224), so which node issued it and what that node's
+/// clock believed must be irrelevant. Three probes, each of which a
+/// timestamp-based clear would fail under this spread:
+/// 1. a clear issued from the **fast** node erases everything, fleet-wide —
+///    including entries whose recorded timestamps are "in the future" of the
+///    slow node's clock;
+/// 2. every post-clear append survives everywhere, counts exact — a
+///    time-window clear would eat appends stamped "before" the skewed clear;
+/// 3. clears racing from the two most-skewed nodes converge (generations
+///    compose by max; both mean "ignore everything before me").
+///
+/// The scenario first proves the skew is real — the two extreme nodes' `Date`
+/// headers must disagree by most of the 10 s spread — so a broken overlay
+/// fails loudly instead of letting every probe pass vacuously on a
+/// synchronized fleet.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c12_clears_are_exact_under_clock_skew() {
+    let _cluster = Cluster::up_with_overlays(&[
+        "chaos.overlay.yml",
+        "front-door.overlay.yml",
+        "faketime.overlay.yml",
+    ])
+    .await
+    .expect("fleet comes up");
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("a leader settles");
+
+    // The vacuity guard: rift-1 (+5) and rift-3 (−5) must actually disagree.
+    let date_secs = |headers: &reqwest::header::HeaderMap| -> Option<i64> {
+        let raw = headers.get("date")?.to_str().ok()?;
+        let parsed = httpdate::parse_http_date(raw).ok()?;
+        parsed
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|since| since.as_secs() as i64)
+    };
+    let (_, fast_headers, _) = get_data_plane(NODES[0].admin, "/imposters")
+        .await
+        .expect("the fast node answers");
+    let (_, slow_headers, _) = get_data_plane(NODES[2].admin, "/imposters")
+        .await
+        .expect("the slow node answers");
+    let (fast, slow) = match (date_secs(&fast_headers), date_secs(&slow_headers)) {
+        (Some(fast), Some(slow)) => (fast, slow),
+        other => panic!("both nodes must answer a parseable Date header: {other:?}"),
+    };
+    assert!(
+        fast - slow >= 8,
+        "the faketime overlay must skew the extremes ~10 s apart; \
+         observed {}s — a synchronized fleet would pass every probe vacuously",
+        fast - slow
+    );
+    println!(
+        "c12 artifact: observed clock spread between extremes = {}s",
+        fast - slow
+    );
+
+    journal_fixture(NODES[leader].admin).await;
+    let clear = |admin: u16| async move {
+        reqwest::Client::new()
+            .delete(format!(
+                "http://127.0.0.1:{admin}/imposters/{JOURNAL_IMPOSTER_PORT}/savedRequests"
+            ))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map(|response| response.status().as_u16())
+    };
+
+    // Probe 1+2: spray, clear from the fast node, assert empty fleet-wide,
+    // then spray again and assert every post-clear append survives.
+    for (index, tag, count) in [(0usize, "pre", 3usize), (1, "pre2", 3), (2, "pre3", 3)] {
+        drive_journal_traffic(index, tag, count)
+            .await
+            .unwrap_or_else(|e| panic!("spraying node {index}: {e}"));
+    }
+    let status = clear(NODES[0].admin)
+        .await
+        .expect("the fast-node clear answers");
+    assert_eq!(status, 200, "the clear must be accepted");
+
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let mut all_empty = true;
+        let mut last = None;
+        for node in &NODES {
+            let read = merged_saved_requests(node.admin).await;
+            all_empty &= matches!(&read, Ok((paths, false)) if paths.is_empty());
+            last = Some((node.name, read));
+        }
+        if all_empty {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a skewed clear must erase fleet-wide with no clock consulted: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let mut survivors = std::collections::BTreeSet::new();
+    for (index, tag, count) in [(0usize, "post", 2usize), (1, "post2", 4), (2, "post3", 3)] {
+        drive_journal_traffic(index, tag, count)
+            .await
+            .unwrap_or_else(|e| panic!("post-clear spraying node {index}: {e}"));
+        for n in 0..count {
+            survivors.insert(format!("{JOURNAL_ROUTE_PREFIX}/{tag}-{n}"));
+        }
+    }
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let mut settled = true;
+        let mut last = None;
+        for node in &NODES {
+            let read = merged_saved_requests(node.admin).await;
+            settled &= matches!(&read, Ok((paths, false)) if *paths == survivors);
+            last = Some((node.name, read));
+        }
+        let count_exact = journal_number_of_requests(NODES[leader].admin)
+            .await
+            .is_ok_and(|count| count == survivors.len() as u64);
+        if settled && count_exact {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every post-clear append must survive everywhere, counts exact: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Probe 3: clears racing from the two clock extremes converge.
+    let (fast_clear, slow_clear) = tokio::join!(clear(NODES[0].admin), clear(NODES[2].admin));
+    assert_eq!(fast_clear.expect("fast racing clear answers"), 200);
+    assert_eq!(slow_clear.expect("slow racing clear answers"), 200);
+    let mut round_c = std::collections::BTreeSet::new();
+    for (index, tag, count) in [(0usize, "race", 2usize), (2, "race2", 2)] {
+        drive_journal_traffic(index, tag, count)
+            .await
+            .unwrap_or_else(|e| panic!("post-race spraying node {index}: {e}"));
+        for n in 0..count {
+            round_c.insert(format!("{JOURNAL_ROUTE_PREFIX}/{tag}-{n}"));
+        }
+    }
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let mut settled = true;
+        let mut last = None;
+        for node in &NODES {
+            let read = merged_saved_requests(node.admin).await;
+            // Exact equality on EVERY node, like probes 1 and 2: a subset
+            // check is satisfied by an empty answer, and a slow-clock node
+            // that applied the racing clear late and ate its own post-race
+            // append is precisely the timestamp-sensitivity this scenario
+            // exists to detect.
+            settled &= matches!(&read, Ok((paths, false)) if *paths == round_c);
+            last = Some((node.name, read));
+        }
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "racing skewed clears must converge exactly on every node (nothing \
+             pre-race survives, everything post-race does): {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// The proxy-recording fixture (#228, C10/C11): a counting origin on the
+/// standalone `source-origin` server (in-network by service name, its own
+/// single-node admin published at 46525 — an already-reserved port, so no new
+/// compose surface), plus a proxyOnce and a proxyAlways imposter on the fleet
+/// routed through the front doors.
+const PROXY_ORIGIN_IMPOSTER_PORT: u16 = 6810;
+const PROXY_ONCE_IMPOSTER_PORT: u16 = 6811;
+const PROXY_ALWAYS_IMPOSTER_PORT: u16 = 6812;
+const PROXY_ORIGIN_ADMIN: u16 = 46525;
+const PROXY_ORIGIN_URL: &str = "http://source-origin:6810";
+
+async fn proxy_fixture(admin: u16, origin_wait_ms: u64) {
+    // The origin counts by recording: every upstream call the fleet makes is a
+    // saved request on the un-clustered origin, per path — a single-node truth
+    // no merge semantics can blur. `wait` keeps claims Pending long enough for
+    // C10 to kill their owners mid-flight; C11 passes 0.
+    let (status, body) = put_imposter_config(
+        PROXY_ORIGIN_ADMIN,
+        &serde_json::json!({
+            "port": PROXY_ORIGIN_IMPOSTER_PORT,
+            "protocol": "http",
+            "recordRequests": true,
+            "stubs": [{
+                "responses": [{
+                    "is": { "statusCode": 200, "body": "from-origin" },
+                    "behaviors": [{ "wait": origin_wait_ms }]
+                }]
+            }]
+        }),
+    )
+    .await
+    .expect("origin admin write");
+    assert_eq!(status, 201, "the counting origin must be created: {body}");
+
+    for (port, mode) in [
+        (PROXY_ONCE_IMPOSTER_PORT, "proxyOnce"),
+        (PROXY_ALWAYS_IMPOSTER_PORT, "proxyAlways"),
+    ] {
+        let (status, body) = put_imposter_config(
+            admin,
+            &serde_json::json!({
+                "port": port,
+                "protocol": "http",
+                "stubs": [{
+                    "responses": [{
+                        "proxy": {
+                            "to": PROXY_ORIGIN_URL,
+                            "mode": mode,
+                            "predicateGenerators": [{ "matches": { "path": true } }]
+                        }
+                    }]
+                }]
+            }),
+        )
+        .await
+        .expect("fleet admin write");
+        assert_eq!(status, 201, "the {mode} imposter must be created: {body}");
+        wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .expect("the proxy imposter converges fleet-wide");
+    }
+
+    let (status, body) = put_routes(
+        admin,
+        &serde_json::json!({
+            "routes": [
+                {
+                    "id": "once",
+                    "match": { "path_prefix": "/once" },
+                    "target": { "port": PROXY_ONCE_IMPOSTER_PORT },
+                },
+                {
+                    "id": "always",
+                    "match": { "path_prefix": "/always" },
+                    "target": { "port": PROXY_ALWAYS_IMPOSTER_PORT },
+                },
+            ],
+        }),
+    )
+    .await
+    .expect("route write");
+    assert_eq!(status, 200, "the proxy routes must be accepted: {body}");
+
+    // Route dispatch readiness, per node. The probes go to the proxy
+    // imposters and therefore reach the origin — their paths are excluded
+    // from every per-path count below by using a dedicated prefix.
+    for (index, front_door) in FRONT_DOOR_HOST_PORTS.iter().enumerate() {
+        let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+        loop {
+            if let Ok((200, _, _)) =
+                get_data_plane(*front_door, &format!("/once/ready/{index}")).await
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node {index}'s front door never dispatched the proxy routes"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+}
+
+/// Upstream calls the origin has served, counted per path — read from the
+/// un-clustered origin's own admin, so it is a plain array with single-node
+/// semantics.
+async fn origin_calls_per_path() -> anyhow::Result<std::collections::BTreeMap<String, usize>> {
+    let (status, body) = get_json(
+        PROXY_ORIGIN_ADMIN,
+        &format!("/imposters/{PROXY_ORIGIN_IMPOSTER_PORT}"),
+    )
+    .await?;
+    if status != 200 {
+        anyhow::bail!("origin imposter read answered {status}");
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    for entry in body
+        .get("requests")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(path) = entry.get("path").and_then(serde_json::Value::as_str) {
+            *counts.entry(path.to_owned()).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// The recorded (non-proxy) stubs a node's applied config holds for `port`.
+async fn recorded_stub_paths(admin: u16, port: u16) -> anyhow::Result<Vec<String>> {
+    let (status, body) = get_json(admin, &format!("/imposters/{port}")).await?;
+    if status != 200 {
+        anyhow::bail!("imposter read answered {status}");
+    }
+    let mut paths = Vec::new();
+    for stub in body
+        .get("stubs")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let is_proxy = stub
+            .get("responses")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|responses| responses.iter().any(|r| r.get("proxy").is_some()));
+        if is_proxy {
+            continue;
+        }
+        if let Some(path) = stub
+            .pointer("/predicates/0/equals/path")
+            .and_then(serde_json::Value::as_str)
+        {
+            paths.push(path.to_owned());
+        }
+    }
+    Ok(paths)
+}
+
+/// Fire one data-plane GET through node `index`'s front door, tolerating
+/// transport errors (a killed node's listener dying mid-request is part of the
+/// chaos, not a failure of the scenario).
+async fn fire(index: usize, path: &str) -> Option<u16> {
+    get_data_plane(FRONT_DOOR_HOST_PORTS[index], path)
+        .await
+        .ok()
+        .map(|(status, _, _)| status)
+}
+
+/// C11 (#228, reserved in Ch.12): concurrent recording loses nothing.
+///
+/// Sharpened against upstream's own claim contract: a concurrent `InFlight`
+/// loser **forwards without recording by design**, so "exactly one upstream
+/// call per signature" is unpinnable during the racing window even on a single
+/// node. What is pinnable, and what this asserts:
+/// 1. exactly **one recorded stub** per proxyOnce signature, identical on
+///    every node (zero lost, zero duplicated recordings);
+/// 2. once Recorded, **zero further upstream calls** — a full post-settle
+///    round from every node adds nothing to the origin's count;
+/// 3. proxyAlways loses nothing either: every post-settle request still
+///    reaches the origin (never replayed), and every signature's responses
+///    merge into one stub per signature fleet-wide.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c11_concurrent_recording_loses_nothing() {
+    let _cluster = Cluster::up_with_overlays(&[
+        "chaos.overlay.yml",
+        "front-door.overlay.yml",
+        "sources.overlay.yml",
+    ])
+    .await
+    .expect("fleet comes up");
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("a leader settles");
+    proxy_fixture(NODES[leader].admin, 0).await;
+
+    const SIGS: usize = 6;
+    // The racing window: every node fires every signature concurrently.
+    let mut tasks = tokio::task::JoinSet::new();
+    for sig in 0..SIGS {
+        for node in 0..NODES.len() {
+            tasks.spawn(async move {
+                let once = fire(node, &format!("/once/p/{sig}")).await;
+                let always = fire(node, &format!("/always/p/{sig}")).await;
+                (once, always)
+            });
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        let (once, always) = joined.expect("hammer task");
+        assert_eq!(
+            once,
+            Some(200),
+            "a raced proxyOnce request must still answer"
+        );
+        assert_eq!(
+            always,
+            Some(200),
+            "a raced proxyAlways request must still answer"
+        );
+    }
+
+    // Settle: every proxyOnce signature ends Recorded — one stub each, on
+    // every node. The fixture's readiness probes went through the same
+    // proxyOnce imposter, so they are recorded signatures too — three more
+    // stubs, expected rather than mysterious.
+    let expected: std::collections::BTreeSet<String> = (0..SIGS)
+        .map(|sig| format!("/once/p/{sig}"))
+        .chain((0..NODES.len()).map(|index| format!("/once/ready/{index}")))
+        .collect();
+    // A raced winner's publication can legitimately fail and release its
+    // claim (the retryable contract) — and a released signature stays
+    // unrecorded until *someone* asks again, which the finished hammer never
+    // will. So the settle loop refires any signature recorded nowhere yet,
+    // exactly as a real client's next request would; the invariant stays
+    // "exactly one stub each, everywhere", and duplicates would still fail
+    // the set comparison.
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT * 2;
+    loop {
+        let mut settled = true;
+        let mut last = None;
+        let mut recorded_anywhere: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for node in &NODES {
+            let paths = recorded_stub_paths(node.admin, PROXY_ONCE_IMPOSTER_PORT).await;
+            if let Ok(paths) = &paths {
+                recorded_anywhere.extend(paths.iter().cloned());
+            }
+            let as_set = paths
+                .as_ref()
+                .map(|p| p.iter().cloned().collect::<std::collections::BTreeSet<_>>());
+            settled &= paths.as_ref().is_ok_and(|p| p.len() == expected.len())
+                && as_set.as_ref().is_ok_and(|s| *s == expected);
+            last = Some((node.name, paths));
+        }
+        if settled {
+            break;
+        }
+        for sig in 0..SIGS {
+            let path = format!("/once/p/{sig}");
+            if !recorded_anywhere.contains(&path) {
+                let _ = fire(sig % NODES.len(), &path).await;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every node must hold exactly one recorded stub per signature: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Post-settle: proxyOnce replays (origin frozen), proxyAlways still
+    // proxies (origin grows by exactly one per request).
+    let before = origin_calls_per_path().await.expect("origin answers");
+    for sig in 0..SIGS {
+        for node in 0..NODES.len() {
+            assert_eq!(
+                fire(node, &format!("/once/p/{sig}")).await,
+                Some(200),
+                "a recorded signature must replay"
+            );
+            assert_eq!(
+                fire(node, &format!("/always/p/{sig}")).await,
+                Some(200),
+                "proxyAlways must keep proxying"
+            );
+        }
+    }
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let after = origin_calls_per_path().await.expect("origin answers");
+        let once_frozen = (0..SIGS).all(|sig| {
+            let path = format!("/once/p/{sig}");
+            after.get(&path) == before.get(&path)
+        });
+        let always_grew = (0..SIGS).all(|sig| {
+            let path = format!("/always/p/{sig}");
+            after.get(&path).copied().unwrap_or(0)
+                == before.get(&path).copied().unwrap_or(0) + NODES.len()
+        });
+        if once_frozen && always_grew {
+            println!(
+                "c11 artifact: per-signature origin calls during the racing window: {:?}",
+                (0..SIGS)
+                    .map(|sig| before.get(&format!("/once/p/{sig}")).copied().unwrap_or(0))
+                    .collect::<Vec<_>>()
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "post-settle: proxyOnce must freeze the origin and proxyAlways must not; \
+             before={before:?} after={after:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// C10 (#228, reserved in Ch.12): proxyOnce's two critical moments, measured.
+///
+/// Moment one kills a **claim owner** while claims are Pending (a slow origin
+/// holds them open); moment two kills the **Raft leader** while publications
+/// are racing commit. Both phases assert the same invariants:
+/// - zero wedged signatures — every signature ends Recorded (a stub on every
+///   node) and replaying (a final round adds nothing at the origin);
+/// - the duplicate-upstream bound is *measured* and printed, per Ch.12's
+///   philosophy, and asserted as one origin call per fire (initial + counted
+///   degraded-window refires): the contract bounds *recordings* at
+///   1 + ownership changes, while degraded forwards during the owner outage
+///   are by-design and tracked by the scenario itself — anything beyond its
+///   own fire count is genuine duplication.
+/// - "recorded but stub-less" is asserted through its observable consequence:
+///   any signature the fleet replays must show its recorded stub in every
+///   node's applied config (no marker-inspection endpoint exists, and with
+///   predicate generators configured a recording always carries its stub).
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c10_proxy_once_survives_owner_and_leader_kills() {
+    let cluster = Cluster::up_with_overlays(&[
+        "chaos.overlay.yml",
+        "front-door.overlay.yml",
+        "sources.overlay.yml",
+    ])
+    .await
+    .expect("fleet comes up");
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("a leader settles");
+    proxy_fixture(NODES[leader].admin, 3000).await;
+
+    let mut phase_sig_base = 0usize;
+    for phase in ["owner-kill", "leader-kill"] {
+        const SIGS: usize = 8;
+        let sigs: Vec<String> = (phase_sig_base..phase_sig_base + SIGS)
+            .map(|sig| format!("/once/q/{sig}"))
+            .collect();
+        phase_sig_base += SIGS;
+
+        let leader_now = wait_single_leader(CONVERGE_TIMEOUT)
+            .await
+            .expect("a leader settles before the phase");
+        let victim_index = match phase {
+            "owner-kill" => (0..NODES.len())
+                .find(|index| *index != leader_now)
+                .expect("a non-leader exists"),
+            _ => leader_now,
+        };
+
+        // Fire every signature concurrently through the two nodes that will
+        // survive, so requests outlive the victim; the slow origin keeps
+        // their claims Pending while the victim dies.
+        let firers: Vec<usize> = (0..NODES.len())
+            .filter(|index| *index != victim_index)
+            .collect();
+        let mut tasks = tokio::task::JoinSet::new();
+        for (n, path) in sigs.iter().cloned().enumerate() {
+            let node = firers[n % firers.len()];
+            tasks.spawn(async move { fire(node, &path).await });
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        cluster
+            .kill(NODES[victim_index].name)
+            .unwrap_or_else(|e| panic!("kill the {phase} victim: {e}"));
+        // The vacuity guard for "mid-flight": the 600 ms pre-kill sleep is a
+        // timing choice, not a proof. The origin records a request on arrival,
+        // *before* its 3 s wait, so at kill time it must already have seen at
+        // least one of this phase's signatures — otherwise the kill landed
+        // before any claim was in flight and the phase silently degraded to
+        // "kill, then fire", which asserts much less than it claims to.
+        let at_kill = origin_calls_per_path()
+            .await
+            .unwrap_or_else(|e| panic!("{phase}: the origin answers at kill time: {e}"));
+        assert!(
+            sigs.iter().any(|sig| at_kill.contains_key(sig)),
+            "{phase}: the kill landed before any claim was in flight — the mid-flight \
+             premise is vacuous (origin had seen none of {sigs:?})"
+        );
+        while let Some(joined) = tasks.join_next().await {
+            // The response itself may be an error if its claim RPC raced the
+            // kill; the engine's contract is degrade-don't-wedge, asserted
+            // below by every signature ending Recorded.
+            let _ = joined.expect("hammer task");
+        }
+
+        cluster
+            .start(NODES[victim_index].name)
+            .unwrap_or_else(|e| panic!("restart the {phase} victim: {e}"));
+        for node in &NODES {
+            wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+                .await
+                .unwrap_or_else(|e| panic!("{} did not reconverge: {e}", node.name));
+        }
+
+        // Zero wedged: retry each not-yet-recorded signature until every one
+        // is Recorded on every node. The budget is deliberately its own —
+        // one retry pass costs up to `sigs × 3 s` at the slow origin alone
+        // (a still-unrecorded signature proxies, and the origin's wait is
+        // what held claims open for the kill), so the standard 45 s
+        // convergence timeout affords barely two passes around a
+        // kill-and-rejoin. Double it: the assertion is "eventually Recorded,
+        // never wedged", and starving the loop measures the harness, not the
+        // claim machinery.
+        let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT * 2;
+        let mut refires: std::collections::BTreeMap<String, usize> =
+            sigs.iter().map(|sig| (sig.clone(), 0)).collect();
+        loop {
+            let mut recorded_on: std::collections::BTreeMap<&str, usize> =
+                sigs.iter().map(|sig| (sig.as_str(), 0)).collect();
+            for node in &NODES {
+                let paths = recorded_stub_paths(node.admin, PROXY_ONCE_IMPOSTER_PORT)
+                    .await
+                    .unwrap_or_default();
+                for sig in &sigs {
+                    if paths.contains(sig) {
+                        *recorded_on.entry(sig.as_str()).or_insert(0) += 1;
+                    }
+                }
+            }
+            if recorded_on.values().all(|nodes| *nodes == NODES.len()) {
+                break;
+            }
+            for (n, path) in sigs.iter().enumerate() {
+                // A signature recorded *somewhere* is committed and only
+                // replicating; refiring it would replay, not record. Only the
+                // genuinely unrecorded ones need another upstream round — and
+                // each refire is counted, because while a claim's owner is
+                // dead every retry legitimately forwards without recording
+                // (degrade-don't-wedge), so the origin-call bound below is a
+                // function of exactly this counter.
+                if recorded_on.get(path.as_str()) == Some(&0) {
+                    *refires.entry(path.clone()).or_insert(0) += 1;
+                    let _ = fire(n % NODES.len(), path).await;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{phase}: a signature wedged — not Recorded fleet-wide within the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Exactly one recorded stub per signature, not merely at-least-one:
+        // the Ch.12 row promises a duplicate bound, and `contains` alone
+        // would wave a double recording through.
+        for node in &NODES {
+            let paths = recorded_stub_paths(node.admin, PROXY_ONCE_IMPOSTER_PORT)
+                .await
+                .unwrap_or_else(|e| panic!("{phase}: {} answers stubs: {e}", node.name));
+            for sig in &sigs {
+                let copies = paths.iter().filter(|path| *path == sig).count();
+                assert_eq!(
+                    copies, 1,
+                    "{phase}: {} holds {copies} recorded stubs for {sig}",
+                    node.name
+                );
+            }
+        }
+
+        // Replay steady-state: a full round adds nothing at the origin.
+        let before = origin_calls_per_path().await.expect("origin answers");
+        for path in &sigs {
+            for node in 0..NODES.len() {
+                assert_eq!(
+                    fire(node, path).await,
+                    Some(200),
+                    "{phase}: a recorded signature must replay from every node"
+                );
+            }
+        }
+        let after = origin_calls_per_path().await.expect("origin answers");
+        for path in &sigs {
+            assert_eq!(
+                after.get(path),
+                before.get(path),
+                "{phase}: replay must not call the origin for {path}"
+            );
+        }
+
+        // The measured duplicate bound — the Ch.12 artifact. The contract
+        // bounds *recordings* at 1 + ownership changes (Ch.6/Ch.7); upstream
+        // *calls* additionally include every degraded forward the outage
+        // window produced, and this scenario knows exactly how many of those
+        // it manufactured: its own refires. So the sound per-signature bound
+        // is `1 initial fire + refires` — one origin call per fire, at most —
+        // and anything above it is genuine duplication (a double recording or
+        // a replay that proxied), which is what the assertion exists to catch.
+        let max_calls = sigs
+            .iter()
+            .map(|path| after.get(path).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        let max_refires = refires.values().copied().max().unwrap_or(0);
+        println!(
+            "c10 artifact ({phase}): max upstream calls for one signature = {max_calls} \
+             (max degraded-window refires = {max_refires}; recordings bound: 1 + ownership changes)"
+        );
+        for path in &sigs {
+            let calls = after.get(path).copied().unwrap_or(0);
+            let fired = 1 + refires.get(path).copied().unwrap_or(0);
+            assert!(
+                calls <= fired,
+                "{phase}: {path} reached the origin {calls} times from only {fired} fires — \
+                 a request that should have replayed proxied instead"
+            );
+        }
+    }
+}
+
+/// One page of a vector-cursor walk (issue #225): the recorded paths this
+/// page delivered, the `x-rift-next-index` token to continue from, and whether
+/// `x-rift-truncated` was stamped.
+async fn cursor_page(
+    admin: u16,
+    token: Option<&str>,
+) -> anyhow::Result<(Vec<String>, String, bool)> {
+    let path = match token {
+        Some(token) => format!("/imposters/{JOURNAL_IMPOSTER_PORT}/savedRequests?since={token}"),
+        None => format!("/imposters/{JOURNAL_IMPOSTER_PORT}/savedRequests"),
+    };
+    let (status, headers, body) = get_data_plane(admin, &path).await?;
+    if status != 200 {
+        anyhow::bail!("cursor read answered {status}: {body}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let entries = parsed.as_array().cloned().unwrap_or_default();
+    let paths = entries
+        .iter()
+        .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    let next = headers
+        .get("x-rift-next-index")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("a merged cursor read must answer x-rift-next-index"))?;
+    let truncated = headers
+        .get("x-rift-truncated")
+        .and_then(|value| value.to_str().ok())
+        == Some("true");
+    Ok((paths, next, truncated))
+}
+
+/// C30 (#228): the vector-cursor walk is gapless and duplicate-free across a
+/// node kill and its return — `test_journal_cursor_merge` in anger.
+///
+/// Delivery is tallied by unique request path rather than `(node_id, seq)`:
+/// every sprayed request is distinctly tagged, so "no path is ever delivered
+/// twice" is duplicate-freedom and "the walked union equals the sprayed set"
+/// is gaplessness — the same invariants, asserted through the public surface.
+///
+/// The SSE variant the issue sketches is deliberately absent: the merged SSE
+/// tail was **not** shipped by #225 — `07-verification-plane.md` records
+/// `.../savedRequests/stream` as still proxying per-node, with the cursor
+/// token designed so the terminator is additive when it lands. Tailing a
+/// per-node proxy here would assert single-node behavior and rot the moment
+/// the merged terminator arrives.
+///
+/// Truncation is proven positively and negatively: a token far below a
+/// shard's eviction watermark answers `x-rift-truncated: true`; a fresh
+/// baseline read of the same evicting port does not.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c30_vector_cursor_walk_survives_membership_change() {
+    let cluster = Cluster::up_with_overlays(&["chaos.overlay.yml", "front-door.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("a leader settles");
+    journal_fixture(NODES[leader].admin).await;
+
+    let mut sprayed = fixture_probe_paths();
+    let mut delivered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let spray = |round: &str, per_node: [usize; 3]| -> Vec<(usize, String, usize)> {
+        let mut plan = Vec::new();
+        for (index, count) in per_node.into_iter().enumerate() {
+            plan.push((index, format!("{round}-{index}"), count));
+        }
+        plan
+    };
+
+    // Round 1: a base set through every node, walked from a baseline read.
+    for (index, tag, count) in spray("r1", [3, 4, 2]) {
+        drive_journal_traffic(index, &tag, count)
+            .await
+            .unwrap_or_else(|e| panic!("spraying node {index}: {e}"));
+        for n in 0..count {
+            sprayed.insert(format!("{JOURNAL_ROUTE_PREFIX}/{tag}-{n}"));
+        }
+    }
+    let walker = NODES[leader].admin;
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    let mut token = loop {
+        // A transport hiccup is "not yet", never a panic: the loop's own
+        // deadline is the failure path, and one dropped read out of a
+        // 3-node poll must not kill a 25-iteration nightly run (issue #228
+        // review, N1).
+        let Ok((paths, next, truncated)) = cursor_page(walker, None).await else {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the baseline page never answered"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        };
+        assert!(
+            !truncated,
+            "a baseline read is a snapshot and never truncated"
+        );
+        if paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            == sprayed
+        {
+            delivered.extend(paths);
+            break next;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the baseline walk never converged on the sprayed set"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+
+    // Round 2: more traffic everywhere, then kill a follower mid-walk. The
+    // dead node's fresh entries must still arrive — from the survivors'
+    // replica caches — and nothing already delivered may repeat.
+    let victim_index = (0..NODES.len())
+        .find(|index| *index != leader)
+        .expect("a non-leader exists");
+    for (index, tag, count) in spray("r2", [2, 3, 3]) {
+        drive_journal_traffic(index, &tag, count)
+            .await
+            .unwrap_or_else(|e| panic!("spraying node {index}: {e}"));
+        for n in 0..count {
+            sprayed.insert(format!("{JOURNAL_ROUTE_PREFIX}/{tag}-{n}"));
+        }
+    }
+    // Warm every node's replica cache with the victim's round-2 entries
+    // before the kill — a node caches its peers' shards through its own
+    // merge-on-read pulls, so every node is polled, not just the walker.
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let mut settled = true;
+        for node in &NODES {
+            let read = merged_saved_requests(node.admin).await;
+            settled &= matches!(&read, Ok((paths, false)) if *paths == sprayed);
+        }
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "round 2 never fully merged everywhere before the kill"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    cluster
+        .kill(NODES[victim_index].name)
+        .expect("kill mid-walk");
+
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    token = loop {
+        let Ok((paths, next, _)) = cursor_page(walker, Some(&token)).await else {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the walk never answered past the kill"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        };
+        for path in &paths {
+            assert!(
+                delivered.insert(path.clone()),
+                "duplicate delivery of {path} after the kill"
+            );
+        }
+        if delivered == sprayed {
+            break next;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the walk never became gapless after the kill: missing {:?}",
+            sprayed.difference(&delivered).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+
+    // Round 3: the victim returns, and the walk continues over the
+    // **survivors'** new traffic only. Not the victim's: its journal was
+    // process memory, so a crash-restart reuses sequence numbers from 1 —
+    // colliding with its own cached pre-kill history in the walk's
+    // `(node_id, seq)` identity. That is a real defect this scenario found on
+    // its first in-anger run (duplicate delivery of a survivor-era path),
+    // filed as #351 for a design fix; what the cursor contract can honestly
+    // promise today is that surviving writers stay gapless and
+    // duplicate-free through the membership change, and that the victim's
+    // already-walked history never re-delivers.
+    cluster
+        .start(NODES[victim_index].name)
+        .expect("restart the victim");
+    for node in &NODES {
+        wait_voters(node, 3.0, CONVERGE_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("{} did not reconverge: {e}", node.name));
+    }
+    for (index, tag, count) in spray("r3", [2, 2, 2]) {
+        if index == victim_index {
+            continue;
+        }
+        drive_journal_traffic(index, &tag, count)
+            .await
+            .unwrap_or_else(|e| panic!("spraying node {index}: {e}"));
+        for n in 0..count {
+            sprayed.insert(format!("{JOURNAL_ROUTE_PREFIX}/{tag}-{n}"));
+        }
+    }
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    token = loop {
+        let Ok((paths, next, _)) = cursor_page(walker, Some(&token)).await else {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the walk never answered past the restart"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        };
+        for path in &paths {
+            assert!(
+                delivered.insert(path.clone()),
+                "duplicate delivery of {path} after the restart"
+            );
+        }
+        if delivered == sprayed {
+            break next;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the walk never caught the survivors' round 3: missing {:?}",
+            sprayed.difference(&delivered).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+
+    // Truncation, both directions. The per-shard cap is max(500, 10_000/N) =
+    // 3334 entries for a 3-voter fleet: overflow one shard well past it so
+    // eviction demonstrably advanced its watermark past our token's position.
+    // One shared client for the whole overflow: `drive_journal_traffic`
+    // builds a client per request, which at 3,500 requests means 3,500 TCP
+    // handshakes in ~20 s on the runner — ~100× any other scenario's volume.
+    // A single keep-alive client is both faster and kinder to the ephemeral
+    // port range the CI sysctl reserves around this suite.
+    const OVERFLOW: usize = 3500;
+    let overflow_client = reqwest::Client::new();
+    for n in 0..OVERFLOW {
+        let response = overflow_client
+            .get(format!(
+                "http://127.0.0.1:{}{JOURNAL_ROUTE_PREFIX}/evict-{n}",
+                FRONT_DOOR_HOST_PORTS[leader]
+            ))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("overflow spray request {n}: {e}"));
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "overflow spray request {n} must be recorded"
+        );
+    }
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let (Ok((_, _, truncated)), Ok((_, _, baseline_truncated))) = (
+            cursor_page(walker, Some(&token)).await,
+            cursor_page(walker, None).await,
+        ) else {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the truncation probes never answered"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        };
+        if truncated && !baseline_truncated {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "truncation must appear iff a presented position predates a watermark \
+             (stale token: {truncated}, baseline: {baseline_truncated})"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// C29 (#228): partial honesty under partition, *measured* — the adversarial
+/// tier over #223's smoke-level partition assertion (which this scenario
+/// replaced, per that scenario's own deletion note): the stamps on both
+/// sides, plus the **budget** (a partitioned merged read answers within the
+/// documented 2 s peer budget, never hangs) and
+/// the **metric** (`rift_cluster_journal_partial_reads_total` moves — headers
+/// without metrics would leave operators blind to what tests can see).
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c29_partial_reads_answer_within_budget_and_count_themselves() {
+    let cluster = Cluster::up_with_overlays(&["chaos.overlay.yml", "front-door.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    let leader = wait_single_leader(CONVERGE_TIMEOUT)
+        .await
+        .expect("a leader settles");
+    journal_fixture(NODES[leader].admin).await;
+
+    for (index, tag, count) in [(0usize, "a", 3usize), (1, "b", 3), (2, "c", 3)] {
         drive_journal_traffic(index, tag, count)
             .await
             .unwrap_or_else(|e| panic!("driving node {index}'s front door: {e}"));
     }
 
-    // Property 1 — the standing gate: nothing is wrong, so nothing is stamped.
-    let (whole, partial) = merged_saved_requests(NODES[majority[0]].admin)
-        .await
-        .expect("the healthy fleet answers a merged read");
-    assert!(
-        !partial,
-        "a healthy fleet must not stamp a merged read partial: {whole:?}"
-    );
-    assert_eq!(
-        whole.len(),
-        9,
-        "every shard must be present before anything is broken: {whole:?}"
-    );
+    // The standing gate, asserted before anything is broken: a healthy fleet's
+    // merged read is complete and NOT stamped, on every node — the same
+    // pre-fault convergence loop C28/C30/C12 run, and the one this scenario
+    // (the family's partial-stamp specialist) must not skip.
+    let mut healthy = fixture_probe_paths();
+    for (_, tag, count) in [(0usize, "a", 3usize), (1, "b", 3), (2, "c", 3)] {
+        for n in 0..count {
+            healthy.insert(format!("{JOURNAL_ROUTE_PREFIX}/{tag}-{n}"));
+        }
+    }
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    loop {
+        let mut settled = true;
+        let mut last = None;
+        for node in &NODES {
+            let read = merged_saved_requests(node.admin).await;
+            settled &= matches!(&read, Ok((paths, false)) if *paths == healthy);
+            last = Some((node.name, read));
+        }
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a healthy fleet must answer the complete set unstamped everywhere: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let minority_index = (0..NODES.len())
+        .find(|index| *index != leader)
+        .expect("a non-leader exists");
+    let minority = &NODES[minority_index];
+    let majority = (0..NODES.len())
+        .find(|index| *index != minority_index)
+        .expect("a majority node exists");
+
+    let partial_before = metric(
+        NODES[majority].metrics,
+        "rift_cluster_journal_partial_reads_total",
+    )
+    .await
+    .unwrap_or(0.0);
 
     cluster
         .partition(minority.name)
         .expect("cut the minority off");
-
-    // `mgmt` must keep the isolated node assertable from the host, or property
-    // 2's minority half cannot be observed at all. Fail specifically rather
-    // than as a confusing timeout inside the assertion below.
     wait_admin_reachable(minority.admin_via_mgmt, Duration::from_secs(30))
         .await
         .unwrap_or_else(|e| {
@@ -5084,34 +6289,54 @@ async fn journal_partition_is_declared_on_both_sides_and_heals() {
             )
         });
 
-    // Property 2 — both sides answer, and both say they are degraded. The
-    // minority cannot reach the other two; the majority cannot reach it.
+    // Both sides answer stamped — and the majority side's answer is *timed*.
+    // The peer budget is 2 s; 4 s of headroom separates "budgeted and
+    // degraded" from "hung on the unreachable peer" without inviting flakes
+    // on a loaded runner. The measured value is printed as the scenario
+    // artifact Ch.12 asks for.
     let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
-    loop {
-        let majority_side = merged_saved_requests(NODES[majority[0]].admin).await;
+    let measured = loop {
+        let started = std::time::Instant::now();
+        let majority_side = merged_saved_requests(NODES[majority].admin).await;
+        let elapsed = started.elapsed();
         let minority_side = merged_saved_requests(minority.admin_via_mgmt).await;
         if let (Ok((_, true)), Ok((_, true))) = (&majority_side, &minority_side) {
-            break;
+            assert!(
+                elapsed < Duration::from_secs(6),
+                "a partitioned merged read must answer within the peer budget \
+                 plus headroom, not hang: took {elapsed:?}"
+            );
+            break elapsed;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "both sides must answer a partitioned read stamped partial; \
+            "both sides must answer stamped partial; \
              majority={majority_side:?} minority={minority_side:?}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    };
+    println!("c29 artifact: partitioned merged read answered in {measured:?} (peer budget 2s)");
 
+    // Metrics honesty: the stamped reads counted themselves.
+    let partial_after = metric(
+        NODES[majority].metrics,
+        "rift_cluster_journal_partial_reads_total",
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the partial-reads family must be scrapeable: {e}"));
+    assert!(
+        partial_after > partial_before,
+        "rift_cluster_journal_partial_reads_total must move when reads are \
+         stamped: before={partial_before} after={partial_after}"
+    );
+
+    // Heal and re-assert the standing gate: stamp gone, sets identical.
     cluster.heal(minority).expect("heal the partition");
     for node in &NODES {
         wait_voters(node, 3.0, CONVERGE_TIMEOUT)
             .await
             .unwrap_or_else(|e| panic!("{} did not reconverge on 3 voters: {e}", node.name));
     }
-
-    // Property 3 — the stamp clears and the sets converge. Polled together, not
-    // separately: "unstamped" and "agrees with everyone" are one claim, and
-    // asserting them in sequence would let a run pass on an unstamped read that
-    // was still missing the healed node's entries.
     let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
     loop {
         let reads: Vec<_> = {

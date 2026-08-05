@@ -488,10 +488,14 @@ limitations follow from the same trade, worth knowing before picking it:
 history, so pass the pin in:
 
 ```sh
-docker build -f deploy/Dockerfile \
+docker build -f deploy/Dockerfile --target runtime \
   --build-arg RIFT_UPSTREAM_VERSION="$(git -C vendor/rift describe --tags --always)" \
   -t rift-cluster-server .
 ```
+
+(`--target runtime` is required since issue #228: the Dockerfile's last stage is the
+chaos suite's clock-skew flavor, so an untargeted build no longer produces the
+production image.)
 
 Omit it and the banner reads `rift unknown` — unhelpful, but never a *wrong*
 version, which matters because this string ends up in bug reports.

@@ -248,6 +248,19 @@ Toxiproxy is used for C6 and *not* for C4, for two independent reasons:
   `reset_peer` at toxicity 0.3 — 30% of connections reset, the TCP-level analogue
   of loss bursts.
 
+### Why libfaketime (C12), not the clock itself
+
+The same shape of reasoning, for time instead of the network: the containers
+share the host kernel's clock, so there is no per-container clock to set — the
+only way one node can honestly disagree with another about the time is to lie
+to that node's *process*, which is what `faketime.overlay.yml`'s `LD_PRELOAD`
+of libfaketime does (via the `runtime-faketime` build target, the production
+`runtime` stage plus the library — no shipped image ever carries it). The
+scenario proves the lie took hold before asserting anything: the two extreme
+nodes' `Date` headers must disagree by most of the ±5 s spread, so a broken
+overlay fails loudly instead of passing every clock-free-clears probe on a
+secretly synchronized fleet.
+
 ### Why C6 bounds a rate, not a count
 
 C6's injected jitter **overlaps the election timeout by design**: 100±100 ms each
@@ -310,27 +323,39 @@ Implemented and passing: `test_config_sync_converges`, `test_node_rejoin`,
 `c25_key_revocation_survives_a_partition`,
 `c26_audit_chain_survives_a_full_cluster_restart`,
 `c27_tenancy_isolates_ownership_but_not_the_data_plane`,
-`journal_partition_is_declared_on_both_sides_and_heals`.
+`c28_fleet_journal_is_exact_under_node_kill`,
+`c29_partial_reads_answer_within_budget_and_count_themselves`,
+`c30_vector_cursor_walk_survives_membership_change`,
+`c10_proxy_once_survives_owner_and_leader_kills`,
+`c11_concurrent_recording_loses_nothing`,
+`c12_clears_are_exact_under_clock_skew`.
 
-`journal_partition_is_declared_on_both_sides_and_heals` is the one implemented
-scenario with **no `cNN` number**, deliberately. Issue #223's acceptance criteria
-ask for a smoke-level partition assertion and say in as many words that "the full
-in-anger scenario is #228's"; #228 reserves C28–C30 for the verification plane and
-its **C29 is this same property done properly** — partitioned mid-spray, asserting
-`rift_cluster_journal_partial_reads_total` moved, and *measuring* the 2 s budget
-rather than bounding it. Taking a number here would have squatted on that for a
-weaker test. When C29 lands, this one is redundant and should be deleted rather
-than kept alongside it.
+## C28–C30 + C10–C12: the verification plane (#228)
 
-It also needs no new overlay, which is worth recording because #228's design notes
-predict one ("a scenario asserting `Rift-Cluster-Partial` on data reads needs a
-published port overlay"). It does not: traffic goes through `front-door.overlay.yml`'s
-already-published per-node listeners, and the merged read is an *admin* call on a
-port the base file already publishes. Imposter data ports stay unpublished.
+The M3 exit bar's in-anger tier: fleet `savedRequests`/counts/clears/cursors
+under kill, partition and skew, plus exactly-once proxy recording under owner
+and leader death. (#223's smoke-level partition scenario,
+`journal_partition_is_declared_on_both_sides_and_heals`, was deleted when C29
+landed, exactly as its own note here used to direct: C29 is the same property
+measured properly.)
+
+None of the journal scenarios needs a new overlay — traffic goes through
+`front-door.overlay.yml`'s already-published per-node listeners and every
+merged read is an *admin* call on a port the base file publishes; imposter data
+ports stay unpublished. The proxy pair borrows `sources.overlay.yml`'s
+standalone `source-origin` server as its counting origin (in-network by service
+name, single-node admin already published and port-reserved), so the whole
+family adds exactly one piece of compose surface: `faketime.overlay.yml` for
+C12, which publishes nothing.
 
 | scenario | asserts | vacuity guard |
 |---|---|---|
-| `journal_partition_is_declared_on_both_sides_and_heals` | a healthy fleet's merged `savedRequests` read is **not** stamped; under `partition()` **both** sides still answer, stamped `Rift-Cluster-Partial: true`, rather than hanging or silently shortening; on heal the stamp clears and all three nodes' sets converge | no mutation story yet — this one was written green rather than as a defect reproduction. Its guard against vacuity is the `whole.len() == 9` assertion before the partition: 2+3+1 requests driven through three *different* front doors plus one readiness probe each, so it only holds if the three writer shards are genuinely distinct **and** the merge combined them. A fleet recording everything on one node fails it |
+| `c28_fleet_journal_is_exact_under_node_kill` | survivors answer **exactly N** with the dead shard cache-served, honestly stamped partial while its writer is gone; fleet count exact; the stamp clears with the same N when the node returns | the pre-kill convergence gate: the exact tagged set must merge unstamped across three genuinely distinct shards before anything is broken |
+| `c29_partial_reads_answer_within_budget_and_count_themselves` | both partition sides answer **within the 2 s peer budget** (measured, printed as the run artifact); `rift_cluster_journal_partial_reads_total` moves; heal clears the stamp and converges the sets | the metric delta — a fleet that stamped headers without counting them fails, as does one that never stamped at all |
+| `c30_vector_cursor_walk_survives_membership_change` | the `?since=` walk is gapless and duplicate-free across a kill and the node's return (tallied by unique request path); `x-rift-truncated` appears **iff** a presented position predates a shard's eviction watermark | delivered-set equality against the sprayed set at every phase — a walk that skipped or repeated anything fails the set comparison, and the truncation probe asserts both directions |
+| `c10_proxy_once_survives_owner_and_leader_kills` | zero wedged signatures across an owner kill *and* a leader kill (every signature ends Recorded on every node); replay adds nothing at the origin; max upstream calls per signature measured and printed, loosely bounded | the replay-freeze check — a fleet that "recovered" by silently re-proxying forever fails the origin-count freeze |
+| `c11_concurrent_recording_loses_nothing` | exactly one recorded stub per proxyOnce signature fleet-wide after a 3-node race; zero origin calls once Recorded; proxyAlways never replays and keeps reaching the origin | the post-settle round from every node — one lost recording shows as an origin call, one duplicate as a second stub |
+| `c12_clears_are_exact_under_clock_skew` | a fast-clock clear erases fleet-wide; every post-clear append survives with counts exact; racing clears from the two clock extremes converge | the `Date`-header spread assertion — a broken faketime overlay (synchronized fleet) fails before any clock-free probe can pass vacuously |
 
 `c5_rolling_restart_never_stops_accepting_writes` was committed **failing**, as
 the reproduction for a real defect this tier found (#72): a node that gracefully

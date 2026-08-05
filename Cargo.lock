@@ -610,6 +610,7 @@ name = "cluster-chaos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "httpdate",
  "reqwest",
  "rift-cluster",
  "serde_json",

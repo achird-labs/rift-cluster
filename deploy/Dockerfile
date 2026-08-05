@@ -15,8 +15,10 @@
 #
 # Two published FLAVORS (#270), selected with `--target`:
 #
-#   `runtime`        (default, last stage — what a bare `docker build` with no
-#                     `--target` produces) — `debian:bookworm-slim`, carries `git` so
+#   `runtime`        (the production default — pass `--target runtime` explicitly: since
+#                     issue #228 the file's LAST stage is the chaos suite's
+#                     `runtime-faketime`, so a bare untargeted build no longer produces
+#                     this) — `debian:bookworm-slim`, carries `git` so
 #                     `git+https:`/`git+file:` imposter sources work.
 #   `runtime-static` (`-static` tag suffix) — `FROM scratch`, a musl binary and nothing
 #                     else: no shell, no package manager, no git. Smaller and a narrower
@@ -320,11 +322,14 @@ ENTRYPOINT ["/usr/local/bin/rift-cluster-server"]
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
-# This MUST remain the last stage in the file: `cluster-smoke` and every local
-# `docker build -f deploy/Dockerfile .` build with no `--target`, which resolves to whichever
-# stage is last. The two static stages above are inserted BEFORE this one for exactly that
-# reason — appending them after `runtime` would silently change what an untargeted build
-# produces.
+# NO LONGER the last stage in the file (issue #228): `runtime-faketime` — the chaos
+# suite's clock-skew flavor, which must build FROM this stage — sits after it, so an
+# untargeted build now resolves to *that*. The invariant therefore inverted: every build
+# site in the repo pins `target:` explicitly (the base compose, both demo composes, the
+# sources overlay, release.yml's matrix, and the README's build command), and
+# `every_dockerfile_build_site_pins_a_target` in the chaos suite's `scenarios.rs` fails
+# the build of any compose file that forgets — appending a stage can never again silently
+# change what anyone builds.
 FROM debian:bookworm-slim AS runtime
 
 # ca-certificates is needed for outbound TLS (proxied imposters, HTTPS config
@@ -370,3 +375,23 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD ["rift-cluster-server", "healthcheck"]
 
 ENTRYPOINT ["rift-cluster-server"]
+
+# --- runtime-faketime: the chaos suite's clock-skew flavor (issue #228, C12) -----------------
+#
+# Identical to `runtime` plus libfaketime, selected only by
+# `tests/cluster-chaos/compose/faketime.overlay.yml` via `build.target`. Never
+# published and never the default: skewing a production node's clock is not a
+# feature, and keeping the stage here (rather than a second Dockerfile) is what
+# guarantees it can never drift from the runtime image it decorates. The
+# symlink gives the overlay an architecture-independent LD_PRELOAD path —
+# Debian installs the library under the multiarch triplet, which differs
+# between the amd64 CI runner and an arm64 laptop.
+FROM runtime AS runtime-faketime
+# The runtime stage runs as `rift`; apt needs root, and the drop back is what
+# keeps this flavor's only delta the library itself.
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libfaketime \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s "$(find /usr/lib -name 'libfaketime.so.1' | head -n 1)" /usr/local/lib/libfaketime.so.1
+USER rift
