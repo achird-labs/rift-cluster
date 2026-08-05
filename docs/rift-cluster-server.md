@@ -1470,12 +1470,20 @@ so a URI no node should ever fetch never reaches the log at all, and again in th
 provider:
 
 - A `git+` URI must be written with `//` after the scheme — `git+file://…`, not
-  `git+file:…`. The single-colon spelling is **refused at admission**, because
-  the fetch path's scheme parser splits on `://` and would route it to the
-  `file:` provider, which opens the whole string as a path: a source the control
-  plane had just called a well-formed git remote fails with a not-found naming a
-  path nobody wrote. One admissible spelling per scheme is what keeps the two
-  parsers from disagreeing.
+  `git+file:…`. The single-colon spelling is **refused at admission**, so that
+  each scheme has exactly one admissible spelling.
+
+  This refusal originally existed because the two parsers *disagreed* about that
+  spelling: the control plane called `git+file:/srv/x` a git remote while the
+  fetch path's scheme parser split on `://` and routed it to the `file:`
+  provider, which opened the whole string as a path — a source the control plane
+  had just called a well-formed git remote failing with a not-found naming a path
+  nobody wrote. Since [rift#926](https://github.com/achird-labs/rift/pull/926)
+  the fetch path reads a bare `scheme:` through an RFC 3986 scheme grammar, so it
+  now agrees: both spellings resolve to `git+file`. The admission refusal is kept
+  regardless — one spelling per scheme is worth having on its own, and it now
+  guards against the parsers drifting apart again rather than papering over a
+  live disagreement.
 - A remote or ref beginning with `-` is **refused**. `git`'s option parser
   permutes, so a remote like `--upload-pack=/tmp/x.sh` would otherwise be parsed
   as an *option* and run `/tmp/x.sh` as the rift process on every node that pulls
