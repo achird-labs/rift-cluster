@@ -974,10 +974,10 @@ paths:
 
   # ---------------------------------------------------------------------
   # ee: fleet request journal (issue #223) — merge-on-read GET, Raft-committed clear
-  # generation DELETE (issue #224). `?since=` is the one GET case that still proxies
-  # verbatim (a scalar cursor cannot address a multi-writer merge, #225's territory);
-  # `?match=` is the one DELETE case that stays a local-only proxy (#223 review, B3).
-  # Both exceptions live here in prose since a RouteKey carries no query.
+  # generation DELETE (issue #224), vector-cursor `?since=` GET (issue #225). `?match=` is
+  # now the only GET case that still proxies verbatim, and the only DELETE case that stays a
+  # local-only proxy (#223 review, B3). Both exceptions live here in prose since a RouteKey
+  # carries no query.
   # ---------------------------------------------------------------------
   /imposters/{port}/savedRequests:
     parameters:
@@ -986,27 +986,50 @@ paths:
       operationId: listSavedRequests
       summary: List recorded requests for an imposter, merged across the fleet
       description: >
-        Without `since` **and** without `match`, the cluster front **terminates** this route
-        (issue #223) rather than proxying: it merges this node's own writer shard
+        Without `match`, the cluster front **terminates** this route (issues #223, #225)
+        rather than proxying: it merges this node's own writer shard
         with every other roster peer's, pulled live under a 2 s fleet-wide
         budget, and falls back to the last anti-entropy-cached copy of any
         peer that misses it. Answers a **bare JSON array** of recorded
         requests, ordered by each entry's own recorded timestamp (never a
         node-local arrival clock, which would let two nodes disagree about
         the order) — not an envelope. `matchOutcome` survives on every entry
-        unchanged. Carries no `x-rift-next-index`/`x-rift-truncated`: a merged
-        read has no single cursor that means the same thing on every shard,
-        so it withholds both rather than publish one that would silently
-        mislead a client into thinking it does.
+        unchanged.
 
-        With `since` **or** `match` present, this proxies to the local engine exactly as
-        before #223 — `since` is a scalar cursor that cannot address a multi-writer merge, so
-        that case is out of scope here and stays #225's; `match` is a predicate the
-        merge-on-read path never evaluates at all, so terminating on it would silently answer
-        with the *whole* fleet's requests instead of the caller's scoped subset, and turn a
-        malformed filter's upstream `400` into a `200` with everything. Both proxy verbatim,
-        leaving upstream's own clause parser and its existing error handling in charge either
-        way. `x-rift-next-index`/`x-rift-truncated` are only ever emitted on that proxied path.
+        `x-rift-next-index` carries an **opaque vector cursor** (issue #225), not an integer:
+        a position per writer shard plus the clear generation it was issued under, base64url
+        encoded. Round-trip it verbatim; do not parse it. This replaces #223's withheld-header
+        convention — #223 withheld the cursor because a scalar index names a position in no
+        shard in particular, and the vector token is precisely the value that does mean the
+        same thing on every node. Passing it back as `since` resumes the walk gaplessly and
+        without duplicates **per shard**, across membership changes (a departed node's position
+        freezes; a joining node enters at 0) and across clears (#224 — cleared entries are never
+        replayed and the token never regresses).
+
+        `x-rift-truncated: true` when retention evicted entries this reader had not yet seen,
+        exactly as upstream means it. Additive-only: never sent as `false`. A **baseline** read
+        (no `since` at all) is a snapshot of everything still retained and is therefore never
+        truncated — only a reader resuming from a position can have missed something.
+
+        Pages are ordered by recorded timestamp *within* a page. Concatenating pages is not a
+        globally sorted stream: a peer that becomes reachable between pages contributes entries
+        older than everything already returned, so do not build an append-only "latest requests"
+        view by appending pages without re-sorting.
+
+        A `since` value that is neither a token this fleet issued nor a bare `u64` answers
+        **400**, never a defaulted position — defaulting would silently replay the whole
+        journal or silently skip everything recorded since. A bare `u64` is accepted for the
+        upgrade window and read as this node's own shard position (`{this_node: seq}`), which
+        is the only thing it can have meant: before #225 a merged read issued no cursor at all,
+        so any scalar a client holds came from a proxied per-node read of this node.
+
+        With `match` present, this proxies to the local engine exactly as before #223: it is a
+        predicate the merge-on-read path never evaluates at all, so terminating on it would
+        silently answer with the *whole* fleet's requests instead of the caller's scoped
+        subset, and turn a malformed filter's upstream `400` into a `200` with everything.
+        Proxying leaves upstream's own clause parser and its existing error handling in charge,
+        and on that path the cursor headers carry upstream's own scalar index rather than a
+        vector token.
 
         `/imposters/{port}/requests` is an alias: `classify` collapses both
         spellings onto the same handler, so the two operations describe
@@ -1117,11 +1140,11 @@ paths:
         reference because a generated client reads each operation
         independently.
 
-        Without `since` and without `match`, terminates as the fleet merge-on-read
-        `savedRequests` documents in full; with either present, proxies to the local engine
-        (`since` is #225's territory; `match` is a predicate the merge-on-read path never
-        evaluates). See that operation's description for the whole contract, including why no
-        cursor header is ever emitted on the merged path.
+        Without `match`, terminates as the fleet merge-on-read `savedRequests` documents in
+        full, `?since=` included (issue #225); with `match` present, proxies to the local
+        engine, because it is a predicate the merge-on-read path never evaluates. See that
+        operation's description for the whole contract, including the opaque vector cursor
+        `x-rift-next-index` carries on the merged path.
       tags: [imposters]
       x-rift-origin: ee
       parameters:
@@ -3534,17 +3557,26 @@ components:
       in: query
       required: false
       description: >
-        Journal cursor: return only entries recorded at or after this index,
-        as previously reported by this endpoint's x-rift-next-index response
+        Journal cursor: return only entries recorded after this position, as
+        previously reported by this endpoint's x-rift-next-index response
         header. Absent means a baseline read of everything still retained.
+
+        On the clustered merge-on-read path this is an **opaque vector cursor**
+        (issue #225) — a string, not an integer: it encodes a position per
+        writer shard plus the clear generation it was issued under, because a
+        scalar index names a position in no shard in particular once more than
+        one node is recording. Round-trip it verbatim; do not parse it, and do
+        not construct one. A bare `u64` is still accepted during the upgrade
+        window and read as this node's own shard position.
+
         Unlike the audit journal's forgiving `since`, an unparseable value
         here answers 400 rather than taking a default — a cursor that
         silently restarted at zero would re-deliver the whole journal as if
-        it were new traffic.
+        it were new traffic, and one that silently jumped to the end would
+        hide everything recorded since it was issued.
       schema:
-        type: integer
-        format: int64
-        minimum: 0
+        type: string
+        example: eyJ2IjoxLCJnZW4iOjAsInBvcyI6eyIxIjo0Mn19
     JournalMatch:
       name: match
       in: query
@@ -3600,17 +3632,24 @@ components:
         format: uuid
     XRiftNextIndex:
       description: >
-        The journal index to send as `since` on the next read to continue
-        exactly where this response stopped. Emitted only by a backend with
-        stable indices, and only on a complete cursor read — a degraded
-        partial read omits it. Its **presence is the protocol**: a client
+        The cursor to send as `since` on the next read to continue exactly
+        where this response stopped. Its **presence is the protocol**: a client
         probes for this header to discover whether cursoring is supported at
         all, rather than assuming a default and paging against a backend that
         cannot honour it (issue #603).
+
+        On the clustered merge-on-read path (issue #225) the value is an
+        **opaque vector cursor** — a string encoding a position per writer
+        shard and the clear generation it was issued under. Round-trip it
+        verbatim; never parse it. It is emitted on every merged read, including
+        a degraded one: a `Rift-Cluster-Partial` answer is still a real
+        position in every shard that did answer, so withholding the cursor
+        there would strand a client mid-walk for the duration of a partition.
+        Proxied per-node reads still carry upstream's own scalar index here,
+        under the same "do not parse it" contract.
       schema:
-        type: integer
-        format: int64
-        minimum: 0
+        type: string
+        example: eyJ2IjoxLCJnZW4iOjAsInBvcyI6eyIxIjo0Mn19
     XRiftTruncated:
       description: >
         Present, with the value `true`, when retention evicted entries the

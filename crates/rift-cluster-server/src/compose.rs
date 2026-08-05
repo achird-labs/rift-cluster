@@ -200,6 +200,21 @@ impl ComposedServer {
             .map_or_else(|| self.server.admin_addr(), AdminFront::local_addr)
     }
 
+    /// The **core engine's** admin address, behind the cluster front — where [`Self::admin_addr`]
+    /// proxies to when clustering is on, and the same address when it is off.
+    ///
+    /// This is the bypass, and it exists because there is no longer a query string that means
+    /// "read only this node". Issue #223 left `?since=` proxying, so a caller wanting one node's
+    /// own shard could ask the front for it; issue #225 terminates that route too, so every
+    /// requests-read through the front is now a fleet-wide merge. A test asserting that each
+    /// node recorded onto its own shard — the premise the merge tests rest on — has to address
+    /// the engine directly, and naming that explicitly is better than a query-string trick that
+    /// silently becomes a merged read the next time the front's classifier widens.
+    #[must_use]
+    pub fn engine_admin_addr(&self) -> SocketAddr {
+        self.server.admin_addr()
+    }
+
     /// The bound probe address — `None` when clustering is off, because an
     /// un-clustered node must be indistinguishable from the open-source binary.
     #[must_use]

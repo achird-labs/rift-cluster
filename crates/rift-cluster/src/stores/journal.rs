@@ -202,9 +202,18 @@ pub struct ShardRead {
 /// guessing — see [`CursorError`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalCursor {
-    /// The port's clear generation (issue #224) at the moment this cursor was issued — not
-    /// at the moment it is read back. A merge compares the two to tell whether a clear landed
-    /// in between and, if so, which entries it is entitled to have dropped.
+    /// The port's clear generation (issue #224) at the moment this cursor was issued — not at
+    /// the moment it is read back.
+    ///
+    /// **Carried, not yet acted on.** The walk's clear-safety comes entirely from the per-shard
+    /// positions plus the fact that a clear never resets `seq`: entries from a superseded
+    /// generation are dropped by the merge itself, and the positions step over the seq range
+    /// they occupied, so nothing here needs to filter on this value. It is part of the `v1`
+    /// wire format because a reader that *can* see which generation a token was minted under is
+    /// the cheap enabling condition for anything that later needs to (telling "your cursor
+    /// predates a clear" apart from "nothing new", say), and adding a field to a versioned
+    /// token afterwards costs a version bump. Kept deliberately, described honestly: no code
+    /// path reads it except to keep it monotone.
     pub generation: u64,
     /// `node_id -> that shard's seq the reader has consumed`, exclusive — the same convention
     /// [`ClusterJournal::read_shard_since`]'s `since_seq` uses. A shard absent from the map
@@ -252,6 +261,22 @@ pub enum CursorError {
 }
 
 impl JournalCursor {
+    /// An explicit position at the very beginning: no shard positions at all, which reads
+    /// identically to every shard at 0.
+    ///
+    /// This is **not** what an absent `?since=` means. A baseline read is a snapshot of
+    /// everything retained and so can never be truncated, whereas this is a reader asserting it
+    /// has consumed nothing — which, against a shard that has evicted, means it has already
+    /// missed something. The merged read keeps the two apart by passing `Option<&JournalCursor>`
+    /// rather than substituting this value for absence; see `merge_shards_since`.
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            generation: 0,
+            pos: BTreeMap::new(),
+        }
+    }
+
     /// Encode this cursor as a versioned, opaque, unpadded base64url token — safe inside a
     /// query string and an SSE `id:` line, both of which forbid `+`, `/`, `=`, and whitespace.
     #[must_use]
@@ -468,7 +493,7 @@ impl ClusterJournal {
     /// needs it to build its own [`super::journal_net::ShardSlice`] without
     /// waiting on a `RaftNode` that may not exist yet.
     #[must_use]
-    pub(crate) fn node_id(&self) -> NodeId {
+    pub(crate) const fn node_id(&self) -> NodeId {
         self.node_id
     }
 
