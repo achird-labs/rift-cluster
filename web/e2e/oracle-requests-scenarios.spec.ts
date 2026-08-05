@@ -90,10 +90,16 @@ async function apiScenarios(
   return (await response.json()) as { flowId: string; scenarios: Scenario[] };
 }
 
-/** The total the pager reports, parsed out of "1–50 of 55 on this node". */
+/**
+ * The total the pager reports, parsed out of "1–50 of 55".
+ *
+ * The trailing "on this node" this used to require is gone: #147 H points the screen at the
+ * fleet's merged journal, so the count is the fleet's and qualifying it per-node would be a false
+ * claim. That sweep is what this regex tracks.
+ */
 async function shownTotal(page: Page): Promise<number> {
   const label = (await page.getByTestId("request-total").textContent()) ?? "";
-  const match = /of\s+(\d+)\s+on this node/.exec(label);
+  const match = /of\s+(\d+)/.exec(label);
   expect(match, `could not read a total out of ${JSON.stringify(label)}`).not.toBeNull();
   return Number(match![1]);
 }
