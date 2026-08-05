@@ -536,7 +536,13 @@ describe("#250 — a stub seeded from a recorded request", () => {
 
     const editor = (await screen.findByTestId("code-editor-fallback")) as HTMLTextAreaElement;
     await waitFor(() => expect(editor.value.length).toBeGreaterThan(0));
-    expect(JSON.parse(editor.value)).toEqual(seed);
+    // The seed, plus an id. A stub created without one has no by-id address, so it can be neither
+    // edited nor removed from the stub table afterwards — the editor seeds one for every new stub,
+    // seeded-from-a-request included.
+    const draft = JSON.parse(editor.value) as Record<string, unknown> & { id: string };
+    expect(draft.id).toMatch(/^stub-/);
+    const { id: _id, ...rest } = draft;
+    expect(rest).toEqual(seed);
     expect((await screen.findByTestId("stub-seed-note")).textContent).toMatch(
       /records requests, not responses/i,
     );

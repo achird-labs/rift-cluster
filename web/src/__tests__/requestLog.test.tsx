@@ -586,7 +586,12 @@ describe("#250 — turning a request into a stub", () => {
 
     const editor = (await screen.findByTestId("code-editor-fallback")) as HTMLTextAreaElement;
     await waitFor(() => expect(editor.value.length).toBeGreaterThan(0));
-    expect(JSON.parse(editor.value)).toEqual({
+    // Plus a seeded id: a stub created without one can be neither edited nor removed afterwards,
+    // so the editor gives every new stub an addressable name — including one seeded from a request.
+    const draft = JSON.parse(editor.value) as Record<string, unknown> & { id: string };
+    expect(draft.id).toMatch(/^stub-/);
+    const { id: _id, ...rest } = draft;
+    expect(rest).toEqual({
       predicates: [{ equals: { method: "POST", path: "/v1/payments" } }],
       responses: [
         { is: { statusCode: 200, headers: { "Content-Type": "application/json" }, body: "{}" } },

@@ -166,8 +166,36 @@ function ResponseCard({
     onChange({ ...item, statusCode: parsed });
   };
 
+  /**
+   * A header name no existing row already uses.
+   *
+   * The row has to arrive with a name, and that is not a style choice. This editor's JSON text is
+   * the single source of truth and the form is a projection of it: `onChange` recomposes the JSON,
+   * `renderHeaders` drops any header whose name is empty (an empty header name is not a header),
+   * and the form is then re-derived from that JSON. A row added blank was therefore gone before it
+   * could be typed into — the button did nothing at all, forever.
+   *
+   * The sibling `PredicateBuilder` has no such problem because `renderClauseJson` writes blank
+   * values through, so its new rows survive the round trip. Headers are the one builder whose blank
+   * row is unrepresentable, so it is the one that needs a representable starting value.
+   *
+   * Suffixed on collision so clicking twice gives two editable rows rather than one row and a
+   * silent no-op — the same defect in miniature.
+   */
+  const nextHeaderName = (): string => {
+    const taken = new Set(item.headers.map((header) => header.name));
+    if (!taken.has("X-New-Header")) return "X-New-Header";
+    for (let n = 2; ; n += 1) {
+      const candidate = `X-New-Header-${n}`;
+      if (!taken.has(candidate)) return candidate;
+    }
+  };
+
   const addHeader = (): void => {
-    onChange({ ...item, headers: [...item.headers, { name: "", value: "", multi: false }] });
+    onChange({
+      ...item,
+      headers: [...item.headers, { name: nextHeaderName(), value: "", multi: false }],
+    });
   };
 
   const removeHeader = (headerIndex: number): void => {

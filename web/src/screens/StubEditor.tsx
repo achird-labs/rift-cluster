@@ -98,13 +98,39 @@ function composeStubText(
 }
 
 /**
+ * An id for a stub the operator is creating.
+ *
+ * Seeded rather than left blank, because `id` being optional is a one-way door: a stub without one
+ * has no by-id address, so `StubActions` correctly refuses to edit it — and offers no delete
+ * either. Creating one through this form therefore produced a stub that could not be edited OR
+ * removed from the stub table, recoverable only by rewriting the imposter's whole stub list. The
+ * form is the one place that can stop that happening, and it costs a default the operator is free
+ * to overwrite.
+ *
+ * Readable rather than a bare UUID: it goes in a URL, a `Delete <id>` button label and the
+ * conflict diff, and `stub-3f9a2c` is something a person can say out loud.
+ */
+function newStubId(): string {
+  const suffix =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID().slice(0, 6)
+      : Math.floor(Math.random() * 0xff_ffff)
+          .toString(16)
+          .padStart(6, "0");
+  return `stub-${suffix}`;
+}
+
+/**
  * A blank stub for the append case.
  *
  * Deliberately still predicate-less: guessing a path would put words in the operator's mouth, and
  * the editor says out loud what a predicate-less stub does (see `Summary`) rather than hiding the
- * consequence behind a plausible default.
+ * consequence behind a plausible default. An id is NOT the same kind of guess — it names the stub
+ * rather than deciding what it matches, and without one the stub is uneditable.
  */
-const NEW_STUB_TEXT = pretty({ responses: [{ is: { statusCode: 200 } }] });
+function newStubText(): string {
+  return pretty({ id: newStubId(), responses: [{ is: { statusCode: 200 } }] });
+}
 
 /**
  * Starting points for a new stub.
@@ -228,7 +254,7 @@ export function StubEditor({
 }): ReactNode {
   const [text, setText] = useState(() => {
     if (target.kind !== "new") return pretty(original);
-    return target.seed === undefined ? NEW_STUB_TEXT : pretty(target.seed);
+    return target.seed === undefined ? newStubText() : pretty({ id: newStubId(), ...target.seed });
   });
   /*
    * Was this draft seeded from a request? Used only to swap the presets for a note explaining where
@@ -426,7 +452,11 @@ export function StubEditor({
       ) : null}
 
       {target.kind === "new" && !seeded && editable !== null ? (
-        <Presets onPick={(stub) => setText(pretty(stub))} />
+        <Presets
+          // A preset is a whole stub the operator then edits, so it needs the same id a blank new
+          // stub gets — otherwise picking one silently opts out of being editable later.
+          onPick={(stub) => setText(pretty({ id: newStubId(), ...(stub as object) }))}
+        />
       ) : null}
 
       {editable !== null ? (
