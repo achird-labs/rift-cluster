@@ -68,8 +68,9 @@ const CLUSTER_ADDITIONS: &[&str] = &[
     // than only the ones that opted into something.
     "with_request_journal",
     // Exactly-once proxy recording via fleet-wide ownership: ClusterProxyStore
-    // claims each (port, signature) at its HRW owner (KeyClass::Proxy), making
-    // stub-less recordings unrepresentable by construction (issue #226).
+    // claims each (port, signature) at its HRW owner (KeyClass::Proxy), and a
+    // recording commits marker and stub in one log entry, so "recorded but
+    // stub-less" is unrepresentable by construction (issue #226).
     "with_proxy_store",
     // An imposter exists cluster-wide regardless of whether any one node could
     // bind its port, so a node that loses the port to an unrelated process
