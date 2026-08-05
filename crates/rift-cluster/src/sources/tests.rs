@@ -398,21 +398,28 @@ fn declaring_an_unavailable_scheme_names_the_cause_and_the_fix() {
     );
 }
 
-/// `git+file:` reaches [`super::git::GitSource`] only in its `git+file://<path>`
-/// form, and the refusal funnel inherits exactly that.
+/// `git+file:` reaches [`super::git::GitSource`], and the refusal funnel
+/// inherits exactly that.
 ///
-/// Pinned here because **two scheme parsers disagree** about the single-colon
-/// spelling, which is a trap for anyone reading either one alone:
-/// upstream's `SourceRef::scheme` splits on `"://"` and calls
-/// `git+file:/srv/x` a `file:` URI, while this crate's
-/// `control::require_well_formed_uri` splits on `':'` and calls the same string
-/// `git+file` — so it is *validated* as git and then *routed* to `FileSource`.
+/// This test used to pin a **disagreement between two scheme parsers**: upstream's
+/// `SourceRef::scheme` split on `"://"` and called `git+file:/srv/x` a `file:`
+/// URI, while this crate's `control::require_well_formed_uri` splits on `':'`
+/// and called the same string `git+file` — so it was *validated* as git and then
+/// *routed* to `FileSource`. The parse was asserted here precisely so that a
+/// change to either parser would fail a test rather than silently move which
+/// provider a URI lands on.
 ///
-/// That disagreement predates this issue and is identical on both image
-/// flavors (a git-present node routes it to `FileSource` too, and fails on a
-/// literal path). #270 neither causes it nor fixes it — filed separately — but
-/// the parse is asserted here so that a change to either parser fails a test
-/// instead of silently moving which provider a URI lands on.
+/// **That is what happened, and the disagreement is now gone.** Upstream
+/// `achird-labs/rift#926` (this repo's #310) restored the bare-colon fallback
+/// behind an RFC 3986 scheme grammar, so `SourceRef::scheme` now reads
+/// `git+file:/srv/x` as `git+file` — the same answer this crate's validator
+/// always gave. Both spellings route to the git provider.
+///
+/// The assertions stay, with the agreed answer, because the canary is still
+/// worth having: they now fail if the two parsers ever drift *apart* again.
+/// Note that #301's admission refusal below is unchanged and still refuses the
+/// single-colon spelling — it is now belt-and-braces rather than the only thing
+/// standing between that spelling and a misroute.
 #[test]
 fn only_the_double_slash_git_file_spelling_routes_to_git() {
     let providers = providers_with_git_unavailable();
@@ -425,6 +432,17 @@ fn only_the_double_slash_git_file_spelling_routes_to_git() {
         "{refusal}"
     );
 
+    // The single-colon spelling now reaches the same funnel. Before rift#926 it
+    // parsed as `file`, which this build *serves*, so no refusal was produced at
+    // all and the URI landed in `FileSource` to fail later on a literal path.
+    let single_colon = providers
+        .scheme_refusal("git+file:/srv/mocks.git#main:m.json")
+        .expect("the single-colon form now parses as git+file and is refused too");
+    assert!(
+        single_colon.contains("`git+file:` sources are unavailable"),
+        "{single_colon}"
+    );
+
     assert_eq!(
         super::SourceRef::new("git+file:///srv/mocks.git#main:m.json").scheme(),
         "git+file",
@@ -432,9 +450,9 @@ fn only_the_double_slash_git_file_spelling_routes_to_git() {
     );
     assert_eq!(
         super::SourceRef::new("git+file:/srv/mocks.git#main:m.json").scheme(),
-        "file",
-        "the single-colon spelling is a `file:` URI to the fetch path, whatever \
-         control-plane validation calls it"
+        "git+file",
+        "since achird-labs/rift#926 the single-colon spelling parses as `git+file` \
+         on the fetch path too — the same answer control-plane validation gives"
     );
 
     // #301: the two parsers can no longer *silently* disagree, because the
