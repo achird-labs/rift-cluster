@@ -1386,11 +1386,8 @@ export interface components {
         };
         /** @description The answering node's own view — **not** a fleet fact. A poll failure is a property of one node's reach to an external host at one moment and is deliberately never replicated, so this half can differ across the fleet; it is kept apart from the record precisely so that it cannot be mistaken for one more replicated field. */
         SourcesNodeLocal: {
-            /**
-             * Format: int64
-             * @description The cluster node that answered this request.
-             */
-            nodeId: number;
+            /** @description The cluster node that answered this request. A **string**, not an integer, for the same reason as `FleetMembers.node_id`: a raft id is a `u64`, JSON numbers are IEEE-754 doubles wherever the reader is JavaScript, and every id above 2^53-1 is silently rounded on the way in. This endpoint was missed when the fleet projections were fixed, and went on reporting a node that does not exist. */
+            nodeId: string;
             /** @description Last poll error per source id, for sources this node has seen fail. Empty when nothing is failing — an explicit empty map, not an absent field. Polls run on the leader, so a follower's map is usually empty. Scoped to the tenant of the request: the scheduler polls every tenant's tracking sources, and a source id is unique only within its tenant. */
             pollErrors: {
                 [key: string]: string;

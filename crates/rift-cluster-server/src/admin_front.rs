@@ -2862,7 +2862,12 @@ fn render_sources(
         })
         .collect();
     let node_local = serde_json::json!({
-        "nodeId": node_id,
+        // A STRING, for the reason `cluster_api::node_id` documents at length: a `NodeId` is a
+        // `u64`, JSON numbers are IEEE-754 doubles wherever the reader is JavaScript, and every id
+        // above 2^53-1 arrives silently rounded. #332 fixed `/_fleet/*` and `/_cluster/*`; this
+        // endpoint carries the same id and was missed, so it went on reporting a node that does
+        // not exist.
+        "nodeId": node_id.to_string(),
         "pollErrors": serde_json::Value::Object(poll_errors),
     });
     let body = match view {
@@ -4508,16 +4513,21 @@ mod tests {
             revision: 12,
         };
 
-        let body = render_sources(7, &SourcesView::One(record.clone()), |id| {
-            (id == "payments").then(|| "connect timeout".to_owned())
-        })
+        let body = render_sources(
+            3_342_140_982_834_931_156,
+            &SourcesView::One(record.clone()),
+            |id| (id == "payments").then(|| "connect timeout".to_owned()),
+        )
         .expect("renders");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert!(
             body["source"].get("lastPollError").is_none(),
             "the record must stay exactly the replicated projection: {body}"
         );
-        assert_eq!(body["nodeLocal"]["nodeId"], 7);
+        // A realistic id, as a string. `7` passed happily while the endpoint rounded every id a
+        // real fleet actually issues — the third time in this codebase that a single-digit fixture
+        // hid a `u64` round-trip defect (see #332).
+        assert_eq!(body["nodeLocal"]["nodeId"], "3342140982834931156");
         assert_eq!(
             body["nodeLocal"]["pollErrors"]["payments"],
             "connect timeout"
