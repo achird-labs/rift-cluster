@@ -71,6 +71,7 @@ use parking_lot::Mutex;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDefinition};
 use rift_cluster_base::seams::{
     ApplyReport, CompiledRoutes, ImposterConfig, ImposterError, ImposterManager, Route, RouteTable,
+    Stub, StubResponse,
 };
 use serde::{Deserialize, Serialize};
 
@@ -191,6 +192,86 @@ const SESSION_KEY_ROW: &str = "key";
 /// (`Some`) no matter what the space is named.
 const SM_JOURNAL_GENS_TABLE: TableDefinition<(&str, u16, &str), u64> =
     TableDefinition::new("sm_journal_gens");
+
+/// `(tenant, port, sig-hash) -> recorded-response JSON` (#226): the applied proxy-recording
+/// markers `ControlOp::ProxyRecorded` writes. A row is both facts at once: *this signature is
+/// Recorded* (the claim table any owner — including one elected after a handoff — answers
+/// `AlreadyRecorded` from), and *this is the replayable response* (`lookup()`'s durable source
+/// for a stub-less proxyOnce recording, which has no recorded stub in config to replay from).
+/// Keyed like `sm_journal_gens` minus the space tag: the sig-hash is already a fixed-alphabet
+/// hex string, so no encoding is needed to keep key families apart.
+const SM_PROXY_RECORDED_TABLE: TableDefinition<(&str, u16, &str), &str> =
+    TableDefinition::new("sm_proxy_recorded");
+
+/// What [`place_recorded_stub`] did, carrying exactly what the engine drive needs to
+/// reproduce it against the live stub vector.
+enum PlacedRecording {
+    /// The stub was inserted whole at `index`.
+    Inserted { index: usize },
+    /// The stub's responses were merged into the existing stub at `index`, addressable by
+    /// `id` — a `ReplaceById` drive.
+    MergedInto { index: usize, id: String },
+    /// Merged into a user-authored stub that carries no id: nothing in a patch script can
+    /// address it, so the drive falls back to a full sync.
+    MergedAnonymous,
+}
+
+/// Deterministically place a recorded stub in a config's stub list — the state-machine
+/// transliteration of upstream's `insert_or_append_proxy_stub`
+/// (`rift-mock-core/src/imposter/core/proxy.rs`), which operates on the live `StubState`
+/// vector and cannot be reused over serialized config. Keep the two in step: the position
+/// rules — `proxyOnce` inserts *before* the proxy stub so the recording matches first,
+/// `proxyAlways` merges into an existing stub with structurally equal non-empty predicates
+/// *after* it (upstream #611) or inserts after — are engine semantics this apply reproduces,
+/// not policy of its own. A missing proxy stub degrades to appending at the end, exactly as
+/// upstream's `unwrap_or(stubs.len())` does.
+fn place_recorded_stub(
+    stubs: &mut Vec<Stub>,
+    stub: Stub,
+    placement: control::RecordedStubPlacement,
+    proxy_to: &str,
+) -> PlacedRecording {
+    let proxy_idx = stubs
+        .iter()
+        .position(|s| {
+            s.responses
+                .iter()
+                .any(|r| matches!(r, StubResponse::Proxy { proxy } if proxy.to == proxy_to))
+        })
+        .unwrap_or(stubs.len());
+    match placement {
+        control::RecordedStubPlacement::BeforeProxy => {
+            stubs.insert(proxy_idx, stub);
+            PlacedRecording::Inserted { index: proxy_idx }
+        }
+        control::RecordedStubPlacement::AfterProxyMerging => {
+            let merged_idx = stubs
+                .iter()
+                .enumerate()
+                .skip(proxy_idx + 1)
+                .find(|(_, existing)| {
+                    existing.predicates == stub.predicates && !existing.predicates.is_empty()
+                })
+                .map(|(idx, _)| idx);
+            match merged_idx {
+                Some(idx) => {
+                    stubs[idx].responses.extend(stub.responses);
+                    match stubs[idx].id.clone() {
+                        Some(id) => PlacedRecording::MergedInto { index: idx, id },
+                        None => PlacedRecording::MergedAnonymous,
+                    }
+                }
+                None => {
+                    let insert_index = (proxy_idx + 1).min(stubs.len());
+                    stubs.insert(insert_index, stub);
+                    PlacedRecording::Inserted {
+                        index: insert_index,
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Encodes the space component of an `sm_journal_gens` key so a port-wide clear (`None`) can
 /// never be confused with a space-scoped one — including a hypothetically empty space name.
@@ -497,6 +578,13 @@ struct SnapshotPayload {
     /// its peers have already agreed are cleared, the very inversion issue #224 exists to close.
     #[serde(default)]
     journal_gens: Vec<(String, u16, Option<String>, u64)>,
+    /// `(tenant, port, sig-hash, recorded-response JSON)` rows of `sm_proxy_recorded` (#226).
+    /// `#[serde(default)]` for the #134/#137 reason every table above carries it. The failure
+    /// if it were forgotten: a node that joins by snapshot answers `Claimed` for signatures
+    /// the fleet already recorded, and the engine calls the real upstream a second time — the
+    /// exact duplicate `proxyOnce` exists to prevent.
+    #[serde(default)]
+    proxy_recorded: Vec<(String, u16, String, String)>,
     /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
     dedup: Vec<(String, String)>,
     last_applied_log: Option<LogId<u64>>,
@@ -555,6 +643,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
             .map_err(io)?;
         write_txn.open_table(SM_SESSION_KEY_TABLE).map_err(io)?;
         write_txn.open_table(SM_JOURNAL_GENS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_PROXY_RECORDED_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
         write_txn.open_table(PENDING_INTENTS_TABLE).map_err(io)?;
@@ -2285,6 +2374,34 @@ impl RedbStateMachine {
             .map_or(0, |v| v.value()))
     }
 
+    /// The applied proxy-recording marker for `(tenant, port, sig_hash)` (#226): the
+    /// recorded-response JSON `ControlOp::ProxyRecorded` committed, or `None` when the
+    /// signature has never been recorded (or was cleared). Local durable state — any node
+    /// answers without leadership, which is what lets a post-handoff owner say
+    /// `AlreadyRecorded` with no in-memory trace of the claim.
+    ///
+    /// # Errors
+    /// Storage I/O.
+    #[allow(clippy::result_large_err)]
+    pub fn proxy_recorded_resp(
+        &self,
+        tenant: &str,
+        port: u16,
+        sig_hash: &str,
+    ) -> StorageResult<Option<String>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_PROXY_RECORDED_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Ok(table
+            .get((tenant, port, sig_hash))
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|v| v.value().to_owned()))
+    }
+
     /// The desired engine state as of now, read from an open (possibly
     /// mid-transaction) view of `sm_configs`: every tenant's config, unioned —
     /// parsed — disabled ones included (a paused imposter stays bound, #817).
@@ -2810,6 +2927,7 @@ impl RedbStateMachine {
         audit_checkpoint: &mut Table<'_, &'static str, u64>,
         session_key: &mut Table<'_, &'static str, &'static str>,
         journal_gens: &mut Table<'_, (&'static str, u16, &'static str), u64>,
+        proxy_recorded: &mut Table<'_, (&'static str, u16, &'static str), &'static str>,
         // The local journal to push a committed generation into (issue #224), resolved once by
         // `apply` rather than upgraded per op — `None` in storage tests, on an embedder that
         // never wires one, or when a shutdown race has already dropped it (see the `journal`
@@ -2873,6 +2991,14 @@ impl RedbStateMachine {
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 configs
                     .insert((tenant.as_str(), port), value.as_str())
+                    .map_err(io)?;
+                // A replace is a new imposter in the recording sense (#226): the old
+                // config's recorded stubs are gone from the stub list this put installs,
+                // and a surviving marker row would answer `AlreadyRecorded` with the *old*
+                // upstream's response — so the markers die with the config they described,
+                // exactly as they do on `DeleteImposter`.
+                proxy_recorded
+                    .retain(|(t, p, _), _| !(t == tenant.as_str() && p == port))
                     .map_err(io)?;
                 Self::mark_drifted(sources, tenant.as_str(), provenance.as_ref(), index)?;
                 crate::metrics::config_applied(port, index);
@@ -2944,6 +3070,11 @@ impl RedbStateMachine {
                 // for a missing imposter is the write path's concern).
                 let provenance = Self::provenance_of(configs, tenant.as_str(), *port)?;
                 configs.remove((tenant.as_str(), *port)).map_err(io)?;
+                // Recordings die with their imposter (#226) — the clustered mirror of the
+                // manager's own port-reclaim `clear`, and atomic with the delete here.
+                proxy_recorded
+                    .retain(|(t, p, _), _| !(t == tenant.as_str() && p == *port))
+                    .map_err(io)?;
                 Self::mark_drifted(sources, tenant.as_str(), provenance.as_ref(), index)?;
                 crate::metrics::config_removed(*port);
                 Ok(Ok(vec![Self::sync_action(configs)?]))
@@ -2974,6 +3105,9 @@ impl RedbStateMachine {
                     (removed, drifted)
                 };
                 configs.retain(|(t, _), _| t != tenant).map_err(io)?;
+                proxy_recorded
+                    .retain(|(t, _, _), _| t != tenant)
+                    .map_err(io)?;
                 for id in drifted {
                     Self::mark_drifted(
                         sources,
@@ -3322,6 +3456,14 @@ impl RedbStateMachine {
                     configs
                         .insert((tenant_str, port), value.as_str())
                         .map_err(io)?;
+                    // Same reasoning as the `PutImposter` purge (#226): a source-driven
+                    // replace installs a new stub list, so the old config's recording
+                    // markers must not survive to replay a dead upstream's responses. The
+                    // byte-identical short-circuit above never reaches here, which is what
+                    // keeps still-valid recordings across a no-op pull.
+                    proxy_recorded
+                        .retain(|(t, p, _), _| !(t == tenant_str && p == port))
+                        .map_err(io)?;
                     crate::metrics::config_applied(port, index);
                 }
 
@@ -3645,6 +3787,148 @@ impl RedbStateMachine {
                 }
                 Ok(Ok(Vec::new()))
             }
+            ControlOp::ProxyRecorded {
+                tenant,
+                port,
+                sig_hash,
+                resp,
+                stub,
+            } => {
+                // First-wins, idempotent — but only where "once" is the semantics. A
+                // duplicate commit for the same proxyOnce signature (two owners racing a
+                // membership handoff, or an op replayed past dedup's TTL) must not clobber
+                // the recording replayers have already served. A `proxyAlways` merge
+                // (`AfterProxyMerging`) is the opposite contract: the same signature
+                // commits once per proxied request, and the merge below is the point.
+                let already_recorded = proxy_recorded
+                    .get((tenant.as_str(), *port, sig_hash.as_str()))
+                    .map_err(io)?
+                    .is_some();
+                let merging = stub.as_ref().is_some_and(|recorded| {
+                    recorded.placement == control::RecordedStubPlacement::AfterProxyMerging
+                });
+                if already_recorded && !merging {
+                    return Ok(Ok(Vec::new()));
+                }
+                let resp_json = serde_json::to_string(resp)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                // Checked for the stub-less path too, not just the config mutation below: a
+                // recording racing a concurrent `DeleteImposter` must not re-insert a marker
+                // after the delete's purge, or a later imposter on the same port would
+                // wrongly answer `AlreadyRecorded` with the dead imposter's response.
+                if configs.get((tenant.as_str(), *port)).map_err(io)?.is_none() {
+                    return Ok(Err(format!("no imposter on port {port}")));
+                }
+
+                let Some(recorded) = stub else {
+                    // Stub-less recording (no predicate generators): the row alone is the
+                    // durable replay source `lookup()` answers from.
+                    proxy_recorded
+                        .insert(
+                            (tenant.as_str(), *port, sig_hash.as_str()),
+                            resp_json.as_str(),
+                        )
+                        .map_err(io)?;
+                    return Ok(Ok(Vec::new()));
+                };
+
+                let mut record: StoredImposter = {
+                    match configs.get((tenant.as_str(), *port)).map_err(io)? {
+                        None => return Ok(Err(format!("no imposter on port {port}"))),
+                        Some(guard) => match serde_json::from_str(guard.value()) {
+                            Ok(record) => record,
+                            Err(e) => {
+                                tracing::error!(port = *port, error = %e, "corrupt stored record");
+                                return Ok(Err(format!(
+                                    "corrupt stored record for port {port}: {e}"
+                                )));
+                            }
+                        },
+                    }
+                };
+                let mut config: ImposterConfig = match serde_json::from_str(&record.config_json) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        tracing::error!(port = *port, error = %e, "corrupt stored config");
+                        return Ok(Err(format!("corrupt stored config for port {port}: {e}")));
+                    }
+                };
+                let mut stub_value = (*recorded.stub).clone();
+                if stub_value.id.is_none() {
+                    // Addressable identity: the engine drive replaces a merged stub by id, and
+                    // a later proxyAlways merge into this stub needs the same handle. Derived
+                    // from the sig-hash so every replica assigns the identical id.
+                    stub_value.id = Some(format!("proxy-recorded-{sig_hash}"));
+                }
+                let placed = place_recorded_stub(
+                    &mut config.stubs,
+                    stub_value,
+                    recorded.placement,
+                    &recorded.proxy_to,
+                );
+                let quotas = match Self::quotas_for(tenants, tenant.as_str())? {
+                    Ok(quotas) => quotas,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                if config.stubs.len() > quotas.max_stubs_per_imposter as usize {
+                    return Ok(Err(format!(
+                        "tenant {:?} allows at most {} stubs per imposter; this recording would \
+                         leave {}",
+                        tenant.as_str(),
+                        quotas.max_stubs_per_imposter,
+                        config.stubs.len()
+                    )));
+                }
+                record.config_json = serde_json::to_string(&config)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                record.revision = index;
+                let value = serde_json::to_string(&record)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                configs
+                    .insert((tenant.as_str(), *port), value.as_str())
+                    .map_err(io)?;
+                // Both facts land in this one apply transaction — the marker row is written
+                // only alongside the stub mutation, so "recorded but stub-less" is
+                // unrepresentable by construction (#226).
+                proxy_recorded
+                    .insert(
+                        (tenant.as_str(), *port, sig_hash.as_str()),
+                        resp_json.as_str(),
+                    )
+                    .map_err(io)?;
+                Self::mark_drifted(sources, tenant.as_str(), record.source.as_ref(), index)?;
+                crate::metrics::config_applied(*port, index);
+                let action = match placed {
+                    PlacedRecording::Inserted { index } => EngineAction::Patch {
+                        port: *port,
+                        edit: control::StubEditScript(vec![control::StubEdit::Add {
+                            stub: config.stubs[index].clone(),
+                            index: Some(index),
+                        }]),
+                    },
+                    PlacedRecording::MergedInto { index, id } => EngineAction::Patch {
+                        port: *port,
+                        edit: control::StubEditScript(vec![control::StubEdit::ReplaceById {
+                            id,
+                            stub: config.stubs[index].clone(),
+                        }]),
+                    },
+                    // The merge target was a user-authored stub with no id: nothing addresses
+                    // it in a patch script, so fall back to the full-sync drive — rare, and
+                    // always correct.
+                    PlacedRecording::MergedAnonymous => Self::sync_action(configs)?,
+                };
+                Ok(Ok(vec![action]))
+            }
+            ControlOp::ProxyRecordedClear { tenant, port } => {
+                // Clearing an empty table is a no-op, not a failure — idempotent like every
+                // delete here. Recorded *stubs* stay: they are imposter config, deleted
+                // through the stub-edit surfaces (#226's documented split).
+                proxy_recorded
+                    .retain(|(t, p, _), _| !(t == tenant.as_str() && p == *port))
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
         }
     }
 
@@ -3817,6 +4101,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             audit_gc_watermark,
             session_key,
             journal_gens,
+            proxy_recorded,
             dedup,
         ) = {
             let read_txn = self
@@ -3979,6 +4264,26 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                     value.value(),
                 ));
             }
+            // Travels with the snapshot for the #134/#137 reason every table above does. The
+            // #226-specific failure if forgotten: a snapshot-joined node answers `Claimed`
+            // for signatures the fleet already recorded — a duplicate upstream call.
+            let proxy_recorded_table = read_txn
+                .open_table(SM_PROXY_RECORDED_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut proxy_recorded = Vec::new();
+            for item in proxy_recorded_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (tenant, port, sig_hash) = key.value();
+                proxy_recorded.push((
+                    tenant.to_owned(),
+                    port,
+                    sig_hash.to_owned(),
+                    value.value().to_owned(),
+                ));
+            }
             let dedup_table = read_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -4004,6 +4309,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 audit_gc_watermark,
                 session_key,
                 journal_gens,
+                proxy_recorded,
                 dedup,
             )
         };
@@ -4022,6 +4328,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             audit_gc_watermark,
             session_key,
             journal_gens,
+            proxy_recorded,
             dedup,
             last_applied_log: applied.last_applied_log,
             last_membership: applied.last_membership.clone(),
@@ -4137,6 +4444,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut journal_gens = write_txn
                 .open_table(SM_JOURNAL_GENS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut proxy_recorded = write_txn
+                .open_table(SM_PROXY_RECORDED_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut dedup = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -4228,6 +4538,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut audit_checkpoint,
                                         &mut session_key,
                                         &mut journal_gens,
+                                        &mut proxy_recorded,
                                         journal.as_deref(),
                                         &request.op,
                                         log_id.index,
@@ -4246,6 +4557,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut audit_checkpoint,
                                     &mut session_key,
                                     &mut journal_gens,
+                                    &mut proxy_recorded,
                                     journal.as_deref(),
                                     &request.op,
                                     log_id.index,
@@ -4586,6 +4898,22 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                 let space_key = journal_gen_space_key(space.as_deref());
                 journal_gens_table
                     .insert((tenant.as_str(), *port, space_key.as_str()), *generation)
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
+            // Cleared before repopulating for the same stale-row reason as `journal_gens`
+            // above: a marker this node held from before the install may name a signature
+            // the fleet has since cleared, and leaving it would resurrect `AlreadyRecorded`
+            // for it.
+            let mut proxy_recorded_table = write_txn
+                .open_table(SM_PROXY_RECORDED_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            proxy_recorded_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (tenant, port, sig_hash, resp) in &payload.proxy_recorded {
+                proxy_recorded_table
+                    .insert((tenant.as_str(), *port, sig_hash.as_str()), resp.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -7403,6 +7731,296 @@ mod tests {
                 .expect("read gen"),
             0
         );
+    }
+
+    // -- ProxyRecorded / ProxyRecordedClear (#226) ---------------------------------
+
+    fn proxy_imposter_config(port: u16) -> ImposterConfig {
+        config(
+            port,
+            json!([{
+                "responses": [{
+                    "proxy": { "to": "http://u.example", "mode": "proxyOnce" }
+                }]
+            }]),
+        )
+    }
+
+    fn recorded_stub(
+        body: &str,
+        placement: crate::control::RecordedStubPlacement,
+    ) -> crate::control::RecordedStub {
+        crate::control::RecordedStub {
+            stub: Box::new(
+                serde_json::from_value(json!({
+                    "predicates": [{ "equals": { "path": "/r" } }],
+                    "responses": [{ "is": { "statusCode": 200, "body": body } }],
+                }))
+                .expect("stub parses"),
+            ),
+            placement,
+            proxy_to: "http://u.example".to_owned(),
+        }
+    }
+
+    fn proxy_recorded(
+        op_id: u128,
+        port: u16,
+        sig_hash: &str,
+        body: &str,
+        stub: Option<crate::control::RecordedStub>,
+    ) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::ProxyRecorded {
+                tenant: TenantId::default(),
+                port,
+                sig_hash: sig_hash.to_owned(),
+                resp: rift_cluster_base::seams::RecordedResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: body.as_bytes().to_vec(),
+                    latency_ms: None,
+                    timestamp_secs: 0,
+                },
+                stub,
+            },
+        )
+    }
+
+    fn marker(sm: &RedbStateMachine, port: u16, sig_hash: &str) -> Option<String> {
+        sm.proxy_recorded_resp(DEFAULT_TENANT, port, sig_hash)
+            .expect("read marker")
+    }
+
+    /// The failure the snapshot field's own doc names: a snapshot built before #226 must
+    /// still install, and the empty table it decodes to must answer "never recorded" —
+    /// not fail — so a rolling upgrade cannot turn joins into duplicate upstream calls.
+    #[tokio::test]
+    async fn a_pre_proxy_recorded_snapshot_still_installs() {
+        let (_td, sm) = fresh_sm(None).await;
+        let legacy = json!({
+            "configs": [],
+            "dedup": [],
+            "last_applied_log": null,
+            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
+        });
+        let payload: super::SnapshotPayload =
+            serde_json::from_value(legacy).expect("a pre-#226 snapshot payload still decodes");
+        assert!(payload.proxy_recorded.is_empty());
+        assert!(marker(&sm, 8080, "aa11").is_none());
+    }
+
+    /// Recordings die with their imposter — the purge `ClusterProxyStore::clear`'s doc
+    /// leans on. A regression here makes a deleted-and-recreated imposter answer
+    /// `AlreadyRecorded` with the dead imposter's response, forever.
+    #[tokio::test]
+    async fn deleting_an_imposter_purges_its_proxy_markers() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::PutImposter {
+                    tenant: TenantId::default(),
+                    config: Box::new(proxy_imposter_config(8080)),
+                },
+            ),
+        )
+        .await;
+        let recorded = apply_one(&mut sm, 2, proxy_recorded(2, 8080, "aa11", "kept", None)).await;
+        assert_eq!(recorded.outcome, ControlOutcome::Applied);
+        assert!(marker(&sm, 8080, "aa11").is_some());
+
+        apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::DeleteImposter {
+                    tenant: TenantId::default(),
+                    port: 8080,
+                },
+            ),
+        )
+        .await;
+        assert!(
+            marker(&sm, 8080, "aa11").is_none(),
+            "the delete purges the port's markers atomically"
+        );
+    }
+
+    /// A recording that would blow the tenant's stub ceiling is a committed refusal that
+    /// names the ceiling — and writes NO marker row, or the claim would settle Recorded
+    /// against a stub that never landed (the atomicity #226 exists to guarantee).
+    #[tokio::test]
+    async fn a_recording_over_the_stub_ceiling_is_refused_and_writes_no_marker() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            tenant_put_with_quotas(
+                1,
+                "acme",
+                Quotas {
+                    max_imposters: 4,
+                    max_stubs_per_imposter: 1,
+                    max_flow_entries: 100,
+                },
+                0,
+            ),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            2,
+            request(
+                2,
+                ControlOp::PutImposter {
+                    tenant: TenantId::new("acme"),
+                    config: Box::new(proxy_imposter_config(8081)),
+                },
+            ),
+        )
+        .await;
+        let refused = apply_one(
+            &mut sm,
+            3,
+            request(
+                3,
+                ControlOp::ProxyRecorded {
+                    tenant: TenantId::new("acme"),
+                    port: 8081,
+                    sig_hash: "bb22".to_owned(),
+                    resp: rift_cluster_base::seams::RecordedResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: b"over".to_vec(),
+                        latency_ms: None,
+                        timestamp_secs: 0,
+                    },
+                    stub: Some(recorded_stub(
+                        "over",
+                        crate::control::RecordedStubPlacement::BeforeProxy,
+                    )),
+                },
+            ),
+        )
+        .await;
+        let ControlOutcome::Failed { reason } = &refused.outcome else {
+            panic!("a recording over the ceiling must be refused: {refused:?}");
+        };
+        assert!(
+            reason.contains("at most 1 stubs"),
+            "names the ceiling: {reason}"
+        );
+        assert!(
+            sm.proxy_recorded_resp("acme", 8081, "bb22")
+                .expect("read marker")
+                .is_none(),
+            "a refused recording writes no marker"
+        );
+    }
+
+    /// The apply-level first-wins guard: a duplicate proxyOnce commit for the same
+    /// signature (a submit retried past dedup, or racing owners across a handoff) is a
+    /// no-op — the first recording keeps both the row and the stub list it produced.
+    #[tokio::test]
+    async fn a_duplicate_proxy_once_recording_is_a_no_op() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::PutImposter {
+                    tenant: TenantId::default(),
+                    config: Box::new(proxy_imposter_config(8080)),
+                },
+            ),
+        )
+        .await;
+        let first = apply_one(
+            &mut sm,
+            2,
+            proxy_recorded(
+                2,
+                8080,
+                "cc33",
+                "first",
+                Some(recorded_stub(
+                    "first",
+                    crate::control::RecordedStubPlacement::BeforeProxy,
+                )),
+            ),
+        )
+        .await;
+        assert_eq!(first.outcome, ControlOutcome::Applied);
+
+        let duplicate = apply_one(
+            &mut sm,
+            3,
+            proxy_recorded(
+                3,
+                8080,
+                "cc33",
+                "second",
+                Some(recorded_stub(
+                    "second",
+                    crate::control::RecordedStubPlacement::BeforeProxy,
+                )),
+            ),
+        )
+        .await;
+        assert_eq!(duplicate.outcome, ControlOutcome::Applied);
+
+        let row = marker(&sm, 8080, "cc33").expect("row survives");
+        assert!(
+            row.contains("Zmlyc3Q=") || row.contains("first") || row.contains("102"),
+            "the first recording wins the row: {row}"
+        );
+        let config_json = sm
+            .read_config(DEFAULT_TENANT, 8080)
+            .expect("read config")
+            .expect("imposter present");
+        let config: ImposterConfig =
+            serde_json::from_str(&config_json).expect("config parses");
+        assert_eq!(
+            config.stubs.len(),
+            2,
+            "the duplicate inserted no second recorded stub"
+        );
+    }
+
+    /// A recording racing a concurrent delete is refused — including the stub-less path,
+    /// which must not re-insert a marker after `DeleteImposter`'s purge (a later imposter
+    /// on the same port would wrongly replay the dead one's response).
+    #[tokio::test]
+    async fn a_recording_for_a_missing_imposter_is_refused() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        for (index, stub) in [
+            None,
+            Some(recorded_stub(
+                "late",
+                crate::control::RecordedStubPlacement::BeforeProxy,
+            )),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let refused = apply_one(
+                &mut sm,
+                (index + 1) as u64,
+                proxy_recorded((index + 1) as u128, 9999, "dd44", "late", stub),
+            )
+            .await;
+            let ControlOutcome::Failed { reason } = &refused.outcome else {
+                panic!("recording an absent imposter must be refused: {refused:?}");
+            };
+            assert!(reason.contains("no imposter"), "names the cause: {reason}");
+        }
+        assert!(marker(&sm, 9999, "dd44").is_none());
     }
 
     /// Blocker 1: before this feature, an unscoped `DELETE savedRequests` proxied to the

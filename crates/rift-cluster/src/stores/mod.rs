@@ -17,11 +17,13 @@ pub mod flow;
 pub mod flow_config;
 pub mod journal;
 pub mod journal_net;
+pub mod proxy;
 pub mod shard;
 
 pub use flow::{ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, flow_routes};
 pub use flow_config::{ContextScope, FlowConfig, ReadConsistency};
 pub use journal::{ClusterJournal, JournalConfig, ShardEntry, ShardRead};
+pub use proxy::{ClusterProxyStore, ProxyBindConfig, ProxyNet, proxy_routes, proxy_sig_key};
 // Trimmed to what is used outside this module (issue #223 review): the wire types, `ShardSlice`,
 // `merge_shards` and `fleet_count` are consumed only by this module's own `JournalNet` and its
 // `mod tests` (which see ancestor-private items regardless of what is re-exported here). Every
