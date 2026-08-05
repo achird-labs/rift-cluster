@@ -67,6 +67,10 @@ const CLUSTER_ADDITIONS: &[&str] = &[
     // traffic happened to land here, and that is wrong for every imposter rather
     // than only the ones that opted into something.
     "with_request_journal",
+    // Exactly-once proxy recording via fleet-wide ownership: ClusterProxyStore
+    // claims each (port, signature) at its HRW owner (KeyClass::Proxy), making
+    // stub-less recordings unrepresentable by construction (issue #226).
+    "with_proxy_store",
     // An imposter exists cluster-wide regardless of whether any one node could
     // bind its port, so a node that loses the port to an unrelated process
     // registers the imposter anyway and serves it in-process rather than 404ing
