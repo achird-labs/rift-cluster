@@ -17,6 +17,7 @@ pub mod flow;
 pub mod flow_config;
 pub mod journal;
 pub mod journal_net;
+mod journal_seq;
 pub mod proxy;
 pub mod shard;
 

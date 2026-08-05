@@ -130,6 +130,32 @@ Three rules make the walk correct, and each is pinned by its own gate test:
   and replaying its history when it returns. A shard with a slice and no cursor
   entry reads as 0, so a joining node enters the walk at the beginning.
 
+**All three rules assume `(node_id, seq)` means one thing forever**, which a
+crash-restart used to break (issue #351). This is not a fourth walk rule — it
+is a property of how seqs are *allocated*, underneath all three.
+
+The Membership rule above splits nodes into "dead/partitioned" and "joining",
+and a crash-restarted node is neither: its `node_id` is persisted, so live
+cursors still address it, and it starts serving again rather than staying
+frozen. Its shard is the *same* shard continuing. It therefore resumes above a
+**durable per-port seq floor** — every seq issued after the restart is strictly
+greater than every seq it could have issued before — so held cursors stay valid
+and receive each post-restart entry exactly once.
+
+Without the floor the counter restarted at 0 while `node_id` stayed stable,
+corrupting identity in both directions at once: reborn seqs collided with
+entries the survivors still cached under the same key (merge dedup silently
+dropped one of the pair), and every reborn seq below a live cursor position was
+withheld forever by the monotone advance. The floor is block-allocated, one
+fsync per 2^20 appends per port, so the recording path pays nothing between
+blocks — see `stores/journal_seq.rs`, which is where its gate tests live too:
+they pin the *allocation* property (a restart never reissues a seq), not the
+walk, which the three rules above already cover.
+
+What the floor does **not** restore is the entries themselves. Those are still
+gone, per the volatility decision in Ch.9; a restarted writer's merged reads
+are therefore short, and saying so honestly is issue #349's.
+
 A bare `u64` is accepted for the upgrade window and read as `{this_node: seq}`:
 before #225 a merged read issued no cursor at all, so any scalar a client holds
 provably came from a proxied per-node read of this node. Anything that is

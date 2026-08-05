@@ -24,11 +24,22 @@ What state lives where, and what it survives:
 | Flow state @ `none` | memory | via replicas | ❌ (opted) | Throwaway CI imposters |
 | Sequence cursors | memory | ❌ reset (D-8) | ❌ | Deliberate: hottest stateful path, test-run-scoped |
 | Request journal + counters | memory (CRDT shards) | ❌ that shard | ❌ | In-run assertion data, bounded buffers |
+| Journal per-port **seq floor** | `journal-seq-floors` in the state dir | ✅ | ✅ | Not the entries — just the counter, so a restarted writer cannot reuse `(node_id, seq)` (#351) |
 | proxyOnce `Pending` claims | owner memory | ❌ re-claimable | ❌ | By design — Chapter 7 |
 | proxyOnce `Recorded` + recorded stubs | via config (Raft SM) | ✅ | ✅ | Recordings are config |
 
 The volatile rows are decisions, not gaps: each would cost hot-path writes to
 preserve state whose value ends with the test run.
+
+The seq-floor row is the one place that reasoning was applied too widely, and
+#351 corrects it. The journal's *entries* are indeed test-run-scoped and stay
+volatile. Its *counter* is not the same kind of thing: `node_id` is durable, so
+`(node_id, seq)` is an identity the rest of the fleet keeps referring to — in
+replica caches and in live cursors — after the writer that issued it is gone.
+A counter that restarted at 0 would hand those identities out a second time,
+which is not lost data but wrong data. Persisting it also does not cost a
+hot-path write, because the floor is reserved a block at a time: one fsync per
+2^20 appends per port, and nothing at all in between.
 
 ## The degradation table
 
