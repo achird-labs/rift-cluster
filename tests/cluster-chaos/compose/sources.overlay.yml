@@ -82,6 +82,11 @@ services:
     build:
       context: ../..
       dockerfile: deploy/Dockerfile
+      # Pinned for the same reason the base compose pins it (issue #228): the
+      # Dockerfile's last stage is now the chaos suite's faketime flavor, and
+      # an untargeted build would silently select it. The origin must be the
+      # same production stage as the fleet it counts for.
+      target: runtime
       args:
         RIFT_UPSTREAM_VERSION: "${RIFT_UPSTREAM_VERSION:-}"
     container_name: source-origin

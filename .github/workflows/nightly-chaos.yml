@@ -159,6 +159,40 @@ jobs:
           # ~18s/iteration, so 100 lands near 30 min.
           - scenario: c27_tenancy_isolates_ownership_but_not_the_data_plane
             iterations: 100
+          # The verification-plane family (#228). Each iteration carries at
+          # least one kill-or-partition plus its convergence waits, so these
+          # sit in the C4/C6 band; C10's two kill→restart phases and C30's
+          # 3.5k eviction-overflow spray are the two heaviest bodies in the
+          # whole matrix and are tiered accordingly.
+          # Measured at ~147s/iteration (kill + restart + three convergence
+          # gates), so 30 lands near 74 min.
+          - scenario: c28_fleet_journal_is_exact_under_node_kill
+            iterations: 30
+          # Partition + heal + budget measurement — locally ~35s/iteration
+          # warm, so 40 lands near 23 min; C4's band on a cold runner.
+          - scenario: c29_partial_reads_answer_within_budget_and_count_themselves
+            iterations: 40
+          # Three walk rounds around a kill/restart plus a 3.5k
+          # eviction-overflow spray — locally ~60s/iteration, so 25 lands
+          # near 25 min warm and stays safe if the spray doubles cold.
+          - scenario: c30_vector_cursor_walk_survives_membership_change
+            iterations: 25
+          # Three spray/clear probes on the faketime fleet, no kills —
+          # locally ~35s/iteration, so 40 lands near 23 min warm.
+          - scenario: c12_clears_are_exact_under_clock_skew
+            iterations: 40
+          # A 3-node racing window plus two settle rounds against the
+          # in-network origin — locally ~35s/iteration, so 40 lands near
+          # 23 min warm.
+          - scenario: c11_concurrent_recording_loses_nothing
+            iterations: 40
+          # The heaviest body here besides C28: two kill→restart phases, each
+          # with a 3s-latency origin holding claims open — locally
+          # ~110s/iteration, so 20 lands near 37 min warm, ~75 min if a cold
+          # runner doubles it. Validate all five against the first nightly's
+          # step summary and retune.
+          - scenario: c10_proxy_once_survives_owner_and_leader_kills
+            iterations: 20
 
     steps:
       - uses: actions/checkout@v4
