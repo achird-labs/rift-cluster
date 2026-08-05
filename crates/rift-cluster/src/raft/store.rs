@@ -1711,6 +1711,28 @@ impl RedbStateMachine {
         None
     }
 
+    /// Is this node's own engine actually **holding `port`'s socket** right now?
+    ///
+    /// The positive counterpart to [`Self::bind_failure`], and not a rephrasing of it: that one
+    /// answers `None` both for "healthy" and for "this node is not serving the port at all", so
+    /// `bind_failure(port).is_none()` is true for a port this node has never heard of. Anything
+    /// deciding whether it is safe to *talk to* `127.0.0.1:port` needs the positive form, because
+    /// the two cases differ exactly where it matters: an unbound port is a socket some other
+    /// process may hold.
+    ///
+    /// This gap is real, not defensive: a `PutImposter` whose bind fails still commits and still
+    /// reads back (`bind_failure_does_not_fail_apply`), by design — a bind failure must not wedge
+    /// the replicated log. So a committed config proves the *record* is this tenant's and proves
+    /// nothing whatever about who is listening on that port.
+    #[must_use]
+    pub fn is_locally_bound(&self, port: u16) -> bool {
+        self.engine.as_ref().is_some_and(|engine| {
+            engine
+                .get_imposter(port)
+                .is_ok_and(|imposter| imposter.is_bound())
+        })
+    }
+
     /// Durably park an accepted intent (issue #9 R4). Runs with `Immediate`
     /// durability because this write IS the acceptance boundary: once the
     /// client hears anything other than a hard error, the op must survive a

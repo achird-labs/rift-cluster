@@ -40,6 +40,16 @@ export type Capability =
    */
   | "imposter.delete"
   /**
+   * `Action::ImposterTry` — Operator-tier, alongside the other "disturb" actions (issue #335).
+   *
+   * Not a shade of `imposter.read`, despite the operator only wanting to look: asking the server
+   * to send a request advances scenario state, appends to the request log and can trigger proxy
+   * recording. The line this draws in the UI is deliberate and worth keeping: a Viewer still gets
+   * `Copy curl` (#334) on every stub, which answers the same diagnostic question without the
+   * server acting on their behalf. Hide *this* control from a Viewer, not that one.
+   */
+  | "imposter.try"
+  /**
    * `Action::SourceRead` — Viewer, alongside `ImposterRead`.
    *
    * Its own action server-side, not a shade of `imposter.read`: `GET /admin/sources` authorizes
@@ -140,6 +150,7 @@ export function roleAllows(role: Role, capability: Capability): boolean {
       return (
         roleAllows("viewer", capability) ||
         capability === "imposter.lifecycle" ||
+        capability === "imposter.try" ||
         capability === "requests.clear" ||
         capability === "scenario.reset" ||
         capability === "space.teardown" ||

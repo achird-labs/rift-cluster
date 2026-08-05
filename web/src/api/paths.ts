@@ -37,6 +37,16 @@ export const requestsPath = (port: number): string => `/imposters/${port}/reques
 export const stubsPath = (port: number): string => `/imposters/${port}/stubs`;
 
 /**
+ * Ask the server to send a sample request to this imposter and report what it answered (#335).
+ *
+ * Under `/admin/imposters/` rather than the canonical `/imposters/` prefix: the latter is
+ * Mountebank's published imposter surface, and this is an EE-only affordance the admin front
+ * terminates itself. Note what the path does *not* carry — no host, no scheme: the port is the
+ * whole address, which is what keeps this from being a general-purpose fetch.
+ */
+export const tryImposterPath = (port: number): string => `/admin/imposters/${port}/try`;
+
+/**
  * What a recording has captured, cleared. `DELETE` here is not terminated by the admin front — it
  * proxies upstream, and `principal.rs::map_action` folds it onto `Action::SavedRequestsClear`
  * alongside `savedRequests` and `requests` (RFC-002 §4.1) — see `rbac.ts`'s `requests.clear` for the

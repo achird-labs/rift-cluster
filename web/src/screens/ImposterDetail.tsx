@@ -3,7 +3,7 @@ import { type FormEvent, type ReactNode, useState } from "react";
 import { ApiError, apiGetText } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
 import { IMPOSTER_COLUMNS, type ImposterColumn } from "../app/contract.ts";
-import { useImportAddImposter, useImposter } from "../app/queries.ts";
+import { type TrySpec, useImportAddImposter, useImposter, useTryStub } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { toHash } from "../app/routing.ts";
 import { ImposterField } from "../components/imposterFields.tsx";
@@ -16,7 +16,7 @@ import {
   selectImposter,
 } from "../features/imposters/portable.ts";
 import { projectPredicates } from "../features/stubs/predicates.ts";
-import { sampleRequest, toCurl } from "../features/stubs/sample.ts";
+import { type Sample, sampleRequest, toCurl } from "../features/stubs/sample.ts";
 import { RecordingPanel } from "./RecordingPanel.tsx";
 import { DeleteStubButton, StubEditor, type StubTarget } from "./StubEditor.tsx";
 
@@ -448,6 +448,7 @@ function StubTable({
             */}
             <td>
               <CopyCurlButton port={port} stub={stub} />
+              <TryStubButton port={port} stub={stub} />
             </td>
             {mayWrite ? (
               <td>
@@ -549,6 +550,123 @@ function CopyCurlButton({ port, stub }: { port: number; stub: Stub }): ReactNode
       {state === "failed" ? (
         <span className="warn-text" role="status">
           clipboard blocked — the command is on the button&rsquo;s tooltip
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+/**
+ * Send this stub's derived sample request to the imposter and show what came back (#335).
+ *
+ * The sibling of `CopyCurlButton` above, and offered under exactly the same *derivability* rule —
+ * a stub whose predicates cannot be modelled gets neither, because a request that cannot be
+ * derived must not be offered as one that was. Where the two differ is **who** gets it:
+ * `imposter.try` is Operator-tier, because this one makes the server originate the request, which
+ * advances scenario state, appends to the request log, and can trigger proxy recording. A Viewer
+ * keeps the curl button, which answers the same diagnostic question without the server acting on
+ * their behalf.
+ *
+ * Caveats are surfaced beside the result rather than only on the tooltip the curl button uses.
+ * They matter more here: with curl the operator reads the command before running it, so a skipped
+ * predicate is visible; here the request has already gone, and a non-match whose cause was a
+ * caveat reads as a bug in the mock unless the caveat is on screen next to the answer.
+ */
+/**
+ * The wire envelope for a derived sample. One place, because it is both what gets sent and — via
+ * `send.variables` — the key the result is matched against.
+ */
+function tryEnvelope(sample: Sample): TrySpec {
+  return {
+    method: sample.method,
+    path: sample.target,
+    headers: sample.headers,
+    // `null` is `sample.ts`'s "no body"; the contract's is an absent field.
+    ...(sample.body === null ? {} : { body: sample.body }),
+  };
+}
+
+function TryStubButton({ port, stub }: { port: number; stub: Stub }): ReactNode {
+  const { can } = useSession();
+  const send = useTryStub(port);
+
+  const projection = projectPredicates(stub);
+  const mayTry = can("imposter.try");
+  if (!mayTry || projection.kind !== "predicates") return null;
+
+  const sample = sampleRequest(projection.items);
+  const key = stub.id ?? "unnamed";
+  /*
+   * Shown only when it answers the request this row would send *now*.
+   *
+   * `useMutation`'s `data` lives as long as the component instance, and a row keyed by stub id
+   * survives an edit — so without this check, changing a predicate and pressing nothing leaves the
+   * previous verdict on screen next to the new stub. That is the worst possible failure for this
+   * particular panel: its entire purpose is "did my stub match", and the operator would read a
+   * stale answer as the new one. Comparing against the request actually sent (`send.variables`)
+   * ties the result to its cause rather than to which component happens to be mounted.
+   */
+  const sent = JSON.stringify(tryEnvelope(sample));
+  const result =
+    send.data !== undefined && JSON.stringify(send.variables?.request) === sent
+      ? send.data
+      : undefined;
+
+  return (
+    <span className="row">
+      <button
+        className="btn sm"
+        type="button"
+        data-testid={`try-stub-${key}`}
+        disabled={send.isPending}
+        onClick={() => {
+          send.mutate({ request: tryEnvelope(sample) });
+        }}
+      >
+        {send.isPending ? "Sending…" : "Send"}
+      </button>
+      {send.isError ? (
+        <span className="warn-text" role="status" data-testid={`try-error-${key}`}>
+          {/*
+            The endpoint itself failed — the exchange never happened. Deliberately NOT rendered in
+            the response panel as a status: telling an operator their mock answered 502 when the
+            server could not reach it at all sends them after the wrong bug.
+          */}
+          could not send: {send.error.message}
+        </span>
+      ) : null}
+      {result ? (
+        <span className="stack" role="status" data-testid={`try-result-${key}`}>
+          <span>
+            <Ident>{result.status}</Ident> · {result.elapsedMs} ms
+          </span>
+          {result.headers.length > 0 ? (
+            <span className="muted">
+              {result.headers.map((header) => `${header.name}: ${header.value}`).join(" · ")}
+            </span>
+          ) : null}
+          <code>{result.body}</code>
+          {result.truncated ? (
+            <span className="warn-text">
+              body truncated at 1 MiB — what is shown is a prefix, not the whole answer
+            </span>
+          ) : null}
+          {result.bodyLossy ? (
+            <span className="warn-text">
+              body was not valid UTF-8; replacement characters are shown
+            </span>
+          ) : null}
+          {result.headersLossy ? (
+            <span className="warn-text">
+              a header value was not valid UTF-8; replacement characters are shown
+            </span>
+          ) : null}
+          {sample.caveats.length > 0 ? (
+            <span className="warn-text">
+              This request may not match — {sample.caveats.length} caveat(s):{" "}
+              {sample.caveats.join("; ")}
+            </span>
+          ) : null}
         </span>
       ) : null}
     </span>
