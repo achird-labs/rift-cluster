@@ -987,12 +987,12 @@ A node is not Ready until its `cluster-reconciled` gate opens: its applied
 state has caught up to the leader's and its imposters are bound (or their
 failures reported on `GET /_cluster/imposters`).
 
-## Merge-on-read: the fleet request journal (issue #223)
+## Merge-on-read: the fleet request journal (issues #223, #225)
 
 Issue #222 gave every node its own writer shard of the recorded-request
 journal, keyed `(node_id, seq, clear_gen)`. This is the read half: `GET
 /imposters/:port/savedRequests` and its alias `.../requests`, **with no
-`since` and no `match`**, no longer proxy to the local engine — the front
+`match`**, no longer proxy to the local engine — the front
 terminates them as a fleet-wide merge instead, and `numberOfRequests` on `GET
 /imposters/:port` and the listing becomes the fleet sum rather than one
 node's slot. Both spellings also answer identically under the
@@ -1002,10 +1002,10 @@ gets it too, so a caller cannot get a different answer — cursor header
 included — by spelling the path differently.
 
 **Why terminate instead of decorating the proxied body**, the way the
-imposter listing's tenant filter does: a merged response must carry no
-`x-rift-next-index` — proxying first and then stripping a cursor header
-upstream just set is the fragile direction, and the issue's acceptance
-criteria pin the classification flipping outright.
+imposter listing's tenant filter does: the merged response's cursor is a
+different *kind* of value from upstream's, so proxying first and then
+rewriting a header upstream just set is the fragile direction, and the
+issue's acceptance criteria pin the classification flipping outright.
 
 **The mechanics.** A merge pulls this node's own shard plus every other
 roster voter's, concurrently, under a single **2 s total** budget — a slow
@@ -1031,19 +1031,46 @@ local journal enforces on itself, and folds a peer's reply in by `seq`
 rather than appending it, so it cannot grow past what a fleet's worth of
 shards should hold or double-count an entry a race redelivered.
 
-**`since` or `match` still proxies.** A scalar cursor cannot address a
-multi-writer merge — whose `since` would it be? — so a request carrying
-`?since=` falls straight through to the local engine, today's cursor
-semantics unchanged (`x-rift-next-index`/`x-rift-truncated` and all).
-`?match=` proxies for a different but equally hard reason (issue #223
-review, B1): the merge-on-read path never evaluates a match predicate at
-all, so terminating on it would silently answer with the *whole* fleet's
-requests instead of the caller's scoped subset, and would turn a malformed
-filter's upstream `400` into a `200` with everything. Proxying leaves
-upstream's own clause parser, and its existing error handling, in charge of
-both cases. Cursoring a merged read is tracked separately (issue #225);
-until then, a client that wants the fleet view reads without a cursor and
-re-reads for freshness, same as any other merge-on-read.
+**`?since=` is a vector cursor and terminates too (issue #225).** A scalar
+cursor cannot address a multi-writer merge — whose `since` would it be? —
+which is why #223 left this half proxied. #225 answers it with a **vector
+cursor**: an opaque, versioned, base64url token encoding a position per
+writer shard plus the clear generation it was issued under. Every merged read
+returns one in `x-rift-next-index`; pass it back as `?since=` to continue.
+
+Round-trip the token verbatim — it is opaque by contract, and this node
+rejects a version it does not recognize rather than guessing. Passing it back
+resumes the walk **gaplessly and without duplicates per shard**, across
+membership changes (a departed node's position freezes rather than rewinding;
+a joining node enters at 0) and across clears (a pre-clear token
+fast-forwards past retired generations instead of replaying them).
+`x-rift-truncated: true` appears exactly when retention evicted entries the
+reader had not yet seen.
+
+A bare `u64` is still accepted, and read as this node's own shard position —
+before #225 a merged read issued no cursor at all, so any scalar a client
+holds came from a proxied per-node read of this node. This is an
+upgrade-window courtesy, not a supported shape to construct. Anything that is
+neither a token nor a `u64` answers **400**: defaulting it would either
+replay the whole journal or silently skip everything recorded since, and both
+would surface as mystery data in the client rather than an error.
+
+Because every requests-read through the front is now a merge, there is no
+longer a query string meaning "just this node". Read the node's own engine
+admin address directly if you need one shard's view.
+
+**`?match=` still proxies** (issue #223 review, B1), and #225 does not change
+that: the merge-on-read path never evaluates a match predicate at all, so
+terminating on it would silently answer with the *whole* fleet's requests
+instead of the caller's scoped subset, and would turn a malformed filter's
+upstream `400` into a `200` with everything. Proxying leaves upstream's own
+clause parser, and its existing error handling, in charge — and on that path
+the cursor headers carry upstream's own scalar index, not a vector token.
+
+**SSE still proxies per-node.** `.../savedRequests/stream` and `GET /events`
+are unchanged by #225 and remain FleetAdmin-gated per-node tails; the merged
+tail is not yet implemented. A client that needs the fleet view polls the
+cursor above.
 
 **`DELETE savedRequests`/`.../requests` is explicitly transitional, and a
 `match`-scoped clear never fans out at all.** Without `?match=`, it clears

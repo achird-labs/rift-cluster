@@ -21,7 +21,13 @@ pub mod shard;
 
 pub use flow::{ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, flow_routes};
 pub use flow_config::{ContextScope, FlowConfig, ReadConsistency};
-pub use journal::{ClusterJournal, JournalConfig, ShardEntry, ShardRead};
+// `JournalCursor`/`CursorError` join this list because the front door names them directly
+// (issue #225): it decodes the client's `?since=` token before the read and encodes the issued
+// one into `x-rift-next-index` after it, so unlike the merge internals below these are part of
+// the surface a caller outside this crate legitimately reaches for.
+pub use journal::{
+    ClusterJournal, CursorError, JournalConfig, JournalCursor, ShardEntry, ShardRead,
+};
 // Trimmed to what is used outside this module (issue #223 review): the wire types, `ShardSlice`,
 // `merge_shards` and `fleet_count` are consumed only by this module's own `JournalNet` and its
 // `mod tests` (which see ancestor-private items regardless of what is re-exported here). Every

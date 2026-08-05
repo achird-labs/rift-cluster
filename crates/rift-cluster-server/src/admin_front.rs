@@ -74,9 +74,10 @@ use rift_cluster::control::{
     self, ControlOp, ControlRequest, PreconditionTarget, StubEdit, StubEditScript,
 };
 use rift_cluster::decorate::{
-    HEADER_BIND_FAILURES, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION, HEADER_WARNINGS,
+    HEADER_BIND_FAILURES, HEADER_NEXT_INDEX, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION,
+    HEADER_TRUNCATED, HEADER_WARNINGS,
 };
-use rift_cluster::stores::JournalNet;
+use rift_cluster::stores::{JournalCursor, JournalNet};
 use rift_cluster::{
     ControlOutcome, ControlResponse, FLEET_SCOPE, NodeError, PullError, RaftNode,
     SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId,
@@ -414,10 +415,10 @@ pub(crate) enum Terminated {
     ReplaceStubById(u16, String),
     DeleteStubById(u16, String),
     SetEnabled(u16, bool),
-    /// `GET /imposters/{port}/requests|savedRequests` with **no `?since=`** (issue #223): a
-    /// fleet-wide merge-on-read rather than a proxy. With `since` present the read stays proxied —
-    /// a scalar cursor cannot address a multi-writer merge, so that half of the route is #225's
-    /// territory and `classify` falls it straight through.
+    /// `GET /imposters/{port}/requests|savedRequests` with no `?match=` (issues #223, #225): a
+    /// fleet-wide merge-on-read rather than a proxy, **including** the `?since=` form as of #225 —
+    /// the vector cursor is what made a merged cursor read expressible at all, so the front door
+    /// now terminates every requests-read that is not predicate-scoped.
     ReadSavedRequests(u16),
     /// `DELETE` on the same two paths. Two different designs live under this one variant now,
     /// selected in `terminate` by whether `?match=` narrowed the request (issue #223 item 4's
@@ -570,15 +571,17 @@ fn terminated_saved_requests(
     port: u16,
 ) -> Option<Terminated> {
     match *method {
-        // With `since` **or** `match` present, this falls through to the proxy instead of
-        // terminating (issue #223 review, B1 — the design decision this mirrors the existing
-        // `since` exception for): `since` is a scalar cursor that cannot address a multi-writer
-        // merge (#225's territory), and `match` is a predicate the merge-on-read path never
-        // evaluates at all — terminating on a `?match=`-scoped request would silently answer with
-        // the *whole* fleet's requests instead of the caller's scoped subset, and would turn a
-        // malformed filter's upstream `400` into a `200` with everything. Proxying leaves
-        // upstream's own clause parser and its existing error handling in charge of both.
-        Method::GET if !has_query_param(query, "since") && !has_query_param(query, "match") => {
+        // `?since=` now terminates too (issue #225): the vector cursor replaced the scalar one
+        // #223 could not honour, so a `since` read is a merged read like any other and the
+        // engine's `parse_since` must never see a vector token. That carve-out is deleted here.
+        //
+        // `?match=` still falls through to the proxy (issue #223 review, B1), and for a reason
+        // #225 does not touch: it is a predicate the merge-on-read path never evaluates at all,
+        // so terminating a `?match=`-scoped request would silently answer with the *whole*
+        // fleet's requests instead of the caller's scoped subset, and would turn a malformed
+        // filter's upstream `400` into a `200` with everything. Proxying leaves upstream's own
+        // clause parser and its existing error handling in charge of it.
+        Method::GET if !has_query_param(query, "match") => {
             Some(Terminated::ReadSavedRequests(port))
         }
         Method::DELETE => Some(Terminated::ClearSavedRequests(port)),
@@ -727,6 +730,30 @@ fn has_query_param(query: Option<&str>, name: &str) -> bool {
         .unwrap_or_default()
         .split('&')
         .any(|pair| pair == name || pair.split_once('=').is_some_and(|(key, _)| key == name))
+}
+
+/// The **raw** value of a query parameter, or `None` when it is absent — [`has_query_param`]'s
+/// matching rules, with the value handed back instead of discarded.
+///
+/// No percent-decoding, for the same reason that function does none: this and the proxy it can
+/// fall through to must agree byte-for-byte about what the query string says. Nothing this reads
+/// ever needs escaping — a cursor token is unpadded base64url (`[A-Za-z0-9_-]`) and the legacy
+/// form it also accepts is decimal digits, neither of which a conforming client encodes. A token
+/// that arrives encoded anyway is, correctly, not a token this node issued, and is refused as one
+/// rather than silently repaired into a position nobody asked for.
+///
+/// A valueless `?since` (no `=`) yields `Some("")`, not `None`: for a cursor those are different
+/// requests — "this token is empty" is a client bug worth a 400, while absence means "start from
+/// the beginning" — and collapsing them would turn the first into the second.
+fn query_param<'q>(query: Option<&'q str>, name: &str) -> Option<&'q str> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|pair| match pair.split_once('=') {
+            Some((key, value)) if key == name => Some(value),
+            _ if pair == name => Some(""),
+            _ => None,
+        })
 }
 
 /// Map a terminated route to the action that authorizes it (RFC-002 §4.1).
@@ -2196,7 +2223,7 @@ async fn terminate(
         // source surface does — none of the `If-Match`/`_rift.script`/loopback-render machinery
         // below applies.
         Terminated::ReadSavedRequests(port) => {
-            return terminate_read_saved_requests(&state, port).await;
+            return terminate_read_saved_requests(&state, port, req.uri().query()).await;
         }
         // Only the `?match=`-narrowed form diverts here (issue #223 item 4's original design,
         // B3 — #224 left it alone deliberately, see `terminate_clear_saved_requests`'s doc): a
@@ -2294,29 +2321,83 @@ async fn terminate(
     }
 }
 
-/// `GET /imposters/{port}/requests|savedRequests` with no `?since=` and no `?match=` (issue
-/// #223): the fleet-wide merge-on-read `classify` terminated this route for. `merge_shards`'s 15
-/// gate tests already prove the convergence properties; this is purely turning the outcome into
-/// the bytes and header the openapi contract pins — a bare JSON array of `RecordedRequest`,
-/// `matchOutcome` intact on every entry because it rides inside `RecordedRequest` untouched, and
-/// no cursor header at all (the withheld-cursor convention: a merged read has no single index
-/// that means the same thing on every shard, so it must not look like it does).
-async fn terminate_read_saved_requests(state: &Arc<FrontState>, port: u16) -> Response<FrontBody> {
-    let outcome = state
+/// `GET /imposters/{port}/requests|savedRequests` with no `?match=` (issues #223, #225): the
+/// fleet-wide merge-on-read `classify` terminated this route for, in both its uncursored and its
+/// `?since=` form.
+///
+/// `merge_shards_since`'s gate tests already prove the walk's properties (every entry exactly
+/// once, per-shard gaplessness across membership changes, a token that never regresses, an honest
+/// truncation bit); this is purely turning that outcome into the bytes and headers the openapi
+/// contract pins:
+///
+/// - the body stays a **bare JSON array** of `RecordedRequest`, cursored or not — the historical
+///   shape is a compatibility contract, and `matchOutcome` rides inside each entry untouched so
+///   #220's diagnostics survive a merged read for free;
+/// - `x-rift-next-index` carries the **opaque vector token**, replacing #223's withheld-header
+///   convention. #223 withheld it because a scalar index means nothing across shards; #225's
+///   whole point is that there is now a value that does mean something, so withholding it would
+///   leave the client no way to page at all;
+/// - `x-rift-truncated: true` only when the walk really lost entries to eviction, matching the
+///   meaning upstream gives the header.
+///
+/// A malformed token is a **typed 400**, never a defaulted position: silently reading it as 0
+/// would replay the whole journal, and reading it as "current" would skip everything recorded
+/// since — both are wrong-but-quiet, and the wrongness would surface in the client's decoder with
+/// nothing server-side to correlate. Upstream refuses an unparseable `since` the same way.
+async fn terminate_read_saved_requests(
+    state: &Arc<FrontState>,
+    port: u16,
+    query: Option<&str>,
+) -> Response<FrontBody> {
+    let this_node = state.journal_net.node_id();
+    let cursor = match query_param(query, "since") {
+        // Legacy acceptance is deliberate and narrow: a bare `u64` a client holds can only have
+        // come from a per-node proxied read of THIS node, because a merged read has issued no
+        // cursor at all until this issue. Reading it as `{this_node: seq}` is the honest upgrade
+        // -window interpretation; every other shard starts at 0 because the client provably has
+        // seen none of them.
+        Some(raw) => match JournalCursor::decode_or_legacy(raw, this_node) {
+            Ok(cursor) => Some(cursor),
+            Err(e) => {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    ErrorKind::BadData,
+                    &format!("since is not a usable cursor: {e}"),
+                );
+            }
+        },
+        // Absent `since` is a **baseline** read, and stays `None` all the way down rather than
+        // becoming a cursor at position zero. The two differ in exactly one observable: a
+        // baseline read is a snapshot and can never be truncated, while a reader who claims a
+        // position of zero has provably missed whatever eviction removed. Upstream and this
+        // crate's single-node path both draw that line, so collapsing it here would make every
+        // ordinary uncursored read of an evicting port answer `x-rift-truncated: true`.
+        None => None,
+    };
+
+    let page = state
         .journal_net
-        .merge_read(port, JOURNAL_PEER_BUDGET)
+        .merge_read_since(port, cursor.as_ref(), JOURNAL_PEER_BUDGET)
         .await;
-    let requests: Vec<&RecordedRequest> =
-        outcome.entries.iter().map(|entry| &entry.request).collect();
+    let requests: Vec<&RecordedRequest> = page.entries.iter().map(|entry| &entry.request).collect();
     match serde_json::to_vec(&requests) {
         Ok(bytes) => {
-            let mut response =
-                buffered_response(StatusCode::OK, Bytes::from(bytes), json_content_type())
-                    .unwrap_or_else(|response| response);
-            if outcome.partial {
-                set_header(&mut response, HEADER_PARTIAL, "true");
+            // Headers are set only on a response that carries the body they describe: a 500
+            // from `buffered_response` must not advertise a cursor for a page nobody received,
+            // which is why upstream splits its own cursor-response builder the same way.
+            match buffered_response(StatusCode::OK, Bytes::from(bytes), json_content_type()) {
+                Ok(mut response) => {
+                    set_header(&mut response, HEADER_NEXT_INDEX, &page.next.encode());
+                    if page.truncated {
+                        set_header(&mut response, HEADER_TRUNCATED, "true");
+                    }
+                    if page.partial {
+                        set_header(&mut response, HEADER_PARTIAL, "true");
+                    }
+                    response
+                }
+                Err(response) => response,
             }
-            response
         }
         // Fails closed like `narrow_imposter_listing`: a body this node cannot encode must not
         // become a 200 with nothing in it, which would read as "no requests ever recorded" to
@@ -4290,19 +4371,27 @@ mod tests {
             );
         }
 
-        // `?since=` is a scalar cursor that cannot address a multi-writer merge (#225's
-        // territory): with it present, the read must fall straight through to the proxy — the
-        // regression this route's design most easily loses, since its no-cursor sibling above now
-        // terminates.
-        assert!(
-            classify(&Method::GET, "/imposters/4545/requests", Some("since=3")).is_none(),
-            "GET .../requests?since=3 must still proxy"
-        );
+        // Issue #225 flips this row. `?since=` used to fall through to the proxy because a
+        // scalar cursor cannot address a multi-writer merge; the vector cursor is exactly the
+        // value that can, so the cursored read now terminates like its uncursored sibling and
+        // the engine's own `parse_since` never sees a vector token. Both spellings, and the
+        // legacy scalar form a pre-#225 client still holds.
+        for query in ["since=3", "since=eyJ2IjoxfQ", "since"] {
+            assert!(
+                classify(&Method::GET, "/imposters/4545/requests", Some(query)).is_some(),
+                "GET .../requests?{query} must terminate as of #225"
+            );
+            assert!(
+                classify(&Method::GET, "/imposters/4545/savedRequests", Some(query)).is_some(),
+                "GET .../savedRequests?{query} must terminate as of #225"
+            );
+        }
 
-        // Issue #223 review, B1: `?match=` is the same exception as `?since=` — a scoped
-        // predicate the merge-on-read path never evaluates, so terminating on it would silently
-        // widen the answer to the whole fleet's requests. Both spellings, both query forms
-        // (`match=...` and a bare `match`), must fall through to the proxy exactly like `since`.
+        // Issue #223 review, B1, and **not** widened by #225: `?match=` is a scoped predicate the
+        // merge-on-read path never evaluates, so terminating on it would silently widen the answer
+        // to the whole fleet's requests and turn a malformed filter's upstream 400 into a 200 with
+        // everything. Both spellings, both query forms (`match=...` and a bare `match`), still
+        // fall through to the proxy.
         for query in ["match=flow_id%3Drun-7", "match"] {
             assert!(
                 classify(&Method::GET, "/imposters/4545/requests", Some(query)).is_none(),
@@ -4313,7 +4402,8 @@ mod tests {
                 "GET .../savedRequests?{query} must still proxy"
             );
         }
-        // `since` and `match` together must still fall through — either one alone is enough.
+        // `match` still wins when both are present: `since` no longer excuses a read from
+        // terminating, but `match` alone is still enough to send the whole thing to the proxy.
         assert!(
             classify(
                 &Method::GET,
@@ -4321,7 +4411,7 @@ mod tests {
                 Some("since=3&match=flow_id%3Drun-7")
             )
             .is_none(),
-            "GET .../savedRequests?since=3&match=... must still proxy"
+            "GET .../savedRequests?since=3&match=... must still proxy — `match` is the exception"
         );
         // `?match=` on the DELETE, unlike the GET, still terminates — B3's design decision is
         // that a scoped clear stays local-only (and stamps partial), not that it stops
@@ -4374,14 +4464,16 @@ mod tests {
                 "{method} {path} (admin alias) must terminate"
             );
         }
+        // The alias must flip with the canonical path (issue #225), not lag behind it — the two
+        // spellings drifting apart is exactly the defect #223's review caught on this route.
         assert!(
             classify(
                 &Method::GET,
                 "/admin/imposters/4545/savedRequests",
                 Some("since=3")
             )
-            .is_none(),
-            "GET admin-alias .../savedRequests?since=3 must still proxy"
+            .is_some(),
+            "GET admin-alias .../savedRequests?since=3 must terminate as of #225"
         );
         // The admin alias is scoped to the savedRequests/requests shape — flow-state inspection
         // and any other unrecognized suffix under this prefix stay this front's non-concern and
@@ -4428,6 +4520,78 @@ mod tests {
             !has_query_param(Some("since=3"), "match"),
             "an unrelated query parameter must not be mistaken for `match`"
         );
+    }
+
+    /// `query_param` is what hands the cursor token to the decoder, so the ways it can quietly
+    /// return the wrong string are the ways a walk silently restarts or skips (issue #225).
+    #[test]
+    fn the_query_value_reader_finds_exactly_the_named_parameter() {
+        assert_eq!(query_param(Some("since=abc"), "since"), Some("abc"));
+        assert_eq!(
+            query_param(Some("match=x&since=abc&limit=5"), "since"),
+            Some("abc"),
+            "position in the query string must not matter"
+        );
+        assert_eq!(
+            query_param(Some("sincerely=no&since=yes"), "since"),
+            Some("yes"),
+            "a parameter whose name merely starts with `since` is a different parameter"
+        );
+        assert_eq!(
+            query_param(Some("since"), "since"),
+            Some(""),
+            "a valueless `since` is an empty token, not an absent one — the caller 400s on it"
+        );
+        assert_eq!(query_param(Some("match=x"), "since"), None);
+        assert_eq!(query_param(None, "since"), None);
+        // A base64url token contains `-` and `_` and nothing that needs escaping; it must arrive
+        // byte-identical or the walk resumes somewhere the client never asked for.
+        let token = JournalCursor {
+            generation: 3,
+            pos: [(1u64, 9u64), (2, 4)].into_iter().collect(),
+        }
+        .encode();
+        assert_eq!(
+            query_param(Some(&format!("since={token}")), "since"),
+            Some(token.as_str()),
+            "the issued token must survive the query string unchanged"
+        );
+    }
+
+    /// The three shapes `?since=` can take, and what each must mean (issue #225, AC5). The
+    /// malformed case is the one that matters most: defaulting it would either replay the whole
+    /// journal or skip everything since, and both are silent.
+    #[test]
+    fn a_since_value_is_a_token_a_legacy_scalar_or_a_refusal() {
+        let this_node = 7;
+
+        let token = JournalCursor {
+            generation: 2,
+            pos: [(1u64, 5u64)].into_iter().collect(),
+        }
+        .encode();
+        assert_eq!(
+            JournalCursor::decode_or_legacy(&token, this_node).expect("a vector token is accepted"),
+            JournalCursor {
+                generation: 2,
+                pos: [(1u64, 5u64)].into_iter().collect(),
+            }
+        );
+
+        let legacy =
+            JournalCursor::decode_or_legacy("42", this_node).expect("a legacy scalar is accepted");
+        assert_eq!(
+            legacy.pos.get(&this_node).copied(),
+            Some(42),
+            "a bare u64 can only have come from a proxied read of this node"
+        );
+
+        for bad in ["", "not base64!!", "-1", "Zm9v"] {
+            assert!(
+                JournalCursor::decode_or_legacy(bad, this_node).is_err(),
+                "{bad:?} must be refused, not defaulted to a position"
+            );
+        }
     }
 
     /// The source inspection surface (issue #239): the two reads terminate,
@@ -4635,6 +4799,26 @@ mod tests {
     /// A bound front over a throwaway node, for the accept-loop observation
     /// tests. `upstream_admin` is never dialled — nothing sends a request.
     async fn test_front() -> (AdminFront, Arc<RaftNode>, tempfile::TempDir) {
+        let (front, node, _journal, dir) =
+            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
+        (front, node, dir)
+    }
+
+    /// [`test_front`] over a caller-supplied journal, handed back so a test can record into the
+    /// very shard the front will read (issue #225).
+    ///
+    /// The cursor tests need this because `?since=` **terminates** now: nothing they exercise
+    /// dials `upstream_admin`, so a front over a journal they control is a complete, honest
+    /// harness for the whole handler — query parsing, token decode, the merge walk, and the
+    /// response headers — rather than a mock of it.
+    async fn test_front_over(
+        journal: Arc<rift_cluster::stores::ClusterJournal>,
+    ) -> (
+        AdminFront,
+        Arc<RaftNode>,
+        Arc<rift_cluster::stores::ClusterJournal>,
+        tempfile::TempDir,
+    ) {
         let (node, dir) = test_node().await;
         let front = bind(
             FrontConfig {
@@ -4652,13 +4836,214 @@ mod tests {
                 puller: Arc::new(SourcePuller::new(
                     rift_cluster_base::seams::SourceRegistry::default(),
                 )),
-                journal_net: JournalNet::new(rift_cluster::stores::ClusterJournal::new(1)),
+                journal_net: JournalNet::new(Arc::clone(&journal)),
             },
             &node,
         )
         .await
         .expect("front binds");
-        (front, node, dir)
+        (front, node, journal, dir)
+    }
+
+    // ---- Cursor wiring on the merged read (issue #225) ---------------------------------
+    //
+    // The token codec and the merge walk each have their own gate tests. These cover the seam
+    // between them — query parsing, decode, and the response headers — which is the part a
+    // mutation could break while every other test in the tree stayed green.
+
+    use rift_cluster_base::seams::RequestJournal;
+
+    const CURSOR_TEST_PORT: u16 = 4545;
+
+    fn recorded(path: &str) -> rift_cluster_base::seams::RecordedRequest {
+        rift_cluster_base::seams::RecordedRequest {
+            mode: rift_cluster_base::seams::ResponseMode::Text,
+            request_from: "t".into(),
+            method: "GET".into(),
+            path: path.into(),
+            query: Default::default(),
+            headers: Default::default(),
+            body: None,
+            timestamp: format!("2026-01-01T00:00:{:02}Z", path.len()),
+            match_outcome: None,
+        }
+    }
+
+    /// `GET /imposters/{port}/savedRequests` against the bound front, with an optional raw
+    /// query string — returned as `(status, headers, body)` so a test can assert on all three.
+    async fn read_requests(
+        front: &AdminFront,
+        query: Option<&str>,
+    ) -> (u16, reqwest::header::HeaderMap, String) {
+        let addr = front.local_addr();
+        let url = match query {
+            Some(q) => format!("http://{addr}/imposters/{CURSOR_TEST_PORT}/savedRequests?{q}"),
+            None => format!("http://{addr}/imposters/{CURSOR_TEST_PORT}/savedRequests"),
+        };
+        let response = reqwest::get(url).await.expect("the front answers");
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let body = response.text().await.expect("a body");
+        (status, headers, body)
+    }
+
+    fn header_of(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// The happy path end to end: a merged read issues a token, and presenting that token walks
+    /// forward rather than replaying. Nothing else in the tree proves `x-rift-next-index` is
+    /// actually *set* by the handler, nor that a token survives the query string and decodes on
+    /// the way back in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_merged_read_issues_a_cursor_that_pages_forward() {
+        let journal = rift_cluster::stores::ClusterJournal::new(1);
+        let (front, node, journal, _dir) = test_front_over(journal).await;
+
+        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
+        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/bb"));
+
+        let (status, headers, body) = read_requests(&front, None).await;
+        assert_eq!(status, 200, "uncursored merged read: {body}");
+        assert!(body.contains("/a") && body.contains("/bb"), "body: {body}");
+        assert!(
+            header_of(&headers, HEADER_TRUNCATED).is_none(),
+            "nothing was evicted, so truncation must not be claimed"
+        );
+        let token = header_of(&headers, HEADER_NEXT_INDEX)
+            .expect("a merged read must issue a cursor (issue #225)");
+        assert!(
+            JournalCursor::decode(&token).is_ok(),
+            "the issued token must decode, not merely look opaque: {token}"
+        );
+
+        // Presenting it walks forward: everything recorded so far is consumed.
+        let (status, _, body) = read_requests(&front, Some(&format!("since={token}"))).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "[]", "the token must not replay the page it followed");
+
+        // And a genuinely new entry surfaces on the next page, so "empty" was exhaustion
+        // rather than the cursor swallowing everything.
+        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/ccc"));
+        let (status, _, body) = read_requests(&front, Some(&format!("since={token}"))).await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("/ccc") && !body.contains("/bb"),
+            "only the entry recorded after the token may appear: {body}"
+        );
+
+        node.shutdown().await.expect("node shuts down");
+    }
+
+    /// A cursor the front cannot read is a **typed 400**, never a defaulted position. This is
+    /// the arm with the most expensive silent failure in the change: defaulting to 0 replays
+    /// the whole journal as new traffic, and defaulting to "current" hides everything recorded
+    /// since — both surface in the client's decoder with nothing server-side to correlate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_since_is_a_typed_400_not_a_defaulted_position() {
+        let journal = rift_cluster::stores::ClusterJournal::new(1);
+        let (front, node, journal, _dir) = test_front_over(journal).await;
+        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
+
+        for bad in ["not%20base64%21", "Zm9v", "since-was-empty"] {
+            let (status, _, body) = read_requests(&front, Some(&format!("since={bad}"))).await;
+            assert_eq!(status, 400, "since={bad} must be refused: {body}");
+            assert!(
+                !body.contains("/a"),
+                "a refused cursor must not answer with journal entries: {body}"
+            );
+        }
+        // A bare `?since` with no value is an empty token, not an absent one.
+        let (status, _, _) = read_requests(&front, Some("since")).await;
+        assert_eq!(
+            status, 400,
+            "a valueless `since` is a broken token, not a baseline read"
+        );
+
+        node.shutdown().await.expect("node shuts down");
+    }
+
+    /// The upgrade window: a bare `u64` predates the vector cursor and can only have come from
+    /// a proxied per-node read of this node, so it is honoured as this node's own position.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_legacy_scalar_since_is_read_as_this_nodes_position() {
+        let journal = rift_cluster::stores::ClusterJournal::new(1);
+        let (front, node, journal, _dir) = test_front_over(journal).await;
+        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
+        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/bb"));
+
+        // Seq 1 is `/a`, so a scalar cursor of 1 has consumed it and must not see it again.
+        let (status, headers, body) = read_requests(&front, Some("since=1")).await;
+        assert_eq!(status, 200, "a legacy scalar must be accepted: {body}");
+        assert!(
+            body.contains("/bb") && !body.contains("\"/a\""),
+            "a scalar cursor must resume this node's shard, not restart it: {body}"
+        );
+        assert!(
+            header_of(&headers, HEADER_NEXT_INDEX).is_some(),
+            "a legacy read still upgrades the caller to a vector token"
+        );
+
+        node.shutdown().await.expect("node shuts down");
+    }
+
+    /// AC3's wiring half: `x-rift-truncated` is stamped when — and only when — retention ate
+    /// entries the presented position had not reached. The walk's own gate tests pin the
+    /// boundary arithmetic; this pins that the bit actually reaches the response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eviction_stamps_the_truncation_header_on_a_stale_cursor() {
+        // A cap this small makes retention pressure immediate and deterministic, instead of
+        // recording ten thousand entries to reach the default.
+        let journal = rift_cluster::stores::ClusterJournal::with_parts(
+            1,
+            rift_cluster::stores::JournalConfig {
+                fleet_capacity: 2,
+                min_shard_cap: 2,
+                ..Default::default()
+            },
+            Arc::new(rift_cluster::stores::journal::MonotonicClock::default()),
+        );
+        let (front, node, journal, _dir) = test_front_over(journal).await;
+
+        RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded("/a"));
+        let (_, headers, _) = read_requests(&front, None).await;
+        let early = header_of(&headers, HEADER_NEXT_INDEX).expect("a cursor");
+        assert!(
+            header_of(&headers, HEADER_TRUNCATED).is_none(),
+            "nothing has been evicted yet"
+        );
+
+        // Push past the cap so the shard's watermark climbs above where `early` points.
+        for path in ["/bb", "/ccc", "/dddd", "/eeeee"] {
+            RequestJournal::record(&*journal, CURSOR_TEST_PORT, "", recorded(path));
+        }
+
+        let (status, headers, body) = read_requests(&front, Some(&format!("since={early}"))).await;
+        assert_eq!(
+            status, 200,
+            "a truncated read still serves what survives: {body}"
+        );
+        assert_eq!(
+            header_of(&headers, HEADER_TRUNCATED).as_deref(),
+            Some("true"),
+            "the reader's position predates the eviction watermark and must be told so: {body}"
+        );
+
+        // But a **baseline** read of the very same evicting shard must NOT claim truncation: it
+        // is a snapshot of what is retained, so it has no hole. Collapsing absence into a
+        // position of zero would make this the loudest false alarm in the API — every ordinary
+        // uncursored read of a busy port, forever. Upstream and the single-node path both draw
+        // this line, so the merged read has to as well.
+        let (_, headers, _) = read_requests(&front, None).await;
+        assert!(
+            header_of(&headers, HEADER_TRUNCATED).is_none(),
+            "a baseline read is a snapshot and can never be truncated"
+        );
+
+        node.shutdown().await.expect("node shuts down");
     }
 
     /// Issue #64: the accept loop dying is *observable*.

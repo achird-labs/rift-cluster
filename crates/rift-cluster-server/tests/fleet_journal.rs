@@ -21,7 +21,8 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use clap::Parser;
-use rift_cluster::decorate::HEADER_PARTIAL;
+use rift_cluster::decorate::{HEADER_NEXT_INDEX, HEADER_PARTIAL, HEADER_TRUNCATED};
+use rift_cluster::stores::JournalCursor;
 use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose::{self, ComposedServer};
 use serde_json::json;
@@ -259,13 +260,17 @@ impl Fleet {
         Seen::of(response).await
     }
 
-    /// The local-only read: `?since=` keeps upstream's own clause parser, so the
-    /// front proxies it straight to this node's engine instead of merging.
+    /// The local-only read: this node's **engine**, addressed directly, bypassing the front.
+    ///
+    /// It used to be `?since=0` through the front, which issue #223 left proxied. Issue #225
+    /// terminates that route too — every requests-read through the front is now a fleet-wide
+    /// merge — so the same URL would answer the merged set and this helper would silently stop
+    /// meaning "local", taking the shard-partitioning assertions below with it.
     async fn local(&self, index: usize) -> Seen {
-        let admin = self.admin(index);
+        let engine = self.nodes[index].engine_admin_addr();
         let port = self.port;
         let response = reqwest::get(format!(
-            "http://{admin}/imposters/{port}/savedRequests?since=0"
+            "http://{engine}/imposters/{port}/savedRequests?since=0"
         ))
         .await
         .expect("local read");
@@ -303,15 +308,20 @@ fn paths(seen: &Seen) -> BTreeSet<String> {
 /// Acceptance criteria 1, 4 and 6 in one run, because they are one contract
 /// seen from three sides: every node answers the *same* merged set (AC1), a
 /// clear on one node is not resurrected by another's shard (AC4), and the
-/// merged read is honest about being complete and about not being paginable
-/// (AC6).
+/// merged read is honest about being complete and — as of issue #225 — about
+/// how to page it (AC6). That last clause used to read "about *not* being
+/// paginable": #223 withheld the cursor because a scalar index names a
+/// position in no shard in particular, and #225's vector token is the value
+/// that replaced it.
 ///
-/// The `?since=0` local reads are load-bearing, not decoration. They are the
-/// positive control for `x-rift-next-index` — proving its absence on the merged
-/// read is a deliberate difference rather than a header that never appears —
-/// and they are what stops the whole test passing vacuously: if the front doors
-/// did not actually record on three different nodes, the per-node shards would
-/// not partition the way this asserts.
+/// The direct-to-engine local reads are load-bearing, not decoration: they are what stops the
+/// whole test passing vacuously. If the front doors did not actually record on three different
+/// nodes, the per-node shards would not partition the way this asserts, and a merge of three
+/// copies of one shard would look identical to a merge of three distinct ones.
+///
+/// They no longer double as the positive control for `x-rift-next-index`. Issue #225 made the
+/// merged read itself carry a cursor, so its presence is now asserted where it belongs — on the
+/// merged read — rather than inferred from a proxied sibling.
 #[tokio::test]
 async fn every_node_answers_one_identical_merged_set_and_a_clear_does_not_resurrect() {
     let states = [
@@ -348,8 +358,8 @@ async fn every_node_answers_one_identical_merged_set_and_a_clear_does_not_resurr
             "node {index}'s shard must not contain another node's traffic: {local_paths:?}"
         );
         assert!(
-            local.header("x-rift-next-index").is_some(),
-            "the local `?since=` read is paginable and must carry the cursor: {local}"
+            local.header(HEADER_NEXT_INDEX).is_some(),
+            "the engine's own `?since=` read is paginable and must carry upstream's cursor: {local}"
         );
     }
 
@@ -373,9 +383,21 @@ async fn every_node_answers_one_identical_merged_set_and_a_clear_does_not_resurr
             merged.header(HEADER_PARTIAL).is_none(),
             "no peer was missing, so the merged read must not claim partial: {merged}"
         );
+        // Issue #225 flips this. #223 withheld the cursor because a scalar index names a
+        // position in no shard in particular; the vector token is the value that does mean the
+        // same thing on every node, so a merged read now offers one — and it must, or a client
+        // has no way to page a clustered journal at all.
+        let token = merged
+            .header(HEADER_NEXT_INDEX)
+            .unwrap_or_else(|| panic!("a merged read must offer a vector cursor: {merged}"));
         assert!(
-            merged.header("x-rift-next-index").is_none(),
-            "a merged read spans shards and has no single cursor, so it must not offer one: {merged}"
+            JournalCursor::decode(token).is_ok(),
+            "the issued cursor must be a token this fleet can read back, not an opaque-looking \
+             string that only round-trips by accident: {token}"
+        );
+        assert!(
+            merged.header(HEADER_TRUNCATED).is_none(),
+            "nothing was evicted, so the merged read must not claim truncation: {merged}"
         );
 
         // AC1's other half: the listing's `numberOfRequests` is the fleet count,
