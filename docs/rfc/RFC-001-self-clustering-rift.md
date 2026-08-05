@@ -1048,6 +1048,14 @@ acceptable shapes, decided at implementation time:
    `Rift-Cluster-Partial: true`, until the vector cursor lands. Honest and useful; it must
    not be described as a fleet stream.
 
+**Decided (issue #348): shape 1, for `…/savedRequests/stream`.** The interim was never
+needed — the vector cursor (#225) landed first, so the tail could be built directly as a
+cursor walk that never ends, over the replica cache the anti-entropy pull already fills.
+`hello` declares the bound this section insists on, as `clusterTailLatencyMs`. `GET /events`
+is **not** part of that decision: it stays proxied per-node and FleetAdmin-gated until #163
+filters it by tenant, which is a tenancy question rather than a merging one. See Ch.7
+§"Cursor reads and live streams".
+
 Phase-3 exit criterion: **`test_journal_cursor_merge`** — spray across 3 nodes while
 polling with the returned cursor. Stated per generation, because a clear deliberately
 discards data and a cross-clear concatenation is therefore *supposed* to exceed a final

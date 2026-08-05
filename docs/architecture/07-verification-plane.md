@@ -186,11 +186,50 @@ neither a token nor a `u64` is a typed 400 — never a defaulted position, since
 defaulting either replays the whole journal or silently skips everything
 recorded since.
 
-**The merged SSE tail is not yet implemented.** `.../savedRequests/stream` and
-`GET /events` both still proxy per-node, FleetAdmin-gated, as they did before
-this issue; the cursor half above is what shipped. The token was designed to
-serve both — an SSE `id:` line is a valid place to put it — so the terminator
-is additive when it lands.
+**The merged SSE tail (issue #348) is the same walk, never ending.**
+`GET .../savedRequests/stream` terminates at the front door and answers a
+fleet-merged `text/event-stream`. It is not a second implementation beside the
+cursor read: every wake re-runs `merge_shards_since` from the position that
+connection holds, so the `id:` line after an event is a cursor token in exactly
+the sense `x-rift-next-index` is, and a `Last-Event-ID` reconnect degrades to a
+cursor read and then goes live. That is why the two read modes are one contract
+rather than two that agree by inspection.
+
+The front needs no handle on the engine's event bus to do this, which is what
+the design originally assumed it would. It already holds the journal: the
+`JournalNet` behind `savedRequests` wraps the very `ClusterJournal` the manager
+records into, so local entries are readable in-process the moment they land,
+and peer entries arrive in the same net's replica cache on the anti-entropy
+tick. Only a wake signal was missing.
+
+**Latency is declared rather than pretended away.** Local entries surface
+immediately. Peer entries cannot: a tail that fanned out to every peer per
+event would multiply inter-node traffic by the number of attached clients, so
+the tail rides the anti-entropy cadence the fleet already pays for. `hello`
+carries `clusterTailLatencyMs` — the interval the loop was actually started
+with, not the compiled-in constant — and it bounds how late a peer's entry can
+be. Honesty about the merge is streamed too: `partial` on every transition of
+the degraded state (both senses of it, including #349's crash-restarted writer),
+and `lagged` when retention evicted entries the reader had not reached.
+
+One subtlety the walk forced. `merge_shards` orders by the request's own
+timestamp, and *within a single shard* that is not guaranteed to agree with seq
+order — two concurrent requests can be stamped in one order and sequenced in
+the other. A cursor is a per-shard high-water mark, so emitting seq 7 before
+seq 6 while folding the token forward would strand seq 6 permanently. The
+stream therefore emits each page in a linear extension of per-shard seq order
+(`stream_order`), interleaved across shards by timestamp exactly as before.
+The page-level token never had this problem — it advances to everything a shard
+holds — so this is specific to handing out a token per event.
+
+**`GET /events` stays proxied per-node and FleetAdmin-gated**, and the asymmetry
+is deliberate: its payload spans every tenant and is not yet filtered
+server-side, so the gate is stricter than RFC-002 §4.2 asks until #163 lands the
+filtering. The per-port tail is different in kind — it carries one imposter's
+requests and is authorized as the ordinary port-scoped `imposter.read` it always
+was. Terminating it changed no authorization posture at all. (Earlier revisions
+of this chapter described *both* streams as FleetAdmin-gated; only the firehose
+ever was.)
 
 ## proxyOnce: exactly-once recording via an owner claim
 

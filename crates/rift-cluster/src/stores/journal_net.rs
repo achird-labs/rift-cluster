@@ -11,7 +11,7 @@
 //! it is provable without a cluster — which is what lets the chaos tier assert the *distributed*
 //! claims (partition honesty, dead-writer survival) instead of re-deriving the merge itself.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -266,6 +266,87 @@ pub(crate) fn merge_shards_since(
     }
 }
 
+/// Re-order one merged page into an order a **per-entry** cursor can actually address (issue
+/// #348) — each shard's entries in seq order, interleaved across shards by timestamp.
+///
+/// This exists because a live tail hands out a resumption token *per event*, and
+/// [`merge_shards`]'s order cannot carry one. That sort is by the recorded request's `timestamp`
+/// — a string stamped when the request arrived at the imposter — with `(node_id, seq)` only as a
+/// tiebreak. Within a single shard that is **not** guaranteed to be seq-ascending: two concurrent
+/// requests on one node can be stamped in one order and sequenced in the other, and the timestamp
+/// is compared as text, so any formatting drift inverts it too.
+///
+/// A cursor is a per-shard high-water mark. Emit `A:7` before `A:6` while folding the mark
+/// forward as you go, and the mark passes 6 — so every later read withholds it, forever. Not a
+/// delayed delivery: permanent, silent loss, which is exactly what this issue's zero-loss
+/// criterion forbids. The page-level token [`MergeSince::next`] never had this problem, because
+/// it advances each shard to everything the shard *holds* rather than to a prefix of a sorted
+/// list; the hazard is specific to a mid-page token.
+///
+/// Cross-shard, entries still compete by timestamp — but between each shard's *next unemitted*
+/// entry rather than across the flat list, so the interleave can differ from [`merge_shards`]'s.
+/// The module test shows it: `[(1,2),(2,1),(1,1)]` becomes `[(2,1),(1,1),(1,2)]`. That is the
+/// design's "per-shard ordering only, cross-shard interleave by recorded timestamp" — the ordering
+/// guarantee a stream can actually keep, since a merged page's order is not stable across reads
+/// anyway (a peer that becomes reachable contributes entries older than everything already sent).
+#[must_use]
+pub fn stream_order(entries: Vec<ShardEntry>) -> Vec<ShardEntry> {
+    let mut by_shard: BTreeMap<NodeId, std::collections::VecDeque<ShardEntry>> = BTreeMap::new();
+    for entry in entries {
+        by_shard.entry(entry.node_id).or_default().push_back(entry);
+    }
+    for shard in by_shard.values_mut() {
+        shard.make_contiguous().sort_by_key(|entry| entry.seq);
+    }
+
+    let mut out = Vec::with_capacity(by_shard.values().map(std::collections::VecDeque::len).sum());
+    loop {
+        // The head of each shard is that shard's next-lowest seq, so picking the smallest head by
+        // the merge's own ordering keeps the cross-shard interleave while never taking a shard's
+        // entries out of sequence.
+        let next = by_shard
+            .iter()
+            .filter_map(|(node, shard)| shard.front().map(|entry| (*node, entry)))
+            .min_by(|(a_node, a), (b_node, b)| {
+                a.request
+                    .timestamp
+                    .cmp(&b.request.timestamp)
+                    .then_with(|| a_node.cmp(b_node))
+                    .then_with(|| a.seq.cmp(&b.seq))
+            })
+            .map(|(node, _)| node);
+        let Some(node) = next else { break };
+        if let Some(entry) = by_shard
+            .get_mut(&node)
+            .and_then(std::collections::VecDeque::pop_front)
+        {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+/// Fold one emitted entry into a cursor: the resumption token that belongs on that entry's SSE
+/// `id:` line (issue #348).
+///
+/// Only the entry's own shard advances, and only to its own seq — the narrowest honest claim a
+/// reader can make. Sound **only** over a sequence in per-shard seq order, which is what
+/// [`stream_order`] exists to guarantee; see its doc for what folding over the raw merge order
+/// would silently drop.
+///
+/// `generation` is carried through untouched. It never filters entries (that is the slices' own
+/// clear generation, applied inside [`merge_shards`]) — it exists to keep the token monotone, and
+/// the drain's page-level [`MergeSince::next`] brings it current at every page boundary.
+#[must_use]
+pub fn advanced_by(cursor: &JournalCursor, entry: &ShardEntry) -> JournalCursor {
+    let mut next = cursor.clone();
+    next.pos
+        .entry(entry.node_id)
+        .and_modify(|position| *position = (*position).max(entry.seq))
+        .or_insert(entry.seq);
+    next
+}
+
 /// The highest seq any slice reports `node` as having evicted through (inclusive).
 fn evicted_through(slices: &[ShardSlice], node: NodeId) -> u64 {
     slices
@@ -497,6 +578,24 @@ pub struct JournalNet {
     /// net) is built before the `RaftNode` exists. `Weak` so the anti-entropy
     /// loop can never keep the node alive past shutdown.
     node: OnceLock<Weak<RaftNode>>,
+    /// Per-port verdict from the most recent [`Self::anti_entropy_tick`]: is a merged answer for
+    /// this port currently short (issue #348)? Both senses of [`MergeOutcome::partial`], recorded
+    /// where the tick already learns them.
+    ///
+    /// This exists because a live tail cannot afford [`Self::merge_read_since`]'s per-call
+    /// fan-out — N clients times M peers every few seconds — but must still be as honest as the
+    /// cursor read is. The tick already asks every peer the same question on the same cadence and,
+    /// before this, threw both answers away: it merged each reply and kept no verdict at all.
+    /// Recording it costs no extra round trip and no new wire field.
+    tick_partial: RwLock<HashMap<u16, bool>>,
+    /// Bumped when a tick merged at least one entry that was new to this cache, so a live tail
+    /// learns about *peer* entries as soon as the cadence surfaces them rather than on a timer of
+    /// its own. Same lossy-by-design contract as [`ClusterJournal::changes`].
+    ticks: tokio::sync::watch::Sender<u64>,
+    /// The cadence [`spawn_anti_entropy`] was actually started with — what a stream declares as
+    /// `clusterTailLatencyMs`. `OnceLock` because the loop is spawned once, after construction;
+    /// unset (tests, an embedder that never spawns the loop) reads as the default.
+    tail_latency: OnceLock<Duration>,
 }
 
 impl JournalNet {
@@ -506,7 +605,140 @@ impl JournalNet {
             journal,
             replicas: RwLock::new(HashMap::new()),
             node: OnceLock::new(),
+            tick_partial: RwLock::new(HashMap::new()),
+            ticks: tokio::sync::watch::Sender::new(0),
+            tail_latency: OnceLock::new(),
         })
+    }
+
+    /// A receiver that fires when an anti-entropy tick merged something new (issue #348).
+    #[must_use]
+    pub fn tick_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ticks.subscribe()
+    }
+
+    /// A receiver that fires when this node records an entry of its own (issue #348) — the local
+    /// half of a live tail's wake, forwarded so the front door needs a handle on the net only,
+    /// never on the journal underneath it.
+    #[must_use]
+    pub fn journal_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.journal.changes()
+    }
+
+    /// The anti-entropy cadence this net is actually running at — the latency a merged live tail
+    /// declares rather than pretends away (issue #348).
+    #[must_use]
+    pub fn tail_latency(&self) -> Duration {
+        // Never zero: this value is handed to `tokio::time::interval`, which panics on a zero
+        // period, and `spawn_anti_entropy` is `pub` and takes an arbitrary `Duration`. Clamping
+        // at the source removes the panic surface rather than trusting every caller.
+        self.tail_latency
+            .get()
+            .copied()
+            .filter(|interval| !interval.is_zero())
+            .unwrap_or(DEFAULT_ANTI_ENTROPY_INTERVAL)
+    }
+
+    /// [`Self::merge_read_since`] **without** the per-call peer fan-out: the same walk over
+    /// whatever the replica cache already holds, stamped with the last tick's verdict (issue
+    /// #348).
+    ///
+    /// This is the read a live tail does on every wake, and the fan-out is exactly what it must
+    /// not do. `merge_read_since` asks every peer directly because a one-shot cursor read has no
+    /// other way to be fresh; a tail is woken repeatedly and forever, so paying that cost per
+    /// wake would multiply the fleet's inter-node traffic by the number of attached clients. The
+    /// anti-entropy loop already pulls the same data from the same peers on a fixed cadence, so
+    /// the tail rides it instead — which is what makes the declared `clusterTailLatencyMs` an
+    /// honest bound rather than a guess.
+    ///
+    /// The walk itself is byte-for-byte the cursor read's (`merge_shards_since`), which is what
+    /// keeps the two read modes one contract instead of two implementations that agree by
+    /// accident.
+    #[must_use]
+    pub fn merge_cached_since(&self, port: u16, cursor: Option<&JournalCursor>) -> MergeSince {
+        merge_shards_since(
+            &self.slices_above(port, cursor),
+            self.tick_partial(port),
+            cursor,
+        )
+    }
+
+    /// [`Self::slices_for`], but each shard carries only the entries **above** that shard's
+    /// cursor position.
+    ///
+    /// A one-shot cursor read can afford `slices_for`, which clones every retained entry of every
+    /// shard; it happens once per request. A live tail cannot — it re-reads on every wake, for the
+    /// life of the connection, and the wake fires on any recording anywhere on this node. At the
+    /// default cap that is tens of thousands of `RecordedRequest` clones per wake to answer a
+    /// drain that is usually empty, which is enough to saturate a core per attached stream on a
+    /// busy node.
+    ///
+    /// The result is **identical**, not an approximation. `merge_shards_since` filters by exactly
+    /// this predicate anyway, so the emitted set cannot differ. The one derived value that reads
+    /// the entries is `held` (the highest seq a shard holds), and it is unchanged wherever it
+    /// matters: if any entry is above the position then the highest seq is among them, so the max
+    /// is the same; if none is, `held` degrades to `0` and the shard advances to
+    /// `max(position, evicted)` — which is what the full read computes too, since every entry it
+    /// would have seen is at or below the position. Watermarks, clear generations and space
+    /// generations are carried across untouched, so truncation detection is unaffected.
+    #[must_use]
+    fn slices_above(&self, port: u16, cursor: Option<&JournalCursor>) -> Vec<ShardSlice> {
+        let position_of = |node: NodeId| {
+            cursor
+                .and_then(|cursor| cursor.pos.get(&node).copied())
+                .unwrap_or(0)
+        };
+
+        let this_node = self.journal.node_id();
+        let mut slices = vec![ShardSlice {
+            node_id: this_node,
+            read: self.journal.read_shard_since(port, position_of(this_node)),
+        }];
+        slices.extend(
+            self.replicas
+                .read()
+                .iter()
+                .filter(|((_, replica_port), _)| *replica_port == port)
+                .map(|((node_id, _), cached)| {
+                    let position = position_of(*node_id);
+                    ShardSlice {
+                        node_id: *node_id,
+                        read: ShardRead {
+                            entries: cached
+                                .read
+                                .entries
+                                .iter()
+                                .filter(|entry| entry.seq > position)
+                                .cloned()
+                                .collect(),
+                            // The same max as `slices_for` (issue #340): the origin's watermark
+                            // raised by whatever this cache itself dropped under cap pressure.
+                            evicted_below_seq: cached
+                                .read
+                                .evicted_below_seq
+                                .max(cached.dropped_below_seq),
+                            clear_gen: cached.read.clear_gen,
+                            space_gens: cached.read.space_gens.clone(),
+                            count_slot: cached.read.count_slot,
+                        },
+                    }
+                }),
+        );
+        slices
+    }
+
+    /// The last tick's partial verdict for `port`; `false` until a tick has run.
+    ///
+    /// Absent is not "degraded": a single-node fleet never ticks against anyone, and a tail
+    /// attached before the first tick has no evidence of a problem. Reporting `true` there would
+    /// make every stream on a healthy one-voter cluster claim partial forever.
+    #[must_use]
+    fn tick_partial(&self, port: u16) -> bool {
+        self.tick_partial
+            .read()
+            .get(&port)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// This node's writer id — the shard a legacy scalar `?since=` is attributed to (issue #225).
@@ -746,6 +978,11 @@ impl JournalNet {
         let Some(node) = self.node() else { return };
         let ports = self.journal.known_ports();
         if ports.is_empty() {
+            // Symmetric with the no-peers return below (issue #348): there is nothing to be short
+            // about, so no port may keep a stale `true`. `known_ports` does not shrink today, so
+            // this is a guard rather than a live path — but an asymmetric pair here is exactly the
+            // shape that rots into a permanently degraded stream if it ever does.
+            self.tick_partial.write().clear();
             return;
         }
         let peers: Vec<NodeId> = node
@@ -756,6 +993,11 @@ impl JournalNet {
             .filter(|&id| id != node.id())
             .collect();
         if peers.is_empty() {
+            // A fleet of one has nobody to be short against, so any verdict left over from when
+            // it had peers is now false (issue #348). Not merely stale: a node whose peers all
+            // left the roster would otherwise stream `partial` forever, the streaming analogue of
+            // what `a_peer_that_left_the_roster_no_longer_degrades_the_read` pins for the read.
+            self.tick_partial.write().clear();
             return;
         }
 
@@ -815,24 +1057,44 @@ impl JournalNet {
         // responsible for losing, which must be counted too, not just the ones that errored.
         let mut answered: std::collections::HashSet<(NodeId, u16)> =
             std::collections::HashSet::new();
+        // This tick's verdict per port, for a live tail to stamp (issue #348). Seeded `false` for
+        // every port the tick covers, so a port that recovered this round is actively cleared
+        // rather than left holding the previous round's `true`.
+        let mut degraded: HashMap<u16, bool> = ports.iter().map(|&port| (port, false)).collect();
+        let mut merged_anything = false;
         let drained = tokio::time::timeout(ANTI_ENTROPY_BUDGET, async {
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok((peer, port, Some(reply))) => {
                         answered.insert((peer, port));
+                        // Read before the move, exactly as `pull_since_budgeted` does: the
+                        // content sense of `partial` (issue #349) rides this scalar, and
+                        // `merge_reply` takes the reply by value.
+                        let cached_min = reply.asker_cached_min;
+                        merged_anything |= !reply.entries.is_empty();
                         self.merge_reply(peer, port, reply);
+                        if self.lost_to_crash(cached_min, port) {
+                            degraded.insert(port, true);
+                        }
                     }
                     Ok((peer, port, None)) => {
                         // Already logged and counted inside the task, at whichever level fit
                         // the failure (a bad reply is a `warn`-worthy version-skew smell; an
                         // unreachable peer is the `debug`-level expected shape of a partition).
                         answered.insert((peer, port));
+                        degraded.insert(port, true);
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
                             "journal anti-entropy: peer pull task panicked"
                         );
+                        // Which `(peer, port)` died with it is unknowable — the task carried that
+                        // pair, and the join is what failed. Fail closed across the tick rather
+                        // than clear a port whose answer was actually lost.
+                        for value in degraded.values_mut() {
+                            *value = true;
+                        }
                     }
                 }
             }
@@ -849,9 +1111,17 @@ impl JournalNet {
                             "journal anti-entropy: peer pull lost to budget"
                         );
                         crate::metrics::journal_peer_pull_failure(&peer.to_string());
+                        degraded.insert(port, true);
                     }
                 }
             }
+        }
+
+        // Published after the merging is done, so a tail woken by `ticks` reads a verdict that
+        // already accounts for everything this round learned.
+        self.tick_partial.write().extend(degraded);
+        if merged_anything {
+            self.ticks.send_modify(|n| *n = n.wrapping_add(1));
         }
     }
 
@@ -1169,11 +1439,34 @@ impl JournalNet {
 /// the same lifecycle as `FlowNet::bind`'s spawn site — so the loop can never
 /// keep the net (and transitively the node) alive past shutdown; it exits the
 /// tick it discovers the net is gone.
+///
+/// A live SSE tail (issue #348) *does* hold a strong `Arc<JournalNet>` for as long as its client
+/// stays connected, so the upgrade above can keep succeeding after shutdown has begun. That is
+/// harmless — the net's own node slot is `Weak`, so `anti_entropy_tick` finds no node and returns
+/// immediately — but the "nothing outlives shutdown" reading of this comment is no longer true on
+/// its own, and the stream is the caller that changed it.
 pub fn spawn_anti_entropy(
     net: &Arc<JournalNet>,
     handle: &tokio::runtime::Handle,
     interval: Duration,
 ) {
+    // Recorded before the loop starts, so a stream that attaches immediately declares the cadence
+    // this fleet actually runs at rather than the compiled-in default (issue #348).
+    //
+    // A second call keeps the first interval, deliberately — same contract as [`JournalNet::bind`],
+    // and stated here because the failure mode is otherwise invisible: the loop would tick at the
+    // new interval while every `hello` kept declaring the old one, which is a quietly wrong
+    // latency promise rather than a loud error. There is one call site today (`compose.rs`, once
+    // per node), and it builds a fresh net each time, so this is a guard against a future
+    // double-spawn rather than a live case.
+    if net.tail_latency.set(interval).is_err() {
+        tracing::warn!(
+            existing_ms = net.tail_latency().as_millis(),
+            requested_ms = interval.as_millis(),
+            "journal anti-entropy respawned with a different cadence; streams keep declaring the \
+             first one"
+        );
+    }
     let net = Arc::downgrade(net);
     handle.spawn(async move {
         loop {
@@ -2515,6 +2808,281 @@ mod tests {
             let round: SinceReq =
                 serde_json::from_slice(&serde_json::to_vec(&req).expect("encode")).expect("decode");
             assert_eq!(round.asker, ASKER);
+        }
+    }
+
+    /// The live-tail gate (issue #348): the ordering a per-entry cursor needs, the fold that
+    /// produces it, and the reconnect property the two exist to give.
+    mod live_tail {
+        use super::*;
+
+        /// The defect this whole reordering exists to prevent, pinned directly.
+        ///
+        /// `merge_shards` sorts by the request timestamp, so a shard whose seqs were assigned in
+        /// the opposite order to their timestamps comes back out of sequence. Folding a per-entry
+        /// cursor over *that* order advances the shard past the lower seq and loses it forever.
+        #[test]
+        fn stream_order_puts_each_shard_in_seq_order_even_when_timestamps_invert() {
+            // Node 1 records seq 1 late and seq 2 early — the concurrent-request inversion.
+            let slices = vec![
+                slice(
+                    1,
+                    vec![
+                        entry(1, 1, "2026-01-01T00:00:09Z"),
+                        entry(1, 2, "2026-01-01T00:00:01Z"),
+                    ],
+                ),
+                slice(2, vec![entry(2, 1, "2026-01-01T00:00:05Z")]),
+            ];
+            let raw = merge_shards_since(&slices, false, None).entries;
+            assert_eq!(
+                raw.iter().map(|e| (e.node_id, e.seq)).collect::<Vec<_>>(),
+                vec![(1, 2), (2, 1), (1, 1)],
+                "precondition: the merge really does emit node 1 out of seq order here — if this \
+                 ever stops being true, `stream_order` is still required but this test is vacuous"
+            );
+
+            let ordered = stream_order(raw);
+            assert_eq!(
+                ordered
+                    .iter()
+                    .map(|e| (e.node_id, e.seq))
+                    .collect::<Vec<_>>(),
+                vec![(2, 1), (1, 1), (1, 2)],
+                "node 1 is back in seq order (1 before 2), and the cross-shard interleave still \
+                 goes by timestamp — node 2 leads because its head (05) predates node 1's (09)"
+            );
+        }
+
+        /// The negative half of the test above: folding the *raw* merge order loses an entry.
+        ///
+        /// Without this, deleting [`stream_order`] and streaming `merge_shards_since`'s order
+        /// directly would leave every other test in this module green — the proptest included,
+        /// since it folds over whatever order it is given. This is the one test that fails when
+        /// the reordering goes away, so it is what keeps the rest of them honest.
+        #[test]
+        fn folding_a_cursor_over_the_raw_merge_order_would_lose_an_entry() {
+            let slices = vec![slice(
+                1,
+                vec![
+                    entry(1, 1, "2026-01-01T00:00:09Z"),
+                    entry(1, 2, "2026-01-01T00:00:01Z"),
+                ],
+            )];
+
+            let raw = merge_shards_since(&slices, false, None).entries;
+            // Raw order is (1,2) then (1,1): the timestamps invert the seqs.
+            let mut cursor = JournalCursor::start();
+            cursor = advanced_by(&cursor, &raw[0]);
+
+            let remainder = merge_shards_since(&slices, false, Some(&cursor)).entries;
+            assert!(
+                remainder.is_empty(),
+                "streaming the raw order would advance node 1 to seq 2 after ONE event, so seq 1 \
+                 is never delivered and never will be — the silent loss `stream_order` prevents"
+            );
+
+            // The same disconnect point, through the order the stream actually emits.
+            let ordered = stream_order(merge_shards_since(&slices, false, None).entries);
+            let resumed = advanced_by(&JournalCursor::start(), &ordered[0]);
+            let remainder =
+                stream_order(merge_shards_since(&slices, false, Some(&resumed)).entries);
+            assert_eq!(
+                remainder.iter().map(|e| e.seq).collect::<Vec<_>>(),
+                vec![2],
+                "and through `stream_order` the second entry is still owed, and still arrives"
+            );
+        }
+
+        #[test]
+        fn advanced_by_advances_only_the_entrys_own_shard_and_never_rewinds() {
+            let cursor = JournalCursor {
+                generation: 7,
+                pos: [(1, 4), (2, 9)].into_iter().collect(),
+            };
+
+            let forward = advanced_by(&cursor, &entry(1, 5, "t"));
+            assert_eq!(
+                forward.pos.get(&1),
+                Some(&5),
+                "the entry's own shard advances"
+            );
+            assert_eq!(
+                forward.pos.get(&2),
+                Some(&9),
+                "every other shard is untouched"
+            );
+            assert_eq!(
+                forward.generation, 7,
+                "generation is carried, never invented"
+            );
+
+            let backward = advanced_by(&cursor, &entry(1, 2, "t"));
+            assert_eq!(
+                backward.pos.get(&1),
+                Some(&4),
+                "a lower seq must not rewind the mark — that would re-deliver what was already sent"
+            );
+
+            let joining = advanced_by(&cursor, &entry(3, 1, "t"));
+            assert_eq!(
+                joining.pos.get(&3),
+                Some(&1),
+                "a shard absent from the cursor enters at the emitted entry"
+            );
+        }
+
+        /// **The reconnect guarantee.** For any slice set and any point a client could disconnect,
+        /// resuming from the `id:` of the last event it received delivers exactly the events it
+        /// had not yet seen — no gap, no repeat.
+        ///
+        /// This is the cluster analogue of upstream's
+        /// `request_event_index_matches_savedrequests_cursor`, and it is what makes the live tail
+        /// and the `?since=` read one contract rather than two implementations that happen to
+        /// agree. Written as a property rather than an example because the failure mode it guards
+        /// is order-dependent: it needs a timestamp/seq inversion in a specific place, which is
+        /// exactly what a hand-written case is least likely to contain.
+        #[test]
+        fn resuming_from_any_stream_prefix_delivers_exactly_the_remainder() {
+            use proptest::prelude::*;
+
+            // Deliberately few distinct timestamps against many seqs: ties and inversions are the
+            // interesting region, and a wide timestamp range would make them vanishingly rare.
+            let shard = prop::collection::vec((1u64..=6, 0u64..=3), 0..7);
+            let slices_strategy = prop::collection::vec(shard, 1..4);
+
+            proptest!(|(shards in slices_strategy)| {
+                let slices: Vec<ShardSlice> = shards
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entries)| {
+                        let node = u64::try_from(index).expect("test node index fits") + 1;
+                        let mut seen = std::collections::BTreeSet::new();
+                        let entries = entries
+                            .iter()
+                            // A shard cannot issue one seq twice; dedupe rather than reject, so
+                            // the generator keeps its full range of shapes.
+                            .filter(|(seq, _)| seen.insert(*seq))
+                            .map(|(seq, stamp)| entry(node, *seq, &format!("t{stamp}")))
+                            .collect();
+                        slice(node, entries)
+                    })
+                    .collect();
+
+                let full = stream_order(merge_shards_since(&slices, false, None).entries);
+                let key = |e: &ShardEntry| (e.node_id, e.seq);
+
+                for split in 0..=full.len() {
+                    // Fold the cursor exactly as the stream does: one `advanced_by` per event
+                    // actually delivered, starting from the reader's initial position.
+                    let mut resumed = JournalCursor::start();
+                    for delivered in &full[..split] {
+                        resumed = advanced_by(&resumed, delivered);
+                    }
+
+                    let remainder = stream_order(
+                        merge_shards_since(&slices, false, Some(&resumed)).entries,
+                    );
+
+                    prop_assert_eq!(
+                        remainder.iter().map(key).collect::<Vec<_>>(),
+                        full[split..].iter().map(key).collect::<Vec<_>>(),
+                        "reconnecting after {} of {} events must deliver the rest exactly once",
+                        split,
+                        full.len()
+                    );
+                }
+            });
+        }
+
+        /// A cursor read and a tail over the same slices must not disagree about what they hold —
+        /// they are the same walk, and this is what keeps them so.
+        #[test]
+        fn merge_cached_since_is_the_cursor_walk_over_whatever_the_cache_holds() {
+            let journal = ClusterJournal::new(1);
+            journal.record_indexed(9000, "flow", req_at("t1", "/a"));
+            journal.record_indexed(9000, "flow", req_at("t2", "/b"));
+            let net = JournalNet::new(journal);
+
+            let cached = net.merge_cached_since(9000, None);
+            let direct = merge_shards_since(&net.slices_for(9000), false, None);
+
+            assert_eq!(
+                cached.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+                direct.entries.iter().map(|e| e.seq).collect::<Vec<_>>()
+            );
+            assert_eq!(cached.next.encode(), direct.next.encode());
+
+            // The claim `slices_above` makes in its own doc — that reading only above the cursor
+            // is *identical* to reading everything and filtering, not merely close enough. The
+            // interesting position is one that withholds some entries but not all, and the one
+            // past the end, where `held` degrades to 0 and must still not rewind the token.
+            for position in 0..=3 {
+                let cursor = JournalCursor {
+                    generation: 0,
+                    pos: [(1, position)].into_iter().collect(),
+                };
+                let above = net.merge_cached_since(9000, Some(&cursor));
+                let whole = merge_shards_since(&net.slices_for(9000), false, Some(&cursor));
+                assert_eq!(
+                    above.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+                    whole.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+                    "the emitted set must not depend on how much was read, at position {position}"
+                );
+                assert_eq!(
+                    above.next.encode(),
+                    whole.next.encode(),
+                    "nor may the next token, at position {position}"
+                );
+                assert_eq!(above.truncated, whole.truncated, "nor truncation");
+            }
+            assert!(
+                !cached.partial,
+                "a node that has never ticked against a peer has no evidence of being short"
+            );
+        }
+
+        /// The stream declares the cadence the fleet is actually running at, not the constant.
+        #[test]
+        fn tail_latency_reports_the_cadence_the_loop_was_started_with() {
+            let net = JournalNet::new(ClusterJournal::new(1));
+            assert_eq!(
+                net.tail_latency(),
+                DEFAULT_ANTI_ENTROPY_INTERVAL,
+                "unset before the loop is spawned, so a tail still declares something honest"
+            );
+
+            let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+            spawn_anti_entropy(&net, runtime.handle(), Duration::from_millis(250));
+            assert_eq!(net.tail_latency(), Duration::from_millis(250));
+        }
+
+        /// An append must wake a live reader; that is the whole point of the channel.
+        #[test]
+        fn recording_an_entry_wakes_a_reader_watching_the_journal() {
+            let journal = ClusterJournal::new(1);
+            let mut changes = journal.changes();
+            assert!(
+                !changes
+                    .has_changed()
+                    .expect("sender outlives this receiver"),
+                "nothing recorded yet"
+            );
+
+            journal.record_indexed(9001, "flow", req_at("t1", "/a"));
+            assert!(
+                changes
+                    .has_changed()
+                    .expect("sender outlives this receiver"),
+                "a recorded entry has to be observable, or a tail only ever sees it on the next \
+                 anti-entropy tick"
+            );
+            changes.mark_unchanged();
+            assert!(
+                !changes
+                    .has_changed()
+                    .expect("sender outlives this receiver")
+            );
         }
     }
 }

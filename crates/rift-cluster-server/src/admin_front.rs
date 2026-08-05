@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, Limited, channel::Channel, combinators::BoxBody};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::service_fn;
@@ -77,7 +77,7 @@ use rift_cluster::decorate::{
     HEADER_BIND_FAILURES, HEADER_NEXT_INDEX, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION,
     HEADER_TRUNCATED, HEADER_WARNINGS,
 };
-use rift_cluster::stores::{JournalCursor, JournalNet};
+use rift_cluster::stores::{JournalCursor, JournalNet, advanced_by, stream_order};
 use rift_cluster::{
     ControlOutcome, ControlResponse, FLEET_SCOPE, NodeError, PullError, RaftNode,
     SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId,
@@ -420,6 +420,23 @@ pub(crate) enum Terminated {
     /// the vector cursor is what made a merged cursor read expressible at all, so the front door
     /// now terminates every requests-read that is not predicate-scoped.
     ReadSavedRequests(u16),
+    /// `GET /imposters/{port}/savedRequests/stream` with no `?match=` (issue #348): the live
+    /// sibling of [`Self::ReadSavedRequests`] — a merged, fleet-wide SSE tail instead of the
+    /// per-node proxy this path used to get.
+    ///
+    /// Only the canonical spelling, mirroring upstream's `stream_target`, which recognises
+    /// exactly this one. The `/admin/imposters/` alias above exists because *upstream itself*
+    /// serves the requests read under both spellings; it does not serve the stream under both, so
+    /// terminating a second spelling here would invent a route that answers 404 when proxied.
+    ///
+    /// `?match=` still proxies, for [`terminated_saved_requests`]'s reason verbatim (issue #223
+    /// review, B1): the merge path evaluates no predicates, so terminating a predicate-scoped
+    /// stream would answer with the whole fleet's requests instead of the caller's subset.
+    ///
+    /// `GET /events` is deliberately **not** here. It stays proxied per-node and FleetAdmin-gated
+    /// because its payload is tenant-unfiltered (`principal.rs`, issue #163 owns the filtering) —
+    /// the asymmetry is documented in Ch.7 and `docs/rift-cluster-server.md`.
+    StreamSavedRequests(u16),
     /// `DELETE` on the same two paths. Two different designs live under this one variant now,
     /// selected in `terminate` by whether `?match=` narrowed the request (issue #223 item 4's
     /// original design decision, B3, still holds for the scoped form):
@@ -536,6 +553,7 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::DeleteStubById(port, _)
         | Terminated::SetEnabled(port, _)
         | Terminated::ReadSavedRequests(port)
+        | Terminated::StreamSavedRequests(port)
         | Terminated::ClearSavedRequests(port)
         | Terminated::ClearSavedProxyResponses(port)
         | Terminated::SpaceTeardown(port, _)
@@ -579,6 +597,7 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::DeleteStubById(_, _)
         | Terminated::SetEnabled(_, _)
         | Terminated::ReadSavedRequests(_)
+        | Terminated::StreamSavedRequests(_)
         | Terminated::ClearSavedRequests(_)
         | Terminated::ClearSavedProxyResponses(_)
         | Terminated::SpaceTeardown(_, _)
@@ -733,6 +752,15 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
         // Both spellings are one handler upstream (`router.rs` maps `["requests"]` and
         // `["savedRequests"]` identically), so they classify identically here too (issue #223).
         [_, "requests" | "savedRequests"] => terminated_saved_requests(method, query, port),
+        // The live tail (issue #348). Exactly upstream's `stream_target` shape — `savedRequests`
+        // only, never `requests`, because that is the one spelling upstream's own classifier
+        // recognises. Anything else on this path (a non-GET, or a `?match=`-scoped tail) falls
+        // through to the proxy and keeps behaving precisely as it does today.
+        [_, "savedRequests", "stream"]
+            if *method == Method::GET && !has_query_param(query, "match") =>
+        {
+            Some(Terminated::StreamSavedRequests(port))
+        }
         // Only the DELETE terminates (issue #226): the clear must purge the fleet's
         // replicated claim markers, which no proxied engine call can reach. GET stays
         // proxied — the recorded-responses listing is upstream's own surface.
@@ -839,6 +867,10 @@ fn action_for(kind: &Terminated) -> Action {
         // rather than minting new ones keeps the audit action name identical to what the same
         // route was authorized under before it terminated here.
         Terminated::ReadSavedRequests(_) => Action::ImposterRead,
+        // The same action the proxied stream already resolves to: upstream classifies the
+        // per-port alias as a port-scoped `imposter.read` (`admin_api/authz.rs`), so
+        // terminating it changes no authorization posture at all (issue #348).
+        Terminated::StreamSavedRequests(_) => Action::ImposterRead,
         Terminated::ClearSavedRequests(_) => Action::SavedRequestsClear,
         // The same action upstream authorizes the identical route under (see the comment
         // above): the proxied path already landed on `SavedRequestsClear`, and terminating
@@ -2293,6 +2325,12 @@ async fn terminate(
         Terminated::ReadSavedRequests(port) => {
             return terminate_read_saved_requests(&state, port, req.uri().query()).await;
         }
+        // The live sibling of the read above, and it returns here for the same reason: nothing to
+        // commit, and none of the `If-Match`/`_rift.script`/loopback-render machinery applies to a
+        // response whose body is still being written when the handler returns (issue #348).
+        Terminated::StreamSavedRequests(port) => {
+            return terminate_stream_saved_requests(&state, port, req.headers());
+        }
         // Only the `?match=`-narrowed form diverts here (issue #223 item 4's original design,
         // B3 — #224 left it alone deliberately, see `terminate_clear_saved_requests`'s doc): a
         // scoped clear has no fleet-wide meaning, so it stays a local-only proxy stamped
@@ -2471,6 +2509,260 @@ async fn terminate_read_saved_requests(
         // become a 200 with nothing in it, which would read as "no requests ever recorded" to
         // whatever is asserting against this.
         Err(e) => internal(&format!("encoding the merged journal read: {e}")),
+    }
+}
+
+/// How often an idle stream emits `: ping`, matching upstream's `HEARTBEAT` exactly so a load
+/// balancer's idle timeout behaves the same clustered as it does single-node.
+const STREAM_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// Smallest gap between two drains of one stream. The append signal is journal-wide (one channel
+/// per journal, not per port), so recording on ANY imposter wakes every attached tail; without a
+/// floor here a busy node would have each tail re-merging back-to-back, overwhelmingly to produce
+/// empty pages for ports its client never asked about. Far below the anti-entropy cadence a tail
+/// declares, so it costs no visible latency.
+const STREAM_DRAIN_DEBOUNCE: Duration = Duration::from_millis(25);
+
+/// Write-side buffer for the SSE channel, upstream's `CHANNEL_BUFFER` verbatim. A client this far
+/// behind on the socket blocks the forwarder on `send_data`, which is what turns a slow reader
+/// into *its own* cursor stalling rather than into unbounded memory here.
+const STREAM_CHANNEL_BUFFER: usize = 16;
+
+/// One SSE frame. `id` is a cursor token rather than upstream's scalar bus seq — the one
+/// deliberate divergence in the framing, and the reason the tail and the `?since=` read are the
+/// same contract.
+fn sse_frame(event: &str, id: Option<&str>, data: &serde_json::Value) -> Bytes {
+    let mut frame = format!("event: {event}\n");
+    if let Some(id) = id {
+        frame.push_str(&format!("id: {id}\n"));
+    }
+    frame.push_str(&format!("data: {data}\n\n"));
+    Bytes::from(frame)
+}
+
+/// `GET /imposters/{port}/savedRequests/stream` with no `?match=` (issue #348) — the merged,
+/// fleet-wide live tail.
+///
+/// **Shape:** a cursor walk that never ends. Every wake re-runs `merge_cached_since` — the same
+/// `merge_shards_since` the `?since=` read runs — from the cursor this connection holds, emits
+/// whatever is new, and folds the cursor forward. Live tailing, a `Last-Event-ID` reconnect and a
+/// polled cursor read are therefore one code path, which is what makes "the `id:` after an event
+/// is the token a simultaneous cursor read would return" true by construction rather than by
+/// test.
+///
+/// **Latency is declared, not pretended away.** Local entries surface as soon as the journal's
+/// append signal fires. *Peer* entries cannot: they arrive in the replica cache on the
+/// anti-entropy cadence, and asking every peer per wake would multiply inter-node traffic by the
+/// number of attached clients. So the tail rides that cadence and says so — `hello` carries
+/// `clusterTailLatencyMs`, and the number is the interval the loop was actually started with.
+///
+/// **What is deliberately different from upstream's stream**, all additive per Ch.12's standing
+/// gate: `hello` carries `clusterTailLatencyMs` and `cursor` and omits upstream's scalar `seq`
+/// (a merged stream has no single bus position); `id:` is the vector cursor token; and `index` is
+/// emitted only for entries this node wrote — a peer's bare seq means nothing in this node's
+/// numbering, and offering it would invite a client to present another shard's position as a
+/// legacy scalar `?since=`.
+fn terminate_stream_saved_requests(
+    state: &Arc<FrontState>,
+    port: u16,
+    headers: &hyper::HeaderMap,
+) -> Response<FrontBody> {
+    let this_node = state.journal_net.node_id();
+    // A reconnect presents the id of the last event it actually received. Same acceptance as the
+    // read path's `?since=`, legacy scalar included, so a client can move between the two modes
+    // with one token — and the same typed 400 rather than a defaulted position, because
+    // defaulting either replays everything or silently skips it.
+    let resume = match headers.get("last-event-id") {
+        None => None,
+        Some(value) => {
+            let Ok(raw) = value.to_str() else {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    ErrorKind::BadData,
+                    "Last-Event-ID is not readable ASCII; expected a cursor token",
+                );
+            };
+            match JournalCursor::decode_or_legacy(raw, this_node) {
+                Ok(cursor) => Some(cursor),
+                Err(e) => {
+                    return typed_error(
+                        StatusCode::BAD_REQUEST,
+                        ErrorKind::BadData,
+                        &format!("Last-Event-ID is not a usable cursor: {e}"),
+                    );
+                }
+            }
+        }
+    };
+
+    let journal_net = Arc::clone(&state.journal_net);
+    let tail_latency = journal_net.tail_latency();
+
+    // Subscribed BEFORE the baseline position is read, and the order is load-bearing. `subscribe`
+    // marks a receiver as having already seen the channel's current value, so a recording that
+    // lands between the read and the subscribe would be above the baseline — owed to this client —
+    // yet leave no bump for it to wake on. The entry would then sit unsent until some later
+    // append, tick, or the cadence timer, which is exactly the "local entries surface immediately"
+    // promise below broken. Subscribing first can only cost a spurious first wake, which drains
+    // nothing and is free.
+    let mut appends = journal_net.journal_changes();
+    let mut ticks = journal_net.tick_changes();
+
+    // A plain connect is live-only: take the position a baseline cursor read would answer with and
+    // emit nothing for it. That is upstream's contract too — v1 never replays on connect, and a
+    // client that wants history polls the read. A reconnect instead starts from the presented
+    // token, so its first drain IS the catch-up, which is where zero-loss comes from.
+    let (mut cursor, mut drain_now) = match resume {
+        Some(cursor) => (cursor, true),
+        None => (journal_net.merge_cached_since(port, None).next, false),
+    };
+
+    let hello = serde_json::json!({
+        "engineVersion": rift_cluster_base::version(),
+        "types": ["requests"],
+        "port": port,
+        "clusterTailLatencyMs": u64::try_from(tail_latency.as_millis()).unwrap_or(u64::MAX),
+        "cursor": cursor.encode(),
+    });
+
+    let (mut tx, body) = Channel::<Bytes, hyper::Error>::new(STREAM_CHANNEL_BUFFER);
+
+    tokio::spawn(async move {
+        if tx
+            .send_data(sse_frame("hello", None, &hello))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut heartbeat = tokio::time::interval(STREAM_HEARTBEAT);
+        heartbeat.tick().await; // the immediate first tick, consumed so no ping fires now
+        // A floor under how often peer entries are looked for, even if no tick ever reports having
+        // merged anything new — the declared latency has to hold whether or not the cache moved.
+        let mut cadence = tokio::time::interval(tail_latency);
+        cadence.tick().await;
+        // Only transitions are announced, so a healthy stream stays silent and a degraded one says
+        // so exactly once until it recovers.
+        let mut declared_partial = false;
+
+        loop {
+            if drain_now {
+                drain_now = false;
+                let page = journal_net.merge_cached_since(port, Some(&cursor));
+
+                if page.truncated {
+                    // Upstream's `lagged` means "there is a gap; reconcile by polling", which is
+                    // precisely what truncation means here — entries this reader had not reached
+                    // were dropped by retention. Reusing the event name keeps one vocabulary.
+                    let frame = sse_frame(
+                        "lagged",
+                        None,
+                        &serde_json::json!({ "truncated": true, "cursor": page.next.encode() }),
+                    );
+                    if tx.send_data(frame).await.is_err() {
+                        return;
+                    }
+                }
+                if page.partial != declared_partial {
+                    declared_partial = page.partial;
+                    let frame = sse_frame(
+                        "partial",
+                        None,
+                        &serde_json::json!({ "partial": declared_partial }),
+                    );
+                    if tx.send_data(frame).await.is_err() {
+                        return;
+                    }
+                }
+
+                // `stream_order`, not the merge's own order: a per-event resumption token is only
+                // sound over a sequence that is per-shard seq-ascending, and the merge sorts by a
+                // request timestamp that can invert two of one shard's seqs. See its doc — folding
+                // over the raw order loses the lower seq permanently.
+                let entries = stream_order(page.entries);
+                let last = entries.len().saturating_sub(1);
+                for (index, entry) in entries.iter().enumerate() {
+                    cursor = advanced_by(&cursor, entry);
+                    // The final event of a drain carries the page's own token instead of the
+                    // running fold. The two agree about everything delivered; the page token
+                    // additionally covers what the shards hold but did not surface (evicted or
+                    // cleared ranges), which is exactly what makes a quiescent stream's last `id:`
+                    // equal to what a cursor read would answer. Mid-drain events keep the fold, so
+                    // a disconnect part-way through still resumes without a gap or a repeat.
+                    let id = if index == last {
+                        page.next.encode()
+                    } else {
+                        cursor.encode()
+                    };
+
+                    let mut data = serde_json::json!({
+                        "port": port,
+                        "flowId": entry.flow_id,
+                        "request": entry.request,
+                    });
+                    if entry.node_id == this_node {
+                        // Parity with the proxied single-node stream, which carries the local
+                        // journal index. Withheld for peer entries on purpose: that seq is a
+                        // position in *another* shard, and this field is what a client would hand
+                        // back as a legacy scalar `?since=`, where it would be read as ours.
+                        data["index"] = serde_json::json!(entry.seq);
+                    }
+                    if tx
+                        .send_data(sse_frame("request", Some(&id), &data))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // Adopt the page token even when the drain emitted nothing: it additionally covers
+                // ranges the shards no longer hold (evicted, or dropped by a clear generation), so
+                // a cursor left at the running fold would re-examine and re-reject them on every
+                // wake for the life of the connection.
+                cursor = page.next;
+                tokio::time::sleep(STREAM_DRAIN_DEBOUNCE).await;
+                continue;
+            }
+
+            tokio::select! {
+                // A local append is visible immediately; this is what keeps single-node latency
+                // indistinguishable from upstream's.
+                result = appends.changed() => {
+                    if result.is_err() {
+                        return; // the journal is gone: the node is shutting down
+                    }
+                    drain_now = true;
+                }
+                // A tick that merged something new — how peer entries arrive.
+                result = ticks.changed() => {
+                    if result.is_err() {
+                        return;
+                    }
+                    drain_now = true;
+                }
+                _ = cadence.tick() => drain_now = true,
+                _ = heartbeat.tick() => {
+                    if tx.send_data(Bytes::from_static(b": ping\n\n")).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    match Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        // Defeat proxy/response buffering so events reach the client immediately — upstream sets
+        // the same header for the same reason.
+        .header("X-Accel-Buffering", "no")
+        .body(body.boxed())
+    {
+        Ok(response) => response,
+        // Unreachable in practice (a static status and three static headers), but this file's rule
+        // is that a failure surfaces rather than becoming a wrong-status 200.
+        Err(e) => internal(&format!("building the savedRequests stream response: {e}")),
     }
 }
 
@@ -4183,6 +4475,10 @@ async fn build_mutation(
         Terminated::ReadSavedRequests(_) => Err(internal(
             "the merged journal read is served by terminate_read_saved_requests, not build_mutation",
         )),
+        // Same shape as the read above, and diverted in `terminate` for the same reason.
+        Terminated::StreamSavedRequests(_) => Err(internal(
+            "the merged journal tail is served by terminate_stream_saved_requests, not build_mutation",
+        )),
         // Only the **unscoped** form of the clear reaches here (issue #224): the `?match=`
         // narrowed form diverts to `terminate_clear_saved_requests` in `terminate` before
         // `build_mutation` is ever called (see that match arm's own comment), so `kind` is
@@ -5182,6 +5478,76 @@ mod tests {
                     Some(Terminated::TryImposter(_))
                 ),
                 "{method} {path} must not classify as a try"
+            );
+        }
+    }
+
+    /// The live tail (issue #348) terminates on exactly one path, one method, and only without a
+    /// predicate — everything else on or near it keeps proxying exactly as it does today.
+    #[test]
+    fn classify_terminates_exactly_the_saved_requests_stream() {
+        assert!(matches!(
+            classify(&Method::GET, "/imposters/4545/savedRequests/stream", None),
+            Some(Terminated::StreamSavedRequests(4545))
+        ));
+        assert!(
+            matches!(
+                classify(
+                    &Method::GET,
+                    "/imposters/4545/savedRequests/stream",
+                    Some("types=requests")
+                ),
+                Some(Terminated::StreamSavedRequests(4545))
+            ),
+            "an unrelated query parameter must not push the tail back onto the proxy"
+        );
+
+        for (method, path, query) in [
+            // `?match=` is a predicate the merge path never evaluates, so it keeps proxying —
+            // issue #223 review B1, verbatim. Terminating it would answer with the whole fleet's
+            // requests instead of the caller's scoped subset.
+            (
+                Method::GET,
+                "/imposters/4545/savedRequests/stream",
+                Some("match=method:GET"),
+            ),
+            // `GET /events` is the firehose: tenant-unfiltered, FleetAdmin-gated, and issue #163's
+            // to widen. It must never reach this front's terminator.
+            (Method::GET, "/events", None),
+            (Method::GET, "/events", Some("port=4545")),
+            // Only `savedRequests` has a stream upstream — `requests` does not, so terminating it
+            // would invent a route that 404s when proxied.
+            (Method::GET, "/imposters/4545/requests/stream", None),
+            // The `/admin/` alias exists for the read because upstream serves the read under both
+            // spellings. It does not serve the stream under both.
+            (
+                Method::GET,
+                "/admin/imposters/4545/savedRequests/stream",
+                None,
+            ),
+            // A stream is a read.
+            (Method::POST, "/imposters/4545/savedRequests/stream", None),
+            (Method::DELETE, "/imposters/4545/savedRequests/stream", None),
+            // Ports that are not ports, and neighbouring shapes.
+            (
+                Method::GET,
+                "/imposters/notaport/savedRequests/stream",
+                None,
+            ),
+            (Method::GET, "/imposters/70000/savedRequests/stream", None),
+            (
+                Method::GET,
+                "/imposters/4545/savedRequests/stream/more",
+                None,
+            ),
+            (Method::GET, "/imposters/4545/savedRequestsstream", None),
+        ] {
+            assert!(
+                !matches!(
+                    classify(&method, path, query),
+                    Some(Terminated::StreamSavedRequests(_))
+                ),
+                "{method} {path} (query {query:?}) must not classify as the merged tail"
             );
         }
     }
