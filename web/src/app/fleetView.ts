@@ -10,14 +10,26 @@ type FleetHealth = components["schemas"]["FleetHealth"];
 export type Degradation = "not-ready" | "draining" | "isolated" | "no-leader" | "evicted";
 
 export type FleetView = {
-  nodeId: number;
+  /*
+   * Node ids are STRINGS, all the way through.
+   *
+   * A raft id is a `u64` and the fleet screen renders it verbatim. Carried as a `number` it would
+   * be an IEEE-754 double, and every id above 2^53-1 silently rounds — the console displayed
+   * `3342140982834931000` for a node the fleet calls `3342140982834931156`. The wire now sends
+   * strings for exactly this reason, and nothing here may convert them back: `Number(id)` would
+   * reintroduce the defect one line from where it was fixed.
+   *
+   * `lastApplied` and `ringEpoch` stay numbers. They are magnitudes rather than identifiers, and a
+   * log index reaching 2^53 is not a reachable state.
+   */
+  nodeId: string;
   isLeader: boolean;
-  /** `null` when this node knows of no leader — an unknown, not a zero. */
-  leader: number | null;
+  /** `null` when this node knows of no leader — an unknown, not the id `"0"`. */
+  leader: string | null;
   lastApplied: number | null;
-  voters: number[];
+  voters: string[];
   ringEpoch: number;
-  ringMembers: number[];
+  ringMembers: string[];
   ready: boolean;
   state: FleetHealth["state"];
   pendingGates: string[];

@@ -72,9 +72,12 @@ async fn members_reports_this_nodes_view_of_the_cluster() {
     let client = client(Some(SECRET));
 
     let members = get(&client, fixture.addr, "/_cluster/members").await;
-    assert_eq!(members["node_id"], 1);
-    assert_eq!(members["voters"], serde_json::json!([1]));
-    assert_eq!(members["current_leader"], 1);
+    // Strings, not numbers: a raft id is a `u64` and JSON numbers are doubles wherever the reader
+    // is JavaScript, so an id above 2^53-1 arrives silently rounded. Asserting the string form is
+    // what keeps the wire encoding from regressing to one that cannot carry its own values.
+    assert_eq!(members["node_id"], "1");
+    assert_eq!(members["voters"], serde_json::json!(["1"]));
+    assert_eq!(members["current_leader"], "1");
     assert_eq!(members["is_leader"], true);
 }
 
@@ -132,7 +135,7 @@ async fn health_reports_readiness_and_the_ring() {
     assert_eq!(health["pending_gates"], serde_json::json!([]));
     assert_eq!(health["isolated"], false);
     // A single-node cluster's ring is itself, at the membership log index.
-    assert_eq!(health["ring"]["members"], serde_json::json!([1]));
+    assert_eq!(health["ring"]["members"], serde_json::json!(["1"]));
     assert!(
         health["ring"]["m_idx"].as_u64().is_some(),
         "ring epoch must be reported so nodes can be compared: {health}"

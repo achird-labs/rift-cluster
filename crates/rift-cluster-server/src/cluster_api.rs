@@ -218,14 +218,31 @@ pub fn routes(base: Router, slot: NodeSlot, readiness: Arc<Readiness>) -> Router
 /// RFC-006 §5.2) so the two ports answer from one code path rather than two
 /// implementations that a test has to keep honest — one implementation
 /// called twice cannot diverge.
+/// A raft node id, rendered as a **string**.
+///
+/// A `NodeId` is a `u64`. JSON numbers are IEEE-754 doubles wherever the reader is JavaScript, so
+/// every id above 2^53-1 is silently rounded on the way in: the console read `3342140982834931156`
+/// off the wire and displayed `3342140982834931000`. Not a formatting problem — a different node,
+/// presented as a complete answer, on the one screen whose job is to say which nodes are in the
+/// fleet. An operator pasting that into `curl` addresses nothing.
+///
+/// Ids are identifiers, never magnitudes: nothing sums or orders them, so a string costs nothing
+/// and is the only encoding that survives the round trip. `last_applied` and `m_idx` stay numbers
+/// deliberately — they ARE magnitudes, and a log index reaching 2^53 is not a reachable state.
+fn node_id(id: impl std::fmt::Display) -> serde_json::Value {
+    serde_json::Value::String(id.to_string())
+}
+
 pub(crate) fn members_body(node: &RaftNode) -> serde_json::Value {
     let status = node.status();
     serde_json::json!({
-        "node_id": status.node_id,
+        "node_id": node_id(status.node_id),
         "is_leader": status.is_leader,
-        "current_leader": status.current_leader,
+        // `null` stays `null`: "this node knows of no leader" is an absence, and rendering it as
+        // the string "0" would name node 0 as the leader.
+        "current_leader": status.current_leader.map(node_id),
         "last_applied": status.last_applied,
-        "voters": status.voters,
+        "voters": status.voters.iter().map(node_id).collect::<Vec<_>>(),
     })
 }
 
@@ -240,8 +257,10 @@ pub(crate) fn health_body(node: &RaftNode, readiness: &Readiness) -> serde_json:
         "pending_gates": readiness.pending(),
         "isolated": node.is_isolated(),
         "ring": {
+            // `m_idx` is an epoch counter — a magnitude, and small. The members are ids; see
+            // `node_id` for why those are strings.
             "m_idx": ring.m_idx(),
-            "members": ring.members(),
+            "members": ring.members().iter().map(node_id).collect::<Vec<_>>(),
         },
     })
 }
@@ -291,4 +310,47 @@ where
         let reported = report().and_then(|value| serde_json::to_vec(&value).map_err(handler_error));
         Box::pin(async move { reported })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::node_id;
+
+    /// The encoding property the whole change rests on: a `u64` id survives verbatim.
+    ///
+    /// `3342140982834931156` is the id that exposed this. It is not representable as an IEEE-754
+    /// double, so a client reading it as a JSON number gets `3342140982834931000` — a different
+    /// node, and one that does not exist. The console displayed exactly that.
+    #[test]
+    fn a_u64_id_beyond_two_to_the_53_survives_as_an_exact_string() {
+        assert_eq!(
+            node_id(3_342_140_982_834_931_156_u64),
+            serde_json::json!("3342140982834931156")
+        );
+
+        // The first integer a double cannot hold, so the test names the boundary rather than
+        // implying the problem starts somewhere vague.
+        assert_eq!(
+            node_id(9_007_199_254_740_993_u64),
+            serde_json::json!("9007199254740993")
+        );
+    }
+
+    /// The half a "renders as a string" assertion alone would miss: the string has to parse BACK.
+    #[test]
+    fn the_rendered_string_round_trips_to_the_same_u64() {
+        for id in [
+            0_u64,
+            1,
+            9_007_199_254_740_993,
+            3_342_140_982_834_931_156,
+            u64::MAX,
+        ] {
+            let rendered = node_id(id);
+            let text = rendered
+                .as_str()
+                .expect("a node id renders as a JSON string");
+            assert_eq!(text.parse::<u64>().expect("and parses back"), id);
+        }
+    }
 }

@@ -6,12 +6,24 @@ import { fleetView, viewConfidence } from "./fleetView.ts";
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
 
+/*
+ * Realistic raft ids, as strings.
+ *
+ * Every fixture here used to say `voters: [1, 2, 3]`. A single-digit id cannot round-trip wrong, so
+ * the defect these types now prevent — a `u64` above 2^53-1 silently rounded by `JSON.parse` — was
+ * unreachable from the fixtures even in principle. `A` is deliberately one that a double cannot
+ * hold: `Number("3342140982834931156")` is `3342140982834931000`.
+ */
+const A = "3342140982834931156";
+const B = "3481475601826307430";
+const C = "17445687154000629855";
+
 const THREE_NODE: FleetMembers = {
-  node_id: 1,
+  node_id: A,
   is_leader: true,
-  current_leader: 1,
+  current_leader: A,
   last_applied: 412,
-  voters: [1, 2, 3],
+  voters: [A, B, C],
 };
 
 const HEALTHY: FleetHealth = {
@@ -19,15 +31,15 @@ const HEALTHY: FleetHealth = {
   state: "ready",
   pending_gates: [],
   isolated: false,
-  ring: { m_idx: 7, members: [1, 2, 3] },
+  ring: { m_idx: 7, members: [A, B, C] },
 };
 
 const SINGLE_NODE: FleetMembers = {
-  node_id: 1,
+  node_id: A,
   is_leader: true,
-  current_leader: 1,
+  current_leader: A,
   last_applied: 9,
-  voters: [1],
+  voters: [A],
 };
 
 const SINGLE_HEALTHY: FleetHealth = {
@@ -35,20 +47,22 @@ const SINGLE_HEALTHY: FleetHealth = {
   state: "ready",
   pending_gates: [],
   isolated: false,
-  ring: { m_idx: 1, members: [1] },
+  ring: { m_idx: 1, members: [A] },
 };
 
 describe("fleetView on a healthy 3-node fleet", () => {
   const view = fleetView(THREE_NODE, HEALTHY);
 
   it("reports the fleet's identity from the schema'd fields", () => {
-    expect(view.nodeId).toBe(1);
+    // Compared against the string literals, not against `Number(...)` of them: a `toBe(Number(A))`
+    // here would pass while carrying the very rounding this change exists to stop.
+    expect(view.nodeId).toBe(A);
     expect(view.isLeader).toBe(true);
-    expect(view.leader).toBe(1);
+    expect(view.leader).toBe(A);
     expect(view.lastApplied).toBe(412);
-    expect(view.voters).toEqual([1, 2, 3]);
+    expect(view.voters).toEqual([A, B, C]);
     expect(view.ringEpoch).toBe(7);
-    expect(view.ringMembers).toEqual([1, 2, 3]);
+    expect(view.ringMembers).toEqual([A, B, C]);
   });
 
   it("is neither single-node nor degraded", () => {
@@ -100,7 +114,7 @@ describe("degraded detection", () => {
     // the readiness gates stay satisfied, and `state` stays `ready`. Without this the node reports
     // itself healthy while owning no part of the ring and receiving no further replication.
     const view = fleetView(
-      { node_id: 4, is_leader: false, current_leader: 1, last_applied: 400, voters: [1, 2, 3] },
+      { node_id: "9007199254740993", is_leader: false, current_leader: A, last_applied: 400, voters: [A, B, C] },
       HEALTHY,
     );
     expect(view.degraded).toContain("evicted");
@@ -112,9 +126,9 @@ describe("degraded detection", () => {
     // the same call, which only sorts and dedups — so within one snapshot they are the same set.
     // Comparing them across this view's two requests would report a sub-second read skew as a
     // persistent fleet degradation, which is a warning an operator can neither act on nor clear.
-    expect(fleetView(THREE_NODE, { ...HEALTHY, ring: { m_idx: 7, members: [1, 2] } }).degraded).toEqual([]);
+    expect(fleetView(THREE_NODE, { ...HEALTHY, ring: { m_idx: 7, members: [A, B] } }).degraded).toEqual([]);
     expect(
-      fleetView(THREE_NODE, { ...HEALTHY, ring: { m_idx: 8, members: [1, 2, 3, 4] } }).degraded,
+      fleetView(THREE_NODE, { ...HEALTHY, ring: { m_idx: 8, members: [A, B, C, "9007199254740993"] } }).degraded,
     ).toEqual([]);
   });
 

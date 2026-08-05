@@ -2,14 +2,18 @@ import { describe, expect, it } from "vitest";
 
 import { coverageFor, describeCoverage, page, readLog } from "./source.ts";
 
+const A = "3342140982834931156";
+const B = "3481475601826307430";
+const C = "17445687154000629855";
+
 const VIEW = {
-  nodeId: 3,
+  nodeId: C,
   isLeader: false,
-  leader: 1,
+  leader: A,
   lastApplied: 0,
-  voters: [1, 2, 3],
+  voters: [A, B, C],
   ringEpoch: 0,
-  ringMembers: [1, 2, 3],
+  ringMembers: [A, B, C],
   ready: true,
   state: "ready" as const,
   pendingGates: [],
@@ -22,7 +26,7 @@ describe("coverageFor", () => {
   it("names the node and counts the nodes it does not represent", () => {
     expect(coverageFor({ kind: "read", view: VIEW })).toEqual({
       kind: "per-node",
-      node: "3",
+      node: C,
       unrepresented: 2,
     });
   });
@@ -30,7 +34,7 @@ describe("coverageFor", () => {
   // A one-node fleet has nothing to be partial about; labelling it degraded would train operators
   // to ignore the label on the fleets where it matters.
   it("reports a single-node fleet as the whole fleet, not as a partial view", () => {
-    const single = { ...VIEW, voters: [3], ringMembers: [3], singleNode: true };
+    const single = { ...VIEW, voters: [C], ringMembers: [C], singleNode: true };
     expect(coverageFor({ kind: "read", view: single })).toEqual({ kind: "fleet" });
   });
 
@@ -40,10 +44,10 @@ describe("coverageFor", () => {
   // applied membership at all. Either way "0 other nodes are not represented" asserts complete
   // coverage from a node that has none.
   it("reports a multi-voter node whose ring shows no peers as unknown, not as zero others", () => {
-    const skewed = { ...VIEW, voters: [1, 2], ringMembers: [3], singleNode: false };
+    const skewed = { ...VIEW, voters: [A, B], ringMembers: [C], singleNode: false };
     expect(coverageFor({ kind: "read", view: skewed })).toEqual({
       kind: "per-node",
-      node: "3",
+      node: C,
       unrepresented: null,
     });
   });
@@ -64,8 +68,10 @@ describe("coverageFor", () => {
 
 describe("describeCoverage", () => {
   it("names the node and the count of nodes not represented", () => {
-    const text = describeCoverage({ kind: "per-node", node: "3", unrepresented: 2 });
-    expect(text).toContain("3");
+    const text = describeCoverage({ kind: "per-node", node: C, unrepresented: 2 });
+    // The label truncates a 20-digit id, so it carries the head rather than the whole value — what
+    // matters is that it names THIS node and not some rounded neighbour.
+    expect(text).toContain(C.slice(0, 10));
     expect(text).toContain("2");
   });
 
