@@ -9,6 +9,7 @@ import {
   defaultSelection,
   hasCatchAll,
   rowActionFor,
+  shadowingStubIndex,
   stubFromRequest,
 } from "./stubFromRequest.ts";
 
@@ -235,6 +236,36 @@ describe("the shadowing warning", () => {
   it("does not cry wolf over a stub that does have predicates", () => {
     expect(hasCatchAll([{ predicates: [{ equals: { path: "/a" } }], responses: RESPONSE }])).toBe(false);
     expect(hasCatchAll([])).toBe(false);
+  });
+
+  /*
+   * Issue #336's companion. Deliberately a different question from `hasCatchAll`, and the
+   * difference is the last-position case: a predicate-less stub with nothing after it matches
+   * everything but shadows nothing, and warning about it would fire on the most ordinary shape
+   * there is — a space-wide default. `hasCatchAll` answers "would a stub appended now be
+   * shadowed", where being last is exactly what matters.
+   */
+  it("names the position of a stub that actually shadows a later one", () => {
+    const catchAll = { responses: RESPONSE };
+    const specific = { predicates: [{ equals: { path: "/a" } }], responses: RESPONSE };
+    expect(shadowingStubIndex([catchAll, specific])).toBe(0);
+    expect(shadowingStubIndex([specific, catchAll, specific])).toBe(1);
+    // An explicit empty predicate list is the same shape as an absent one.
+    expect(shadowingStubIndex([{ predicates: [], responses: RESPONSE }, specific])).toBe(0);
+  });
+
+  it("does not warn when the catch-all shadows nothing", () => {
+    const catchAll = { responses: RESPONSE };
+    const specific = { predicates: [{ equals: { path: "/a" } }], responses: RESPONSE };
+    // Last position: it matches everything, but there is nothing after it to swallow.
+    expect(shadowingStubIndex([specific, catchAll])).toBeNull();
+    expect(shadowingStubIndex([catchAll])).toBeNull();
+    expect(shadowingStubIndex([specific, specific])).toBeNull();
+    expect(shadowingStubIndex([])).toBeNull();
+    // Off-the-wire junk must not take the screen down.
+    expect(shadowingStubIndex(null)).toBeNull();
+    expect(shadowingStubIndex({ stubs: [] })).toBeNull();
+    expect(shadowingStubIndex([null, specific])).toBeNull();
   });
 
   it("ignores junk in the stub list rather than throwing on it", () => {

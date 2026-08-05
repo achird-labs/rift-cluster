@@ -210,6 +210,45 @@ describe("a space's stubs are not the imposter's stubs", () => {
     expect(caveat.textContent).toMatch(/not the imposter's stubs/i);
   });
 
+  it("says when a space stub shadows the rest of its space", async () => {
+    /*
+     * Issue #336's companion. A predicate-less stub matching everything is correct Mountebank
+     * semantics, so nothing refuses it — but this table is addressed by position and has no ids,
+     * so "why is stub 1 not answering" has no visible cause without this banner. It is also the
+     * shape #336 could silently install before the upstream fix.
+     */
+    stubFetch(
+      healthy({
+        [SPACE_PATH]: {
+          json: {
+            space: FLOW,
+            stubs: [
+              { responses: [{ is: { statusCode: 200 } }] },
+              { predicates: [{ equals: { path: "/late" } }], responses: [{ is: { statusCode: 201 } }] },
+            ],
+            scenarios: [],
+          },
+        },
+      }),
+    );
+    renderScreen("viewer");
+
+    const warning = await screen.findByTestId("space-stub-shadow-warning");
+    expect(warning.textContent).toMatch(/matches every request in this space/i);
+    // Names the position, because position is the only handle this collection has.
+    expect(warning.textContent).toMatch(/\b0\b/);
+  });
+
+  it("does not warn when the catch-all is last and shadows nothing", async () => {
+    // `healthy()`'s default space is exactly this: one predicate-less stub, nothing after it. That
+    // is an ordinary space-wide default, and warning about it would be crying wolf.
+    stubFetch(healthy());
+    renderScreen("viewer");
+
+    await screen.findByTestId("space-stubs");
+    expect(screen.queryByTestId("space-stub-shadow-warning")).toBeNull();
+  });
+
   it("reports how many requests resolved to the space", async () => {
     stubFetch(healthy());
     renderScreen("viewer");
