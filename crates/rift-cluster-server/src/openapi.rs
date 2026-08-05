@@ -304,6 +304,9 @@ mod parity {
             Terminated::ClearSavedRequests(_) => {
                 RouteKey::new(&Method::DELETE, "/imposters/{port}/savedRequests")
             }
+            Terminated::SpaceTeardown(_, _) => {
+                RouteKey::new(&Method::DELETE, "/imposters/{port}/spaces/{flowId}")
+            }
             Terminated::PutRoutes => RouteKey::new(&Method::PUT, "/front-door/routes"),
             Terminated::DeleteRoute(_) => {
                 RouteKey::new(&Method::DELETE, "/front-door/routes/{routeId}")
@@ -386,6 +389,7 @@ mod parity {
             Terminated::SetEnabled(4545, false),
             Terminated::ReadSavedRequests(4545),
             Terminated::ClearSavedRequests(4545),
+            Terminated::SpaceTeardown(4545, "flow-1".to_owned()),
             Terminated::PutRoutes,
             Terminated::DeleteRoute("svc".to_owned()),
             Terminated::Tenancy(Route::TenantCreate),
@@ -477,7 +481,10 @@ mod parity {
             ("PUT", "/imposters/{port}/scenarios/{scenarioName}/state"),
             ("POST", "/imposters/{port}/scenarios/reset"),
             ("GET", "/imposters/{port}/spaces/{flowId}"),
-            ("DELETE", "/imposters/{port}/spaces/{flowId}"),
+            // NOT the DELETE (issue #224): the flow-state half stays proxied, but the journal
+            // half now commits `ControlOp::JournalClearGen` alongside it, so `classify` and
+            // `contract_route` both treat the whole route as terminated —
+            // `Terminated::SpaceTeardown` in `ee_served_routes` covers it.
             ("GET", "/imposters/{port}/spaces/{flowId}/stubs"),
             ("POST", "/imposters/{port}/spaces/{flowId}/stubs"),
             ("DELETE", "/admin/imposters/{port}/flow-state/{flowId}"),

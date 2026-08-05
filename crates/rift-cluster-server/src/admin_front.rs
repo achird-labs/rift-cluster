@@ -419,11 +419,26 @@ pub(crate) enum Terminated {
     /// a scalar cursor cannot address a multi-writer merge, so that half of the route is #225's
     /// territory and `classify` falls it straight through.
     ReadSavedRequests(u16),
-    /// `DELETE` on the same two paths (issue #223 item 4). Explicitly transitional: clears this
-    /// node locally through the existing proxy path, then best-effort fans the same clear out to
-    /// every other roster peer — see [`rift_cluster::stores::JournalNet::clear_peers`]'s doc for
-    /// why, and #224 for what replaces it.
+    /// `DELETE` on the same two paths. Two different designs live under this one variant now,
+    /// selected in `terminate` by whether `?match=` narrowed the request (issue #223 item 4's
+    /// original design decision, B3, still holds for the scoped form):
+    ///
+    /// - **Unscoped** (no `?match=`, issue #224): a Raft-committed `ControlOp::JournalClearGen`
+    ///   with `space: None` — see `build_mutation`. This replaced the pre-#224 fan-out over the
+    ///   cluster RPC port entirely; that mechanism (`JournalNet::clear_peers`) no longer exists.
+    /// - **Scoped** (`?match=` present): unchanged from #223 — a local-only proxy to the local
+    ///   engine, always stamped `Rift-Cluster-Partial: true`, never a Raft write. See
+    ///   `terminate_clear_saved_requests`'s own doc for why this half was deliberately left alone.
     ClearSavedRequests(u16),
+    /// `DELETE /imposters/{port}/spaces/{flow}` (issue #224): a space teardown has two
+    /// independent halves. The *flow-state* half — already clustered via `ClusteredFlowStore` —
+    /// stays exactly what it was: proxied to the local engine, untouched by this issue. The
+    /// *journal* half is what #224 adds: after a successful proxied teardown,
+    /// `terminate_space_teardown` additionally commits `ControlOp::JournalClearGen { space:
+    /// Some(flow), .. }` through Raft, the space-scoped sibling of the unscoped
+    /// `ClearSavedRequests` commit above. Not routed through `build_mutation` — there is no
+    /// loopback path to `FetchAfter`/`Captured` render from; the response is the proxy's own.
+    SpaceTeardown(u16, String),
     /// Whole-table replace of the front door's route table (issue #131).
     /// There is no upstream `/front-door/routes` to proxy to (U-11's admin
     /// CRUD was deferred), so this is provided here, not there.
@@ -493,7 +508,8 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::DeleteStubById(port, _)
         | Terminated::SetEnabled(port, _)
         | Terminated::ReadSavedRequests(port)
-        | Terminated::ClearSavedRequests(port) => Some(*port),
+        | Terminated::ClearSavedRequests(port)
+        | Terminated::SpaceTeardown(port, _) => Some(*port),
         Terminated::Create
         | Terminated::ReplaceAllImposters
         | Terminated::DeleteAllImposters
@@ -530,6 +546,7 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::SetEnabled(_, _)
         | Terminated::ReadSavedRequests(_)
         | Terminated::ClearSavedRequests(_)
+        | Terminated::SpaceTeardown(_, _)
         | Terminated::PutRoutes
         | Terminated::DeleteRoute(_)
         // Resource routes: the id names a record *within* the caller's
@@ -666,6 +683,14 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
         // Both spellings are one handler upstream (`router.rs` maps `["requests"]` and
         // `["savedRequests"]` identically), so they classify identically here too (issue #223).
         [_, "requests" | "savedRequests"] => terminated_saved_requests(method, query, port),
+        // `DELETE /imposters/{port}/spaces/{flow}` (issue #224): exactly the two-segment shape
+        // upstream's own router matches for `ImposterRoute::Space` (`["spaces", flow_id]` —
+        // `SpaceStubs`'s three-segment `["spaces", flow_id, "stubs"]` is a different route and a
+        // write, not a delete, so it falls through here untouched). Every other method on this
+        // shape stays proxied exactly as before — only the delete gets a journal half to commit.
+        [_, "spaces", flow] if *method == Method::DELETE && !flow.is_empty() => {
+            Some(Terminated::SpaceTeardown(port, (*flow).to_owned()))
+        }
         [_, "stubs"] => match *method {
             Method::POST => Some(Terminated::AddStub(port)),
             Method::PUT => Some(Terminated::ReplaceStubs(port)),
@@ -735,6 +760,11 @@ fn action_for(kind: &Terminated) -> Action {
         // route was authorized under before it terminated here.
         Terminated::ReadSavedRequests(_) => Action::ImposterRead,
         Terminated::ClearSavedRequests(_) => Action::SavedRequestsClear,
+        // Exactly upstream's own mapping for this shape (`principal::map_action`'s
+        // `has_space && !is_flow_state` arm, the proxied path's identical route used before
+        // this terminated): a space teardown is the Operator-tier "disturb" sibling of
+        // `FlowStateClear`, distinguished by the canonical (non-`/admin/imposters/`) prefix.
+        Terminated::SpaceTeardown(_, _) => Action::SpaceTeardown,
         // The front-door route table (issue #131) predates RFC-002 and has no
         // action of its own in its closed §4.1 list. Treated as an ordinary
         // imposter-tier config write pending a dedicated action.
@@ -2162,15 +2192,31 @@ async fn terminate(
             )
             .await;
         }
-        // Neither is a `ControlOp`: a merge-on-read has nothing to commit, and the transitional
-        // clear (issue #223 item 4, #224's territory once it lands) fans out over the cluster RPC
-        // port rather than the Raft log. Both return here for the same reason the source surface
-        // does — none of the `If-Match`/`_rift.script`/loopback-render machinery below applies.
+        // A merge-on-read has nothing to commit, so it returns here for the same reason the
+        // source surface does — none of the `If-Match`/`_rift.script`/loopback-render machinery
+        // below applies.
         Terminated::ReadSavedRequests(port) => {
             return terminate_read_saved_requests(&state, port).await;
         }
-        Terminated::ClearSavedRequests(port) => {
-            return terminate_clear_saved_requests(&state, req, port, &tenant).await;
+        // Only the `?match=`-narrowed form diverts here (issue #223 item 4's original design,
+        // B3 — #224 left it alone deliberately, see `terminate_clear_saved_requests`'s doc): a
+        // scoped clear has no fleet-wide meaning, so it stays a local-only proxy stamped
+        // `Rift-Cluster-Partial`, never a Raft write. The **unscoped** form falls through this
+        // match (to `_ => {}` below) into the ordinary terminated-write pipeline instead — as of
+        // #224 it commits `ControlOp::JournalClearGen` through Raft like any other write, so it
+        // needs exactly the machinery this early return exists to skip.
+        Terminated::ClearSavedRequests(_) if has_query_param(req.uri().query(), "match") => {
+            return terminate_clear_saved_requests(&state, req, &tenant).await;
+        }
+        // Two independent halves (issue #224): the flow-state teardown proxies exactly as
+        // before this issue, and the journal-generation commit happens alongside it inside
+        // `terminate_space_teardown` itself. Diverted here for the same reason the source
+        // writes and the tenancy surface are — neither half fits `build_mutation`'s single-op,
+        // loopback-rendered shape, and there is nothing to `FetchAfter`/`Captured` from for a
+        // route with no state-machine record of its own.
+        Terminated::SpaceTeardown(port, flow) => {
+            return terminate_space_teardown(&state, &node, req, port, flow, &tenant, principal_id)
+                .await;
         }
         _ => {}
     }
@@ -2279,52 +2325,128 @@ async fn terminate_read_saved_requests(state: &Arc<FrontState>, port: u16) -> Re
     }
 }
 
-/// `DELETE /imposters/{port}/requests|savedRequests` (issue #223 item 4): clear this node's own
-/// journal through the same proxy path the route used before it classified here — the local
-/// engine's clear already resets its own request count and honours `?match=`, and nothing about
-/// that needs to change — then best-effort fan the same clear out to every other roster peer,
-/// **unless `?match=` narrowed this clear**.
+/// `DELETE /imposters/{port}/requests|savedRequests` **with `?match=`** (issue #223 item 4's
+/// original design, B3 — reachable only for the scoped form as of issue #224; see
+/// `Terminated::ClearSavedRequests`'s own doc for where the unscoped form went).
 ///
-/// Design decision (issue #223 review, B3): a `?match=` clear stays **local-only**. The wire
-/// [`rift_cluster::stores::ClearReq`] carries only a port — there is nowhere on it to carry a
-/// match predicate — so fanning a scoped clear out over that wire would land on every peer as an
-/// *unconditional full* clear, over-deleting whatever else that port holds on every other node
-/// (a different flow, a different tenant's traffic sharing the port). That is strictly worse than
-/// not fanning out at all, so this clear is knowingly not fleet-wide and says so:
-/// `Rift-Cluster-Partial: true` is stamped unconditionally — not because a peer was unreachable,
-/// but because the clear itself never reached them by design — so a client cannot mistake a
-/// scoped, local clear for a fleet-complete one. #224 replaces the whole mechanism with a
-/// Raft-committed clear that can carry a real predicate; until then this is what keeps the
-/// dishonest case (peers silently keeping their own copies of what looked like a full delete)
-/// from ever answering unstamped.
-///
-/// See [`rift_cluster::stores::JournalNet::clear_peers`]'s doc for what "best-effort" means on the
-/// unscoped path this falls back to.
+/// Design decision (issue #223 review, B3), unchanged by #224: a `?match=` clear stays
+/// **local-only**, proxied to the local engine exactly as any other proxied write is, and always
+/// stamped `Rift-Cluster-Partial: true`. #224 gave the *unscoped* clear a wire format that can
+/// carry real fleet-wide meaning (a Raft-committed generation bump) — but the wire a scoped clear
+/// would need is a different, harder problem this issue does not solve: `ControlOp::JournalClearGen`
+/// carries a `space`, not an arbitrary match predicate, so a `?match=` filter (an SDK's own
+/// `flowId`/method/path clause) has nowhere to travel that isn't either dropped or misrepresented
+/// as a full-space clear. Committing the wrong, wider thing would be worse than staying local: a
+/// client that asked to clear ten of a space's two hundred entries would find all two hundred
+/// gone fleet-wide instead. So this stays exactly what B3 shipped it as — a local, honestly
+/// partial clear — until a predicate-carrying op is designed for it.
 async fn terminate_clear_saved_requests(
     state: &Arc<FrontState>,
     req: Request<Incoming>,
-    port: u16,
     tenant: &TenantId,
 ) -> Response<FrontBody> {
-    let scoped = has_query_param(req.uri().query(), "match");
     let mut response = proxy(Arc::clone(state), req, Some(tenant)).await;
+    // Stamped only for a clear the local engine actually performed: a 404/409/etc. means nothing
+    // was cleared on this node, and claiming a scoped-but-honest partial regardless would attach
+    // the header to a request that never actually cleared anything.
+    if response.status().is_success() {
+        set_header(&mut response, HEADER_PARTIAL, "true");
+    }
+    response
+}
+
+/// `DELETE /imposters/{port}/spaces/{flow}` (issue #224): proxy the flow-state teardown exactly
+/// as this route always has — it is already clustered via `ClusteredFlowStore`, and #224 does not
+/// touch that half — then, only if that teardown actually happened, additionally commit
+/// `ControlOp::JournalClearGen { space: Some(flow), .. }` through Raft so every node's own
+/// journal starts dropping that space's pre-clear entries too, the space-scoped sibling of what
+/// the unscoped `savedRequests` clear now commits for a whole port.
+///
+/// Ordering mirrors `terminate_clear_saved_requests`'s own "only act on a clear that really
+/// happened" rule: a proxy failure means the flow-state store was never touched, so there is
+/// nothing for the journal half to record either. The reverse failure — proxy succeeds but the
+/// commit does not — is answered as an error rather than swallowed (this file's production rule:
+/// a failed commit must surface, never a silent 200), even though the flow-state half has by then
+/// already torn down; there is no atomic way to straddle a proxied side effect and a Raft write,
+/// and reporting the honest partial failure is better than hiding it behind the proxy's own 200.
+async fn terminate_space_teardown(
+    state: &Arc<FrontState>,
+    node: &Arc<RaftNode>,
+    req: Request<Incoming>,
+    port: u16,
+    flow: String,
+    tenant: &TenantId,
+    principal_id: Option<String>,
+) -> Response<FrontBody> {
+    let response = proxy(Arc::clone(state), req, Some(tenant)).await;
     if !response.status().is_success() {
-        // Only fan out (or stamp partial for) a clear the local engine actually performed: a
-        // 404/409/etc. here means nothing was cleared on this node either, and propagating "clear
-        // this port" to peers, or claiming a scoped-but-honest partial, regardless would attach
-        // fan-out side effects to a request that never actually cleared anything locally.
         return response;
     }
-    if scoped {
-        set_header(&mut response, HEADER_PARTIAL, "true");
-        return response;
+    let op = ControlOp::JournalClearGen {
+        tenant: tenant.clone(),
+        port,
+        space: Some(flow),
+    };
+    // `validate` first, like every other write on this front — a refusal here would be this
+    // function's own bug (the op is built from an already-authorized, already-proxied request),
+    // but the R4 order (validate, park durably, submit) is kept uniform rather than special-cased
+    // away for the one write that "shouldn't" need it.
+    if let Err(reason) = control::validate(&op) {
+        return refusal_response(&reason);
     }
-    if state
-        .journal_net
-        .clear_peers(port, JOURNAL_PEER_BUDGET)
-        .await
-    {
-        set_header(&mut response, HEADER_PARTIAL, "true");
+    let op_id = Uuid::new_v4();
+    let request = mint(op_id, op, None, principal_id);
+    if let Err(e) = node.park_intent(&request) {
+        return typed_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorKind::InternalError,
+            &format!(
+                "flow-state teardown succeeded but the journal clear could not be durably accepted: {e}"
+            ),
+        );
+    }
+    let committed = match tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await {
+        Err(_) => {
+            node.request_replay();
+            let mut error = typed_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                ErrorKind::Timeout,
+                "flow-state teardown succeeded but the journal clear did not commit within the \
+                 deadline; parked for replay",
+            );
+            set_header(&mut error, HEADER_OP_ID, &op_id.to_string());
+            return error;
+        }
+        Ok(Err(NodeError::Unavailable(detail))) => {
+            node.request_replay();
+            let mut error = typed_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorKind::Unavailable,
+                &format!(
+                    "flow-state teardown succeeded but the journal clear found no quorum/leader \
+                     (parked for replay): {detail}"
+                ),
+            );
+            set_header(&mut error, HEADER_OP_ID, &op_id.to_string());
+            return error;
+        }
+        Ok(Err(e)) => {
+            node.request_replay();
+            let mut error = typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorKind::InternalError,
+                &format!("flow-state teardown succeeded but the journal clear failed: {e}"),
+            );
+            set_header(&mut error, HEADER_OP_ID, &op_id.to_string());
+            return error;
+        }
+        Ok(Ok(response)) => response,
+    };
+    if let Err(e) = node.unpark_intent(&op_id) {
+        tracing::error!(%op_id, error = %e, "op terminal but could not unpark");
+    }
+    if let ControlOutcome::Failed { reason } = &committed.outcome {
+        return refusal_response(reason);
     }
     response
 }
@@ -3448,14 +3570,37 @@ async fn build_mutation(
         Terminated::SourcePut | Terminated::SourceDelete(_) | Terminated::SourcePull(_) => Err(
             internal("source writes are served by terminate_source_write, not build_mutation"),
         ),
-        // Same shape again: neither is a `ControlOp` at all — the merged read has nothing to
-        // commit, and the transitional clear fans out over the cluster RPC port rather than the
-        // Raft log — and both divert to their own `terminate_*` handler before this is reached.
+        // Not a `ControlOp` at all — the merged read has nothing to commit — and diverts to its
+        // own `terminate_*` handler before this is ever reached.
         Terminated::ReadSavedRequests(_) => Err(internal(
             "the merged journal read is served by terminate_read_saved_requests, not build_mutation",
         )),
-        Terminated::ClearSavedRequests(_) => Err(internal(
-            "the journal clear fan-out is served by terminate_clear_saved_requests, not build_mutation",
+        // Only the **unscoped** form of the clear reaches here (issue #224): the `?match=`
+        // narrowed form diverts to `terminate_clear_saved_requests` in `terminate` before
+        // `build_mutation` is ever called (see that match arm's own comment), so `kind` is
+        // always the port-wide clear here, never the scoped one.
+        Terminated::ClearSavedRequests(port) => Ok(Mutation {
+            ops: vec![ControlOp::JournalClearGen {
+                tenant: tenant.clone(),
+                port,
+                space: None,
+            }],
+            port: Some(port),
+            // Byte-identical to what upstream's own `handle_clear_requests` answers with
+            // (`handle_get(port, ...)`, the imposter's own `GET` representation) — a re-render,
+            // not a canned message, is what "re-render the imposter as upstream does" means here.
+            render: Render::FetchAfter {
+                path: format!("/imposters/{port}"),
+                status: StatusCode::OK,
+            },
+        }),
+        // Neither half of a space teardown is a single `ControlOp` `build_mutation` can render
+        // the normal way: the flow-state half is a proxy, not a state-machine record with a
+        // loopback path to `FetchAfter` from, and the journal half's response is the proxy's own
+        // body, not a re-read. Diverts to `terminate_space_teardown` in `terminate`, same shape
+        // as the source writes and the tenancy surface above.
+        Terminated::SpaceTeardown(_, _) => Err(internal(
+            "space teardown is served by terminate_space_teardown, not build_mutation",
         )),
     }
 }
@@ -4099,12 +4244,20 @@ mod tests {
             (Method::DELETE, "/imposters/4545/stubs/by-id/a"),
             (Method::POST, "/imposters/4545/enable"),
             (Method::POST, "/imposters/4545/disable"),
-            // Issue #223: the fleet merge-on-read (no `?since=`) and the transitional clear
-            // fan-out. Both spellings, since they are one handler behind two paths.
+            // Issue #223: the fleet merge-on-read (no `?since=`) and the clear — unscoped as of
+            // #224 a Raft-committed generation bump, `?match=`-scoped still a local proxy (see
+            // `Terminated::ClearSavedRequests`'s doc) — but both forms terminate either way, so
+            // `classify` draws no distinction here. Both spellings, since they are one handler
+            // behind two paths.
             (Method::GET, "/imposters/4545/requests"),
             (Method::GET, "/imposters/4545/savedRequests"),
             (Method::DELETE, "/imposters/4545/savedRequests"),
             (Method::DELETE, "/imposters/4545/requests"),
+            // Issue #224: the journal half of a space teardown now rides alongside the
+            // flow-state proxy, so this route terminates too — the flow-state half is still
+            // proxied *inside* `terminate_space_teardown`, but `classify` itself now recognizes
+            // the route rather than falling through entirely.
+            (Method::DELETE, "/imposters/4545/spaces/flow-1"),
         ];
         for (method, path) in terminated {
             assert!(
@@ -4121,7 +4274,6 @@ mod tests {
             (Method::POST, "/imposters/4545/verify"),
             (Method::PUT, "/imposters/4545/scenarios/checkout/state"),
             (Method::POST, "/imposters/4545/scenarios/reset"),
-            (Method::DELETE, "/imposters/4545/spaces/flow-1"),
             (Method::GET, "/config"),
             (Method::GET, "/metrics"),
             (Method::POST, "/_reload"),
@@ -4179,6 +4331,29 @@ mod tests {
             "DELETE .../savedRequests?match=... must still terminate"
         );
 
+        // Issue #224: a space teardown classifies with the port and flow id extracted, exactly
+        // the shape `terminate_space_teardown` needs.
+        assert!(
+            matches!(
+                classify(&Method::DELETE, "/imposters/4545/spaces/flow-1", None),
+                Some(Terminated::SpaceTeardown(4545, flow)) if flow == "flow-1"
+            ),
+            "DELETE .../spaces/{{flow}} must terminate with the port and flow extracted"
+        );
+        // Every other method on the same two-segment shape stays proxied — only the delete
+        // gains a journal half; a write there is `SpaceStubs`' three-segment sibling, a
+        // different route entirely, untouched by this issue.
+        for method in [Method::GET, Method::PUT, Method::POST] {
+            assert!(
+                classify(&method, "/imposters/4545/spaces/flow-1", None).is_none(),
+                "{method} .../spaces/{{flow}} must still proxy"
+            );
+        }
+        assert!(
+            classify(&Method::DELETE, "/imposters/4545/spaces/", None).is_none(),
+            "an empty flow id names no space to tear down"
+        );
+
         // Issue #223 review, Important: the `/admin/imposters/{port}/...` alias must terminate
         // identically to the canonical `/imposters/{port}/...` spelling for both verbs — the same
         // "both spellings, one handler" treatment `is_imposter_listing` already gives the
@@ -4218,6 +4393,36 @@ mod tests {
 
         // An unparseable port is not this surface's route at all.
         assert!(classify(&Method::DELETE, "/imposters/not-a-port", None).is_none());
+    }
+
+    /// Issue #224: `?match=` must keep `terminate`'s scoped-vs-unscoped dispatch on the
+    /// pure-proxy path (`terminate_clear_saved_requests`), never `build_and_run`/
+    /// `build_mutation`'s Raft-committing one — so a scoped clear never becomes a `ControlOp`.
+    /// `classify` alone cannot prove this: it answers `Some(Terminated::ClearSavedRequests(port))`
+    /// either way, by design (see that variant's own doc) — the dispatch guard in `terminate` is
+    /// `has_query_param(query, "match")`, which is what actually decides, and which this tests
+    /// directly against the same query strings `classify_terminates_exactly_the_config_surface`
+    /// already proves still terminate.
+    #[test]
+    fn a_match_narrowed_clear_still_proxies() {
+        assert!(
+            has_query_param(Some("match=flow_id%3Drun-7"), "match"),
+            "a ?match=... clear must be recognized as scoped, so `terminate` routes it to the \
+             proxy path instead of committing a JournalClearGen"
+        );
+        assert!(
+            has_query_param(Some("match"), "match"),
+            "a bare ?match with no value is still scoped — presence is what matters, not the \
+             value"
+        );
+        assert!(
+            !has_query_param(None, "match"),
+            "no query at all is the unscoped form, which commits through Raft"
+        );
+        assert!(
+            !has_query_param(Some("since=3"), "match"),
+            "an unrelated query parameter must not be mistaken for `match`"
+        );
     }
 
     /// The source inspection surface (issue #239): the two reads terminate,

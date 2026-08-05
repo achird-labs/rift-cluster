@@ -219,10 +219,10 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Clear recorded requests for an imposter, fanned out to the fleet
-         * @description Terminates (issue #223 item 4): clears this node's own journal through the same local engine call as before, honouring `match` — and only `match`, never `since` — exactly as it always did.
-         *     **Without `match`**: best-effort fans an unconditional full clear out to every other roster peer over the cluster RPC port. **Explicitly transitional** — a peer missed by the fan-out (partition, crash, slower than the 2 s budget) keeps the deleted entries until #224 replaces this whole mechanism with a Raft-committed clear that converges by consensus; `Rift-Cluster-Partial` says whether every peer confirmed.
-         *     **With `match`** (issue #223 review, B3 — a design decision, not a gap): the clear stays **local-only** and is never fanned out. The wire fan-out has nowhere to carry a match predicate, so propagating a scoped clear as an unconditional full clear would over-delete whatever else that port holds on every other node — a different flow, a different tenant's traffic sharing the port. `Rift-Cluster-Partial` is stamped unconditionally in this case, not because a peer was unreachable but because the clear itself never reached them by design, so a client cannot mistake a scoped, local clear for a fleet-complete one.
+         * Clear recorded requests for an imposter, converging by consensus
+         * @description Terminates (issue #223 item 4), and as of issue #224 the two forms below diverge in *how* they terminate — both are covered by `classify` regardless, so the front owns this route either way; only the mechanism differs.
+         *     **Without `match`**: commits a Raft-replicated clear generation for this port (`ControlOp::JournalClearGen`, `space` unset). A clear never deletes an entry directly — it raises a counter every reader compares its own entries' stamps against, so the clear converges by consensus rather than by a best-effort broadcast a partitioned peer could miss forever. Two clears racing from different nodes both take effect (the counter has no fixed value to overwrite), and a node that was offline when this committed still applies it correctly once it catches up, by replication or by snapshot. `Rift-Cluster-Partial` is never stamped on this path — a consensus write is not partial.
+         *     **With `match`** (issue #223 review, B3 — a design decision #224 deliberately left alone): the clear stays **local-only**, proxied to the local engine exactly as before #223, and never becomes a Raft write. `ControlOp::JournalClearGen` carries a `space`, not an arbitrary match predicate, so a scoped filter has nowhere on that op to travel that isn't either dropped or misrepresented as a full clear — committing the wrong, wider thing would be worse than staying local. `Rift-Cluster-Partial: true` is stamped unconditionally on this path, not because a peer was unreachable but because the clear itself is knowingly not fleet-wide by design, so a client cannot mistake a scoped, local clear for a fleet-complete one.
          *     Answers the imposter's current state either way. Aliased as `DELETE /imposters/{port}/requests`, and — issue #223 review — as both spellings under `/admin/imposters/{port}/...` too.
          */
         delete: operations["clearSavedRequests"];
@@ -250,8 +250,8 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Clear matched requests for an imposter, fanned out to the fleet
-         * @description The alias spelling of `DELETE /imposters/{port}/savedRequests` — the same handler, so the same parameters, body, status codes and transitional fan-out contract.
+         * Clear matched requests for an imposter, converging by consensus
+         * @description The alias spelling of `DELETE /imposters/{port}/savedRequests` — the same handler, so the same parameters, body, status codes and Raft-committed-generation contract.
          */
         delete: operations["clearRequests"];
         options?: never;
@@ -394,7 +394,10 @@ export interface paths {
         get: operations["getSpace"];
         put?: never;
         post?: never;
-        /** Tear down one correlated-isolation space (upstream) */
+        /**
+         * Tear down one correlated-isolation space
+         * @description Two independent halves (issue #224). The flow-state store is already clustered via `ClusteredFlowStore`, so this proxies to the local engine exactly as it always has — this issue does not touch that half, and the response below is that proxy's own body, unchanged. What #224 adds is the journal half: once the flow-state teardown actually succeeds, the cluster front additionally commits a Raft-replicated clear generation for this space (the same convergence primitive `DELETE .../savedRequests` commits for a whole port), so every node's own recorded-request journal starts dropping this space's pre-teardown entries too. A teardown that fails locally (404/409/etc.) commits nothing — there is nothing to converge on if the space was never actually torn down.
+         */
         delete: operations["deleteSpace"];
         options?: never;
         head?: never;
@@ -1717,7 +1720,12 @@ export interface components {
         XRiftNextIndex: number;
         /** @description Present, with the value `true`, when retention evicted entries the caller's `since` cursor had not yet read — the gap is unrecoverable and the client has silently missed requests. Emitted **only** when that is the case: there is no `false` form, so a client tests for the header's presence and never parses its value. */
         XRiftTruncated: true;
-        /** @description A fleet merge-on-read (issue #223) could not confirm every roster peer within its budget: the merged journal entries, the fleet `numberOfRequests` decoration on getImposter/listImposters, or the transitional clearSavedRequests/clearRequests fan-out. Emitted **only** when at least one peer was unreachable or too slow — there is no `false` form, exactly like `x-rift-truncated`, and a Ch.12 strict-mode gate asserts its absence on a fully healthy answer. Never means a peer's data was dropped from the answer: whatever the last anti-entropy pass cached for that peer still merges in, so this says "possibly missing something newer," never "missing that peer entirely." */
+        /**
+         * @description Two distinct reasons emit this header, never conflated by the response that carries it:
+         *     A fleet merge-on-read (issue #223) could not confirm every roster peer within its budget — the merged journal entries, or the fleet `numberOfRequests` decoration on getImposter/listImposters. Emitted only when at least one peer was unreachable or too slow; never means a peer's data was dropped from the answer, since whatever the last anti-entropy pass cached for that peer still merges in — this says "possibly missing something newer," never "missing that peer entirely."
+         *     A `?match=`-scoped `clearSavedRequests`/`clearRequests` (issue #223 review, B3 — #224 left this deliberately unchanged): stamped unconditionally, not because a peer was unreachable but because a scoped clear is knowingly local-only *by design* — it never becomes the Raft-committed, fleet-converging write the unscoped form is.
+         *     There is no `false` form either way, exactly like `x-rift-truncated`, and a Ch.12 strict-mode gate asserts its absence on a fully healthy, unscoped answer.
+         */
         RiftClusterPartial: true;
     };
     pathItems: never;

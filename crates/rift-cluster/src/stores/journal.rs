@@ -16,9 +16,10 @@
 //! * `seq` — this node's per-port monotone counter. It is also the index handed back
 //!   to the engine, so the upstream `?since=` cursor and SSE `index` contracts hold
 //!   unchanged on a single node.
-//! * `clear_gen` — the port's clear generation at append time. Pinned at 0 here and
-//!   bumped by issue #224; reserving the field now means generations change no storage
-//!   shape later, and a merge can ignore-older-generation from the day it is written.
+//! * `clear_gen` — the port's clear generation at append time, alongside each entry's own
+//!   `space_gen` (issue #224): monotone counters the Raft state machine bumps via
+//!   [`ClusterJournal::set_clear_gen`] when a fleet-wide clear commits, so a merge can drop
+//!   everything older without clock sync or coordination on the write side either.
 //!
 //! Single-node fidelity is the exit gate: with one voter this is behaviourally identical
 //! to the upstream `LocalJournal` it replaces, down to which reads report truncation —
@@ -137,6 +138,12 @@ pub struct ShardEntry {
     pub node_id: NodeId,
     pub seq: u64,
     pub clear_gen: u64,
+    /// The entry's space generation at append time — `clear_gen`'s sibling, scoped to
+    /// `flow_id` instead of the whole port. Kept as its own component rather than folded into
+    /// `clear_gen` (e.g. `max(port_gen, space_gen)`): a port-wide clear must drop an entry
+    /// whose space generation is numerically *higher* than the new port generation, and a
+    /// merged stamp cannot tell that case apart from a legitimately post-clear one.
+    pub space_gen: u64,
     /// Resolved at record time so scoped clears need not re-derive it from stored headers.
     pub flow_id: String,
     pub request: RecordedRequest,
@@ -159,6 +166,11 @@ pub struct ShardRead {
     /// quantity `evicted_through`, which is the less ambiguous reading of the two.)
     pub evicted_below_seq: u64,
     pub clear_gen: u64,
+    /// Current per-space generations — only spaces that have actually been bumped occupy a
+    /// row, so a never-cleared space costs nothing here. Sorted by space name: this crosses
+    /// into the merge's fleet-wide max and onto the wire, and both need a deterministic order
+    /// to agree with themselves across nodes and across repeated calls.
+    pub space_gens: Vec<(String, u64)>,
     /// This node's G-counter slot — summed across shards to answer `numberOfRequests`.
     pub count_slot: u64,
 }
@@ -178,9 +190,14 @@ struct PortShard {
     /// Highest seq dropped by *retention pressure* (cap or age). Deliberate deletions
     /// never touch it: losing entries you asked to delete is not a hole in your view.
     evicted_below_seq: AtomicU64,
-    /// The port's clear generation, stamped into every entry appended under it. Pinned
-    /// at 0 until issue #224 bumps it.
+    /// The port's clear generation, stamped into every entry appended under it and raised
+    /// only by [`ClusterJournal::set_clear_gen`] (issue #224).
     clear_gen: AtomicU64,
+    /// Per-space generations, populated only for spaces [`ClusterJournal::set_clear_gen`] has
+    /// bumped. A separate `parking_lot::RwLock` from `entries`, not folded into it: the append
+    /// path only ever reads one space's entry from here, so it should not have to fight a
+    /// scoped clear (or another append) for the whole deque's lock to do it.
+    space_gens: RwLock<HashMap<String, u64>>,
     /// Whether the cap warning already fired for the current fill-up. A full shard evicts
     /// on every record, and warning per eviction serializes the recording path on the
     /// tracing writer (upstream issue #718). Deliberate deletions re-arm it.
@@ -199,6 +216,7 @@ impl PortShard {
             seq: AtomicU64::new(0),
             evicted_below_seq: AtomicU64::new(0),
             clear_gen: AtomicU64::new(0),
+            space_gens: RwLock::new(HashMap::new()),
             cap_warned: AtomicBool::new(false),
             entries_gauge: crate::metrics::journal_entries_gauge(port),
         }
@@ -338,6 +356,15 @@ impl ClusterJournal {
     pub fn read_shard_since(&self, port: u16, since_seq: u64) -> ShardRead {
         let shard = self.shard(port);
         let entries = shard.entries.read();
+        // Sorted here rather than left in `HashMap` iteration order: this is the payload a
+        // merge and the wire both consume, and both need every node to agree on the order.
+        let mut space_gens: Vec<(String, u64)> = shard
+            .space_gens
+            .read()
+            .iter()
+            .map(|(space, generation)| (space.clone(), *generation))
+            .collect();
+        space_gens.sort_by(|a, b| a.0.cmp(&b.0));
         ShardRead {
             entries: entries
                 .iter()
@@ -346,8 +373,103 @@ impl ClusterJournal {
                 .collect(),
             evicted_below_seq: shard.evicted_below_seq.load(Ordering::SeqCst),
             clear_gen: shard.clear_gen.load(Ordering::SeqCst),
+            space_gens,
             count_slot: shard.count.load(Ordering::SeqCst),
         }
+    }
+
+    /// Apply a clear generation bump for `port` (issue #224): `space: None` raises the port's
+    /// own generation, which every subsequent append is stamped with regardless of space;
+    /// `Some(space)` raises only that space's. This is *applied* Raft state — the state
+    /// machine calls it from the apply path when `ControlOp::JournalClearGen` commits, never a
+    /// caller working ahead of consensus — so it must be monotone per key: a late or
+    /// re-delivered apply carrying a lower generation than what is already stamped is ignored
+    /// rather than un-clearing a port a newer entry already committed. Apply is strictly
+    /// increasing per key by construction (each commit stores `current + 1`), so this guard
+    /// only ever fires against a duplicate or out-of-order redelivery, never a legitimate one.
+    ///
+    /// This monotonicity is specific to the apply path. [`Self::reset_clear_gen`] is the other
+    /// caller of this generation — snapshot install — and deliberately does *not* go through
+    /// here: a fleet's agreed-on generation can be *lower* than what this node still holds, and
+    /// `fetch_max` structurally cannot express that.
+    ///
+    /// Creates the port's shard if this is the first thing ever recorded against it — a clear
+    /// can commit before any append does. Touches nothing else: `seq`, `evicted_below_seq`,
+    /// the entries and the count slot stay exactly as `record_indexed` and the deletion
+    /// methods left them, because losing entries is not this method's job. See
+    /// [`Self::zero_count`] for the one apply-path case that *does* touch the count slot.
+    pub fn set_clear_gen(&self, port: u16, space: Option<&str>, generation: u64) {
+        let shard = self.shard(port);
+        match space {
+            None => {
+                shard.clear_gen.fetch_max(generation, Ordering::SeqCst);
+            }
+            Some(space) => {
+                let mut space_gens = shard.space_gens.write();
+                space_gens
+                    .entry(space.to_string())
+                    .and_modify(|current| *current = (*current).max(generation))
+                    .or_insert(generation);
+            }
+        }
+    }
+
+    /// Set `port`'s clear generation (or `port`'s `space`) to exactly `generation`, regardless
+    /// of what is currently stamped (issue #224, Non-blocker 1). The one caller allowed to
+    /// *lower* it: `install_snapshot` clears and reinserts `sm_journal_gens` from the payload
+    /// because a generation this node still holds could be higher than what the fleet has since
+    /// agreed on (a stale leader that cleared, was partitioned, and rejoined by snapshot from a
+    /// peer that never saw that clear) — and the live journal must follow the durable table
+    /// down, not just up, or this one node's stuck-high generation would silently win the
+    /// fleet-wide max a merge computes, dropping every other node's entries from the read.
+    ///
+    /// Never call this from the apply path — [`Self::set_clear_gen`]'s `fetch_max` is what keeps
+    /// a duplicate or re-delivered apply from un-clearing a port a newer entry already
+    /// committed, and this method has no such guard.
+    pub fn reset_clear_gen(&self, port: u16, space: Option<&str>, generation: u64) {
+        let shard = self.shard(port);
+        match space {
+            None => shard.clear_gen.store(generation, Ordering::SeqCst),
+            Some(space) => {
+                shard
+                    .space_gens
+                    .write()
+                    .insert(space.to_string(), generation);
+            }
+        }
+    }
+
+    /// Zero this node's G-counter slot for `port` (issue #224, Blocker 1). A **port-wide**
+    /// clear now commits through Raft as a generation bump rather than a call into the local
+    /// engine, so nothing else zeroes `numberOfRequests` — before this feature, the unscoped
+    /// `DELETE savedRequests` proxied straight to [`Self::clear`], which does. The apply path
+    /// calls this only for `space: None`; a space-scoped bump must leave the count alone,
+    /// matching [`Self::clear_flow`]'s and `retain`'s existing contract that a scoped deletion
+    /// never resets the total.
+    ///
+    /// Deliberately a separate operation from [`Self::set_clear_gen`], not folded into it:
+    /// `set_clear_gen` is also called by cold-start rehydration and (via
+    /// [`Self::reset_clear_gen`]) snapshot install, and re-zeroing the count on either of those
+    /// would erase real, already-committed traffic the fleet never asked to forget — only a
+    /// *newly applied* port-wide clear should ever zero it.
+    ///
+    /// Each node zeros its own slot as it applies, independently — a fleet sum taken mid-apply
+    /// can therefore differ transiently across nodes by apply lag, same as any other
+    /// per-node-on-apply projection in this state machine.
+    pub fn zero_count(&self, port: u16) {
+        self.shard(port).count.store(0, Ordering::SeqCst);
+    }
+
+    /// This node's currently-live **port** clear generation for `port` (issue #224) — never
+    /// a space generation, which has no single value to report here. Reads the atomic
+    /// directly rather than going through [`Self::read_shard_since`], which would pay for
+    /// walking (and cloning) the deque to build a `ShardRead` this caller only wants one
+    /// field of; [`super::journal_net::journal_routes`]'s counts handler is the caller, and
+    /// it needs this alongside [`RequestJournal::count`] to answer `numberOfRequests`
+    /// generation-aware (see [`super::journal_net::fleet_count`]).
+    #[must_use]
+    pub(crate) fn clear_gen(&self, port: u16) -> u64 {
+        self.shard(port).clear_gen.load(Ordering::SeqCst)
     }
 
     fn shard(&self, port: u16) -> Arc<PortShard> {
@@ -470,10 +592,14 @@ impl RequestJournal for ClusterJournal {
     fn record_indexed(&self, port: u16, flow_id: &str, req: RecordedRequest) -> Option<u64> {
         let shard = self.shard(port);
         let now = self.clock.now_millis();
-        // Both resolved before the lock, to keep the critical section to the deque
-        // mutation and the seq assignment that must be atomic with it.
+        // Resolved before the lock, to keep the critical section to the deque mutation and
+        // the seq assignment that must be atomic with it. `space_gens` is a separate lock
+        // from `entries` and is only ever read here — `set_clear_gen` never touches
+        // `entries` — so taking it first and releasing it before the write lock below
+        // introduces no ordering between the two that could deadlock.
         let cap = self.shard_cap();
         let flow = flow_id.to_string();
+        let space_gen = shard.space_gens.read().get(flow_id).copied().unwrap_or(0);
         // Outlives the guard below, so evicted entries' destructors run after it drops.
         let mut drained = Vec::new();
 
@@ -489,6 +615,7 @@ impl RequestJournal for ClusterJournal {
                 node_id: self.node_id,
                 seq,
                 clear_gen: shard.clear_gen.load(Ordering::SeqCst),
+                space_gen,
                 flow_id: flow,
                 request: req,
                 recorded_at_millis: now,
@@ -992,10 +1119,109 @@ mod tests {
         );
         assert!(
             shard.entries.iter().all(|e| e.clear_gen == 0),
-            "generations are pinned at 0 until #224 bumps them"
+            "a port that has never been cleared stamps generation 0"
         );
         assert_eq!(shard.entries[0].flow_id, "flow-a");
         assert_eq!(shard.entries[1].request.path, "/b");
+    }
+
+    // ---- Clear generations (issue #224) ----------------------------------------------
+    //
+    // The generation is *applied* state: `set_clear_gen` is what the Raft state machine calls
+    // when `ControlOp::JournalClearGen` commits. Nothing here reaches consensus; these pin the
+    // local half — that a bump changes what subsequent appends are stamped with, and that it
+    // touches nothing else.
+
+    #[test]
+    fn a_port_generation_bump_stamps_every_subsequent_append() {
+        let j = bound(3, 7);
+        j.record_indexed(1, "flow-a", req("/before"));
+
+        j.set_clear_gen(1, None, 1);
+        j.record_indexed(1, "flow-a", req("/after"));
+
+        let shard = j.read_shard_since(1, 0);
+        assert_eq!(
+            shard
+                .entries
+                .iter()
+                .map(|e| (e.request.path.as_str(), e.clear_gen))
+                .collect::<Vec<_>>(),
+            vec![("/before", 0), ("/after", 1)],
+            "the bump stamps appends after it and rewrites nothing before it — the older \
+             entries are dropped by the merge, not deleted here"
+        );
+        assert_eq!(
+            shard.clear_gen, 1,
+            "the shard publishes its current generation so a merge can compute the threshold"
+        );
+    }
+
+    #[test]
+    fn a_space_generation_bump_stamps_only_its_own_spaces_appends() {
+        let j = bound(3, 7);
+        j.set_clear_gen(1, Some("flow-a"), 4);
+
+        j.record_indexed(1, "flow-a", req("/a"));
+        j.record_indexed(1, "flow-b", req("/b"));
+
+        let shard = j.read_shard_since(1, 0);
+        let stamped: Vec<_> = shard
+            .entries
+            .iter()
+            .map(|e| (e.flow_id.as_str(), e.clear_gen, e.space_gen))
+            .collect();
+        assert_eq!(
+            stamped,
+            vec![("flow-a", 0, 4), ("flow-b", 0, 0)],
+            "a space bump raises only its own space's stamp; a sibling space and the \
+             port-wide generation are untouched"
+        );
+        assert_eq!(
+            shard.space_gens,
+            vec![("flow-a".to_owned(), 4)],
+            "only spaces that have ever been bumped occupy a row"
+        );
+    }
+
+    #[test]
+    fn a_generation_bump_never_moves_seq_or_the_eviction_watermark() {
+        // Cursor validity across clears (#225 depends on this). A clear deletes nothing
+        // locally, so there is no hole to report and no counter to rewind.
+        let j = bound(3, 7);
+        j.record_indexed(1, "f", req("/a"));
+        j.record_indexed(1, "f", req("/b"));
+        let before = j.read_shard_since(1, 0);
+
+        j.set_clear_gen(1, None, 1);
+        j.set_clear_gen(1, Some("f"), 1);
+        j.record_indexed(1, "f", req("/c"));
+
+        let after = j.read_shard_since(1, 0);
+        assert_eq!(
+            after.evicted_below_seq, before.evicted_below_seq,
+            "a deliberate clear is not retention pressure, so the watermark must not move"
+        );
+        assert_eq!(
+            after.entries.last().expect("appended").seq,
+            3,
+            "seq keeps counting across a clear rather than restarting at 1"
+        );
+    }
+
+    #[test]
+    fn a_stale_generation_never_moves_the_stamp_backwards() {
+        // Apply is monotone per key, but a late/duplicate delivery must not un-clear a port.
+        let j = bound(3, 7);
+        j.set_clear_gen(1, None, 5);
+        j.set_clear_gen(1, None, 2);
+
+        j.record_indexed(1, "f", req("/a"));
+        assert_eq!(
+            j.read_shard_since(1, 0).entries[0].clear_gen,
+            5,
+            "an out-of-order lower generation is ignored, not applied"
+        );
     }
 
     #[test]

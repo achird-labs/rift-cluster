@@ -457,11 +457,13 @@ lazy_static! {
     /// (issue #223) that came back without a usable reply or confirmation, including a peer the
     /// transport's own health tracking has already given up on and one lost to a caller's budget
     /// rather than outright errored. Covers every caller that dials a peer over this journal's
-    /// wire, not just `anti_entropy_tick`: the merge-on-read pull (`pull_since_budgeted`), the
-    /// fleet count fan-out (`fleet_counts`) and the clear fan-out (`clear_peers`) all touch it too
-    /// (review fix for B5 — before this, the one path that produces a user-visible
-    /// `Rift-Cluster-Partial` produced no metric at all). `peer` is a roster node id, so
-    /// cardinality tracks fleet size, never request traffic.
+    /// wire, not just `anti_entropy_tick`: the merge-on-read pull (`pull_since_budgeted`) and the
+    /// fleet count fan-out (`fleet_counts`) both touch it too (review fix for B5 — before this,
+    /// the one path that produces a user-visible `Rift-Cluster-Partial` produced no metric at
+    /// all). `peer` is a roster node id, so cardinality tracks fleet size, never request traffic.
+    ///
+    /// The clear fan-out was a third caller until issue #224 replaced it with a Raft-committed
+    /// generation bump, which converges by consensus and so has no peer to fail against.
     static ref JOURNAL_PEER_PULL_FAILURES: IntCounterVec = register_int_counter_vec!(
         "rift_cluster_journal_peer_pull_failures_total",
         "Anti-entropy journal pulls that failed, by peer",

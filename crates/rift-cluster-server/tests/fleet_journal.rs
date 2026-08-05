@@ -426,6 +426,36 @@ async fn every_node_answers_one_identical_merged_set_and_a_clear_does_not_resurr
             paths(&merged).is_empty(),
             "node {index} resurrected cleared requests from a peer's shard: {merged}"
         );
+
+        // Blocker 1 (issue #224): a merged read reporting empty is not enough — the clear must
+        // also zero `numberOfRequests`, upstream's own G-counter of every request seen
+        // (recorded body or not), or the listing keeps reporting the pre-clear total forever
+        // even though nothing is left to read back.
+        let admin = fleet.admin(index);
+        let listing = Seen::of(
+            reqwest::get(format!("http://{admin}/imposters"))
+                .await
+                .expect("imposter listing"),
+        )
+        .await;
+        let listing_body = listing.json();
+        let count = listing_body
+            .get("imposters")
+            .and_then(serde_json::Value::as_array)
+            .expect("listing has an `imposters` array")
+            .iter()
+            .find(|imposter| {
+                imposter.get("port").and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(fleet.port))
+            })
+            .and_then(|imposter| imposter.get("numberOfRequests"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("node {index} listing names the imposter: {listing}"));
+        assert_eq!(
+            count, 0,
+            "node {index}: a fleet-wide clear must zero numberOfRequests, not just empty the \
+             merged read"
+        );
     }
 }
 
