@@ -126,3 +126,41 @@ groups:
         annotations:
           summary: "Fleet journal reads are persistently degraded"
           description: "rift:journal_partial_reads:rate5m has been above zero for 10 minutes: merged savedRequests reads are being stamped Rift-Cluster-Partial, so a rostered peer is unreachable or over budget and verification reads may be missing recent entries. Transient partials during a rolling restart are by design and are why the window is 10m rather than shorter; a sustained rate is not. Check rift:journal_peer_pull_failures:rate5m to see which peer."
+
+      # The recording plane's one alert (#347).
+      #
+      # Deliberately the only one of the three release reasons that pages, and
+      # the selector is the whole point. `upstream_failure` means the system
+      # under test failed the winner's call, and `deadline` means a winner
+      # crashed or wedged and its Pending claim aged out — both are the mock
+      # fleet correctly observing something else misbehaving, and paging on
+      # them would page an operator for a tester's broken fixture.
+      # `publish_failure` is the reason that indicts THIS system rather than
+      # its user: the upstream call already succeeded, and the recording then
+      # failed to publish OR WAS REFUSED — a committed refusal (a deleted
+      # imposter, an exhausted quota) counts here too, per
+      # rift_cluster_proxy_claim_releases_total's doc comment in
+      # crates/rift-cluster/src/metrics.rs and the ControlOutcome::Failed arm
+      # in crates/rift-cluster/src/stores/proxy.rs. Either way the exchange is
+      # lost rather than delayed, which is what makes it worth a page; the
+      # annotation names the refusal cases so the runbook does not send an
+      # operator to look at Raft health for a quota problem.
+      #
+      # `for: 10m` against a `rate(...[5m])` expression, matching
+      # RiftJournalReadsDegraded. The 2x relationship is arithmetic, not
+      # symmetry-for-its-own-sake: `rate[5m] > 0` stays true until 5m after
+      # the LAST increment, so the condition holds for
+      # (t_last - t_first) + 5m. Setting `for:` equal to the rate window would
+      # therefore fire on any two failures at distinct scrape times — a burst
+      # of exactly the kind this file's header says to ride out. `for: 10m`
+      # buys a genuine ~5m of spread before paging. Both halves are pinned in
+      # rules/tests/alerts_test.yml, including the two-scrape burst that the
+      # 5m form would have paged on.
+      - alert: RiftProxyRecordingsFailing
+        expr: rift:proxy_claim_releases:rate5m{reason="publish_failure"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Proxy recordings are being attempted and not landing"
+          description: "rift:proxy_claim_releases:rate5m{reason=\"publish_failure\"} has been above zero for 10 minutes: proxyOnce winners are completing their upstream calls and then failing to publish the recording to consensus, or having it refused outright (a deleted imposter, an exhausted quota), so the claim is released to keep the signature retryable and the exchange is never recorded. Verification reads will be missing these exchanges entirely — this is recording loss, not a slow path. Check Raft health first, then whether the target imposters still exist and are within quota. The other two release reasons (upstream_failure, deadline) deliberately do not page: they are the system under test or a wedged winner, not the recording pipeline. See rift_cluster_proxy_claim_releases_total's doc comment in crates/rift-cluster/src/metrics.rs."

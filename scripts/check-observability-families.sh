@@ -22,12 +22,18 @@
 # appears in the file": only the value of an `expr:` key in Prometheus rule
 # YAML, and the value of an `expr` key (at any nesting depth) in Grafana
 # dashboard JSON, count. A metric name mentioned in a YAML comment or a
-# dashboard's markdown documentation panel is prose, not a query — and this
-# repo's own verification-plane.json dashboard deliberately DOCUMENTS three
-# not-yet-registered journal families by name (explaining why their panels
-# are absent, per issue #223/#226) specifically so an empty panel does not
-# get silently misread as "no problem." A blunter "anywhere in the file"
-# scan would fail that dashboard for doing the responsible thing.
+# dashboard's markdown documentation panel is prose, not a query, and a
+# blunter "anywhere in the file" scan would fail a pack for explaining
+# itself.
+#
+# This distinction was originally forced by verification-plane.json carrying
+# a text panel that named not-yet-registered families to explain why their
+# panels were absent (issues #223/#226) — so that an empty panel could not be
+# silently misread as "no problem". Both have since landed and that panel is
+# gone (#319, #347), but the narrow rule is not scaffolding to remove: the
+# rule comments in deploy/observability/prometheus/rules/ cite family names in
+# prose throughout, and the next deliberately-deferred family will want the
+# same escape hatch the text panel used.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
