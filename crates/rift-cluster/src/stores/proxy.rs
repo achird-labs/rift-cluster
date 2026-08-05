@@ -53,7 +53,6 @@ const CLAIM_PATH: &str = "/_cluster/proxy/claim";
 const RELEASE_PATH: &str = "/_cluster/proxy/release";
 const COMPLETE_PATH: &str = "/_cluster/proxy/complete";
 const LOOKUP_PATH: &str = "/_cluster/proxy/lookup";
-const CLEAR_PATH: &str = "/_cluster/proxy/clear";
 
 /// Bound on a claim/release/lookup end to end: owner-local map work plus one RPC hop —
 /// the flow store's reasoning, and the same 2 s.
@@ -143,6 +142,10 @@ struct PendingClaim {
 struct CachedRecording {
     resp_json: String,
     at: Instant,
+    /// The commit revision (applying log index) of the `ProxyRecorded` op this entry
+    /// mirrors. The cache is only trusted while the local applied state has not yet
+    /// caught up to it — past that, the row is the truth (see `completed_lookup`).
+    revision: u64,
 }
 
 /// Binding-time configuration, [`FlowBindConfig`](super::FlowBindConfig)'s sibling.
@@ -352,7 +355,10 @@ impl ProxyNet {
                 };
             }
         }
-        if self.completed_lookup(req.port, &req.sig_hash).is_some() {
+        if self
+            .completed_lookup(&node, req.port, &req.sig_hash)
+            .is_some()
+        {
             return ClaimReply::AlreadyRecorded;
         }
         let mut pending = self.pending.lock();
@@ -464,6 +470,7 @@ impl ProxyNet {
                         CachedRecording {
                             resp_json,
                             at: Instant::now(),
+                            revision: response.revision,
                         },
                     );
                     metrics::proxy_recording();
@@ -489,23 +496,37 @@ impl ProxyNet {
         }
     }
 
-    fn completed_lookup(&self, port: u16, sig_hash: &str) -> Option<String> {
+    /// A completion-cache hit, valid only inside the commit→apply window it exists to
+    /// bridge. Once the node's `last_applied` has passed the entry's commit revision, the
+    /// applied row is the truth: present means the caller already answered from it; absent
+    /// means a *later* purge (an explicit clear, or an imposter delete/replace) removed
+    /// it, and honoring the cache would resurrect a recording the fleet agreed to forget —
+    /// which is also what makes purges converge with the log instead of needing any
+    /// cross-node cache invalidation.
+    fn completed_lookup(&self, node: &RaftNode, port: u16, sig_hash: &str) -> Option<String> {
         let mut completed = self.completed.lock();
         let slot = (port, sig_hash.to_owned());
-        if let Some(cached) = completed.get(&slot) {
-            if cached.at.elapsed() < COMPLETE_CACHE_TTL {
-                return Some(cached.resp_json.clone());
-            }
+        let cached = completed.get(&slot)?;
+        if cached.at.elapsed() >= COMPLETE_CACHE_TTL {
             completed.remove(&slot);
+            return None;
         }
-        None
+        if node
+            .status()
+            .last_applied
+            .is_some_and(|applied| applied >= cached.revision)
+        {
+            completed.remove(&slot);
+            return None;
+        }
+        Some(cached.resp_json.clone())
     }
 
     fn owner_lookup(&self, req: &LookupReq) -> LookupReply {
         let resp_json = match self.view() {
             Ok((node, _)) => match node.proxy_recorded(&req.tenant, req.port, &req.sig_hash) {
                 Ok(Some(json)) => Some(json),
-                Ok(None) => self.completed_lookup(req.port, &req.sig_hash),
+                Ok(None) => self.completed_lookup(&node, req.port, &req.sig_hash),
                 Err(e) => {
                     // A storage read failure is unhealthy-node signal, not a cache miss —
                     // say so before degrading to the completion cache (which may still
@@ -515,7 +536,7 @@ impl ProxyNet {
                         error = %e,
                         "proxy marker read failed; answering from the completion cache"
                     );
-                    self.completed_lookup(req.port, &req.sig_hash)
+                    self.completed_lookup(&node, req.port, &req.sig_hash)
                 }
             },
             Err(_) => None,
@@ -686,20 +707,16 @@ struct LookupReply {
     resp: Option<RecordedResponse>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ClearReq {
-    port: u16,
-}
-
-/// The wire surface: five POST routes on the cluster port, HMAC-authed and
-/// version-negotiated by the transport like every other route.
+/// The wire surface: four POST routes on the cluster port, HMAC-authed and
+/// version-negotiated by the transport like every other route. Deliberately no clear
+/// route: purges converge through the applied log plus `completed_lookup`'s revision
+/// check, not through a best-effort fan-out a partitioned peer could miss forever.
 #[must_use]
 pub fn proxy_routes(net: Arc<ProxyNet>) -> Router {
     let claim_net = Arc::clone(&net);
     let release_net = Arc::clone(&net);
     let complete_net = Arc::clone(&net);
-    let lookup_net = Arc::clone(&net);
-    let clear_net = net;
+    let lookup_net = net;
 
     Router::new()
         .route(
@@ -751,19 +768,6 @@ pub fn proxy_routes(net: Arc<ProxyNet>) -> Router {
                         .map_err(|e| RpcError::Handler(format!("proxy/lookup decode: {e}")))?;
                     let reply = net.owner_lookup(&req);
                     serde_json::to_vec(&reply).map_err(|e| RpcError::Handler(e.to_string()))
-                })
-            }),
-        )
-        .route(
-            "POST",
-            CLEAR_PATH,
-            Arc::new(move |body: Vec<u8>| -> HandlerFuture {
-                let net = Arc::clone(&clear_net);
-                Box::pin(async move {
-                    let req: ClearReq = serde_json::from_slice(&body)
-                        .map_err(|e| RpcError::Handler(format!("proxy/clear decode: {e}")))?;
-                    net.clear_local(req.port);
-                    Ok(b"{}".to_vec())
                 })
             }),
         )
@@ -1186,73 +1190,20 @@ impl ProxyRecordingStore for ClusterProxyStore {
         reply.resp
     }
 
-    /// **Must never block.** The manager calls this from its port-reclaim path, which the
-    /// state machine's own engine drive reaches on every imposter deletion or replace —
-    /// while `apply` awaits it. A `clear` that waits on a Raft write from there is waiting
-    /// on the very apply loop it is blocking: each reclaim stalls the state machine for the
-    /// full submit deadline, and every unrelated admin write blows `WRITE_DEADLINE` with
-    /// "did not commit within the deadline" (the exact 504s the C22/C23/C26 smoke scenarios
-    /// caught). So the durable half is *spawned* onto the bridge runtime, never awaited.
+    /// Local caches only — deliberately **no Raft write and no RPC**, ever.
+    ///
+    /// Two reasons, one per caller. The manager calls this from its port-reclaim path,
+    /// which every node's engine drive reaches on every imposter delete or replace while
+    /// `apply` awaits it — a submit from there either blocks the apply loop it needs
+    /// (the C22/C23/C26 write-deadline storms) or, spawned, has *every replica* minting
+    /// its own audited op per reclaim (the C26 audit-chain drift). And nothing durable
+    /// needs doing here anyway: the delete/replace ops purge the marker rows atomically
+    /// at apply, and the explicit `DELETE .../savedProxyResponses` terminates at the
+    /// front door as one `ProxyRecordedClear` op. Stale completion-cache entries on
+    /// *other* nodes are not fanned out either — `completed_lookup` invalidates them
+    /// against the applied state, so purges converge with the log.
     fn clear(&self, port: u16) {
         self.net.clear_local(port);
-        // The imposter-deletion reclaim arrives here after `DeleteImposter` already purged
-        // the rows atomically with the delete; an unresolvable port is that case, not an
-        // error — nothing durable is left to clear.
-        let Ok(identity) = self.net.port_identity(port) else {
-            return;
-        };
-        let Some(bridge) = self.net.bridge.get() else {
-            tracing::error!(
-                port,
-                "proxy clear before the cluster bound; markers survive until a bound clear"
-            );
-            return;
-        };
-        let net = Arc::clone(&self.net);
-        let tenant = TenantId::new(identity.tenant);
-        bridge.handle().spawn(async move {
-            let (node, ring) = match net.view() {
-                Ok(view) => view,
-                Err(reason) => {
-                    tracing::error!(port, %reason, "proxy clear did not commit; markers survive");
-                    return;
-                }
-            };
-            let request = ControlRequest {
-                op_id: Uuid::new_v4(),
-                principal: None,
-                issued_at_secs: now_secs(),
-                expected_revision: None,
-                op: ControlOp::ProxyRecordedClear { tenant, port },
-            };
-            if let Err(e) = node.submit(request).await {
-                // The trait offers no error channel; error-level is the honest floor — a
-                // clear that did not commit means `AlreadyRecorded` survives for cleared
-                // signatures.
-                tracing::error!(port, error = %e, "proxy clear did not commit; markers survive");
-                return;
-            }
-            // Best-effort fan-out for the peers' owner-local Pending/complete caches. A
-            // peer this misses self-heals at the claim deadline / cache TTL.
-            let body = match serde_json::to_vec(&ClearReq { port }) {
-                Ok(body) => body,
-                Err(e) => {
-                    tracing::warn!(port, error = %e, "proxy clear fan-out skipped: encode failed");
-                    return;
-                }
-            };
-            for member in ring.members().iter().copied() {
-                if member == node.id() {
-                    continue;
-                }
-                if let Err(e) = node
-                    .call_member(member, "POST", CLEAR_PATH, body.clone())
-                    .await
-                {
-                    tracing::warn!(port, member, error = %e, "proxy clear fan-out missed a peer");
-                }
-            }
-        });
     }
 }
 

@@ -795,8 +795,10 @@ async fn new_owner_answers_already_recorded_from_applied_table() {
 }
 
 // ---------------------------------------------------------------------------
-// AC10 — clear deletes the recorded markers fleet-wide; the signature records
-// afresh afterwards.
+// AC10 — the committed clear (`ControlOp::ProxyRecordedClear`, what
+// `DELETE .../savedProxyResponses` terminates into at the front door) deletes
+// the recorded markers fleet-wide — every node's caches retire against the
+// applied state with no fan-out — and the signature records afresh.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn clear_deletes_recorded_markers_fleet_wide() {
@@ -813,12 +815,16 @@ async fn clear_deletes_recorded_markers_fleet_wide() {
         .await
         .expect("recording lands");
 
-    {
-        let store = Arc::clone(&store);
-        tokio::task::spawn_blocking(move || store.clear(TEST_PORT))
-            .await
-            .expect("join");
-    }
+    // Submitted from the *other* member, like any front-door write would be —
+    // the clear's effect must not depend on which node accepted it.
+    members[1]
+        .node
+        .submit(mint(rift_cluster::ControlOp::ProxyRecordedClear {
+            tenant: TenantId::new("default"),
+            port: TEST_PORT,
+        }))
+        .await
+        .expect("the clear commits");
 
     // Cleared fleet-wide: both nodes grant a fresh claim again.
     let deadline = Instant::now() + CONVERGE;
