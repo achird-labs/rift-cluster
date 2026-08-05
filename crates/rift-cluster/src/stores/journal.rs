@@ -992,10 +992,109 @@ mod tests {
         );
         assert!(
             shard.entries.iter().all(|e| e.clear_gen == 0),
-            "generations are pinned at 0 until #224 bumps them"
+            "a port that has never been cleared stamps generation 0"
         );
         assert_eq!(shard.entries[0].flow_id, "flow-a");
         assert_eq!(shard.entries[1].request.path, "/b");
+    }
+
+    // ---- Clear generations (issue #224) ----------------------------------------------
+    //
+    // The generation is *applied* state: `set_clear_gen` is what the Raft state machine calls
+    // when `ControlOp::JournalClearGen` commits. Nothing here reaches consensus; these pin the
+    // local half — that a bump changes what subsequent appends are stamped with, and that it
+    // touches nothing else.
+
+    #[test]
+    fn a_port_generation_bump_stamps_every_subsequent_append() {
+        let j = bound(3, 7);
+        j.record_indexed(1, "flow-a", req("/before"));
+
+        j.set_clear_gen(1, None, 1);
+        j.record_indexed(1, "flow-a", req("/after"));
+
+        let shard = j.read_shard_since(1, 0);
+        assert_eq!(
+            shard
+                .entries
+                .iter()
+                .map(|e| (e.request.path.as_str(), e.clear_gen))
+                .collect::<Vec<_>>(),
+            vec![("/before", 0), ("/after", 1)],
+            "the bump stamps appends after it and rewrites nothing before it — the older \
+             entries are dropped by the merge, not deleted here"
+        );
+        assert_eq!(
+            shard.clear_gen, 1,
+            "the shard publishes its current generation so a merge can compute the threshold"
+        );
+    }
+
+    #[test]
+    fn a_space_generation_bump_stamps_only_its_own_spaces_appends() {
+        let j = bound(3, 7);
+        j.set_clear_gen(1, Some("flow-a"), 4);
+
+        j.record_indexed(1, "flow-a", req("/a"));
+        j.record_indexed(1, "flow-b", req("/b"));
+
+        let shard = j.read_shard_since(1, 0);
+        let stamped: Vec<_> = shard
+            .entries
+            .iter()
+            .map(|e| (e.flow_id.as_str(), e.clear_gen, e.space_gen))
+            .collect();
+        assert_eq!(
+            stamped,
+            vec![("flow-a", 0, 4), ("flow-b", 0, 0)],
+            "a space bump raises only its own space's stamp; a sibling space and the \
+             port-wide generation are untouched"
+        );
+        assert_eq!(
+            shard.space_gens,
+            vec![("flow-a".to_owned(), 4)],
+            "only spaces that have ever been bumped occupy a row"
+        );
+    }
+
+    #[test]
+    fn a_generation_bump_never_moves_seq_or_the_eviction_watermark() {
+        // Cursor validity across clears (#225 depends on this). A clear deletes nothing
+        // locally, so there is no hole to report and no counter to rewind.
+        let j = bound(3, 7);
+        j.record_indexed(1, "f", req("/a"));
+        j.record_indexed(1, "f", req("/b"));
+        let before = j.read_shard_since(1, 0);
+
+        j.set_clear_gen(1, None, 1);
+        j.set_clear_gen(1, Some("f"), 1);
+        j.record_indexed(1, "f", req("/c"));
+
+        let after = j.read_shard_since(1, 0);
+        assert_eq!(
+            after.evicted_below_seq, before.evicted_below_seq,
+            "a deliberate clear is not retention pressure, so the watermark must not move"
+        );
+        assert_eq!(
+            after.entries.last().expect("appended").seq,
+            3,
+            "seq keeps counting across a clear rather than restarting at 1"
+        );
+    }
+
+    #[test]
+    fn a_stale_generation_never_moves_the_stamp_backwards() {
+        // Apply is monotone per key, but a late/duplicate delivery must not un-clear a port.
+        let j = bound(3, 7);
+        j.set_clear_gen(1, None, 5);
+        j.set_clear_gen(1, None, 2);
+
+        j.record_indexed(1, "f", req("/a"));
+        assert_eq!(
+            j.read_shard_since(1, 0).entries[0].clear_gen,
+            5,
+            "an out-of-order lower generation is ignored, not applied"
+        );
     }
 
     #[test]

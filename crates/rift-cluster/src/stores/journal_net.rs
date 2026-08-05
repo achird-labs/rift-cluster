@@ -985,6 +985,7 @@ mod tests {
             node_id,
             seq,
             clear_gen,
+            space_gen: 0,
             flow_id: String::new(),
             request,
             recorded_at_millis,
@@ -1005,6 +1006,27 @@ mod tests {
         )
     }
 
+    /// An entry carrying both generation components and a real `flow_id`, for the space-scoped
+    /// cases (issue #224).
+    fn entry_space(
+        node_id: NodeId,
+        seq: u64,
+        clear_gen: u64,
+        space_gen: u64,
+        flow_id: &str,
+        timestamp: &str,
+    ) -> ShardEntry {
+        ShardEntry {
+            node_id,
+            seq,
+            clear_gen,
+            space_gen,
+            flow_id: flow_id.to_owned(),
+            request: req_at(timestamp, &format!("/p{seq}")),
+            recorded_at_millis: 0,
+        }
+    }
+
     fn slice(node_id: NodeId, entries: Vec<ShardEntry>) -> ShardSlice {
         ShardSlice {
             node_id,
@@ -1013,6 +1035,7 @@ mod tests {
                 entries,
                 evicted_below_seq: 0,
                 clear_gen: 0,
+                space_gens: Vec::new(),
             },
         }
     }
@@ -1161,6 +1184,92 @@ mod tests {
         let merged = merge_shards(&[cleared, current], false);
         let nodes: Vec<NodeId> = merged.entries.iter().map(|e| e.node_id).collect();
         assert_eq!(nodes, vec![2], "the pre-clear entry is gone");
+    }
+
+    // ---- Clear generations, live (issue #224) ----------------------------------------
+
+    /// A reader that has applied the bump answers post-clear state or nothing — never a mix of
+    /// both generations. This is the partition invariant (AC2) at merge scope: the minority's
+    /// stale entries are dropped the moment *this reader* knows the generation moved, without any
+    /// node re-issuing the clear.
+    #[test]
+    fn a_reader_that_has_applied_the_bump_never_answers_a_mixed_generation() {
+        // The lagging peer still reports generation 0 and its pre-clear entries.
+        let lagging = slice(1, vec![entry_gen(1, 1, 0, "2026-01-01T00:00:01Z")]);
+        let mut applied = slice(2, vec![entry_gen(2, 1, 1, "2026-01-01T00:00:02Z")]);
+        applied.read.clear_gen = 1;
+
+        let merged = merge_shards(&[lagging, applied], false);
+        assert!(
+            merged.entries.iter().all(|e| e.clear_gen == 1),
+            "the threshold is the max generation any slice reports, so one peer having \
+             applied the bump is enough to drop every older entry fleet-wide"
+        );
+    }
+
+    /// A **port-wide** clear must clear a space's entries too, even when that space carries a
+    /// numerically higher space generation from an earlier scoped teardown.
+    ///
+    /// This is the case that rules out collapsing the two generations into one stamp
+    /// (`max(port_gen, space_gen)`): under that encoding this entry's stamp would be 5, the
+    /// port bump to 1 would leave the threshold at 5, and a full clear would silently fail to
+    /// clear it. They are separate components precisely so this cannot happen.
+    #[test]
+    fn a_port_bump_drops_entries_carrying_a_higher_space_generation() {
+        let mut scoped = slice(1, vec![entry_space(1, 1, 0, 5, "flow-a", "2026-01-01T00:00:01Z")]);
+        scoped.read.space_gens = vec![("flow-a".to_owned(), 5)];
+        scoped.read.clear_gen = 1;
+
+        let merged = merge_shards(&[scoped], false);
+        assert!(
+            merged.entries.is_empty(),
+            "a port-wide clear outranks any space generation — it clears the whole port"
+        );
+    }
+
+    /// Space teardown is surgical: only the torn-down space loses entries (AC4).
+    #[test]
+    fn a_space_bump_drops_only_that_spaces_entries() {
+        let mut shard = slice(
+            1,
+            vec![
+                entry_space(1, 1, 0, 0, "flow-a", "2026-01-01T00:00:01Z"),
+                entry_space(1, 2, 0, 0, "flow-b", "2026-01-01T00:00:02Z"),
+                entry_space(1, 3, 0, 1, "flow-a", "2026-01-01T00:00:03Z"),
+            ],
+        );
+        shard.read.space_gens = vec![("flow-a".to_owned(), 1)];
+
+        let merged = merge_shards(&[shard], false);
+        let kept: Vec<(&str, u64)> = merged
+            .entries
+            .iter()
+            .map(|e| (e.flow_id.as_str(), e.seq))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("flow-b", 2), ("flow-a", 3)],
+            "flow-a's pre-teardown entry is dropped; its post-teardown entry and flow-b's \
+             untouched entry both survive"
+        );
+    }
+
+    /// A space generation known to one peer applies to every peer's entries for that space —
+    /// the map is fleet state, not per-shard state.
+    #[test]
+    fn a_space_generation_from_any_slice_applies_to_every_slice() {
+        let stale = slice(1, vec![entry_space(1, 1, 0, 0, "flow-a", "2026-01-01T00:00:01Z")]);
+        let mut knows = slice(2, vec![entry_space(2, 1, 0, 2, "flow-a", "2026-01-01T00:00:02Z")]);
+        knows.read.space_gens = vec![("flow-a".to_owned(), 2)];
+
+        let merged = merge_shards(&[stale, knows], false);
+        assert_eq!(
+            merged.entries.len(),
+            1,
+            "the lagging peer's pre-teardown entry is dropped using the generation the \
+             other peer reports"
+        );
+        assert_eq!(merged.entries[0].node_id, 2);
     }
 
     /// Today every shard pins generation 0, and that must merge exactly as it did before the
