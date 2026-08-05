@@ -1186,12 +1186,19 @@ impl ProxyRecordingStore for ClusterProxyStore {
         reply.resp
     }
 
+    /// **Must never block.** The manager calls this from its port-reclaim path, which the
+    /// state machine's own engine drive reaches on every imposter deletion or replace —
+    /// while `apply` awaits it. A `clear` that waits on a Raft write from there is waiting
+    /// on the very apply loop it is blocking: each reclaim stalls the state machine for the
+    /// full submit deadline, and every unrelated admin write blows `WRITE_DEADLINE` with
+    /// "did not commit within the deadline" (the exact 504s the C22/C23/C26 smoke scenarios
+    /// caught). So the durable half is *spawned* onto the bridge runtime, never awaited.
     fn clear(&self, port: u16) {
-        // The imposter-deletion reclaim path arrives here after `DeleteImposter` already
-        // purged the rows atomically with the delete; an unresolvable port is that case,
-        // not an error.
+        self.net.clear_local(port);
+        // The imposter-deletion reclaim arrives here after `DeleteImposter` already purged
+        // the rows atomically with the delete; an unresolvable port is that case, not an
+        // error — nothing durable is left to clear.
         let Ok(identity) = self.net.port_identity(port) else {
-            self.net.clear_local(port);
             return;
         };
         let Some(bridge) = self.net.bridge.get() else {
@@ -1199,13 +1206,18 @@ impl ProxyRecordingStore for ClusterProxyStore {
                 port,
                 "proxy clear before the cluster bound; markers survive until a bound clear"
             );
-            self.net.clear_local(port);
             return;
         };
         let net = Arc::clone(&self.net);
         let tenant = TenantId::new(identity.tenant);
-        let cleared = bridge.call(CallerClass::DataPlane, SETTLE_OP_DEADLINE, async move {
-            let (node, _ring) = net.view().map_err(RpcError::Handler)?;
+        bridge.handle().spawn(async move {
+            let (node, ring) = match net.view() {
+                Ok(view) => view,
+                Err(reason) => {
+                    tracing::error!(port, %reason, "proxy clear did not commit; markers survive");
+                    return;
+                }
+            };
             let request = ControlRequest {
                 op_id: Uuid::new_v4(),
                 principal: None,
@@ -1213,27 +1225,22 @@ impl ProxyRecordingStore for ClusterProxyStore {
                 expected_revision: None,
                 op: ControlOp::ProxyRecordedClear { tenant, port },
             };
-            node.submit(request)
-                .await
-                .map(|_| ())
-                .map_err(|e| RpcError::Handler(e.to_string()))
-        });
-        self.net.clear_local(port);
-        if let Err(e) = cleared {
-            // The trait offers no error channel; error-level is the honest floor — a clear
-            // that did not commit means `AlreadyRecorded` survives for cleared signatures.
-            tracing::error!(port, error = %e, "proxy clear did not commit; markers survive");
-            return;
-        }
-        // Best-effort fan-out for the peers' owner-local Pending/complete caches, budgeted
-        // and logged separately from the commit above so a slow peer cannot make a clear
-        // that DID commit read as failed. A peer this misses self-heals at the claim
-        // deadline / cache TTL.
-        let net = Arc::clone(&self.net);
-        let fanned = bridge.call(CallerClass::DataPlane, SETTLE_OP_DEADLINE, async move {
-            let (node, ring) = net.view().map_err(RpcError::Handler)?;
-            let body = serde_json::to_vec(&ClearReq { port })
-                .map_err(|e| RpcError::Handler(e.to_string()))?;
+            if let Err(e) = node.submit(request).await {
+                // The trait offers no error channel; error-level is the honest floor — a
+                // clear that did not commit means `AlreadyRecorded` survives for cleared
+                // signatures.
+                tracing::error!(port, error = %e, "proxy clear did not commit; markers survive");
+                return;
+            }
+            // Best-effort fan-out for the peers' owner-local Pending/complete caches. A
+            // peer this misses self-heals at the claim deadline / cache TTL.
+            let body = match serde_json::to_vec(&ClearReq { port }) {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::warn!(port, error = %e, "proxy clear fan-out skipped: encode failed");
+                    return;
+                }
+            };
             for member in ring.members().iter().copied() {
                 if member == node.id() {
                     continue;
@@ -1245,15 +1252,7 @@ impl ProxyRecordingStore for ClusterProxyStore {
                     tracing::warn!(port, member, error = %e, "proxy clear fan-out missed a peer");
                 }
             }
-            Ok(())
         });
-        if let Err(e) = fanned {
-            tracing::warn!(
-                port,
-                error = %e,
-                "proxy clear fan-out incomplete; peers' claim caches heal at their TTLs"
-            );
-        }
     }
 }
 
