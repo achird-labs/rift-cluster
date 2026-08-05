@@ -15,6 +15,8 @@ import {
   exportQuery,
   selectImposter,
 } from "../features/imposters/portable.ts";
+import { projectPredicates } from "../features/stubs/predicates.ts";
+import { sampleRequest, toCurl } from "../features/stubs/sample.ts";
 import { RecordingPanel } from "./RecordingPanel.tsx";
 import { DeleteStubButton, StubEditor, type StubTarget } from "./StubEditor.tsx";
 
@@ -414,6 +416,7 @@ function StubTable({
           <th>Scenario</th>
           <th className="numeric">Predicates</th>
           <th className="numeric">Responses</th>
+          <th>Try</th>
           {mayWrite ? <th>Actions</th> : null}
         </tr>
       </thead>
@@ -437,6 +440,14 @@ function StubTable({
             </td>
             <td className="numeric">
               <Ident>{stub.responses?.length ?? UNKNOWN}</Ident>
+            </td>
+            {/*
+              Its own cell, always present. Copying a curl is a READ — it exercises the mock rather
+              than changing it — so gating it on `mayWrite` would deny the try-it affordance to
+              exactly the role most likely to be diagnosing why a stub is not matching.
+            */}
+            <td>
+              <CopyCurlButton port={port} stub={stub} />
             </td>
             {mayWrite ? (
               <td>
@@ -484,6 +495,66 @@ const IDLESS_NOTE_ID = "stub-idless-note";
  * keeps a short `no id` marker and points at the shared note through `aria-describedby`, so the
  * explanation is still one tab-stop away for a screen reader and still on screen for everyone else.
  */
+/**
+ * Copy a `curl` that exercises this stub.
+ *
+ * A read action, so it is offered to anyone who can see the stub — trying a mock is not editing it.
+ *
+ * The origin is this page's host with the IMPOSTER's port: the console is served from the admin
+ * port, and the stub answers on its own. That is also why this copies a command instead of sending
+ * the request itself — a browser fetch from the admin origin to the imposter's port is cross-origin
+ * and a mock server sends no CORS headers, so an in-page "send" would be blocked for most stubs.
+ * A command the operator runs in their own terminal has no such problem.
+ */
+function CopyCurlButton({ port, stub }: { port: number; stub: Stub }): ReactNode {
+  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+
+  const projection = projectPredicates(stub);
+  // A stub whose predicates the form cannot model is exactly the stub whose request cannot be
+  // derived — offering a button that would produce `GET /` regardless would be a guess wearing a
+  // command's clothes.
+  if (projection.kind !== "predicates") return null;
+
+  const sample = sampleRequest(projection.items);
+  const origin = `${window.location.protocol}//${window.location.hostname}:${port}`;
+  const command = toCurl(sample, origin);
+
+  return (
+    <span className="row">
+      <button
+        className="btn sm"
+        type="button"
+        data-testid={`copy-curl-${stub.id ?? "unnamed"}`}
+        // The caveats ride on the control that produces the command, so an operator cannot copy a
+        // partial request without the reason it is partial being one hover away.
+        title={
+          sample.caveats.length === 0
+            ? command
+            : `${command}\n\nThis request may not match:\n- ${sample.caveats.join("\n- ")}`
+        }
+        onClick={() => {
+          void navigator.clipboard
+            .writeText(command)
+            .then(() => setState("copied"))
+            .catch(() => setState("failed"));
+        }}
+      >
+        Copy curl
+      </button>
+      {state === "copied" ? (
+        <span className="muted" role="status">
+          copied{sample.caveats.length === 0 ? "" : ` · ${sample.caveats.length} caveat(s)`}
+        </span>
+      ) : null}
+      {state === "failed" ? (
+        <span className="warn-text" role="status">
+          clipboard blocked — the command is on the button&rsquo;s tooltip
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 function StubActions({
   port,
   stub,
