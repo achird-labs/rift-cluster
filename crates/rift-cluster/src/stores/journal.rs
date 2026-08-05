@@ -435,6 +435,15 @@ pub struct ClusterJournal {
     /// built with a state directory, in which case a crash-restarted writer resumes
     /// strictly above every seq the previous boot could have handed out.
     seq_floors: SeqFloors,
+    /// Bumped once per recorded entry, so a live reader can wake on an append instead of
+    /// polling for one (issue #348). The value is a counter nobody interprets — receivers
+    /// care only that it changed, and then re-read the journal through the ordinary merge.
+    ///
+    /// A `watch` rather than a broadcast on purpose: the entries themselves travel on the
+    /// read path, so a reader that misses N bumps and wakes once has lost nothing. That is
+    /// what keeps a slow SSE client from ever applying backpressure to the recording path —
+    /// `send_modify` never blocks and never fails, even with no receivers at all.
+    appends: tokio::sync::watch::Sender<u64>,
 }
 
 impl ClusterJournal {
@@ -490,7 +499,18 @@ impl ClusterJournal {
             clock,
             config,
             seq_floors,
+            appends: tokio::sync::watch::Sender::new(0),
         })
+    }
+
+    /// A receiver that fires whenever an entry is recorded on any port (issue #348).
+    ///
+    /// Deliberately not per-port: a live tail already filters by port on the read side, and one
+    /// channel per journal keeps the recording path's cost a single `send_modify` regardless of
+    /// how many ports exist or how many readers are attached.
+    #[must_use]
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.appends.subscribe()
     }
 
     /// The seq boundary between this boot and any previous one for `port`.
@@ -903,6 +923,10 @@ impl RequestJournal for ClusterJournal {
 
         shard.entries_gauge.set(retained as f64);
         crate::metrics::note_journal_evictions(evicted.cap, evicted.age);
+        // After the write lock is released, so a woken reader always finds the entry it was
+        // woken for. Waking inside the lock would let the reader race the recorder to
+        // `entries` and see the shard as it was before the push.
+        self.appends.send_modify(|n| *n = n.wrapping_add(1));
         Some(seq)
     }
 

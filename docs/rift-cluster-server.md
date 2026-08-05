@@ -1067,10 +1067,39 @@ upstream `400` into a `200` with everything. Proxying leaves upstream's own
 clause parser, and its existing error handling, in charge — and on that path
 the cursor headers carry upstream's own scalar index, not a vector token.
 
-**SSE still proxies per-node.** `.../savedRequests/stream` and `GET /events`
-are unchanged by #225 and remain FleetAdmin-gated per-node tails; the merged
-tail is not yet implemented. A client that needs the fleet view polls the
-cursor above.
+**`GET .../savedRequests/stream` is a merged live tail** (issue #348). It
+terminates at the front door and answers `text/event-stream` carrying the whole
+fleet's recorded requests, not just this node's. It is the same merged walk the
+cursor read above performs, resumed on every wake instead of once: the `id:`
+line after an event is a cursor token in exactly the sense `x-rift-next-index`
+is, and reconnecting with `Last-Event-ID` resumes gaplessly and without
+duplicates per shard. You can move between polling and tailing with one token.
+
+The `hello` event carries `clusterTailLatencyMs`. Entries this node records
+appear immediately; entries from other nodes ride the anti-entropy cadence, and
+that number is the honest upper bound on how late they can be — a tail that
+asked every peer per event would multiply inter-node traffic by the number of
+connected clients. `partial` events mark every transition into and out of a
+degraded merge, and `lagged` means retention dropped entries you had not
+reached yet: reconcile by polling, the stream does not replay. `: ping` every
+15 s, as single-node.
+
+Additive differences from the single-node stream, all of them declared in
+`openapi-ee.yaml`: `hello` gains `clusterTailLatencyMs` and `cursor` and omits
+the engine's scalar `seq` (a merged stream has no single bus position); `id:`
+is the vector cursor token; `index` appears only on entries this node wrote,
+because another node's seq means nothing in this node's numbering; and
+`partial` is new.
+
+**With `?match=` the tail keeps proxying**, for the reason the read does: the
+merge path evaluates no predicates, so terminating a scoped tail would answer
+with the whole fleet's requests instead of your subset.
+
+**`GET /events` still proxies per-node and is FleetAdmin-gated.** That
+asymmetry is deliberate — the firehose spans every tenant and is not yet
+filtered server-side (issue #163), whereas the per-port tail carries one
+imposter's requests and is authorized as the port-scoped `imposter.read` it
+always was. Terminating the per-port tail changed no authorization posture.
 
 **`DELETE savedRequests`/`.../requests` is explicitly transitional, and a
 `match`-scoped clear never fans out at all.** Without `?match=`, it clears

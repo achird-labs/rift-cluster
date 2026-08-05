@@ -235,6 +235,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/imposters/{port}/savedRequests/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Live tail of recorded requests, merged across the fleet (SSE)
+         * @description The live sibling of `GET /imposters/{port}/savedRequests`, terminated by the cluster front rather than proxied to one node (issue #348). Answers `text/event-stream`.
+         *     **One contract, two read modes.** Every wake re-runs the same merged cursor walk the `savedRequests` read runs, from the position this connection holds. So the `id:` line after an event is a cursor token in exactly the sense `x-rift-next-index` is, and once a burst has drained it is the same token a simultaneous cursor read would answer with. Reconnect with `Last-Event-ID` and the walk resumes gaplessly and without duplicates **per shard** — the same guarantee, and the same token vocabulary, as `since`.
+         *     **Latency is declared, not hidden.** Entries this node records surface immediately. Entries from *peer* shards arrive on the anti-entropy cadence, because a tail that fanned out to every peer per event would multiply inter-node traffic by the number of attached clients. The `hello` event therefore carries `clusterTailLatencyMs`, the interval this fleet actually runs that cadence at, and it is an honest upper bound on how late a peer's entry can be.
+         *     **Events.** `hello` first, carrying `engineVersion`, `types` (always `["requests"]`), `port`, `clusterTailLatencyMs`, and `cursor` — the position the stream starts from, so a client can bootstrap a poll from it. Then `request` events, whose `data` is `{port, flowId, request}`, plus `index` **only** for entries this node wrote (a peer's seq is a position in another shard and must never be presented back as a scalar `since`). `lagged` when retention evicted entries this reader had not reached — same meaning as upstream's: reconcile by polling, this stream does not replay. `partial` on every transition of the merged read's degraded state, `true` and back to `false`, so a peer going unreachable mid-stream is visible rather than silent. `: ping` every 15 s.
+         *     **Divergences from the engine's own stream**, all additive: `hello` gains `clusterTailLatencyMs` and `cursor` and omits the engine's scalar `seq` (a merged stream has no single bus position); `id:` is the vector cursor token rather than a bus sequence number; `index` is withheld for peer entries; and `partial` is new.
+         *     With `match` present this proxies to the local engine unchanged, for the reason `GET .../savedRequests` documents: the merge path evaluates no predicates, so terminating a predicate-scoped tail would answer with the whole fleet's requests instead of the caller's subset.
+         *     Unlike this route, `GET /events` stays proxied per-node and FleetAdmin-gated: its payload spans every tenant and is not yet filtered server-side (issue #163 owns that). This per-port tail carries one imposter's requests and is authorized as the ordinary port-scoped `imposter.read` it always was.
+         */
+        get: operations["streamSavedRequests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/imposters/{port}/requests": {
         parameters: {
             query?: never;
@@ -2748,6 +2777,50 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Imposter"];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No such imposter for this tenant, or owned by another tenant. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    streamSavedRequests: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Repeatable filter clause; every clause supplied must match (AND). The grammar is closed — `method=<Verb>`, `path=<Path>`, `flow_id=<Value>`, or `header:<Name>=<Value>` — and a value outside it answers 400 rather than being ignored, because a filter that silently degraded to "match everything" would cross-contaminate correlated scenarios.
+                 * @example [
+                 *       "method=POST",
+                 *       "header:Content-Type=application/json"
+                 *     ]
+                 */
+                match?: components["parameters"]["JournalMatch"];
+            };
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description An open SSE stream. Ends only when the client disconnects or the node stops. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
                 };
             };
             400: components["responses"]["BadData"];

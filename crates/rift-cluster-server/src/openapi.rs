@@ -301,6 +301,12 @@ mod parity {
             Terminated::ReadSavedRequests(_) => {
                 RouteKey::new(&Method::GET, "/imposters/{port}/savedRequests")
             }
+            // Only the canonical spelling has a stream (issue #348) — upstream's `stream_target`
+            // recognises exactly this one path, so unlike the read above there is no alias half
+            // for `SAVED_REQUESTS_ALIAS_ROUTES` to cover.
+            Terminated::StreamSavedRequests(_) => {
+                RouteKey::new(&Method::GET, "/imposters/{port}/savedRequests/stream")
+            }
             Terminated::ClearSavedRequests(_) => {
                 RouteKey::new(&Method::DELETE, "/imposters/{port}/savedRequests")
             }
@@ -394,6 +400,7 @@ mod parity {
             Terminated::SetEnabled(4545, true),
             Terminated::SetEnabled(4545, false),
             Terminated::ReadSavedRequests(4545),
+            Terminated::StreamSavedRequests(4545),
             Terminated::ClearSavedRequests(4545),
             Terminated::ClearSavedProxyResponses(4545),
             Terminated::SpaceTeardown(4545, "flow-1".to_owned()),

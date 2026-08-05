@@ -572,3 +572,508 @@ async fn a_peer_that_left_the_roster_no_longer_degrades_the_read() {
         "no voter is missing after a clean departure, so nothing is degraded: {after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The merged live tail (issue #348).
+//
+// Read over a raw socket rather than through an HTTP client: the stream's wire shape *is* part of
+// its contract (`text/event-stream`, no buffering, chunked framing, `: ping`), and a client that
+// normalises those away would let a regression in any of them pass. It also keeps the test tree
+// free of a streaming-client dependency it does not otherwise have.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct SseEvent {
+    name: String,
+    id: Option<String>,
+    data: serde_json::Value,
+}
+
+/// An open SSE connection, de-chunked and parsed incrementally.
+struct Tail {
+    socket: tokio::net::TcpStream,
+    /// De-chunked body bytes not yet consumed as complete frames.
+    body: String,
+    /// Raw chunked-transfer bytes not yet decoded.
+    raw: Vec<u8>,
+    headers: String,
+    events: Vec<SseEvent>,
+    pings: usize,
+    /// The peer closed the connection; further reads would return 0 forever.
+    closed: bool,
+}
+
+impl Tail {
+    /// Open the tail on node `admin`, optionally resuming from `last_event_id`, and read as far as
+    /// the response headers.
+    async fn open(
+        admin: std::net::SocketAddr,
+        port: u16,
+        query: &str,
+        last_event_id: Option<&str>,
+    ) -> Self {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut socket = tokio::net::TcpStream::connect(admin)
+            .await
+            .expect("connect to the admin front");
+        let resume = last_event_id
+            .map(|id| format!("Last-Event-ID: {id}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "GET /imposters/{port}/savedRequests/stream{query} HTTP/1.1\r\n\
+             Host: {admin}\r\n\
+             Accept: text/event-stream\r\n\
+             {resume}\r\n"
+        );
+        socket
+            .write_all(request.as_bytes())
+            .await
+            .expect("write the stream request");
+
+        let mut tail = Self {
+            socket,
+            body: String::new(),
+            raw: Vec::new(),
+            headers: String::new(),
+            events: Vec::new(),
+            pings: 0,
+            closed: false,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !tail.raw.windows(4).any(|w| w == b"\r\n\r\n") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream never sent response headers"
+            );
+            tail.read_more(Duration::from_secs(2)).await;
+        }
+        let split = tail
+            .raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("checked above");
+        tail.headers = String::from_utf8_lossy(&tail.raw[..split]).into_owned();
+        tail.raw.drain(..split + 4);
+        tail.decode();
+        // Headers arriving does not mean the first frame has. Whether `hello` rides the same TCP
+        // segment as the response head is a scheduling accident — it did under `--test-threads=1`
+        // and did not under `3` — so wait for it here rather than letting every caller race it.
+        // Bounded and non-fatal: an error response (a refused `Last-Event-ID`) legitimately
+        // carries no frames at all, and those callers only read `headers`.
+        tail.until(Duration::from_secs(10), |t| !t.events.is_empty())
+            .await;
+        tail
+    }
+
+    /// Read whatever is available within `budget`. A timeout is not a failure — an idle stream is
+    /// the normal state — so this returns quietly either way.
+    async fn read_more(&mut self, budget: Duration) {
+        use tokio::io::AsyncReadExt as _;
+
+        if self.closed {
+            // Nothing more will arrive, and reading a closed socket returns 0 immediately — so
+            // without this the deadline in `until` would be burned in a spin rather than a wait.
+            tokio::time::sleep(budget).await;
+            return;
+        }
+        let mut buf = [0_u8; 8192];
+        // A timeout is the normal idle state of a live tail and means nothing. A read *error* is
+        // the node having died or reset the connection, and must not be reported later as a bare
+        // "nothing ever arrived" — that is the difference between a diagnosable failure and a
+        // mystery timeout.
+        match tokio::time::timeout(budget, self.socket.read(&mut buf)).await {
+            Ok(Ok(0)) => self.closed = true,
+            Ok(Ok(read)) => self.raw.extend_from_slice(&buf[..read]),
+            Ok(Err(e)) => panic!("the stream connection failed mid-read: {e}"),
+            Err(_) => {}
+        }
+    }
+
+    /// Decode as many complete `Transfer-Encoding: chunked` chunks as `raw` holds, then parse as
+    /// many complete SSE frames as the decoded body holds.
+    fn decode(&mut self) {
+        while let Some(eol) = self.raw.windows(2).position(|w| w == b"\r\n") {
+            let Ok(header) = std::str::from_utf8(&self.raw[..eol]) else {
+                break;
+            };
+            let Ok(size) = usize::from_str_radix(header.trim(), 16) else {
+                break;
+            };
+            // header + CRLF + payload + CRLF
+            if self.raw.len() < eol + 2 + size + 2 {
+                break;
+            }
+            let payload = self.raw[eol + 2..eol + 2 + size].to_vec();
+            self.raw.drain(..eol + 2 + size + 2);
+            self.body.push_str(&String::from_utf8_lossy(&payload));
+        }
+
+        while let Some(end) = self.body.find("\n\n") {
+            let frame: String = self.body.drain(..end + 2).collect();
+            let frame = frame.trim_end();
+            if frame.starts_with(':') {
+                self.pings += 1;
+                continue;
+            }
+            let mut name = String::new();
+            let mut id = None;
+            let mut data = String::new();
+            for line in frame.lines() {
+                if let Some(value) = line.strip_prefix("event: ") {
+                    name = value.to_owned();
+                } else if let Some(value) = line.strip_prefix("id: ") {
+                    id = Some(value.to_owned());
+                } else if let Some(value) = line.strip_prefix("data: ") {
+                    data = value.to_owned();
+                }
+            }
+            // Loud on purpose. Defaulting a malformed `data:` line to `Value::Null` would make
+            // this harness the thing that hides the bug it exists to catch: every assertion below
+            // reaches through `.get(...)`, which answers `None` on `Null`, so a corrupted frame
+            // would quietly drop out of a *negative* assertion ("no peer entry carries `index`")
+            // and turn an encoding or chunk-boundary defect into a pass.
+            let parsed = serde_json::from_str(&data)
+                .unwrap_or_else(|e| panic!("an SSE data line was not valid JSON ({e}): {data:?}"));
+            self.events.push(SseEvent {
+                name,
+                id,
+                data: parsed,
+            });
+        }
+    }
+
+    /// Pump the socket until `want` is satisfied or `budget` runs out. Returns whether it was.
+    async fn until(&mut self, budget: Duration, want: impl Fn(&Self) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if want(self) {
+                return true;
+            }
+            self.read_more(Duration::from_millis(200)).await;
+            self.decode();
+        }
+        want(self)
+    }
+
+    fn hello(&self) -> &SseEvent {
+        self.events
+            .iter()
+            .find(|e| e.name == "hello")
+            .expect("every stream opens with hello")
+    }
+
+    /// The recorded paths delivered so far, in delivery order.
+    fn delivered(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .filter(|e| e.name == "request")
+            .filter_map(|e| {
+                e.data
+                    .get("request")?
+                    .get("path")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn requests(&self) -> Vec<&SseEvent> {
+        self.events.iter().filter(|e| e.name == "request").collect()
+    }
+}
+
+/// AC1 + AC6: a tail on one node sees traffic recorded on the other two, within the latency the
+/// stream itself declares — and the framing is upstream's.
+#[tokio::test]
+async fn the_merged_tail_delivers_what_every_node_records() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let fleet = Fleet::start(&states).await;
+
+    let mut tail = Tail::open(fleet.admin(0), fleet.port, "", None).await;
+
+    assert!(
+        tail.headers.contains("200 OK"),
+        "the tail must be terminated, not refused: {}",
+        tail.headers
+    );
+    for expected in [
+        "text/event-stream",
+        "no-cache",
+        // Upstream sets this so an intermediary cannot buffer the stream into uselessness; a
+        // clustered tail behind a load balancer needs it at least as much.
+        "no",
+    ] {
+        assert!(
+            tail.headers
+                .to_lowercase()
+                .contains(&expected.to_lowercase()),
+            "response headers must carry {expected:?}: {}",
+            tail.headers
+        );
+    }
+
+    let hello = tail.hello().clone();
+    let declared = hello
+        .data
+        .get("clusterTailLatencyMs")
+        .and_then(serde_json::Value::as_u64)
+        .expect("hello declares the cluster tail latency");
+    assert!(
+        declared > 0,
+        "a declared latency of zero would be a promise the anti-entropy cadence cannot keep"
+    );
+    assert_eq!(
+        hello
+            .data
+            .get("types")
+            .and_then(serde_json::Value::as_array),
+        Some(&vec![serde_json::Value::from("requests")]),
+        "the per-port alias is request-only, exactly as upstream's is"
+    );
+    assert!(
+        hello
+            .data
+            .get("cursor")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "hello carries the start token, so a client can bootstrap a poll from it: {hello:?}"
+    );
+
+    // Traffic on the OTHER two nodes: these entries can only reach this tail through the merge.
+    fleet.drive(1, "beta", 2).await;
+    fleet.drive(2, "gamma", 2).await;
+
+    // The declared latency is the contract, so it is also the budget — with a margin for the
+    // fleet to actually route and record the requests, not for the tail to be late.
+    let budget = Duration::from_millis(declared) * 3 + Duration::from_secs(5);
+    let want: BTreeSet<String> = ["/svc/beta-0", "/svc/beta-1", "/svc/gamma-0", "/svc/gamma-1"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let arrived = tail
+        .until(budget, |t| {
+            want.iter().all(|path| t.delivered().contains(path))
+        })
+        .await;
+    assert!(
+        arrived,
+        "every peer-recorded request must arrive within the declared {declared} ms cadence; \
+         delivered so far: {:?}",
+        tail.delivered()
+    );
+
+    // Peer entries must not offer `index`: that seq is a position in another node's shard, and a
+    // client handing it back as a legacy scalar `since` would have it read as ours.
+    let peer_with_index = tail
+        .requests()
+        .into_iter()
+        .filter(|e| {
+            e.data
+                .get("request")
+                .and_then(|r| r.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|p| p.contains("beta") || p.contains("gamma"))
+        })
+        .filter(|e| e.data.get("index").is_some())
+        .count();
+    assert_eq!(
+        peer_with_index,
+        0,
+        "no peer entry may carry `index`: {:?}",
+        tail.requests()
+    );
+
+    for event in tail.requests() {
+        assert!(
+            event.id.is_some(),
+            "every request event carries a resumption token: {event:?}"
+        );
+        assert!(
+            event.data.get("flowId").is_some() && event.data.get("port").is_some(),
+            "the data object keeps upstream's shape: {event:?}"
+        );
+    }
+}
+
+/// AC2 + AC3: reconnecting with the last `id:` loses nothing and repeats nothing.
+#[tokio::test]
+async fn a_reconnect_from_the_last_event_id_neither_loses_nor_repeats() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let fleet = Fleet::start(&states).await;
+
+    let mut first = Tail::open(fleet.admin(0), fleet.port, "", None).await;
+    fleet.drive(0, "first", 3).await;
+    assert!(
+        first
+            .until(Duration::from_secs(20), |t| t.delivered().len() >= 3)
+            .await,
+        "the first connection must receive its batch: {:?}",
+        first.delivered()
+    );
+
+    let seen_first = first.delivered();
+    let resume_from = first
+        .requests()
+        .last()
+        .and_then(|e| e.id.clone())
+        .expect("the last delivered event carries the token to resume from");
+    drop(first);
+
+    // Recorded while nobody is listening: the gap a reconnect has to close.
+    fleet.drive(1, "gap", 2).await;
+
+    let mut second = Tail::open(fleet.admin(0), fleet.port, "", Some(&resume_from)).await;
+    assert!(
+        second
+            .until(Duration::from_secs(30), |t| {
+                let seen = t.delivered();
+                ["/svc/gap-0", "/svc/gap-1"]
+                    .iter()
+                    .all(|p| seen.contains(&(*p).to_owned()))
+            })
+            .await,
+        "a reconnect must deliver what was recorded while it was away: {:?}",
+        second.delivered()
+    );
+
+    let seen_second = second.delivered();
+    for already in &seen_first {
+        assert!(
+            !seen_second.contains(already),
+            "{already} was delivered before the disconnect and must not repeat: {seen_second:?}"
+        );
+    }
+    let unique: BTreeSet<&String> = seen_second.iter().collect();
+    assert_eq!(
+        unique.len(),
+        seen_second.len(),
+        "no entry may be delivered twice within one connection: {seen_second:?}"
+    );
+}
+
+/// A `Last-Event-ID` the front cannot read is a typed 400 — never a defaulted position, which
+/// would silently replay everything or silently skip it.
+#[tokio::test]
+async fn an_unusable_last_event_id_is_refused_rather_than_defaulted() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let fleet = Fleet::start(&states).await;
+
+    let tail = Tail::open(
+        fleet.admin(0),
+        fleet.port,
+        "",
+        Some("not-a-cursor-token-at-all"),
+    )
+    .await;
+    assert!(
+        tail.headers.contains("400"),
+        "an unreadable resumption token must be refused: {}",
+        tail.headers
+    );
+}
+
+/// A `?match=`-scoped tail keeps proxying (issue #223 review, B1), so it must NOT carry the
+/// merged stream's `hello`. Proving it by the discriminator rather than by the absence of data:
+/// upstream's own hello has no `clusterTailLatencyMs`, and only the merged tail adds one.
+#[tokio::test]
+async fn a_match_scoped_tail_still_proxies_to_the_local_engine() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let fleet = Fleet::start(&states).await;
+
+    // Upstream's own clause syntax (`<field>=<value>`), deliberately: proving this path reaches
+    // upstream's parser is half the point of the assertion below.
+    let mut tail = Tail::open(fleet.admin(0), fleet.port, "?match=method=GET", None).await;
+    assert!(
+        tail.headers.contains("200 OK"),
+        "a well-formed scoped tail must be accepted, not refused — a 400 here would make the \
+         hello assertion below pass for the wrong reason: {}",
+        tail.headers
+    );
+    assert!(
+        tail.until(Duration::from_secs(15), |t| !t.events.is_empty())
+            .await,
+        "the proxied stream still opens and greets: {}",
+        tail.headers
+    );
+    assert!(
+        tail.hello().data.get("clusterTailLatencyMs").is_none(),
+        "a predicate-scoped tail must reach the engine's own stream, not the merged one: {:?}",
+        tail.hello()
+    );
+    assert!(
+        tail.hello().data.get("seq").is_some(),
+        "and the engine's hello is the one with a scalar bus seq: {:?}",
+        tail.hello()
+    );
+}
+
+/// AC4: a peer going unreachable mid-stream is *announced*, not silently absorbed.
+///
+/// This is the one acceptance criterion whose machinery is entirely new — the streamed `partial`
+/// reads a verdict `anti_entropy_tick` now records, rather than the per-read fan-out the cursor
+/// read uses — so an end-to-end assertion is what stops it from being plausible-but-untrue.
+#[tokio::test]
+async fn a_peer_dying_mid_stream_is_announced_not_silently_absorbed() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let mut fleet = Fleet::start(&states).await;
+
+    let mut tail = Tail::open(fleet.admin(0), fleet.port, "", None).await;
+    let declared = tail
+        .hello()
+        .data
+        .get("clusterTailLatencyMs")
+        .and_then(serde_json::Value::as_u64)
+        .expect("hello declares the cadence");
+
+    // The vacuity guard: a healthy fleet must NOT be announcing partial, or the assertion below
+    // would pass on a stream that simply says `partial` all the time.
+    fleet.drive(0, "healthy", 1).await;
+    tail.until(Duration::from_secs(5), |t| !t.delivered().is_empty())
+        .await;
+    assert!(
+        !tail.events.iter().any(|e| e.name == "partial"),
+        "a healthy fleet must not be claiming a degraded merge: {:?}",
+        tail.events
+    );
+
+    // Hard stop, not a graceful leave: the node stays a voter, so the tick still expects it and
+    // cannot reach it — exactly the condition the stamp exists to report.
+    fleet.take_last().shutdown().await;
+
+    // The verdict is recorded by the anti-entropy tick, so it cannot appear faster than one
+    // cadence; allow several, plus room for the transport to give up on the dead peer.
+    let budget = Duration::from_millis(declared) * 4 + Duration::from_secs(20);
+    let announced = tail
+        .until(budget, |t| {
+            t.events
+                .iter()
+                .any(|e| e.name == "partial" && e.data.get("partial") == Some(&true.into()))
+        })
+        .await;
+    assert!(
+        announced,
+        "an unreachable voter must be declared on the stream, not silently dropped: {:?}",
+        tail.events
+    );
+}
