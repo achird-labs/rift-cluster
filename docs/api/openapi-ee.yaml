@@ -4441,17 +4441,24 @@ components:
       required: [node_id, is_leader, current_leader, last_applied, voters]
       properties:
         node_id:
-          type: integer
-          format: int64
-          description: This node's raft id.
+          type: string
+          description: >
+            This node's raft id. A **string**, not an integer: a raft id is a
+            `u64`, JSON numbers are IEEE-754 doubles wherever the reader is
+            JavaScript, and every id above 2^53-1 is silently rounded on the
+            way in. Ids are identifiers, never magnitudes — nothing sums or
+            orders them — so a string costs nothing and is the only encoding
+            that survives the round trip.
         is_leader:
           type: boolean
           description: Whether this node is currently the raft leader.
         current_leader:
-          type: integer
-          format: int64
+          type: string
           nullable: true
-          description: The current leader's node id, if one is known to this node.
+          description: >
+            The current leader's node id, if one is known to this node. A
+            string for the same reason as `node_id`. `null` is an absence —
+            "this node knows of no leader" — never the id `"0"`.
         last_applied:
           type: integer
           format: int64
@@ -4460,9 +4467,10 @@ components:
         voters:
           type: array
           items:
-            type: integer
-            format: int64
-          description: Voter node ids in the currently effective membership.
+            type: string
+          description: >
+            Voter node ids in the currently effective membership. Strings for
+            the same reason as `node_id`.
 
     FleetHealth:
       type: object
@@ -4502,9 +4510,10 @@ components:
             members:
               type: array
               items:
-                type: integer
-                format: int64
-              description: Node ids currently in the ownership ring, in ring order.
+                type: string
+              description: >
+                Node ids currently in the ownership ring, in ring order.
+                Strings for the same reason as `FleetMembers.node_id`.
 
     FleetOpStatus:
       type: object

@@ -1407,25 +1407,19 @@ export interface components {
         };
         /** @description This node's view of raft membership — the `/_fleet/members` read-only admin-port projection (RFC-006 §5.2) of `cluster_api.rs`'s `members_body`, byte-identical to `/_cluster/members` on the cluster port. One builder, two ports, so the two cannot drift. */
         FleetMembers: {
-            /**
-             * Format: int64
-             * @description This node's raft id.
-             */
-            node_id: number;
+            /** @description This node's raft id. A **string**, not an integer: a raft id is a `u64`, JSON numbers are IEEE-754 doubles wherever the reader is JavaScript, and every id above 2^53-1 is silently rounded on the way in. Ids are identifiers, never magnitudes — nothing sums or orders them — so a string costs nothing and is the only encoding that survives the round trip. */
+            node_id: string;
             /** @description Whether this node is currently the raft leader. */
             is_leader: boolean;
-            /**
-             * Format: int64
-             * @description The current leader's node id, if one is known to this node.
-             */
-            current_leader: number | null;
+            /** @description The current leader's node id, if one is known to this node. A string for the same reason as `node_id`. `null` is an absence — "this node knows of no leader" — never the id `"0"`. */
+            current_leader: string | null;
             /**
              * Format: int64
              * @description Index of the last log entry applied to this node's state machine.
              */
             last_applied: number | null;
-            /** @description Voter node ids in the currently effective membership. */
-            voters: number[];
+            /** @description Voter node ids in the currently effective membership. Strings for the same reason as `node_id`. */
+            voters: string[];
         };
         /** @description This node's readiness plus its ring view — the `/_fleet/health` read-only admin-port projection (RFC-006 §5.2) of `cluster_api.rs`'s `health_body`. */
         FleetHealth: {
@@ -1446,8 +1440,8 @@ export interface components {
                  * @description The ownership ring's membership-epoch index.
                  */
                 m_idx: number;
-                /** @description Node ids currently in the ownership ring, in ring order. */
-                members: number[];
+                /** @description Node ids currently in the ownership ring, in ring order. Strings for the same reason as `FleetMembers.node_id`. */
+                members: string[];
             };
         };
         /** @description The `/_fleet/ops/{opId}` read-only admin-port projection (RFC-006 §5.2) of `cluster_api.rs`'s `op_body` — the poll target for a `202`-parked or async-committed write's op id. */
