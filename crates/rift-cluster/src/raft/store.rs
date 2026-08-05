@@ -58,8 +58,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
@@ -80,6 +80,7 @@ use crate::control::{
     FLEET_SCOPE, OnDrift, PreconditionTarget, Principal, Quotas, Role, SessionKey, SourceMode,
     SourceProvenance, StubEdit, StubEditScript, Tenant, TenantId,
 };
+use crate::stores::journal::ClusterJournal;
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
 
@@ -182,6 +183,36 @@ const SM_SESSION_KEY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("
 /// [`AUDIT_SINK_KEY`] is: it reads like the rest of the schema and a second signing key, if one
 /// is ever wanted, is a key change and not a schema migration.
 const SESSION_KEY_ROW: &str = "key";
+/// `(tenant, port, space-tag) -> generation` (issue #224): the applied clear-generation
+/// counters `ControlOp::JournalClearGen` bumps. Modelled on `sm_audit_checkpoint` — a small,
+/// monotone, per-key counter table — except the key is three-part: `space-tag` is
+/// [`journal_gen_space_key`]'s own encoding of `Option<&str>`, not a bare `&str`, because a
+/// port-wide clear (`None`) must never be representable the same way as a space-scoped one
+/// (`Some`) no matter what the space is named.
+const SM_JOURNAL_GENS_TABLE: TableDefinition<(&str, u16, &str), u64> =
+    TableDefinition::new("sm_journal_gens");
+
+/// Encodes the space component of an `sm_journal_gens` key so a port-wide clear (`None`) can
+/// never be confused with a space-scoped one — including a hypothetically empty space name.
+/// `validate` already refuses `Some("")`, but this encoding does not lean on that refusal (the
+/// #224 design note this crate was told twice): every space-scoped key carries a leading `'s'`
+/// tag byte a port-wide key can never produce, because the port-wide key is the fixed one-byte
+/// string `"p"` — the two families cannot collide regardless of what a space is named.
+fn journal_gen_space_key(space: Option<&str>) -> String {
+    match space {
+        None => "p".to_owned(),
+        Some(space) => format!("s{space}"),
+    }
+}
+
+/// The inverse of [`journal_gen_space_key`]: recovers the `Option<String>` shape a snapshot
+/// payload and [`ClusterJournal::set_clear_gen`] both want from a stored key. Any key that is
+/// not the literal `"p"` sentinel is a space-scoped key with the tag stripped — `strip_prefix`
+/// returning `None` only for `"p"` itself is exactly the case that must decode to `None`.
+fn decode_journal_gen_space_key(key: &str) -> Option<String> {
+    key.strip_prefix('s').map(str::to_owned)
+}
+
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
 const SM_APPLIED_TABLE: TableDefinition<(), &[u8]> = TableDefinition::new("sm_applied");
 /// Node-local durable intents (issue #9 R4): ops this node accepted but has
@@ -457,6 +488,15 @@ struct SnapshotPayload {
     /// field exists to prevent from happening by accident.
     #[serde(default)]
     session_key: Option<String>,
+    /// `(tenant, port, space, generation)` rows of `sm_journal_gens` (issue #224).
+    /// `#[serde(default)]` for the #134/#137 reason every table above carries it: a snapshot
+    /// built before this field existed must still install, and the empty vec it decodes to means
+    /// exactly what an upgrading fleet's history actually is — no clear has ever committed. The
+    /// sharper failure than most of this table's siblings if it were ever forgotten here: a node
+    /// that joins by snapshot and reads every generation as `0` would silently resurrect entries
+    /// its peers have already agreed are cleared, the very inversion issue #224 exists to close.
+    #[serde(default)]
+    journal_gens: Vec<(String, u16, Option<String>, u64)>,
     /// `(op_id, dedup-entry JSON)` rows of `sm_op_dedup`.
     dedup: Vec<(String, String)>,
     last_applied_log: Option<LogId<u64>>,
@@ -514,6 +554,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
             .open_table(SM_AUDIT_GC_WATERMARK_TABLE)
             .map_err(io)?;
         write_txn.open_table(SM_SESSION_KEY_TABLE).map_err(io)?;
+        write_txn.open_table(SM_JOURNAL_GENS_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
         write_txn.open_table(SM_APPLIED_TABLE).map_err(io)?;
         write_txn.open_table(PENDING_INTENTS_TABLE).map_err(io)?;
@@ -859,6 +900,21 @@ pub struct RedbStateMachine {
     /// refusal that names no single port). This is node status, not replicated
     /// state — every replica has its own bind outcomes.
     apply_failures: Arc<Mutex<BTreeMap<u16, String>>>,
+    /// This node's local request journal, late-bound (issue #224): `apply`/`install_snapshot`
+    /// push a committed clear generation into it via [`ClusterJournal::set_clear_gen`] so this
+    /// replica's own shards start dropping pre-clear entries immediately, without waiting for a
+    /// caller to read `sm_journal_gens` back out.
+    ///
+    /// `OnceLock<Weak<_>>`, mirroring `ClusterJournal`'s own late-bound `Voters::Node` slot (and
+    /// `FlowNet`'s node slot): the journal is built in `compose.rs` before the Raft node exists
+    /// (so it cannot be required at construction the way `db` is), and `Weak` for the same
+    /// reason those are — this state machine must never be the thing keeping the journal's
+    /// memory resident past shutdown. `None` in storage tests and on an embedder that never
+    /// wires one, exactly like `engine`; a dropped handle degrades the push into a benign no-op
+    /// (see the `JournalClearGen` arm of `mutate_tables`), never a panic — the generation the
+    /// fleet agrees on is durable in `sm_journal_gens` either way, and a later snapshot install
+    /// replays it into whatever journal eventually catches up.
+    journal: OnceLock<Weak<ClusterJournal>>,
     /// How long audit rows are kept, in seconds; `0` = forever (issue #163).
     ///
     /// **Every node in a fleet must be configured identically.** This value
@@ -877,6 +933,7 @@ impl std::fmt::Debug for RedbStateMachine {
         f.debug_struct("RedbStateMachine")
             .field("engine", &self.engine.is_some())
             .field("routes", &self.routes.is_some())
+            .field("journal", &self.journal.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -889,6 +946,7 @@ impl RedbStateMachine {
             engine: None,
             routes: None,
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
+            journal: OnceLock::new(),
             audit_retention_secs: DEFAULT_AUDIT_RETENTION_SECS,
         }
     }
@@ -916,6 +974,20 @@ impl RedbStateMachine {
     #[must_use]
     pub fn with_routes_handle(mut self, routes: Arc<ArcSwap<CompiledRoutes>>) -> Self {
         self.routes = Some(routes);
+        self
+    }
+
+    /// Attach this node's local request journal (issue #224), so `apply`/`install_snapshot` can
+    /// push a committed clear generation into it. Same before-`Raft::new` contract as
+    /// [`Self::with_engine`] — call before this state machine is cloned into `Raft::new` and
+    /// into `sm_reader`, so both share the same bound handle from their first apply.
+    ///
+    /// Stores only a [`Weak`] (see the `journal` field's doc for why); does not need `&mut self`
+    /// because the slot binds at most once (`OnceLock::set`), the same idempotent-bind contract
+    /// `ClusterJournal::bind` itself keeps.
+    #[must_use]
+    pub fn with_journal(self, journal: &Arc<ClusterJournal>) -> Self {
+        let _ = self.journal.set(Arc::downgrade(journal));
         self
     }
 
@@ -2147,6 +2219,27 @@ impl RedbStateMachine {
             .map_or(0, |v| v.value()))
     }
 
+    /// The applied clear generation for `port` (or `port`'s `space`, when given); `0` if
+    /// `ControlOp::JournalClearGen` has never committed for that key (issue #224).
+    ///
+    /// # Errors
+    /// Storage I/O.
+    #[allow(clippy::result_large_err)]
+    pub fn journal_gen(&self, tenant: &str, port: u16, space: Option<&str>) -> StorageResult<u64> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_JOURNAL_GENS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let space_key = journal_gen_space_key(space);
+        Ok(table
+            .get((tenant, port, space_key.as_str()))
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map_or(0, |v| v.value()))
+    }
+
     /// The desired engine state as of now, read from an open (possibly
     /// mid-transaction) view of `sm_configs`: every tenant's config, unioned —
     /// parsed — disabled ones included (a paused imposter stays bound, #817).
@@ -2671,6 +2764,12 @@ impl RedbStateMachine {
         audit_sink: &mut Table<'_, &'static str, &'static str>,
         audit_checkpoint: &mut Table<'_, &'static str, u64>,
         session_key: &mut Table<'_, &'static str, &'static str>,
+        journal_gens: &mut Table<'_, (&'static str, u16, &'static str), u64>,
+        // The local journal to push a committed generation into (issue #224), resolved once by
+        // `apply` rather than upgraded per op — `None` in storage tests, on an embedder that
+        // never wires one, or when a shutdown race has already dropped it (see the `journal`
+        // field's doc on `RedbStateMachine`).
+        journal: Option<&ClusterJournal>,
         op: &ControlOp,
         index: u64,
         issued_at_secs: u64,
@@ -3457,6 +3556,40 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
+            ControlOp::JournalClearGen {
+                tenant,
+                port,
+                space,
+            } => {
+                // Tenant-exists / port-ownership are deliberately not checked here — see
+                // `validate`'s doc for this op. A clear is a convergence primitive, not a config
+                // write: it must succeed even against a port nothing has configured yet, the
+                // same way `ClusterJournal::set_clear_gen` creates the shard on first touch
+                // rather than refusing an unknown one.
+                let space_key = journal_gen_space_key(space.as_deref());
+                let key = (tenant.as_str(), *port, space_key.as_str());
+                // Apply *increments* rather than storing a value the submitter chose (see the
+                // op's own doc on `ControlOp::JournalClearGen`): two clears racing from two
+                // different leaders both take effect, composing to +2 — harmlessly stronger than
+                // either alone, since both mean "ignore everything before me" — rather than the
+                // second silently overwriting the first with the identical number.
+                let current = journal_gens.get(key).map_err(io)?.map_or(0, |v| v.value());
+                let next = current + 1;
+                journal_gens.insert(key, next).map_err(io)?;
+                // Pushed into this replica's own local shard(s) now, not deferred to
+                // `drive_engine`: unlike an engine bind, `ClusterJournal::set_clear_gen` is an
+                // infallible in-memory `fetch_max` with nothing to retry or report a failure
+                // for, so there is no reason to give it the async, failure-tracked treatment the
+                // engine gets. A missing handle (see the field's doc) is a benign no-op — the
+                // generation this fleet agrees on is durable in `sm_journal_gens` regardless, and
+                // any journal that binds or catches up later reads it from there (a snapshot
+                // install replays every row; a late `bind` finds the redb table already correct
+                // the next time this op's effect is asked about through it).
+                if let Some(journal) = journal {
+                    journal.set_clear_gen(*port, space.as_deref(), next);
+                }
+                Ok(Ok(Vec::new()))
+            }
         }
     }
 
@@ -3628,6 +3761,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             audit_checkpoint,
             audit_gc_watermark,
             session_key,
+            journal_gens,
             dedup,
         ) = {
             let read_txn = self
@@ -3769,6 +3903,27 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 .get(SESSION_KEY_ROW)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
                 .map(|v| v.value().to_owned());
+            // Travels with the snapshot for the #134/#137 reason every table above does, with the
+            // #224-specific failure if it is ever forgotten here: a node that joins by snapshot
+            // and reads every generation as `0` would resurrect entries its peers have already
+            // agreed are cleared.
+            let journal_gens_table = read_txn
+                .open_table(SM_JOURNAL_GENS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut journal_gens = Vec::new();
+            for item in journal_gens_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (tenant, port, space_key) = key.value();
+                journal_gens.push((
+                    tenant.to_owned(),
+                    port,
+                    decode_journal_gen_space_key(space_key),
+                    value.value(),
+                ));
+            }
             let dedup_table = read_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -3793,6 +3948,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 audit_checkpoint,
                 audit_gc_watermark,
                 session_key,
+                journal_gens,
                 dedup,
             )
         };
@@ -3810,6 +3966,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             audit_checkpoint,
             audit_gc_watermark,
             session_key,
+            journal_gens,
             dedup,
             last_applied_log: applied.last_applied_log,
             last_membership: applied.last_membership.clone(),
@@ -3922,9 +4079,16 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut session_key = write_txn
                 .open_table(SM_SESSION_KEY_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut journal_gens = write_txn
+                .open_table(SM_JOURNAL_GENS_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut dedup = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            // Resolved once for the whole batch, not per entry: `Weak::upgrade` is cheap but
+            // there is still no reason to pay it once per op when every op in this apply call
+            // pushes into the very same journal (issue #224).
+            let journal = self.journal.get().and_then(Weak::upgrade);
             // GC against the *replicated* logical clock (see `AppliedState`),
             // so every replica drops exactly the same entries at the same log
             // point — a local clock here would let a TTL-boundary replay
@@ -4008,6 +4172,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut audit_sink,
                                         &mut audit_checkpoint,
                                         &mut session_key,
+                                        &mut journal_gens,
+                                        journal.as_deref(),
                                         &request.op,
                                         log_id.index,
                                         applied.logical_clock_secs,
@@ -4024,6 +4190,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut audit_sink,
                                     &mut audit_checkpoint,
                                     &mut session_key,
+                                    &mut journal_gens,
+                                    journal.as_deref(),
                                     &request.op,
                                     log_id.index,
                                     applied.logical_clock_secs,
@@ -4347,6 +4515,25 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
+            // Cleared before it is repopulated, like every table above — and the #224 reason to
+            // do it this way rather than leave stale rows behind is the sharpest of the lot: a
+            // generation this node still held from before the install could be *higher* than
+            // what the payload carries (a stale leader that clears, is partitioned, and rejoins
+            // by snapshot from a peer that never saw it), and leaving it in place would make a
+            // clear this fleet has since forgotten win over the one it actually agrees on.
+            let mut journal_gens_table = write_txn
+                .open_table(SM_JOURNAL_GENS_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            journal_gens_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (tenant, port, space, generation) in &payload.journal_gens {
+                let space_key = journal_gen_space_key(space.as_deref());
+                journal_gens_table
+                    .insert((tenant.as_str(), *port, space_key.as_str()), *generation)
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
             let mut dedup_table = write_txn
                 .open_table(SM_DEDUP_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
@@ -4377,6 +4564,24 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         write_txn
             .commit()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+
+        // Pushed into the local journal after the durable write, like the engine/routes
+        // convergence just below — and for the identical #134/#137 reason `journal_gens_table`
+        // above is cleared-then-repopulated rather than merged: a node joining (or rejoining
+        // after a partition) by snapshot must come back agreeing with the fleet on every
+        // generation, not just the ones its own log had already applied. A missing/dropped
+        // handle is the same benign no-op it is in `mutate_tables`'s `JournalClearGen` arm — the
+        // generations are durable in `sm_journal_gens` regardless of whether anything is
+        // listening on the other end right now.
+        if let Some(journal) = self.journal.get().and_then(Weak::upgrade) {
+            // `ClusterJournal` itself is tenant-oblivious (it always has been — see its own
+            // module doc: entries key on `(node_id, seq, clear_gen)`, nothing tenant-shaped), so
+            // only `port`/`space`/`generation` travel across this boundary; `tenant` stays behind
+            // in `sm_journal_gens`, which is the source of truth `journal_gen` reads back from.
+            for (_tenant, port, space, generation) in &payload.journal_gens {
+                journal.set_clear_gen(*port, space.as_deref(), *generation);
+            }
+        }
 
         // A snapshot replaces the whole applied state, so the engine and the
         // front door's compiled table both converge on it the same way apply
@@ -4447,6 +4652,7 @@ mod tests {
         Quotas, Role, SourceMode, StubEdit, StubEditScript, TenantId,
     };
     use crate::raft::TypeConfig;
+    use crate::stores::journal::ClusterJournal;
 
     struct RedbBuilder;
 
@@ -6989,6 +7195,151 @@ mod tests {
         assert!(payload.principals.is_empty());
         assert!(payload.bindings.is_empty());
         assert!(sm.test_tenant("default").is_none());
+    }
+
+    // -- issue #224: journal clear generations ---------------------------------
+
+    fn journal_clear(op_id: u128, port: u16, space: Option<&str>) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::JournalClearGen {
+                tenant: TenantId::default(),
+                port,
+                space: space.map(str::to_owned),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn applying_a_journal_clear_increments_the_generation() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let response = apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert_eq!(
+            sm.journal_gen(DEFAULT_TENANT, 8080, None)
+                .expect("read gen"),
+            1
+        );
+
+        apply_one(&mut sm, 2, journal_clear(2, 8080, None)).await;
+        assert_eq!(
+            sm.journal_gen(DEFAULT_TENANT, 8080, None)
+                .expect("read gen"),
+            2,
+            "a second clear on the same port bumps again"
+        );
+    }
+
+    /// Two clears for the same `(tenant, port)`, applied in log order (as every replica
+    /// applies them), both succeed and compose to +2 — never one silently overwriting the
+    /// other with the identical value. This is the entire reason
+    /// `ControlOp::JournalClearGen` carries no number of its own: a submitted value would let
+    /// the second of two racing clears collapse onto the first instead of composing with it.
+    #[tokio::test]
+    async fn racing_journal_clears_compose_rather_than_overwrite() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let first = apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
+        let second = apply_one(&mut sm, 2, journal_clear(2, 8080, None)).await;
+        assert_eq!(first.outcome, ControlOutcome::Applied);
+        assert_eq!(second.outcome, ControlOutcome::Applied);
+        assert_eq!(
+            sm.journal_gen(DEFAULT_TENANT, 8080, None)
+                .expect("read gen"),
+            2,
+            "two racing clears must compose to +2, not collapse to the same value twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_space_clear_leaves_the_port_generation_untouched() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, journal_clear(1, 8080, Some("f"))).await;
+        assert_eq!(
+            sm.journal_gen(DEFAULT_TENANT, 8080, Some("f"))
+                .expect("read gen"),
+            1
+        );
+        assert_eq!(
+            sm.journal_gen(DEFAULT_TENANT, 8080, None)
+                .expect("read gen"),
+            0,
+            "a space-scoped clear must not bump the port-wide generation"
+        );
+        assert_eq!(
+            sm.journal_gen(DEFAULT_TENANT, 8080, Some("g"))
+                .expect("read gen"),
+            0,
+            "a space-scoped clear must not bump a sibling space's generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn applying_a_journal_clear_pushes_the_generation_into_the_bound_local_journal() {
+        let journal = ClusterJournal::new(1);
+        let (_td, sm) = fresh_sm(None).await;
+        let mut sm = sm.with_journal(&journal);
+        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
+        assert_eq!(
+            journal.read_shard_since(8080, 0).clear_gen,
+            1,
+            "apply must push the bumped generation into this node's own local journal, not \
+             just the durable table"
+        );
+    }
+
+    /// A node joining by snapshot must come back holding the same generations its peers do —
+    /// the #134/#137 lesson (a node reading a cleared entry back as if it never cleared)
+    /// applied a third time to a third table.
+    #[tokio::test]
+    async fn journal_generations_survive_a_snapshot_install() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, journal_clear(1, 8080, None)).await;
+        apply_one(&mut sm, 2, journal_clear(2, 8080, Some("f"))).await;
+
+        let snapshot: Snapshot<TypeConfig> = sm.build_snapshot().await.expect("build snapshot");
+        let (_td2, mut restored) = fresh_sm(None).await;
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install snapshot");
+
+        assert_eq!(
+            restored
+                .journal_gen(DEFAULT_TENANT, 8080, None)
+                .expect("read gen"),
+            1,
+            "a node joining by snapshot must not read a cleared port back as 0 — that would \
+             resurrect entries its peers already agree are cleared"
+        );
+        assert_eq!(
+            restored
+                .journal_gen(DEFAULT_TENANT, 8080, Some("f"))
+                .expect("read gen"),
+            1
+        );
+    }
+
+    /// A snapshot payload serialized before issue #224 still installs — `journal_gens` defaults
+    /// to empty, which is what "this fleet has never committed a clear" is. Mirrors
+    /// `a_pre_sources_snapshot_still_installs`/`a_pre_tenancy_snapshot_still_installs`: the same
+    /// #134/#137 lesson, paid down with the same `#[serde(default)]` discipline a third time.
+    #[tokio::test]
+    async fn a_pre_journal_gens_snapshot_still_installs() {
+        let (_td, sm) = fresh_sm(None).await;
+        let legacy = json!({
+            "configs": [],
+            "dedup": [],
+            "last_applied_log": null,
+            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } },
+        });
+        let payload: super::SnapshotPayload =
+            serde_json::from_value(legacy).expect("a pre-#224 snapshot payload still decodes");
+        assert!(payload.journal_gens.is_empty());
+        assert_eq!(
+            sm.journal_gen(DEFAULT_TENANT, 8080, None)
+                .expect("read gen"),
+            0
+        );
     }
 
     /// This slice adds tenancy *records*; it must not change any answer the

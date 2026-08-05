@@ -607,6 +607,11 @@ pub async fn start_with_runtimes(
             snapshot_log_entries: cli.cluster.cluster_snapshot_log_entries,
         },
         Arc::clone(&front_door_routes),
+        // Bound before `Raft::new` (issue #224), the same before-construction contract as
+        // `engine`/`front_door_routes` just above: catch-up replay during a join must push
+        // clear generations into this node's own journal too, not just live commits after
+        // `start` returns.
+        Arc::clone(&request_journal),
     )
     .await
     {

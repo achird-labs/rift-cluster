@@ -624,6 +624,28 @@ pub enum ControlOp {
         /// dump and survives JSON without a base64 alphabet decision.
         key: String,
     },
+    /// Bump a port's journal clear generation, or one space's within it (Ch.7 §"Clears are
+    /// generation bumps — never timestamps", issue #224).
+    ///
+    /// A clear deletes nothing. It raises a counter, and every reader ignores entries stamped
+    /// below it — so the clear converges by consensus rather than by a best-effort broadcast a
+    /// partitioned peer can miss forever, and no node consults a clock to decide what "before the
+    /// clear" means. That is what makes the result immune to skew: there is no timestamp in the
+    /// path at all.
+    ///
+    /// **Carries no number.** Apply *increments*, rather than storing a value the submitter
+    /// chose, because two clears racing from two nodes must both take effect: they commit in log
+    /// order and compose to +2, which is harmlessly stronger than either alone since both mean
+    /// "ignore everything before me". A submitted number would instead make the second clear
+    /// silently overwrite the first with the same value.
+    ///
+    /// `space: None` clears the whole port; `Some(flow)` clears only that space's entries and
+    /// leaves the port generation — and therefore every sibling space — untouched.
+    JournalClearGen {
+        tenant: TenantId,
+        port: u16,
+        space: Option<String>,
+    },
 }
 
 /// The fleet's session-signing key, as applied state (issue #185).
@@ -816,12 +838,19 @@ pub enum StubEdit {
 ///
 /// Only ops that reach the log. Reads are not audited in v1 (§9, on volume),
 /// and — the part that is easy to misread as a bug — neither are the
-/// *reads-that-mutate* served over the **proxy** path (`ScenarioReset`,
-/// `SavedRequestsClear`, `FlowStateClear`). Those are forwarded to the loopback
-/// core admin and never become a [`ControlOp`], so a log-derived projection
-/// cannot see them. Auditing them means putting them on consensus; recording
-/// them at the front door instead would produce per-node rows that can disagree
-/// with the log, which is the one thing this design refuses.
+/// *reads-that-mutate* still served over the **proxy** path (`ScenarioReset`,
+/// and the flow-state half of a space teardown). Those are forwarded to the
+/// loopback core admin and never become a [`ControlOp`], so a log-derived
+/// projection cannot see them. Auditing them means putting them on consensus;
+/// recording them at the front door instead would produce per-node rows that can
+/// disagree with the log, which is the one thing this design refuses.
+///
+/// `SavedRequestsClear` **used to be on that list and no longer is.** Issue #224
+/// took the clear onto consensus as [`ControlOp::JournalClearGen`] — for
+/// convergence rather than for auditing, but the audit row falls out of that for
+/// free, which is exactly the trade this paragraph describes. The `?match=`
+/// narrowed form stays proxied and therefore stays unaudited: it is a targeted,
+/// best-effort per-shard deletion with no fleet-wide meaning to record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditRow {
@@ -883,7 +912,8 @@ impl ControlOp {
             | ControlOp::AuditSinkPut { tenant, .. }
             | ControlOp::AuditSinkDelete { tenant }
             | ControlOp::AuditCheckpointPut { tenant, .. }
-            | ControlOp::SessionKeyPut { tenant, .. } => tenant,
+            | ControlOp::SessionKeyPut { tenant, .. }
+            | ControlOp::JournalClearGen { tenant, .. } => tenant,
         }
     }
 
@@ -933,6 +963,11 @@ impl ControlOp {
             // how every console session is revoked at once — precisely the kind of act an auditor
             // reading an incident timeline needs to see.
             ControlOp::SessionKeyPut { .. } => "cluster.admin",
+            // Unlike `AuditCheckpointPut`, this one IS audited (issue #224): taking the clear onto
+            // consensus is what makes an honest audit row possible at all — the pre-#224 fan-out
+            // had no log entry to attribute one to. Named identically to `authz::Action::SavedRequestsClear`'s
+            // own `as_str()`, matching every other action string here.
+            ControlOp::JournalClearGen { .. } => "savedRequests.clear",
         })
     }
 
@@ -971,6 +1006,13 @@ impl ControlOp {
             // One key, fleet-wide: it addresses the whole scope, not a named object. The key itself
             // must never reach an audit row.
             | ControlOp::SessionKeyPut { .. } => AUDIT_RESOURCE_ALL.to_owned(),
+            // A port-wide clear addresses the port, exactly like `PatchStubs`/`SetEnabled`; a
+            // space-scoped one addresses the narrower `port/space` pair so an audit reader can
+            // tell the two apart without decoding the outcome text.
+            ControlOp::JournalClearGen { port, space, .. } => match space {
+                Some(space) => format!("{port}/{space}"),
+                None => port.to_string(),
+            },
         }
     }
 }
@@ -1341,6 +1383,31 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
                     "session key must be exactly {SESSION_KEY_BYTES} bytes, got {}",
                     decoded.len()
                 ));
+            }
+            Ok(())
+        }
+        // Deliberately shallow: only the checks that hold regardless of state. Whether `tenant`
+        // exists and whether it owns `port` are apply-time questions (`raft::store::mutate_tables`'
+        // `JournalClearGen` arm) — the same split every other op here draws, and the reason is the
+        // same too: `validate` runs identically on every replica from the op alone, so it must
+        // never depend on a table a replica could disagree with another about.
+        ControlOp::JournalClearGen {
+            tenant,
+            port,
+            space,
+        } => {
+            require_real_tenant(tenant)?;
+            if *port == 0 {
+                return Err("port must be non-zero: 0 addresses no imposter to clear".to_owned());
+            }
+            if let Some(space) = space
+                && space.is_empty()
+            {
+                return Err(
+                    "space must not be empty when given: an empty scope is not a narrower \
+                     clear, it is an unaddressed one"
+                        .to_owned(),
+                );
             }
             Ok(())
         }
@@ -1987,7 +2054,12 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget<'_>> {
         | ControlOp::AuditSinkDelete { .. }
         | ControlOp::AuditCheckpointPut { .. }
         // The session key addresses the fleet, not an imposter record.
-        | ControlOp::SessionKeyPut { .. } => None,
+        | ControlOp::SessionKeyPut { .. }
+        // A clear is a convergence primitive, not a config write conditioned on a stored
+        // revision: it commits unconditionally, like `AuditCheckpointPut`'s `max` does, so two
+        // concurrent clears compose rather than one losing an optimistic-concurrency race the
+        // op was never meant to run.
+        | ControlOp::JournalClearGen { .. } => None,
     }
 }
 
@@ -2492,6 +2564,47 @@ mod tests {
             enabled: false,
         };
         assert_eq!(validate(&op), Ok(()));
+    }
+
+    // -- validate: JournalClearGen (issue #224) --------------------------------
+
+    #[test]
+    fn validate_rejects_a_journal_clear_on_port_zero() {
+        let op = ControlOp::JournalClearGen {
+            tenant: TenantId::default(),
+            port: 0,
+            space: None,
+        };
+        let err = validate(&op).expect_err("port 0 addresses no imposter");
+        assert!(err.contains("port"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_a_journal_clear_on_an_empty_space() {
+        let op = ControlOp::JournalClearGen {
+            tenant: TenantId::default(),
+            port: 1,
+            space: Some(String::new()),
+        };
+        let err = validate(&op).expect_err("an empty space is not a narrower clear");
+        assert!(err.contains("space"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_journal_clear_for_both_scopes() {
+        let port_wide = ControlOp::JournalClearGen {
+            tenant: TenantId::default(),
+            port: 1,
+            space: None,
+        };
+        assert_eq!(validate(&port_wide), Ok(()));
+
+        let space_scoped = ControlOp::JournalClearGen {
+            tenant: TenantId::new("acme"),
+            port: 1,
+            space: Some("checkout".to_owned()),
+        };
+        assert_eq!(validate(&space_scoped), Ok(()));
     }
 
     // -- validate: PutRoutes / DeleteRoute -------------------------------------
