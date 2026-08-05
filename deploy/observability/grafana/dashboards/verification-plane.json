@@ -360,23 +360,139 @@
       "description": "Rate of failed anti-entropy journal pulls, kept per peer. The label is the diagnostic: one elevated line means one bad node, every line elevated means this node is partitioned from the fleet. Failures that do not degrade a read are the replica cache working, which is why this panel does not alert on its own."
     },
     {
-      "id": 6,
-      "title": "Proxy-claim families not yet registered",
-      "type": "text",
+      "id": 10,
+      "title": "Proxy claim outcomes",
+      "type": "timeseries",
       "gridPos": {
-        "h": 6,
-        "w": 24,
+        "h": 8,
+        "w": 8,
         "x": 0,
         "y": 24
       },
-      "options": {
-        "mode": "markdown",
-        "content": "### Not shown on this dashboard\n\nThe **proxyOnce owner-claim** panels are deliberately absent. Their metric families arrive with issue #226 and are not registered yet.\n\nAn empty panel bound to a metric that does not exist renders as a silent \"No data\" that looks identical to a healthy-but-quiet system \u2014 worse than this note, because it invites reading \"no data\" as \"no problem.\" When #226 lands, add the panels here and delete this note.\n\nThe journal partial-read, merge-latency and peer-pull-failure panels this note used to cover landed with issue #319, once #223 registered their families.\n"
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
       },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:proxy_claims:rate5m",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
       "fieldConfig": {
         "defaults": {},
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "How the fleet is answering proxyOnce claims. granted = the request won the right to record; inflight = a concurrent winner already exists, so the request proxies without recording; already_recorded = replay. Watch the ratio rather than the absolute rates: a rising inflight share is contention on one signature, and that is normal under concurrent load. granted running persistently above the recordings panel means claims are being handed out and given back, which the releases panel beside this one explains."
+    },
+    {
+      "id": 11,
+      "title": "Proxy claim releases",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:proxy_claim_releases:rate5m",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "The ledger of claims given back, and the reason granted need not equal recorded. upstream_failure is the system under test failing the winner's call; deadline is a crashed or wedged winner whose Pending claim aged out. Both are the mock fleet correctly observing something else misbehave. publish_failure is the reason that indicts this system rather than its user: the upstream call already succeeded, and the recording then failed to publish to consensus OR WAS REFUSED - a committed refusal such as a deleted imposter or an exhausted quota lands here too. Either way the exchange is lost rather than delayed. That label alone pages, as RiftProxyRecordingsFailing after 10m."
+    },
+    {
+      "id": 12,
+      "title": "Recordings vs granted claims",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "rift-prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:proxy_recordings:rate5m",
+          "legendFormat": "recordings/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "rift-prometheus"
+          },
+          "expr": "rift:proxy_claims:rate5m{outcome=\"granted\"}",
+          "legendFormat": "granted claims/s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Plotted together for comparison, but NOT a 1:1 pair, and reading them as one is the mistake this panel exists to preempt. Recordings counts proxyOnce completions AND proxyAlways merges, while granted counts only proxyOnce claims, so any proxyAlways traffic puts recordings above granted with nothing wrong. The meaningful comparison is the gap between them against the releases panel: claims granted and not recorded should be accounted for by a release, and a persistent gap that releases do not explain is a leak."
     }
   ],
   "templating": {

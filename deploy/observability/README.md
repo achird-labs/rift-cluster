@@ -118,7 +118,7 @@ Two different bounds, and the distinction matters:
   a 0.001 one), and at high traffic it is vacuous. The normalised expression
   is plotted next to the match-rate stat for exactly this cross-check.
 
-## Verification Plane: the journal panels, and what is still absent
+## Verification Plane: the journal panels
 
 Three panels cover merge-on-read's honesty signals (issue #319, once #223
 registered their families):
@@ -142,10 +142,40 @@ on the system working. The 10 m window exists because transient partials during
 a rolling restart are `Rift-Cluster-Partial` behaving as designed; a shorter
 window pages on every deploy until someone mutes it.
 
-**Still absent:** the proxyOnce owner-claim panels. Those families arrive with
-issue #226 and are not registered yet, so the dashboard carries a text panel
-saying so rather than empty "No data" panels, which would be indistinguishable
-from a healthy-but-quiet system.
+## Verification Plane: the proxy-claim panels
+
+Three more panels cover the proxyOnce owner-claim protocol (issue #347, once
+#226 registered their families). Nothing on this dashboard is deferred any
+more: the text panel that used to explain the gap is gone, because the gap is.
+
+| panel | rule | reads as |
+|---|---|---|
+| Proxy claim outcomes | `rift:proxy_claims:rate5m` | the ratio, not the rates: a rising `inflight` share is contention on one signature and is normal under load |
+| Proxy claim releases | `rift:proxy_claim_releases:rate5m` | why `granted` need not equal recorded; only `publish_failure` indicts this system |
+| Recordings vs granted claims | `rift:proxy_recordings:rate5m` + `rift:proxy_claims:rate5m{outcome="granted"}` | a gap the releases panel does not account for is a leak |
+
+**The last panel is not a 1:1 comparison.** `rift_cluster_proxy_recordings_total`
+counts proxyOnce completions *and* proxyAlways merges, while `granted` counts
+only proxyOnce claims — so a deployment running any proxyAlways traffic shows
+recordings above granted with nothing wrong. What is meaningful is the gap
+between them read against the releases panel.
+
+Only `publish_failure` alerts (`RiftProxyRecordingsFailing`, `for: 10m`).
+`upstream_failure` is the system under test failing the winner's call and
+`deadline` is a wedged winner whose Pending claim aged out — paging on either
+would page an operator for a tester's broken fixture. `publish_failure` covers
+a publication that failed **or was refused**, so a deleted imposter or an
+exhausted quota drives it too; the annotation names those cases so the runbook
+does not start at Raft health for a quota problem.
+
+**Why the window is twice the rate window.** `rate(...[5m]) > 0` stays true
+until 5 minutes after the *last* increment, so the condition holds for
+`(t_last - t_first) + 5m`. A `for:` equal to the rate window would therefore
+fire on any two failures at distinct scrape times — no burst tolerance at all,
+despite looking like it has some. `for: 10m` buys a genuine ~5 minutes of
+spread, and matches `RiftJournalReadsDegraded`. Both the firing and the
+non-firing halves are pinned in `rules/tests/alerts_test.yml`, including the
+two-scrape burst a 5 m window would have paged on.
 
 ## Compose smoke
 

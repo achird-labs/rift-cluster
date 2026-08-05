@@ -135,16 +135,21 @@ groups:
 
   - name: rift-cluster-journal
     rules:
-      # Deliberately restricted to the two journal families that are
-      # actually registered (`rift_cluster_journal_entries`,
-      # `rift_cluster_journal_evictions_total`). The partial-reads,
-      # merge-latency and peer-pull-failure journal metrics do not exist yet
-      # — they land with issues #223/#226 — and a recording rule over an
-      # unregistered metric would not fail loudly, it would just evaluate to
-      # an empty vector forever, which is a worse trap than the rule simply
-      # not existing. See the "Not shown on this dashboard" panel on
-      # verification-plane.json for the same reasoning applied to the panel
-      # side.
+      # This group was once deliberately restricted to the two journal
+      # families registered at the time (`rift_cluster_journal_entries`,
+      # `rift_cluster_journal_evictions_total`), because a recording rule over
+      # an unregistered metric does not fail loudly — it evaluates to an empty
+      # vector forever, which is a worse trap than the rule simply not
+      # existing. That restriction has been lifted in two steps: #223
+      # registered the partial-read, merge-latency and peer-pull-failure
+      # families and #319 added their rules below; #226 registered the
+      # proxy-claim families and #347 added the `rift-cluster-proxy` group
+      # that follows. Every family referenced by an `expr:` in this file is
+      # registered in crates/rift-cluster/src/metrics.rs, and
+      # scripts/check-observability-families.sh is the gate that keeps that
+      # true rather than merely currently-so. Note the scope: that gate reads
+      # `expr:` values only, so a family named in prose — including in these
+      # comments — is deliberately outside it.
       #
       # `rift_cluster_journal_entries{port}` is one shard of the fleet
       # journal per node (see its doc comment in
@@ -212,3 +217,55 @@ groups:
         expr: histogram_quantile(0.95, sum by (le) (rate(rift_cluster_journal_merge_seconds_bucket[5m])))
       - record: rift:journal_merge_seconds:p99
         expr: histogram_quantile(0.99, sum by (le) (rate(rift_cluster_journal_merge_seconds_bucket[5m])))
+
+  - name: rift-cluster-proxy
+    rules:
+      # -- proxyOnce owner claims, the recording plane's ledger (#347) --
+      #
+      # These three families landed with #226 and were omitted from the pack
+      # #227 shipped for the same reason the journal families above were: they
+      # were not registered yet, and #227's acceptance criterion is that no
+      # rule or panel references an unregistered family. They are registered
+      # now (crates/rift-cluster/src/metrics.rs), so the omission has flipped
+      # from correct to a gap.
+
+      # `outcome` is kept and `instance` summed away. The three outcomes are
+      # not severities of one thing, they are three different states of the
+      # claim protocol: `granted` = this request won the right to record,
+      # `inflight` = a concurrent winner already exists so this request proxies
+      # without recording, `already_recorded` = replay. Collapsing them to a
+      # single claim rate would hide the only movement worth watching — a
+      # shift in the RATIO between them, which is how contention shows up.
+      - record: rift:proxy_claims:rate5m
+        expr: sum by (outcome) (rate(rift_cluster_proxy_claims_total[5m]))
+
+      # Why `granted` need not equal recordings: this is the ledger of claims
+      # given back. (It can equal them — no releases and no proxyAlways
+      # traffic is a perfectly ordinary steady state.) `reason` stays because
+      # the three reasons place blame in three different places —
+      # `upstream_failure` is the system under test, `deadline` is a crashed
+      # or wedged winner whose Pending claim aged out, and `publish_failure`
+      # is THIS system: the recording's Raft publication failed or was
+      # refused, so the claim was freed to keep the signature retryable.
+      #
+      # Only the third is a defect in the recording pipeline, which is why it
+      # is the one RiftProxyRecordingsFailing pages on and why this rule must
+      # keep the label — an aggregate release rate could not express that
+      # alert at all.
+      - record: rift:proxy_claim_releases:rate5m
+        expr: sum by (reason) (rate(rift_cluster_proxy_claim_releases_total[5m]))
+
+      # Recordings actually committed to the fleet. Summed across instances
+      # because "is the fleet recording" is one question.
+      #
+      # Resist reading this as `granted`'s partner. It counts proxyOnce
+      # completions AND proxyAlways merges (see the family's doc comment),
+      # while `granted` counts only proxyOnce claims — so the two are not 1:1
+      # in either direction, and a deployment running any proxyAlways traffic
+      # will show recordings above granted with nothing wrong. The comparison
+      # that IS meaningful is granted-minus-recordings against the releases
+      # rate above: claims handed out and not turned into recordings should be
+      # accounted for by a release, and a persistent gap that releases do not
+      # explain is a leak.
+      - record: rift:proxy_recordings:rate5m
+        expr: sum(rate(rift_cluster_proxy_recordings_total[5m]))

@@ -361,3 +361,98 @@ tests:
         exp_samples:
           - labels: '{__name__="rift:journal_merge_seconds:p99"}'
             value: 4.927272727272727e-03
+
+  # -- The proxy-claim rules (issue #347) --------------------------------
+  #
+  # Same six-sample shape as the journal cases above (0 0 0 0 0 V at 1m,
+  # evaluated at 5m over a [5m] window), so the pinned numbers are read the
+  # same way: Prometheus's extrapolated rate, pinned to catch a rule being
+  # edited into a different aggregation rather than to re-derive the
+  # extrapolation constant.
+  #
+  # Every family here is given TWO instances, at DIFFERENT rates. Be precise
+  # about which mutation that buys, because the obvious answer is wrong:
+  # dropping the aggregation entirely (`sum by (outcome, instance)`) is
+  # already caught by a single instance, since promtool compares label sets
+  # exactly and the stray `instance=` label fails the match on its own.
+  #
+  # What one instance canNOT distinguish is `sum` from `max`, `min` or `avg` —
+  # over a single series all four are the same number. Two instances at
+  # different rates separate them: the pinned 0.25 for `granted` is
+  # 0.2 + 0.05, which only `sum` produces (`max` gives 0.2, `avg` 0.125).
+  - interval: 1m
+    input_series:
+      # Claim outcomes. `outcome` is kept and `instance` summed away: the
+      # question "how is the fleet answering claims" is one question, but
+      # granted/inflight/already_recorded are three different answers and
+      # collapsing them would hide the only interesting shift between them.
+      - series: 'rift_cluster_proxy_claims_total{instance="rift-1", outcome="granted"}'
+        values: '0 0 0 0 0 60'
+      - series: 'rift_cluster_proxy_claims_total{instance="rift-2", outcome="granted"}'
+        values: '0 0 0 0 0 15'
+      - series: 'rift_cluster_proxy_claims_total{instance="rift-1", outcome="inflight"}'
+        values: '0 0 0 0 0 30'
+      - series: 'rift_cluster_proxy_claims_total{instance="rift-2", outcome="inflight"}'
+        values: '0 0 0 0 0 0'
+      # A zero-valued label that must still appear: `already_recorded` is
+      # replay, and replay dropping to nothing is itself a signal. Pinned so a
+      # future `> 0` filter in the rule would fail here rather than silently
+      # erase the series.
+      - series: 'rift_cluster_proxy_claims_total{instance="rift-1", outcome="already_recorded"}'
+        values: '0 0 0 0 0 0'
+    promql_expr_test:
+      - expr: rift:proxy_claims:rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="rift:proxy_claims:rate5m", outcome="already_recorded"}'
+            value: 0
+          - labels: '{__name__="rift:proxy_claims:rate5m", outcome="granted"}'
+            value: 0.25
+          - labels: '{__name__="rift:proxy_claims:rate5m", outcome="inflight"}'
+            value: 0.1
+
+  # Releases keep `reason` for the same reason claims keep `outcome`, but the
+  # stakes differ: `publish_failure` is the only one of the three that means
+  # the RECORDING PIPELINE is broken rather than the system under test, and it
+  # is the label RiftProxyRecordingsFailing pages on. Summing the label away
+  # would make that alert unexpressible.
+  - interval: 1m
+    input_series:
+      # Two nodes each failing to publish at 0.1/s. They sum to 0.2/s rather
+      # than collapsing to "one broken node" — the value adds across observers
+      # because it is a rate of failed publications, not a count of nodes.
+      - series: 'rift_cluster_proxy_claim_releases_total{instance="rift-1", reason="publish_failure"}'
+        values: '0 0 0 0 0 30'
+      - series: 'rift_cluster_proxy_claim_releases_total{instance="rift-2", reason="publish_failure"}'
+        values: '0 0 0 0 0 30'
+      - series: 'rift_cluster_proxy_claim_releases_total{instance="rift-1", reason="upstream_failure"}'
+        values: '0 0 0 0 0 15'
+      - series: 'rift_cluster_proxy_claim_releases_total{instance="rift-2", reason="deadline"}'
+        values: '0 0 0 0 0 15'
+    promql_expr_test:
+      - expr: rift:proxy_claim_releases:rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="rift:proxy_claim_releases:rate5m", reason="deadline"}'
+            value: 0.05
+          - labels: '{__name__="rift:proxy_claim_releases:rate5m", reason="publish_failure"}'
+            value: 0.2
+          - labels: '{__name__="rift:proxy_claim_releases:rate5m", reason="upstream_failure"}'
+            value: 0.05
+
+  # Recordings carry no labels at all, so the only thing to prove is the
+  # cross-instance sum — and it is worth proving precisely because this is the
+  # family a reader is most likely to expect to equal `granted`. It does not:
+  # see the rule's own comment and metrics.rs:346-347.
+  - interval: 1m
+    input_series:
+      - series: 'rift_cluster_proxy_recordings_total{instance="rift-1"}'
+        values: '0 0 0 0 0 45'
+      - series: 'rift_cluster_proxy_recordings_total{instance="rift-2"}'
+        values: '0 0 0 0 0 15'
+    promql_expr_test:
+      - expr: rift:proxy_recordings:rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="rift:proxy_recordings:rate5m"}'
+            value: 0.2

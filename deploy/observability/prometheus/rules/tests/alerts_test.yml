@@ -161,3 +161,92 @@ tests:
       - eval_time: 16m
         alertname: RiftJournalReadsDegraded
         exp_alerts: []
+
+  # -- RiftProxyRecordingsFailing (issue #347) ---------------------------
+  #
+  # `for: 10m` against a `rate(...[5m])` expression. All three shapes below
+  # are pinned, because the arithmetic here is easy to get wrong in a way no
+  # gate catches: `rate[5m] > 0` stays true until 5m after the LAST increment,
+  # so the condition holds for (t_last - t_first) + 5m. An earlier draft of
+  # this alert used `for: 5m` and therefore paged on any two failures at
+  # distinct scrape times; the burst case below is the regression test for
+  # exactly that, and it is the case a single-scrape blip test cannot catch.
+  - interval: 1m
+    input_series:
+      # A counter that keeps climbing: publications are failing every scrape.
+      - series: 'rift_cluster_proxy_claim_releases_total{instance="rift-1", reason="publish_failure"}'
+        values: '0+60x25'
+      # A second reason climbing just as fast, which must NOT contribute: the
+      # alert selects `reason="publish_failure"`, and an upstream failure is
+      # the system under test misbehaving, not the recording pipeline. Drop
+      # the selector and this series raises a SECOND alert instance at the
+      # 16m assertion below, where `exp_alerts` pins exactly one — which is
+      # what makes this series a guard rather than noise.
+      - series: 'rift_cluster_proxy_claim_releases_total{instance="rift-1", reason="upstream_failure"}'
+        values: '0+60x25'
+    alert_rule_test:
+      # Pending, not firing, well inside the window.
+      - eval_time: 5m
+        alertname: RiftProxyRecordingsFailing
+        exp_alerts: []
+      # Still pending at 10m: the condition first holds one interval in (a
+      # rate needs two samples), so the full `for:` has not elapsed yet.
+      - eval_time: 10m
+        alertname: RiftProxyRecordingsFailing
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: RiftProxyRecordingsFailing
+        exp_alerts:
+          # `reason` survives onto the alert itself. The expression selects
+          # rather than aggregates, so the recording rule's label passes
+          # straight through to the firing instance — which is what a router
+          # would need to key on, and is pinned here so that replacing the
+          # selector with an aggregation (which would drop it) fails loudly.
+          - exp_labels:
+              severity: warning
+              reason: publish_failure
+            exp_annotations:
+              summary: "Proxy recordings are being attempted and not landing"
+              description: "rift:proxy_claim_releases:rate5m{reason=\"publish_failure\"} has been above zero for 10 minutes: proxyOnce winners are completing their upstream calls and then failing to publish the recording to consensus, or having it refused outright (a deleted imposter, an exhausted quota), so the claim is released to keep the signature retryable and the exchange is never recorded. Verification reads will be missing these exchanges entirely — this is recording loss, not a slow path. Check Raft health first, then whether the target imposters still exist and are within quota. The other two release reasons (upstream_failure, deadline) deliberately do not page: they are the system under test or a wedged winner, not the recording pipeline. See rift_cluster_proxy_claim_releases_total's doc comment in crates/rift-cluster/src/metrics.rs."
+
+  # THE BURST THAT MUST NOT PAGE, and the reason `for:` is twice the rate
+  # window. Two scrapes of publish failures a minute apart, then silence: a
+  # Raft refusal either side of an election, entirely recoverable. Under the
+  # `for: 5m` this alert was first drafted with, this fired at 7m. It is
+  # pinned here rather than described, because the difference between the two
+  # windows is invisible to every other check in the pack.
+  - interval: 1m
+    input_series:
+      - series: 'rift_cluster_proxy_claim_releases_total{instance="rift-1", reason="publish_failure"}'
+        values: '0 0 5 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: RiftProxyRecordingsFailing
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: RiftProxyRecordingsFailing
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: RiftProxyRecordingsFailing
+        exp_alerts: []
+
+  # The single-scrape blip: one Raft refusal, then nothing. Kept alongside
+  # the burst case because it exercises the other end of the same window --
+  # here the rate decays to zero on its own before `for:` could elapse, so
+  # the alert is unreachable rather than merely un-elapsed.
+  - interval: 1m
+    input_series:
+      - series: 'rift_cluster_proxy_claim_releases_total{instance="rift-1", reason="publish_failure"}'
+        values: '0 0 5 5 5 5 5 5 5 5 5 5 5 5 5 5'
+    alert_rule_test:
+      # Mid-blip as well as after it: asserting only the late point would show
+      # the alert had cleared, not that it never fired while the rate was up.
+      - eval_time: 4m
+        alertname: RiftProxyRecordingsFailing
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: RiftProxyRecordingsFailing
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: RiftProxyRecordingsFailing
+        exp_alerts: []
