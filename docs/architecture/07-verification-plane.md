@@ -84,6 +84,65 @@ anti-entropy cadence — events from *other* nodes arrive within the pull
 interval, and the stream declares that latency rather than pretending
 otherwise.
 
+### As implemented (issue #225)
+
+The token is `v1: {gen, pos: {node_id → shard_seq}}`, serialized to JSON and
+encoded unpadded base64url, so it is safe in a query string and an SSE `id:`
+line alike. It is opaque **by contract**, not merely by convention: a client
+round-trips it and never parses it, which is what leaves the encoding free to
+change behind its version tag. An unrecognized version is refused rather than
+guessed at.
+
+`gen` is the port's clear generation (#224) at issue time. It is **carried but
+not yet acted on**: a clear landing mid-walk neither re-delivers cleared
+entries nor rewinds the reader, but that comes from the per-shard positions
+plus the fact that a clear never resets `seq` — the merge drops superseded
+generations, and the positions step over the seq range they occupied. The
+field is in the `v1` format because a token that records which generation it
+was minted under is the cheap enabling condition for anything that later needs
+to distinguish "your cursor predates a clear" from "nothing new", and adding a
+field to a versioned token afterwards costs a version bump.
+
+The front door terminates **every** requests-read that is not `?match=`-scoped,
+`?since=` included — the engine's own scalar `parse_since` never sees a vector
+token. Each merged read answers `x-rift-next-index` with the next token (this
+replaces #223's withheld-header convention, which existed only because there
+was no value that meant the same thing on every shard) and
+`x-rift-truncated: true` exactly when some shard's presented position had
+fallen below that shard's eviction watermark. `evicted_below_seq` is
+inclusive, so a reader *at* the watermark has seen everything eviction removed
+and is not truncated.
+
+Three rules make the walk correct, and each is pinned by its own gate test:
+
+- **Which entries** — an entry is withheld when its own shard's position is at
+  or past its `seq`. Per-shard filtering is the whole point of a vector cursor:
+  the merged *order* is by recorded timestamp and therefore interleaves shards
+  arbitrarily, so no single index is a position in any shard in particular.
+- **Where the next page starts** — each shard advances to the highest of the
+  presented position, its eviction watermark, and the highest `seq` it holds.
+  Taking the eviction and clear-dropped entries into account (rather than just
+  "the highest seq emitted") stops the walk re-scanning entries it can never
+  serve; taking the presented position into account is what makes the token
+  monotone even when a replica cache has gone backwards.
+- **Membership** — a shard in the cursor with no slice this round keeps its
+  position, so a dead or partitioned node freezes rather than rewinding to 0
+  and replaying its history when it returns. A shard with a slice and no cursor
+  entry reads as 0, so a joining node enters the walk at the beginning.
+
+A bare `u64` is accepted for the upgrade window and read as `{this_node: seq}`:
+before #225 a merged read issued no cursor at all, so any scalar a client holds
+provably came from a proxied per-node read of this node. Anything that is
+neither a token nor a `u64` is a typed 400 — never a defaulted position, since
+defaulting either replays the whole journal or silently skips everything
+recorded since.
+
+**The merged SSE tail is not yet implemented.** `.../savedRequests/stream` and
+`GET /events` both still proxy per-node, FleetAdmin-gated, as they did before
+this issue; the cursor half above is what shipped. The token was designed to
+serve both — an SSE `id:` line is a valid place to put it — so the terminator
+is additive when it lands.
+
 ## proxyOnce: exactly-once recording via an owner claim
 
 The one verification feature that is *not* mergeable: `proxyOnce` must call

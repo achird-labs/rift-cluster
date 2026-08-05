@@ -18,7 +18,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use super::journal::{ClusterJournal, ShardEntry, ShardRead};
+use super::journal::{ClusterJournal, JournalCursor, ShardEntry, ShardRead};
 use crate::raft::{NodeId, RaftNode};
 use crate::rpc::{HandlerFuture, Router, RpcError};
 use rift_cluster_base::seams::RequestJournal;
@@ -137,6 +137,125 @@ pub(crate) fn merge_shards(slices: &[ShardSlice], partial: bool) -> MergeOutcome
     });
 
     MergeOutcome { entries, partial }
+}
+
+/// One page of a merged cursor walk (issue #225): [`merge_shards`]'s answer, narrowed to what a
+/// reader holding `cursor` has not already consumed, plus the token that fetches the next page.
+///
+/// `pub` for the same reason [`MergeOutcome`] is — it is [`JournalNet::merge_read_since`]'s
+/// return type, and that is called from the front door in another crate.
+#[derive(Debug, Clone)]
+pub struct MergeSince {
+    pub entries: Vec<ShardEntry>,
+    /// Carried through from [`MergeOutcome::partial`] unchanged: a degraded fleet is orthogonal
+    /// to where the reader is in the walk.
+    pub partial: bool,
+    /// The position to present for the next page. Never regresses below the cursor it was
+    /// derived from, in any component — see [`merge_shards_since`].
+    pub next: JournalCursor,
+    /// At least one shard's presented position predated that shard's eviction watermark: entries
+    /// the reader had not yet seen were dropped by retention before it reached them. Renders as
+    /// `x-rift-truncated: true`, the same meaning upstream gives the header.
+    pub truncated: bool,
+}
+
+/// [`merge_shards`], resumed from a vector cursor — the merged read a `?since=` token addresses.
+///
+/// The merge itself is unchanged and still does all the convergence work; this adds exactly
+/// three things on top of it, each a property a walk cannot be correct without.
+///
+/// **Which entries.** An entry is withheld when its own shard's position in the cursor is at or
+/// past its `seq`. Filtering per shard is the entire point of a *vector* cursor: one scalar
+/// cannot say "I have seen node 1 through 40 and node 2 through 3", and a merge that orders by
+/// timestamp interleaves shards arbitrarily, so any single index is a position in no shard in
+/// particular. Per-shard filtering is what makes the walk gapless and duplicate-free per shard
+/// even as the merged *order* shifts under it.
+///
+/// **Where the next page starts.** A shard advances to the highest of three values: the position
+/// the reader presented, that shard's eviction watermark, and the highest `seq` the shard
+/// currently holds. Taking the maximum rather than "the highest seq actually emitted" is what
+/// stops the walk re-scanning entries it can never serve — one dropped by a clear generation
+/// (#224) or by eviction is gone permanently, so a cursor that stayed below it would re-examine
+/// and re-reject the same range on every page forever. Taking it *with* the presented position
+/// is what makes the token monotone: a shard whose slice has gone backwards (a replica cache
+/// that lost entries, a peer rolled back) never rewinds a reader that was already ahead of it.
+///
+/// **Membership.** A shard in the cursor with no slice this round keeps its position untouched —
+/// `next` starts as a copy of the presented `pos`, so a node that is dead, partitioned, or lost
+/// to the pull budget freezes rather than disappearing. Dropping it would rewind it to 0 and
+/// replay its whole history the moment it returned. A shard with a slice and no cursor entry is
+/// the mirror case: absent reads as 0, so a joining node enters the walk at the beginning and
+/// none of its entries are skipped as "already seen".
+///
+/// `truncated` is set when a presented position is strictly below that shard's watermark.
+/// `evicted_below_seq` is inclusive — that seq itself is gone — so a reader *at* the watermark
+/// has seen everything eviction removed and is not truncated, while one below it has a real
+/// hole. Both directions of that boundary matter: too eager and the bit cries wolf on every
+/// read, too lax and it stays silent about data the reader will never be shown.
+///
+/// **`cursor: None` is a baseline read, and is not the same thing as a cursor whose positions
+/// are all 0.** A baseline read is a snapshot of everything still retained, so by definition it
+/// has no hole and is *never* truncated; an explicit position of 0 is a reader claiming to have
+/// consumed nothing, who therefore *has* missed whatever eviction removed. Upstream draws
+/// exactly this line (`since.is_some_and(..)` in `rift-mock-core`'s journal), so does this
+/// crate's own single-node path, and
+/// [`super::journal::ClusterJournal`]'s `cursor_since_zero_differs_from_baseline_only_in_truncation`
+/// pins it. Collapsing the two here would make every uncursored read of an evicting port claim
+/// truncation forever — the header crying wolf on the most common read there is.
+#[must_use]
+pub(crate) fn merge_shards_since(
+    slices: &[ShardSlice],
+    partial: bool,
+    cursor: Option<&JournalCursor>,
+) -> MergeSince {
+    let position_of = |node: NodeId| {
+        cursor
+            .and_then(|cursor| cursor.pos.get(&node).copied())
+            .unwrap_or(0)
+    };
+
+    let entries = merge_shards(slices, partial)
+        .entries
+        .into_iter()
+        .filter(|entry| entry.seq > position_of(entry.node_id))
+        .collect();
+
+    let mut pos = cursor.map(|cursor| cursor.pos.clone()).unwrap_or_default();
+    let mut truncated = false;
+    for slice in slices {
+        let evicted = evicted_through(slices, slice.node_id);
+        let held = slice.read.entries.iter().map(|e| e.seq).max().unwrap_or(0);
+        let position = position_of(slice.node_id);
+        // `cursor.is_some()`: a baseline read is a snapshot and cannot have a hole, however
+        // much this shard has evicted. See this function's doc.
+        if cursor.is_some() && position < evicted {
+            truncated = true;
+        }
+        // Folded with `max` rather than `insert` for the same reason `evicted_through` maxes:
+        // two slices can name the same node, and the later one must not be able to lower it.
+        let advanced = position.max(evicted).max(held);
+        pos.entry(slice.node_id)
+            .and_modify(|current| *current = (*current).max(advanced))
+            .or_insert(advanced);
+    }
+
+    MergeSince {
+        entries,
+        partial,
+        next: JournalCursor {
+            // Monotone like the positions: never below what the caller presented, so a node
+            // that has not yet applied a clear cannot rewind a reader's token by reporting the
+            // older generation.
+            generation: slices
+                .iter()
+                .map(|slice| slice.read.clear_gen)
+                .max()
+                .unwrap_or(0)
+                .max(cursor.map_or(0, |cursor| cursor.generation)),
+            pos,
+        },
+        truncated,
+    }
 }
 
 /// The highest seq any slice reports `node` as having evicted through (inclusive).
@@ -313,6 +432,16 @@ impl JournalNet {
             replicas: RwLock::new(HashMap::new()),
             node: OnceLock::new(),
         })
+    }
+
+    /// This node's writer id — the shard a legacy scalar `?since=` is attributed to (issue #225).
+    ///
+    /// Reads the journal's own id rather than the bound `RaftNode`'s, for the reason
+    /// [`Self::slices_for`] gives: the journal knows its writer id from construction, so this
+    /// answers correctly whether or not [`Self::bind`] has run.
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.journal.node_id()
     }
 
     /// Attach the node once it exists. Binding twice is a no-op — the second
@@ -555,6 +684,31 @@ impl JournalNet {
     /// `merge_shards` stays a function of its inputs alone.
     #[must_use]
     pub async fn merge_read(&self, port: u16, budget: Duration) -> MergeOutcome {
+        // A baseline read is the cursorless case of the same walk, so it goes through the same
+        // code rather than beside it: with no cursor the per-shard filter withholds nothing and
+        // the result is `merge_shards` verbatim. Expressing it this way is what stops the two
+        // read paths drifting into disagreeing about eviction, clear generations, or order.
+        let page = self.merge_read_since(port, None, budget).await;
+        MergeOutcome {
+            entries: page.entries,
+            partial: page.partial,
+        }
+    }
+
+    /// The cursored form of [`Self::merge_read`] (issue #225): the same fleet-wide merge, resumed
+    /// from a vector cursor and answering with the token that fetches the next page. See
+    /// [`merge_shards_since`] for the walk's semantics — this adds the network fan-out and the
+    /// observability, exactly as [`Self::merge_read`] did before it.
+    ///
+    /// `cursor: None` is a **baseline** read, not a cursor at position zero; the difference is
+    /// the truncation bit, and [`merge_shards_since`]'s doc says why.
+    #[must_use]
+    pub async fn merge_read_since(
+        &self,
+        port: u16,
+        cursor: Option<&JournalCursor>,
+        budget: Duration,
+    ) -> MergeSince {
         let partial = self.pull_since_budgeted(port, budget).await;
         // Timed from *after* the fan-out, not around it (issue #319). The
         // histogram's own registration calls this "an in-memory sort … not I/O"
@@ -568,12 +722,12 @@ impl JournalNet {
         // it is a different series with different buckets — #228's C29 asks for
         // exactly that, and reusing this one for it is what broke it.
         let start = std::time::Instant::now();
-        let outcome = merge_shards(&self.slices_for(port), partial);
+        let page = merge_shards_since(&self.slices_for(port), partial, cursor);
         crate::metrics::journal_merge_observed(start.elapsed());
-        if outcome.partial {
+        if page.partial {
             crate::metrics::journal_partial_read();
         }
-        outcome
+        page
     }
 
     /// Pull `port` fresh from every other roster voter, concurrently, merging each reply into the
@@ -1367,5 +1521,387 @@ mod tests {
         let json = serde_json::to_string(&reply).expect("CountsReply serializes");
         let back: CountsReply = serde_json::from_str(&json).expect("CountsReply round-trips");
         assert_eq!(back.slots, vec![(4545, 12, 0), (8080, 0, 1)]);
+    }
+
+    // ---- Vector cursors: the merge-walk (issue #225) -----------------------------------
+    //
+    // `merge_shards` answers "the whole port, merged". These answer "the whole port *after a
+    // position you already hold*" — the same merge, filtered per shard, plus the token the next
+    // page is fetched with. The properties under test are the ones a walk cannot be correct
+    // without: every entry exactly once, no per-shard gaps, a token that never regresses, and a
+    // truncation bit that is set exactly when the reader really did miss something.
+
+    /// A slice with an explicit eviction watermark. [`slice`] always reports `0`, which is the
+    /// one value that can never make the truncation bit interesting.
+    fn slice_evicted(
+        node_id: NodeId,
+        entries: Vec<ShardEntry>,
+        evicted_below_seq: u64,
+    ) -> ShardSlice {
+        let mut slice = slice(node_id, entries);
+        slice.read.evicted_below_seq = evicted_below_seq;
+        slice
+    }
+
+    /// A slice reporting a port clear generation — the walk's half of #224.
+    fn slice_gen(node_id: NodeId, entries: Vec<ShardEntry>, clear_gen: u64) -> ShardSlice {
+        let mut slice = slice(node_id, entries);
+        slice.read.clear_gen = clear_gen;
+        slice
+    }
+
+    fn empty_cursor() -> JournalCursor {
+        JournalCursor::start()
+    }
+
+    fn since_paths(page: &MergeSince) -> Vec<&str> {
+        page.entries
+            .iter()
+            .map(|e| e.request.path.as_str())
+            .collect()
+    }
+
+    /// AC1, the whole of it in one walk: page until the walk is dry, and the pages concatenated
+    /// must be the merged set exactly once each — no duplicate across a page boundary (the
+    /// classic off-by-one in an exclusive cursor) and no entry skipped.
+    #[test]
+    fn a_cursor_walk_yields_every_entry_exactly_once() {
+        let slices = vec![
+            slice(
+                1,
+                vec![
+                    entry(1, 1, "2026-01-01T00:00:01Z"),
+                    entry(1, 2, "2026-01-01T00:00:04Z"),
+                ],
+            ),
+            slice(
+                2,
+                vec![
+                    entry(2, 1, "2026-01-01T00:00:02Z"),
+                    entry(2, 2, "2026-01-01T00:00:05Z"),
+                ],
+            ),
+            slice(3, vec![entry(3, 1, "2026-01-01T00:00:03Z")]),
+        ];
+
+        let first = merge_shards_since(&slices, false, None);
+        assert_eq!(
+            since_paths(&first),
+            merge_shards(&slices, false)
+                .entries
+                .iter()
+                .map(|e| e.request.path.as_str())
+                .collect::<Vec<_>>(),
+            "an empty cursor must yield exactly what an uncursored merged read yields"
+        );
+
+        // The walk is exhausted, not looping: a second page from the issued token is empty, and
+        // the token it issues in turn has not moved.
+        let second = merge_shards_since(&slices, false, Some(&first.next));
+        assert!(
+            second.entries.is_empty(),
+            "re-presenting the issued token must not replay the page it was issued after: {:?}",
+            since_paths(&second)
+        );
+        assert_eq!(
+            second.next, first.next,
+            "an empty page must not move the cursor"
+        );
+    }
+
+    /// The incremental half of AC1: entries recorded after the token was issued appear, and only
+    /// those. This is what makes the console's 2 s poll a delta fetch rather than a refetch.
+    #[test]
+    fn a_second_page_carries_only_what_arrived_after_the_first() {
+        let before = vec![
+            slice(1, vec![entry(1, 1, "2026-01-01T00:00:01Z")]),
+            slice(2, vec![entry(2, 1, "2026-01-01T00:00:02Z")]),
+        ];
+        let first = merge_shards_since(&before, false, None);
+        assert_eq!(since_paths(&first).len(), 2);
+
+        let after = vec![
+            slice(
+                1,
+                vec![
+                    entry(1, 1, "2026-01-01T00:00:01Z"),
+                    entry(1, 2, "2026-01-01T00:00:03Z"),
+                ],
+            ),
+            slice(2, vec![entry(2, 1, "2026-01-01T00:00:02Z")]),
+        ];
+        let second = merge_shards_since(&after, false, Some(&first.next));
+        assert_eq!(
+            since_paths(&second),
+            vec!["/p2"],
+            "only the entry recorded after the first page may appear"
+        );
+    }
+
+    /// AC1's membership clause, half one: a shard that stops answering must keep its position
+    /// rather than vanish from the token. Dropping it would rewind that shard to 0 the moment it
+    /// came back, replaying its entire history into a walk that had already consumed it.
+    #[test]
+    fn a_missing_shard_keeps_its_position_instead_of_rewinding_to_zero() {
+        let both = vec![
+            slice(1, vec![entry(1, 1, "2026-01-01T00:00:01Z")]),
+            slice(2, vec![entry(2, 7, "2026-01-01T00:00:02Z")]),
+        ];
+        let first = merge_shards_since(&both, false, None);
+        assert_eq!(first.next.pos.get(&2).copied(), Some(7));
+
+        // Node 2 drops out of the slice set entirely — dead, or lost to the pull budget.
+        let survivors = vec![slice(1, vec![entry(1, 1, "2026-01-01T00:00:01Z")])];
+        let next = merge_shards_since(&survivors, true, Some(&first.next));
+        assert_eq!(
+            next.next.pos.get(&2).copied(),
+            Some(7),
+            "a dead shard's position must freeze, not disappear"
+        );
+        assert!(
+            next.entries.is_empty(),
+            "the surviving shard had nothing new to add"
+        );
+    }
+
+    /// AC1's membership clause, half two: a shard nobody has read yet enters at 0, so its whole
+    /// history surfaces on the next page rather than being skipped as "already seen".
+    #[test]
+    fn a_shard_that_joins_after_the_walk_started_enters_at_zero() {
+        let before = vec![slice(1, vec![entry(1, 1, "2026-01-01T00:00:01Z")])];
+        let first = merge_shards_since(&before, false, None);
+        assert!(
+            !first.next.pos.contains_key(&9),
+            "node 9 has not been heard from yet"
+        );
+
+        let after = vec![
+            slice(1, vec![entry(1, 1, "2026-01-01T00:00:01Z")]),
+            slice(
+                9,
+                vec![
+                    entry(9, 1, "2026-01-01T00:00:02Z"),
+                    entry(9, 2, "2026-01-01T00:00:03Z"),
+                ],
+            ),
+        ];
+        let second = merge_shards_since(&after, false, Some(&first.next));
+        assert_eq!(
+            since_paths(&second),
+            vec!["/p1", "/p2"],
+            "a joining shard's entries all surface — it enters the walk at 0"
+        );
+    }
+
+    /// AC2: a clear landing mid-walk must not replay the cleared entries, and the token must not
+    /// regress. The cleared entries are already invisible to `merge_shards`; what this pins is
+    /// that the *cursor* also steps over them, so the reader never sees them again and never
+    /// re-scans the seq range they occupied.
+    #[test]
+    fn a_clear_mid_walk_neither_replays_nor_regresses() {
+        let before = vec![slice_gen(
+            1,
+            vec![
+                entry_gen(1, 1, 0, "2026-01-01T00:00:01Z"),
+                entry_gen(1, 2, 0, "2026-01-01T00:00:02Z"),
+            ],
+            0,
+        )];
+        let first = merge_shards_since(&before, false, None);
+        assert_eq!(since_paths(&first), vec!["/p1", "/p2"]);
+
+        // A clear bumps the port to generation 1; the pre-clear entries are still physically
+        // present in the shard but belong to the superseded generation, and one post-clear entry
+        // has landed since.
+        let after = vec![slice_gen(
+            1,
+            vec![
+                entry_gen(1, 1, 0, "2026-01-01T00:00:01Z"),
+                entry_gen(1, 2, 0, "2026-01-01T00:00:02Z"),
+                entry_gen(1, 3, 1, "2026-01-01T00:00:03Z"),
+            ],
+            1,
+        )];
+        let second = merge_shards_since(&after, false, Some(&first.next));
+        assert_eq!(
+            since_paths(&second),
+            vec!["/p3"],
+            "only the post-clear entry may appear — the cleared ones must not replay"
+        );
+        assert!(
+            second.next.pos.get(&1).copied().unwrap_or(0)
+                >= first.next.pos.get(&1).copied().unwrap_or(0),
+            "the token must never regress across a clear"
+        );
+        assert_eq!(
+            second.next.generation, 1,
+            "the issued token carries the generation it was issued under"
+        );
+    }
+
+    /// AC3, both directions. `evicted_below_seq` is **inclusive** — that seq itself is gone — so
+    /// a reader at exactly the watermark has seen everything eviction removed and has NOT been
+    /// truncated. Getting this boundary wrong in either direction is the whole bug: one way
+    /// cries wolf on every read, the other stays silent about real data loss.
+    #[test]
+    fn truncation_is_reported_exactly_when_the_position_predates_the_watermark() {
+        let slices = vec![slice_evicted(
+            1,
+            vec![entry(1, 6, "2026-01-01T00:00:06Z")],
+            5,
+        )];
+
+        for (position, expected) in [(3u64, true), (4, true), (5, false), (6, false)] {
+            let cursor = JournalCursor {
+                generation: 0,
+                pos: [(1u64, position)].into_iter().collect(),
+            };
+            let page = merge_shards_since(&slices, false, Some(&cursor));
+            assert_eq!(
+                page.truncated, expected,
+                "position {position} against watermark 5 must report truncated={expected}"
+            );
+        }
+    }
+
+    /// A **baseline** read is a snapshot of what is retained and therefore cannot have a hole,
+    /// however much the shard has evicted — while a reader presenting an explicit position of 0
+    /// claims to have consumed nothing and so *has* missed what eviction removed.
+    ///
+    /// That distinction is the whole reason the cursor is an `Option` here rather than a
+    /// zeroed-out value: collapsing them makes every ordinary uncursored read of an evicting
+    /// port claim truncation forever, which is the header crying wolf on the most common read
+    /// there is. Upstream draws the same line (`since.is_some_and(..)`), and this crate's
+    /// single-node path is pinned to it by
+    /// `cursor_since_zero_differs_from_baseline_only_in_truncation`; this is that test's
+    /// merged analogue.
+    #[test]
+    fn a_baseline_read_is_never_truncated_but_an_explicit_zero_is() {
+        let slices = vec![slice_evicted(
+            1,
+            vec![entry(1, 6, "2026-01-01T00:00:06Z")],
+            5,
+        )];
+
+        let baseline = merge_shards_since(&slices, false, None);
+        assert!(
+            !baseline.truncated,
+            "a baseline read sees everything retained, so it has no hole to report"
+        );
+
+        let from_zero = merge_shards_since(&slices, false, Some(&empty_cursor()));
+        assert!(
+            from_zero.truncated,
+            "a reader claiming position 0 has provably missed the evicted entries"
+        );
+
+        // The truncation bit must be the *only* difference between the two, exactly as the
+        // single-node test asserts of its own pair.
+        assert_eq!(since_paths(&baseline), since_paths(&from_zero));
+        assert_eq!(baseline.next, from_zero.next);
+    }
+
+    /// AC2's monotonicity clause on its own: a token presented from *ahead* of what the slices
+    /// hold — a peer that has since been rolled back, or a replica cache that lost entries — must
+    /// come back unchanged, never rewound to what this node can currently see.
+    #[test]
+    fn the_next_cursor_never_regresses_below_the_one_presented() {
+        let slices = vec![slice(1, vec![entry(1, 2, "2026-01-01T00:00:02Z")])];
+        let ahead = JournalCursor {
+            generation: 0,
+            pos: [(1u64, 99u64)].into_iter().collect(),
+        };
+        let page = merge_shards_since(&slices, false, Some(&ahead));
+        assert_eq!(
+            page.next.pos.get(&1).copied(),
+            Some(99),
+            "a position ahead of the shard must be preserved, not rewound"
+        );
+        assert!(
+            page.entries.is_empty(),
+            "nothing in the shard is newer than the presented position"
+        );
+    }
+
+    /// A position that predates an eviction watermark must still advance past it, or the walk
+    /// re-scans the evicted range on every single page forever.
+    #[test]
+    fn a_position_below_the_watermark_advances_past_it() {
+        let slices = vec![slice_evicted(
+            1,
+            vec![entry(1, 9, "2026-01-01T00:00:09Z")],
+            5,
+        )];
+        let stale = JournalCursor {
+            generation: 0,
+            pos: [(1u64, 2u64)].into_iter().collect(),
+        };
+        let page = merge_shards_since(&slices, false, Some(&stale));
+        assert!(page.truncated);
+        assert_eq!(
+            page.next.pos.get(&1).copied(),
+            Some(9),
+            "the token must clear the watermark and the entries it actually served"
+        );
+    }
+
+    /// AC6's cluster half: a one-voter fleet is just the single-shard case of the same walk, and
+    /// the token it issues must still page correctly rather than degenerating into something
+    /// only a multi-node fleet can walk.
+    #[test]
+    fn a_single_shard_fleet_still_issues_a_walkable_token() {
+        let slices = vec![slice(1, vec![entry(1, 1, "2026-01-01T00:00:01Z")])];
+        let first = merge_shards_since(&slices, false, None);
+        assert_eq!(since_paths(&first), vec!["/p1"]);
+        assert_eq!(first.next.pos.get(&1).copied(), Some(1));
+        assert!(
+            merge_shards_since(&slices, false, Some(&first.next))
+                .entries
+                .is_empty()
+        );
+        // And it survives the wire, which is the only way the front door can hand it back.
+        let token = first.next.encode();
+        assert_eq!(
+            JournalCursor::decode(&token).expect("the issued token round-trips"),
+            first.next
+        );
+    }
+
+    /// Two slices can name the same node — this node's own shard alongside a replica copy of
+    /// it — and the fold that builds `next` must take the **max** rather than letting whichever
+    /// slice happens to come last overwrite the position. An `insert` here would make the token
+    /// depend on slice order, which is exactly the non-determinism `merge_shards` is built to
+    /// avoid, and in the bad ordering it would hand back a position *behind* what was served.
+    #[test]
+    fn two_slices_for_one_node_fold_to_the_higher_position() {
+        let stale = slice(1, vec![entry(1, 2, "2026-01-01T00:00:02Z")]);
+        let fresh = slice(
+            1,
+            vec![
+                entry(1, 2, "2026-01-01T00:00:02Z"),
+                entry(1, 9, "2026-01-01T00:00:09Z"),
+            ],
+        );
+
+        for (label, slices) in [
+            ("fresh last", vec![stale.clone(), fresh.clone()]),
+            ("stale last", vec![fresh, stale]),
+        ] {
+            let page = merge_shards_since(&slices, false, None);
+            assert_eq!(
+                page.next.pos.get(&1).copied(),
+                Some(9),
+                "{label}: the token must reach the highest seq either slice held"
+            );
+        }
+    }
+
+    /// `partial` is orthogonal to the cursor and must pass through untouched — a walk over a
+    /// degraded fleet is still a walk, and the honesty bit belongs to the reader either way.
+    #[test]
+    fn a_partial_merge_stays_partial_through_the_walk() {
+        let slices = vec![slice(1, vec![entry(1, 1, "2026-01-01T00:00:01Z")])];
+        assert!(merge_shards_since(&slices, true, None).partial);
+        assert!(!merge_shards_since(&slices, false, None).partial);
     }
 }

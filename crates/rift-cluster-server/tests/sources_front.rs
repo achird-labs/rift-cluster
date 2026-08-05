@@ -243,7 +243,17 @@ async fn a_viewer_reads_sources_with_fleet_and_node_facts_apart() {
     // poll errors — none here, which an empty map states explicitly rather
     // than by omission.
     let node_local = body["nodeLocal"].as_object().expect("nodeLocal object");
-    assert!(node_local["nodeId"].is_u64(), "the observing node is named");
+    // A STRING, not a `u64`. A raft id is a `u64` and JSON numbers are IEEE-754 doubles wherever
+    // the reader is JavaScript, so an id above 2^53-1 arrives silently rounded — this endpoint was
+    // naming a node that does not exist. Asserting it parses BACK to a `u64` is what makes this a
+    // check on the encoding rather than merely on the type.
+    let observing = node_local["nodeId"]
+        .as_str()
+        .expect("the observing node is named");
+    assert!(
+        observing.parse::<u64>().is_ok(),
+        "the node id must still be a u64, just carried as text: {observing}"
+    );
     assert_eq!(
         node_local["pollErrors"],
         serde_json::json!({}),
@@ -263,7 +273,15 @@ async fn a_viewer_reads_sources_with_fleet_and_node_facts_apart() {
     assert_eq!(body["source"]["id"], "payments");
     assert_eq!(body["source"]["uri"], "scripted://cfg/payments.json");
     assert!(body["source"].get("lastPollError").is_none());
-    assert!(body["nodeLocal"]["nodeId"].is_u64());
+    // The single-source read carries the same node-local half as the list, so it gets the same
+    // check: a string that still parses back to a `u64`.
+    let observing = body["nodeLocal"]["nodeId"]
+        .as_str()
+        .expect("the observing node is named");
+    assert!(
+        observing.parse::<u64>().is_ok(),
+        "still a u64, carried as text: {observing}"
+    );
 
     fixture.server.shutdown().await;
 }

@@ -54,6 +54,22 @@ pub const HEADER_BIND_FAILURES: &str = "rift-cluster-bind-failures";
 /// asserts the header's *absence* on a fully healthy answer, so this must never be stamped `false`.
 pub const HEADER_PARTIAL: &str = "rift-cluster-partial";
 
+/// The cursor to present for the next page of a requests read (issue #225).
+///
+/// **Upstream's name, not a `Rift-Cluster-*` one**, and deliberately so: this is the same header
+/// the engine sets for a single-node cursor read, carrying the same meaning in the same place, so
+/// a client pages a clustered read with exactly the code that pages a single-node one. Renaming it
+/// under the cluster prefix would fork the contract for no gain — the *value* is what changed
+/// (an opaque vector token rather than a bare index), and the value was always opaque by contract.
+pub const HEADER_NEXT_INDEX: &str = "x-rift-next-index";
+/// Retention evicted entries the reader had not yet seen (issue #225) — upstream's name and
+/// upstream's meaning, for the same reason as [`HEADER_NEXT_INDEX`].
+///
+/// Additive-only, like [`HEADER_PARTIAL`]: set to `true` or not set at all, never `false`. A
+/// reader that has missed nothing must see no header, because that is the shape upstream's own
+/// clients already test against.
+pub const HEADER_TRUNCATED: &str = "x-rift-truncated";
+
 /// Translates `cluster.*` annotations into `Rift-Cluster-*` response headers.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterDecorator;
