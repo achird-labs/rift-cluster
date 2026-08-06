@@ -964,10 +964,17 @@ textarea {
   font-weight: 400;
 }
 
+/*
+ * `white-space: nowrap` because a button's label is one thing to press, not prose. The tables are
+ * `table-layout: fixed`, so an actions column is a fixed share of the row — a two-word label like
+ * "Open log" wrapped across two lines and spilled out of its own border once the padding here grew.
+ * Nothing about that is specific to the padding: any narrower column reproduces it.
+ */
 .btn,
 button.plain {
   cursor: pointer;
   padding: 8px 13px;
+  white-space: nowrap;
 }
 
 /*
