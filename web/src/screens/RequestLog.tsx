@@ -795,7 +795,10 @@ function ImposterPicker(): ReactNode {
                 <tr>
                   <th style={{ width: "12ch" }}>Port</th>
                   <th>Name</th>
-                  <th style={{ width: "14ch" }} aria-label="Open" />
+                  {/* Sized in px, not `ch`: the table is `table-layout: fixed`, so a column too narrow for
+                      its content clips it rather than growing — which is what cut this button in half
+                      when control padding grew. */}
+                  <th style={{ width: "132px" }} aria-label="Open" />
                 </tr>
               </thead>
               <tbody>

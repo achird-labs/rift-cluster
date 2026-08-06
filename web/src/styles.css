@@ -2828,3 +2828,22 @@ input[type="radio"] {
 .pill-filter.is-pending:hover {
   background: none;
 }
+
+/* The flow-state sections, shown before an imposter is chosen — inert, so they are styled as labels
+   rather than as the tab strip they preview. `aria-hidden`: the same words appear as real tabs the
+   moment a choice is made, and announcing them twice would promise controls that are not there. */
+.flow-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.flow-preview-tab {
+  font: 500 11.5px/1 var(--mono);
+  color: var(--ink-3);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 6px 12px;
+}

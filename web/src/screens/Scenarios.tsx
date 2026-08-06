@@ -862,10 +862,27 @@ function ImposterPicker(): ReactNode {
     <section className="screen" data-testid="scenarios-screen">
       <header className="screen-head">
         <h1>Scenarios &amp; state</h1>
-        <p className="muted">
-          Choose an imposter to read its scenarios, spaces and flow state.
+        <p className="scope-label">
+          Scenario positions, the spaces they are scoped to, and the FSMs that define them all belong
+          to one imposter — so this screen starts by asking which.
         </p>
       </header>
+
+      {/*
+        The tab names, before a choice is made.
+        
+        Without them this screen is a card headed "Choose an imposter" over a port/name table, which
+        is pixel-for-pixel what the request log shows for the same reason — and the two were being
+        mistaken for each other. Naming the three sections says which screen this is and what
+        choosing an imposter will actually open.
+      */}
+      <div className="flow-preview" aria-hidden="true">
+        {FLOW_TABS.map((entry) => (
+          <span key={entry.id} className="flow-preview-tab">
+            {entry.label}
+          </span>
+        ))}
+      </div>
       {imposters.isError ? (
         <ErrorNote error={imposters.error} context="Could not read the imposter list" />
       ) : null}
@@ -884,7 +901,10 @@ function ImposterPicker(): ReactNode {
                 <tr>
                   <th style={{ width: "12ch" }}>Port</th>
                   <th>Name</th>
-                  <th style={{ width: "14ch" }} aria-label="Open" />
+                  {/* Sized in px, not `ch`: the table is `table-layout: fixed`, so a column too narrow for
+                      its content clips it rather than growing — which is what cut this button in half
+                      when control padding grew. */}
+                  <th style={{ width: "132px" }} aria-label="Open" />
                 </tr>
               </thead>
               <tbody>
