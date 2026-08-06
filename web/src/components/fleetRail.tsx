@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 import type { FleetView } from "../app/fleetView.ts";
-import { Unshipped, UnshippedPanel } from "./unshipped.tsx";
+import { Pending, PendingPanel } from "./pending.tsx";
 
 /**
  * The fleet rail: the hash ring, the control plane, and the merged tail.
@@ -79,7 +79,11 @@ export function HashRing({ fleet }: { fleet: FleetView | undefined }): ReactNode
         </text>
       </svg>
       <div style={{ marginTop: "10px" }}>
-        <Unshipped reason="Which key the ring assigns to which member is not published — /_fleet/health carries the members and the epoch, but no per-key ownership projection exists. The arcs show the ring's shape, not a measured distribution." />
+        {/* `app/pending.ts::flowOwner` is the call site this fills once #359 lands. */}
+        <Pending
+          issue={359}
+          reason="The ring's members and epoch are published, so the arcs are real; which key lands on which member is not."
+        />
       </div>
     </section>
   );
@@ -99,7 +103,7 @@ export function ControlPlane({ fleet }: { fleet: FleetView | undefined }): React
     return (
       <section className="rail-sect">
         <h2 className="eyebrow">Control plane</h2>
-        <UnshippedPanel reason="The fleet projection is scoped to fleet.read, and this principal is refused it." />
+        <PendingPanel issue={361} reason="The fleet projection is scoped to fleet.read, and this principal is refused it." />
       </section>
     );
   }
@@ -120,11 +124,12 @@ export function ControlPlane({ fleet }: { fleet: FleetView | undefined }): React
                 <span className="applied">{fleet.lastApplied}</span>
               ) : (
                 <span className="applied">
-                  <Unshipped
+                  <Pending
+                    issue={361}
                     reason={
                       isSelf
                         ? "This node reported no applied index."
-                        : "A peer's applied index cannot be read from here: the console is served under connect-src 'self', so it can only ever query its own node, and no fleet-wide aggregate endpoint publishes the others."
+                        : "The console is served under connect-src 'self', so it can only ever query its own node. A peer's applied index needs a fleet-wide projection the serving node assembles."
                     }
                   />
                 </span>
@@ -151,9 +156,13 @@ function LiveTail(): ReactNode {
     <section className="rail-sect" style={{ flex: 1, minHeight: 0 }}>
       <h2 className="eyebrow">
         Live tail · merged
-        <span className="unshipped">not streaming</span>
+        
       </h2>
-      <UnshippedPanel reason="No fleet-wide request tail is published. Recorded requests are readable per imposter on the request log; a single merged stream across every imposter is not an endpoint the fleet offers." />
+      {/* `app/pending.ts::mergedTail` is the call site this fills once #362 lands. */}
+      <PendingPanel
+        issue={362}
+        reason="Recorded requests are readable per imposter on the request log. One ordered stream across every imposter is not an endpoint the fleet offers yet."
+      />
     </section>
   );
 }

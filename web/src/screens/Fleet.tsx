@@ -7,7 +7,7 @@ import type { FleetView } from "../app/fleetView.ts";
 import { useFleetView } from "../app/queries.ts";
 import { Card, ErrorNote, Ident, Status, Tile, UNKNOWN } from "../components/primitives.tsx";
 import { ControlPlane, HashRing } from "../components/fleetRail.tsx";
-import { UnshippedPanel } from "../components/unshipped.tsx";
+import { PendingPanel } from "../components/pending.tsx";
 
 export function Fleet(): ReactNode {
   const fleet = useFleetView();
@@ -132,13 +132,13 @@ function View({ view }: { view: FleetView }): ReactNode {
        */}
       <div className="fleet-ops">
         <Card title="Durability &amp; write path">
-          <UnshippedPanel reason="The write barrier, its timeout, the flow fsync policy and the admin-write mode are configured on the node's command line and are not read back by any endpoint." />
+          <PendingPanel issue={365} reason="The write barrier, its timeout, the flow fsync policy and the admin-write mode are configured on the node's command line and are not read back by any endpoint." />
         </Card>
         <Card title="Snapshots">
-          <UnshippedPanel reason="No endpoint reports the last snapshot or triggers a new one. Snapshotting and log compaction are driven by the node's own thresholds." />
+          <PendingPanel issue={365} reason="No endpoint reports the last snapshot or triggers a new one. Snapshotting and log compaction are driven by the node's own thresholds." />
         </Card>
         <Card title="Membership">
-          <UnshippedPanel reason="Adding a learner or removing a voter is a cluster-membership change with no admin-API route. A graceful leave that would drop the fleet below two voters is refused by the node itself, not from here." />
+          <PendingPanel issue={366} reason="Adding a learner or removing a voter is a cluster-membership change with no admin-API route. A graceful leave that would drop the fleet below two voters is refused by the node itself, not from here." />
         </Card>
       </div>
 

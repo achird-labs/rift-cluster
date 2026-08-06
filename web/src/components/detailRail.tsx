@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 import type { FleetView } from "../app/fleetView.ts";
 import { Ident } from "./primitives.tsx";
-import { Unshipped, UnshippedPanel } from "./unshipped.tsx";
+import { Pending, PendingPanel } from "./pending.tsx";
 
 /**
  * The imposter detail's right rail: the write path, this port's place on the ring, and the
@@ -45,14 +45,14 @@ function WritePath({ revision }: { revision: string | null }): ReactNode {
         <dt>Revision</dt>
         <dd>
           {revision === null ? (
-            <Unshipped reason="This read carried no Rift-Cluster-Revision header." />
+            <Pending issue={361} reason="This read carried no Rift-Cluster-Revision header." />
           ) : (
             <Ident>{revision}</Ident>
           )}
         </dd>
         <dt>Stages</dt>
         <dd>
-          <Unshipped reason="Per-write progress — submitted, replicated to a quorum, applied — is not published. An admin write resolves to a commit outcome; the intermediate stages are not observable from the console." />
+          <Pending issue={361} reason="Per-write progress — submitted, replicated to a quorum, applied — is not published. An admin write resolves to a commit outcome; the intermediate stages are not observable from the console." />
         </dd>
       </dl>
     </section>
@@ -78,14 +78,14 @@ function PortOnRing({ port, fleet }: { port: number; fleet: FleetView | undefine
         <dt>Ring epoch</dt>
         <dd>
           {fleet === undefined ? (
-            <Unshipped reason="The fleet projection is scoped to fleet.read, and this principal is refused it." />
+            <Pending issue={361} reason="The fleet projection is scoped to fleet.read, and this principal is refused it." />
           ) : (
             <Ident>{fleet.ringEpoch}</Ident>
           )}
         </dd>
         <dt>Flow owner</dt>
         <dd>
-          <Unshipped reason="No endpoint maps a key to its owning member. The ring's membership and epoch are published; the HRW assignment that decides which node holds this port's flow state is not." />
+          <Pending issue={359} reason="No endpoint maps a key to its owning member. The ring's membership and epoch are published; the HRW assignment that decides which node holds this port's flow state is not." />
         </dd>
       </dl>
     </section>
@@ -104,7 +104,7 @@ function RecentHits(): ReactNode {
   return (
     <section className="rail-sect" style={{ flex: 1, minHeight: 0 }}>
       <h2 className="eyebrow">Recent hits · this stub</h2>
-      <UnshippedPanel reason="Recorded requests are not attributed to the stub that matched them, so a per-stub hit list would be a client-side re-run of the server's own matching rather than a reading of it. The request log carries this imposter's traffic." />
+      <PendingPanel issue={364} reason="Recorded requests are not attributed to the stub that matched them, so a per-stub hit list would be a client-side re-run of the server's own matching rather than a reading of it. The request log carries this imposter's traffic." />
     </section>
   );
 }

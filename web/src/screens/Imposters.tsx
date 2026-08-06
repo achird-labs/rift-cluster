@@ -21,7 +21,7 @@ import { toHash, useHashQuery } from "../app/routing.ts";
 import { ExportDialog } from "../components/exportDialog.tsx";
 import { FleetRail } from "../components/fleetRail.tsx";
 import { ImposterField, stubCountOf } from "../components/imposterFields.tsx";
-import { Unshipped } from "../components/unshipped.tsx";
+import { Pending } from "../components/pending.tsx";
 import {
   type BulkAction,
   BulkBar,
@@ -115,7 +115,7 @@ function ImposterTiles({
       <div className="tile">
         <dt className="eyebrow">Requests · fleet sum</dt>
         <dd className="v-plain">
-          <Unshipped reason="No schema'd field carries a request count on the imposter list. `numberOfRequests` arrives only through the body's non-exhaustive index signature, which app/contract.ts refuses on purpose — the request log is where a counted figure has a backing endpoint." />
+          <Pending issue={363} reason="No schema'd field carries a request count on the imposter list. `numberOfRequests` arrives only through the body's non-exhaustive index signature, which app/contract.ts refuses on purpose." />
         </dd>
         <dd className="note">counted per imposter on the request log</dd>
       </div>
@@ -133,7 +133,7 @@ function ImposterTiles({
       <div className="tile">
         <dt className="eyebrow">Parked intents</dt>
         <dd className="v-plain">
-          <Unshipped reason="The parked-write queue is not published. Under --cluster-admin-async a write can be accepted and replayed later, but no endpoint reports how many are outstanding." />
+          <Pending issue={360} reason="The parked-write queue is not published. Under --cluster-admin-async a write can be accepted and replayed later, but no endpoint reports how many are outstanding." />
         </dd>
         <dd className="note">accepted, awaiting replay</dd>
       </div>

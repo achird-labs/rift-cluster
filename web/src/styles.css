@@ -2166,41 +2166,45 @@ input[type="radio"] {
    asked and the answer is nothing" — in a console whose whole job is telling an operator what is
    true of a live fleet. This says nobody asked, because there is nothing to ask. */
 
-.unshipped {
+.pending {
   display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font: 500 9.5px/1 var(--mono);
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-  background: var(--idle-soft);
-  border: 1px dashed var(--line-2);
-  border-radius: var(--r-pill);
-  padding: 3px 8px;
+  align-items: baseline;
+  gap: 7px;
   white-space: nowrap;
+  color: var(--ink-3);
 }
 
-/* In a table cell the marker is the value, so it sits where a value would rather than inline. */
-td > .unshipped,
-.imp-row .unshipped {
-  font-size: 9px;
-  padding: 2px 6px;
+/* The chip is the nav's, one level down — a field that is designed and unbuilt, rather than a
+   screen that is. Small enough to sit inside a table cell without setting the row height. */
+.pending .issue,
+.pending-panel .issue {
+  font: 500 10px/1 var(--mono);
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 5px;
+  text-decoration: none;
+  flex: none;
 }
 
-/* A whole panel that has no data source: the marker plus one sentence saying which endpoint is
-   missing, so the reader learns the reason rather than only the fact. */
-.unshipped-panel {
+.pending .issue:hover,
+.pending-panel .issue:hover {
+  color: var(--ink);
+  border-color: var(--line-2);
+}
+
+/* A whole panel with no data source: one sentence saying what is missing, and its issue. */
+.pending-panel {
   border: 1px dashed var(--line-2);
   border-radius: var(--r-panel);
   background: var(--surface-2);
   padding: 13px 14px;
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: flex-start;
+  gap: 10px;
 }
 
-.unshipped-panel p {
+.pending-panel p {
   margin: 0;
   font: 400 11px/1.6 var(--mono);
   color: var(--ink-3);
