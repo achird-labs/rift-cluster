@@ -2479,3 +2479,146 @@ td > .unshipped,
   color: var(--ink);
   font-weight: 600;
 }
+
+/* ── Export dialog ─────────────────────────────────────────────────────────
+   Wider than a confirm and scrollable, because it is a choice with consequences rather than a
+   yes/no: the options, the request they produce and what that request puts in the file all have to
+   be on screen together for the reading to be worth anything. */
+
+.export-dialog {
+  width: min(660px, 100%);
+  max-height: min(86vh, 900px);
+  overflow-y: auto;
+  text-align: left;
+}
+
+.export-dialog h2 {
+  margin-bottom: 4px;
+}
+
+.export-dialog > .muted {
+  margin: 0 0 18px;
+  font: 400 11.5px/1.6 var(--mono);
+}
+
+.export-dialog .field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.export-scopes {
+  margin-left: 0;
+}
+
+.export-opts {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  margin-bottom: 18px;
+}
+
+.export-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 13px 16px;
+  cursor: pointer;
+}
+
+.export-opt + .export-opt,
+.export-opt + .export-opt.is-fact {
+  border-top: 1px solid var(--surface-3);
+}
+
+/* A row that states a fact rather than offering a choice — no pointer, because nothing here is
+   clickable, and a cursor that says otherwise is a promise the row does not keep. */
+.export-opt.is-fact {
+  cursor: default;
+  /* Aligned with the checkbox rows above it rather than flush, so the column of labels stays one
+     column even though this row has no box in front of it. */
+  padding-left: 43px;
+}
+
+.export-opt input[type="checkbox"] {
+  margin-top: 2px;
+  flex: none;
+  accent-color: var(--accent);
+}
+
+.export-opt.is-warn input[type="checkbox"] {
+  accent-color: var(--crit);
+}
+
+.export-opt-label {
+  font: 500 12.5px/1.3 var(--mono);
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.export-opt .note {
+  margin: 4px 0 0;
+  font: 400 11px/1.6 var(--mono);
+  color: var(--ink-3);
+}
+
+.export-opt.is-warn .note {
+  color: var(--crit);
+}
+
+.export-contents {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 15px 18px;
+  margin-bottom: 18px;
+}
+
+.export-contents h3 {
+  margin: 0 0 10px;
+  font: 600 12px/1.3 var(--sans);
+}
+
+.export-contents ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.export-contents li {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  gap: 9px;
+  align-items: baseline;
+  font: 400 11.5px/1.6 var(--mono);
+  color: var(--ink-3);
+}
+
+/* The glyph is the encoding, not the colour — `✓` against `·` reads the same to a reader who sees
+   no difference between the green and the grey. */
+.export-contents li.is-in {
+  color: var(--ink-2);
+}
+
+.export-contents li.is-in > span:first-child {
+  color: var(--good);
+}
+
+.export-dialog .payload {
+  max-height: 160px;
+}
+
+.export-dialog .banner {
+  margin-bottom: 18px;
+}
+
+.export-dialog .banner p {
+  margin: 3px 0 0;
+}

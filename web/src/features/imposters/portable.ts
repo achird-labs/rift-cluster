@@ -30,17 +30,54 @@
 export type ExportProjection = "replay-ready" | "as-configured";
 
 /**
- * The query string for a projection.
+ * The two flags the export route actually takes.
  *
  * `replayable=true` renders the imposter in the form `PUT /imposters` accepts back.
  * `removeProxies=true` additionally turns recorded proxy responses into static stubs and drops the
  * proxy stubs themselves — the difference between "a mock of what the upstream said" and "a mock
  * that will go on recording at whoever imports it".
+ *
+ * `tls` is the design's third option and it is NOT yet a server flag: the export route never
+ * carries `key` or `cert` for an https imposter today, with or without a parameter asking it to —
+ * verified against a live fleet. It is carried here so the dialog matches the design, and it is
+ * sent on the wire so that the moment the route learns the parameter this begins working with no
+ * further change. Until then the server ignores it and the exported file has no TLS material in it,
+ * which is what `EXPORT_TLS_IS_INERT` exists to say out loud to anyone reading this code.
  */
+export type ExportOptions = { replayable: boolean; removeProxies: boolean; tls: boolean };
+
+/**
+ * Whether `tls=true` actually changes the exported document.
+ *
+ * `false` today. Flip it when the export route implements the parameter — and when it is flipped,
+ * the dialog's private-key warning stops being a statement about a file that cannot contain keys
+ * and starts being a statement about one that can.
+ */
+export const EXPORT_TLS_IS_INERT = true;
+
+export function exportOptionsQuery(options: ExportOptions): string {
+  return (
+    `?replayable=${String(options.replayable)}` +
+    `&removeProxies=${String(options.removeProxies)}` +
+    `&tls=${String(options.tls)}`
+  );
+}
+
+/**
+ * The named projections, as options.
+ *
+ * One builder underneath, so the presets and the dialog's own checkboxes cannot produce different
+ * URLs for the same intent — the drift would be silent, and it would be a file whose contents did
+ * not match the projection its filename claims.
+ */
+export const PROJECTION_OPTIONS: Record<ExportProjection, ExportOptions> = {
+  "replay-ready": { replayable: true, removeProxies: true, tls: false },
+  "as-configured": { replayable: true, removeProxies: false, tls: false },
+};
+
+/** The query string for a named projection. */
 export function exportQuery(projection: ExportProjection): string {
-  return projection === "replay-ready"
-    ? "?replayable=true&removeProxies=true"
-    : "?replayable=true";
+  return exportOptionsQuery(PROJECTION_OPTIONS[projection]);
 }
 
 /** Indentation for the documents this module has to re-serialize. Deterministic is the requirement. */

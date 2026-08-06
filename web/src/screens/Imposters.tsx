@@ -18,6 +18,7 @@ import {
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { toHash, useHashQuery } from "../app/routing.ts";
+import { ExportDialog } from "../components/exportDialog.tsx";
 import { FleetRail } from "../components/fleetRail.tsx";
 import { ImposterField, stubCountOf } from "../components/imposterFields.tsx";
 import { Unshipped } from "../components/unshipped.tsx";
@@ -49,10 +50,10 @@ import {
   UnconfirmedNote,
 } from "../components/primitives.tsx";
 import {
-  type ExportProjection,
+  type ExportOptions,
   type ImportEntry,
   type ImportPlan,
-  exportQuery,
+  exportOptionsQuery,
   exportSetFilename,
   importPlan,
   parseImportDocument,
@@ -174,6 +175,7 @@ export function Imposters(): ReactNode {
   const remove = useDeleteImposter();
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [confirming, setConfirming] = useState<Imposter | null>(null);
   // Only to qualify what the list shows. A principal without the fleet scope simply gets no
   // qualification — never a 404 error on a screen whose own read succeeded.
@@ -334,6 +336,20 @@ export function Imposters(): ReactNode {
             {confidence.unknown ? ` Caveat: ${confidence.reason}.` : ""}
           </p>
           <div className="spacer" />
+          {/* Export sits with Import and New imposter rather than in a card below the tiles: it is
+              an action on this screen's subject, and the header is where this screen's actions are.
+              It opens a dialog because the choice it carries — what actually lands in the file —
+              needs more than a button label to state. */}
+          {mayExport ? (
+            <button
+              className="btn"
+              type="button"
+              data-testid="export-imposters"
+              onClick={() => setExporting(true)}
+            >
+              Export
+            </button>
+          ) : null}
           {mayCreate ? (
             <button
               className="btn"
@@ -362,7 +378,9 @@ export function Imposters(): ReactNode {
           maySeeSources={maySeeSources}
         />
 
-        {mayExport ? <ExportSetControl tenant={tenant} /> : null}
+        {mayExport && exporting ? (
+        <ExportSetControl tenant={tenant} count={all.length} onClose={() => setExporting(false)} />
+      ) : null}
 
         {importing ? (
           <ImportPanel
@@ -988,58 +1006,50 @@ function NewImposter({
  * Two buttons, not a select-then-go: the projections carry a real semantic difference (whether the
  * import goes on recording), and naming both up front is worth more than one fewer click.
  */
-function ExportSetControl({ tenant }: { tenant: string | null }): ReactNode {
-  const [busy, setBusy] = useState<ExportProjection | null>(null);
+function ExportSetControl({
+  tenant,
+  count,
+  onClose,
+}: {
+  tenant: string | null;
+  count: number;
+  onClose: () => void;
+}): ReactNode {
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function run(projection: ExportProjection): Promise<void> {
+  async function run(options: ExportOptions): Promise<void> {
     setError(null);
-    setBusy(projection);
+    setBusy(true);
     try {
-      const text = await apiGetText(`/imposters${exportQuery(projection)}`, { tenant });
+      const text = await apiGetText(`/imposters${exportOptionsQuery(options)}`, { tenant });
       downloadText(exportSetFilename(tenant), text);
+      onClose();
     } catch (error_) {
       setError(errorText(error_));
     } finally {
-      setBusy(null);
+      setBusy(false);
     }
   }
 
   return (
-    <div className="card" data-testid="export-imposters">
-      <div className="card-body">
-        <span className="eyebrow">Export every imposter in this tenant</span>
-        <div className="field-row">
-          <button
-            className="btn sm"
-            type="button"
-            disabled={busy !== null}
-            onClick={() => void run("replay-ready")}
-          >
-            {busy === "replay-ready" ? "Exporting…" : "Replay-ready"}
-          </button>
-          <span className="note">
-            Default. Recorded proxy responses become static stubs; proxy stubs are dropped.
-          </span>
-        </div>
-        <div className="field-row">
-          <button
-            className="btn sm"
-            type="button"
-            disabled={busy !== null}
-            onClick={() => void run("as-configured")}
-          >
-            {busy === "as-configured" ? "Exporting…" : "As configured"}
-          </button>
-          <span className="note">Proxy stubs kept, so the importer goes on recording.</span>
-        </div>
-        {error === null ? null : (
-          <p className="error" data-testid="export-imposters-error" role="alert">
-            {error}
-          </p>
-        )}
-      </div>
-    </div>
+    <>
+      <ExportDialog
+        scope={{ kind: "tenant" }}
+        tenant={tenant}
+        imposterCount={count}
+        busy={busy}
+        onExport={(options) => void run(options)}
+        onCancel={onClose}
+      />
+      {/* Kept outside the dialog on purpose: a failed export leaves the dialog open with the
+          options the operator chose still in it, so retrying does not mean re-deciding. */}
+      {error === null ? null : (
+        <p className="error" data-testid="export-imposters-error" role="alert">
+          {error}
+        </p>
+      )}
+    </>
   );
 }
 
