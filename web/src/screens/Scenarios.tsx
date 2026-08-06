@@ -5,6 +5,7 @@ import {
   useAddSpaceStub,
   useClearFlowState,
   useFlowStateEntry,
+  useImposter,
   useImposters,
   useResetScenarios,
   useScenarios,
@@ -14,8 +15,10 @@ import {
   useTeardownSpace,
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
+import { useHashQuery } from "../app/routing.ts";
 import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
 import { shadowingStubIndex } from "../features/requests/stubFromRequest.ts";
+import { scenarioDefinitions } from "../features/scenarios/definitions.ts";
 import {
   ABSENT_ENTRY_CAVEAT,
   SPACE_STUB_CAVEAT,
@@ -54,6 +57,18 @@ function ForImposter({ port, flow }: { port: number; flow: string | null }): Rea
   const resolvedFlow =
     scenarios.data?.kind === "scenarios" ? scenarios.data.flowId : (flow ?? null);
 
+  // In the hash query, so a tab is linkable and survives a reload — the same rule the imposter
+  // list's filters and the imposter detail's tabs follow.
+  const [search, setSearch] = useHashQuery();
+  const requested = new URLSearchParams(search).get("tab");
+  const tab: FlowTab = FLOW_TABS.find((entry) => entry.id === requested)?.id ?? "scenarios";
+  const setTab = (next: FlowTab): void => {
+    const params = new URLSearchParams(search);
+    if (next === "scenarios") params.delete("tab");
+    else params.set("tab", next);
+    setSearch(params.toString());
+  };
+
   return (
     <section className="screen" data-testid="scenarios-screen">
       <header className="screen-head">
@@ -84,9 +99,31 @@ function ForImposter({ port, flow }: { port: number; flow: string | null }): Rea
         </span>
       </div>
 
-      <ScenarioPanel port={port} flow={resolvedFlow} state={scenarios} />
-      <SpacePanel port={port} flowId={resolvedFlow} />
-      <FlowStatePanel port={port} flowId={resolvedFlow} />
+      {/*
+       * Three tabs, as the design has them. They are not three views of one thing — they are three
+       * different tiers, and the screen used to stack them so a reader scrolled past the per-flow
+       * position to reach the machine that defines it:
+       *
+       *   Scenarios & KV      the position each flow currently sits at, plus the durable KV beside it
+       *   Spaces              the flows themselves — what a scenario state is scoped to
+       *   Scenario definitions the FSM the match gate reads, which is imposter config, not runtime
+       *
+       * The last is the one worth separating hardest: editing a definition is an ordinary clustered
+       * write to the imposter document, while everything on the first tab is per-flow runtime that
+       * a reset discards. Same screen, opposite durability.
+       */}
+      <FlowTabs current={tab} onPick={setTab} />
+
+      {tab === "scenarios" ? (
+        <>
+          <ScenarioPanel port={port} flow={resolvedFlow} state={scenarios} />
+          <FlowStatePanel port={port} flowId={resolvedFlow} />
+        </>
+      ) : null}
+
+      {tab === "spaces" ? <SpacePanel port={port} flowId={resolvedFlow} /> : null}
+
+      {tab === "defs" ? <ScenarioDefinitions port={port} /> : null}
     </section>
   );
 }
@@ -872,5 +909,127 @@ function ImposterPicker(): ReactNode {
         </Card>
       ) : null}
     </section>
+  );
+}
+
+const FLOW_TABS = [
+  { id: "scenarios", label: "Scenarios & KV" },
+  { id: "spaces", label: "Spaces" },
+  { id: "defs", label: "Scenario definitions" },
+] as const;
+
+type FlowTab = (typeof FLOW_TABS)[number]["id"];
+
+function FlowTabs({
+  current,
+  onPick,
+}: {
+  current: FlowTab;
+  onPick: (tab: FlowTab) => void;
+}): ReactNode {
+  return (
+    <div className="tabs" role="tablist" aria-label="Flow state sections">
+      {FLOW_TABS.map((entry) => (
+        <button
+          key={entry.id}
+          type="button"
+          role="tab"
+          data-testid={`flow-tab-${entry.id}`}
+          aria-selected={entry.id === current}
+          onClick={() => onPick(entry.id)}
+        >
+          {entry.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The FSM each scenario declares.
+ *
+ * Derived from the imposter's own stubs rather than read from a definitions endpoint, because there
+ * is no such endpoint and there does not need to be: the machine IS the stubs. Each one names the
+ * state it requires and the state it moves to, so `scenarioDefinitions` reassembles exactly the
+ * graph the match gate walks — and every edge points at the stub that drives it, which is what
+ * makes this a reading rather than a drawing.
+ */
+function ScenarioDefinitions({ port }: { port: number }): ReactNode {
+  const imposter = useImposter(port);
+  const defs = scenarioDefinitions(imposter.data?.data.stubs);
+
+  if (imposter.isPending) return <p className="muted">Reading…</p>;
+  if (imposter.isError) {
+    return <ErrorNote error={imposter.error} context="Could not read this imposter's stubs" />;
+  }
+
+  if (defs.length === 0) {
+    return (
+      <Empty
+        testId="scenario-defs-empty"
+        title="No scenario is declared on this imposter"
+        body="A stub joins a machine by naming a scenario and the state it requires or moves to. Until one does, there is no FSM for the match gate to read."
+      />
+    );
+  }
+
+  return (
+    <>
+      <p className="muted">
+        A scenario is the FSM the match gate reads before a stub is allowed to answer. It is part of
+        the imposter document, so editing one is an ordinary clustered write — not flow state, which
+        is the per-flow position inside it.
+      </p>
+      {defs.map((def) => (
+        <Card key={def.name} title={def.name} bleed>
+          <div className="fsm-states">
+            {def.states.map((state) => (
+              <span
+                key={state}
+                className={`fsm-state${state === def.initial ? " is-initial" : ""}`}
+              >
+                {state}
+                {state === def.initial ? <span className="fsm-initial">initial</span> : null}
+              </span>
+            ))}
+          </div>
+          {def.transitions.length === 0 ? (
+            <p className="hint">
+              Every stub in this scenario answers without advancing it, so the machine has no
+              transitions — it is a set of states the traffic never moves between.
+            </p>
+          ) : (
+            <div className="scroll-x">
+              <table className="dense">
+                <thead>
+                  <tr>
+                    <th style={{ width: "4ch" }}>#</th>
+                    <th style={{ width: "20ch" }}>From</th>
+                    <th style={{ width: "20ch" }}>To</th>
+                    <th>Stub</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {def.transitions.map((transition, index) => (
+                    <tr key={`${transition.from}-${transition.to}-${String(index)}`}>
+                      <td className="ident">{index + 1}</td>
+                      <td className="ident">{transition.from}</td>
+                      <td className="ident">&rarr; {transition.to}</td>
+                      <td className="ident">
+                        {transition.stub === null ? (
+                          <span className="muted">this stub carries no id</span>
+                        ) : (
+                          <Truncated value={transition.stub} max={28} />
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      ))}
+    </>
   );
 }

@@ -186,13 +186,25 @@ test.describe("roles get the console their bindings allow", () => {
     await goToScreen(page, `/scenarios/${imposters[0]}`);
     await expect(page.getByTestId("reset-scenarios")).toBeVisible();
     await expect(page.getByTestId("flow-state-clear-all")).toBeVisible();
+
+    /*
+     * The space control is asserted absent ON THE TAB IT LIVES ON.
+     *
+     * Spaces became their own tab, and asserting `toHaveCount(0)` from the scenarios tab would pass
+     * for the wrong reason — the control is not rendered there for anybody, so the assertion would
+     * hold even if an operator were wrongly offered it. An absence is only evidence where the thing
+     * would otherwise be.
+     */
+    await goToScreen(page, `/scenarios/${imposters[0]}?tab=spaces`);
+    await expect(page.getByTestId("space-teardown")).toBeVisible();
     await expect(page.getByTestId("space-add-stub")).toHaveCount(0);
   });
 
   test("an editor may scope a stub into a space", async ({ page }) => {
     const { imposters } = fixture();
     await signIn(page, "editor");
-    await goToScreen(page, `/scenarios/${imposters[0]}`);
+    // Spaces are their own tab now; the tab lives in the hash, so this arrives on it directly.
+    await goToScreen(page, `/scenarios/${imposters[0]}?tab=spaces`);
     await expect(page.getByTestId("space-add-stub")).toBeVisible();
   });
 

@@ -2626,3 +2626,42 @@ input[type="radio"] {
 .export-dialog .banner p {
   margin: 3px 0 0;
 }
+
+/* ── Scenario FSM ──────────────────────────────────────────────────────────
+   The states a machine can be in, then the edges between them. Chips rather than a drawn graph: a
+   scenario with six states and nine edges is a diagram nobody can read at this size, and the table
+   underneath answers "what moves this" better than an arrow would. */
+
+.fsm-states {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.fsm-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font: 500 12px/1 var(--mono);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 6px 11px;
+}
+
+/* The state a flow sits in before anything has moved it — worth marking, because it is the one an
+   operator's first request will meet. */
+.fsm-state.is-initial {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.fsm-initial {
+  font: 600 9px/1 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
