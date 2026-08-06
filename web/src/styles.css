@@ -189,6 +189,15 @@
   --r-pill: 999px;
 
   /*
+   * Ring segments. One quantity split N ways, so they step away from the accent rather than
+   * reaching for new hues — and they are NOT the reserved status set, which never doubles as a
+   * chart series.
+   */
+  --ring-1: #2f5fd0;
+  --ring-2: #5b8de8;
+  --ring-3: #9dbcf2;
+
+  /*
    * Motion: the "subtle" tier only — 150–200ms, ease-out. An operator console watching a
    * 12,000-row log has no motion budget beyond acknowledging a click.
    */
@@ -237,6 +246,9 @@
     --panel: #262420;
     --panel-ink: #ece7dc;
     --panel-ink-2: #a09889;
+    --ring-1: #9db6f0;
+    --ring-2: #6d8ccc;
+    --ring-3: #46618f;
   }
 }
 
@@ -753,6 +765,9 @@ main {
 .fact dd .note {
   font-size: 12px;
   color: var(--ink-3);
+  /* `.tile dd` sets `break-all` for the id-shaped values it usually holds. A note is a sentence,
+     and `break-all` hyphenates it mid-word. */
+  word-break: normal;
 }
 
 /* `.tile dt` too: the imposter detail renders its facts as a definition list inside tiles, and
@@ -2097,4 +2112,327 @@ input[type="radio"] {
 .select-col {
   width: 1%;
   white-space: nowrap;
+}
+
+/* ── 2a: the split screen and its right rail ───────────────────────────────
+   The design's landing shape — screen on the left, a fixed 348px fleet rail on the right carrying
+   the ring, the control plane and the merged tail. The rail is `aside` in the markup because it is
+   complementary to the screen rather than part of it: a screen reader reaches the imposter table
+   without walking a ring diagram first. */
+
+.screen-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 348px;
+  gap: 0;
+  align-items: start;
+  min-height: 0;
+}
+
+.screen-split > .screen-main {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  padding-right: 22px;
+}
+
+.rail-right {
+  background: var(--surface);
+  border-left: 1px solid var(--line);
+  border-radius: 0;
+  padding: 4px 0 4px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+/*
+ * Below the design's own width the rail would squeeze the table it exists to annotate, so it drops
+ * under it. Still not a mobile layout (RFC-006 §10) — the breakpoint is "narrower than the design",
+ * not "a phone".
+ */
+@media (max-width: 1240px) {
+  .screen-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .screen-split > .screen-main {
+    padding-right: 0;
+  }
+
+  .rail-right {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    padding: 20px 0 0;
+  }
+}
+
+.rail-sect {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.rail-sect > .eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  letter-spacing: 0.1em;
+}
+
+/* ── The unshipped marker ──────────────────────────────────────────────────
+   2a's own device, borrowed for a second job.
+
+   The design uses `NOT SHIPPED YET` for two whole screens it has drawn ahead of the build. The same
+   marker answers a narrower question here: this panel is drawn, but the fleet publishes no endpoint
+   that would fill it (ring ownership per key, parked intents, a peer's applied index — the last of
+   which `connect-src 'self'` puts permanently out of the console's reach).
+
+   It is deliberately not a spinner, a dash, or a zero. Each of those reads as a *measurement* — "we
+   asked and the answer is nothing" — in a console whose whole job is telling an operator what is
+   true of a live fleet. This says nobody asked, because there is nothing to ask. */
+
+.unshipped {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: 500 9.5px/1 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  background: var(--idle-soft);
+  border: 1px dashed var(--line-2);
+  border-radius: var(--r-pill);
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+
+/* In a table cell the marker is the value, so it sits where a value would rather than inline. */
+td > .unshipped,
+.imp-row .unshipped {
+  font-size: 9px;
+  padding: 2px 6px;
+}
+
+/* A whole panel that has no data source: the marker plus one sentence saying which endpoint is
+   missing, so the reader learns the reason rather than only the fact. */
+.unshipped-panel {
+  border: 1px dashed var(--line-2);
+  border-radius: var(--r-panel);
+  background: var(--surface-2);
+  padding: 13px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.unshipped-panel p {
+  margin: 0;
+  font: 400 11px/1.6 var(--mono);
+  color: var(--ink-3);
+}
+
+/* ── Hash-space ring ───────────────────────────────────────────────────────
+   Segment colours step away from the accent rather than reaching for new hues: the ring is one
+   quantity split N ways, not N unrelated series, and the status set stays reserved. */
+
+.ring {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.ring-label {
+  font: 600 15px/1 var(--sans);
+  fill: var(--ink);
+}
+
+.ring-sub {
+  font: 400 11px/1 var(--mono);
+  fill: var(--ink-3);
+}
+
+.ring-track {
+  fill: none;
+  stroke: var(--surface-3);
+}
+
+.ring-seg {
+  fill: none;
+  transition:
+    stroke-dasharray var(--t-base) var(--ease),
+    stroke-dashoffset var(--t-base) var(--ease);
+}
+
+.ring-seg-1 {
+  stroke: var(--ring-1);
+}
+
+.ring-seg-2 {
+  stroke: var(--ring-2);
+}
+
+.ring-seg-3 {
+  stroke: var(--ring-3);
+}
+
+/* ── Control plane rows ────────────────────────────────────────────────────
+   One row per voter. The dot is never the only encoding — the tag word beside it says the same
+   thing, per the status rule the token block states. */
+
+.node-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+  background: var(--surface);
+  min-width: 0;
+}
+
+.node-row.is-self {
+  border-color: var(--line-2);
+  background: var(--surface-2);
+}
+
+.node-row .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.node-row .dot.is-good {
+  background: var(--good);
+}
+
+.node-row .dot.is-idle {
+  background: var(--idle);
+}
+
+.node-row .nid {
+  font: 500 12px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-row .tag {
+  font: 500 9.5px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  flex: none;
+}
+
+.node-row .applied {
+  margin-left: auto;
+  font: 400 11.5px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+  flex: none;
+}
+
+/* ── Live tail ─────────────────────────────────────────────────────────────
+   A rule down the left rather than a box: the tail is a continuing thing, and a closed border would
+   imply it has ends. */
+
+.tail {
+  font: 400 11px/1.85 var(--mono);
+  color: var(--ink-2);
+  border-left: 2px solid var(--line);
+  padding-left: 11px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.tail-line {
+  display: flex;
+  gap: 7px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.tail-line .ts {
+  color: var(--ink-3);
+  flex: none;
+}
+
+.tail-line .st {
+  flex: none;
+  font-weight: 500;
+}
+
+.tail-line .st.is-good {
+  color: var(--good);
+}
+
+.tail-line .st.is-warn {
+  color: var(--warn);
+}
+
+.tail-line .st.is-crit {
+  color: var(--crit);
+}
+
+.tail-line .what {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tail-live {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--good);
+  flex: none;
+}
+
+/* ── Filter pills ──────────────────────────────────────────────────────────
+   The design's segmented filter, as real buttons. `aria-pressed` carries the selection, so the
+   state is not fill-colour alone. */
+
+.pill-filters {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pill-filter {
+  font: 500 11.5px/1 var(--sans);
+  padding: 5px 11px;
+  border-radius: var(--r-pill);
+  border: 1px solid transparent;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.pill-filter:hover {
+  color: var(--ink);
+  background: var(--surface-3);
+}
+
+.pill-filter[aria-pressed="true"] {
+  border-color: var(--line-2);
+  background: var(--surface-3);
+  color: var(--ink);
+}
+
+.pill-filter.is-crit {
+  color: var(--crit);
+}
+
+.pill-filter.is-crit[aria-pressed="true"] {
+  border-color: var(--crit);
+  background: var(--crit-soft);
+  color: var(--crit);
 }

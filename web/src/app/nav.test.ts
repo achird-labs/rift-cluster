@@ -8,15 +8,18 @@ describe("nav model", () => {
     // C6 (#189) turns `requests` live and adds the front-door route editor beside it. C7 (#190)
     // turns `administration` live. #233 turns `sources` live.
     //
-    // The order is the rail's section grouping, not authoring order: the four mock screens, then
-    // fleet, then administration.
+    // The order is the nav bar's section grouping, not authoring order — and it is the design's:
+    // the four mock screens, then the two fleet-scoped ones, then administration. `sources` sits in
+    // the fleet group rather than with the mocks because a source is a fleet-wide declaration
+    // (leader-only poller, replicated to every node), which is also the only arrangement that puts
+    // it where 2a draws it without breaking the group-sorted invariant asserted below.
     expect(liveEntries().map((e) => e.id)).toEqual([
       "imposters",
-      "requests",
       "routes",
       "scenarios",
-      "sources",
+      "requests",
       "cluster",
+      "sources",
       "administration",
     ]);
   });

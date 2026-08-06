@@ -18,7 +18,9 @@ import {
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { toHash, useHashQuery } from "../app/routing.ts";
-import { ImposterField } from "../components/imposterFields.tsx";
+import { FleetRail } from "../components/fleetRail.tsx";
+import { ImposterField, stubCountOf } from "../components/imposterFields.tsx";
+import { Unshipped } from "../components/unshipped.tsx";
 import {
   type BulkAction,
   BulkBar,
@@ -60,6 +62,83 @@ import { type Finding, lintStub } from "../features/stubs/lint.ts";
 import type { CommitOutcome } from "../features/writes/commit.ts";
 
 type Imposter = components["schemas"]["Imposter"];
+type SourceRecord = components["schemas"]["SourceRecord"];
+
+/**
+ * 2a's four tiles.
+ *
+ * Two of them are real and two are markers, and the split is the whole point of building it this
+ * way rather than filling all four with plausible numbers:
+ *
+ * - **Imposters / stubs** — counted from the list this screen already holds.
+ * - **Sources / drifted** — counted from `/admin/sources`, the same read the provenance filter uses.
+ *   Absent entirely for a principal without `source.read`, rather than shown as zero: "you may not
+ *   ask" and "the answer is none" are different facts.
+ * - **Requests · fleet sum** — `numberOfRequests` reaches the imposter body only through a
+ *   non-exhaustive index signature, which is exactly the client-side guess `contract.ts` was written
+ *   to refuse. Summing it here would launder a value the contract rejects one file away.
+ * - **Parked intents** — no endpoint publishes the parked-write queue at all.
+ */
+function ImposterTiles({
+  imposters,
+  sources,
+  maySeeSources,
+}: {
+  imposters: readonly Imposter[];
+  sources: readonly SourceRecord[] | undefined;
+  maySeeSources: boolean;
+}): ReactNode {
+  /*
+   * `stubCountOf`, not `stubs?.length`. The list projection omits the stub array and sends
+   * `stubCount` instead, so reading the array here summed to zero on the one screen this tile is
+   * for — the same trap `imposterFields.tsx` documents for the column beside it. `null` means the
+   * response carried neither, which is not the same fact as an imposter with no stubs, so the
+   * total is only shown when every row answered.
+   */
+  const counts = imposters.map((imposter) => stubCountOf(imposter));
+  const stubTotal = counts.every((n) => n !== null)
+    ? counts.reduce((sum: number, n) => sum + (n ?? 0), 0)
+    : null;
+  const drifted = sources?.filter((source) => source.drifted === true).length ?? 0;
+
+  return (
+    <dl className="tiles">
+      <div className="tile">
+        <dt className="eyebrow">Imposters</dt>
+        <dd className="v">{imposters.length}</dd>
+        <dd className="note">
+          {stubTotal === null ? "stub count not in this response" : `${String(stubTotal)} ${stubTotal === 1 ? "stub" : "stubs"}`}
+        </dd>
+      </div>
+
+      <div className="tile">
+        <dt className="eyebrow">Requests · fleet sum</dt>
+        <dd className="v-plain">
+          <Unshipped reason="No schema'd field carries a request count on the imposter list. `numberOfRequests` arrives only through the body's non-exhaustive index signature, which app/contract.ts refuses on purpose — the request log is where a counted figure has a backing endpoint." />
+        </dd>
+        <dd className="note">counted per imposter on the request log</dd>
+      </div>
+
+      {maySeeSources ? (
+        <div className={`tile${drifted > 0 ? " is-warn" : ""}`}>
+          <dt className="eyebrow">Sources</dt>
+          <dd className="v">{sources?.length ?? 0}</dd>
+          <dd className="note">
+            {drifted === 0 ? "none drifted" : `${String(drifted)} drifted`}
+          </dd>
+        </div>
+      ) : null}
+
+      <div className="tile">
+        <dt className="eyebrow">Parked intents</dt>
+        <dd className="v-plain">
+          <Unshipped reason="The parked-write queue is not published. Under --cluster-admin-async a write can be accepted and replayed later, but no endpoint reports how many are outstanding." />
+        </dd>
+        <dd className="note">accepted, awaiting replay</dd>
+      </div>
+    </dl>
+  );
+}
 
 /**
  * Trigger a browser download of text this console already has in hand — never re-fetched, never
@@ -240,271 +319,285 @@ export function Imposters(): ReactNode {
   }
 
   return (
-    <section className="screen">
-      <header className="screen-head">
-        <h1>Imposters</h1>
-        <p className="scope-label" data-testid="imposters-scope-label">
-          Served by this node from replicated state.
-          {confidence.partial ? ` This node is degraded: ${confidence.reason}.` : ""}
-          {confidence.unknown ? ` Caveat: ${confidence.reason}.` : ""}
-        </p>
-        <div className="spacer" />
-        {mayCreate ? (
-          <button
-            className="btn"
-            type="button"
-            data-testid="open-import"
-            onClick={() => setImporting(true)}
-          >
-            Import
-          </button>
-        ) : null}
-        {mayCreate ? (
-          <button
-            className="btn primary"
-            type="button"
-            data-testid="new-imposter"
-            onClick={() => setCreating(true)}
-          >
-            New imposter
-          </button>
-        ) : null}
-      </header>
-
-      {mayExport ? <ExportSetControl tenant={tenant} /> : null}
-
-      {importing ? (
-        <ImportPanel
-          existingPorts={existingPorts}
-          existingCount={imposters.data?.length ?? 0}
-          mayWrite={mayCreate}
-          mayReplace={mayReplace}
-          onClose={() => setImporting(false)}
-        />
-      ) : null}
-
-      {create.isError ? (
-        <ErrorNote error={create.error} context="The imposter was not created" />
-      ) : null}
-      {/*
-        Suppressed while a batch owns the outcome. These notes are the SINGLE-row vocabulary: during
-        a bulk run they report only the last item, name no port, and sit alongside a per-item report
-        that already says more — and they outlive dismissing it.
-      */}
-      {remove.isError && !batchOwnsOutcome ? (
-        <ErrorNote error={remove.error} context="The imposter was not deleted" />
-      ) : null}
-      {create.data?.kind === "unobservable" ? <UnconfirmedNote reason={create.data.reason} /> : null}
-      {remove.data?.kind === "unobservable" && !batchOwnsOutcome ? (
-        <UnconfirmedNote reason={remove.data.reason} />
-      ) : null}
-
-      {creating ? (
-        <NewImposter
-          busy={create.isPending}
-          onCancel={() => setCreating(false)}
-          onCreate={(body) =>
-            create.mutate(body, {
-              // Closes only on success. A refused create that dismissed its own form would take the
-              // operator's typing with it and leave the error pointing at a screen with no form.
-              onSuccess: () => setCreating(false),
-            })
-          }
-        />
-      ) : null}
-
-      {confirming === null ? null : (
-        <Confirm
-          testId="confirm-delete-imposter"
-          title={`Delete ${confirming.name ?? `imposter ${confirming.port ?? ""}`}?`}
-          body={
-            <>
-              This removes the imposter, its stubs, its recorded requests and its flow state across
-              the fleet. Nothing undoes it.
-            </>
-          }
-          confirmLabel={`Delete ${confirming.name ?? confirming.port ?? "imposter"}`}
-          busy={remove.isPending}
-          onCancel={() => setConfirming(null)}
-          onConfirm={() => {
-            const port = confirming.port;
-            if (port !== undefined) remove.mutate({ port });
-            setConfirming(null);
-          }}
-        />
-      )}
-
-      {imposters.isError ? <ErrorNote error={imposters.error} context="Could not list imposters" /> : null}
-      {toggle.isError && !batchOwnsOutcome ? (
-        <ErrorNote error={toggle.error} context="That change did not take effect" />
-      ) : null}
-      {toggle.data?.kind === "unobservable" && !batchOwnsOutcome ? (
-        <UnconfirmedNote reason={toggle.data.reason} />
-      ) : null}
-
-      {imposters.isPending ? <p className="muted">Reading…</p> : null}
-
-      {imposters.isSuccess && imposters.data.length === 0 ? (
-        <EmptyState
-          uncertain={confidence.partial || confidence.unknown}
-          reason={confidence.reason}
-        />
-      ) : null}
-
-      {imposters.isSuccess && imposters.data.length > 0 ? (
-        <Card title="Imposters" bleed>
-          <ImposterFilters
-            query={query}
-            onChange={setQuery}
-            onReset={() => setQuery(EMPTY_QUERY)}
-            shown={rows.length}
-            total={all.length}
-            unclassified={unclassified}
-            showOwner={sourceOwned !== null}
-          />
-
-          {bulkActions.length > 0 ? (
-            <BulkBar
-              count={effective.length}
-              actions={bulkActions}
-              running={running}
-              progress={progress}
-              onAct={(action) => setConfirmingBulk(action)}
-              onClear={() => setSelected(new Set())}
-            />
+    /*
+     * 2a's landing shape: the screen, then a fixed fleet rail. The rail is complementary rather
+     * than part of the list — it annotates the fleet the imposters live on — so it is an `aside`
+     * outside `.screen-main` and after it in the DOM.
+     */
+    <section className="screen screen-split">
+      <div className="screen-main">
+        <header className="screen-head">
+          <h1>Imposters</h1>
+          <p className="scope-label" data-testid="imposters-scope-label">
+            Served by this node from replicated state.
+            {confidence.partial ? ` This node is degraded: ${confidence.reason}.` : ""}
+            {confidence.unknown ? ` Caveat: ${confidence.reason}.` : ""}
+          </p>
+          <div className="spacer" />
+          {mayCreate ? (
+            <button
+              className="btn"
+              type="button"
+              data-testid="open-import"
+              onClick={() => setImporting(true)}
+            >
+              Import
+            </button>
           ) : null}
+          {mayCreate ? (
+            <button
+              className="btn primary"
+              type="button"
+              data-testid="new-imposter"
+              onClick={() => setCreating(true)}
+            >
+              New imposter
+            </button>
+          ) : null}
+        </header>
 
-          {report === null ? null : (
-            <BulkReport
-              result={report.result}
-              verb={report.verb}
-              onDismiss={() => setReport(null)}
-            />
-          )}
-
-          {rows.length === 0 ? (
-            <p className="muted" data-testid="imposters-no-matches">
-              No imposter in this tenant matches that filter.
-            </p>
-          ) : (
-            <div className="scroll-x">
-              <table className="dense">
-                <thead>
-                  <tr>
-                    {bulkActions.length > 0 ? (
-                      <th className="select-col">
-                        {/*
-                          Select-all means "everything the current filter shows", which is what the
-                          label says out loud. Selecting rows the operator cannot see is the one
-                          behaviour a bulk delete must never have.
-                        */}
-                        <input
-                          type="checkbox"
-                          data-testid="imposter-select-all"
-                          aria-label={`Select all ${visiblePorts.size} shown`}
-                          checked={allVisibleSelected}
-                          disabled={running !== null || visiblePorts.size === 0}
-                          onChange={(event) =>
-                            /*
-                              Union in, and remove only what is shown — individual ticks accumulate
-                              across filter changes, so a select-all that REPLACED the set would
-                              silently discard ticks made under a previous filter. The two paths
-                              have to agree or the count is a lie in one of them.
-                            */
-                            setSelected((current) => {
-                              const next = new Set(current);
-                              for (const port of visiblePorts) {
-                                if (event.target.checked) next.add(port);
-                                else next.delete(port);
-                              }
-                              return next;
-                            })
-                          }
-                        />
-                      </th>
-                    ) : null}
-                    {IMPOSTER_COLUMNS.map((column) =>
-                      column.key === "port" || column.key === "name" || column.key === "stubs" ? (
-                        <SortHeader
-                          key={column.key}
-                          label={column.label}
-                          column={column.key}
-                          query={query}
-                          onChange={setQuery}
-                          numeric={column.numeric}
-                        />
-                      ) : (
-                        <th key={column.key} className={column.numeric ? "numeric" : undefined}>
-                          {column.label}
-                        </th>
-                      ),
-                    )}
-                    {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((imposter, index) => (
-                    <Row
-                      key={imposter.port ?? `unnamed-${index}`}
-                      imposter={imposter}
-                      mayToggle={mayToggle}
-                      mayDelete={mayDelete}
-                      busy={toggle.isPending}
-                      selectable={bulkActions.length > 0}
-                      selected={imposter.port !== undefined && selected.has(imposter.port)}
-                      selectionDisabled={running !== null}
-                      onSelect={(port, checked) =>
-                        setSelected((current) => {
-                          const next = new Set(current);
-                          if (checked) next.add(port);
-                          else next.delete(port);
-                          return next;
-                        })
-                      }
-                      onToggle={(port, enable) => toggle.mutate({ port, enable })}
-                      onDelete={() => setConfirming(imposter)}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Card>
-      ) : null}
-
-      {confirmingBulk === null ? null : (
-        <Confirm
-          testId="confirm-bulk-imposters"
-          title={`${confirmingBulk.label} ${effective.length} imposter${effective.length === 1 ? "" : "s"}?`}
-          body={
-            <>
-              {/*
-                The exact count and, for a delete, the exact ports. There is no bulk endpoint — this
-                is one call per imposter, and some may be refused — so the dialog says that here
-                rather than letting a half-applied batch be the first the operator hears of it.
-              */}
-              This runs one request per imposter. Some may be refused; the batch does not stop at the
-              first failure, and every outcome is reported.
-              {confirmingBulk.key === "delete" ? (
-                <>
-                  {" "}
-                  Deleting removes each imposter, its stubs, its recorded requests and its flow state
-                  across the fleet. Nothing undoes it. Ports:{" "}
-                  <code data-testid="confirm-bulk-ports">{effective.join(", ")}</code>
-                </>
-              ) : null}
-            </>
-          }
-          confirmLabel={`${confirmingBulk.label} ${effective.length}`}
-          busy={running !== null}
-          onCancel={() => setConfirmingBulk(null)}
-          onConfirm={() => {
-            const action = confirmingBulk;
-            setConfirmingBulk(null);
-            void runAction(action);
-          }}
+        <ImposterTiles
+          imposters={all}
+          sources={sources.data?.sources}
+          maySeeSources={maySeeSources}
         />
-      )}
+
+        {mayExport ? <ExportSetControl tenant={tenant} /> : null}
+
+        {importing ? (
+          <ImportPanel
+            existingPorts={existingPorts}
+            existingCount={imposters.data?.length ?? 0}
+            mayWrite={mayCreate}
+            mayReplace={mayReplace}
+            onClose={() => setImporting(false)}
+          />
+        ) : null}
+
+        {create.isError ? (
+          <ErrorNote error={create.error} context="The imposter was not created" />
+        ) : null}
+        {/*
+          Suppressed while a batch owns the outcome. These notes are the SINGLE-row vocabulary: during
+          a bulk run they report only the last item, name no port, and sit alongside a per-item report
+          that already says more — and they outlive dismissing it.
+        */}
+        {remove.isError && !batchOwnsOutcome ? (
+          <ErrorNote error={remove.error} context="The imposter was not deleted" />
+        ) : null}
+        {create.data?.kind === "unobservable" ? <UnconfirmedNote reason={create.data.reason} /> : null}
+        {remove.data?.kind === "unobservable" && !batchOwnsOutcome ? (
+          <UnconfirmedNote reason={remove.data.reason} />
+        ) : null}
+
+        {creating ? (
+          <NewImposter
+            busy={create.isPending}
+            onCancel={() => setCreating(false)}
+            onCreate={(body) =>
+              create.mutate(body, {
+                // Closes only on success. A refused create that dismissed its own form would take the
+                // operator's typing with it and leave the error pointing at a screen with no form.
+                onSuccess: () => setCreating(false),
+              })
+            }
+          />
+        ) : null}
+
+        {confirming === null ? null : (
+          <Confirm
+            testId="confirm-delete-imposter"
+            title={`Delete ${confirming.name ?? `imposter ${confirming.port ?? ""}`}?`}
+            body={
+              <>
+                This removes the imposter, its stubs, its recorded requests and its flow state across
+                the fleet. Nothing undoes it.
+              </>
+            }
+            confirmLabel={`Delete ${confirming.name ?? confirming.port ?? "imposter"}`}
+            busy={remove.isPending}
+            onCancel={() => setConfirming(null)}
+            onConfirm={() => {
+              const port = confirming.port;
+              if (port !== undefined) remove.mutate({ port });
+              setConfirming(null);
+            }}
+          />
+        )}
+
+        {imposters.isError ? <ErrorNote error={imposters.error} context="Could not list imposters" /> : null}
+        {toggle.isError && !batchOwnsOutcome ? (
+          <ErrorNote error={toggle.error} context="That change did not take effect" />
+        ) : null}
+        {toggle.data?.kind === "unobservable" && !batchOwnsOutcome ? (
+          <UnconfirmedNote reason={toggle.data.reason} />
+        ) : null}
+
+        {imposters.isPending ? <p className="muted">Reading…</p> : null}
+
+        {imposters.isSuccess && imposters.data.length === 0 ? (
+          <EmptyState
+            uncertain={confidence.partial || confidence.unknown}
+            reason={confidence.reason}
+          />
+        ) : null}
+
+        {imposters.isSuccess && imposters.data.length > 0 ? (
+          <Card title="Imposters" bleed>
+            <ImposterFilters
+              query={query}
+              onChange={setQuery}
+              onReset={() => setQuery(EMPTY_QUERY)}
+              shown={rows.length}
+              total={all.length}
+              unclassified={unclassified}
+              showOwner={sourceOwned !== null}
+            />
+
+            {bulkActions.length > 0 ? (
+              <BulkBar
+                count={effective.length}
+                actions={bulkActions}
+                running={running}
+                progress={progress}
+                onAct={(action) => setConfirmingBulk(action)}
+                onClear={() => setSelected(new Set())}
+              />
+            ) : null}
+
+            {report === null ? null : (
+              <BulkReport
+                result={report.result}
+                verb={report.verb}
+                onDismiss={() => setReport(null)}
+              />
+            )}
+
+            {rows.length === 0 ? (
+              <p className="muted" data-testid="imposters-no-matches">
+                No imposter in this tenant matches that filter.
+              </p>
+            ) : (
+              <div className="scroll-x">
+                <table className="dense">
+                  <thead>
+                    <tr>
+                      {bulkActions.length > 0 ? (
+                        <th className="select-col">
+                          {/*
+                            Select-all means "everything the current filter shows", which is what the
+                            label says out loud. Selecting rows the operator cannot see is the one
+                            behaviour a bulk delete must never have.
+                          */}
+                          <input
+                            type="checkbox"
+                            data-testid="imposter-select-all"
+                            aria-label={`Select all ${visiblePorts.size} shown`}
+                            checked={allVisibleSelected}
+                            disabled={running !== null || visiblePorts.size === 0}
+                            onChange={(event) =>
+                              /*
+                                Union in, and remove only what is shown — individual ticks accumulate
+                                across filter changes, so a select-all that REPLACED the set would
+                                silently discard ticks made under a previous filter. The two paths
+                                have to agree or the count is a lie in one of them.
+                              */
+                              setSelected((current) => {
+                                const next = new Set(current);
+                                for (const port of visiblePorts) {
+                                  if (event.target.checked) next.add(port);
+                                  else next.delete(port);
+                                }
+                                return next;
+                              })
+                            }
+                          />
+                        </th>
+                      ) : null}
+                      {IMPOSTER_COLUMNS.map((column) =>
+                        column.key === "port" || column.key === "name" || column.key === "stubs" ? (
+                          <SortHeader
+                            key={column.key}
+                            label={column.label}
+                            column={column.key}
+                            query={query}
+                            onChange={setQuery}
+                            numeric={column.numeric}
+                          />
+                        ) : (
+                          <th key={column.key} className={column.numeric ? "numeric" : undefined}>
+                            {column.label}
+                          </th>
+                        ),
+                      )}
+                      {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((imposter, index) => (
+                      <Row
+                        key={imposter.port ?? `unnamed-${index}`}
+                        imposter={imposter}
+                        mayToggle={mayToggle}
+                        mayDelete={mayDelete}
+                        busy={toggle.isPending}
+                        selectable={bulkActions.length > 0}
+                        selected={imposter.port !== undefined && selected.has(imposter.port)}
+                        selectionDisabled={running !== null}
+                        onSelect={(port, checked) =>
+                          setSelected((current) => {
+                            const next = new Set(current);
+                            if (checked) next.add(port);
+                            else next.delete(port);
+                            return next;
+                          })
+                        }
+                        onToggle={(port, enable) => toggle.mutate({ port, enable })}
+                        onDelete={() => setConfirming(imposter)}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        ) : null}
+
+        {confirmingBulk === null ? null : (
+          <Confirm
+            testId="confirm-bulk-imposters"
+            title={`${confirmingBulk.label} ${effective.length} imposter${effective.length === 1 ? "" : "s"}?`}
+            body={
+              <>
+                {/*
+                  The exact count and, for a delete, the exact ports. There is no bulk endpoint — this
+                  is one call per imposter, and some may be refused — so the dialog says that here
+                  rather than letting a half-applied batch be the first the operator hears of it.
+                */}
+                This runs one request per imposter. Some may be refused; the batch does not stop at the
+                first failure, and every outcome is reported.
+                {confirmingBulk.key === "delete" ? (
+                  <>
+                    {" "}
+                    Deleting removes each imposter, its stubs, its recorded requests and its flow state
+                    across the fleet. Nothing undoes it. Ports:{" "}
+                    <code data-testid="confirm-bulk-ports">{effective.join(", ")}</code>
+                  </>
+                ) : null}
+              </>
+            }
+            confirmLabel={`${confirmingBulk.label} ${effective.length}`}
+            busy={running !== null}
+            onCancel={() => setConfirmingBulk(null)}
+            onConfirm={() => {
+              const action = confirmingBulk;
+              setConfirmingBulk(null);
+              void runAction(action);
+            }}
+          />
+        )}
+      </div>
+      <FleetRail fleet={fleet.data} />
     </section>
   );
 }

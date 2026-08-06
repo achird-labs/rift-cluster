@@ -85,18 +85,9 @@ export const NAV: readonly NavEntry[] = [
   },
   {
     kind: "live",
-    id: "requests",
-    label: "Request log",
-    route: { screen: "requests", port: null },
-    requires: "imposter.read",
-    group: "mocks",
-    glyph: "▤",
-  },
-  {
-    kind: "live",
     id: "routes",
-    label: "Front-door routes",
-    short: "Routes",
+    label: "Front door routes",
+    short: "Front door",
     route: { screen: "routes" },
     // The table is read with `Action::ImposterRead`; writing it needs `imposter.write`, which the
     // screen gates per control rather than hiding the whole screen from an operator who may read it.
@@ -107,8 +98,8 @@ export const NAV: readonly NavEntry[] = [
   {
     kind: "live",
     id: "scenarios",
-    label: "Scenarios & state",
-    short: "Scenarios",
+    label: "Flow state & scenarios",
+    short: "Flow state",
     route: { screen: "scenarios", port: null, flow: null },
     // The weakest thing the screen can do, deliberately. Its controls gate individually — reset is
     // Operator, set-state and the flow-state write are Editor — so requiring a write capability
@@ -119,13 +110,10 @@ export const NAV: readonly NavEntry[] = [
   },
   {
     kind: "live",
-    id: "sources",
-    label: "Sources",
-    // #233 shipped: the backend has carried sources, provenance and drift for a while, and this
-    // entry used to tell an operator "not yet shipped, see #233" while pointing at the very issue
-    // that built the screen it was missing.
-    route: { screen: "sources" },
-    requires: "source.read",
+    id: "requests",
+    label: "Requests",
+    route: { screen: "requests", port: null },
+    requires: "imposter.read",
     group: "mocks",
     glyph: "▤",
   },
@@ -141,9 +129,21 @@ export const NAV: readonly NavEntry[] = [
   },
   {
     kind: "live",
+    id: "sources",
+    label: "Sources",
+    // #233 shipped: the backend has carried sources, provenance and drift for a while, and this
+    // entry used to tell an operator "not yet shipped, see #233" while pointing at the very issue
+    // that built the screen it was missing.
+    route: { screen: "sources" },
+    requires: "source.read",
+    group: "fleet",
+    glyph: "▤",
+  },
+  {
+    kind: "live",
     id: "administration",
-    label: "Tenants & principals",
-    short: "Tenants",
+    label: "Tenancy & principals",
+    short: "Tenancy",
     // `principals`, not `tenants`: the tenants tab is `ClusterAdmin`, while this entry is offered to
     // anyone holding `tenant.manage`. Landing a TenantAdmin on a tab its role cannot open — and
     // whose probe renders a bare refusal with no tab bar — left the role with no route to the two
