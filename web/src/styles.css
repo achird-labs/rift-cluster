@@ -2465,3 +2465,45 @@ td > .unshipped,
   padding: 7px 11px;
   flex: none;
 }
+
+/* ── Fleet screen composition ──────────────────────────────────────────────
+   The ring beside its membership, then the operational panels in a row. Both collapse to one column
+   before the ring would be squeezed narrower than it reads at. */
+
+.fleet-shape {
+  display: grid;
+  grid-template-columns: 340px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.fleet-ops {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .fleet-shape {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* The type-to-confirm box, for the acts whose blast radius is the whole fleet. */
+.confirm .confirm-typed {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 14px;
+}
+
+.confirm .confirm-typed span {
+  font: 400 12px/1.4 var(--mono);
+  color: var(--ink-2);
+}
+
+.confirm .confirm-typed b {
+  color: var(--ink);
+  font-weight: 600;
+}

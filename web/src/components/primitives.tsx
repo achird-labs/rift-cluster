@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 
 import { ApiError } from "../api/client.ts";
 
@@ -218,12 +218,19 @@ export function UnconfirmedNote({ reason }: { reason: string }): ReactNode {
  *
  * `role="dialog"` + `aria-modal` and an Escape handler; the surrounding scrim is not clickable to
  * dismiss, deliberately — a stray click beside a destructive dialog should do nothing at all.
+ *
+ * `requireTyped` raises the bar for the worst of them: the operator types the thing's own name, and
+ * the destructive button stays disabled until it matches. Reserved for acts whose blast radius is
+ * the whole fleet rather than one object — the design asks for it by name, and the reason it is
+ * worth the friction is that those are exactly the acts where a muscle-memory click on a dialog the
+ * operator has dismissed fifty times before is the failure mode.
  */
 export function Confirm({
   title,
   body,
   confirmLabel,
   busy = false,
+  requireTyped,
   onConfirm,
   onCancel,
   testId,
@@ -232,10 +239,17 @@ export function Confirm({
   body: ReactNode;
   confirmLabel: string;
   busy?: boolean;
+  /** The exact string the operator must type before the act is allowed. */
+  requireTyped?: string;
   onConfirm: () => void;
   onCancel: () => void;
   testId?: string;
 }): ReactNode {
+  const [typed, setTyped] = useState("");
+  // Trimmed, not normalised further: a trailing space from a paste is not a different answer, but
+  // a different case or a near-miss name is exactly what this gate exists to catch.
+  const unlocked = requireTyped === undefined || typed.trim() === requireTyped;
+
   return (
     <div
       className="scrim"
@@ -246,6 +260,21 @@ export function Confirm({
       <div className="confirm" role="dialog" aria-modal="true" aria-label={title} data-testid={testId}>
         <h2>{title}</h2>
         <p>{body}</p>
+        {requireTyped === undefined ? null : (
+          <label className="field confirm-typed">
+            <span>
+              Type <b>{requireTyped}</b> to confirm
+            </span>
+            <input
+              type="text"
+              value={typed}
+              autoComplete="off"
+              spellCheck={false}
+              data-testid="confirm-typed"
+              onChange={(event) => setTyped(event.target.value)}
+            />
+          </label>
+        )}
         <div className="acts">
           <button className="btn" type="button" onClick={onCancel} disabled={busy}>
             Cancel
@@ -254,9 +283,11 @@ export function Confirm({
             className="btn danger"
             type="button"
             onClick={onConfirm}
-            disabled={busy}
+            disabled={busy || !unlocked}
             data-testid="confirm-destructive"
-            autoFocus
+            /* Focus the box the operator must fill when there is one; otherwise the act itself.
+               Autofocusing a disabled button would leave the dialog with no focused control. */
+            autoFocus={requireTyped === undefined}
           >
             {busy ? "Working…" : confirmLabel}
           </button>

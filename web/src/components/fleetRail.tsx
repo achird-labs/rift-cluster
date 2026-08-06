@@ -36,7 +36,7 @@ const CIRCUMFERENCE = 2 * Math.PI * R;
  * steps; beyond that the member count in the centre is the honest summary, and a fourth near-
  * identical arc would be decoration rather than information.
  */
-function HashRing({ fleet }: { fleet: FleetView | undefined }): ReactNode {
+export function HashRing({ fleet }: { fleet: FleetView | undefined }): ReactNode {
   const members = fleet?.ringMembers ?? [];
   const count = members.length;
   const drawn = Math.min(count, 3);
@@ -94,7 +94,7 @@ function HashRing({ fleet }: { fleet: FleetView | undefined }): ReactNode {
  * that does not exist. That distinction is worth keeping visible, which is why the marker sits per
  * row rather than over the whole panel.
  */
-function ControlPlane({ fleet }: { fleet: FleetView | undefined }): ReactNode {
+export function ControlPlane({ fleet }: { fleet: FleetView | undefined }): ReactNode {
   if (fleet === undefined) {
     return (
       <section className="rail-sect">

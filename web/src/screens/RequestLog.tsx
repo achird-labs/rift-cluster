@@ -4,7 +4,15 @@ import type { components } from "../api/schema.ts";
 import { ApiError } from "../api/client.ts";
 import { useClearRequests, useImposter, useImposters, useRequestLog } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
+import {
+  Card,
+  Confirm,
+  Empty,
+  ErrorNote,
+  Ident,
+  Truncated,
+  UNKNOWN,
+} from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
 import type { RecordedRequest } from "../features/requests/source.ts";
@@ -124,6 +132,9 @@ function Log({ port }: { port: number }): ReactNode {
             </>
           }
           confirmLabel="Clear log"
+          // Fleet-wide, through Raft, and nothing restores the rows — so the port is typed rather
+          // than the dialog merely dismissed.
+          requireTyped={String(port)}
           busy={clear.isPending}
           onCancel={() => setConfirming(false)}
           onConfirm={() => {
@@ -295,14 +306,32 @@ function Rows({
   return (
     <>
       <section className="card">
+        {/*
+         * The design's journal carries NODE, STATUS and LATENCY beside these. None of the three is
+         * published: a recorded request names the client it came from, the stub that answered and
+         * when, but not which node served it, what status went back, or how long it took.
+         *
+         * Said once, here, rather than as a marker in every row. A column of fourteen identical
+         * "no endpoint" chips is noise; one sentence naming what is missing is information — and it
+         * keeps the table to the columns that actually carry a reading.
+         */}
+        <div className="card-head">
+          <h2>Request journal</h2>
+          <span className="muted">merge-on-read across the fleet&rsquo;s writer shards</span>
+          <div className="spacer" />
+          <span className="muted">
+            node, status and latency are not recorded per request
+          </span>
+        </div>
         <div className="scroll-x">
           <table className="dense">
             <thead>
               <tr>
-                <th style={{ width: "20ch" }}>Time</th>
+                <th style={{ width: "20ch" }}>Timestamp</th>
                 <th style={{ width: "10ch" }}>Method</th>
-                <th>Path</th>
-                <th style={{ width: "18ch" }}>From</th>
+                <th>Request</th>
+                <th style={{ width: "16ch" }}>Stub</th>
+                <th style={{ width: "16ch" }}>From</th>
               </tr>
             </thead>
             <tbody>
@@ -407,13 +436,30 @@ function Row({
             <span className="path">{request.path ?? "—"}</span>
           </button>
         </td>
+        {/* Which stub answered — published per row as `stubId`, alongside `matched`. A request the
+            match walked past every stub for is a different fact from one whose stub had no id, so
+            the unmatched case says so rather than rendering an em dash both times. */}
         <td className="ident">
-          <Truncated value={request.requestFrom ?? "—"} max={16} />
+          {request.matched === false ? (
+            <span className="status status-warn">
+              <span className="g" aria-hidden="true">
+                &#9650;
+              </span>
+              no match
+            </span>
+          ) : typeof request.stubId === "string" ? (
+            <Truncated value={request.stubId} max={14} />
+          ) : (
+            UNKNOWN
+          )}
+        </td>
+        <td className="ident">
+          <Truncated value={request.requestFrom ?? "—"} max={14} />
         </td>
       </tr>
       {open ? (
         <tr data-testid="request-detail">
-          <td colSpan={4}>
+          <td colSpan={5}>
             <dl className="detail">
               <div className="kv">
                 <dt>Path</dt>

@@ -1185,6 +1185,10 @@ function ImportPanel({
             </>
           }
           confirmLabel={`Replace ${existingCount} imposter${existingCount === 1 ? "" : "s"}`}
+          // The widest act the console offers: every imposter in the tenant goes, replaced by a
+          // document. Typing the count is the difference between meaning it and having clicked
+          // through this dialog before.
+          requireTyped={String(existingCount)}
           busy={running}
           onCancel={() => setConfirmingReplace(false)}
           onConfirm={() => void runReplace(doc.kind === "ok" ? doc.entries : [])}
