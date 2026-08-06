@@ -7,7 +7,7 @@ import type { FleetView } from "../app/fleetView.ts";
 import { useFleetView } from "../app/queries.ts";
 import { Card, ErrorNote, Ident, Status, Tile, UNKNOWN } from "../components/primitives.tsx";
 import { ControlPlane, HashRing } from "../components/fleetRail.tsx";
-import { PendingPanel } from "../components/pending.tsx";
+import { Pending, PendingPanel } from "../components/pending.tsx";
 
 export function Fleet(): ReactNode {
   const fleet = useFleetView();
@@ -149,6 +149,14 @@ function View({ view }: { view: FleetView }): ReactNode {
        */}
       <div className="fleet-shape">
         <Card title="Ring">
+          {/* The design heads this card with the fleet's name. Nothing publishes one (#373) — and
+              the sharper cost is not this card but the top bar: an operator with staging and
+              production open in two tabs can tell them apart only by port, while every destructive
+              act in this console is fleet-wide. */}
+          <div className="fleet-name">
+            <span className="eyebrow">Fleet</span>
+            <Pending issue={373} reason="Nothing names the fleet. Node ids identify members; no label identifies the cluster." />
+          </div>
           <HashRing fleet={view} />
         </Card>
         <Card title="Members">

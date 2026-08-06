@@ -19,6 +19,7 @@ import { useHashQuery } from "../app/routing.ts";
 import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
 import { shadowingStubIndex } from "../features/requests/stubFromRequest.ts";
 import { scenarioDefinitions } from "../features/scenarios/definitions.ts";
+import { Pending, PendingPanel } from "../components/pending.tsx";
 import {
   ABSENT_ENTRY_CAVEAT,
   SPACE_STUB_CAVEAT,
@@ -118,10 +119,16 @@ function ForImposter({ port, flow }: { port: number; flow: string | null }): Rea
         <>
           <ScenarioPanel port={port} flow={resolvedFlow} state={scenarios} />
           <FlowStatePanel port={port} flowId={resolvedFlow} />
+          <OwnershipRules />
         </>
       ) : null}
 
-      {tab === "spaces" ? <SpacePanel port={port} flowId={resolvedFlow} /> : null}
+      {tab === "spaces" ? (
+        <>
+          <SpacePanel port={port} flowId={resolvedFlow} />
+          <ActiveSpaces />
+        </>
+      ) : null}
 
       {tab === "defs" ? <ScenarioDefinitions port={port} /> : null}
     </section>
@@ -239,6 +246,11 @@ function ScenarioTable({
           <tr>
             <th>Scenario</th>
             <th style={{ width: "26ch" }}>State in this space</th>
+            {/* The design carries both beside the state. Which node owns this flow, and the epoch
+                and generation a write against it is fenced with, are the two facts that decide
+                whether a state you just set will survive — and neither is published (#359). */}
+            <th style={{ width: "14ch" }}>Owner</th>
+            <th style={{ width: "14ch" }}>Fence</th>
             {mayWrite ? <th style={{ width: "16ch" }} aria-label="Set state" /> : null}
           </tr>
         </thead>
@@ -289,6 +301,18 @@ function ScenarioRow({
         </td>
         <td data-testid={`scenario-state-${scenario.name}`}>
           <Ident>{scenario.state}</Ident>
+        </td>
+        <td>
+          <Pending
+            issue={359}
+            reason="Which node owns this flow is not published. The ring's membership and epoch are; the assignment is not."
+          />
+        </td>
+        <td>
+          <Pending
+            issue={359}
+            reason="The epoch and ownership generation a write against this flow is fenced with are not exposed."
+          />
         </td>
         {mayWrite ? (
           <td>
@@ -1051,5 +1075,60 @@ function ScenarioDefinitions({ port }: { port: number }): ReactNode {
         </Card>
       ))}
     </>
+  );
+}
+
+/**
+ * What a handoff does to each kind of state, and the rule that stops two owners overlapping.
+ *
+ * Both are statements about the cluster rather than readings from it, and both belong beside the
+ * state they describe: an operator setting a scenario position is entitled to know that it survives
+ * a handoff while the sequence cursor beside it does not.
+ */
+function OwnershipRules(): ReactNode {
+  return (
+    <div className="ownership-rules">
+      <Card title="On ownership change">
+        <dl className="kv-grid">
+          <dt>Scenario FSM / KV</dt>
+          <dd className="good-text">adopt highest (m_idx, v, origin)</dd>
+          <dt>Sequence cursors</dt>
+          {/* Deliberate, not a gap: a cursor is a position in a stream the new owner never saw. */}
+          <dd className="warn-text">reset — deliberate</dd>
+          <dt>proxyOnce Recorded</dt>
+          <dd className="good-text">adopts</dd>
+          <dt>proxyOnce Pending</dt>
+          <dd className="crit-text">dies with the owner, re-claims</dd>
+          <dt>Journal / counters</dt>
+          <dd>no owner &middot; CRDT merge-on-read</dd>
+        </dl>
+      </Card>
+      <Card title="Isolated-owner rule">
+        <p className="muted">
+          A node that has not heard a leader heartbeat within 3&times; the election timeout marks
+          itself isolated and refuses owner-side stateful operations. The two serving windows cannot
+          overlap by more than the heartbeat bound, and the fencing tuple mops up anything written
+          inside it.
+        </p>
+      </Card>
+    </div>
+  );
+}
+
+/**
+ * The spaces this imposter actually has.
+ *
+ * Not readable: `GET .../spaces/{flowId}` reads one space by id and nothing lists them. A space is
+ * created implicitly by whatever flow id a request carried, so "which exist" is exactly the
+ * question an operator arrives with — and today they infer it from the request log.
+ */
+function ActiveSpaces(): ReactNode {
+  return (
+    <Card title="Active spaces">
+      <PendingPanel
+        issue={374}
+        reason="No endpoint lists an imposter's spaces — one can be read by id, but they are created implicitly by whatever flow id a request carried, so there is nothing to enumerate them."
+      />
+    </Card>
   );
 }

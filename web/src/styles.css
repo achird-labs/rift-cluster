@@ -3292,7 +3292,25 @@ input[type="radio"] {
  * need and hands the overflow to `.scroll-x`, which is already wrapped around every one of these.
  */
 table.dense.wide {
-  min-width: 1500px;
+  /*
+   * `auto` + `max-content`, not a min-width.
+   *
+   * A min-width alone did nothing: at 1500px it still fitted the container, so `table-layout: fixed`
+   * went on dividing the width between twelve columns and clipping every one. Sizing to content is
+   * the actual fix — the columns take what they need, the table overflows, and `.scroll-x` scrolls
+   * it. `min-width: 100%` keeps it filling the card when the content is narrow.
+   */
+  table-layout: auto;
+  width: max-content;
+  min-width: 100%;
+}
+
+/* `overflow: hidden` on the cell is what turned "too narrow" into "clipped mid-character". With the
+   table sizing to content there is nothing to hide, and values must not wrap into two lines. */
+table.dense.wide td,
+table.dense.wide th {
+  overflow: visible;
+  white-space: nowrap;
 }
 
 /* One row per gate still holding readiness. The word carries the state; the glyph and colour
@@ -3310,4 +3328,27 @@ table.dense.wide {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.ownership-rules {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+/* Status words in a definition list, where a pill would be too heavy for a one-line value. */
+.good-text {
+  color: var(--good);
+}
+
+.crit-text {
+  color: var(--crit);
+}
+
+.fleet-name {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
 }
