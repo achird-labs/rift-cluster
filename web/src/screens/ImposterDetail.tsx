@@ -6,6 +6,8 @@ import { IMPOSTER_COLUMNS, type ImposterColumn } from "../app/contract.ts";
 import type { FleetView } from "../app/fleetView.ts";
 import {
   type TrySpec,
+  useClearRequests,
+  useDeleteImposter,
   useFleetView,
   useImportAddImposter,
   useImposter,
@@ -14,8 +16,9 @@ import {
 import { useSession } from "../app/session.tsx";
 import { toHash, useHashQuery } from "../app/routing.ts";
 import { DetailRail } from "../components/detailRail.tsx";
+import { Pending, PendingPanel } from "../components/pending.tsx";
 import { ImposterField } from "../components/imposterFields.tsx";
-import { Card, Empty, ErrorNote, Ident, UNKNOWN, UNNAMED } from "../components/primitives.tsx";
+import { Card, Confirm, Empty, ErrorNote, Ident, UNKNOWN, UNNAMED } from "../components/primitives.tsx";
 import {
   type ExportProjection,
   cloneImposter,
@@ -182,6 +185,7 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
 
           {tab === "settings" ? (
             <>
+              <RiftKnobs />
               {mayRead ? (
                 <ExportImposterControl port={port} name={imposter.data.data.name} tenant={tenant} />
               ) : null}
@@ -200,6 +204,7 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
                 imposter={imposter.data.data}
                 revision={imposter.data.revision}
               />
+              <DangerZone port={port} name={imposter.data.data.name} />
             </>
           ) : null}
         </>
@@ -250,7 +255,13 @@ function DetailTabs({
   );
 }
 
-/** The rail's facts at full width, for the tab whose whole subject they are. */
+/**
+ * Where this imposter's flow state lives, and whether its socket came up.
+ *
+ * Two questions with one root: an imposter is an *object* on the ring, not a socket on a machine.
+ * Its flow state belongs to whichever node the ring assigns it, and its listener may have come up on
+ * some nodes and not others — and neither fact is visible from the imposter document.
+ */
 function OwnershipTab({
   port,
   revision,
@@ -263,11 +274,65 @@ function OwnershipTab({
   return (
     <div className="screen-split">
       <div className="screen-main">
-        <Card title="Ownership">
+        <Card title="Flow-state placement">
           <p className="muted">
-            Which node owns this port&rsquo;s flow state is decided by rendezvous hashing over the
-            ring. The ring&rsquo;s membership and epoch are published; the assignment itself is not,
-            so the console can show you the ring this port hashes against but not the answer.
+            The owner is computed from committed membership at this node&rsquo;s applied index, never
+            negotiated: rendezvous hashing picks the highest-scoring ready node for the flow id, so
+            every node that has applied the same membership reaches the same answer without talking
+            to the others.
+          </p>
+          <dl className="kv-grid">
+            <dt>Owner</dt>
+            <dd>
+              <Pending
+                issue={359}
+                reason="No endpoint maps a key to its owning member. The ring's membership and epoch are published; the assignment is not."
+              />
+            </dd>
+            <dt>Successors</dt>
+            <dd>
+              <Pending
+                issue={359}
+                reason="Who would take this flow on a handoff follows from the same ranking, and is unpublished for the same reason."
+              />
+            </dd>
+            <dt>Fencing tuple</dt>
+            <dd>
+              <Pending
+                issue={359}
+                reason="The epoch and ownership generation a write is fenced against are not exposed per flow."
+              />
+            </dd>
+            <dt>Ring epoch</dt>
+            <dd>
+              {fleet === undefined ? (
+                <Pending
+                  issue={361}
+                  reason="The fleet projection is scoped to fleet.read, and this principal is refused it."
+                />
+              ) : (
+                <Ident>{fleet.ringEpoch}</Ident>
+              )}
+            </dd>
+            <dt>On handoff</dt>
+            {/* Not a reading — a statement of what the cluster does, which is the thing an operator
+                needs before they move a node. Worth stating precisely: two of these four are
+                preserved and two are deliberately not. */}
+            <dd className="warn-text">
+              FSM and KV adopt · sequence cursors reset · proxyOnce claims are re-taken
+            </dd>
+          </dl>
+        </Card>
+
+        <Card title="Bind status per node">
+          <PendingPanel
+            issue={370}
+            reason="Whether this imposter's listener came up is not reported per node. A port can be taken on one node and free on another, so this is a real condition — and a survivable one."
+          />
+          <p className="hint">
+            A node that cannot bind still serves this imposter through the front door — dispatch
+            targets the imposter object, not its socket. What a failed bind breaks is the
+            direct-to-port path, on that node only.
           </p>
         </Card>
       </div>
@@ -275,6 +340,143 @@ function OwnershipTab({
     </div>
   );
 }
+
+/**
+ * Every act on this imposter that cannot be undone from here, in one place.
+ *
+ * They existed already and were scattered — a clear on the request log, a delete on the list, a
+ * flow reset on the scenarios screen. Gathering them is the design's improvement and it is a real
+ * one: an operator about to do something irreversible should see the whole set, because the
+ * question "is this the one I want" is only answerable next to the alternatives.
+ *
+ * Each is gated on the capability that authorizes the call rather than on a blanket "may write" —
+ * `rbac.ts` makes the point that transcribing the real action is what stops the table going stale.
+ */
+function DangerZone({ port, name }: { port: number; name: string | undefined }): ReactNode {
+  const { can } = useSession();
+  const clear = useClearRequests();
+  const remove = useDeleteImposter();
+  const [confirming, setConfirming] = useState<"clear" | "delete" | null>(null);
+
+  const mayClear = can("requests.clear");
+  const mayDelete = can("imposter.delete");
+  if (!mayClear && !mayDelete) return null;
+
+  return (
+    <div className="card danger-zone" data-testid="danger-zone">
+      <div className="card-body">
+        <h2>Danger zone</h2>
+        <p className="muted">
+          Each of these is a replicated control op — it lands on every node, and nothing here undoes
+          it.
+        </p>
+        <div className="row">
+          {mayClear ? (
+            <button
+              className="btn danger"
+              type="button"
+              data-testid="danger-clear-requests"
+              onClick={() => setConfirming("clear")}
+            >
+              Clear recorded requests
+            </button>
+          ) : null}
+          {mayDelete ? (
+            <button
+              className="btn danger"
+              type="button"
+              data-testid="danger-delete-imposter"
+              onClick={() => setConfirming("delete")}
+            >
+              Delete imposter
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {confirming === "clear" ? (
+        <Confirm
+          testId="confirm-danger-clear"
+          title="Clear this imposter's recorded requests?"
+          body={
+            <>
+              This empties the recorded requests for imposter {port} <b>fleet-wide</b> — the clear
+              commits through Raft to every node, and nothing restores these rows.
+            </>
+          }
+          confirmLabel="Clear log"
+          requireTyped={String(port)}
+          busy={clear.isPending}
+          onCancel={() => setConfirming(null)}
+          onConfirm={() => {
+            clear.mutate({ port });
+            setConfirming(null);
+          }}
+        />
+      ) : null}
+
+      {confirming === "delete" ? (
+        <Confirm
+          testId="confirm-danger-delete"
+          title={`Delete ${name ?? String(port)}?`}
+          body={
+            <>
+              This removes the imposter, its stubs, its recorded requests and its flow state across
+              the fleet. Nothing undoes it.
+            </>
+          }
+          confirmLabel={`Delete ${name ?? String(port)}`}
+          requireTyped={String(port)}
+          busy={remove.isPending}
+          onCancel={() => setConfirming(null)}
+          onConfirm={() => {
+            remove.mutate({ port });
+            setConfirming(null);
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The per-imposter `_rift` knobs the design draws.
+ *
+ * None is on the document today — `_rift` carries lint warnings and nothing else — so the panel is
+ * built and its controls point at the work. `contextScope` has its own issue already (#288, under
+ * the RFC-005 state epic); the other three are #369.
+ */
+function RiftKnobs(): ReactNode {
+  return (
+    <Card title="_rift · per-imposter knobs">
+      <dl className="kv-grid">
+        <dt>flowState.contextScope</dt>
+        <dd>
+          <Pending
+            issue={288}
+            reason="The contextScope knob is tracked under the RFC-005 state epic. Until it lands, a flow's context scope is a fleet default rather than a per-imposter choice."
+          />
+        </dd>
+        <dt>flowState.durability</dt>
+        <dd>
+          <Pending issue={369} reason="Not carried on the imposter document." />
+        </dd>
+        <dt>flowIdSource</dt>
+        <dd>
+          <Pending
+            issue={369}
+            reason="How a request maps to a flow — a header, a query parameter, or one shared context — is not carried on the imposter document, and it decides whether two callers share scenario state."
+          />
+        </dd>
+        <dt>readConsistency</dt>
+        <dd>
+          <Pending issue={369} reason="Not carried on the imposter document." />
+        </dd>
+      </dl>
+    </Card>
+  );
+}
+
 
 /** Export this one imposter, in either projection (#251). */
 function ExportImposterControl({
