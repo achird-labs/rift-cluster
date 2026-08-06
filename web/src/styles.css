@@ -2665,3 +2665,104 @@ input[type="radio"] {
   letter-spacing: 0.09em;
   text-transform: uppercase;
 }
+
+/* ── Front door: tester and notes ──────────────────────────────────────────
+   The two explanatory cards sit side by side under the table; the tester is a rail, because it
+   annotates the table rather than being another row of it. */
+
+.front-door-notes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+.front-door-notes p {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.front-door-notes p:last-child {
+  margin-bottom: 0;
+}
+
+.rail-right .field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+
+.rail-right .field label {
+  font: 500 11px/1 var(--mono);
+  color: var(--ink-3);
+}
+
+/*
+ * The verdict, stated in a word before the detail. Tinted rather than only worded — but the word is
+ * the encoding and the tint reinforces it, per the status rule the token block sets out.
+ */
+.probe-verdict {
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+  padding: 12px 13px;
+  background: var(--surface-2);
+}
+
+.probe-verdict.is-hit {
+  border-color: var(--good);
+  background: var(--good-soft);
+}
+
+.probe-verdict.is-miss {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.probe-verdict strong {
+  font: 600 12.5px/1.3 var(--sans);
+}
+
+.probe-verdict p {
+  margin: 4px 0 0;
+  font: 400 11.5px/1.6 var(--mono);
+  color: var(--ink-2);
+}
+
+/* One line per route the front door would consider, in the order it would consider them. */
+.trace {
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+/*
+ * Stacked, not two columns. A route id is operator-chosen and can be any length; in a 348px rail a
+ * side-by-side layout either wraps the id mid-word or pushes the reason off the edge — both of
+ * which happened before this. The id reads as a heading over its own reason instead.
+ */
+.trace li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font: 400 11px/1.5 var(--mono);
+  color: var(--ink-3);
+  min-width: 0;
+}
+
+.trace li > span {
+  overflow-wrap: anywhere;
+}
+
+.trace li.is-hit {
+  color: var(--good);
+}
+
+.trace-id {
+  color: var(--ink-2);
+  font-weight: 500;
+}
