@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 import type { BulkResult } from "../features/imposters/bulk.ts";
+import { Pending } from "./pending.tsx";
 import { summaryLine } from "../features/imposters/bulk.ts";
 import type {
   ImposterQuery,
@@ -125,6 +126,54 @@ export function ImposterFilters({
       ) : null}
 
       <div className="spacer" />
+
+      {/*
+        The design's quick filters, over the same query the controls above write.
+        
+        Not a replacement for them: the selects can express combinations these cannot, and the text
+        box is what makes 200 imposters navigable. These are the three questions asked often enough
+        to deserve one click — and `aria-pressed` carries the state, so the fill is not the only
+        signal.
+      */}
+      <div className="pill-filters" role="group" aria-label="Quick filters">
+        <button
+          type="button"
+          className="pill-filter"
+          data-testid="quick-all"
+          aria-pressed={query.state === "all" && query.drifted === "all"}
+          onClick={() => onChange({ ...query, state: "all", drifted: "all" })}
+        >
+          All
+        </button>
+        <button
+          type="button"
+          className="pill-filter"
+          data-testid="quick-drifted"
+          aria-pressed={query.drifted === "drifted"}
+          onClick={() =>
+            onChange({ ...query, drifted: query.drifted === "drifted" ? "all" : "drifted" })
+          }
+        >
+          Drifted
+        </button>
+        <button
+          type="button"
+          className="pill-filter"
+          data-testid="quick-paused"
+          aria-pressed={query.state === "disabled"}
+          onClick={() =>
+            onChange({ ...query, state: query.state === "disabled" ? "all" : "disabled" })
+          }
+        >
+          Paused
+        </button>
+        {/* The design's fourth pill. Whether an imposter's listener came up is not reported per
+            node (#370), so this states the gap rather than offering a filter that cannot filter. */}
+        <span className="pill-filter is-pending">
+          Bind failures{" "}
+          <Pending issue={370} reason="Per-node bind status is not reported, so the console cannot tell which imposters failed to bind anywhere." />
+        </span>
+      </div>
 
       <span className="muted" data-testid="imposter-filter-count" aria-live="polite">
         {filtered ? `${shown} of ${total}` : `${total} imposter${total === 1 ? "" : "s"}`}

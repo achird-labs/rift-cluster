@@ -21,6 +21,8 @@ export type OwnerFilter = "all" | "source" | "hand";
 export type SortKey = "port" | "name" | "stubs";
 export type SortDirection = "asc" | "desc";
 
+export type DriftFilter = "all" | "drifted";
+
 export type ImposterQuery = {
   text: string;
   state: StateFilter;
@@ -34,6 +36,15 @@ export type ImposterQuery = {
    * everything. `sourceOwned` being `null` — refused, unread, or still loading — means exactly that.
    */
   owner: OwnerFilter;
+  /**
+   * Imposters whose owning source has drifted — hand-edited since its last pull.
+   *
+   * A separate dimension from `owner` rather than a third value of it, because they answer
+   * different questions and an operator wants both at once: `owner: "source"` is "who created
+   * this", `drifted: "drifted"` is "and has someone edited it behind the source's back". Folding
+   * them together would make "source-owned AND drifted" unaskable.
+   */
+  drifted: DriftFilter;
   sort: SortKey;
   direction: SortDirection;
 };
@@ -43,6 +54,7 @@ export const EMPTY_QUERY: ImposterQuery = {
   state: "all",
   recording: "all",
   owner: "all",
+  drifted: "all",
   sort: "port",
   direction: "asc",
 };
@@ -53,6 +65,7 @@ export function isEmptyQuery(query: ImposterQuery): boolean {
     query.state === EMPTY_QUERY.state &&
     query.recording === EMPTY_QUERY.recording &&
     query.owner === EMPTY_QUERY.owner &&
+    query.drifted === EMPTY_QUERY.drifted &&
     query.sort === EMPTY_QUERY.sort &&
     query.direction === EMPTY_QUERY.direction
   );
@@ -74,6 +87,7 @@ export function encodeQuery(query: ImposterQuery): string {
   if (query.state !== EMPTY_QUERY.state) params.set("state", query.state);
   if (query.recording !== EMPTY_QUERY.recording) params.set("rec", query.recording);
   if (query.owner !== EMPTY_QUERY.owner) params.set("owner", query.owner);
+  if (query.drifted !== EMPTY_QUERY.drifted) params.set("drifted", query.drifted);
   if (query.sort !== EMPTY_QUERY.sort) params.set("sort", query.sort);
   if (query.direction !== EMPTY_QUERY.direction) params.set("dir", query.direction);
   return params.toString();
@@ -90,6 +104,7 @@ export function decodeQuery(search: string): ImposterQuery {
     state: oneOf(params.get("state"), ["all", "enabled", "disabled"], EMPTY_QUERY.state),
     recording: oneOf(params.get("rec"), ["all", "has", "none"], EMPTY_QUERY.recording),
     owner: oneOf(params.get("owner"), ["all", "source", "hand"], EMPTY_QUERY.owner),
+    drifted: oneOf(params.get("drifted"), ["all", "drifted"], EMPTY_QUERY.drifted),
     sort: oneOf(params.get("sort"), ["port", "name", "stubs"], EMPTY_QUERY.sort),
     direction: oneOf(params.get("dir"), ["asc", "desc"], EMPTY_QUERY.direction),
   };
@@ -262,12 +277,33 @@ export function visibleImposters(
   imposters: readonly Imposter[],
   query: ImposterQuery,
   sourceOwned: ReadonlySet<number> | null = null,
+  driftedPorts: ReadonlySet<number> | null = null,
 ): Imposter[] {
-  return sortImposters(
-    filterImposters(imposters, query, sourceOwned),
-    query.sort,
-    query.direction,
-  );
+  const matched = filterImposters(imposters, query, sourceOwned).filter((imposter) => {
+    if (query.drifted === "all") return true;
+    /*
+     * `null` is "the drift set could not be read" — the same shape `sourceOwned` uses — and it
+     * matches nothing rather than everything. Answering "all of them are drifted" for a principal
+     * refused `source.read` would be the loudest possible wrong answer.
+     */
+    if (driftedPorts === null) return false;
+    return imposter.port !== undefined && driftedPorts.has(imposter.port);
+  });
+  return sortImposters(matched, query.sort, query.direction);
+}
+
+/**
+ * The ports owned by a source that has drifted.
+ *
+ * Same join as `sourceOwnedPorts`, narrowed to the sources reporting `drifted` — so it inherits the
+ * same `null` meaning: the read was refused or has not happened, which is not the same fact as no
+ * source having drifted.
+ */
+export function driftedPorts(
+  sources: readonly { ports?: number[]; drifted?: boolean }[] | undefined,
+): ReadonlySet<number> | null {
+  if (sources === undefined) return null;
+  return new Set(sources.filter((source) => source.drifted === true).flatMap((s) => s.ports ?? []));
 }
 
 /**

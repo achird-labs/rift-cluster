@@ -2814,3 +2814,17 @@ input[type="radio"] {
   gap: 8px;
   flex-wrap: wrap;
 }
+
+/* A pill that reports a gap rather than offering a filter — no hover, no press state, because
+   nothing happens when it is clicked and a control that looks live and is not is worse than none. */
+.pill-filter.is-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: default;
+  color: var(--ink-3);
+}
+
+.pill-filter.is-pending:hover {
+  background: none;
+}

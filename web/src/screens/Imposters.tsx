@@ -35,6 +35,7 @@ import {
   actionablePorts,
   decodeQuery,
   encodeQuery,
+  driftedPorts,
   sourceOwnedPorts,
   unclassifiedCount,
   visibleImposters,
@@ -220,9 +221,10 @@ export function Imposters(): ReactNode {
   const maySeeSources = can("source.read");
   const sources = useSources({ enabled: maySeeSources });
   const sourceOwned = sourceOwnedPorts(sources.data?.sources);
+  const drifted = driftedPorts(sources.data?.sources);
 
   const all = imposters.data ?? [];
-  const rows = visibleImposters(all, query, sourceOwned);
+  const rows = visibleImposters(all, query, sourceOwned, drifted);
   const unclassified = unclassifiedCount(all, query, sourceOwned);
 
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
@@ -548,6 +550,11 @@ export function Imposters(): ReactNode {
                           </th>
                         ),
                       )}
+                      {/* The design's two extra columns. `Owner` is the ring's flow owner, which
+                          nothing publishes (#359); `Provenance` is a real join this screen already
+                          computes for its filter, so it renders. */}
+                      <th style={{ width: "14ch" }}>Owner</th>
+                      <th style={{ width: "16ch" }}>Provenance</th>
                       {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
                     </tr>
                   </thead>
@@ -556,6 +563,8 @@ export function Imposters(): ReactNode {
                       <Row
                         key={imposter.port ?? `unnamed-${index}`}
                         imposter={imposter}
+                        sourceOwned={sourceOwned}
+                        drifted={drifted}
                         mayToggle={mayToggle}
                         mayDelete={mayDelete}
                         busy={toggle.isPending}
@@ -700,6 +709,8 @@ function Row({
   onSelect,
   onToggle,
   onDelete,
+  sourceOwned,
+  drifted,
 }: {
   imposter: Imposter;
   mayToggle: boolean;
@@ -711,6 +722,9 @@ function Row({
   onSelect: (port: number, checked: boolean) => void;
   onToggle: (port: number, enable: boolean) => void;
   onDelete: () => void;
+  /** `null` when `source.read` was refused or the read has not landed — not "hand-created". */
+  sourceOwned: ReadonlySet<number> | null;
+  drifted: ReadonlySet<number> | null;
 }): ReactNode {
   const port = imposter.port;
   const label = imposter.name ?? (port === undefined ? UNKNOWN : String(port));
@@ -737,10 +751,42 @@ function Row({
         </td>
       ) : null}
       {IMPOSTER_COLUMNS.map((column) => (
-        <td key={column.key} className={column.numeric ? "numeric" : undefined}>
+        <td
+          key={column.key}
+          className={column.numeric ? "numeric" : undefined}
+          data-testid={`imposter-cell-${column.key}-${port ?? "unnamed"}`}
+        >
           <ImposterField imposter={imposter} field={column.key} renderName={nameLink(imposter)} />
         </td>
       ))}
+      <td>
+        <Pending
+          issue={359}
+          reason="Which ring member owns this port's flow state is not published. The ring's membership and epoch are; the assignment is not."
+        />
+      </td>
+      {/*
+        Provenance is real, and the three states are genuinely different facts: a source owns this
+        port and has drifted from it, a source owns it cleanly, or nothing declared it. `null` — the
+        source read was refused or has not happened — is a fourth, and says so rather than claiming
+        the imposter was hand-created.
+      */}
+      <td className="ident">
+        {sourceOwned === null ? (
+          <span className="muted">not read</span>
+        ) : port !== undefined && drifted?.has(port) === true ? (
+          <span className="status status-warn">
+            <span className="g" aria-hidden="true">
+              &#9650;
+            </span>
+            drifted
+          </span>
+        ) : port !== undefined && sourceOwned.has(port) ? (
+          "source"
+        ) : (
+          "hand-created"
+        )}
+      </td>
       {mayToggle || mayDelete ? (
         <td>
           {/* Rendered only for a role that holds the matching action. RFC-006 §3 rule 3: this is
