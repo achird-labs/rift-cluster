@@ -22,6 +22,7 @@ import { ExportDialog } from "../components/exportDialog.tsx";
 import { FleetRail } from "../components/fleetRail.tsx";
 import { ImposterField, stubCountOf } from "../components/imposterFields.tsx";
 import { Pending } from "../components/pending.tsx";
+import { useToast } from "../components/toast.tsx";
 import {
   type BulkAction,
   BulkBar,
@@ -1276,13 +1277,18 @@ function ExportSetControl({
 }): ReactNode {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const toast = useToast();
 
   async function run(options: ExportOptions): Promise<void> {
     setError(null);
     setBusy(true);
     try {
       const text = await apiGetText(`/imposters${exportOptionsQuery(options)}`, { tenant });
-      downloadText(exportSetFilename(tenant), text);
+      const filename = exportSetFilename(tenant);
+      downloadText(filename, text);
+      // A download is the one action with no on-screen consequence at all: the dialog closes and the
+      // file lands somewhere the console cannot see. Saying so is the whole point of the toast.
+      toast({ tone: "good", message: `Exported ${String(count)} imposters`, meta: filename });
       onClose();
     } catch (error_) {
       setError(errorText(error_));

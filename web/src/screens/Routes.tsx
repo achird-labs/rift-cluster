@@ -8,6 +8,7 @@ import { Pending } from "../components/pending.tsx";
 import type { Route } from "../features/routes/order.ts";
 import { effectiveOrder, orderReason, validateTable } from "../features/routes/order.ts";
 import { probeRoutes } from "../features/routes/probe.ts";
+import { useToast } from "../components/toast.tsx";
 
 export function RouteTableScreen(): ReactNode {
   const { can } = useSession();
@@ -86,6 +87,7 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
   }, [loaded, loadedKey, draftKey, baseKey, unconfirmed]);
 
   const dirty = draftKey !== baseKey;
+  const toast = useToast();
   const errors = validateTable(draft);
   const ordered = effectiveOrder(draft);
   const rank = new Map(ordered.map((route, index) => [route.id, index + 1]));
@@ -114,6 +116,25 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
          */
         onSuccess: ({ outcome }) => {
           if (outcome.kind === "applied") setBase(draft);
+          /*
+           * Both outcomes are confirmed, and they are not the same confirmation. `applied` is the
+           * fleet holding this table; `unobservable` is the fleet having taken it while the console
+           * lost sight of the commit — which is why that one is a `warn` and says so, rather than a
+           * green tick over an unknown.
+           */
+          toast(
+            outcome.kind === "applied"
+              ? {
+                  tone: "good",
+                  message: `Route table saved — ${String(draft.length)} route${draft.length === 1 ? "" : "s"}`,
+                  meta: "committed fleet-wide",
+                }
+              : {
+                  tone: "warn",
+                  message: "Route table accepted, not yet confirmed",
+                  meta: "re-read this screen to see where it landed",
+                },
+          );
         },
       },
     );

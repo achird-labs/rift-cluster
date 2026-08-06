@@ -9,6 +9,7 @@ import { RouteTableScreen } from "../screens/Routes.tsx";
 import { Scenarios } from "../screens/Scenarios.tsx";
 import { Sources } from "../screens/Sources.tsx";
 import { GROUP_LABEL, ISSUE_URL, NAV, NAV_GROUPS, type NavGroup, groupOf } from "./nav.ts";
+import { ToastHost } from "../components/toast.tsx";
 import { SignOut } from "./SignOut.tsx";
 import { useSession } from "./session.tsx";
 import { type Route, toHash, useRoute } from "./routing.ts";
@@ -17,6 +18,7 @@ export function Shell(): ReactNode {
   const route = useRoute();
 
   return (
+    <ToastHost>
     <div className="app">
       <header className="topbar">
         <div className="brand">
@@ -34,6 +36,7 @@ export function Shell(): ReactNode {
         <Screen route={route} />
       </main>
     </div>
+    </ToastHost>
   );
 }
 
