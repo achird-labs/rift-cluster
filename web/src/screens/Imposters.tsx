@@ -894,6 +894,14 @@ function NewImposter({
   const [cert, setCert] = useState("");
   const [certKey, setCertKey] = useState("");
   const [invalid, setInvalid] = useState<string | null>(null);
+  const [step, setStep] = useState(0);
+  // The optional first stub. A predicate-less imposter answers every request with a bare 200, which
+  // is a fine thing to want and a surprising thing to get by accident — so the step exists, and
+  // skipping it is a choice rather than an omission.
+  const [stubMethod, setStubMethod] = useState("GET");
+  const [stubPath, setStubPath] = useState("");
+  const [stubStatus, setStubStatus] = useState("200");
+  const [stubBody, setStubBody] = useState("");
 
   /*
    * The body this form will POST, built once and used by both the preview and the submit.
@@ -918,6 +926,30 @@ function NewImposter({
         // the same fact as no name.
         ...(name.trim() === "" ? {} : { name: name.trim() }),
         ...(protocol === "https" ? { cert: cert.trim(), key: certKey.trim() } : {}),
+        /*
+         * The first stub, only when a path was given. An empty predicate would match everything,
+         * which is the behaviour an imposter already has with no stubs at all — so a blank step
+         * adds nothing rather than adding a catch-all nobody asked for.
+         */
+        ...(stubPath.trim() === ""
+          ? {}
+          : {
+              stubs: [
+                {
+                  predicates: [
+                    { equals: { method: stubMethod, path: stubPath.trim() } },
+                  ],
+                  responses: [
+                    {
+                      is: {
+                        statusCode: Number(stubStatus) || 200,
+                        ...(stubBody.trim() === "" ? {} : { body: stubBody }),
+                      },
+                    },
+                  ],
+                },
+              ],
+            }),
       }
     : null;
 
@@ -938,8 +970,37 @@ function NewImposter({
   }
 
   return (
-    <Card title="New imposter">
-      <form className="stub-form" onSubmit={submit} data-testid="new-imposter-form">
+    <div className="scrim" onKeyDown={(event) => { if (event.key === "Escape") onCancel(); }}>
+      <div
+        className="confirm wizard"
+        role="dialog"
+        aria-modal="true"
+        aria-label="New imposter"
+        data-testid="new-imposter-wizard"
+      >
+        <header className="wizard-head">
+          <div>
+            <h2>New imposter</h2>
+            <p className="muted">POST /imposters &mdash; a replicated control op</p>
+          </div>
+          <ol className="wizard-steps">
+            {WIZARD_STEPS.map((label, index) => (
+              <li
+                key={label}
+                className={index === step ? "is-current" : index < step ? "is-done" : undefined}
+                aria-current={index === step ? "step" : undefined}
+              >
+                <span className="wizard-dot">{index < step ? "\u2713" : index + 1}</span>
+                {label}
+              </li>
+            ))}
+          </ol>
+        </header>
+
+      <form className="stub-form wizard-form" onSubmit={submit} data-testid="new-imposter-form">
+        <div className="wizard-body">
+        {step === 0 ? (
+        <>
         <div className="field-row">
           <div className="field">
             <label htmlFor="new-port">Port</label>
@@ -1009,6 +1070,67 @@ function NewImposter({
             </span>
           </span>
         </label>
+        </>
+        ) : null}
+
+        {step === 1 ? (
+          <>
+            <p className="muted">
+              An imposter with no stubs answers every request with a bare 200. Give it one now — the
+              rest go in the editor.
+            </p>
+            <div className="field-row">
+              <div className="field">
+                <label htmlFor="new-stub-method">Method</label>
+                <select
+                  id="new-stub-method"
+                  value={stubMethod}
+                  onChange={(event) => setStubMethod(event.target.value)}
+                >
+                  {["GET", "POST", "PUT", "PATCH", "DELETE"].map((verb) => (
+                    <option key={verb} value={verb}>
+                      {verb}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field grow">
+                <label htmlFor="new-stub-path">Path</label>
+                <input
+                  id="new-stub-path"
+                  value={stubPath}
+                  data-testid="new-stub-path"
+                  placeholder="/v1/orders"
+                  onChange={(event) => setStubPath(event.target.value)}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="new-stub-status">Status</label>
+                <input
+                  id="new-stub-status"
+                  inputMode="numeric"
+                  value={stubStatus}
+                  onChange={(event) => setStubStatus(event.target.value)}
+                />
+              </div>
+            </div>
+            <div className="field">
+              <label htmlFor="new-stub-body">Body</label>
+              <textarea
+                id="new-stub-body"
+                value={stubBody}
+                placeholder='{"ok":true}'
+                onChange={(event) => setStubBody(event.target.value)}
+              />
+            </div>
+            <p className="hint">
+              Leave the path blank to create the imposter with no stubs at all — which is a real
+              choice, not a skipped step: it answers everything with a bare 200 until you add one.
+            </p>
+          </>
+        ) : null}
+
+        {step === 2 ? <ReviewStep draft={draft} /> : null}
 
         {invalid === null ? null : (
           <p className="error" data-testid="new-imposter-invalid" role="alert">
@@ -1016,33 +1138,124 @@ function NewImposter({
           </p>
         )}
 
-        {/*
-          * What will be sent, before it is sent.
-          *
-          * The same object `submit` passes to `onCreate`, serialized — not a description of it. A
-          * `cert`/`key` pair is part of the imposter config and therefore replicates through Raft
-          * into every node's log and snapshot, which is a thing an operator should be able to SEE
-          * they are about to do rather than read about afterwards.
-          */}
-        {draft === null ? null : (
-          <div className="field">
-            <span className="eyebrow">Request body · POST /imposters</span>
-            <pre className="payload" data-testid="new-imposter-preview">
-              {JSON.stringify(draft, null, 2)}
-            </pre>
-          </div>
-        )}
-
-        <div className="row">
-          <button className="btn primary" type="submit" disabled={busy}>
-            {busy ? "Creating…" : "Create imposter"}
-          </button>
-          <button className="btn" type="button" onClick={onCancel} disabled={busy}>
-            Cancel
-          </button>
         </div>
+
+        <footer className="wizard-foot">
+          <span className={invalid === null ? "muted" : "warn-text"}>
+            {step === 2
+              ? "Writes replicate — every node converges on this imposter."
+              : `Step ${String(step + 1)} of ${String(WIZARD_STEPS.length)}`}
+          </span>
+          <div className="row">
+            <button className="btn" type="button" onClick={onCancel} disabled={busy}>
+              Cancel
+            </button>
+            {step > 0 ? (
+              <button
+                className="btn"
+                type="button"
+                data-testid="wizard-back"
+                onClick={() => setStep(step - 1)}
+                disabled={busy}
+              >
+                Back
+              </button>
+            ) : null}
+            {/*
+              Distinct `key`s, and they are load-bearing rather than tidiness.
+              
+              Without them React reuses one DOM node for both — same position, same element type —
+              and only mutates its type and handler. A click already in flight on "Next" then lands
+              on "Create imposter" and creates the imposter without the operator ever seeing the
+              review step. Keying them apart makes React replace the node, so that click hits a
+              detached element and does nothing, which is the correct outcome for a press that was
+              aimed at a different control.
+            */}
+            {step < WIZARD_STEPS.length - 1 ? (
+              <button
+                key="advance"
+                className="btn primary"
+                type="button"
+                data-testid="wizard-next"
+                /* Validating on the way forward rather than only at submit: the port is the one
+                   field that can be wrong in a way the later steps depend on, and finding out at
+                   the end means re-deciding the stub too. */
+                onClick={() => {
+                  if (step === 0 && draft === null) {
+                    setInvalid("Port must be a whole number between 1 and 65535.");
+                    return;
+                  }
+                  setInvalid(null);
+                  setStep(step + 1);
+                }}
+                disabled={busy}
+              >
+                Next
+              </button>
+            ) : (
+              <button key="create" className="btn primary" type="submit" disabled={busy}>
+                {busy ? "Creating…" : "Create imposter"}
+              </button>
+            )}
+          </div>
+        </footer>
       </form>
-    </Card>
+      </div>
+    </div>
+  );
+}
+
+const WIZARD_STEPS = ["Identity", "First stub", "Review"] as const;
+
+/**
+ * The last step: exactly what will be sent, and what the fleet will do with it.
+ *
+ * The design ends this step with "`Idempotency-Key` is sent with the request, so a retry after a
+ * timeout can never double-apply". The console does not send one — the API defines the header and
+ * no call site sets it (#371) — so that sentence is not printed. What replaces it is the true
+ * version, which is also the more useful one, because it tells an operator what a timeout here
+ * actually means for them.
+ */
+function ReviewStep({ draft }: { draft: Imposter | null }): ReactNode {
+  return (
+    <div className="wizard-review">
+      <div>
+        <span className="eyebrow">Request body · POST /imposters</span>
+        <pre className="payload" data-testid="new-imposter-preview">
+          {draft === null ? "// a valid port is needed first" : JSON.stringify(draft, null, 2)}
+        </pre>
+      </div>
+      <div className="wizard-aside">
+        <div className="card">
+          <div className="card-body">
+            <span className="eyebrow">What happens on create</span>
+            <ol className="wizard-happens">
+              <li>
+                <b>Submitted on this node</b>
+                <span>durably parked before it is forwarded</span>
+              </li>
+              <li>
+                <b>Forwarded to the leader</b>
+                <span>committed on a majority of voters</span>
+              </li>
+              <li>
+                <b>Applied fleet-wide</b>
+                <span>the write resolves once the fleet has it, not when this node accepts it</span>
+              </li>
+              <li>
+                <b>Bound on each node</b>
+                <span>a node that cannot bind still serves it through the front door</span>
+              </li>
+            </ol>
+          </div>
+        </div>
+        <p className="hint">
+          If this request times out, the write may still have landed. The console sends no
+          idempotency key (#371), so re-submitting is a second operation rather than a retry of the
+          first — reload the list before creating it again.
+        </p>
+      </div>
+    </div>
   );
 }
 

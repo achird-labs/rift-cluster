@@ -69,7 +69,7 @@ test.describe("component baselines", () => {
     await signIn(page, "editor");
     await goToScreen(page, "/imposters");
     await page.getByTestId("new-imposter").click();
-    await expect(page.getByTestId("new-imposter-form")).toHaveScreenshot("new-imposter-form.png");
+    await expect(page.getByTestId("new-imposter-wizard")).toHaveScreenshot("new-imposter-form.png");
   });
 
   test("a checkbox renders differently checked and unchecked", async ({ page }) => {
