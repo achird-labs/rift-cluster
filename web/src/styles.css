@@ -128,16 +128,25 @@
    choice closes inside a green/amber/red convention. Glyph shape and the word carry the meaning;
    colour reinforces it.
 
-   Every value below clears 4.5:1 against every surface it is used on, in both themes. That is
-   where this palette departs from the mockup, and deliberately: the mockup's muted greys measure
-   3.45:1 (#8a8377) and 2.62:1 (#a09889) on the paper ground, and its amber 3.46:1 — all of them
-   readable in a 1360px design card and none of them readable as body text. The mockup's two
-   faintest greys collapse into `--ink-3` here, which keeps three warm steps of hierarchy while
-   every step stays legible, and the amber darkens from #b5761f to #8f5f14.
+   Every value below clears 4.5:1 against every surface it is used on. That is where this palette
+   departs from the mockup, and deliberately: the mockup's muted greys measure 3.45:1 (#8a8377) and
+   2.62:1 (#a09889) on the paper ground, and its amber 3.46:1 — all of them readable in a 1360px
+   design card and none of them readable as body text. The mockup's two faintest greys collapse into
+   `--ink-3` here, which keeps three warm steps of hierarchy while every step stays legible, and the
+   amber darkens from #b5761f to #8f5f14.
 
-   Light is the `:root` default and dark comes from the media query. There is no `[data-theme]`
-   override: the console ships no theme toggle, and a selector for a control that does not exist is
-   dead CSS that reads as a missing feature. */
+   ONE THEME. There is no dark variant and no `prefers-color-scheme` block, which is a change from
+   what this file shipped before: the console carried a dark theme nobody had designed, so an
+   operator on a dark desktop saw a console that no mockup had ever been reviewed against, and every
+   judgement about this palette — the contrast tuning above, the ink-filled primary, the one cool
+   accent among warm neutrals — was being made about a set of colours half the readers never saw.
+
+   `color-scheme: light` states it to the browser as well as to the cascade, so form controls,
+   scrollbars and the canvas behind the page render light regardless of the OS setting. Without it a
+   dark-mode browser paints its own UA surfaces dark under a light page.
+
+   The cost is real and accepted: an operator on a dark desktop gets a bright window. The thing
+   traded away was worse — a second palette drifting untested behind a media query. */
 :root {
   --ground: #f7f5f1;
   --surface: #fffefb;
@@ -162,16 +171,14 @@
     0 1px 2px rgba(27, 26, 24, 0.07), 0 1px 1px rgba(27, 26, 24, 0.04);
 
   /*
-   * The modal backdrop. A token rather than a literal because it is theme-sensitive in the same way
-   * `--shadow` is: a translucent ink that reads as a dimmed page over `--ground: #f7f5f1` is nearly
-   * invisible over the dark theme's `#161513`, so each theme states its own.
+   * The modal backdrop. A token rather than a literal so the one value that dims the whole page is
+   * named where the rest of the palette is, rather than inlined at the single rule that uses it.
    */
   --scrim: rgba(27, 26, 24, 0.34);
 
   /*
    * A deliberately dark panel inside a light page — the request-body preview and the payload
-   * viewers. Fixed rather than themed: it is a code surface, and it reads as one only by staying
-   * dark while the page around it is paper.
+   * viewers. It is a code surface, and it reads as one by being the only dark thing on the page.
    */
   --panel: #1f1e1b;
   --panel-ink: #e8e3d8;
@@ -212,44 +219,7 @@
     "IBM Plex Mono", ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Mono",
     Menlo, Consolas, "Liberation Mono", monospace;
 
-  color-scheme: light dark;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --ground: #161513;
-    --surface: #1f1e1b;
-    --surface-2: #262420;
-    --surface-3: #302e29;
-    --ink: #ece7dc;
-    --ink-2: #c3bcae;
-    --ink-3: #a09889;
-    --line: #322f2a;
-    --line-2: #45413a;
-    --accent: #9db6f0;
-    --accent-soft: #1e2740;
-    --good: #6fbf95;
-    --good-soft: #16281f;
-    --warn: #dfae5e;
-    --warn-soft: #2c2314;
-    --crit: #f09a8f;
-    --crit-soft: #331d1b;
-    --idle: #a09889;
-    --idle-soft: #24221e;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
-    /* Deeper than light mode's: the dark surfaces are already close to the backdrop's ink, so the
-       same alpha would barely separate the dialog from the page it is covering. */
-    --scrim: rgba(0, 0, 0, 0.66);
-    /* The code panel is the one surface that does not invert — but on a dark page it would sit a
-       shade *below* the card it is in, so it borrows `--surface-2` to stay a panel rather than a
-       hole. */
-    --panel: #262420;
-    --panel-ink: #ece7dc;
-    --panel-ink-2: #a09889;
-    --ring-1: #9db6f0;
-    --ring-2: #6d8ccc;
-    --ring-3: #46618f;
-  }
+  color-scheme: light;
 }
 
 * {
@@ -1021,7 +991,7 @@ button.plain:hover:not([disabled]) {
 /*
  * Not `filter: brightness()`. On the near-black ink fill it moves #1b1a18 to #1d1c19 — a change no
  * one can see, so the button reads as dead on hover. An explicit step to the next ink stop is
- * visible in both themes, where brightness is visible in neither.
+ * visible where brightness is not.
  */
 .btn.primary:hover:not([disabled]) {
   background: var(--ink-2);
@@ -1030,9 +1000,11 @@ button.plain:hover:not([disabled]) {
 
 /*
  * `color: var(--surface)` rather than a literal `#fff`, which is a dark-theme fix as much as a
- * tokenisation one: `--crit` inverts to a light salmon under `prefers-color-scheme: dark`, and
- * white-on-salmon measured 1.9:1 — the destructive button was the least readable control in the
- * console. Tracking the surface gives 5.8:1 in light and 7.7:1 in dark.
+ * tokenisation one: while this console still carried a dark theme, `--crit` inverted to a light
+ * salmon there and white-on-salmon measured 1.9:1 — the destructive button was the least readable
+ * control in the console. Tracking `--surface` fixed it, and it stays tracked now the dark theme is
+ * gone: a literal `#fff` is a bet that `--crit` will always be dark enough to carry white text, and
+ * the token costs nothing to keep honest.
  */
 .btn.danger {
   background: var(--crit);

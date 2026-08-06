@@ -49,21 +49,6 @@ function declares(selector: string, property: string): boolean {
   return body !== null && new RegExp(`(^|[;{\\s])${property}\\s*:`, "m").test(body);
 }
 
-/** The body of the first `@media (prefers-color-scheme: dark)` block, brace-matched. */
-function darkBlock(): string {
-  const start = CODE.search(/@media\s*\(\s*prefers-color-scheme:\s*dark\s*\)/);
-  if (start === -1) return "";
-  let depth = 0;
-  for (let i = CODE.indexOf("{", start); i < CODE.length; i += 1) {
-    if (CODE[i] === "{") depth += 1;
-    if (CODE[i] === "}") {
-      depth -= 1;
-      if (depth === 0) return CODE.slice(start, i);
-    }
-  }
-  return "";
-}
-
 describe("the destructive-confirm modal is styled at all (#236)", () => {
   it("declares a rule for each of the three class names Confirm renders", () => {
     // `primitives.tsx::Confirm` renders exactly these, and every destructive act in the console
@@ -111,19 +96,30 @@ describe("the destructive-confirm modal is styled at all (#236)", () => {
     expect(ruleBody(".confirm .acts")).toMatch(/justify-content/);
   });
 
-  it("builds the backdrop from a token that both themes define", () => {
+  it("builds the backdrop from a token rather than a literal", () => {
     /*
-     * A hardcoded `rgba(0,0,0,.5)` would be legible in light mode and near-invisible against the
-     * dark theme's `--ground: #0b1326`. Every other theme-sensitive value here is a token with a
-     * dark override — `--shadow` is the closest precedent — so the scrim follows that rather than
-     * inventing a literal the dark block cannot reach.
+     * The one value that dims the whole page is named where the rest of the palette is. This used
+     * to be about surviving a theme swap — a hardcoded `rgba(0,0,0,.5)` was legible on paper and
+     * near-invisible over the old dark theme's ground — and the console ships one palette now, so
+     * what is left is the plainer reason: a literal buried in a single rule is the value nobody
+     * finds when the palette is next retuned.
      */
     expect(ruleBody(".scrim")).toMatch(/var\(--scrim\)/);
-    // Both checked against an actually-delimited block. A lazy `[\s\S]*?` from the media query
-    // would be satisfied by the `:root` definition that precedes it and would prove nothing about
-    // the dark override existing at all.
-    const light = /:root\s*{[^}]*--scrim\s*:/.test(CODE);
-    const dark = /--scrim\s*:/.test(darkBlock());
-    expect({ light, dark }).toEqual({ light: true, dark: true });
+    expect(/:root\s*{[^}]*--scrim\s*:/.test(CODE)).toBe(true);
+  });
+
+  it("ships exactly one theme", () => {
+    /*
+     * Asserted rather than remembered.
+     *
+     * The console carried a dark theme nobody had designed against, so an operator on a dark
+     * desktop saw a palette no mockup had been reviewed in — and every judgement about contrast,
+     * about the ink-filled primary, about one cool accent among warm neutrals, was being made about
+     * a set of colours half the readers never saw. Dropping it was a decision; a
+     * `prefers-color-scheme` block reappearing would silently undo it, and nothing else in the
+     * suite would notice.
+     */
+    expect(CODE).not.toMatch(/@media[^{]*prefers-color-scheme/);
+    expect(ruleBody(":root")).toMatch(/color-scheme:\s*light\s*;/);
   });
 });

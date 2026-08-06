@@ -14,8 +14,10 @@ import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
  * in Blink and makes `accent-color` a no-op, so every checkbox in the console rendered as an empty
  * square. jsdom parses CSS but never computes the cascade or paints, so nothing there could fail.
  *
- * Runs in both `chromium` (light) and `chromium-dark`, because the token set swaps entirely on
- * `prefers-color-scheme` and a control that vanishes in one theme is a real defect.
+ * One theme, so one run. This used to run twice — `chromium` and `chromium-dark` — because the
+ * token set swapped entirely on `prefers-color-scheme` and a control that vanished in one theme was
+ * a real defect. The console ships a single palette now, so the second pass photographed the same
+ * pixels and doubled the baselines to regenerate.
  */
 
 /**
