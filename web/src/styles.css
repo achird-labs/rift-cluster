@@ -3018,3 +3018,15 @@ input[type="radio"] {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Usage over limit. The limit is muted because it is configuration — the eye should land on the
+   figure that moves, which is the one that is not there yet. */
+.quota-cell {
+  white-space: nowrap;
+}
+
+.quota-limit {
+  margin-left: 6px;
+  font: 400 11.5px/1 var(--mono);
+  color: var(--ink-3);
+}
