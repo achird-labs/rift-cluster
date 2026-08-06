@@ -18,19 +18,21 @@ export function Shell(): ReactNode {
 
   return (
     <div className="app">
-      <Nav current={route} />
-      <div className="app-main">
-        <header className="topbar">
+      <header className="topbar">
+        <div className="brand">
+          <b>Rift</b>
+          <span>CLUSTER</span>
+        </div>
+        <Nav current={route} />
+        <div className="who">
           <TenantSwitcher />
-          <div className="who">
-            <Identity />
-            <SignOut />
-          </div>
-        </header>
-        <main>
-          <Screen route={route} />
-        </main>
-      </div>
+          <Identity />
+          <SignOut />
+        </div>
+      </header>
+      <main>
+        <Screen route={route} />
+      </main>
     </div>
   );
 }
@@ -60,6 +62,11 @@ function Screen({ route }: { route: Route }): ReactNode {
  * The full §4 screen list. A screen this slice has not built is greyed and carries its issue
  * number — "a visible roadmap, not a 404". Omitting them would present two screens as the whole
  * console.
+ *
+ * Horizontal since the warm-paper redesign, which changes what a group can be: there is no line to
+ * spend on a heading, so a group is a run of entries between two hairlines and carries its name to
+ * assistive tech through `role="group"` instead. The order, the RBAC filtering and the roadmap
+ * entries are all unchanged — only the axis is.
  */
 function Nav({ current }: { current: Route }): ReactNode {
   const { can } = useSession();
@@ -70,19 +77,14 @@ function Nav({ current }: { current: Route }): ReactNode {
   const visible = NAV.filter((entry) => entry.kind === "planned" || can(entry.requires));
 
   return (
-    <nav className="rail" aria-label="Console sections">
-      <div className="brand">
-        <b>Rift</b>
-        <span>CONSOLE</span>
-      </div>
+    <nav className="nav" aria-label="Console sections">
       {NAV_GROUPS.map((group: NavGroup) => {
         const entries = visible.filter((entry) => groupOf(entry) === group);
-        // A group whose every entry the role cannot read draws no heading. An empty labelled
-        // section would advertise a category the principal can never open.
+        // A group whose every entry the role cannot read draws nothing — not even its separator.
+        // An empty labelled run would advertise a category the principal can never open.
         if (entries.length === 0) return null;
         return (
-          <div className="nav-group" key={group}>
-            <div className="eyebrow">{GROUP_LABEL[group]}</div>
+          <div className="nav-group" key={group} role="group" aria-label={GROUP_LABEL[group]}>
             {entries.map((entry) => {
               if (entry.kind === "planned") {
                 return (
@@ -123,11 +125,16 @@ function Nav({ current }: { current: Route }): ReactNode {
                   data-testid={`nav-${entry.id}`}
                   href={hash}
                   aria-current={toHash(current) === hash ? "page" : undefined}
+                  /* The bar prints `short` where the full label would not fit, but the entry is
+                     still named by its full label. `short` is a substring of it (asserted in
+                     nav.test.ts), so the visible text appears in the accessible name and WCAG
+                     2.5.3 holds — "click Fleet" still addresses this control. */
+                  aria-label={entry.short === undefined ? undefined : entry.label}
                 >
                   <span className="glyph" aria-hidden="true">
                     {entry.glyph}
                   </span>
-                  {entry.label}
+                  {entry.short ?? entry.label}
                 </a>
               );
             })}

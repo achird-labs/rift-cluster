@@ -1,67 +1,192 @@
 /*
- * The console's design system, ported from `docs/design/console/console-prototype.html`
- * (RFC-006 scope A). The prototype's README calls its token block "a starting palette that has
- * been contrast-validated, not a finished system" — this is that palette adopted as the system,
- * because nothing else was ever specified and the screens had drifted onto an unrelated set of
- * nine ad-hoc greys.
+ * The console's design system.
+ *
+ * Redesigned onto the "technical light" direction of `RiftCluster Console.dc.html` — warm paper
+ * rather than the cool blue-grey this file shipped before, drift and provenance foregrounded, and
+ * IBM Plex carrying the distinction between prose and identifiers. The information architecture is
+ * unchanged; what changed is the surface, the type, and the amount of chrome each row spends.
  *
  * Build-time CSS only (RFC-006 §7). Runtime CSS-in-JS injects a <style> element, and while C5
  * widened the policy to `style-src 'unsafe-inline'` for monaco's theme service, the shipped shell
  * is still asserted style-free by `tests/console.rs` — so nothing here may lean on that allowance.
  *
- * System font stacks rather than a webfont: `default-src 'self'` blocks a CDN font and the binary
- * ships air-gapped, so the console faces the same constraint the prototype did. Deliberately not
- * Inter.
- *
  * Desktop only (RFC-006 §10). There is no mobile layout and none is planned — this is a fleet
  * operator's tool, and a narrow-window collapse would be a layout nobody uses pretending to be one
- * that is supported. The one concession below is a rail that goes horizontal, so a narrow window
- * is awkward rather than broken.
+ * that is supported. The nav bar wraps rather than collapsing, so a narrow window is awkward rather
+ * than broken.
  */
 
+/* ── Type ───────────────────────────────────────────────────────────────────
+   IBM Plex, self-hosted. The mockup loads it from Google Fonts; the console cannot — it is served
+   under `default-src 'self'` (`console.rs`) onto networks with no route to the internet, and
+   `bundle-offline.test.ts` fails the build on any external subresource. So the faces ship in the
+   bundle, `url()` stays relative, and vite emits them same-origin under /assets.
+
+   This replaces a system font stack, and the replacement is the point rather than a side effect:
+   Plex Mono's disambiguated 0/O/1/l is what makes a column of ports, raft indices and hash keys
+   readable, and Plex Sans is drawn to sit beside it. Licensed OFL 1.1 — see `fonts/OFL.txt`.
+
+   Plex Sans is a variable font, so one file per subset covers 400/500/600. Plex Mono is not, so it
+   ships three. Latin and latin-ext only: the console's own strings are English, and latin-ext
+   covers the accented characters a principal's display name is likely to carry. A name outside
+   both ranges falls through to the system stack rather than to tofu.
+
+   `font-display: swap` — the faces are same-origin and already in the bundle the page just loaded,
+   so the swap window is short, and an operator reading a fleet at 3am should not wait on a font. */
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-sans-var-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-sans-var-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-400-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-400-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-500-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-500-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-600-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-600-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+
 /* ── Tokens ─────────────────────────────────────────────────────────────────
-   Neutrals are biased cool blue-green toward the accent, not mid-grey.
+   Neutrals are warm — a paper ground under near-white cards, with the ink browned off black. The
+   accent is the one cool thing on the page, which is what makes a port number or an owner read as
+   a link rather than as more text.
 
-   Status colours are a RESERVED set, never reused as a chart series, and never
-   carry meaning alone: green↔red measures ΔE 5.8–7.2 apart under protanopia and
-   deuteranopia, a gap no hue choice closes inside a green/amber/red convention.
-   Glyph shape and the word carry the meaning; colour reinforces it. Every value
-   below clears 4.5:1 against its own surface in both themes — the first draft's
-   amber measured 2.24:1 on white, which is why light-mode amber is #8A5A00.
+   Status colours are a RESERVED set, never reused as a chart series, and never carry meaning
+   alone: green↔red measures ΔE 5.8–7.2 apart under protanopia and deuteranopia, a gap no hue
+   choice closes inside a green/amber/red convention. Glyph shape and the word carry the meaning;
+   colour reinforces it.
 
-   Light is the `:root` default and dark comes from the media query, which is the
-   way round the prototype has it. There is no `[data-theme]` override here: the
-   console ships no theme toggle, and a selector for a control that does not
-   exist is dead CSS that reads as a missing feature. */
+   Every value below clears 4.5:1 against every surface it is used on, in both themes. That is
+   where this palette departs from the mockup, and deliberately: the mockup's muted greys measure
+   3.45:1 (#8a8377) and 2.62:1 (#a09889) on the paper ground, and its amber 3.46:1 — all of them
+   readable in a 1360px design card and none of them readable as body text. The mockup's two
+   faintest greys collapse into `--ink-3` here, which keeps three warm steps of hierarchy while
+   every step stays legible, and the amber darkens from #b5761f to #8f5f14.
+
+   Light is the `:root` default and dark comes from the media query. There is no `[data-theme]`
+   override: the console ships no theme toggle, and a selector for a control that does not exist is
+   dead CSS that reads as a missing feature. */
 :root {
-  --ground: #f5f7fc;
-  --surface: #ffffff;
-  --surface-2: #edf1fa;
-  --surface-3: #dfe6f4;
-  --ink: #111a2e;
-  --ink-2: #414d69;
-  --ink-3: #5f6b87;
-  --line: #d6deee;
-  --line-2: #bcc7de;
-  --accent: #2f4cb0;
-  --accent-soft: #e7ecfb;
-  --good: #0b6b3a;
-  --good-soft: #e2f1e8;
-  --warn: #8a5a00;
-  --warn-soft: #f8eeda;
-  --crit: #b02418;
-  --crit-soft: #fae7e4;
-  --idle: #5f6b87;
-  --idle-soft: #eceff7;
+  --ground: #f7f5f1;
+  --surface: #fffefb;
+  --surface-2: #faf8f4;
+  --surface-3: #f2efe9;
+  --ink: #1b1a18;
+  --ink-2: #4a463f;
+  --ink-3: #6f6a61;
+  --line: #e2ded6;
+  --line-2: #d5d0c6;
+  --accent: #2f5fd0;
+  --accent-soft: #e7edfb;
+  --good: #2a7454;
+  --good-soft: #e4efe9;
+  --warn: #8f5f14;
+  --warn-soft: #fdf8ee;
+  --crit: #b33a3a;
+  --crit-soft: #fbeceb;
+  --idle: #6f6a61;
+  --idle-soft: #f0ede6;
   --shadow:
-    0 1px 2px rgba(17, 26, 46, 0.07), 0 1px 1px rgba(17, 26, 46, 0.04);
+    0 1px 2px rgba(27, 26, 24, 0.07), 0 1px 1px rgba(27, 26, 24, 0.04);
 
   /*
    * The modal backdrop. A token rather than a literal because it is theme-sensitive in the same way
-   * `--shadow` is: a translucent ink that reads as a dimmed page over `--ground: #f5f7fc` is nearly
-   * invisible over the dark theme's `#0b1326`, so each theme states its own.
+   * `--shadow` is: a translucent ink that reads as a dimmed page over `--ground: #f7f5f1` is nearly
+   * invisible over the dark theme's `#161513`, so each theme states its own.
    */
-  --scrim: rgba(17, 26, 46, 0.55);
+  --scrim: rgba(27, 26, 24, 0.34);
+
+  /*
+   * A deliberately dark panel inside a light page — the request-body preview and the payload
+   * viewers. Fixed rather than themed: it is a code surface, and it reads as one only by staying
+   * dark while the page around it is paper.
+   */
+  --panel: #1f1e1b;
+  --panel-ink: #e8e3d8;
+  --panel-ink-2: #a09889;
+
+  /*
+   * Corner radii, named by what they wrap rather than by size, so the scale stays consistent as
+   * components are added. The previous system's 2–4px reads as a control panel; this one's 6–10px
+   * is what makes the same density read as paper.
+   */
+  --r-control: 6px;
+  --r-panel: 7px;
+  --r-card: 8px;
+  --r-modal: 10px;
+  --r-pill: 999px;
 
   /*
    * Motion: the "subtle" tier only — 150–200ms, ease-out. An operator console watching a
@@ -72,40 +197,46 @@
   --ease: cubic-bezier(0.25, 0.46, 0.45, 0.94);
 
   --sans:
-    ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono:
-    ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas,
-    "Liberation Mono", monospace;
+    "IBM Plex Mono", ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Mono",
+    Menlo, Consolas, "Liberation Mono", monospace;
 
   color-scheme: light dark;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --ground: #0b1326;
-    --surface: #171f33;
-    --surface-2: #1e273d;
-    --surface-3: #273148;
-    --ink: #e6ecfa;
-    --ink-2: #a9b7d2;
-    --ink-3: #8394b3;
-    --line: #2a344c;
-    --line-2: #3a4664;
-    --accent: #adc6ff;
-    --accent-soft: #1b2743;
-    --good: #22c55e;
-    --good-soft: #102c1e;
-    --warn: #f0b849;
-    --warn-soft: #302512;
-    --crit: #ff8a7a;
-    --crit-soft: #35191a;
-    --idle: #8394b3;
-    --idle-soft: #1c2438;
+    --ground: #161513;
+    --surface: #1f1e1b;
+    --surface-2: #262420;
+    --surface-3: #302e29;
+    --ink: #ece7dc;
+    --ink-2: #c3bcae;
+    --ink-3: #a09889;
+    --line: #322f2a;
+    --line-2: #45413a;
+    --accent: #9db6f0;
+    --accent-soft: #1e2740;
+    --good: #6fbf95;
+    --good-soft: #16281f;
+    --warn: #dfae5e;
+    --warn-soft: #2c2314;
+    --crit: #f09a8f;
+    --crit-soft: #331d1b;
+    --idle: #a09889;
+    --idle-soft: #24221e;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
     /* Deeper than light mode's: the dark surfaces are already close to the backdrop's ink, so the
        same alpha would barely separate the dialog from the page it is covering. */
     --scrim: rgba(0, 0, 0, 0.66);
+    /* The code panel is the one surface that does not invert — but on a dark page it would sit a
+       shade *below* the card it is in, so it borrows `--surface-2` to stay a panel rather than a
+       hole. */
+    --panel: #262420;
+    --panel-ink: #ece7dc;
+    --panel-ink-2: #a09889;
   }
 }
 
@@ -124,7 +255,7 @@ body {
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-  border-radius: 2px;
+  border-radius: 4px;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -181,78 +312,115 @@ code,
   border: 0;
 }
 
-/* ── App frame ─────────────────────────────────────────────────────────── */
+/* ── App frame ─────────────────────────────────────────────────────────────
+   One bar across the top, then the screen. The 232px rail this replaced spent a fixed column on
+   eight links; the screens under it are dense tables of ports, indices and hash keys, and they are
+   what the width is for. */
 
 .app {
-  display: grid;
-  grid-template-columns: 232px minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   min-height: 100vh;
 }
 
-.app-main {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
+/* ── Top bar ─────────────────────────────────────────────────────────────── */
 
-.rail {
+.topbar {
   background: var(--surface);
-  border-right: 1px solid var(--line);
-  padding: 18px 0;
+  border-bottom: 1px solid var(--line);
+  padding: 0 22px;
   display: flex;
-  flex-direction: column;
-  gap: 22px;
+  align-items: center;
+  gap: 18px;
+  min-height: 58px;
+  /* Wraps rather than scrolls or collapses. Desktop-only (RFC-006 §10) is a decision about what is
+     designed for, not a licence to break: below about 1180px the right-hand cluster drops to its
+     own line and everything stays reachable. */
+  flex-wrap: wrap;
 }
 
 .brand {
-  padding: 0 18px;
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 9px;
+  flex: none;
+  /* The hairline the mockup draws after the wordmark. On the brand rather than on the nav so it
+     survives a nav that renders no groups at all, and sized by its own padding rather than by
+     stretching to the bar — a stretched divider grows with the bar when it wraps. */
+  border-right: 1px solid var(--line);
+  padding: 4px 18px 4px 0;
 }
 
 .brand b {
-  font: 700 16px/1 var(--sans);
-  letter-spacing: -0.01em;
+  font: 600 15px/1 var(--sans);
+  letter-spacing: -0.013em;
 }
 
 .brand span {
-  font: 500 10px/1 var(--mono);
+  font: 500 10.5px/1 var(--mono);
   color: var(--ink-3);
   letter-spacing: 0.06em;
 }
 
-.nav-group {
+/* ── Nav ─────────────────────────────────────────────────────────────────── */
+
+.nav {
   display: flex;
-  flex-direction: column;
-  gap: 1px;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
-.nav-group > .eyebrow {
-  padding: 0 18px 6px;
+/*
+ * A group is a run of entries, and the hairline between runs is the only thing left carrying the
+ * grouping visually — so it is drawn between groups and never before the first or after the last,
+ * where it would read as a divider against the brand or against the identity cluster.
+ */
+.nav-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.nav-group + .nav-group {
+  border-left: 1px solid var(--line);
+  padding-left: 14px;
 }
 
 .nav-item {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 7px 18px;
+  gap: 7px;
+  padding: 7px 11px;
+  border-radius: var(--r-control);
   color: var(--ink-2);
   text-decoration: none;
-  border-left: 2px solid transparent;
-  font-size: 13.5px;
+  font: 500 12.5px/1 var(--sans);
+  white-space: nowrap;
+  transition:
+    background var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
 }
 
 .nav-item:hover {
-  background: var(--surface-2);
+  background: var(--surface-3);
   color: var(--ink);
 }
 
+/*
+ * The current screen is filled, not underlined. An underline is what the imposter-detail tab strip
+ * uses one level down, and the two would read as the same control at two depths.
+ */
 .nav-item[aria-current="page"] {
-  border-left-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--ink);
+  background: var(--ink);
+  color: var(--surface);
   font-weight: 600;
+}
+
+.nav-item[aria-current="page"]:hover {
+  background: var(--ink);
+  color: var(--surface);
 }
 
 /*
@@ -270,12 +438,11 @@ code,
 }
 
 .nav-item .issue {
-  margin-left: auto;
-  font: 500 10.5px/1 var(--mono);
+  font: 500 10px/1 var(--mono);
   color: var(--ink-3);
   border: 1px solid var(--line);
-  border-radius: 2px;
-  padding: 2px 4px;
+  border-radius: 4px;
+  padding: 3px 5px;
   text-decoration: none;
 }
 
@@ -285,26 +452,24 @@ code,
 }
 
 .nav-item .glyph {
-  width: 14px;
+  width: 12px;
   text-align: center;
   color: var(--ink-3);
-  font-size: 11px;
+  font-size: 10.5px;
 }
 
 .nav-item[aria-current="page"] .glyph {
-  color: var(--accent);
+  color: var(--surface);
 }
 
-/* ── Top bar ───────────────────────────────────────────────────────────── */
+/* ── Identity cluster ────────────────────────────────────────────────────── */
 
-.topbar {
-  background: var(--surface);
-  border-bottom: 1px solid var(--line);
-  padding: 11px 22px;
+.who {
+  margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 16px;
-  min-height: 52px;
+  gap: 12px;
+  text-align: right;
 }
 
 .tenant-switch {
@@ -312,8 +477,8 @@ code,
   align-items: center;
   gap: 8px;
   border: 1px solid var(--line-2);
-  border-radius: 3px;
-  padding: 5px 9px;
+  border-radius: var(--r-control);
+  padding: 5px 10px;
   background: var(--surface);
 }
 
@@ -322,7 +487,7 @@ code,
 }
 
 .tenant-switch select {
-  font: 600 13px/1 var(--mono);
+  font: 500 12.5px/1 var(--mono);
   border: 0;
   background: transparent;
   color: var(--ink);
@@ -330,20 +495,12 @@ code,
   padding: 0;
 }
 
-.who {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  text-align: right;
-}
-
 .who .identity .id {
   font: 600 12.5px/1.35 var(--sans);
 }
 
 .who .identity .role {
-  font: 500 10px/1 var(--mono);
+  font: 400 10.5px/1 var(--mono);
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--ink-3);
@@ -359,12 +516,12 @@ code,
 .avatar {
   width: 28px;
   height: 28px;
-  border-radius: 3px;
+  border-radius: var(--r-control);
   background: var(--accent-soft);
   color: var(--accent);
   display: grid;
   place-items: center;
-  font: 700 11px/1 var(--mono);
+  font: 600 11px/1 var(--mono);
   border: 1px solid var(--accent);
   flex: none;
 }
@@ -433,7 +590,7 @@ main {
 .card {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   box-shadow: var(--shadow);
   overflow: hidden;
 }
@@ -471,7 +628,7 @@ main {
   gap: 11px;
   align-items: flex-start;
   padding: 11px 13px;
-  border-radius: 4px;
+  border-radius: var(--r-card);
   border: 1px solid;
   font-size: 13px;
 }
@@ -541,7 +698,7 @@ main {
 .fact {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   padding: 13px 14px;
   box-shadow: var(--shadow);
   display: flex;
@@ -638,7 +795,7 @@ main {
   gap: 5px;
   font: 600 11.5px/1 var(--sans);
   padding: 4px 8px 4px 6px;
-  border-radius: 3px;
+  border-radius: var(--r-pill);
   border: 1px solid;
   white-space: nowrap;
 }
@@ -712,7 +869,7 @@ table.dense th,
 
 table.dense td,
 .card table td {
-  padding: 9px 14px;
+  padding: 11px 16px;
   border-bottom: 1px solid var(--line);
   vertical-align: middle;
   overflow: hidden;
@@ -723,9 +880,14 @@ table.dense tbody tr:last-child td,
   border-bottom: 0;
 }
 
+/*
+ * `--surface-3`, not `--surface-2`. The header row is `--surface-2` and sticks to the top of a
+ * scrolling table, so a hover tint of the same value made the hovered row read as a second header
+ * mid-table. One step further from the surface separates them.
+ */
 table.dense tbody tr:hover,
 .card table tbody tr:hover {
-  background: var(--surface-2);
+  background: var(--surface-3);
 }
 
 table.dense .numeric,
@@ -786,16 +948,26 @@ input:not([type="checkbox"]):not([type="radio"]),
 select,
 textarea {
   font: 500 12.5px/1 var(--sans);
-  padding: 6px 10px;
+  padding: 8px 11px;
   border: 1px solid var(--line-2);
-  border-radius: 3px;
+  border-radius: var(--r-control);
   background: var(--surface);
   color: var(--ink);
+}
+
+/* Text entry is monospace throughout: every value typed into this console — a port, a path, a
+   status code, a JSON body — is an identifier rather than prose. */
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+  font-family: var(--mono);
+  font-weight: 400;
 }
 
 .btn,
 button.plain {
   cursor: pointer;
+  padding: 8px 13px;
 }
 
 /*
@@ -812,24 +984,42 @@ button.plain:hover:not([disabled]) {
   background: var(--surface-2);
 }
 
+/*
+ * Ink-filled, not accent-filled — the mockup's primary action, and the reason it works: the accent
+ * is already doing a job on this page (ports, owners, anything navigable), so an accent-filled
+ * button competes with every link around it. Ink is unused elsewhere as a fill, so exactly one
+ * thing per screen is solid dark, and that thing is the action.
+ */
 .btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
 }
 
+/*
+ * Not `filter: brightness()`. On the near-black ink fill it moves #1b1a18 to #1d1c19 — a change no
+ * one can see, so the button reads as dead on hover. An explicit step to the next ink stop is
+ * visible in both themes, where brightness is visible in neither.
+ */
 .btn.primary:hover:not([disabled]) {
-  filter: brightness(1.08);
+  background: var(--ink-2);
+  border-color: var(--ink-2);
 }
 
+/*
+ * `color: var(--surface)` rather than a literal `#fff`, which is a dark-theme fix as much as a
+ * tokenisation one: `--crit` inverts to a light salmon under `prefers-color-scheme: dark`, and
+ * white-on-salmon measured 1.9:1 — the destructive button was the least readable control in the
+ * console. Tracking the surface gives 5.8:1 in light and 7.7:1 in dark.
+ */
 .btn.danger {
   background: var(--crit);
   border-color: var(--crit);
-  color: #fff;
+  color: var(--surface);
 }
 
 .btn.danger:hover:not([disabled]) {
-  filter: brightness(1.08);
+  filter: brightness(0.94);
 }
 
 .btn.sm {
@@ -1026,7 +1216,7 @@ input[type="radio"] {
   padding: 18px 20px 16px;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--r-modal);
   box-shadow: var(--shadow);
 }
 
@@ -1064,7 +1254,7 @@ input[type="radio"] {
   align-items: center;
   gap: 9px;
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 
@@ -1090,7 +1280,7 @@ input[type="radio"] {
   padding: 9px 12px;
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
   font: 500 12px/1.5 var(--mono);
   color: var(--ink-2);
   text-align: left;
@@ -1151,7 +1341,7 @@ input[type="radio"] {
   padding: 11px 14px;
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-panel);
 }
 
 .scope .coverage {
@@ -1170,7 +1360,7 @@ input[type="radio"] {
   font: 650 10.5px/1 var(--mono);
   letter-spacing: 0.05em;
   padding: 3px 5px;
-  border-radius: 2px;
+  border-radius: 4px;
   border: 1px solid var(--line-2);
   color: var(--ink-2);
   background: var(--surface-2);
@@ -1222,16 +1412,22 @@ input[type="radio"] {
  * mock chose the path, headers and body. Always text in a <pre>, never interpreted as markup, and
  * scrolling inside its own box so a minified payload cannot stretch the page.
  */
+/*
+ * Payload viewers read on a dark panel, as the mockup has them. It is the one surface that does not
+ * follow the theme: a body of JSON is a code surface, and on a paper page it reads as one only by
+ * staying dark. `--panel-ink` measures 13.0:1 on it, so this is a contrast gain over the
+ * `--ink-2`-on-`--surface-2` it replaces.
+ */
 .payload,
 .stub-diff pre,
 .stub-body pre {
   margin: 0;
-  padding: 10px 12px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: 3px;
-  font: 500 12px/1.55 var(--mono);
-  color: var(--ink-2);
+  padding: 12px 13px;
+  background: var(--panel);
+  border: 1px solid var(--panel);
+  border-radius: var(--r-panel);
+  font: 400 12px/1.65 var(--mono);
+  color: var(--panel-ink);
   overflow-x: auto;
   white-space: pre;
   max-height: 200px;
@@ -1245,7 +1441,7 @@ input[type="radio"] {
 .diagnostics,
 .diag {
   border: 1px solid;
-  border-radius: 3px;
+  border-radius: var(--r-panel);
   padding: 10px 12px;
   font-size: 12.5px;
   max-width: 60rem;
@@ -1317,7 +1513,7 @@ input[type="radio"] {
   color: var(--ink-3);
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: 2px;
+  border-radius: 4px;
   padding: 3px 5px;
   min-width: 2.4ch;
   display: inline-block;
@@ -1337,7 +1533,7 @@ input[type="radio"] {
 .clause {
   font: 500 11px/1 var(--mono);
   border: 1px solid var(--line-2);
-  border-radius: 2px;
+  border-radius: 4px;
   padding: 3px 5px;
   color: var(--ink-2);
   background: var(--surface);
@@ -1355,7 +1551,7 @@ input[type="radio"] {
 .stub-editor {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   box-shadow: var(--shadow);
   padding: 14px;
 }
@@ -1390,7 +1586,7 @@ input[type="radio"] {
   display: grid;
   gap: 10px;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-card);
   padding: 10px;
 }
 
@@ -1408,7 +1604,7 @@ input[type="radio"] {
 .predicate-row-options {
   padding: 8px;
   background: var(--ground);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
 }
 
 .predicate-actions {
@@ -1422,7 +1618,7 @@ input[type="radio"] {
   gap: 6px;
   padding: 8px;
   border: 1px dashed var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
 }
 
 .predicate-group ul {
@@ -1463,7 +1659,7 @@ input[type="radio"] {
   display: grid;
   gap: 10px;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-card);
   padding: 10px;
 }
 
@@ -1472,7 +1668,7 @@ input[type="radio"] {
   gap: 8px;
   padding: 8px;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
 }
 
 .response-card-header {
@@ -1517,7 +1713,7 @@ input[type="radio"] {
  */
 .response-chaos {
   border: 1px dashed var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
   padding: 8px;
 }
 
@@ -1571,7 +1767,7 @@ input[type="radio"] {
 .code-editor {
   min-height: 20rem;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-control);
 }
 
 /*
@@ -1584,7 +1780,7 @@ input[type="radio"] {
   font: 500 12px/1.6 var(--mono);
   padding: 10px 12px;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-control);
   background: var(--surface-2);
   color: var(--ink);
   resize: vertical;
@@ -1597,7 +1793,7 @@ input[type="radio"] {
   align-items: flex-start;
   font-size: 12.5px;
   padding: 8px 10px;
-  border-radius: 3px;
+  border-radius: var(--r-panel);
   border: 1px solid var(--accent);
   background: var(--accent-soft);
   margin-top: 12px;
@@ -1675,7 +1871,7 @@ input[type="radio"] {
 .key-once {
   border: 1px solid var(--warn);
   background: var(--warn-soft);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   padding: 14px;
   display: flex;
   flex-direction: column;
@@ -1699,7 +1895,7 @@ input[type="radio"] {
   word-break: break-all;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-control);
   padding: 9px 11px;
   display: block;
 }
@@ -1736,7 +1932,7 @@ input[type="radio"] {
   width: min(430px, 100%);
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: var(--r-modal);
   box-shadow: var(--shadow);
   padding: 26px;
   display: flex;
@@ -1815,22 +2011,26 @@ input[type="radio"] {
 }
 
 /*
- * One concession to a narrow window, and it is not a mobile layout: the rail goes horizontal so a
- * half-width window is awkward rather than unusable. RFC-006 §10 still stands — nothing below is
- * designed for a phone.
+ * One concession to a narrow window, and it is not a mobile layout: the bar is already horizontal
+ * and already wraps, so all this does is stop the brand's divider from cutting across the wrap and
+ * let the identity cluster sit under the nav rather than being pushed off the end. RFC-006 §10
+ * still stands — nothing below is designed for a phone.
  */
 @media (max-width: 900px) {
-  .app {
-    grid-template-columns: 1fr;
+  .topbar {
+    padding: 10px 16px;
+    align-items: flex-start;
   }
 
-  .rail {
-    flex-direction: row;
-    overflow-x: auto;
+  .brand {
     border-right: 0;
-    border-bottom: 1px solid var(--line);
-    gap: 12px;
-    align-items: center;
+    padding-right: 0;
+  }
+
+  .who {
+    margin-left: 0;
+    width: 100%;
+    justify-content: flex-end;
   }
 }
 
@@ -1844,7 +2044,7 @@ input[type="radio"] {
   flex-wrap: wrap;
   gap: 10px;
   padding: 10px 14px;
-  border-bottom: 1px solid var(--rule);
+  border-bottom: 1px solid var(--line);
 }
 
 .filters .field {
@@ -1865,20 +2065,20 @@ input[type="radio"] {
 }
 
 .btn-link:hover {
-  color: var(--ink-1);
+  color: var(--ink);
 }
 
 .bulk-bar {
   align-items: center;
   gap: 8px;
   padding: 8px 14px;
-  border-bottom: 1px solid var(--rule);
+  border-bottom: 1px solid var(--line);
   background: var(--surface-2, transparent);
 }
 
 .bulk-report {
   padding: 8px 14px;
-  border-bottom: 1px solid var(--rule);
+  border-bottom: 1px solid var(--line);
 }
 
 .bulk-report-list {

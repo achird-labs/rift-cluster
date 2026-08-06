@@ -5,10 +5,12 @@ export const ISSUE_URL = (issue: number): string =>
   `https://github.com/achird-labs/rift-cluster/issues/${issue}`;
 
 /**
- * The rail's section headings, in render order.
+ * The nav bar's sections, in render order.
  *
- * Grouping is the design prototype's (`docs/design/console/console-prototype.html`), and the
- * unbuilt group is last on purpose: it is a roadmap, so it reads after the things that work.
+ * The bar is horizontal, so a group is no longer a heading over a stack — it is a run of entries
+ * between two hairlines. The grouping still decides the order and still shows in the layout; it
+ * just stops spending a line of vertical space on a label. The unbuilt group is last on purpose:
+ * it is a roadmap, so it reads after the things that work.
  */
 export const NAV_GROUPS = ["mocks", "fleet", "administration", "planned"] as const;
 export type NavGroup = (typeof NAV_GROUPS)[number];
@@ -20,11 +22,22 @@ export const GROUP_LABEL: Record<NavGroup, string> = {
   planned: "Not yet shipped",
 };
 
+/**
+ * What the nav bar prints, when the full label is too long for a horizontal strip.
+ *
+ * Constrained to a substring of `label`, and asserted so in `nav.test.ts`. The entry keeps its full
+ * label as its accessible name, and WCAG 2.5.3 (Label in Name) requires the visible text to appear
+ * in that name — otherwise "click Fleet" names a control no speech-input user can address. Omitted
+ * where the label already fits.
+ */
+export type ShortLabel = string;
+
 /** A screen this slice built. `requires` decides whether it is offered, not whether it is permitted. */
 export type LiveEntry = {
   kind: "live";
   id: string;
   label: string;
+  short?: ShortLabel;
   route: Route;
   requires: Capability;
   group: Exclude<NavGroup, "planned">;
@@ -83,6 +96,7 @@ export const NAV: readonly NavEntry[] = [
     kind: "live",
     id: "routes",
     label: "Front-door routes",
+    short: "Routes",
     route: { screen: "routes" },
     // The table is read with `Action::ImposterRead`; writing it needs `imposter.write`, which the
     // screen gates per control rather than hiding the whole screen from an operator who may read it.
@@ -94,6 +108,7 @@ export const NAV: readonly NavEntry[] = [
     kind: "live",
     id: "scenarios",
     label: "Scenarios & state",
+    short: "Scenarios",
     route: { screen: "scenarios", port: null, flow: null },
     // The weakest thing the screen can do, deliberately. Its controls gate individually — reset is
     // Operator, set-state and the flow-state write are Editor — so requiring a write capability
@@ -118,6 +133,7 @@ export const NAV: readonly NavEntry[] = [
     kind: "live",
     id: "cluster",
     label: "Cluster & fleet",
+    short: "Fleet",
     route: { screen: "cluster" },
     requires: "fleet.read",
     group: "fleet",
@@ -127,6 +143,7 @@ export const NAV: readonly NavEntry[] = [
     kind: "live",
     id: "administration",
     label: "Tenants & principals",
+    short: "Tenants",
     // `principals`, not `tenants`: the tenants tab is `ClusterAdmin`, while this entry is offered to
     // anyone holding `tenant.manage`. Landing a TenantAdmin on a tab its role cannot open — and
     // whose probe renders a bare refusal with no tab bar — left the role with no route to the two

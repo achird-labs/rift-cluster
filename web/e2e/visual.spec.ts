@@ -1,3 +1,5 @@
+import type { Page } from "@playwright/test";
+
 import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
 
 /**
@@ -16,6 +18,15 @@ import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
  * `prefers-color-scheme` and a control that vanishes in one theme is a real defect.
  */
 
+/**
+ * The nav, by role and accessible name rather than by class.
+ *
+ * It was `nav.rail` until the bar went horizontal, and a locator that a pure restyle can break is a
+ * locator asserting the wrong thing: what this baseline is about is the set of entries a role is
+ * offered, which the accessible name identifies and the class name only happened to.
+ */
+const navBar = (page: Page) => page.getByRole("navigation", { name: "Console sections" });
+
 /** Hide anything whose content legitimately changes between runs. */
 const VOLATILE = [
   // Applied index and last-error timestamps advance on their own.
@@ -23,17 +34,18 @@ const VOLATILE = [
 ];
 
 test.describe("component baselines", () => {
-  test("the nav rail", async ({ page }) => {
+  test("the nav bar", async ({ page }) => {
     await signIn(page, "fleet-admin");
-    await expect(page.locator("nav.rail")).toHaveScreenshot("rail-fleet-admin.png");
+    await expect(navBar(page)).toHaveScreenshot("nav-fleet-admin.png");
   });
 
-  test("the nav rail as a viewer, where most entries are not drawn", async ({ page }) => {
-    // The rail's shape *is* the RBAC surface. A baseline here fails if a control starts being
+  test("the nav bar as a viewer, where most entries are not drawn", async ({ page }) => {
+    // The bar's shape *is* the RBAC surface. A baseline here fails if a control starts being
     // offered to a role that cannot use it — the failure mode `rbac.ts` exists to prevent, caught
-    // visually rather than by assertion.
+    // visually rather than by assertion. Under the top-bar layout it also catches a group whose
+    // every entry is filtered away still drawing its separator.
     await signIn(page, "viewer");
-    await expect(page.locator("nav.rail")).toHaveScreenshot("rail-viewer.png");
+    await expect(navBar(page)).toHaveScreenshot("nav-viewer.png");
   });
 
   test("the topbar with identity and sign-out", async ({ page }) => {
@@ -74,7 +86,15 @@ test.describe("component baselines", () => {
   test("the imposter table", async ({ page }) => {
     await signIn(page, "editor");
     await goToScreen(page, "/imposters");
-    await expect(page.locator(".card").first()).toHaveScreenshot("imposter-table.png");
+    /*
+     * `.card:has(table.dense)`, not `.card").first()`.
+     *
+     * The first card on this screen stopped being the table when #251 added the tenant export
+     * control above it, and the baseline has been a picture of two export buttons ever since — so
+     * the table this test is named for has had no visual coverage at all, silently. A locator that
+     * says which card it wants cannot drift that way again.
+     */
+    await expect(page.locator(".card:has(table.dense)")).toHaveScreenshot("imposter-table.png");
   });
 
   test("the fleet stat tiles", async ({ page }) => {
