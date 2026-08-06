@@ -65,7 +65,7 @@ type Imposter = components["schemas"]["Imposter"];
 type SourceRecord = components["schemas"]["SourceRecord"];
 
 /**
- * 2a's four tiles.
+ * The screen's four tiles.
  *
  * Two of them are real and two are markers, and the split is the whole point of building it this
  * way rather than filling all four with plausible numbers:
@@ -320,7 +320,7 @@ export function Imposters(): ReactNode {
 
   return (
     /*
-     * 2a's landing shape: the screen, then a fixed fleet rail. The rail is complementary rather
+     * The landing shape: the screen, then a fixed fleet rail. The rail is complementary rather
      * than part of the list — it annotates the fleet the imposters live on — so it is an `aside`
      * outside `.screen-main` and after it in the DOM.
      */

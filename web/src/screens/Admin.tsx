@@ -903,6 +903,7 @@ function BindingsTab({ tenant }: { tenant: string }): ReactNode {
               <Ident>{p.displayName}</Ident> — {p.role ?? "no binding"}
               {mayManage ? (
                 <button
+                  className="btn sm danger"
                   type="button"
                   onClick={() => deleteBinding.mutate({ tenantId: tenant, principalId: p.id })}
                 >

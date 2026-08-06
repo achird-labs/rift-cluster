@@ -132,3 +132,14 @@ export function setTabVisibility(state: "visible" | "hidden"): void {
   document.dispatchEvent(new Event("visibilitychange"));
   window.dispatchEvent(new Event(state === "hidden" ? "blur" : "focus"));
 }
+
+/**
+ * Put the imposter detail on one of its tabs before rendering.
+ *
+ * The tab lives in the hash query so it is linkable, which means a test that wants the Settings
+ * panel sets the hash rather than clicking through — the same way a bookmark would arrive on it.
+ * Cleared by the same `window.location.hash = ""` the suites already run in `afterEach`.
+ */
+export function onDetailTab(tab: "stubs" | "requests" | "ownership" | "settings"): void {
+  window.location.hash = tab === "stubs" ? "#/" : `#/?tab=${tab}`;
+}

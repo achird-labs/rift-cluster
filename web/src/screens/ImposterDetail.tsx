@@ -3,11 +3,19 @@ import { type FormEvent, type ReactNode, useState } from "react";
 import { ApiError, apiGetText } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
 import { IMPOSTER_COLUMNS, type ImposterColumn } from "../app/contract.ts";
-import { type TrySpec, useImportAddImposter, useImposter, useTryStub } from "../app/queries.ts";
+import type { FleetView } from "../app/fleetView.ts";
+import {
+  type TrySpec,
+  useFleetView,
+  useImportAddImposter,
+  useImposter,
+  useTryStub,
+} from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { toHash } from "../app/routing.ts";
+import { toHash, useHashQuery } from "../app/routing.ts";
+import { DetailRail } from "../components/detailRail.tsx";
 import { ImposterField } from "../components/imposterFields.tsx";
-import { Card, Empty, ErrorNote, Ident, UNKNOWN } from "../components/primitives.tsx";
+import { Card, Empty, ErrorNote, Ident, UNKNOWN, UNNAMED } from "../components/primitives.tsx";
 import {
   type ExportProjection,
   cloneImposter,
@@ -18,6 +26,7 @@ import {
 import { projectPredicates } from "../features/stubs/predicates.ts";
 import { type Sample, sampleRequest, toCurl } from "../features/stubs/sample.ts";
 import { RecordingPanel } from "./RecordingPanel.tsx";
+import { RequestLog } from "./RequestLog.tsx";
 import { DeleteStubButton, StubEditor, type StubTarget } from "./StubEditor.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
@@ -74,15 +83,49 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
   const [cloning, setCloning] = useState(false);
   const mayWrite = can("imposter.write");
   const mayRead = can("imposter.read");
+  // Only to annotate this port's place on the ring. A principal without the fleet scope gets the
+  // rail without the epoch, never a 404 on a screen whose own read succeeded.
+  const fleet = useFleetView({ enabled: can("fleet.read") });
+
+  // In the hash query so a tab is linkable and survives a reload, the same rule the imposter
+  // list's filters follow. An unknown value falls back rather than throwing: a stale bookmark
+  // should render the imposter, not a blank screen.
+  const [search, setSearch] = useHashQuery();
+  const requested = new URLSearchParams(search).get("tab");
+  const tab: DetailTab =
+    DETAIL_TABS.find((entry) => entry.id === requested)?.id ?? "stubs";
+  const setTab = (next: DetailTab): void => {
+    const params = new URLSearchParams(search);
+    if (next === "stubs") params.delete("tab");
+    else params.set("tab", next);
+    setSearch(params.toString());
+  };
+
+  const name = imposter.isSuccess ? imposter.data.data.name : undefined;
+  const revision = imposter.isSuccess ? imposter.data.revision : null;
 
   return (
     <section className="screen">
-      <header className="screen-head">
-        <a href={toHash({ screen: "imposters" })}>&larr; Imposters</a>
-        <h1>
-          Imposter <Ident>{port}</Ident>
-        </h1>
-        <p className="scope-label">Served by this node from replicated state.</p>
+      {/* The name and port together, then the identity line under them —
+          tenant and revision, which are the two things an operator checks before editing. */}
+      <header className="screen-head detail-head">
+        <a className="btn" href={toHash({ screen: "imposters" })}>
+          &larr; Imposters
+        </a>
+        <div className="detail-title">
+          <h1>
+            {name ?? UNNAMED} <Ident>{port}</Ident>
+          </h1>
+          <p className="scope-label">
+            tenant <Ident>{tenant ?? "—"}</Ident>
+            {revision === null ? null : (
+              <>
+                {" · "}
+                <Ident>{revision}</Ident>
+              </>
+            )}
+          </p>
+        </div>
         <div className="spacer" />
         {mayWrite ? (
           <button
@@ -96,14 +139,13 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
         ) : null}
       </header>
 
+      <DetailTabs current={tab} onPick={setTab} />
+
       {imposter.isError ? <ErrorNote error={imposter.error} context="Could not read this imposter" /> : null}
       {imposter.isPending ? <p className="muted">Reading…</p> : null}
 
       {imposter.isSuccess ? (
         <>
-          {mayRead ? (
-            <ExportImposterControl port={port} name={imposter.data.data.name} tenant={tenant} />
-          ) : null}
           {cloning ? (
             <CloneImposter
               port={port}
@@ -112,28 +154,125 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
               onCancel={() => setCloning(false)}
             />
           ) : null}
-          <dl className="tiles">
-            {DETAIL_FIELDS.map((field) => (
-              <div key={field.key} className="tile">
-                <dt>{field.label}</dt>
-                <dd data-testid={`detail-${field.key}`}>
-                  <ImposterField imposter={imposter.data.data} field={field.key} />
-                </dd>
+
+          {tab === "stubs" ? (
+            /* The design splits this tab three ways — match order, the editor, the fleet rail. `Stubs`
+               already carries the first two side by side, so the split here is between it and the
+               rail rather than a third column bolted on. */
+            <div className="screen-split">
+              <div className="screen-main">
+                <Stubs
+                  port={port}
+                  imposter={imposter.data.data}
+                  revision={imposter.data.revision}
+                  mayWrite={mayWrite}
+                  editing={editing}
+                  onEdit={setEditing}
+                />
               </div>
-            ))}
-          </dl>
-          <RecordingPanel port={port} imposter={imposter.data.data} revision={imposter.data.revision} />
-          <Stubs
-            port={port}
-            imposter={imposter.data.data}
-            revision={imposter.data.revision}
-            mayWrite={mayWrite}
-            editing={editing}
-            onEdit={setEditing}
-          />
+              <DetailRail port={port} revision={imposter.data.revision} fleet={fleet.data} />
+            </div>
+          ) : null}
+
+          {tab === "requests" ? <RequestLog port={port} /> : null}
+
+          {tab === "ownership" ? (
+            <OwnershipTab port={port} revision={imposter.data.revision} fleet={fleet.data} />
+          ) : null}
+
+          {tab === "settings" ? (
+            <>
+              {mayRead ? (
+                <ExportImposterControl port={port} name={imposter.data.data.name} tenant={tenant} />
+              ) : null}
+              <dl className="tiles">
+                {DETAIL_FIELDS.map((field) => (
+                  <div key={field.key} className="tile">
+                    <dt>{field.label}</dt>
+                    <dd data-testid={`detail-${field.key}`}>
+                      <ImposterField imposter={imposter.data.data} field={field.key} />
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+              <RecordingPanel
+                port={port}
+                imposter={imposter.data.data}
+                revision={imposter.data.revision}
+              />
+            </>
+          ) : null}
         </>
       ) : null}
     </section>
+  );
+}
+
+const DETAIL_TABS = [
+  { id: "stubs", label: "Stubs" },
+  { id: "requests", label: "Requests" },
+  { id: "ownership", label: "Ownership" },
+  { id: "settings", label: "Settings" },
+] as const;
+
+type DetailTab = (typeof DETAIL_TABS)[number]["id"];
+
+/**
+ * The detail's tab strip.
+ *
+ * Real buttons in a `tablist`, not links: the tabs switch a panel within one screen rather than
+ * navigating, and `aria-selected` carries the choice so the underline is not the only signal. The
+ * selection lives in the hash query, so a tab is linkable and survives a reload — the same rule the
+ * imposter list's filters follow.
+ */
+function DetailTabs({
+  current,
+  onPick,
+}: {
+  current: DetailTab;
+  onPick: (tab: DetailTab) => void;
+}): ReactNode {
+  return (
+    <div className="tabs" role="tablist" aria-label="Imposter sections">
+      {DETAIL_TABS.map((entry) => (
+        <button
+          key={entry.id}
+          type="button"
+          role="tab"
+          data-testid={`detail-tab-${entry.id}`}
+          aria-selected={entry.id === current}
+          onClick={() => onPick(entry.id)}
+        >
+          {entry.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** The rail's facts at full width, for the tab whose whole subject they are. */
+function OwnershipTab({
+  port,
+  revision,
+  fleet,
+}: {
+  port: number;
+  revision: string | null;
+  fleet: FleetView | undefined;
+}): ReactNode {
+  return (
+    <div className="screen-split">
+      <div className="screen-main">
+        <Card title="Ownership">
+          <p className="muted">
+            Which node owns this port&rsquo;s flow state is decided by rendezvous hashing over the
+            ring. The ring&rsquo;s membership and epoch are published; the assignment itself is not,
+            so the console can show you the ring this port hashes against but not the answer.
+          </p>
+        </Card>
+      </div>
+      <DetailRail port={port} revision={revision} fleet={fleet} />
+    </div>
   );
 }
 

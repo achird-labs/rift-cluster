@@ -123,8 +123,14 @@ test.describe("roles get the console their bindings allow", () => {
     // `imposter.lifecycle` yes, `imposter.write` no — so neither authoring control is drawn.
     await expect(page.getByRole("button", { name: /add stub/i })).toHaveCount(0);
     await expect(page.getByTestId("clone-imposter")).toHaveCount(0);
-    // The read it may do still works, so this is gating rather than a screen that failed to load.
-    await expect(page.getByTestId("detail-port")).toContainText(String(imposters[0]));
+    /*
+     * The read it may do still works, so this is gating rather than a screen that failed to load.
+     *
+     * Asserted on the heading rather than the `detail-port` field: the fields moved onto the
+     * Settings tab, and the heading carries the port on every tab. That makes it the better probe
+     * for "the screen loaded" anyway — it cannot pass merely because one panel happened to render.
+     */
+    await expect(page.getByRole("heading", { level: 1 })).toContainText(String(imposters[0]));
   });
 
   test("an editor gets those same controls", async ({ page }) => {

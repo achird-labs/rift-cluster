@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 /**
  * The marker for a value the design draws and the fleet does not publish.
  *
- * 2a uses `NOT SHIPPED YET` for two whole screens it has designed ahead of the build. This is the
- * same device doing a narrower job: the panel or column is built to the design, but no endpoint
+ * The design marks two whole screens it drew ahead of the build `NOT SHIPPED YET`. This is the same
+ * device doing a narrower job: the panel or column is built to the design, but no endpoint
  * backs the number that belongs in it.
  *
  * It is deliberately none of a dash, a zero, a spinner, or an empty cell. Every one of those reads

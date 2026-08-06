@@ -4,7 +4,7 @@ import type { FleetView } from "../app/fleetView.ts";
 import { Unshipped, UnshippedPanel } from "./unshipped.tsx";
 
 /**
- * 2a's right rail: the hash ring, the control plane, and the merged tail.
+ * The fleet rail: the hash ring, the control plane, and the merged tail.
  *
  * Complementary to the screen rather than part of it, so it is an `aside` with its own label — a
  * screen reader reaches the imposter table without walking a ring diagram to get there.

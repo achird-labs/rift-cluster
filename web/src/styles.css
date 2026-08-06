@@ -2114,8 +2114,8 @@ input[type="radio"] {
   white-space: nowrap;
 }
 
-/* ── 2a: the split screen and its right rail ───────────────────────────────
-   The design's landing shape — screen on the left, a fixed 348px fleet rail on the right carrying
+/* ── The split screen and its right rail ───────────────────────────────────
+   The landing shape — screen on the left, a fixed 348px fleet rail on the right carrying
    the ring, the control plane and the merged tail. The rail is `aside` in the markup because it is
    complementary to the screen rather than part of it: a screen reader reaches the imposter table
    without walking a ring diagram first. */
@@ -2183,10 +2183,10 @@ input[type="radio"] {
 }
 
 /* ── The unshipped marker ──────────────────────────────────────────────────
-   2a's own device, borrowed for a second job.
+   The design's own device, borrowed for a second job.
 
-   The design uses `NOT SHIPPED YET` for two whole screens it has drawn ahead of the build. The same
-   marker answers a narrower question here: this panel is drawn, but the fleet publishes no endpoint
+   It marks two whole screens the design drew ahead of the build. The same marker answers a narrower
+   question here: this panel is drawn, but the fleet publishes no endpoint
    that would fill it (ring ownership per key, parked intents, a peer's applied index — the last of
    which `connect-src 'self'` puts permanently out of the console's reach).
 
@@ -2435,4 +2435,33 @@ td > .unshipped,
   border-color: var(--crit);
   background: var(--crit-soft);
   color: var(--crit);
+}
+
+/* ── Imposter detail head ──────────────────────────────────────────────────
+   The name and port on one line, the identity line under them. `.screen-head` lays its children out
+   end-aligned in a row, so the title and its scope label need their own stacking box to stay
+   together as the pair they read as. */
+
+.detail-head .detail-title {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.detail-head .detail-title h1 {
+  margin: 0;
+}
+
+.detail-head .detail-title .scope-label {
+  margin: 0;
+}
+
+/* The back link is a button by treatment and a link by behaviour — it navigates, so it stays an
+   anchor and only borrows `.btn`. Sized down: it is the least important control in the row. */
+.detail-head > a.btn {
+  font: 400 12px/1 var(--mono);
+  color: var(--ink-3);
+  padding: 7px 11px;
+  flex: none;
 }

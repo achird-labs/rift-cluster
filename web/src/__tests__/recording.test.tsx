@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { components } from "../api/schema.ts";
 import {
@@ -12,7 +12,7 @@ import {
   recordingState,
 } from "../features/recording/state.ts";
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { onDetailTab, renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
 
 type Stub = components["schemas"]["Stub"];
 
@@ -71,6 +71,14 @@ function routes(stubs: Stub[], opts: { recorded?: Stub[]; voters?: number[] } = 
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+/*
+ * Recording is imposter-level configuration, so the detail screen keeps it on the Settings tab.
+ * Every test here is about that panel, so they all start where it lives.
+ */
+beforeEach(() => {
+  onDetailTab("settings");
 });
 
 describe("recording state is read from the stubs, never remembered", () => {

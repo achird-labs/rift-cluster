@@ -12,7 +12,7 @@ describe("nav model", () => {
     // the four mock screens, then the two fleet-scoped ones, then administration. `sources` sits in
     // the fleet group rather than with the mocks because a source is a fleet-wide declaration
     // (leader-only poller, replicated to every node), which is also the only arrangement that puts
-    // it where 2a draws it without breaking the group-sorted invariant asserted below.
+    // it where the design draws it without breaking the group-sorted invariant asserted below.
     expect(liveEntries().map((e) => e.id)).toEqual([
       "imposters",
       "routes",
