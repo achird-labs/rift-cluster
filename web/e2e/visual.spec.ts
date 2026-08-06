@@ -93,7 +93,19 @@ test.describe("component baselines", () => {
      * control above it, and the baseline has been a picture of two export buttons ever since — so
      * the table this test is named for has had no visual coverage at all, silently. A locator that
      * says which card it wants cannot drift that way again.
+     *
+     * Filtered to one fixture imposter before capturing, because this suite shares a live fleet
+     * with the specs running beside it: `recording.spec.ts` and `oracle.spec.ts` both create
+     * throwaway imposters, so an unfiltered table is however many rows happened to exist at the
+     * moment of capture. That is exactly the "a row count and the whole page diffs" flakiness this
+     * file's header says it exists to avoid — it only became visible once the locator started
+     * capturing the real table.
      */
+    const { imposters } = fixture();
+    await page.getByTestId("imposter-filter-text").fill(String(imposters[0]));
+    // "1 of N" once a filter is active — N moves with what the other specs have created, which is
+    // precisely why the capture is filtered, so only the "1 of" prefix is asserted.
+    await expect(page.getByTestId("imposter-filter-count")).toContainText(/^1 of /);
     await expect(page.locator(".card:has(table.dense)")).toHaveScreenshot("imposter-table.png");
   });
 

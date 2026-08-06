@@ -214,7 +214,10 @@ test.describe("the imposter list agrees with the fleet", () => {
     await signIn(page, "editor");
     await page.getByTestId("imposter-name-4901").click();
     await expect(page).toHaveURL(/#\/imposters\/4901$/);
-    await expect(page.getByTestId("detail-port")).toContainText("4901");
+    // The heading, not `detail-port`: the contract fields moved onto the detail screen's Settings
+    // tab, and the heading carries the port on every tab — a better "this is the right screen"
+    // probe for the same reason.
+    await expect(page.getByRole("heading", { level: 1 })).toContainText("4901");
     // The authoring controls the whole screen exists for — the thing being unreachable cost.
     await expect(page.getByRole("button", { name: /add stub/i })).toBeVisible();
   });

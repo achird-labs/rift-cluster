@@ -831,12 +831,37 @@ function NewImposter({
   const [certKey, setCertKey] = useState("");
   const [invalid, setInvalid] = useState<string | null>(null);
 
+  /*
+   * The body this form will POST, built once and used by both the preview and the submit.
+   *
+   * One builder rather than two, deliberately: a preview assembled separately from the payload is
+   * a screenshot of a different request, and the failure is silent — it looks right and sends
+   * something else. `null` when the port is not yet a port, which is also what stops the preview
+   * rendering a body that could not be sent.
+   */
+  const parsedPort = Number(port);
+  const portOk = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535;
+  const draft: Imposter | null = portOk
+    ? {
+        port: parsedPort,
+        protocol,
+        recordRequests,
+        // Sent explicitly rather than left to the schema default: the contract marks it required (it
+        // carries a default, which `openapi-typescript` renders as non-optional), and a newly created
+        // imposter that arrived disabled would look like a create that half-worked.
+        enabled: true,
+        // Omitted rather than sent empty: the contract's fields are optional, and a blank name is not
+        // the same fact as no name.
+        ...(name.trim() === "" ? {} : { name: name.trim() }),
+        ...(protocol === "https" ? { cert: cert.trim(), key: certKey.trim() } : {}),
+      }
+    : null;
+
   function submit(event: FormEvent): void {
     event.preventDefault();
     // A port is 1–65535 and nothing else. Checked here so an obvious typo is a sentence next to the
     // field rather than a round trip that comes back as a 400 with no field to point at.
-    const parsed = Number(port);
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    if (draft === null) {
       setInvalid("Port must be a whole number between 1 and 65535.");
       return;
     }
@@ -845,19 +870,7 @@ function NewImposter({
       return;
     }
     setInvalid(null);
-    onCreate({
-      port: parsed,
-      protocol,
-      recordRequests,
-      // Sent explicitly rather than left to the schema default: the contract marks it required (it
-      // carries a default, which `openapi-typescript` renders as non-optional), and a newly created
-      // imposter that arrived disabled would look like a create that half-worked.
-      enabled: true,
-      // Omitted rather than sent empty: the contract's fields are optional, and a blank name is not
-      // the same fact as no name.
-      ...(name.trim() === "" ? {} : { name: name.trim() }),
-      ...(protocol === "https" ? { cert: cert.trim(), key: certKey.trim() } : {}),
-    });
+    onCreate(draft);
   }
 
   return (
@@ -937,6 +950,23 @@ function NewImposter({
           <p className="error" data-testid="new-imposter-invalid" role="alert">
             {invalid}
           </p>
+        )}
+
+        {/*
+          * What will be sent, before it is sent.
+          *
+          * The same object `submit` passes to `onCreate`, serialized — not a description of it. A
+          * `cert`/`key` pair is part of the imposter config and therefore replicates through Raft
+          * into every node's log and snapshot, which is a thing an operator should be able to SEE
+          * they are about to do rather than read about afterwards.
+          */}
+        {draft === null ? null : (
+          <div className="field">
+            <span className="eyebrow">Request body · POST /imposters</span>
+            <pre className="payload" data-testid="new-imposter-preview">
+              {JSON.stringify(draft, null, 2)}
+            </pre>
+          </div>
         )}
 
         <div className="row">
