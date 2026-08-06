@@ -11,7 +11,6 @@ import {
   ErrorNote,
   Ident,
   Truncated,
-  UNKNOWN,
 } from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
@@ -327,11 +326,15 @@ function Rows({
           <table className="dense">
             <thead>
               <tr>
-                <th style={{ width: "20ch" }}>Timestamp</th>
-                <th style={{ width: "10ch" }}>Method</th>
+                {/* Widths in px, sized to the values these columns actually hold: an RFC 3339
+                    timestamp with fractional seconds and an offset is ~32 characters, and a
+                    `host:port` is not 14. In `ch` they were narrow enough that a fixed-layout table
+                    clipped both mid-value. */}
+                <th style={{ width: "230px" }}>Timestamp</th>
+                <th style={{ width: "84px" }}>Method</th>
                 <th>Request</th>
-                <th style={{ width: "16ch" }}>Stub</th>
-                <th style={{ width: "16ch" }}>From</th>
+                <th style={{ width: "150px" }}>Stub</th>
+                <th style={{ width: "150px" }}>From</th>
               </tr>
             </thead>
             <tbody>
@@ -407,6 +410,45 @@ function Method({ method }: { method: string | undefined }): ReactNode {
  * innerHTML escape hatch is banned by lint — this component exists so that stays true in one place
  * rather than at every call site.
  */
+/**
+ * The stub that answered, or why the row cannot say.
+ *
+ * Four outcomes, kept apart because they mean different things to someone reading a log to find out
+ * why a request did what it did: a named winner, a winner the outcome does not name, a request that
+ * matched nothing, and a request nothing recorded an outcome for.
+ */
+function StubCell({ outcome }: { outcome: MatchOutcome | undefined }): ReactNode {
+  const view = describeOutcome(outcome);
+  switch (view.kind) {
+    case "matched":
+      /*
+       * The bare id in the column, `describeOutcome`'s fuller label only when there is no id.
+       * Classification comes from the shared reader either way — this is a display choice, not a
+       * second opinion about whether the request matched.
+       */
+      return typeof outcome?.stubId === "string" && outcome.stubId !== "" ? (
+        <Truncated value={outcome.stubId} max={18} />
+      ) : (
+        <span className="muted">{view.label}</span>
+      );
+    case "unmatched":
+      return (
+        <span className="status status-warn">
+          <span className="g" aria-hidden="true">
+            &#9650;
+          </span>
+          no match
+        </span>
+      );
+    case "unreadable":
+      return <span className="muted">unreadable</span>;
+    case "none":
+      // Not "did not match" — the schema says so explicitly, and the difference is the whole
+      // question when an operator is asking why a request went unanswered.
+      return <span className="muted">not recorded</span>;
+  }
+}
+
 function Row({
   request,
   mayWriteStubs,
@@ -436,25 +478,20 @@ function Row({
             <span className="path">{request.path ?? "—"}</span>
           </button>
         </td>
-        {/* Which stub answered — published per row as `stubId`, alongside `matched`. A request the
-            match walked past every stub for is a different fact from one whose stub had no id, so
-            the unmatched case says so rather than rendering an em dash both times. */}
+        {/*
+          Which stub answered, through `describeOutcome` rather than off the request.
+          
+          This read `request.stubId` and `request.matched` and showed an em dash for every row on a
+          live fleet, because neither is where the attribution lives: the engine sends it nested in
+          `matchOutcome`. `describeOutcome` is the module that already knows that, and it keeps four
+          states apart that a naive read collapses into one — the schema is explicit that an absent
+          outcome means "nothing recorded it", never "did not match".
+        */}
         <td className="ident">
-          {request.matched === false ? (
-            <span className="status status-warn">
-              <span className="g" aria-hidden="true">
-                &#9650;
-              </span>
-              no match
-            </span>
-          ) : typeof request.stubId === "string" ? (
-            <Truncated value={request.stubId} max={14} />
-          ) : (
-            UNKNOWN
-          )}
+          <StubCell outcome={request.matchOutcome} />
         </td>
         <td className="ident">
-          <Truncated value={request.requestFrom ?? "—"} max={14} />
+          <Truncated value={request.requestFrom ?? "—"} max={21} />
         </td>
       </tr>
       {open ? (

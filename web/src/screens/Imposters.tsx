@@ -1,4 +1,4 @@
-import { type ChangeEvent, type FormEvent, type ReactNode, useEffect, useState } from "react";
+import { type ChangeEvent, type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 
 import { ApiError, apiGetText } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
@@ -896,6 +896,20 @@ function NewImposter({
   const [certKey, setCertKey] = useState("");
   const [invalid, setInvalid] = useState<string | null>(null);
   const [step, setStep] = useState(0);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  /*
+   * Focus follows the step.
+   *
+   * Advancing replaces the button that was focused — Next and Create carry distinct keys so React
+   * swaps the node rather than mutating it — which left focus on `<body>`, outside the dialog.
+   * Escape then reached nothing and a keyboard user was silently ejected mid-decision.
+   *
+   * An effect rather than a `key` on the dialog: keying it would remount the whole subtree on every
+   * step, which is a great deal of churn to move a caret.
+   */
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, [step]);
   // The optional first stub. A predicate-less imposter answers every request with a bare 200, which
   // is a fine thing to want and a surprising thing to get by accident — so the step exists, and
   // skipping it is a choice rather than an omission.
@@ -972,12 +986,22 @@ function NewImposter({
 
   return (
     <div className="scrim" onKeyDown={(event) => { if (event.key === "Escape") onCancel(); }}>
+      {/*
+        `tabIndex={-1}` and focused on every step change.
+        
+        Advancing a step replaces the button that was focused (they carry distinct keys, so React
+        swaps the node rather than mutating it), which left focus on `<body>` — outside the dialog.
+        Escape then reached nothing, and a keyboard user was silently ejected from the modal
+        mid-decision. Moving focus to the dialog keeps both the key handler and the user inside it.
+      */}
       <div
         className="confirm wizard"
         role="dialog"
         aria-modal="true"
         aria-label="New imposter"
         data-testid="new-imposter-wizard"
+        tabIndex={-1}
+        ref={dialogRef}
       >
         <header className="wizard-head">
           <div>
