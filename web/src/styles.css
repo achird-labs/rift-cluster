@@ -1555,11 +1555,26 @@ input[type="radio"] {
  * `minmax(0, …)` on both tracks rather than `1fr`: a long unbroken body line in the editor would
  * otherwise force the grid wider than its container and scroll the whole page sideways.
  */
+/*
+ * `stretch`, not `start`.
+ *
+ * The form column runs to whatever height the stub needs — a few predicates and three responses is
+ * easily a thousand pixels — while the JSON pane sat at its 20rem minimum and left the rest of the
+ * row empty. Two views of one document should be the same height: the JSON is the document, and it
+ * is the pane an operator scrolls when the form cannot express something.
+ */
 .stub-panes {
   display: grid;
   grid-template-columns: minmax(0, 20rem) minmax(0, 1fr);
   gap: 14px;
-  align-items: start;
+  align-items: stretch;
+}
+
+.stub-panes > .code-editor,
+.stub-panes > .code-editor-fallback {
+  /* Tall documents scroll inside the editor rather than growing the page: the form beside it is the
+     thing being read down, and a JSON pane that pushed the page to 4000px would take it with it. */
+  max-height: 78vh;
 }
 
 .stub-panes > :only-child {
@@ -1760,6 +1775,7 @@ input[type="radio"] {
 
 .code-editor {
   min-height: 20rem;
+  height: 100%;
   border: 1px solid var(--line);
   border-radius: var(--r-control);
 }
@@ -3110,4 +3126,188 @@ input[type="radio"] {
 
 .toast-close:hover {
   opacity: 1;
+}
+
+/* ── Stub workspace ────────────────────────────────────────────────────────
+   The stubs in match order beside whichever one is open. The order is the screen's subject — the
+   matcher walks it top to bottom — so it stays visible while a stub is edited, which it did not
+   when the only view of it was a table below the editor. */
+
+.stub-workspace {
+  display: grid;
+  grid-template-columns: 290px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+  min-width: 0;
+}
+
+.stub-pane {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.stub-list {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 13px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stub-list > .eyebrow {
+  padding: 0 4px 2px;
+}
+
+.stub-list-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* A button, not a link: it opens a panel beside itself rather than navigating. */
+.stub-list-row {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--r-panel);
+  background: none;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.stub-list-row:hover:not([disabled]) {
+  background: var(--surface-3);
+}
+
+.stub-list-row.is-selected {
+  background: var(--surface);
+  border-color: var(--line-2);
+}
+
+/* A stub with no id cannot be addressed by the by-id routes, so it cannot be opened. Stated as a
+   disabled control rather than a click that quietly does nothing. */
+.stub-list-row[disabled] {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.stub-list-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.stub-list-n {
+  font: 500 11px/1 var(--mono);
+  color: var(--ink-3);
+  flex: none;
+}
+
+.stub-list-method {
+  font: 600 11.5px/1 var(--mono);
+  color: var(--accent);
+  flex: none;
+}
+
+.stub-list-target {
+  font: 400 12px/1.3 var(--mono);
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stub-list-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font: 400 10.5px/1.4 var(--mono);
+  color: var(--ink-3);
+  min-width: 0;
+}
+
+.stub-list-id {
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 12ch;
+}
+
+/* A predicate-less stub answers everything from its position on, so every stub below it is
+   unreachable — the one property of this list the rows cannot show on their own. */
+.stub-list-catchall {
+  font: 600 9px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 4px;
+  padding: 3px 5px;
+  flex: none;
+}
+
+.stub-list-add {
+  border: 1px dashed var(--line-2);
+  border-radius: var(--r-panel);
+  background: none;
+  color: var(--ink-3);
+  font: 400 12px/1 var(--mono);
+  padding: 11px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+.stub-list-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+@media (max-width: 1100px) {
+  .stub-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/*
+ * A table with more columns than the viewport.
+ *
+ * `table-layout: fixed` divides the available width between the columns it has — with twelve of
+ * them it compresses every one until values clip mid-character, which is worse than a scrollbar
+ * because a clipped URI still looks like a URI. A min-width makes the columns take the space they
+ * need and hands the overflow to `.scroll-x`, which is already wrapped around every one of these.
+ */
+table.dense.wide {
+  min-width: 1500px;
+}
+
+/* One row per gate still holding readiness. The word carries the state; the glyph and colour
+   reinforce it, per the status rule the token block sets out. */
+.gate-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.gate-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }

@@ -178,7 +178,10 @@ export function Sources(): ReactNode {
           bleed
         >
           <div className="scroll-x">
-            <table className="dense">
+            {/* `wide`: twelve columns do not fit 1600px, and `table-layout: fixed` compresses
+                rather than overflowing — so the URI rendered as `http://127.0.0.` and the drift
+                pill was cut mid-word. A min-width lets `.scroll-x` do the job it is there for. */}
+            <table className="dense wide">
               <thead>
                 <tr>
                   {SOURCE_COLUMNS.map((column) => (

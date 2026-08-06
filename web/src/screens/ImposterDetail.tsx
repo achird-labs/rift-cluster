@@ -26,6 +26,7 @@ import {
   exportQuery,
   selectImposter,
 } from "../features/imposters/portable.ts";
+import { matchOrder } from "../features/stubs/matchOrder.ts";
 import { projectPredicates } from "../features/stubs/predicates.ts";
 import { type Sample, sampleRequest, toCurl } from "../features/stubs/sample.ts";
 import { RecordingPanel } from "./RecordingPanel.tsx";
@@ -683,17 +684,27 @@ function Stubs({
   const editingStub =
     editing?.kind === "existing" ? stubs?.find((stub) => stub.id === editing.stubId) : undefined;
 
-  return (
-    <>
-      {mayWrite ? (
-        <nav className="pager">
-          <button className="btn sm" type="button" onClick={() => onEdit({ kind: "new" })}>
-            Add stub
-          </button>
-        </nav>
-      ) : null}
+  const open = editing !== null && (editing.kind === "new" || editingStub !== undefined);
 
-      {editing !== null && (editing.kind === "new" || editingStub !== undefined) ? (
+  return (
+    /*
+     * The design's two columns: the stubs in match order, then whichever one is open.
+     *
+     * Match order is the screen's whole subject — the matcher walks this list top to bottom and the
+     * first stub whose predicates hold answers — so it stays on screen while a stub is edited. The
+     * table underneath used to be the only way to see it, which meant the order vanished the moment
+     * an operator opened a stub to change it.
+     */
+    <div className="stub-workspace">
+      <StubList
+        stubs={stubs}
+        editing={editing}
+        mayWrite={mayWrite}
+        onEdit={onEdit}
+      />
+
+      <div className="stub-pane">
+      {open ? (
         <StubEditor
           /*
            * Keyed by the target, not by the stub's content. The imposter is polled, so `original`
@@ -707,16 +718,109 @@ function Stubs({
           revision={revision}
           onDone={() => onEdit(null)}
         />
-      ) : null}
+      ) : (
+        /*
+         * Nothing open: the full table, which carries what the column cannot — route, scenario,
+         * predicate and response counts, and the per-stub try controls. The design has no such
+         * table because its list is the whole navigator; keeping it here is a console-specific
+         * choice that costs nothing while a stub is open and loses nothing while none is.
+         */
+        <StubTable
+          port={port}
+          stubs={stubs}
+          revision={revision}
+          mayWrite={mayWrite}
+          onEdit={onEdit}
+        />
+      )}
+      </div>
+    </div>
+  );
+}
 
-      <StubTable
-        port={port}
-        stubs={stubs}
-        revision={revision}
-        mayWrite={mayWrite}
-        onEdit={onEdit}
-      />
-    </>
+/**
+ * The stubs in the order the matcher walks them.
+ *
+ * Each row says what it matches and what it answers, which is the pair an operator is comparing
+ * when they ask why a request went where it did. A stub with no predicates is marked: it answers
+ * everything from that position on, so every stub below it is unreachable — the one property of
+ * this list that is invisible from the rows themselves.
+ */
+function StubList({
+  stubs,
+  editing,
+  mayWrite,
+  onEdit,
+}: {
+  stubs: Stub[] | undefined;
+  editing: StubTarget | null;
+  mayWrite: boolean;
+  onEdit: (target: StubTarget | null) => void;
+}): ReactNode {
+  const entries = matchOrder(stubs);
+
+  return (
+    <aside className="stub-list" aria-label="Stubs in match order">
+      <h2 className="eyebrow">Stubs · match order</h2>
+
+      {/*
+        Nothing said here when there is nothing to list.
+        
+        The pane beside this one already states both empty cases — no stubs, versus a response that
+        carried no stub list — with the fuller copy and the testids that pin the distinction. Saying
+        it twice put the same sentence on screen in two places, which is how it read.
+      */}
+      {entries.length === 0 ? null : (
+        <ol className="stub-list-rows">
+          {entries.map((entry) => {
+            const selected =
+              editing?.kind === "existing" && entry.id !== null && editing.stubId === entry.id;
+            return (
+              <li key={`${String(entry.index)}-${entry.id ?? "unnamed"}`}>
+                <button
+                  type="button"
+                  className={`stub-list-row${selected ? " is-selected" : ""}`}
+                  data-testid={`stub-list-${String(entry.index)}`}
+                  /* A stub with no id has no by-id address, so it cannot be opened — the same rule
+                     the table's edit action follows, stated here as a disabled control rather than
+                     a click that silently does nothing. */
+                  disabled={entry.id === null}
+                  aria-current={selected ? "true" : undefined}
+                  onClick={() => entry.id !== null && onEdit({ kind: "existing", stubId: entry.id })}
+                >
+                  <span className="stub-list-head">
+                    <span className="stub-list-n">#{entry.index}</span>
+                    {entry.method === null ? null : (
+                      <span className="stub-list-method">{entry.method}</span>
+                    )}
+                    <span className="stub-list-target">
+                      {entry.target ?? (entry.catchAll ? "matches everything" : "no path predicate")}
+                    </span>
+                  </span>
+                  <span className="stub-list-meta">
+                    {entry.catchAll ? <span className="stub-list-catchall">catch-all</span> : null}
+                    <span>{entry.answer ?? "no response"}</span>
+                    {entry.responses > 1 ? <span>· cycles {entry.responses}</span> : null}
+                    <span className="stub-list-id">{entry.id ?? "no id"}</span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+
+      {mayWrite ? (
+        <button
+          type="button"
+          className="stub-list-add"
+          data-testid="stub-list-add"
+          onClick={() => onEdit({ kind: "new" })}
+        >
+          + add stub
+        </button>
+      ) : null}
+    </aside>
   );
 }
 

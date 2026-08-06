@@ -112,6 +112,38 @@ function View({ view }: { view: FleetView }): ReactNode {
       </Card>
 
       {/*
+       * Readiness gates as their own card, which is where the design puts them.
+       *
+       * `/readyz` publishes the gates that are still PENDING, not every gate and its state — so an
+       * empty card is the good case and has to say so, rather than reading as a panel that failed
+       * to load. The satisfied gates are not enumerable from here at all, which is why this counts
+       * what is outstanding rather than listing a checklist.
+       */}
+      <Card title="Readiness gates">
+        {view.pendingGates.length === 0 ? (
+          <p className="muted" data-testid="fleet-gates-clear">
+            No gate is holding readiness. <code>/readyz</code> reports only what is still pending, so
+            this is the whole of what it has to say — the gates it has already satisfied are not
+            enumerated.
+          </p>
+        ) : (
+          <ul className="gate-list" data-testid="fleet-gates-pending">
+            {view.pendingGates.map((gate) => (
+              <li key={gate}>
+                <span className="status status-warn">
+                  <span className="g" aria-hidden="true">
+                    &#9650;
+                  </span>
+                  pending
+                </span>
+                <Ident>{gate}</Ident>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      {/*
        * The ring and its members, side by side — the shape of the fleet next to the list of who is
        * in it. Both are read from `/_fleet/health` and `/_fleet/members`; neither is inferred.
        */}
