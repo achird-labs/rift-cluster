@@ -38,6 +38,7 @@ import {
   UNKNOWN,
   UnconfirmedNote,
 } from "../components/primitives.tsx";
+import { Pending } from "../components/pending.tsx";
 import { failureReason, hasMorePages, isApplied, nextSince } from "../features/admin/audit.ts";
 import { KEY_NOT_SHOWN_AGAIN } from "../features/admin/key.ts";
 import { assignableRoles } from "../features/admin/roles.ts";
@@ -288,7 +289,13 @@ function TenantsTab(): ReactNode {
             <tr>
               <th>Id</th>
               <th>Name</th>
-              <th>Quotas</th>
+              {/* The design splits the one "Quotas" cell into a column per quota, because the
+                  figure an operator looks for is usage against the limit rather than the limit —
+                  a limit is configuration, usage is the thing that moves. Usage is unpublished
+                  (#372), so each cell shows what is known over what is not. */}
+              <th className="numeric">Imposters</th>
+              <th className="numeric">Stubs / imposter</th>
+              <th className="numeric">Flow entries</th>
               <th>Journal retention</th>
               <th style={{ width: "12ch" }}>State</th>
               {mayManage ? <th>Actions</th> : null}
@@ -341,10 +348,17 @@ function TenantRow({
         <Ident>{tenant.id}</Ident>
       </td>
       <td>{tenant.displayName}</td>
-      <td>
-        {tenant.quotas?.maxImposters ?? UNKNOWN} imposters ·{" "}
-        {tenant.quotas?.maxStubsPerImposter ?? UNKNOWN} stubs/imposter ·{" "}
-        {tenant.quotas?.maxFlowEntries ?? UNKNOWN} flow entries
+      <td className="numeric quota-cell">
+        <Pending issue={372} reason="Per-tenant usage is not published — only the limit is." />
+        <span className="quota-limit">/ {tenant.quotas?.maxImposters ?? UNKNOWN}</span>
+      </td>
+      <td className="numeric quota-cell">
+        <Pending issue={372} reason="Per-tenant usage is not published — only the limit is." />
+        <span className="quota-limit">/ {tenant.quotas?.maxStubsPerImposter ?? UNKNOWN}</span>
+      </td>
+      <td className="numeric quota-cell">
+        <Pending issue={372} reason="Per-tenant usage is not published — only the limit is." />
+        <span className="quota-limit">/ {tenant.quotas?.maxFlowEntries ?? UNKNOWN}</span>
       </td>
       <td>{tenant.journalRetentionSecs === 0 ? "unlimited" : `${tenant.journalRetentionSecs}s`}</td>
       {/*
@@ -903,6 +917,7 @@ function BindingsTab({ tenant }: { tenant: string }): ReactNode {
               <Ident>{p.displayName}</Ident> — {p.role ?? "no binding"}
               {mayManage ? (
                 <button
+                  className="btn sm danger"
                   type="button"
                   onClick={() => deleteBinding.mutate({ tenantId: tenant, principalId: p.id })}
                 >

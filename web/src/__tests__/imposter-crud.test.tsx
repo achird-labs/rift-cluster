@@ -16,6 +16,19 @@ const LISTED = {
 
 afterEach(() => vi.unstubAllGlobals());
 
+/**
+ * Walk the create wizard from Identity to Review.
+ *
+ * The form is three steps now, so a test that fills the identity fields and looks for
+ * "Create imposter" would be asserting against a button that is two clicks away. Named rather than
+ * inlined, so what these tests are about stays visible: what gets sent, not how many Next clicks it
+ * took to send it.
+ */
+async function toReview(user: ReturnType<typeof userEvent.setup>): Promise<void> {
+  await user.click(screen.getByTestId("wizard-next"));
+  await user.click(screen.getByTestId("wizard-next"));
+}
+
 describe("creating an imposter", () => {
   it("is not offered to a role that cannot write", async () => {
     // Presentation only — the admin front refuses the same principal either way — but a button that
@@ -40,6 +53,7 @@ describe("creating an imposter", () => {
     await user.click(await screen.findByTestId("new-imposter"));
     await user.type(screen.getByLabelText(/^port$/i), "4600");
     await user.type(screen.getByLabelText(/^name$/i), "billing-api");
+    await toReview(user);
     await user.click(screen.getByRole("button", { name: /create imposter/i }));
 
     await waitFor(() => expect(calls.filter((c) => c === "/imposters").length).toBeGreaterThan(1));
@@ -50,14 +64,18 @@ describe("creating an imposter", () => {
   });
 
   it("refuses a port outside 1–65535 without a round trip", async () => {
-    // Named next to the field rather than returned as a 400 with nothing to point at.
+    /*
+     * Named next to the field rather than returned as a 400 with nothing to point at — and now
+     * caught on the way FORWARD rather than at submit. The port is the one field the later steps
+     * depend on, so finding out at the end would mean re-deciding the first stub too.
+     */
     stubFetch(LISTED);
     renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
 
     const user = userEvent.setup();
     await user.click(await screen.findByTestId("new-imposter"));
     await user.type(screen.getByLabelText(/^port$/i), "70000");
-    await user.click(screen.getByRole("button", { name: /create imposter/i }));
+    await user.click(screen.getByTestId("wizard-next"));
 
     expect((await screen.findByTestId("new-imposter-invalid")).textContent).toMatch(/65535/);
     expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
@@ -73,6 +91,10 @@ describe("creating an imposter", () => {
     await user.click(await screen.findByTestId("new-imposter"));
     await user.type(screen.getByLabelText(/^port$/i), "4600");
     await user.selectOptions(screen.getByLabelText(/protocol/i), "https");
+    // The key pair is checked at submit rather than on the way forward: unlike the port, nothing in
+    // the later steps depends on it, so blocking the operator at step 0 would be friction for no
+    // gain.
+    await toReview(user);
     await user.click(screen.getByRole("button", { name: /create imposter/i }));
 
     expect((await screen.findByTestId("new-imposter-invalid")).textContent).toMatch(/certificate/i);

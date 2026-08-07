@@ -1,12 +1,26 @@
 import { type ReactNode, useState } from "react";
 
 import type { components } from "../api/schema.ts";
-import { ApiError } from "../api/client.ts";
-import { useClearRequests, useImposter, useImposters, useRequestLog } from "../app/queries.ts";
+import {
+  MERGED_JOURNAL_FANOUT,
+  useAllRequests,
+  useClearRequests,
+  useImposter,
+  useImposters,
+  useRequestLog,
+} from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
+import { toHash } from "../app/routing.ts";
+import {
+  Confirm,
+  Empty,
+  ErrorNote,
+  Ident,
+  Truncated,
+} from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
+import { Pending } from "../components/pending.tsx";
 import type { RecordedRequest } from "../features/requests/source.ts";
 import { describeCoverage, headerValues, page } from "../features/requests/source.ts";
 import {
@@ -23,7 +37,7 @@ type Stub = components["schemas"]["Stub"];
 const PAGE_SIZE = 50;
 
 export function RequestLog({ port }: { port: number | null }): ReactNode {
-  if (port === null) return <ImposterPicker />;
+  if (port === null) return <MergedJournal />;
   // Keyed by port so the pager offset does not survive a switch to another imposter: React would
   // otherwise reuse `Log` at the same tree position, and an imposter with traffic would render as
   // an empty table paged past its end — the same lie the unknown/empty split exists to prevent.
@@ -124,6 +138,9 @@ function Log({ port }: { port: number }): ReactNode {
             </>
           }
           confirmLabel="Clear log"
+          // Fleet-wide, through Raft, and nothing restores the rows — so the port is typed rather
+          // than the dialog merely dismissed.
+          requireTyped={String(port)}
           busy={clear.isPending}
           onCancel={() => setConfirming(false)}
           onConfirm={() => {
@@ -295,14 +312,36 @@ function Rows({
   return (
     <>
       <section className="card">
+        {/*
+         * The design's journal carries NODE, STATUS and LATENCY beside these. None of the three is
+         * published: a recorded request names the client it came from, the stub that answered and
+         * when, but not which node served it, what status went back, or how long it took.
+         *
+         * Said once, here, rather than as a marker in every row. A column of fourteen identical
+         * "no endpoint" chips is noise; one sentence naming what is missing is information — and it
+         * keeps the table to the columns that actually carry a reading.
+         */}
+        <div className="card-head">
+          <h2>Request journal</h2>
+          <span className="muted">merge-on-read across the fleet&rsquo;s writer shards</span>
+          <div className="spacer" />
+          <span className="muted">
+            node, status and latency are not recorded per request
+          </span>
+        </div>
         <div className="scroll-x">
           <table className="dense">
             <thead>
               <tr>
-                <th style={{ width: "20ch" }}>Time</th>
-                <th style={{ width: "10ch" }}>Method</th>
-                <th>Path</th>
-                <th style={{ width: "18ch" }}>From</th>
+                {/* Widths in px, sized to the values these columns actually hold: an RFC 3339
+                    timestamp with fractional seconds and an offset is ~32 characters, and a
+                    `host:port` is not 14. In `ch` they were narrow enough that a fixed-layout table
+                    clipped both mid-value. */}
+                <th style={{ width: "230px" }}>Timestamp</th>
+                <th style={{ width: "84px" }}>Method</th>
+                <th>Request</th>
+                <th style={{ width: "150px" }}>Stub</th>
+                <th style={{ width: "150px" }}>From</th>
               </tr>
             </thead>
             <tbody>
@@ -378,6 +417,45 @@ function Method({ method }: { method: string | undefined }): ReactNode {
  * innerHTML escape hatch is banned by lint — this component exists so that stays true in one place
  * rather than at every call site.
  */
+/**
+ * The stub that answered, or why the row cannot say.
+ *
+ * Four outcomes, kept apart because they mean different things to someone reading a log to find out
+ * why a request did what it did: a named winner, a winner the outcome does not name, a request that
+ * matched nothing, and a request nothing recorded an outcome for.
+ */
+function StubCell({ outcome }: { outcome: MatchOutcome | undefined }): ReactNode {
+  const view = describeOutcome(outcome);
+  switch (view.kind) {
+    case "matched":
+      /*
+       * The bare id in the column, `describeOutcome`'s fuller label only when there is no id.
+       * Classification comes from the shared reader either way — this is a display choice, not a
+       * second opinion about whether the request matched.
+       */
+      return typeof outcome?.stubId === "string" && outcome.stubId !== "" ? (
+        <Truncated value={outcome.stubId} max={18} />
+      ) : (
+        <span className="muted">{view.label}</span>
+      );
+    case "unmatched":
+      return (
+        <span className="status status-warn">
+          <span className="g" aria-hidden="true">
+            &#9650;
+          </span>
+          no match
+        </span>
+      );
+    case "unreadable":
+      return <span className="muted">unreadable</span>;
+    case "none":
+      // Not "did not match" — the schema says so explicitly, and the difference is the whole
+      // question when an operator is asking why a request went unanswered.
+      return <span className="muted">not recorded</span>;
+  }
+}
+
 function Row({
   request,
   mayWriteStubs,
@@ -407,13 +485,25 @@ function Row({
             <span className="path">{request.path ?? "—"}</span>
           </button>
         </td>
+        {/*
+          Which stub answered, through `describeOutcome` rather than off the request.
+          
+          This read `request.stubId` and `request.matched` and showed an em dash for every row on a
+          live fleet, because neither is where the attribution lives: the engine sends it nested in
+          `matchOutcome`. `describeOutcome` is the module that already knows that, and it keeps four
+          states apart that a naive read collapses into one — the schema is explicit that an absent
+          outcome means "nothing recorded it", never "did not match".
+        */}
         <td className="ident">
-          <Truncated value={request.requestFrom ?? "—"} max={16} />
+          <StubCell outcome={request.matchOutcome} />
+        </td>
+        <td className="ident">
+          <Truncated value={request.requestFrom ?? "—"} max={21} />
         </td>
       </tr>
       {open ? (
         <tr data-testid="request-detail">
-          <td colSpan={4}>
+          <td colSpan={5}>
             <dl className="detail">
               <div className="kv">
                 <dt>Path</dt>
@@ -719,60 +809,156 @@ function formatQuery(query: Record<string, string> | undefined): string {
 }
 
 /** The log is per-imposter, so with no port in the hash the screen asks which one. */
-function ImposterPicker(): ReactNode {
+/**
+ * The fleet request journal — every imposter's recorded traffic in one table.
+ *
+ * The design's screen, assembled rather than read. There is no fleet-wide journal endpoint (#362):
+ * what exists is per-imposter, each already merged across the fleet's writer shards. So this reads
+ * several and orders the union by recorded timestamp.
+ *
+ * The panel states that, because the ordering is the part that cannot be guaranteed. Within one
+ * imposter the vector cursor makes the sequence authoritative; across imposters the timestamps come
+ * from whichever node served each request, so clock skew can transpose two entries recorded
+ * milliseconds apart. Adjacent rows from different ports are "about this order", and an operator
+ * reasoning about causality between two mocks needs to know that before they do it.
+ */
+function MergedJournal(): ReactNode {
   const imposters = useImposters();
+  const ports = (imposters.data ?? []).flatMap((imposter) =>
+    imposter.port === undefined ? [] : [imposter.port],
+  );
+  const named = new Map(
+    (imposters.data ?? []).map((imposter) => [imposter.port, imposter.name] as const),
+  );
+  const { rows, pending, failed, capped } = useAllRequests(ports);
+
   return (
     <section className="screen">
       <header className="screen-head">
         <h1>Request log</h1>
-        <p className="muted">Choose an imposter to read this node&rsquo;s recorded requests for.</p>
-      </header>
-      {imposters.isError ? (
-        <p className="error" role="alert">
-          {imposters.error instanceof ApiError
-            ? imposters.error.message
-            : "Could not read the imposter list."}
+        <p className="scope-label">
+          Every imposter&rsquo;s recorded requests, newest first.
         </p>
+      </header>
+
+      {imposters.isError ? (
+        <ErrorNote error={imposters.error} context="Could not read the imposter list" />
       ) : null}
-      {imposters.isPending ? <p className="muted">Reading…</p> : null}
-      {imposters.isSuccess && imposters.data.length === 0 ? (
+      {imposters.isPending || pending ? <p className="muted">Reading…</p> : null}
+
+      {/*
+       * The caveat rides above the table, permanently, and is not dismissible: it qualifies every
+       * row beneath it. A note that could be closed would leave an operator reading a merge as a
+       * sequence with nothing on screen to say otherwise.
+       */}
+      <div className="banner info" data-testid="merged-journal-caveat" role="status">
+        <span className="b-glyph" aria-hidden="true">
+          &#9670;
+        </span>
+        <div>
+          <strong>Merged by this console, not by the fleet.</strong>
+          <p>
+            Each imposter&rsquo;s journal is authoritative on its own — merged across the writer
+            shards and ordered by a vector cursor. This table unions several of them and sorts by
+            recorded timestamp, so two rows from <em>different</em> ports are in about this order
+            rather than in a known one: the timestamps come from whichever node served each request.
+            A fleet-wide journal is <a href="https://github.com/achird-labs/rift-cluster/issues/362" target="_blank" rel="noreferrer">#362</a>.
+          </p>
+        </div>
+      </div>
+
+      {capped > 0 || failed > 0 ? (
+        <div className="banner warn" data-testid="merged-journal-partial" role="status">
+          <span className="b-glyph" aria-hidden="true">
+            &#9650;
+          </span>
+          <div>
+            <strong>This is not the whole fleet.</strong>
+            <p>
+              {capped > 0
+                ? `${String(capped)} imposter${capped === 1 ? " was" : "s were"} not read — the fan-out is capped at ${String(MERGED_JOURNAL_FANOUT)}, because this screen polls every two seconds. `
+                : ""}
+              {failed > 0
+                ? `${String(failed)} read failed. `
+                : ""}
+              Open an imposter&rsquo;s own log for a complete answer about it.
+            </p>
+          </div>
+        </div>
+      ) : null}
+
+      {rows.length === 0 && !pending ? (
         <Empty
-          title="No imposters to read a log for"
-          body="The request log is per-imposter. Create one and its recorded requests appear here."
+          testId="merged-journal-empty"
+          title="No requests recorded across this tenant"
+          body="Recording is off by default for imposters created outside the console. An imposter with recording off answers normally and keeps nothing."
         />
       ) : null}
-      {imposters.isSuccess && imposters.data.length > 0 ? (
-        <Card title="Choose an imposter" bleed>
+
+      {rows.length === 0 ? null : (
+        <section className="card">
+          <div className="card-head">
+            <h2>Fleet request journal</h2>
+            <span className="muted">
+              {rows.length} across {Math.min(ports.length, MERGED_JOURNAL_FANOUT)} imposters
+            </span>
+            <div className="spacer" />
+            <span className="muted">node, status and latency are not recorded per request</span>
+          </div>
           <div className="scroll-x">
-            <table className="dense">
+            <table className="dense wide">
               <thead>
                 <tr>
-                  <th style={{ width: "12ch" }}>Port</th>
-                  <th>Name</th>
-                  <th style={{ width: "14ch" }} aria-label="Open" />
+                  <th style={{ width: "230px" }}>Timestamp</th>
+                  <th style={{ width: "110px" }}>Node</th>
+                  <th style={{ width: "150px" }}>Port</th>
+                  <th>Request</th>
+                  <th style={{ width: "110px" }}>Status</th>
+                  <th style={{ width: "150px" }}>Stub</th>
+                  <th style={{ width: "110px" }}>Latency</th>
                 </tr>
               </thead>
               <tbody>
-                {imposters.data.map((imposter) => (
-                  <tr key={imposter.port}>
+                {rows.map((row, index) => (
+                  <tr key={`${String(row.port)}-${String(index)}`} data-testid="merged-request-row">
+                    <td className="ident">{row.request.timestamp ?? "—"}</td>
                     <td>
-                      <span className="port">{imposter.port}</span>
+                      <Pending
+                        issue={364}
+                        reason="Which node served a request is not recorded. The journal merges across writer shards, but a row does not say which shard it came from."
+                      />
                     </td>
-                    <td>
-                      <Truncated value={imposter.name ?? "—"} />
-                    </td>
-                    <td>
-                      <a className="btn sm" href={`#/requests/${imposter.port}`}>
-                        Open log
+                    <td className="ident">
+                      <a href={toHash({ screen: "requests", port: row.port })}>
+                        {row.port}
                       </a>
+                      <span className="muted"> {named.get(row.port) ?? ""}</span>
+                    </td>
+                    <td className="ident">
+                      <Method method={row.request.method} /> {row.request.path ?? "—"}
+                    </td>
+                    <td>
+                      <Pending
+                        issue={364}
+                        reason="The response status is not recorded — the request is, the answer is not."
+                      />
+                    </td>
+                    <td className="ident">
+                      <StubCell outcome={row.request.matchOutcome} />
+                    </td>
+                    <td>
+                      <Pending
+                        issue={364}
+                        reason="How long the imposter took is not recorded."
+                      />
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-        </Card>
-      ) : null}
+        </section>
+      )}
     </section>
   );
 }

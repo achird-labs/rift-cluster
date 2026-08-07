@@ -227,7 +227,12 @@ default-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none
 Which means, concretely:
 
 - **No CDN anything.** No Google Fonts, no icon CDN, no remote images. Self-host
-  or use system font stacks.
+  or use system font stacks. The console self-hosts: `src/fonts/` carries the
+  IBM Plex faces `styles.css` declares, vite emits them under `/assets`, and
+  `src/__tests__/bundle-offline.test.ts` fails the build if any emitted asset
+  ever loads from another origin. Adding a face means adding a file there — a
+  `<link>` to fonts.googleapis.com is not a shortcut, it is a broken console on
+  an air-gapped network.
 - **Build-time CSS only.** Tailwind, CSS Modules and Vanilla Extract emit a
   static stylesheet and are fine. Runtime CSS-in-JS (emotion,
   styled-components) injects `<style>` at runtime; with no `style-src` declared

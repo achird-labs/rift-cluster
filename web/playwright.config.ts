@@ -69,16 +69,21 @@ export default defineConfig({
          * download rather than two, which keeps the CI cache smaller and the local setup shorter.
          */
         channel: CHANNEL,
-        // Pinned, because `prefers-color-scheme` selects an entire token set and the baselines are
-        // per-theme. The dark-mode project below flips exactly this.
+        /*
+         * Pinned light, and now the only theme there is.
+         *
+         * There was a `chromium-dark` project beside this one, running the visual specs a second
+         * time under `colorScheme: "dark"`, because the token set used to swap entirely on
+         * `prefers-color-scheme`. The console ships one palette now (see `styles.css`), so that
+         * project was re-photographing the same pixels — and its baselines were a second set to
+         * regenerate on every change for no coverage.
+         *
+         * Still stated explicitly rather than left to the runner's default: `color-scheme: light`
+         * means the page renders the same either way, and a baseline should not depend on the
+         * appearance setting of whichever machine recorded it.
+         */
         colorScheme: "light",
       },
-    },
-    {
-      name: "chromium-dark",
-      use: { ...devices["Desktop Chrome"], channel: CHANNEL, colorScheme: "dark" },
-      // Only the visual specs run twice; behaviour does not change with the palette.
-      testMatch: /visual\.spec\.ts/,
     },
   ],
 

@@ -4,6 +4,8 @@ import {
   cloneImposter,
   selectImposter,
   exportFilename,
+  PROJECTION_OPTIONS,
+  exportOptionsQuery,
   exportQuery,
   exportSetFilename,
   importPlan,
@@ -29,8 +31,33 @@ describe("export projections", () => {
   it("asks for the replay-ready projection by default, and the as-configured one on request", () => {
     // The difference is whether the importer keeps recording: `removeProxies` turns recorded proxy
     // responses into static stubs and drops the proxy stub itself.
-    expect(exportQuery("replay-ready")).toBe("?replayable=true&removeProxies=true");
-    expect(exportQuery("as-configured")).toBe("?replayable=true");
+    //
+    // Every flag is now sent rather than omitted when false. The route parses values rather than
+    // reading mere presence — `replayable=false` genuinely produces a different document — so this
+    // is the same request, said out loud. It has to be: the export dialog shows the operator the
+    // curl it is about to run, and a preview that hides a parameter is a preview of a different
+    // command.
+    //
+    // `tls` is the design's third option and the route does not implement it yet
+    // (`EXPORT_TLS_IS_INERT`). It is sent regardless so that the day the route learns it, this
+    // works with no further change — and so the curl an operator copies out of the dialog is the
+    // one the console ran.
+    expect(exportQuery("replay-ready")).toBe(
+      "?replayable=true&removeProxies=true&tls=false",
+    );
+    expect(exportQuery("as-configured")).toBe(
+      "?replayable=true&removeProxies=false&tls=false",
+    );
+  });
+
+  it("builds both projections through the one options builder", () => {
+    // The presets and the dialog's checkboxes must not be able to produce different URLs for the
+    // same intent: the drift would be silent, and the result is a file whose contents do not match
+    // the projection its own filename claims.
+    expect(exportQuery("replay-ready")).toBe(exportOptionsQuery(PROJECTION_OPTIONS["replay-ready"]));
+    expect(exportQuery("as-configured")).toBe(
+      exportOptionsQuery(PROJECTION_OPTIONS["as-configured"]),
+    );
   });
 
   it("names the file by port, and by name when there is one", () => {

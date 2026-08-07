@@ -1,4 +1,4 @@
-import { type ChangeEvent, type FormEvent, type ReactNode, useEffect, useState } from "react";
+import { type ChangeEvent, type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 
 import { ApiError, apiGetText } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
@@ -18,7 +18,11 @@ import {
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { toHash, useHashQuery } from "../app/routing.ts";
-import { ImposterField } from "../components/imposterFields.tsx";
+import { ExportDialog } from "../components/exportDialog.tsx";
+import { FleetRail } from "../components/fleetRail.tsx";
+import { ImposterField, stubCountOf } from "../components/imposterFields.tsx";
+import { Pending } from "../components/pending.tsx";
+import { useToast } from "../components/toast.tsx";
 import {
   type BulkAction,
   BulkBar,
@@ -32,6 +36,7 @@ import {
   actionablePorts,
   decodeQuery,
   encodeQuery,
+  driftedPorts,
   sourceOwnedPorts,
   unclassifiedCount,
   visibleImposters,
@@ -47,10 +52,10 @@ import {
   UnconfirmedNote,
 } from "../components/primitives.tsx";
 import {
-  type ExportProjection,
+  type ExportOptions,
   type ImportEntry,
   type ImportPlan,
-  exportQuery,
+  exportOptionsQuery,
   exportSetFilename,
   importPlan,
   parseImportDocument,
@@ -60,6 +65,83 @@ import { type Finding, lintStub } from "../features/stubs/lint.ts";
 import type { CommitOutcome } from "../features/writes/commit.ts";
 
 type Imposter = components["schemas"]["Imposter"];
+type SourceRecord = components["schemas"]["SourceRecord"];
+
+/**
+ * The screen's four tiles.
+ *
+ * Two of them are real and two are markers, and the split is the whole point of building it this
+ * way rather than filling all four with plausible numbers:
+ *
+ * - **Imposters / stubs** — counted from the list this screen already holds.
+ * - **Sources / drifted** — counted from `/admin/sources`, the same read the provenance filter uses.
+ *   Absent entirely for a principal without `source.read`, rather than shown as zero: "you may not
+ *   ask" and "the answer is none" are different facts.
+ * - **Requests · fleet sum** — `numberOfRequests` reaches the imposter body only through a
+ *   non-exhaustive index signature, which is exactly the client-side guess `contract.ts` was written
+ *   to refuse. Summing it here would launder a value the contract rejects one file away.
+ * - **Parked intents** — no endpoint publishes the parked-write queue at all.
+ */
+function ImposterTiles({
+  imposters,
+  sources,
+  maySeeSources,
+}: {
+  imposters: readonly Imposter[];
+  sources: readonly SourceRecord[] | undefined;
+  maySeeSources: boolean;
+}): ReactNode {
+  /*
+   * `stubCountOf`, not `stubs?.length`. The list projection omits the stub array and sends
+   * `stubCount` instead, so reading the array here summed to zero on the one screen this tile is
+   * for — the same trap `imposterFields.tsx` documents for the column beside it. `null` means the
+   * response carried neither, which is not the same fact as an imposter with no stubs, so the
+   * total is only shown when every row answered.
+   */
+  const counts = imposters.map((imposter) => stubCountOf(imposter));
+  const stubTotal = counts.every((n) => n !== null)
+    ? counts.reduce((sum: number, n) => sum + (n ?? 0), 0)
+    : null;
+  const drifted = sources?.filter((source) => source.drifted === true).length ?? 0;
+
+  return (
+    <dl className="tiles">
+      <div className="tile">
+        <dt className="eyebrow">Imposters</dt>
+        <dd className="v">{imposters.length}</dd>
+        <dd className="note">
+          {stubTotal === null ? "stub count not in this response" : `${String(stubTotal)} ${stubTotal === 1 ? "stub" : "stubs"}`}
+        </dd>
+      </div>
+
+      <div className="tile">
+        <dt className="eyebrow">Requests · fleet sum</dt>
+        <dd className="v-plain">
+          <Pending issue={363} reason="No schema'd field carries a request count on the imposter list. `numberOfRequests` arrives only through the body's non-exhaustive index signature, which app/contract.ts refuses on purpose." />
+        </dd>
+        <dd className="note">counted per imposter on the request log</dd>
+      </div>
+
+      {maySeeSources ? (
+        <div className={`tile${drifted > 0 ? " is-warn" : ""}`}>
+          <dt className="eyebrow">Sources</dt>
+          <dd className="v">{sources?.length ?? 0}</dd>
+          <dd className="note">
+            {drifted === 0 ? "none drifted" : `${String(drifted)} drifted`}
+          </dd>
+        </div>
+      ) : null}
+
+      <div className="tile">
+        <dt className="eyebrow">Parked intents</dt>
+        <dd className="v-plain">
+          <Pending issue={360} reason="The parked-write queue is not published. Under --cluster-admin-async a write can be accepted and replayed later, but no endpoint reports how many are outstanding." />
+        </dd>
+        <dd className="note">accepted, awaiting replay</dd>
+      </div>
+    </dl>
+  );
+}
 
 /**
  * Trigger a browser download of text this console already has in hand — never re-fetched, never
@@ -95,6 +177,7 @@ export function Imposters(): ReactNode {
   const remove = useDeleteImposter();
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [confirming, setConfirming] = useState<Imposter | null>(null);
   // Only to qualify what the list shows. A principal without the fleet scope simply gets no
   // qualification — never a 404 error on a screen whose own read succeeded.
@@ -139,9 +222,10 @@ export function Imposters(): ReactNode {
   const maySeeSources = can("source.read");
   const sources = useSources({ enabled: maySeeSources });
   const sourceOwned = sourceOwnedPorts(sources.data?.sources);
+  const drifted = driftedPorts(sources.data?.sources);
 
   const all = imposters.data ?? [];
-  const rows = visibleImposters(all, query, sourceOwned);
+  const rows = visibleImposters(all, query, sourceOwned, drifted);
   const unclassified = unclassifiedCount(all, query, sourceOwned);
 
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
@@ -240,271 +324,308 @@ export function Imposters(): ReactNode {
   }
 
   return (
-    <section className="screen">
-      <header className="screen-head">
-        <h1>Imposters</h1>
-        <p className="scope-label" data-testid="imposters-scope-label">
-          Served by this node from replicated state.
-          {confidence.partial ? ` This node is degraded: ${confidence.reason}.` : ""}
-          {confidence.unknown ? ` Caveat: ${confidence.reason}.` : ""}
-        </p>
-        <div className="spacer" />
-        {mayCreate ? (
-          <button
-            className="btn"
-            type="button"
-            data-testid="open-import"
-            onClick={() => setImporting(true)}
-          >
-            Import
-          </button>
-        ) : null}
-        {mayCreate ? (
-          <button
-            className="btn primary"
-            type="button"
-            data-testid="new-imposter"
-            onClick={() => setCreating(true)}
-          >
-            New imposter
-          </button>
-        ) : null}
-      </header>
-
-      {mayExport ? <ExportSetControl tenant={tenant} /> : null}
-
-      {importing ? (
-        <ImportPanel
-          existingPorts={existingPorts}
-          existingCount={imposters.data?.length ?? 0}
-          mayWrite={mayCreate}
-          mayReplace={mayReplace}
-          onClose={() => setImporting(false)}
-        />
-      ) : null}
-
-      {create.isError ? (
-        <ErrorNote error={create.error} context="The imposter was not created" />
-      ) : null}
-      {/*
-        Suppressed while a batch owns the outcome. These notes are the SINGLE-row vocabulary: during
-        a bulk run they report only the last item, name no port, and sit alongside a per-item report
-        that already says more — and they outlive dismissing it.
-      */}
-      {remove.isError && !batchOwnsOutcome ? (
-        <ErrorNote error={remove.error} context="The imposter was not deleted" />
-      ) : null}
-      {create.data?.kind === "unobservable" ? <UnconfirmedNote reason={create.data.reason} /> : null}
-      {remove.data?.kind === "unobservable" && !batchOwnsOutcome ? (
-        <UnconfirmedNote reason={remove.data.reason} />
-      ) : null}
-
-      {creating ? (
-        <NewImposter
-          busy={create.isPending}
-          onCancel={() => setCreating(false)}
-          onCreate={(body) =>
-            create.mutate(body, {
-              // Closes only on success. A refused create that dismissed its own form would take the
-              // operator's typing with it and leave the error pointing at a screen with no form.
-              onSuccess: () => setCreating(false),
-            })
-          }
-        />
-      ) : null}
-
-      {confirming === null ? null : (
-        <Confirm
-          testId="confirm-delete-imposter"
-          title={`Delete ${confirming.name ?? `imposter ${confirming.port ?? ""}`}?`}
-          body={
-            <>
-              This removes the imposter, its stubs, its recorded requests and its flow state across
-              the fleet. Nothing undoes it.
-            </>
-          }
-          confirmLabel={`Delete ${confirming.name ?? confirming.port ?? "imposter"}`}
-          busy={remove.isPending}
-          onCancel={() => setConfirming(null)}
-          onConfirm={() => {
-            const port = confirming.port;
-            if (port !== undefined) remove.mutate({ port });
-            setConfirming(null);
-          }}
-        />
-      )}
-
-      {imposters.isError ? <ErrorNote error={imposters.error} context="Could not list imposters" /> : null}
-      {toggle.isError && !batchOwnsOutcome ? (
-        <ErrorNote error={toggle.error} context="That change did not take effect" />
-      ) : null}
-      {toggle.data?.kind === "unobservable" && !batchOwnsOutcome ? (
-        <UnconfirmedNote reason={toggle.data.reason} />
-      ) : null}
-
-      {imposters.isPending ? <p className="muted">Reading…</p> : null}
-
-      {imposters.isSuccess && imposters.data.length === 0 ? (
-        <EmptyState
-          uncertain={confidence.partial || confidence.unknown}
-          reason={confidence.reason}
-        />
-      ) : null}
-
-      {imposters.isSuccess && imposters.data.length > 0 ? (
-        <Card title="Imposters" bleed>
-          <ImposterFilters
-            query={query}
-            onChange={setQuery}
-            onReset={() => setQuery(EMPTY_QUERY)}
-            shown={rows.length}
-            total={all.length}
-            unclassified={unclassified}
-            showOwner={sourceOwned !== null}
-          />
-
-          {bulkActions.length > 0 ? (
-            <BulkBar
-              count={effective.length}
-              actions={bulkActions}
-              running={running}
-              progress={progress}
-              onAct={(action) => setConfirmingBulk(action)}
-              onClear={() => setSelected(new Set())}
-            />
+    /*
+     * The landing shape: the screen, then a fixed fleet rail. The rail is complementary rather
+     * than part of the list — it annotates the fleet the imposters live on — so it is an `aside`
+     * outside `.screen-main` and after it in the DOM.
+     */
+    <section className="screen screen-split">
+      <div className="screen-main">
+        <header className="screen-head">
+          <h1>Imposters</h1>
+          <p className="scope-label" data-testid="imposters-scope-label">
+            Served by this node from replicated state.
+            {confidence.partial ? ` This node is degraded: ${confidence.reason}.` : ""}
+            {confidence.unknown ? ` Caveat: ${confidence.reason}.` : ""}
+          </p>
+          <div className="spacer" />
+          {/* Export sits with Import and New imposter rather than in a card below the tiles: it is
+              an action on this screen's subject, and the header is where this screen's actions are.
+              It opens a dialog because the choice it carries — what actually lands in the file —
+              needs more than a button label to state. */}
+          {mayExport ? (
+            <button
+              className="btn"
+              type="button"
+              data-testid="export-imposters"
+              onClick={() => setExporting(true)}
+            >
+              Export
+            </button>
           ) : null}
+          {mayCreate ? (
+            <button
+              className="btn"
+              type="button"
+              data-testid="open-import"
+              onClick={() => setImporting(true)}
+            >
+              Import
+            </button>
+          ) : null}
+          {mayCreate ? (
+            <button
+              className="btn primary"
+              type="button"
+              data-testid="new-imposter"
+              onClick={() => setCreating(true)}
+            >
+              New imposter
+            </button>
+          ) : null}
+        </header>
 
-          {report === null ? null : (
-            <BulkReport
-              result={report.result}
-              verb={report.verb}
-              onDismiss={() => setReport(null)}
-            />
-          )}
+        <ImposterTiles
+          imposters={all}
+          sources={sources.data?.sources}
+          maySeeSources={maySeeSources}
+        />
 
-          {rows.length === 0 ? (
-            <p className="muted" data-testid="imposters-no-matches">
-              No imposter in this tenant matches that filter.
-            </p>
-          ) : (
-            <div className="scroll-x">
-              <table className="dense">
-                <thead>
-                  <tr>
-                    {bulkActions.length > 0 ? (
-                      <th className="select-col">
-                        {/*
-                          Select-all means "everything the current filter shows", which is what the
-                          label says out loud. Selecting rows the operator cannot see is the one
-                          behaviour a bulk delete must never have.
-                        */}
-                        <input
-                          type="checkbox"
-                          data-testid="imposter-select-all"
-                          aria-label={`Select all ${visiblePorts.size} shown`}
-                          checked={allVisibleSelected}
-                          disabled={running !== null || visiblePorts.size === 0}
-                          onChange={(event) =>
-                            /*
-                              Union in, and remove only what is shown — individual ticks accumulate
-                              across filter changes, so a select-all that REPLACED the set would
-                              silently discard ticks made under a previous filter. The two paths
-                              have to agree or the count is a lie in one of them.
-                            */
-                            setSelected((current) => {
-                              const next = new Set(current);
-                              for (const port of visiblePorts) {
-                                if (event.target.checked) next.add(port);
-                                else next.delete(port);
-                              }
-                              return next;
-                            })
-                          }
-                        />
-                      </th>
-                    ) : null}
-                    {IMPOSTER_COLUMNS.map((column) =>
-                      column.key === "port" || column.key === "name" || column.key === "stubs" ? (
-                        <SortHeader
-                          key={column.key}
-                          label={column.label}
-                          column={column.key}
-                          query={query}
-                          onChange={setQuery}
-                          numeric={column.numeric}
-                        />
-                      ) : (
-                        <th key={column.key} className={column.numeric ? "numeric" : undefined}>
-                          {column.label}
-                        </th>
-                      ),
-                    )}
-                    {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((imposter, index) => (
-                    <Row
-                      key={imposter.port ?? `unnamed-${index}`}
-                      imposter={imposter}
-                      mayToggle={mayToggle}
-                      mayDelete={mayDelete}
-                      busy={toggle.isPending}
-                      selectable={bulkActions.length > 0}
-                      selected={imposter.port !== undefined && selected.has(imposter.port)}
-                      selectionDisabled={running !== null}
-                      onSelect={(port, checked) =>
-                        setSelected((current) => {
-                          const next = new Set(current);
-                          if (checked) next.add(port);
-                          else next.delete(port);
-                          return next;
-                        })
-                      }
-                      onToggle={(port, enable) => toggle.mutate({ port, enable })}
-                      onDelete={() => setConfirming(imposter)}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Card>
+        {mayExport && exporting ? (
+        <ExportSetControl tenant={tenant} count={all.length} onClose={() => setExporting(false)} />
       ) : null}
 
-      {confirmingBulk === null ? null : (
-        <Confirm
-          testId="confirm-bulk-imposters"
-          title={`${confirmingBulk.label} ${effective.length} imposter${effective.length === 1 ? "" : "s"}?`}
-          body={
-            <>
-              {/*
-                The exact count and, for a delete, the exact ports. There is no bulk endpoint — this
-                is one call per imposter, and some may be refused — so the dialog says that here
-                rather than letting a half-applied batch be the first the operator hears of it.
-              */}
-              This runs one request per imposter. Some may be refused; the batch does not stop at the
-              first failure, and every outcome is reported.
-              {confirmingBulk.key === "delete" ? (
-                <>
-                  {" "}
-                  Deleting removes each imposter, its stubs, its recorded requests and its flow state
-                  across the fleet. Nothing undoes it. Ports:{" "}
-                  <code data-testid="confirm-bulk-ports">{effective.join(", ")}</code>
-                </>
-              ) : null}
-            </>
-          }
-          confirmLabel={`${confirmingBulk.label} ${effective.length}`}
-          busy={running !== null}
-          onCancel={() => setConfirmingBulk(null)}
-          onConfirm={() => {
-            const action = confirmingBulk;
-            setConfirmingBulk(null);
-            void runAction(action);
-          }}
-        />
-      )}
+        {importing ? (
+          <ImportPanel
+            existingPorts={existingPorts}
+            existingCount={imposters.data?.length ?? 0}
+            mayWrite={mayCreate}
+            mayReplace={mayReplace}
+            onClose={() => setImporting(false)}
+          />
+        ) : null}
+
+        {create.isError ? (
+          <ErrorNote error={create.error} context="The imposter was not created" />
+        ) : null}
+        {/*
+          Suppressed while a batch owns the outcome. These notes are the SINGLE-row vocabulary: during
+          a bulk run they report only the last item, name no port, and sit alongside a per-item report
+          that already says more — and they outlive dismissing it.
+        */}
+        {remove.isError && !batchOwnsOutcome ? (
+          <ErrorNote error={remove.error} context="The imposter was not deleted" />
+        ) : null}
+        {create.data?.kind === "unobservable" ? <UnconfirmedNote reason={create.data.reason} /> : null}
+        {remove.data?.kind === "unobservable" && !batchOwnsOutcome ? (
+          <UnconfirmedNote reason={remove.data.reason} />
+        ) : null}
+
+        {creating ? (
+          <NewImposter
+            busy={create.isPending}
+            onCancel={() => setCreating(false)}
+            onCreate={(body) =>
+              create.mutate(body, {
+                // Closes only on success. A refused create that dismissed its own form would take the
+                // operator's typing with it and leave the error pointing at a screen with no form.
+                onSuccess: () => setCreating(false),
+              })
+            }
+          />
+        ) : null}
+
+        {confirming === null ? null : (
+          <Confirm
+            testId="confirm-delete-imposter"
+            title={`Delete ${confirming.name ?? `imposter ${confirming.port ?? ""}`}?`}
+            body={
+              <>
+                This removes the imposter, its stubs, its recorded requests and its flow state across
+                the fleet. Nothing undoes it.
+              </>
+            }
+            confirmLabel={`Delete ${confirming.name ?? confirming.port ?? "imposter"}`}
+            busy={remove.isPending}
+            onCancel={() => setConfirming(null)}
+            onConfirm={() => {
+              const port = confirming.port;
+              if (port !== undefined) remove.mutate({ port });
+              setConfirming(null);
+            }}
+          />
+        )}
+
+        {imposters.isError ? <ErrorNote error={imposters.error} context="Could not list imposters" /> : null}
+        {toggle.isError && !batchOwnsOutcome ? (
+          <ErrorNote error={toggle.error} context="That change did not take effect" />
+        ) : null}
+        {toggle.data?.kind === "unobservable" && !batchOwnsOutcome ? (
+          <UnconfirmedNote reason={toggle.data.reason} />
+        ) : null}
+
+        {imposters.isPending ? <p className="muted">Reading…</p> : null}
+
+        {imposters.isSuccess && imposters.data.length === 0 ? (
+          <EmptyState
+            uncertain={confidence.partial || confidence.unknown}
+            reason={confidence.reason}
+          />
+        ) : null}
+
+        {imposters.isSuccess && imposters.data.length > 0 ? (
+          <Card title="Imposters" bleed>
+            <ImposterFilters
+              query={query}
+              onChange={setQuery}
+              onReset={() => setQuery(EMPTY_QUERY)}
+              shown={rows.length}
+              total={all.length}
+              unclassified={unclassified}
+              showOwner={sourceOwned !== null}
+            />
+
+            {bulkActions.length > 0 ? (
+              <BulkBar
+                count={effective.length}
+                actions={bulkActions}
+                running={running}
+                progress={progress}
+                onAct={(action) => setConfirmingBulk(action)}
+                onClear={() => setSelected(new Set())}
+              />
+            ) : null}
+
+            {report === null ? null : (
+              <BulkReport
+                result={report.result}
+                verb={report.verb}
+                onDismiss={() => setReport(null)}
+              />
+            )}
+
+            {rows.length === 0 ? (
+              <p className="muted" data-testid="imposters-no-matches">
+                No imposter in this tenant matches that filter.
+              </p>
+            ) : (
+              <div className="scroll-x">
+                <table className="dense">
+                  <thead>
+                    <tr>
+                      {bulkActions.length > 0 ? (
+                        <th className="select-col">
+                          {/*
+                            Select-all means "everything the current filter shows", which is what the
+                            label says out loud. Selecting rows the operator cannot see is the one
+                            behaviour a bulk delete must never have.
+                          */}
+                          <input
+                            type="checkbox"
+                            data-testid="imposter-select-all"
+                            aria-label={`Select all ${visiblePorts.size} shown`}
+                            checked={allVisibleSelected}
+                            disabled={running !== null || visiblePorts.size === 0}
+                            onChange={(event) =>
+                              /*
+                                Union in, and remove only what is shown — individual ticks accumulate
+                                across filter changes, so a select-all that REPLACED the set would
+                                silently discard ticks made under a previous filter. The two paths
+                                have to agree or the count is a lie in one of them.
+                              */
+                              setSelected((current) => {
+                                const next = new Set(current);
+                                for (const port of visiblePorts) {
+                                  if (event.target.checked) next.add(port);
+                                  else next.delete(port);
+                                }
+                                return next;
+                              })
+                            }
+                          />
+                        </th>
+                      ) : null}
+                      {IMPOSTER_COLUMNS.map((column) =>
+                        column.key === "port" || column.key === "name" || column.key === "stubs" ? (
+                          <SortHeader
+                            key={column.key}
+                            label={column.label}
+                            column={column.key}
+                            query={query}
+                            onChange={setQuery}
+                            numeric={column.numeric}
+                          />
+                        ) : (
+                          <th key={column.key} className={column.numeric ? "numeric" : undefined}>
+                            {column.label}
+                          </th>
+                        ),
+                      )}
+                      {/* The design's two extra columns. `Owner` is the ring's flow owner, which
+                          nothing publishes (#359); `Provenance` is a real join this screen already
+                          computes for its filter, so it renders. */}
+                      <th style={{ width: "14ch" }}>Owner</th>
+                      <th style={{ width: "16ch" }}>Provenance</th>
+                      {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((imposter, index) => (
+                      <Row
+                        key={imposter.port ?? `unnamed-${index}`}
+                        imposter={imposter}
+                        sourceOwned={sourceOwned}
+                        drifted={drifted}
+                        mayToggle={mayToggle}
+                        mayDelete={mayDelete}
+                        busy={toggle.isPending}
+                        selectable={bulkActions.length > 0}
+                        selected={imposter.port !== undefined && selected.has(imposter.port)}
+                        selectionDisabled={running !== null}
+                        onSelect={(port, checked) =>
+                          setSelected((current) => {
+                            const next = new Set(current);
+                            if (checked) next.add(port);
+                            else next.delete(port);
+                            return next;
+                          })
+                        }
+                        onToggle={(port, enable) => toggle.mutate({ port, enable })}
+                        onDelete={() => setConfirming(imposter)}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        ) : null}
+
+        {confirmingBulk === null ? null : (
+          <Confirm
+            testId="confirm-bulk-imposters"
+            title={`${confirmingBulk.label} ${effective.length} imposter${effective.length === 1 ? "" : "s"}?`}
+            body={
+              <>
+                {/*
+                  The exact count and, for a delete, the exact ports. There is no bulk endpoint — this
+                  is one call per imposter, and some may be refused — so the dialog says that here
+                  rather than letting a half-applied batch be the first the operator hears of it.
+                */}
+                This runs one request per imposter. Some may be refused; the batch does not stop at the
+                first failure, and every outcome is reported.
+                {confirmingBulk.key === "delete" ? (
+                  <>
+                    {" "}
+                    Deleting removes each imposter, its stubs, its recorded requests and its flow state
+                    across the fleet. Nothing undoes it. Ports:{" "}
+                    <code data-testid="confirm-bulk-ports">{effective.join(", ")}</code>
+                  </>
+                ) : null}
+              </>
+            }
+            confirmLabel={`${confirmingBulk.label} ${effective.length}`}
+            busy={running !== null}
+            onCancel={() => setConfirmingBulk(null)}
+            onConfirm={() => {
+              const action = confirmingBulk;
+              setConfirmingBulk(null);
+              void runAction(action);
+            }}
+          />
+        )}
+      </div>
+      <FleetRail fleet={fleet.data} />
     </section>
   );
 }
@@ -589,6 +710,8 @@ function Row({
   onSelect,
   onToggle,
   onDelete,
+  sourceOwned,
+  drifted,
 }: {
   imposter: Imposter;
   mayToggle: boolean;
@@ -600,6 +723,9 @@ function Row({
   onSelect: (port: number, checked: boolean) => void;
   onToggle: (port: number, enable: boolean) => void;
   onDelete: () => void;
+  /** `null` when `source.read` was refused or the read has not landed — not "hand-created". */
+  sourceOwned: ReadonlySet<number> | null;
+  drifted: ReadonlySet<number> | null;
 }): ReactNode {
   const port = imposter.port;
   const label = imposter.name ?? (port === undefined ? UNKNOWN : String(port));
@@ -626,10 +752,42 @@ function Row({
         </td>
       ) : null}
       {IMPOSTER_COLUMNS.map((column) => (
-        <td key={column.key} className={column.numeric ? "numeric" : undefined}>
+        <td
+          key={column.key}
+          className={column.numeric ? "numeric" : undefined}
+          data-testid={`imposter-cell-${column.key}-${port ?? "unnamed"}`}
+        >
           <ImposterField imposter={imposter} field={column.key} renderName={nameLink(imposter)} />
         </td>
       ))}
+      <td>
+        <Pending
+          issue={359}
+          reason="Which ring member owns this port's flow state is not published. The ring's membership and epoch are; the assignment is not."
+        />
+      </td>
+      {/*
+        Provenance is real, and the three states are genuinely different facts: a source owns this
+        port and has drifted from it, a source owns it cleanly, or nothing declared it. `null` — the
+        source read was refused or has not happened — is a fourth, and says so rather than claiming
+        the imposter was hand-created.
+      */}
+      <td className="ident">
+        {sourceOwned === null ? (
+          <span className="muted">not read</span>
+        ) : port !== undefined && drifted?.has(port) === true ? (
+          <span className="status status-warn">
+            <span className="g" aria-hidden="true">
+              &#9650;
+            </span>
+            drifted
+          </span>
+        ) : port !== undefined && sourceOwned.has(port) ? (
+          "source"
+        ) : (
+          "hand-created"
+        )}
+      </td>
       {mayToggle || mayDelete ? (
         <td>
           {/* Rendered only for a role that holds the matching action. RFC-006 §3 rule 3: this is
@@ -737,13 +895,84 @@ function NewImposter({
   const [cert, setCert] = useState("");
   const [certKey, setCertKey] = useState("");
   const [invalid, setInvalid] = useState<string | null>(null);
+  const [step, setStep] = useState(0);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  /*
+   * Focus follows the step.
+   *
+   * Advancing replaces the button that was focused — Next and Create carry distinct keys so React
+   * swaps the node rather than mutating it — which left focus on `<body>`, outside the dialog.
+   * Escape then reached nothing and a keyboard user was silently ejected mid-decision.
+   *
+   * An effect rather than a `key` on the dialog: keying it would remount the whole subtree on every
+   * step, which is a great deal of churn to move a caret.
+   */
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, [step]);
+  // The optional first stub. A predicate-less imposter answers every request with a bare 200, which
+  // is a fine thing to want and a surprising thing to get by accident — so the step exists, and
+  // skipping it is a choice rather than an omission.
+  const [stubMethod, setStubMethod] = useState("GET");
+  const [stubPath, setStubPath] = useState("");
+  const [stubStatus, setStubStatus] = useState("200");
+  const [stubBody, setStubBody] = useState("");
+
+  /*
+   * The body this form will POST, built once and used by both the preview and the submit.
+   *
+   * One builder rather than two, deliberately: a preview assembled separately from the payload is
+   * a screenshot of a different request, and the failure is silent — it looks right and sends
+   * something else. `null` when the port is not yet a port, which is also what stops the preview
+   * rendering a body that could not be sent.
+   */
+  const parsedPort = Number(port);
+  const portOk = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535;
+  const draft: Imposter | null = portOk
+    ? {
+        port: parsedPort,
+        protocol,
+        recordRequests,
+        // Sent explicitly rather than left to the schema default: the contract marks it required (it
+        // carries a default, which `openapi-typescript` renders as non-optional), and a newly created
+        // imposter that arrived disabled would look like a create that half-worked.
+        enabled: true,
+        // Omitted rather than sent empty: the contract's fields are optional, and a blank name is not
+        // the same fact as no name.
+        ...(name.trim() === "" ? {} : { name: name.trim() }),
+        ...(protocol === "https" ? { cert: cert.trim(), key: certKey.trim() } : {}),
+        /*
+         * The first stub, only when a path was given. An empty predicate would match everything,
+         * which is the behaviour an imposter already has with no stubs at all — so a blank step
+         * adds nothing rather than adding a catch-all nobody asked for.
+         */
+        ...(stubPath.trim() === ""
+          ? {}
+          : {
+              stubs: [
+                {
+                  predicates: [
+                    { equals: { method: stubMethod, path: stubPath.trim() } },
+                  ],
+                  responses: [
+                    {
+                      is: {
+                        statusCode: Number(stubStatus) || 200,
+                        ...(stubBody.trim() === "" ? {} : { body: stubBody }),
+                      },
+                    },
+                  ],
+                },
+              ],
+            }),
+      }
+    : null;
 
   function submit(event: FormEvent): void {
     event.preventDefault();
     // A port is 1–65535 and nothing else. Checked here so an obvious typo is a sentence next to the
     // field rather than a round trip that comes back as a 400 with no field to point at.
-    const parsed = Number(port);
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    if (draft === null) {
       setInvalid("Port must be a whole number between 1 and 65535.");
       return;
     }
@@ -752,24 +981,51 @@ function NewImposter({
       return;
     }
     setInvalid(null);
-    onCreate({
-      port: parsed,
-      protocol,
-      recordRequests,
-      // Sent explicitly rather than left to the schema default: the contract marks it required (it
-      // carries a default, which `openapi-typescript` renders as non-optional), and a newly created
-      // imposter that arrived disabled would look like a create that half-worked.
-      enabled: true,
-      // Omitted rather than sent empty: the contract's fields are optional, and a blank name is not
-      // the same fact as no name.
-      ...(name.trim() === "" ? {} : { name: name.trim() }),
-      ...(protocol === "https" ? { cert: cert.trim(), key: certKey.trim() } : {}),
-    });
+    onCreate(draft);
   }
 
   return (
-    <Card title="New imposter">
-      <form className="stub-form" onSubmit={submit} data-testid="new-imposter-form">
+    <div className="scrim" onKeyDown={(event) => { if (event.key === "Escape") onCancel(); }}>
+      {/*
+        `tabIndex={-1}` and focused on every step change.
+        
+        Advancing a step replaces the button that was focused (they carry distinct keys, so React
+        swaps the node rather than mutating it), which left focus on `<body>` — outside the dialog.
+        Escape then reached nothing, and a keyboard user was silently ejected from the modal
+        mid-decision. Moving focus to the dialog keeps both the key handler and the user inside it.
+      */}
+      <div
+        className="confirm wizard"
+        role="dialog"
+        aria-modal="true"
+        aria-label="New imposter"
+        data-testid="new-imposter-wizard"
+        tabIndex={-1}
+        ref={dialogRef}
+      >
+        <header className="wizard-head">
+          <div>
+            <h2>New imposter</h2>
+            <p className="muted">POST /imposters &mdash; a replicated control op</p>
+          </div>
+          <ol className="wizard-steps">
+            {WIZARD_STEPS.map((label, index) => (
+              <li
+                key={label}
+                className={index === step ? "is-current" : index < step ? "is-done" : undefined}
+                aria-current={index === step ? "step" : undefined}
+              >
+                <span className="wizard-dot">{index < step ? "\u2713" : index + 1}</span>
+                {label}
+              </li>
+            ))}
+          </ol>
+        </header>
+
+      <form className="stub-form wizard-form" onSubmit={submit} data-testid="new-imposter-form">
+        <div className="wizard-body">
+        {step === 0 ? (
+        <>
         <div className="field-row">
           <div className="field">
             <label htmlFor="new-port">Port</label>
@@ -839,6 +1095,67 @@ function NewImposter({
             </span>
           </span>
         </label>
+        </>
+        ) : null}
+
+        {step === 1 ? (
+          <>
+            <p className="muted">
+              An imposter with no stubs answers every request with a bare 200. Give it one now — the
+              rest go in the editor.
+            </p>
+            <div className="field-row">
+              <div className="field">
+                <label htmlFor="new-stub-method">Method</label>
+                <select
+                  id="new-stub-method"
+                  value={stubMethod}
+                  onChange={(event) => setStubMethod(event.target.value)}
+                >
+                  {["GET", "POST", "PUT", "PATCH", "DELETE"].map((verb) => (
+                    <option key={verb} value={verb}>
+                      {verb}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field grow">
+                <label htmlFor="new-stub-path">Path</label>
+                <input
+                  id="new-stub-path"
+                  value={stubPath}
+                  data-testid="new-stub-path"
+                  placeholder="/v1/orders"
+                  onChange={(event) => setStubPath(event.target.value)}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="new-stub-status">Status</label>
+                <input
+                  id="new-stub-status"
+                  inputMode="numeric"
+                  value={stubStatus}
+                  onChange={(event) => setStubStatus(event.target.value)}
+                />
+              </div>
+            </div>
+            <div className="field">
+              <label htmlFor="new-stub-body">Body</label>
+              <textarea
+                id="new-stub-body"
+                value={stubBody}
+                placeholder='{"ok":true}'
+                onChange={(event) => setStubBody(event.target.value)}
+              />
+            </div>
+            <p className="hint">
+              Leave the path blank to create the imposter with no stubs at all — which is a real
+              choice, not a skipped step: it answers everything with a bare 200 until you add one.
+            </p>
+          </>
+        ) : null}
+
+        {step === 2 ? <ReviewStep draft={draft} /> : null}
 
         {invalid === null ? null : (
           <p className="error" data-testid="new-imposter-invalid" role="alert">
@@ -846,16 +1163,124 @@ function NewImposter({
           </p>
         )}
 
-        <div className="row">
-          <button className="btn primary" type="submit" disabled={busy}>
-            {busy ? "Creating…" : "Create imposter"}
-          </button>
-          <button className="btn" type="button" onClick={onCancel} disabled={busy}>
-            Cancel
-          </button>
         </div>
+
+        <footer className="wizard-foot">
+          <span className={invalid === null ? "muted" : "warn-text"}>
+            {step === 2
+              ? "Writes replicate — every node converges on this imposter."
+              : `Step ${String(step + 1)} of ${String(WIZARD_STEPS.length)}`}
+          </span>
+          <div className="row">
+            <button className="btn" type="button" onClick={onCancel} disabled={busy}>
+              Cancel
+            </button>
+            {step > 0 ? (
+              <button
+                className="btn"
+                type="button"
+                data-testid="wizard-back"
+                onClick={() => setStep(step - 1)}
+                disabled={busy}
+              >
+                Back
+              </button>
+            ) : null}
+            {/*
+              Distinct `key`s, and they are load-bearing rather than tidiness.
+              
+              Without them React reuses one DOM node for both — same position, same element type —
+              and only mutates its type and handler. A click already in flight on "Next" then lands
+              on "Create imposter" and creates the imposter without the operator ever seeing the
+              review step. Keying them apart makes React replace the node, so that click hits a
+              detached element and does nothing, which is the correct outcome for a press that was
+              aimed at a different control.
+            */}
+            {step < WIZARD_STEPS.length - 1 ? (
+              <button
+                key="advance"
+                className="btn primary"
+                type="button"
+                data-testid="wizard-next"
+                /* Validating on the way forward rather than only at submit: the port is the one
+                   field that can be wrong in a way the later steps depend on, and finding out at
+                   the end means re-deciding the stub too. */
+                onClick={() => {
+                  if (step === 0 && draft === null) {
+                    setInvalid("Port must be a whole number between 1 and 65535.");
+                    return;
+                  }
+                  setInvalid(null);
+                  setStep(step + 1);
+                }}
+                disabled={busy}
+              >
+                Next
+              </button>
+            ) : (
+              <button key="create" className="btn primary" type="submit" disabled={busy}>
+                {busy ? "Creating…" : "Create imposter"}
+              </button>
+            )}
+          </div>
+        </footer>
       </form>
-    </Card>
+      </div>
+    </div>
+  );
+}
+
+const WIZARD_STEPS = ["Identity", "First stub", "Review"] as const;
+
+/**
+ * The last step: exactly what will be sent, and what the fleet will do with it.
+ *
+ * The design ends this step with "`Idempotency-Key` is sent with the request, so a retry after a
+ * timeout can never double-apply". The console does not send one — the API defines the header and
+ * no call site sets it (#371) — so that sentence is not printed. What replaces it is the true
+ * version, which is also the more useful one, because it tells an operator what a timeout here
+ * actually means for them.
+ */
+function ReviewStep({ draft }: { draft: Imposter | null }): ReactNode {
+  return (
+    <div className="wizard-review">
+      <div>
+        <span className="eyebrow">Request body · POST /imposters</span>
+        <pre className="payload" data-testid="new-imposter-preview">
+          {draft === null ? "// a valid port is needed first" : JSON.stringify(draft, null, 2)}
+        </pre>
+      </div>
+      <div className="wizard-aside">
+        <div className="card">
+          <div className="card-body">
+            <span className="eyebrow">What happens on create</span>
+            <ol className="wizard-happens">
+              <li>
+                <b>Submitted on this node</b>
+                <span>durably parked before it is forwarded</span>
+              </li>
+              <li>
+                <b>Forwarded to the leader</b>
+                <span>committed on a majority of voters</span>
+              </li>
+              <li>
+                <b>Applied fleet-wide</b>
+                <span>the write resolves once the fleet has it, not when this node accepts it</span>
+              </li>
+              <li>
+                <b>Bound on each node</b>
+                <span>a node that cannot bind still serves it through the front door</span>
+              </li>
+            </ol>
+          </div>
+        </div>
+        <p className="hint">
+          If this request times out, the write may still have landed. The console sends no
+          idempotency key (#371), so re-submitting is a second operation rather than a retry of the
+          first — reload the list before creating it again.
+        </p>
+      </div>
+    </div>
   );
 }
 
@@ -865,58 +1290,55 @@ function NewImposter({
  * Two buttons, not a select-then-go: the projections carry a real semantic difference (whether the
  * import goes on recording), and naming both up front is worth more than one fewer click.
  */
-function ExportSetControl({ tenant }: { tenant: string | null }): ReactNode {
-  const [busy, setBusy] = useState<ExportProjection | null>(null);
+function ExportSetControl({
+  tenant,
+  count,
+  onClose,
+}: {
+  tenant: string | null;
+  count: number;
+  onClose: () => void;
+}): ReactNode {
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const toast = useToast();
 
-  async function run(projection: ExportProjection): Promise<void> {
+  async function run(options: ExportOptions): Promise<void> {
     setError(null);
-    setBusy(projection);
+    setBusy(true);
     try {
-      const text = await apiGetText(`/imposters${exportQuery(projection)}`, { tenant });
-      downloadText(exportSetFilename(tenant), text);
+      const text = await apiGetText(`/imposters${exportOptionsQuery(options)}`, { tenant });
+      const filename = exportSetFilename(tenant);
+      downloadText(filename, text);
+      // A download is the one action with no on-screen consequence at all: the dialog closes and the
+      // file lands somewhere the console cannot see. Saying so is the whole point of the toast.
+      toast({ tone: "good", message: `Exported ${String(count)} imposters`, meta: filename });
+      onClose();
     } catch (error_) {
       setError(errorText(error_));
     } finally {
-      setBusy(null);
+      setBusy(false);
     }
   }
 
   return (
-    <div className="card" data-testid="export-imposters">
-      <div className="card-body">
-        <span className="eyebrow">Export every imposter in this tenant</span>
-        <div className="field-row">
-          <button
-            className="btn sm"
-            type="button"
-            disabled={busy !== null}
-            onClick={() => void run("replay-ready")}
-          >
-            {busy === "replay-ready" ? "Exporting…" : "Replay-ready"}
-          </button>
-          <span className="note">
-            Default. Recorded proxy responses become static stubs; proxy stubs are dropped.
-          </span>
-        </div>
-        <div className="field-row">
-          <button
-            className="btn sm"
-            type="button"
-            disabled={busy !== null}
-            onClick={() => void run("as-configured")}
-          >
-            {busy === "as-configured" ? "Exporting…" : "As configured"}
-          </button>
-          <span className="note">Proxy stubs kept, so the importer goes on recording.</span>
-        </div>
-        {error === null ? null : (
-          <p className="error" data-testid="export-imposters-error" role="alert">
-            {error}
-          </p>
-        )}
-      </div>
-    </div>
+    <>
+      <ExportDialog
+        scope={{ kind: "tenant" }}
+        tenant={tenant}
+        imposterCount={count}
+        busy={busy}
+        onExport={(options) => void run(options)}
+        onCancel={onClose}
+      />
+      {/* Kept outside the dialog on purpose: a failed export leaves the dialog open with the
+          options the operator chose still in it, so retrying does not mean re-deciding. */}
+      {error === null ? null : (
+        <p className="error" data-testid="export-imposters-error" role="alert">
+          {error}
+        </p>
+      )}
+    </>
   );
 }
 
@@ -1092,6 +1514,10 @@ function ImportPanel({
             </>
           }
           confirmLabel={`Replace ${existingCount} imposter${existingCount === 1 ? "" : "s"}`}
+          // The widest act the console offers: every imposter in the tenant goes, replaced by a
+          // document. Typing the count is the difference between meaning it and having clicked
+          // through this dialog before.
+          requireTyped={String(existingCount)}
           busy={running}
           onCancel={() => setConfirmingReplace(false)}
           onConfirm={() => void runReplace(doc.kind === "ok" ? doc.entries : [])}

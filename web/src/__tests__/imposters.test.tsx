@@ -79,8 +79,15 @@ describe("imposter list", () => {
     });
     renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
 
-    const silent = within(await screen.findByTestId("imposter-row-4547"));
-    expect(silent.getByText("—")).toBeTruthy();
+    /*
+     * Scoped to the stubs cell, not the row.
+     *
+     * It used to search the whole row for an em dash, which held only while the row contained
+     * exactly one. The Owner column renders a dash too — it has no published source — so a row-wide
+     * search now finds two and cannot say which column was unknown. Naming the cell asserts the
+     * thing the test is actually about.
+     */
+    expect((await screen.findByTestId("imposter-cell-stubs-4547")).textContent).toBe("—");
   });
 
   it("says whose view this is, and does not claim the tenant is empty", async () => {
@@ -236,6 +243,23 @@ describe("RBAC-correct visibility", () => {
   });
 });
 
+/**
+ * Columns the table renders that are NOT imposter fields, enumerated so they cannot grow silently.
+ *
+ * `contract.ts` governs columns whose value comes out of the imposter document — that is what its
+ * `keyof Declared<Imposter>` key type enforces. These two do not:
+ *
+ * - `Owner` is the ring's flow owner. Nothing publishes it (#359), so the cell renders a pending
+ *   marker and no imposter field is involved at all.
+ * - `Provenance` is a **join** against `/admin/sources` — `ports` and `drifted` are that endpoint's
+ *   declared fields, read through `sourceOwnedPorts` and `driftedPorts`, never off the imposter.
+ *
+ * Listing them here keeps the property the test below exists for: a column added without a source
+ * still fails, because it would have to be added to this array first and that is a sentence someone
+ * has to justify.
+ */
+const DERIVED_COLUMNS = ["Owner", "Provenance"] as const;
+
 describe("every rendered cell comes from the declared column table", () => {
   it("renders exactly the declared columns, in order, and no others", async () => {
     // The compile-time half of RFC-006 §11 lives in `contract.ts` (`keyof` the schema type with its
@@ -252,12 +276,15 @@ describe("every rendered cell comes from the declared column table", () => {
     const headers = [...screen.getAllByRole("columnheader")].map((cell) =>
       cell.textContent?.replace(/[\u25b2\u25bc]/g, "").trim(),
     );
-    expect(headers).toEqual(IMPOSTER_COLUMNS.map((column) => column.label));
+    expect(headers).toEqual([
+      ...IMPOSTER_COLUMNS.map((column) => column.label),
+      ...DERIVED_COLUMNS,
+    ]);
 
     // A viewer gets neither the lifecycle column nor the bulk-selection one (it holds none of the
     // bulk actions), so the cell count is exactly the declared columns.
     const cells = within(screen.getByTestId("imposter-row-4545")).getAllByRole("cell");
-    expect(cells.length).toBe(IMPOSTER_COLUMNS.length);
+    expect(cells.length).toBe(IMPOSTER_COLUMNS.length + DERIVED_COLUMNS.length);
   });
 
   it("adds exactly two control columns for a role that holds the actions, and no data column", async () => {
@@ -272,7 +299,7 @@ describe("every rendered cell comes from the declared column table", () => {
     await screen.findByText("billing");
 
     const cells = within(screen.getByTestId("imposter-row-4545")).getAllByRole("cell");
-    expect(cells.length).toBe(IMPOSTER_COLUMNS.length + 2);
+    expect(cells.length).toBe(IMPOSTER_COLUMNS.length + DERIVED_COLUMNS.length + 2);
     expect(screen.getByTestId("imposter-select-4545")).toBeTruthy();
   });
 });

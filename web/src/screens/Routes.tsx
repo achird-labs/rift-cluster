@@ -4,8 +4,11 @@ import { ApiError } from "../api/client.ts";
 import { RouteTableConflict, useDeleteRoute, usePutRoutes, useRouteTable } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { Card, Empty, ErrorNote, Ident, Status, UnconfirmedNote } from "../components/primitives.tsx";
+import { Pending } from "../components/pending.tsx";
 import type { Route } from "../features/routes/order.ts";
 import { effectiveOrder, orderReason, validateTable } from "../features/routes/order.ts";
+import { probeRoutes } from "../features/routes/probe.ts";
+import { useToast } from "../components/toast.tsx";
 
 export function RouteTableScreen(): ReactNode {
   const { can } = useSession();
@@ -31,7 +34,15 @@ export function RouteTableScreen(): ReactNode {
         </p>
       </header>
       {table.isPending ? <p className="muted">Reading…</p> : null}
-      {table.isSuccess ? <Editor loaded={table.data} mayWrite={mayWrite} /> : null}
+      {table.isSuccess ? (
+        <div className="screen-split">
+          <div className="screen-main">
+            <Editor loaded={table.data} mayWrite={mayWrite} />
+            <FrontDoorNotes />
+          </div>
+          <RouteTester routes={table.data} />
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -76,6 +87,7 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
   }, [loaded, loadedKey, draftKey, baseKey, unconfirmed]);
 
   const dirty = draftKey !== baseKey;
+  const toast = useToast();
   const errors = validateTable(draft);
   const ordered = effectiveOrder(draft);
   const rank = new Map(ordered.map((route, index) => [route.id, index + 1]));
@@ -104,6 +116,25 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
          */
         onSuccess: ({ outcome }) => {
           if (outcome.kind === "applied") setBase(draft);
+          /*
+           * Both outcomes are confirmed, and they are not the same confirmation. `applied` is the
+           * fleet holding this table; `unobservable` is the fleet having taken it while the console
+           * lost sight of the commit — which is why that one is a `warn` and says so, rather than a
+           * green tick over an unknown.
+           */
+          toast(
+            outcome.kind === "applied"
+              ? {
+                  tone: "good",
+                  message: `Route table saved — ${String(draft.length)} route${draft.length === 1 ? "" : "s"}`,
+                  meta: "committed fleet-wide",
+                }
+              : {
+                  tone: "warn",
+                  message: "Route table accepted, not yet confirmed",
+                  meta: "re-read this screen to see where it landed",
+                },
+          );
         },
       },
     );
@@ -199,6 +230,12 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
             <th>Id</th>
             <th>Match</th>
             <th>Target</th>
+            {/* The design's HITS column. Nothing counts dispatches per route, so the figure is
+                pending on #368 — the column is here because a route that has never taken a request
+                is either wrong or dead, and both are worth a place to show. */}
+            <th style={{ width: "12ch" }} className="numeric">
+              Hits
+            </th>
             <th>Why this order</th>
             {mayWrite ? <th>Actions</th> : null}
           </tr>
@@ -223,6 +260,12 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
               <td>
                 <Ident>{route.target.port}</Ident>
                 {route.target.strip_prefix ? " · strips prefix" : ""}
+              </td>
+              <td className="numeric">
+                <Pending
+                  issue={368}
+                  reason="Nothing counts dispatches per route. A counter is fleet-wide state, so it wants the merge-on-read treatment the request journal already has."
+                />
               </td>
               <td className="muted">{route.enabled ? orderReason(route) : "disabled"}</td>
               {mayWrite ? (
@@ -442,5 +485,136 @@ function NewRoute({
         </p>
       </form>
     </Card>
+  );
+}
+
+/**
+ * The two things the table does not say about itself.
+ *
+ * Both are static prose, and both earn their space by answering a question the route rows provoke:
+ * what happens when nothing matches, and why a fleet behind a load balancer needs only one data
+ * port. Neither is a reading, so neither pretends to be.
+ */
+function FrontDoorNotes(): ReactNode {
+  return (
+    <div className="front-door-notes">
+      <Card title="Gateway fallback">
+        <p className="muted">Consulted only after every route misses.</p>
+        <p>
+          A test harness can name its own target three ways — the imposter&rsquo;s own port, an
+          <code> X-Rift-Port</code> header, or a route. An unmodified system under test can do none
+          of them, which is the whole reason the route table exists.
+        </p>
+      </Card>
+      <Card title="Why one port is enough">
+        <p>
+          Dispatch targets the imposter <em>object</em>, not its socket. An imposter whose own bind
+          failed on one node is still served there through the front door — and behind a managed
+          load balancer this is the only data port a Service has to expose.
+        </p>
+      </Card>
+    </div>
+  );
+}
+
+/**
+ * Try a request against the table and see which route takes it.
+ *
+ * The verdict is **this console's reading**, not the front door's: there is no route-probe endpoint
+ * to ask, so `probeRoutes` walks the same total order `effectiveOrder` computes and applies the
+ * clauses the same way. That is said on the panel rather than left implied — a tester quietly
+ * disagreeing with the real dispatcher would be worse than no tester, because it would be trusted.
+ */
+function RouteTester({ routes }: { routes: readonly Route[] }): ReactNode {
+  const [host, setHost] = useState("");
+  const [path, setPath] = useState("/");
+  const [header, setHeader] = useState("");
+
+  // `Name: value`, the way an operator would paste it out of curl. A line without a colon is not a
+  // header clause and is ignored rather than guessed at.
+  const headers = header.includes(":")
+    ? [
+        {
+          name: header.slice(0, header.indexOf(":")).trim(),
+          value: header.slice(header.indexOf(":") + 1).trim(),
+        },
+      ]
+    : [];
+
+  const result = probeRoutes(routes, { host, path, method: "GET", headers });
+
+  return (
+    <aside className="rail-right" aria-label="Route tester">
+      <section className="rail-sect">
+        <h2 className="eyebrow">Route tester</h2>
+        <div className="field">
+          <label htmlFor="probe-host">Host</label>
+          <input
+            id="probe-host"
+            value={host}
+            placeholder="payments.test"
+            data-testid="probe-host"
+            onChange={(event) => setHost(event.target.value)}
+          />
+        </div>
+        <div className="field">
+          <label htmlFor="probe-path">Path</label>
+          <input
+            id="probe-path"
+            value={path}
+            placeholder="/v1/orders"
+            data-testid="probe-path"
+            onChange={(event) => setPath(event.target.value)}
+          />
+        </div>
+        <div className="field">
+          <label htmlFor="probe-header">Header</label>
+          <input
+            id="probe-header"
+            value={header}
+            placeholder="X-Env: canary"
+            data-testid="probe-header"
+            onChange={(event) => setHeader(event.target.value)}
+          />
+        </div>
+      </section>
+
+      <section className="rail-sect">
+        <div
+          className={`probe-verdict ${result.winner === null ? "is-miss" : "is-hit"}`}
+          data-testid="probe-verdict"
+          role="status"
+        >
+          <strong>
+            {result.winner === null ? "No route matches" : `Dispatched to ${result.winner.id}`}
+          </strong>
+          <p>
+            {result.winner === null
+              ? "The gateway fallback would be consulted, and a request that names no target reaches nothing."
+              : `port ${String(result.winner.target.port)}${result.winner.target.strip_prefix ? " · strips prefix" : ""}`}
+          </p>
+        </div>
+      </section>
+
+      <section className="rail-sect">
+        <h2 className="eyebrow">Evaluation trace</h2>
+        {result.trace.length === 0 ? (
+          <p className="hint">No enabled route to evaluate.</p>
+        ) : (
+          <ol className="trace">
+            {result.trace.map((entry) => (
+              <li key={entry.id} className={entry.hit ? "is-hit" : "is-miss"}>
+                <span className="trace-id">{entry.id}</span>
+                <span>{entry.why}</span>
+              </li>
+            ))}
+          </ol>
+        )}
+        <p className="hint">
+          Evaluated by this console against the table above — the front door has no probe endpoint
+          to ask, so this is a reading of the same rules rather than its verdict.
+        </p>
+      </section>
+    </aside>
   );
 }

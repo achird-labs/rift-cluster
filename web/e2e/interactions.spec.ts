@@ -240,6 +240,10 @@ test.describe("imposters: create then remove", () => {
     await page.getByTestId("new-imposter").click();
     await page.getByLabel(/^port$/i).fill("4788");
     await page.getByLabel(/^name$/i).fill("e2e-throwaway");
+    // Identity -> First stub -> Review. The stub step is skipped deliberately: leaving the path
+    // blank creates the imposter with no stubs, which is what this test wants.
+    await page.getByTestId("wizard-next").click();
+    await page.getByTestId("wizard-next").click();
     await page.getByRole("button", { name: /create imposter/i }).click();
 
     await expect(page.getByText("e2e-throwaway")).toBeVisible({ timeout: 10_000 });

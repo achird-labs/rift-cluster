@@ -1,10 +1,11 @@
 /** @vitest-environment jsdom */
 import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TENANT_HEADER } from "../api/client.ts";
 import { ImposterDetail } from "../screens/ImposterDetail.tsx";
-import { renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
+import { onDetailTab, renderInApp, stubFetch, whoamiWith } from "./harness.tsx";
 
 const IMPOSTER = {
   port: 4545,
@@ -21,6 +22,9 @@ const IMPOSTER = {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  // The detail screen's tab lives in the hash, so a test that opened one would otherwise leave the
+  // next one on it — an order dependence that reads as an unrelated failure.
+  window.location.hash = "";
 });
 
 describe("imposter detail", () => {
@@ -39,6 +43,8 @@ describe("imposter detail", () => {
   });
 
   it("shows the contract's fields, including the host the list omits", async () => {
+    // The fields are imposter configuration, which the detail screen keeps on its Settings tab.
+    onDetailTab("settings");
     stubFetch({ "/imposters/4545": { json: IMPOSTER } });
     renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("viewer") });
 
@@ -72,6 +78,11 @@ describe("imposter detail", () => {
      * Narrowed to the write affordances by name, and the export is asserted PRESENT rather than
      * merely tolerated: `rbac.ts` makes the point repeatedly that hiding a control from a role that
      * holds the capability is the same class of bug as offering one to a role that does not.
+     *
+     * The two halves now sit on different tabs — the stubs a viewer may read, the export among the
+     * imposter's settings — so the test walks to the second rather than asserting both at once. It
+     * is deliberately one test still: "no write control, but the read affordance is offered" is a
+     * single claim about a role, and splitting it would let half of it pass alone.
      */
     stubFetch({ "/imposters/4545": { json: IMPOSTER } });
     renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("viewer") });
@@ -81,7 +92,9 @@ describe("imposter detail", () => {
       expect([name, screen.queryByRole("button", { name })]).toEqual([name, null]);
     }
     expect(screen.queryByTestId("clone-imposter")).toBeNull();
-    expect(screen.getByTestId("export-imposter")).toBeTruthy();
+
+    await userEvent.setup().click(screen.getByTestId("detail-tab-settings"));
+    expect(await screen.findByTestId("export-imposter")).toBeTruthy();
   });
 
   it("distinguishes an imposter with no stubs from a response that carried no stub list", async () => {

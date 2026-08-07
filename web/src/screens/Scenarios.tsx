@@ -5,6 +5,8 @@ import {
   useAddSpaceStub,
   useClearFlowState,
   useFlowStateEntry,
+  useAllScenarios,
+  useImposter,
   useImposters,
   useResetScenarios,
   useScenarios,
@@ -14,8 +16,11 @@ import {
   useTeardownSpace,
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
+import { useHashQuery } from "../app/routing.ts";
+import { Card, Confirm, Empty, ErrorNote, Ident, Truncated, UNNAMED } from "../components/primitives.tsx";
 import { shadowingStubIndex } from "../features/requests/stubFromRequest.ts";
+import { scenarioDefinitions } from "../features/scenarios/definitions.ts";
+import { Pending, PendingPanel } from "../components/pending.tsx";
 import {
   ABSENT_ENTRY_CAVEAT,
   SPACE_STUB_CAVEAT,
@@ -38,7 +43,7 @@ import {
  * imposter's resolved id is a fact it told us.
  */
 export function Scenarios({ port, flow }: { port: number | null; flow: string | null }): ReactNode {
-  if (port === null) return <ImposterPicker />;
+  if (port === null) return <AllFlows />;
   // Keyed by port and flow so no panel's local state (a typed key, an open editor) survives a move
   // to a different imposter or space — the same reasoning as the request log's key.
   return <ForImposter key={`${port}:${flow ?? ""}`} port={port} flow={flow} />;
@@ -53,6 +58,18 @@ function ForImposter({ port, flow }: { port: number; flow: string | null }): Rea
    */
   const resolvedFlow =
     scenarios.data?.kind === "scenarios" ? scenarios.data.flowId : (flow ?? null);
+
+  // In the hash query, so a tab is linkable and survives a reload — the same rule the imposter
+  // list's filters and the imposter detail's tabs follow.
+  const [search, setSearch] = useHashQuery();
+  const requested = new URLSearchParams(search).get("tab");
+  const tab: FlowTab = FLOW_TABS.find((entry) => entry.id === requested)?.id ?? "scenarios";
+  const setTab = (next: FlowTab): void => {
+    const params = new URLSearchParams(search);
+    if (next === "scenarios") params.delete("tab");
+    else params.set("tab", next);
+    setSearch(params.toString());
+  };
 
   return (
     <section className="screen" data-testid="scenarios-screen">
@@ -84,9 +101,37 @@ function ForImposter({ port, flow }: { port: number; flow: string | null }): Rea
         </span>
       </div>
 
-      <ScenarioPanel port={port} flow={resolvedFlow} state={scenarios} />
-      <SpacePanel port={port} flowId={resolvedFlow} />
-      <FlowStatePanel port={port} flowId={resolvedFlow} />
+      {/*
+       * Three tabs, as the design has them. They are not three views of one thing — they are three
+       * different tiers, and the screen used to stack them so a reader scrolled past the per-flow
+       * position to reach the machine that defines it:
+       *
+       *   Scenarios & KV      the position each flow currently sits at, plus the durable KV beside it
+       *   Spaces              the flows themselves — what a scenario state is scoped to
+       *   Scenario definitions the FSM the match gate reads, which is imposter config, not runtime
+       *
+       * The last is the one worth separating hardest: editing a definition is an ordinary clustered
+       * write to the imposter document, while everything on the first tab is per-flow runtime that
+       * a reset discards. Same screen, opposite durability.
+       */}
+      <FlowTabs current={tab} onPick={setTab} />
+
+      {tab === "scenarios" ? (
+        <>
+          <ScenarioPanel port={port} flow={resolvedFlow} state={scenarios} />
+          <FlowStatePanel port={port} flowId={resolvedFlow} />
+          <OwnershipRules />
+        </>
+      ) : null}
+
+      {tab === "spaces" ? (
+        <>
+          <SpacePanel port={port} flowId={resolvedFlow} />
+          <ActiveSpaces />
+        </>
+      ) : null}
+
+      {tab === "defs" ? <ScenarioDefinitions port={port} /> : null}
     </section>
   );
 }
@@ -202,6 +247,11 @@ function ScenarioTable({
           <tr>
             <th>Scenario</th>
             <th style={{ width: "26ch" }}>State in this space</th>
+            {/* The design carries both beside the state. Which node owns this flow, and the epoch
+                and generation a write against it is fenced with, are the two facts that decide
+                whether a state you just set will survive — and neither is published (#359). */}
+            <th style={{ width: "14ch" }}>Owner</th>
+            <th style={{ width: "14ch" }}>Fence</th>
             {mayWrite ? <th style={{ width: "16ch" }} aria-label="Set state" /> : null}
           </tr>
         </thead>
@@ -252,6 +302,18 @@ function ScenarioRow({
         </td>
         <td data-testid={`scenario-state-${scenario.name}`}>
           <Ident>{scenario.state}</Ident>
+        </td>
+        <td>
+          <Pending
+            issue={359}
+            reason="Which node owns this flow is not published. The ring's membership and epoch are; the assignment is not."
+          />
+        </td>
+        <td>
+          <Pending
+            issue={359}
+            reason="The epoch and ownership generation a write against this flow is fenced with are not exposed."
+          />
         </td>
         {mayWrite ? (
           <td>
@@ -819,48 +881,119 @@ function FlowStateResult({
 }
 
 /** Everything on this screen is per-imposter, so with no port in the hash it asks which one. */
-function ImposterPicker(): ReactNode {
+/**
+ * Every imposter's flow state, without asking which imposter first.
+ *
+ * The design's flow-state screen is fleet-wide: flows listed across imposters, with the imposter as
+ * a **prefix on the flow id** rather than a choice to make before anything renders. This screen used
+ * to open on a "choose an imposter" card that was pixel-for-pixel the request log's, which is both
+ * a worse first screen and the wrong shape — the question is "what is the fleet's flow state", and
+ * an operator who wanted one imposter can still click into it.
+ *
+ * What is listed is each imposter's DEFAULT flow. Nothing enumerates the others: a space is created
+ * implicitly by whatever flow id a request carried, so there is no route that lists them (#374).
+ * That limit is stated on the screen rather than left to be discovered — a table that silently
+ * showed one flow per imposter would read as "these are the flows".
+ */
+function AllFlows(): ReactNode {
   const imposters = useImposters();
+  const ports = (imposters.data ?? []).flatMap((imposter) =>
+    imposter.port === undefined ? [] : [imposter.port],
+  );
+  const named = new Map(
+    (imposters.data ?? []).map((imposter) => [imposter.port, imposter.name] as const),
+  );
+  const { rows, pending } = useAllScenarios(ports);
+
   return (
     <section className="screen" data-testid="scenarios-screen">
       <header className="screen-head">
         <h1>Scenarios &amp; state</h1>
-        <p className="muted">
-          Choose an imposter to read its scenarios, spaces and flow state.
+        <p className="scope-label">
+          Every imposter&rsquo;s default flow. A flow is created implicitly by whatever id a request
+          carried, and no route lists them, so the others are reachable only by naming one.
         </p>
       </header>
+
       {imposters.isError ? (
         <ErrorNote error={imposters.error} context="Could not read the imposter list" />
       ) : null}
-      {imposters.isPending ? <p className="muted">Reading…</p> : null}
-      {imposters.isSuccess && imposters.data.length === 0 ? (
+      {imposters.isPending || pending ? <p className="muted">Reading…</p> : null}
+
+      {imposters.isSuccess && ports.length === 0 ? (
         <Empty
           title="No imposters to inspect"
-          body="Scenarios and spaces belong to an imposter. Create one and its state appears here."
+          body="Scenarios and spaces belong to an imposter. Create one and its flow state appears here."
         />
       ) : null}
-      {imposters.isSuccess && imposters.data.length > 0 ? (
-        <Card title="Choose an imposter" bleed>
+
+      {rows.length === 0 ? null : (
+        <Card title="Scenario FSMs &amp; flow KV" bleed>
           <div className="scroll-x">
             <table className="dense">
               <thead>
                 <tr>
-                  <th style={{ width: "12ch" }}>Port</th>
-                  <th>Name</th>
-                  <th style={{ width: "14ch" }} aria-label="Open" />
+                  <th>Flow id</th>
+                  <th style={{ width: "22ch" }}>State</th>
+                  <th style={{ width: "13ch" }}>Owner</th>
+                  <th style={{ width: "13ch" }}>Fence</th>
+                  <th style={{ width: "132px" }} aria-label="Open" />
                 </tr>
               </thead>
               <tbody>
-                {imposters.data.map((imposter) => (
-                  <tr key={imposter.port}>
+                {rows.map(({ port, state }) => (
+                  <tr key={port} data-testid={`flow-row-${String(port)}`}>
                     <td>
-                      <span className="port">{imposter.port}</span>
+                      <span className="id-cell">
+                        {/* `i<port>:<flow>` — the design's own form, and it is the reason this
+                            screen needs no picker: the imposter is part of the flow's name. */}
+                        <span className="name">
+                          <Ident>
+                            i{port}:{state.kind === "scenarios" ? state.flowId : "?"}
+                          </Ident>
+                        </span>
+                        <span className="meta">
+                          {named.get(port) ?? UNNAMED}
+                          {state.kind === "scenarios" && state.scenarios.length > 0
+                            ? ` · ${state.scenarios.map((entry) => entry.name).join(", ")}`
+                            : " · no scenarios"}
+                        </span>
+                      </span>
                     </td>
                     <td>
-                      <Truncated value={imposter.name ?? "—"} />
+                      {state.kind === "unknown" ? (
+                        <span className="status status-warn">
+                          <span className="g" aria-hidden="true">
+                            &#9650;
+                          </span>
+                          unread
+                        </span>
+                      ) : state.scenarios.length === 0 ? (
+                        <span className="muted">&mdash;</span>
+                      ) : (
+                        <span className="flow-states">
+                          {state.scenarios.map((entry) => (
+                            <span key={entry.name} className="pill accent">
+                              {entry.state}
+                            </span>
+                          ))}
+                        </span>
+                      )}
                     </td>
                     <td>
-                      <a className="btn sm" href={`#/scenarios/${imposter.port}`}>
+                      <Pending
+                        issue={359}
+                        reason="Which node owns this flow is not published. The ring's membership and epoch are; the assignment is not."
+                      />
+                    </td>
+                    <td>
+                      <Pending
+                        issue={359}
+                        reason="The epoch and ownership generation a write against this flow is fenced with are not exposed."
+                      />
+                    </td>
+                    <td>
+                      <a className="btn sm" href={`#/scenarios/${String(port)}`}>
                         Open state
                       </a>
                     </td>
@@ -870,7 +1003,186 @@ function ImposterPicker(): ReactNode {
             </table>
           </div>
         </Card>
-      ) : null}
+      )}
+
+      <OwnershipRules />
     </section>
+  );
+}
+
+const FLOW_TABS = [
+  { id: "scenarios", label: "Scenarios & KV" },
+  { id: "spaces", label: "Spaces" },
+  { id: "defs", label: "Scenario definitions" },
+] as const;
+
+type FlowTab = (typeof FLOW_TABS)[number]["id"];
+
+function FlowTabs({
+  current,
+  onPick,
+}: {
+  current: FlowTab;
+  onPick: (tab: FlowTab) => void;
+}): ReactNode {
+  return (
+    <div className="tabs" role="tablist" aria-label="Flow state sections">
+      {FLOW_TABS.map((entry) => (
+        <button
+          key={entry.id}
+          type="button"
+          role="tab"
+          data-testid={`flow-tab-${entry.id}`}
+          aria-selected={entry.id === current}
+          onClick={() => onPick(entry.id)}
+        >
+          {entry.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The FSM each scenario declares.
+ *
+ * Derived from the imposter's own stubs rather than read from a definitions endpoint, because there
+ * is no such endpoint and there does not need to be: the machine IS the stubs. Each one names the
+ * state it requires and the state it moves to, so `scenarioDefinitions` reassembles exactly the
+ * graph the match gate walks — and every edge points at the stub that drives it, which is what
+ * makes this a reading rather than a drawing.
+ */
+function ScenarioDefinitions({ port }: { port: number }): ReactNode {
+  const imposter = useImposter(port);
+  const defs = scenarioDefinitions(imposter.data?.data.stubs);
+
+  if (imposter.isPending) return <p className="muted">Reading…</p>;
+  if (imposter.isError) {
+    return <ErrorNote error={imposter.error} context="Could not read this imposter's stubs" />;
+  }
+
+  if (defs.length === 0) {
+    return (
+      <Empty
+        testId="scenario-defs-empty"
+        title="No scenario is declared on this imposter"
+        body="A stub joins a machine by naming a scenario and the state it requires or moves to. Until one does, there is no FSM for the match gate to read."
+      />
+    );
+  }
+
+  return (
+    <>
+      <p className="muted">
+        A scenario is the FSM the match gate reads before a stub is allowed to answer. It is part of
+        the imposter document, so editing one is an ordinary clustered write — not flow state, which
+        is the per-flow position inside it.
+      </p>
+      {defs.map((def) => (
+        <Card key={def.name} title={def.name} bleed>
+          <div className="fsm-states">
+            {def.states.map((state) => (
+              <span
+                key={state}
+                className={`fsm-state${state === def.initial ? " is-initial" : ""}`}
+              >
+                {state}
+                {state === def.initial ? <span className="fsm-initial">initial</span> : null}
+              </span>
+            ))}
+          </div>
+          {def.transitions.length === 0 ? (
+            <p className="hint">
+              Every stub in this scenario answers without advancing it, so the machine has no
+              transitions — it is a set of states the traffic never moves between.
+            </p>
+          ) : (
+            <div className="scroll-x">
+              <table className="dense">
+                <thead>
+                  <tr>
+                    <th style={{ width: "4ch" }}>#</th>
+                    <th style={{ width: "20ch" }}>From</th>
+                    <th style={{ width: "20ch" }}>To</th>
+                    <th>Stub</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {def.transitions.map((transition, index) => (
+                    <tr key={`${transition.from}-${transition.to}-${String(index)}`}>
+                      <td className="ident">{index + 1}</td>
+                      <td className="ident">{transition.from}</td>
+                      <td className="ident">&rarr; {transition.to}</td>
+                      <td className="ident">
+                        {transition.stub === null ? (
+                          <span className="muted">this stub carries no id</span>
+                        ) : (
+                          <Truncated value={transition.stub} max={28} />
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      ))}
+    </>
+  );
+}
+
+/**
+ * What a handoff does to each kind of state, and the rule that stops two owners overlapping.
+ *
+ * Both are statements about the cluster rather than readings from it, and both belong beside the
+ * state they describe: an operator setting a scenario position is entitled to know that it survives
+ * a handoff while the sequence cursor beside it does not.
+ */
+function OwnershipRules(): ReactNode {
+  return (
+    <div className="ownership-rules">
+      <Card title="On ownership change">
+        <dl className="kv-grid">
+          <dt>Scenario FSM / KV</dt>
+          <dd className="good-text">adopt highest (m_idx, v, origin)</dd>
+          <dt>Sequence cursors</dt>
+          {/* Deliberate, not a gap: a cursor is a position in a stream the new owner never saw. */}
+          <dd className="warn-text">reset — deliberate</dd>
+          <dt>proxyOnce Recorded</dt>
+          <dd className="good-text">adopts</dd>
+          <dt>proxyOnce Pending</dt>
+          <dd className="crit-text">dies with the owner, re-claims</dd>
+          <dt>Journal / counters</dt>
+          <dd>no owner &middot; CRDT merge-on-read</dd>
+        </dl>
+      </Card>
+      <Card title="Isolated-owner rule">
+        <p className="muted">
+          A node that has not heard a leader heartbeat within 3&times; the election timeout marks
+          itself isolated and refuses owner-side stateful operations. The two serving windows cannot
+          overlap by more than the heartbeat bound, and the fencing tuple mops up anything written
+          inside it.
+        </p>
+      </Card>
+    </div>
+  );
+}
+
+/**
+ * The spaces this imposter actually has.
+ *
+ * Not readable: `GET .../spaces/{flowId}` reads one space by id and nothing lists them. A space is
+ * created implicitly by whatever flow id a request carried, so "which exist" is exactly the
+ * question an operator arrives with — and today they infer it from the request log.
+ */
+function ActiveSpaces(): ReactNode {
+  return (
+    <Card title="Active spaces">
+      <PendingPanel
+        issue={374}
+        reason="No endpoint lists an imposter's spaces — one can be read by id, but they are created implicitly by whatever flow id a request carried, so there is nothing to enumerate them."
+      />
+    </Card>
   );
 }
