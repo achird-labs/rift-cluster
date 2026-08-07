@@ -1043,6 +1043,25 @@ main a:not(.btn):not(.nav-item):not(.issue):not(.prose-link):hover {
   text-decoration: underline;
 }
 
+/*
+ * A link inside a sentence is underlined, always.
+ *
+ * The rule above drops the underline, which is right for the links this console mostly has: a table
+ * cell that navigates, a standalone action. It is wrong the moment a link sits *inside prose*, where
+ * colour becomes the only thing distinguishing it — WCAG 1.4.1, and axe measures the contrast
+ * between link and body text at 1.63:1, nowhere near the 3:1 that would let colour carry it alone.
+ *
+ * Scoped to running text rather than applied everywhere: `p` and the banners, which are the two
+ * places this console puts a sentence with a link in it.
+ */
+main p a:not(.btn):not(.nav-item):not(.issue):not(.prose-link),
+main .banner a:not(.btn):not(.nav-item):not(.issue):not(.prose-link) {
+  /* The `:not` chain is repeated from the rule above deliberately: without it this selector is
+     *less* specific than the one that removes the underline, and loses — which is exactly how the
+     first attempt at this fix failed its own axe scan. */
+  text-decoration: underline;
+}
+
 /* A list carrying its own row semantics — visit order, candidate stubs — not bullets. */
 ul.plain,
 .rows > ul {
