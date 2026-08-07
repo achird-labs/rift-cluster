@@ -3352,3 +3352,10 @@ table.dense.wide th {
   gap: 10px;
   margin-bottom: 12px;
 }
+
+/* The scenario states a flow currently sits at, side by side — one pill per scenario. */
+.flow-states {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}

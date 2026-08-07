@@ -5,6 +5,7 @@ import {
   useAddSpaceStub,
   useClearFlowState,
   useFlowStateEntry,
+  useAllScenarios,
   useImposter,
   useImposters,
   useResetScenarios,
@@ -16,7 +17,7 @@ import {
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { useHashQuery } from "../app/routing.ts";
-import { Card, Confirm, Empty, ErrorNote, Ident, Truncated } from "../components/primitives.tsx";
+import { Card, Confirm, Empty, ErrorNote, Ident, Truncated, UNNAMED } from "../components/primitives.tsx";
 import { shadowingStubIndex } from "../features/requests/stubFromRequest.ts";
 import { scenarioDefinitions } from "../features/scenarios/definitions.ts";
 import { Pending, PendingPanel } from "../components/pending.tsx";
@@ -42,7 +43,7 @@ import {
  * imposter's resolved id is a fact it told us.
  */
 export function Scenarios({ port, flow }: { port: number | null; flow: string | null }): ReactNode {
-  if (port === null) return <ImposterPicker />;
+  if (port === null) return <AllFlows />;
   // Keyed by port and flow so no panel's local state (a typed key, an open editor) survives a move
   // to a different imposter or space — the same reasoning as the request log's key.
   return <ForImposter key={`${port}:${flow ?? ""}`} port={port} flow={flow} />;
@@ -880,68 +881,119 @@ function FlowStateResult({
 }
 
 /** Everything on this screen is per-imposter, so with no port in the hash it asks which one. */
-function ImposterPicker(): ReactNode {
+/**
+ * Every imposter's flow state, without asking which imposter first.
+ *
+ * The design's flow-state screen is fleet-wide: flows listed across imposters, with the imposter as
+ * a **prefix on the flow id** rather than a choice to make before anything renders. This screen used
+ * to open on a "choose an imposter" card that was pixel-for-pixel the request log's, which is both
+ * a worse first screen and the wrong shape — the question is "what is the fleet's flow state", and
+ * an operator who wanted one imposter can still click into it.
+ *
+ * What is listed is each imposter's DEFAULT flow. Nothing enumerates the others: a space is created
+ * implicitly by whatever flow id a request carried, so there is no route that lists them (#374).
+ * That limit is stated on the screen rather than left to be discovered — a table that silently
+ * showed one flow per imposter would read as "these are the flows".
+ */
+function AllFlows(): ReactNode {
   const imposters = useImposters();
+  const ports = (imposters.data ?? []).flatMap((imposter) =>
+    imposter.port === undefined ? [] : [imposter.port],
+  );
+  const named = new Map(
+    (imposters.data ?? []).map((imposter) => [imposter.port, imposter.name] as const),
+  );
+  const { rows, pending } = useAllScenarios(ports);
+
   return (
     <section className="screen" data-testid="scenarios-screen">
       <header className="screen-head">
         <h1>Scenarios &amp; state</h1>
         <p className="scope-label">
-          Scenario positions, the spaces they are scoped to, and the FSMs that define them all belong
-          to one imposter — so this screen starts by asking which.
+          Every imposter&rsquo;s default flow. A flow is created implicitly by whatever id a request
+          carried, and no route lists them, so the others are reachable only by naming one.
         </p>
       </header>
 
-      {/*
-        The tab names, before a choice is made.
-        
-        Without them this screen is a card headed "Choose an imposter" over a port/name table, which
-        is pixel-for-pixel what the request log shows for the same reason — and the two were being
-        mistaken for each other. Naming the three sections says which screen this is and what
-        choosing an imposter will actually open.
-      */}
-      <div className="flow-preview" aria-hidden="true">
-        {FLOW_TABS.map((entry) => (
-          <span key={entry.id} className="flow-preview-tab">
-            {entry.label}
-          </span>
-        ))}
-      </div>
       {imposters.isError ? (
         <ErrorNote error={imposters.error} context="Could not read the imposter list" />
       ) : null}
-      {imposters.isPending ? <p className="muted">Reading…</p> : null}
-      {imposters.isSuccess && imposters.data.length === 0 ? (
+      {imposters.isPending || pending ? <p className="muted">Reading…</p> : null}
+
+      {imposters.isSuccess && ports.length === 0 ? (
         <Empty
           title="No imposters to inspect"
-          body="Scenarios and spaces belong to an imposter. Create one and its state appears here."
+          body="Scenarios and spaces belong to an imposter. Create one and its flow state appears here."
         />
       ) : null}
-      {imposters.isSuccess && imposters.data.length > 0 ? (
-        <Card title="Choose an imposter" bleed>
+
+      {rows.length === 0 ? null : (
+        <Card title="Scenario FSMs &amp; flow KV" bleed>
           <div className="scroll-x">
             <table className="dense">
               <thead>
                 <tr>
-                  <th style={{ width: "12ch" }}>Port</th>
-                  <th>Name</th>
-                  {/* Sized in px, not `ch`: the table is `table-layout: fixed`, so a column too narrow for
-                      its content clips it rather than growing — which is what cut this button in half
-                      when control padding grew. */}
+                  <th>Flow id</th>
+                  <th style={{ width: "22ch" }}>State</th>
+                  <th style={{ width: "13ch" }}>Owner</th>
+                  <th style={{ width: "13ch" }}>Fence</th>
                   <th style={{ width: "132px" }} aria-label="Open" />
                 </tr>
               </thead>
               <tbody>
-                {imposters.data.map((imposter) => (
-                  <tr key={imposter.port}>
+                {rows.map(({ port, state }) => (
+                  <tr key={port} data-testid={`flow-row-${String(port)}`}>
                     <td>
-                      <span className="port">{imposter.port}</span>
+                      <span className="id-cell">
+                        {/* `i<port>:<flow>` — the design's own form, and it is the reason this
+                            screen needs no picker: the imposter is part of the flow's name. */}
+                        <span className="name">
+                          <Ident>
+                            i{port}:{state.kind === "scenarios" ? state.flowId : "?"}
+                          </Ident>
+                        </span>
+                        <span className="meta">
+                          {named.get(port) ?? UNNAMED}
+                          {state.kind === "scenarios" && state.scenarios.length > 0
+                            ? ` · ${state.scenarios.map((entry) => entry.name).join(", ")}`
+                            : " · no scenarios"}
+                        </span>
+                      </span>
                     </td>
                     <td>
-                      <Truncated value={imposter.name ?? "—"} />
+                      {state.kind === "unknown" ? (
+                        <span className="status status-warn">
+                          <span className="g" aria-hidden="true">
+                            &#9650;
+                          </span>
+                          unread
+                        </span>
+                      ) : state.scenarios.length === 0 ? (
+                        <span className="muted">&mdash;</span>
+                      ) : (
+                        <span className="flow-states">
+                          {state.scenarios.map((entry) => (
+                            <span key={entry.name} className="pill accent">
+                              {entry.state}
+                            </span>
+                          ))}
+                        </span>
+                      )}
                     </td>
                     <td>
-                      <a className="btn sm" href={`#/scenarios/${imposter.port}`}>
+                      <Pending
+                        issue={359}
+                        reason="Which node owns this flow is not published. The ring's membership and epoch are; the assignment is not."
+                      />
+                    </td>
+                    <td>
+                      <Pending
+                        issue={359}
+                        reason="The epoch and ownership generation a write against this flow is fenced with are not exposed."
+                      />
+                    </td>
+                    <td>
+                      <a className="btn sm" href={`#/scenarios/${String(port)}`}>
                         Open state
                       </a>
                     </td>
@@ -951,7 +1003,9 @@ function ImposterPicker(): ReactNode {
             </table>
           </div>
         </Card>
-      ) : null}
+      )}
+
+      <OwnershipRules />
     </section>
   );
 }

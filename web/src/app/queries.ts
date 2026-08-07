@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { UseMutationResult, UseQueryResult } from "@tanstack/react-query";
 
 import {
@@ -907,6 +907,52 @@ export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { po
  * scenarios" and "this node could not answer" are different sentences and only the type keeps them
  * apart.
  */
+/**
+ * Every imposter's default flow, read together.
+ *
+ * The flow-state screen is a fleet-wide view in the design — flows listed across imposters, with the
+ * imposter as a prefix on the flow id rather than a choice to make first. Nothing enumerates flows
+ * (#374: a space is created implicitly by whatever id a request carried), so what is actually
+ * readable is each imposter's *default* flow, and that is what this fans out for.
+ *
+ * A fan-out, and worth saying why it is acceptable here when it is not for the request journal: a
+ * flow list is a **set**, not a stream. The journal's fan-out was refused because ordering N
+ * independent reads by whichever returned first would present network timing as journal order. A
+ * set has no order to get wrong — each row is independently true, and a row that fails to load says
+ * so on its own line rather than corrupting the others.
+ *
+ * `combine` folds the results in the query layer so the screen sees one value rather than N.
+ */
+export function useAllScenarios(
+  ports: readonly number[],
+): { rows: { port: number; state: ScenarioState }[]; pending: boolean } {
+  const { tenant } = useSession();
+  return useQueries({
+    queries: ports.map((port) => ({
+      queryKey: key(["scenarios", port, null], tenant),
+      queryFn: async (): Promise<ScenarioState> => {
+        try {
+          return readScenarios(await apiGet<unknown>(scenariosPath(port, null), { tenant }));
+        } catch (error) {
+          return {
+            kind: "unknown" as const,
+            reason: error instanceof Error ? error.message : "this node could not be reached",
+          };
+        }
+      },
+      ...POLLED,
+    })),
+    combine: (results) => ({
+      rows: results.flatMap((result, index) => {
+        const port = ports[index];
+        if (port === undefined || result.data === undefined) return [];
+        return [{ port, state: result.data }];
+      }),
+      pending: results.some((result) => result.isPending),
+    }),
+  });
+}
+
 export function useScenarios(port: number, flow: string | null): UseQueryResult<ScenarioState> {
   const { tenant } = useSession();
   return useQuery({
