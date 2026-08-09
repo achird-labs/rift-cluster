@@ -1788,7 +1788,7 @@ mod tests {
             "ring members come from the applied voters"
         );
         assert_eq!(
-            ring.i_own(1, OwnedKey::config("cfg:8080")),
+            ring.i_own(1, OwnedKey::flow("flow-8080")),
             Some(OwnStatus::Owner),
             "the sole voter owns every config key"
         );

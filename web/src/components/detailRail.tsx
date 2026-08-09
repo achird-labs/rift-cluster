@@ -1,29 +1,21 @@
 import type { ReactNode } from "react";
 
-import type { FleetView } from "../app/fleetView.ts";
 import { Ident } from "./primitives.tsx";
 import { Pending, PendingPanel } from "./pending.tsx";
 
 /**
- * The imposter detail's right rail: the write path, this port's place on the ring, and the
- * stub's recent hits.
+ * The imposter detail's right rail: the write path and the stub's recent hits.
  *
  * `aside`, like the fleet rail, and for the same reason: it annotates the imposter being edited
  * rather than being part of the editor, so a screen reader reaches the stub form without walking it.
+ *
+ * It took a `port` and a `fleet` until the ring panel below was removed; both existed only to
+ * answer "who owns this port", which is not a question with an answer.
  */
-export function DetailRail({
-  port,
-  revision,
-  fleet,
-}: {
-  port: number;
-  revision: string | null;
-  fleet: FleetView | undefined;
-}): ReactNode {
+export function DetailRail({ revision }: { revision: string | null }): ReactNode {
   return (
     <aside className="rail-right" aria-label="This imposter on the fleet">
       <WritePath revision={revision} />
-      <PortOnRing port={port} fleet={fleet} />
       <RecentHits />
     </aside>
   );
@@ -59,38 +51,22 @@ function WritePath({ revision }: { revision: string | null }): ReactNode {
   );
 }
 
-/**
- * Where this port sits on the ring.
+/*
+ * The design draws a "This port on the ring" panel here — hash key, ring epoch, flow owner. It is
+ * gone rather than pending, because the panel's own title is the mistake: **a port does not sit on
+ * the ring.**
  *
- * The ring's epoch and members are real. Which member owns *this port's* flow state is the HRW
- * question the fleet does not answer — the same gap the imposter list's OWNER column carries, and
- * the reason both say so rather than guessing at a hash.
+ * Imposters, stubs and config are replicated to every node through Raft, so every node serves them
+ * and none owns them. The ring assigns owners to *flows* (`KeyClass::FlowKv`), keyed by an opaque
+ * caller-supplied flow id — so a port has as many owners as it has flows, and two of the panel's
+ * three rows asserted things that are not true of a port: its "hash key" was the port number (the
+ * real key is the flow id under its `ContextScope` prefix), and its "flow owner" was a single
+ * owner for a port that has none.
+ *
+ * The ring's epoch, the one real fact here, is on the fleet screen where it describes the fleet
+ * rather than this imposter. Per-flow ownership belongs on the flow-state surface, where the flows
+ * are actually enumerated — see #359.
  */
-function PortOnRing({ port, fleet }: { port: number; fleet: FleetView | undefined }): ReactNode {
-  return (
-    <section className="rail-sect">
-      <h2 className="eyebrow">This port on the ring</h2>
-      <dl className="kv">
-        <dt>Hash key</dt>
-        <dd>
-          <Ident>{port}</Ident>
-        </dd>
-        <dt>Ring epoch</dt>
-        <dd>
-          {fleet === undefined ? (
-            <Pending issue={361} reason="The fleet projection is scoped to fleet.read, and this principal is refused it." />
-          ) : (
-            <Ident>{fleet.ringEpoch}</Ident>
-          )}
-        </dd>
-        <dt>Flow owner</dt>
-        <dd>
-          <Pending issue={359} reason="No endpoint maps a key to its owning member. The ring's membership and epoch are published; the HRW assignment that decides which node holds this port's flow state is not." />
-        </dd>
-      </dl>
-    </section>
-  );
-}
 
 /**
  * Recent hits against the selected stub.

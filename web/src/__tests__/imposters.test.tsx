@@ -83,9 +83,9 @@ describe("imposter list", () => {
      * Scoped to the stubs cell, not the row.
      *
      * It used to search the whole row for an em dash, which held only while the row contained
-     * exactly one. The Owner column renders a dash too — it has no published source — so a row-wide
-     * search now finds two and cannot say which column was unknown. Naming the cell asserts the
-     * thing the test is actually about.
+     * exactly one. `Provenance` renders a dash too — nothing declared this imposter — so a row-wide
+     * search finds two and cannot say which column was unknown. Naming the cell asserts the thing
+     * the test is actually about.
      */
     expect((await screen.findByTestId("imposter-cell-stubs-4547")).textContent).toBe("—");
   });
@@ -247,18 +247,21 @@ describe("RBAC-correct visibility", () => {
  * Columns the table renders that are NOT imposter fields, enumerated so they cannot grow silently.
  *
  * `contract.ts` governs columns whose value comes out of the imposter document — that is what its
- * `keyof Declared<Imposter>` key type enforces. These two do not:
+ * `keyof Declared<Imposter>` key type enforces. This one does not:
  *
- * - `Owner` is the ring's flow owner. Nothing publishes it (#359), so the cell renders a pending
- *   marker and no imposter field is involved at all.
  * - `Provenance` is a **join** against `/admin/sources` — `ports` and `drifted` are that endpoint's
  *   declared fields, read through `sourceOwnedPorts` and `driftedPorts`, never off the imposter.
+ *
+ * There was an `Owner` column here too, pending on #359. It is gone: an imposter has no owner.
+ * Config and stubs are replicated to every node, so every node serves them; only a *flow* is owned,
+ * and a port has as many owners as it has flows. A column that can never be filled is a promise
+ * rather than a roadmap, so it was removed rather than left pending.
  *
  * Listing them here keeps the property the test below exists for: a column added without a source
  * still fails, because it would have to be added to this array first and that is a sentence someone
  * has to justify.
  */
-const DERIVED_COLUMNS = ["Owner", "Provenance"] as const;
+const DERIVED_COLUMNS = ["Provenance"] as const;
 
 describe("every rendered cell comes from the declared column table", () => {
   it("renders exactly the declared columns, in order, and no others", async () => {

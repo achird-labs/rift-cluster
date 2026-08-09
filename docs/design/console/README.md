@@ -162,6 +162,35 @@ air-gapped. Deliberately not Inter.
 **Desktop only** (RFC-006 §10). The narrow-window collapse here is prototype convenience, not a
 mobile layout.
 
+## The mockup's `OWNER` column is wrong — do not rebuild it
+
+The Aug-2026 mockup (`RiftCluster Console.dc.html`) draws an **`OWNER`** column on the imposter
+table, a **`FLOW OWNER`** row in the imposter detail rail, and a **`THIS PORT ON THE RING`** panel.
+The console shipped all three in #358. They encode an ownership that does not exist, and they have
+been **removed** rather than filled in.
+
+What is actually true:
+
+- **Imposters, stubs and config have no owner.** They go through Raft, so a write propagates from
+  the leader to every node and a node that was down catches up when it returns. Every node can
+  serve any imposter and answer stateless requests against it. There is no owner to name.
+- **A flow has exactly one owner.** One node holds and mutates a stateful flow's state
+  (`KeyClass::FlowKv` in `raft/ring.rs`, HRW over the applied membership). A node that receives a
+  request for a flow it does not own talks to the owner rather than answering from its own copy,
+  and successor replicas hold copies so the state survives the owner leaving.
+- **So a port has as many owners as it has flows** — and a "hash key" of `4645` was never a key at
+  all. The real key is the flow id under its `ContextScope` prefix (`i{port}:` per imposter by
+  default, `f:` fleet-wide), which is also why two imposters' same-named spaces are *one* flow with
+  *one* owner under `Fleet` scope.
+
+Ownership therefore belongs on the **flow-state surface**, where flows are actually enumerated —
+tracked in [#359](https://github.com/achird-labs/rift-cluster/issues/359), which was itself filed
+from the mockup's framing and has been re-specified.
+
+This section exists because the mockup is still the artifact people design from, and nothing in it
+signals that these three elements are wrong. If you are porting a screen from it, this is the one
+place that says so.
+
 ## What this prototype is not
 
 - Not the component architecture. It is one file of vanilla JS; the real thing is React + TanStack
