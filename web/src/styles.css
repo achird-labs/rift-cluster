@@ -1,67 +1,208 @@
 /*
- * The console's design system, ported from `docs/design/console/console-prototype.html`
- * (RFC-006 scope A). The prototype's README calls its token block "a starting palette that has
- * been contrast-validated, not a finished system" — this is that palette adopted as the system,
- * because nothing else was ever specified and the screens had drifted onto an unrelated set of
- * nine ad-hoc greys.
+ * The console's design system.
+ *
+ * Redesigned onto the "technical light" direction of `RiftCluster Console.dc.html` — warm paper
+ * rather than the cool blue-grey this file shipped before, drift and provenance foregrounded, and
+ * IBM Plex carrying the distinction between prose and identifiers. The information architecture is
+ * unchanged; what changed is the surface, the type, and the amount of chrome each row spends.
  *
  * Build-time CSS only (RFC-006 §7). Runtime CSS-in-JS injects a <style> element, and while C5
  * widened the policy to `style-src 'unsafe-inline'` for monaco's theme service, the shipped shell
  * is still asserted style-free by `tests/console.rs` — so nothing here may lean on that allowance.
  *
- * System font stacks rather than a webfont: `default-src 'self'` blocks a CDN font and the binary
- * ships air-gapped, so the console faces the same constraint the prototype did. Deliberately not
- * Inter.
- *
  * Desktop only (RFC-006 §10). There is no mobile layout and none is planned — this is a fleet
  * operator's tool, and a narrow-window collapse would be a layout nobody uses pretending to be one
- * that is supported. The one concession below is a rail that goes horizontal, so a narrow window
- * is awkward rather than broken.
+ * that is supported. The nav bar wraps rather than collapsing, so a narrow window is awkward rather
+ * than broken.
  */
 
+/* ── Type ───────────────────────────────────────────────────────────────────
+   IBM Plex, self-hosted. The mockup loads it from Google Fonts; the console cannot — it is served
+   under `default-src 'self'` (`console.rs`) onto networks with no route to the internet, and
+   `bundle-offline.test.ts` fails the build on any external subresource. So the faces ship in the
+   bundle, `url()` stays relative, and vite emits them same-origin under /assets.
+
+   This replaces a system font stack, and the replacement is the point rather than a side effect:
+   Plex Mono's disambiguated 0/O/1/l is what makes a column of ports, raft indices and hash keys
+   readable, and Plex Sans is drawn to sit beside it. Licensed OFL 1.1 — see `fonts/OFL.txt`.
+
+   Plex Sans is a variable font, so one file per subset covers 400/500/600. Plex Mono is not, so it
+   ships three. Latin and latin-ext only: the console's own strings are English, and latin-ext
+   covers the accented characters a principal's display name is likely to carry. A name outside
+   both ranges falls through to the system stack rather than to tofu.
+
+   `font-display: swap` — the faces are same-origin and already in the bundle the page just loaded,
+   so the swap window is short, and an operator reading a fleet at 3am should not wait on a font. */
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-sans-var-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-sans-var-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-400-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-400-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-500-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-500-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-600-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-mono-600-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+
 /* ── Tokens ─────────────────────────────────────────────────────────────────
-   Neutrals are biased cool blue-green toward the accent, not mid-grey.
+   Neutrals are warm — a paper ground under near-white cards, with the ink browned off black. The
+   accent is the one cool thing on the page, which is what makes a port number or an owner read as
+   a link rather than as more text.
 
-   Status colours are a RESERVED set, never reused as a chart series, and never
-   carry meaning alone: green↔red measures ΔE 5.8–7.2 apart under protanopia and
-   deuteranopia, a gap no hue choice closes inside a green/amber/red convention.
-   Glyph shape and the word carry the meaning; colour reinforces it. Every value
-   below clears 4.5:1 against its own surface in both themes — the first draft's
-   amber measured 2.24:1 on white, which is why light-mode amber is #8A5A00.
+   Status colours are a RESERVED set, never reused as a chart series, and never carry meaning
+   alone: green↔red measures ΔE 5.8–7.2 apart under protanopia and deuteranopia, a gap no hue
+   choice closes inside a green/amber/red convention. Glyph shape and the word carry the meaning;
+   colour reinforces it.
 
-   Light is the `:root` default and dark comes from the media query, which is the
-   way round the prototype has it. There is no `[data-theme]` override here: the
-   console ships no theme toggle, and a selector for a control that does not
-   exist is dead CSS that reads as a missing feature. */
+   Every value below clears 4.5:1 against every surface it is used on. That is where this palette
+   departs from the mockup, and deliberately: the mockup's muted greys measure 3.45:1 (#8a8377) and
+   2.62:1 (#a09889) on the paper ground, and its amber 3.46:1 — all of them readable in a 1360px
+   design card and none of them readable as body text. The mockup's two faintest greys collapse into
+   `--ink-3` here, which keeps three warm steps of hierarchy while every step stays legible, and the
+   amber darkens from #b5761f to #8f5f14.
+
+   ONE THEME. There is no dark variant and no `prefers-color-scheme` block, which is a change from
+   what this file shipped before: the console carried a dark theme nobody had designed, so an
+   operator on a dark desktop saw a console that no mockup had ever been reviewed against, and every
+   judgement about this palette — the contrast tuning above, the ink-filled primary, the one cool
+   accent among warm neutrals — was being made about a set of colours half the readers never saw.
+
+   `color-scheme: light` states it to the browser as well as to the cascade, so form controls,
+   scrollbars and the canvas behind the page render light regardless of the OS setting. Without it a
+   dark-mode browser paints its own UA surfaces dark under a light page.
+
+   The cost is real and accepted: an operator on a dark desktop gets a bright window. The thing
+   traded away was worse — a second palette drifting untested behind a media query. */
 :root {
-  --ground: #f5f7fc;
-  --surface: #ffffff;
-  --surface-2: #edf1fa;
-  --surface-3: #dfe6f4;
-  --ink: #111a2e;
-  --ink-2: #414d69;
-  --ink-3: #5f6b87;
-  --line: #d6deee;
-  --line-2: #bcc7de;
-  --accent: #2f4cb0;
-  --accent-soft: #e7ecfb;
-  --good: #0b6b3a;
-  --good-soft: #e2f1e8;
-  --warn: #8a5a00;
-  --warn-soft: #f8eeda;
-  --crit: #b02418;
-  --crit-soft: #fae7e4;
-  --idle: #5f6b87;
-  --idle-soft: #eceff7;
+  --ground: #f7f5f1;
+  --surface: #fffefb;
+  --surface-2: #faf8f4;
+  --surface-3: #f2efe9;
+  --ink: #1b1a18;
+  --ink-2: #4a463f;
+  --ink-3: #6f6a61;
+  --line: #e2ded6;
+  --line-2: #d5d0c6;
+  --accent: #2f5fd0;
+  --accent-soft: #e7edfb;
+  --good: #2a7454;
+  --good-soft: #e4efe9;
+  --warn: #8f5f14;
+  --warn-soft: #fdf8ee;
+  --crit: #b33a3a;
+  --crit-soft: #fbeceb;
+  --idle: #6f6a61;
+  --idle-soft: #f0ede6;
   --shadow:
-    0 1px 2px rgba(17, 26, 46, 0.07), 0 1px 1px rgba(17, 26, 46, 0.04);
+    0 1px 2px rgba(27, 26, 24, 0.07), 0 1px 1px rgba(27, 26, 24, 0.04);
 
   /*
-   * The modal backdrop. A token rather than a literal because it is theme-sensitive in the same way
-   * `--shadow` is: a translucent ink that reads as a dimmed page over `--ground: #f5f7fc` is nearly
-   * invisible over the dark theme's `#0b1326`, so each theme states its own.
+   * The modal backdrop. A token rather than a literal so the one value that dims the whole page is
+   * named where the rest of the palette is, rather than inlined at the single rule that uses it.
    */
-  --scrim: rgba(17, 26, 46, 0.55);
+  --scrim: rgba(27, 26, 24, 0.34);
+
+  /*
+   * A deliberately dark panel inside a light page — the request-body preview and the payload
+   * viewers. It is a code surface, and it reads as one by being the only dark thing on the page.
+   */
+  --panel: #1f1e1b;
+  --panel-ink: #e8e3d8;
+  --panel-ink-2: #a09889;
+
+  /*
+   * Corner radii, named by what they wrap rather than by size, so the scale stays consistent as
+   * components are added. The previous system's 2–4px reads as a control panel; this one's 6–10px
+   * is what makes the same density read as paper.
+   */
+  --r-control: 6px;
+  --r-panel: 7px;
+  --r-card: 8px;
+  --r-modal: 10px;
+  --r-pill: 999px;
+
+  /*
+   * Ring segments. One quantity split N ways, so they step away from the accent rather than
+   * reaching for new hues — and they are NOT the reserved status set, which never doubles as a
+   * chart series.
+   */
+  --ring-1: #2f5fd0;
+  --ring-2: #5b8de8;
+  --ring-3: #9dbcf2;
 
   /*
    * Motion: the "subtle" tier only — 150–200ms, ease-out. An operator console watching a
@@ -72,41 +213,13 @@
   --ease: cubic-bezier(0.25, 0.46, 0.45, 0.94);
 
   --sans:
-    ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono:
-    ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas,
-    "Liberation Mono", monospace;
+    "IBM Plex Mono", ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Mono",
+    Menlo, Consolas, "Liberation Mono", monospace;
 
-  color-scheme: light dark;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --ground: #0b1326;
-    --surface: #171f33;
-    --surface-2: #1e273d;
-    --surface-3: #273148;
-    --ink: #e6ecfa;
-    --ink-2: #a9b7d2;
-    --ink-3: #8394b3;
-    --line: #2a344c;
-    --line-2: #3a4664;
-    --accent: #adc6ff;
-    --accent-soft: #1b2743;
-    --good: #22c55e;
-    --good-soft: #102c1e;
-    --warn: #f0b849;
-    --warn-soft: #302512;
-    --crit: #ff8a7a;
-    --crit-soft: #35191a;
-    --idle: #8394b3;
-    --idle-soft: #1c2438;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
-    /* Deeper than light mode's: the dark surfaces are already close to the backdrop's ink, so the
-       same alpha would barely separate the dialog from the page it is covering. */
-    --scrim: rgba(0, 0, 0, 0.66);
-  }
+  color-scheme: light;
 }
 
 * {
@@ -124,7 +237,7 @@ body {
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-  border-radius: 2px;
+  border-radius: 4px;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -181,78 +294,115 @@ code,
   border: 0;
 }
 
-/* ── App frame ─────────────────────────────────────────────────────────── */
+/* ── App frame ─────────────────────────────────────────────────────────────
+   One bar across the top, then the screen. The 232px rail this replaced spent a fixed column on
+   eight links; the screens under it are dense tables of ports, indices and hash keys, and they are
+   what the width is for. */
 
 .app {
-  display: grid;
-  grid-template-columns: 232px minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   min-height: 100vh;
 }
 
-.app-main {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
+/* ── Top bar ─────────────────────────────────────────────────────────────── */
 
-.rail {
+.topbar {
   background: var(--surface);
-  border-right: 1px solid var(--line);
-  padding: 18px 0;
+  border-bottom: 1px solid var(--line);
+  padding: 0 22px;
   display: flex;
-  flex-direction: column;
-  gap: 22px;
+  align-items: center;
+  gap: 18px;
+  min-height: 58px;
+  /* Wraps rather than scrolls or collapses. Desktop-only (RFC-006 §10) is a decision about what is
+     designed for, not a licence to break: below about 1180px the right-hand cluster drops to its
+     own line and everything stays reachable. */
+  flex-wrap: wrap;
 }
 
 .brand {
-  padding: 0 18px;
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 9px;
+  flex: none;
+  /* The hairline the mockup draws after the wordmark. On the brand rather than on the nav so it
+     survives a nav that renders no groups at all, and sized by its own padding rather than by
+     stretching to the bar — a stretched divider grows with the bar when it wraps. */
+  border-right: 1px solid var(--line);
+  padding: 4px 18px 4px 0;
 }
 
 .brand b {
-  font: 700 16px/1 var(--sans);
-  letter-spacing: -0.01em;
+  font: 600 15px/1 var(--sans);
+  letter-spacing: -0.013em;
 }
 
 .brand span {
-  font: 500 10px/1 var(--mono);
+  font: 500 10.5px/1 var(--mono);
   color: var(--ink-3);
   letter-spacing: 0.06em;
 }
 
-.nav-group {
+/* ── Nav ─────────────────────────────────────────────────────────────────── */
+
+.nav {
   display: flex;
-  flex-direction: column;
-  gap: 1px;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
-.nav-group > .eyebrow {
-  padding: 0 18px 6px;
+/*
+ * A group is a run of entries, and the hairline between runs is the only thing left carrying the
+ * grouping visually — so it is drawn between groups and never before the first or after the last,
+ * where it would read as a divider against the brand or against the identity cluster.
+ */
+.nav-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.nav-group + .nav-group {
+  border-left: 1px solid var(--line);
+  padding-left: 14px;
 }
 
 .nav-item {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 7px 18px;
+  gap: 7px;
+  padding: 7px 11px;
+  border-radius: var(--r-control);
   color: var(--ink-2);
   text-decoration: none;
-  border-left: 2px solid transparent;
-  font-size: 13.5px;
+  font: 500 12.5px/1 var(--sans);
+  white-space: nowrap;
+  transition:
+    background var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
 }
 
 .nav-item:hover {
-  background: var(--surface-2);
+  background: var(--surface-3);
   color: var(--ink);
 }
 
+/*
+ * The current screen is filled, not underlined. An underline is what the imposter-detail tab strip
+ * uses one level down, and the two would read as the same control at two depths.
+ */
 .nav-item[aria-current="page"] {
-  border-left-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--ink);
+  background: var(--ink);
+  color: var(--surface);
   font-weight: 600;
+}
+
+.nav-item[aria-current="page"]:hover {
+  background: var(--ink);
+  color: var(--surface);
 }
 
 /*
@@ -270,12 +420,11 @@ code,
 }
 
 .nav-item .issue {
-  margin-left: auto;
-  font: 500 10.5px/1 var(--mono);
+  font: 500 10px/1 var(--mono);
   color: var(--ink-3);
   border: 1px solid var(--line);
-  border-radius: 2px;
-  padding: 2px 4px;
+  border-radius: 4px;
+  padding: 3px 5px;
   text-decoration: none;
 }
 
@@ -285,26 +434,24 @@ code,
 }
 
 .nav-item .glyph {
-  width: 14px;
+  width: 12px;
   text-align: center;
   color: var(--ink-3);
-  font-size: 11px;
+  font-size: 10.5px;
 }
 
 .nav-item[aria-current="page"] .glyph {
-  color: var(--accent);
+  color: var(--surface);
 }
 
-/* ── Top bar ───────────────────────────────────────────────────────────── */
+/* ── Identity cluster ────────────────────────────────────────────────────── */
 
-.topbar {
-  background: var(--surface);
-  border-bottom: 1px solid var(--line);
-  padding: 11px 22px;
+.who {
+  margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 16px;
-  min-height: 52px;
+  gap: 12px;
+  text-align: right;
 }
 
 .tenant-switch {
@@ -312,8 +459,8 @@ code,
   align-items: center;
   gap: 8px;
   border: 1px solid var(--line-2);
-  border-radius: 3px;
-  padding: 5px 9px;
+  border-radius: var(--r-control);
+  padding: 5px 10px;
   background: var(--surface);
 }
 
@@ -322,7 +469,7 @@ code,
 }
 
 .tenant-switch select {
-  font: 600 13px/1 var(--mono);
+  font: 500 12.5px/1 var(--mono);
   border: 0;
   background: transparent;
   color: var(--ink);
@@ -330,20 +477,12 @@ code,
   padding: 0;
 }
 
-.who {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  text-align: right;
-}
-
 .who .identity .id {
   font: 600 12.5px/1.35 var(--sans);
 }
 
 .who .identity .role {
-  font: 500 10px/1 var(--mono);
+  font: 400 10.5px/1 var(--mono);
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--ink-3);
@@ -359,12 +498,12 @@ code,
 .avatar {
   width: 28px;
   height: 28px;
-  border-radius: 3px;
+  border-radius: var(--r-control);
   background: var(--accent-soft);
   color: var(--accent);
   display: grid;
   place-items: center;
-  font: 700 11px/1 var(--mono);
+  font: 600 11px/1 var(--mono);
   border: 1px solid var(--accent);
   flex: none;
 }
@@ -433,7 +572,7 @@ main {
 .card {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   box-shadow: var(--shadow);
   overflow: hidden;
 }
@@ -471,7 +610,7 @@ main {
   gap: 11px;
   align-items: flex-start;
   padding: 11px 13px;
-  border-radius: 4px;
+  border-radius: var(--r-card);
   border: 1px solid;
   font-size: 13px;
 }
@@ -541,7 +680,7 @@ main {
 .fact {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   padding: 13px 14px;
   box-shadow: var(--shadow);
   display: flex;
@@ -596,6 +735,9 @@ main {
 .fact dd .note {
   font-size: 12px;
   color: var(--ink-3);
+  /* `.tile dd` sets `break-all` for the id-shaped values it usually holds. A note is a sentence,
+     and `break-all` hyphenates it mid-word. */
+  word-break: normal;
 }
 
 /* `.tile dt` too: the imposter detail renders its facts as a definition list inside tiles, and
@@ -638,7 +780,7 @@ main {
   gap: 5px;
   font: 600 11.5px/1 var(--sans);
   padding: 4px 8px 4px 6px;
-  border-radius: 3px;
+  border-radius: var(--r-pill);
   border: 1px solid;
   white-space: nowrap;
 }
@@ -712,7 +854,7 @@ table.dense th,
 
 table.dense td,
 .card table td {
-  padding: 9px 14px;
+  padding: 11px 16px;
   border-bottom: 1px solid var(--line);
   vertical-align: middle;
   overflow: hidden;
@@ -723,9 +865,14 @@ table.dense tbody tr:last-child td,
   border-bottom: 0;
 }
 
+/*
+ * `--surface-3`, not `--surface-2`. The header row is `--surface-2` and sticks to the top of a
+ * scrolling table, so a hover tint of the same value made the hovered row read as a second header
+ * mid-table. One step further from the surface separates them.
+ */
 table.dense tbody tr:hover,
 .card table tbody tr:hover {
-  background: var(--surface-2);
+  background: var(--surface-3);
 }
 
 table.dense .numeric,
@@ -786,16 +933,33 @@ input:not([type="checkbox"]):not([type="radio"]),
 select,
 textarea {
   font: 500 12.5px/1 var(--sans);
-  padding: 6px 10px;
+  padding: 8px 11px;
   border: 1px solid var(--line-2);
-  border-radius: 3px;
+  border-radius: var(--r-control);
   background: var(--surface);
   color: var(--ink);
 }
 
+/* Text entry is monospace throughout: every value typed into this console — a port, a path, a
+   status code, a JSON body — is an identifier rather than prose. */
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+  font-family: var(--mono);
+  font-weight: 400;
+}
+
+/*
+ * `white-space: nowrap` because a button's label is one thing to press, not prose. The tables are
+ * `table-layout: fixed`, so an actions column is a fixed share of the row — a two-word label like
+ * "Open log" wrapped across two lines and spilled out of its own border once the padding here grew.
+ * Nothing about that is specific to the padding: any narrower column reproduces it.
+ */
 .btn,
 button.plain {
   cursor: pointer;
+  padding: 8px 13px;
+  white-space: nowrap;
 }
 
 /*
@@ -812,24 +976,44 @@ button.plain:hover:not([disabled]) {
   background: var(--surface-2);
 }
 
+/*
+ * Ink-filled, not accent-filled — the mockup's primary action, and the reason it works: the accent
+ * is already doing a job on this page (ports, owners, anything navigable), so an accent-filled
+ * button competes with every link around it. Ink is unused elsewhere as a fill, so exactly one
+ * thing per screen is solid dark, and that thing is the action.
+ */
 .btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
 }
 
+/*
+ * Not `filter: brightness()`. On the near-black ink fill it moves #1b1a18 to #1d1c19 — a change no
+ * one can see, so the button reads as dead on hover. An explicit step to the next ink stop is
+ * visible where brightness is not.
+ */
 .btn.primary:hover:not([disabled]) {
-  filter: brightness(1.08);
+  background: var(--ink-2);
+  border-color: var(--ink-2);
 }
 
+/*
+ * `color: var(--surface)` rather than a literal `#fff`, which is a dark-theme fix as much as a
+ * tokenisation one: while this console still carried a dark theme, `--crit` inverted to a light
+ * salmon there and white-on-salmon measured 1.9:1 — the destructive button was the least readable
+ * control in the console. Tracking `--surface` fixed it, and it stays tracked now the dark theme is
+ * gone: a literal `#fff` is a bet that `--crit` will always be dark enough to carry white text, and
+ * the token costs nothing to keep honest.
+ */
 .btn.danger {
   background: var(--crit);
   border-color: var(--crit);
-  color: #fff;
+  color: var(--surface);
 }
 
 .btn.danger:hover:not([disabled]) {
-  filter: brightness(1.08);
+  filter: brightness(0.94);
 }
 
 .btn.sm {
@@ -856,6 +1040,25 @@ main a:not(.btn):not(.nav-item):not(.issue):not(.prose-link),
 }
 
 main a:not(.btn):not(.nav-item):not(.issue):not(.prose-link):hover {
+  text-decoration: underline;
+}
+
+/*
+ * A link inside a sentence is underlined, always.
+ *
+ * The rule above drops the underline, which is right for the links this console mostly has: a table
+ * cell that navigates, a standalone action. It is wrong the moment a link sits *inside prose*, where
+ * colour becomes the only thing distinguishing it — WCAG 1.4.1, and axe measures the contrast
+ * between link and body text at 1.63:1, nowhere near the 3:1 that would let colour carry it alone.
+ *
+ * Scoped to running text rather than applied everywhere: `p` and the banners, which are the two
+ * places this console puts a sentence with a link in it.
+ */
+main p a:not(.btn):not(.nav-item):not(.issue):not(.prose-link),
+main .banner a:not(.btn):not(.nav-item):not(.issue):not(.prose-link) {
+  /* The `:not` chain is repeated from the rule above deliberately: without it this selector is
+     *less* specific than the one that removes the underline, and loses — which is exactly how the
+     first attempt at this fix failed its own axe scan. */
   text-decoration: underline;
 }
 
@@ -1026,7 +1229,7 @@ input[type="radio"] {
   padding: 18px 20px 16px;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--r-modal);
   box-shadow: var(--shadow);
 }
 
@@ -1064,7 +1267,7 @@ input[type="radio"] {
   align-items: center;
   gap: 9px;
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   background: var(--surface);
 }
 
@@ -1090,7 +1293,7 @@ input[type="radio"] {
   padding: 9px 12px;
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
   font: 500 12px/1.5 var(--mono);
   color: var(--ink-2);
   text-align: left;
@@ -1151,7 +1354,7 @@ input[type="radio"] {
   padding: 11px 14px;
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-panel);
 }
 
 .scope .coverage {
@@ -1170,7 +1373,7 @@ input[type="radio"] {
   font: 650 10.5px/1 var(--mono);
   letter-spacing: 0.05em;
   padding: 3px 5px;
-  border-radius: 2px;
+  border-radius: 4px;
   border: 1px solid var(--line-2);
   color: var(--ink-2);
   background: var(--surface-2);
@@ -1222,16 +1425,22 @@ input[type="radio"] {
  * mock chose the path, headers and body. Always text in a <pre>, never interpreted as markup, and
  * scrolling inside its own box so a minified payload cannot stretch the page.
  */
+/*
+ * Payload viewers read on a dark panel, as the mockup has them. It is the one surface that does not
+ * follow the theme: a body of JSON is a code surface, and on a paper page it reads as one only by
+ * staying dark. `--panel-ink` measures 13.0:1 on it, so this is a contrast gain over the
+ * `--ink-2`-on-`--surface-2` it replaces.
+ */
 .payload,
 .stub-diff pre,
 .stub-body pre {
   margin: 0;
-  padding: 10px 12px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: 3px;
-  font: 500 12px/1.55 var(--mono);
-  color: var(--ink-2);
+  padding: 12px 13px;
+  background: var(--panel);
+  border: 1px solid var(--panel);
+  border-radius: var(--r-panel);
+  font: 400 12px/1.65 var(--mono);
+  color: var(--panel-ink);
   overflow-x: auto;
   white-space: pre;
   max-height: 200px;
@@ -1245,7 +1454,7 @@ input[type="radio"] {
 .diagnostics,
 .diag {
   border: 1px solid;
-  border-radius: 3px;
+  border-radius: var(--r-panel);
   padding: 10px 12px;
   font-size: 12.5px;
   max-width: 60rem;
@@ -1317,7 +1526,7 @@ input[type="radio"] {
   color: var(--ink-3);
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: 2px;
+  border-radius: 4px;
   padding: 3px 5px;
   min-width: 2.4ch;
   display: inline-block;
@@ -1337,7 +1546,7 @@ input[type="radio"] {
 .clause {
   font: 500 11px/1 var(--mono);
   border: 1px solid var(--line-2);
-  border-radius: 2px;
+  border-radius: 4px;
   padding: 3px 5px;
   color: var(--ink-2);
   background: var(--surface);
@@ -1355,7 +1564,7 @@ input[type="radio"] {
 .stub-editor {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   box-shadow: var(--shadow);
   padding: 14px;
 }
@@ -1365,11 +1574,26 @@ input[type="radio"] {
  * `minmax(0, …)` on both tracks rather than `1fr`: a long unbroken body line in the editor would
  * otherwise force the grid wider than its container and scroll the whole page sideways.
  */
+/*
+ * `stretch`, not `start`.
+ *
+ * The form column runs to whatever height the stub needs — a few predicates and three responses is
+ * easily a thousand pixels — while the JSON pane sat at its 20rem minimum and left the rest of the
+ * row empty. Two views of one document should be the same height: the JSON is the document, and it
+ * is the pane an operator scrolls when the form cannot express something.
+ */
 .stub-panes {
   display: grid;
   grid-template-columns: minmax(0, 20rem) minmax(0, 1fr);
   gap: 14px;
-  align-items: start;
+  align-items: stretch;
+}
+
+.stub-panes > .code-editor,
+.stub-panes > .code-editor-fallback {
+  /* Tall documents scroll inside the editor rather than growing the page: the form beside it is the
+     thing being read down, and a JSON pane that pushed the page to 4000px would take it with it. */
+  max-height: 78vh;
 }
 
 .stub-panes > :only-child {
@@ -1390,7 +1614,7 @@ input[type="radio"] {
   display: grid;
   gap: 10px;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-card);
   padding: 10px;
 }
 
@@ -1408,7 +1632,7 @@ input[type="radio"] {
 .predicate-row-options {
   padding: 8px;
   background: var(--ground);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
 }
 
 .predicate-actions {
@@ -1422,7 +1646,7 @@ input[type="radio"] {
   gap: 6px;
   padding: 8px;
   border: 1px dashed var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
 }
 
 .predicate-group ul {
@@ -1463,7 +1687,7 @@ input[type="radio"] {
   display: grid;
   gap: 10px;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-card);
   padding: 10px;
 }
 
@@ -1472,7 +1696,7 @@ input[type="radio"] {
   gap: 8px;
   padding: 8px;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
 }
 
 .response-card-header {
@@ -1517,7 +1741,7 @@ input[type="radio"] {
  */
 .response-chaos {
   border: 1px dashed var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-panel);
   padding: 8px;
 }
 
@@ -1570,8 +1794,9 @@ input[type="radio"] {
 
 .code-editor {
   min-height: 20rem;
+  height: 100%;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-control);
 }
 
 /*
@@ -1584,7 +1809,7 @@ input[type="radio"] {
   font: 500 12px/1.6 var(--mono);
   padding: 10px 12px;
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-control);
   background: var(--surface-2);
   color: var(--ink);
   resize: vertical;
@@ -1597,7 +1822,7 @@ input[type="radio"] {
   align-items: flex-start;
   font-size: 12.5px;
   padding: 8px 10px;
-  border-radius: 3px;
+  border-radius: var(--r-panel);
   border: 1px solid var(--accent);
   background: var(--accent-soft);
   margin-top: 12px;
@@ -1675,7 +1900,7 @@ input[type="radio"] {
 .key-once {
   border: 1px solid var(--warn);
   background: var(--warn-soft);
-  border-radius: 4px;
+  border-radius: var(--r-card);
   padding: 14px;
   display: flex;
   flex-direction: column;
@@ -1699,7 +1924,7 @@ input[type="radio"] {
   word-break: break-all;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: var(--r-control);
   padding: 9px 11px;
   display: block;
 }
@@ -1736,7 +1961,7 @@ input[type="radio"] {
   width: min(430px, 100%);
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: var(--r-modal);
   box-shadow: var(--shadow);
   padding: 26px;
   display: flex;
@@ -1815,22 +2040,26 @@ input[type="radio"] {
 }
 
 /*
- * One concession to a narrow window, and it is not a mobile layout: the rail goes horizontal so a
- * half-width window is awkward rather than unusable. RFC-006 §10 still stands — nothing below is
- * designed for a phone.
+ * One concession to a narrow window, and it is not a mobile layout: the bar is already horizontal
+ * and already wraps, so all this does is stop the brand's divider from cutting across the wrap and
+ * let the identity cluster sit under the nav rather than being pushed off the end. RFC-006 §10
+ * still stands — nothing below is designed for a phone.
  */
 @media (max-width: 900px) {
-  .app {
-    grid-template-columns: 1fr;
+  .topbar {
+    padding: 10px 16px;
+    align-items: flex-start;
   }
 
-  .rail {
-    flex-direction: row;
-    overflow-x: auto;
+  .brand {
     border-right: 0;
-    border-bottom: 1px solid var(--line);
-    gap: 12px;
-    align-items: center;
+    padding-right: 0;
+  }
+
+  .who {
+    margin-left: 0;
+    width: 100%;
+    justify-content: flex-end;
   }
 }
 
@@ -1844,7 +2073,7 @@ input[type="radio"] {
   flex-wrap: wrap;
   gap: 10px;
   padding: 10px 14px;
-  border-bottom: 1px solid var(--rule);
+  border-bottom: 1px solid var(--line);
 }
 
 .filters .field {
@@ -1865,20 +2094,20 @@ input[type="radio"] {
 }
 
 .btn-link:hover {
-  color: var(--ink-1);
+  color: var(--ink);
 }
 
 .bulk-bar {
   align-items: center;
   gap: 8px;
   padding: 8px 14px;
-  border-bottom: 1px solid var(--rule);
+  border-bottom: 1px solid var(--line);
   background: var(--surface-2, transparent);
 }
 
 .bulk-report {
   padding: 8px 14px;
-  border-bottom: 1px solid var(--rule);
+  border-bottom: 1px solid var(--line);
 }
 
 .bulk-report-list {
@@ -1890,4 +2119,1262 @@ input[type="radio"] {
 .select-col {
   width: 1%;
   white-space: nowrap;
+}
+
+/* ── The split screen and its right rail ───────────────────────────────────
+   The landing shape — screen on the left, a fixed 348px fleet rail on the right carrying
+   the ring, the control plane and the merged tail. The rail is `aside` in the markup because it is
+   complementary to the screen rather than part of it: a screen reader reaches the imposter table
+   without walking a ring diagram first. */
+
+.screen-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 348px;
+  gap: 0;
+  align-items: start;
+  min-height: 0;
+}
+
+.screen-split > .screen-main {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+  padding-right: 22px;
+}
+
+.rail-right {
+  background: var(--surface);
+  border-left: 1px solid var(--line);
+  border-radius: 0;
+  padding: 4px 0 4px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+/*
+ * Below the design's own width the rail would squeeze the table it exists to annotate, so it drops
+ * under it. Still not a mobile layout (RFC-006 §10) — the breakpoint is "narrower than the design",
+ * not "a phone".
+ */
+@media (max-width: 1240px) {
+  .screen-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .screen-split > .screen-main {
+    padding-right: 0;
+  }
+
+  .rail-right {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    padding: 20px 0 0;
+  }
+}
+
+.rail-sect {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.rail-sect > .eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  letter-spacing: 0.1em;
+}
+
+/* ── The unshipped marker ──────────────────────────────────────────────────
+   The design's own device, borrowed for a second job.
+
+   It marks two whole screens the design drew ahead of the build. The same marker answers a narrower
+   question here: this panel is drawn, but the fleet publishes no endpoint
+   that would fill it (ring ownership per key, parked intents, a peer's applied index — the last of
+   which `connect-src 'self'` puts permanently out of the console's reach).
+
+   It is deliberately not a spinner, a dash, or a zero. Each of those reads as a *measurement* — "we
+   asked and the answer is nothing" — in a console whose whole job is telling an operator what is
+   true of a live fleet. This says nobody asked, because there is nothing to ask. */
+
+.pending {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  white-space: nowrap;
+  color: var(--ink-3);
+}
+
+/* The chip is the nav's, one level down — a field that is designed and unbuilt, rather than a
+   screen that is. Small enough to sit inside a table cell without setting the row height. */
+.pending .issue,
+.pending-panel .issue {
+  font: 500 10px/1 var(--mono);
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 5px;
+  text-decoration: none;
+  flex: none;
+}
+
+.pending .issue:hover,
+.pending-panel .issue:hover {
+  color: var(--ink);
+  border-color: var(--line-2);
+}
+
+/* A whole panel with no data source: one sentence saying what is missing, and its issue. */
+.pending-panel {
+  border: 1px dashed var(--line-2);
+  border-radius: var(--r-panel);
+  background: var(--surface-2);
+  padding: 13px 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.pending-panel p {
+  margin: 0;
+  font: 400 11px/1.6 var(--mono);
+  color: var(--ink-3);
+}
+
+/* ── Hash-space ring ───────────────────────────────────────────────────────
+   Segment colours step away from the accent rather than reaching for new hues: the ring is one
+   quantity split N ways, not N unrelated series, and the status set stays reserved. */
+
+.ring {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.ring-label {
+  font: 600 15px/1 var(--sans);
+  fill: var(--ink);
+}
+
+.ring-sub {
+  font: 400 11px/1 var(--mono);
+  fill: var(--ink-3);
+}
+
+.ring-track {
+  fill: none;
+  stroke: var(--surface-3);
+}
+
+.ring-seg {
+  fill: none;
+  transition:
+    stroke-dasharray var(--t-base) var(--ease),
+    stroke-dashoffset var(--t-base) var(--ease);
+}
+
+.ring-seg-1 {
+  stroke: var(--ring-1);
+}
+
+.ring-seg-2 {
+  stroke: var(--ring-2);
+}
+
+.ring-seg-3 {
+  stroke: var(--ring-3);
+}
+
+/* ── Control plane rows ────────────────────────────────────────────────────
+   One row per voter. The dot is never the only encoding — the tag word beside it says the same
+   thing, per the status rule the token block states. */
+
+.node-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+  background: var(--surface);
+  min-width: 0;
+}
+
+.node-row.is-self {
+  border-color: var(--line-2);
+  background: var(--surface-2);
+}
+
+.node-row .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.node-row .dot.is-good {
+  background: var(--good);
+}
+
+.node-row .dot.is-idle {
+  background: var(--idle);
+}
+
+.node-row .nid {
+  font: 500 12px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-row .tag {
+  font: 500 9.5px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  flex: none;
+}
+
+.node-row .applied {
+  margin-left: auto;
+  font: 400 11.5px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+  flex: none;
+}
+
+/* ── Live tail ─────────────────────────────────────────────────────────────
+   A rule down the left rather than a box: the tail is a continuing thing, and a closed border would
+   imply it has ends. */
+
+.tail {
+  font: 400 11px/1.85 var(--mono);
+  color: var(--ink-2);
+  border-left: 2px solid var(--line);
+  padding-left: 11px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.tail-line {
+  display: flex;
+  gap: 7px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.tail-line .ts {
+  color: var(--ink-3);
+  flex: none;
+}
+
+.tail-line .st {
+  flex: none;
+  font-weight: 500;
+}
+
+.tail-line .st.is-good {
+  color: var(--good);
+}
+
+.tail-line .st.is-warn {
+  color: var(--warn);
+}
+
+.tail-line .st.is-crit {
+  color: var(--crit);
+}
+
+.tail-line .what {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tail-live {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--good);
+  flex: none;
+}
+
+/* ── Filter pills ──────────────────────────────────────────────────────────
+   The design's segmented filter, as real buttons. `aria-pressed` carries the selection, so the
+   state is not fill-colour alone. */
+
+.pill-filters {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pill-filter {
+  font: 500 11.5px/1 var(--sans);
+  padding: 5px 11px;
+  border-radius: var(--r-pill);
+  border: 1px solid transparent;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.pill-filter:hover {
+  color: var(--ink);
+  background: var(--surface-3);
+}
+
+.pill-filter[aria-pressed="true"] {
+  border-color: var(--line-2);
+  background: var(--surface-3);
+  color: var(--ink);
+}
+
+.pill-filter.is-crit {
+  color: var(--crit);
+}
+
+.pill-filter.is-crit[aria-pressed="true"] {
+  border-color: var(--crit);
+  background: var(--crit-soft);
+  color: var(--crit);
+}
+
+/* ── Imposter detail head ──────────────────────────────────────────────────
+   The name and port on one line, the identity line under them. `.screen-head` lays its children out
+   end-aligned in a row, so the title and its scope label need their own stacking box to stay
+   together as the pair they read as. */
+
+.detail-head .detail-title {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.detail-head .detail-title h1 {
+  margin: 0;
+}
+
+.detail-head .detail-title .scope-label {
+  margin: 0;
+}
+
+/* The back link is a button by treatment and a link by behaviour — it navigates, so it stays an
+   anchor and only borrows `.btn`. Sized down: it is the least important control in the row. */
+.detail-head > a.btn {
+  font: 400 12px/1 var(--mono);
+  color: var(--ink-3);
+  padding: 7px 11px;
+  flex: none;
+}
+
+/* ── Fleet screen composition ──────────────────────────────────────────────
+   The ring beside its membership, then the operational panels in a row. Both collapse to one column
+   before the ring would be squeezed narrower than it reads at. */
+
+.fleet-shape {
+  display: grid;
+  grid-template-columns: 340px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.fleet-ops {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .fleet-shape {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* The type-to-confirm box, for the acts whose blast radius is the whole fleet. */
+.confirm .confirm-typed {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 14px;
+}
+
+.confirm .confirm-typed span {
+  font: 400 12px/1.4 var(--mono);
+  color: var(--ink-2);
+}
+
+.confirm .confirm-typed b {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* ── Export dialog ─────────────────────────────────────────────────────────
+   Wider than a confirm and scrollable, because it is a choice with consequences rather than a
+   yes/no: the options, the request they produce and what that request puts in the file all have to
+   be on screen together for the reading to be worth anything. */
+
+.export-dialog {
+  width: min(660px, 100%);
+  max-height: min(86vh, 900px);
+  overflow-y: auto;
+  text-align: left;
+}
+
+.export-dialog h2 {
+  margin-bottom: 4px;
+}
+
+.export-dialog > .muted {
+  margin: 0 0 18px;
+  font: 400 11.5px/1.6 var(--mono);
+}
+
+.export-dialog .field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.export-scopes {
+  margin-left: 0;
+}
+
+.export-opts {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  margin-bottom: 18px;
+}
+
+.export-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 13px 16px;
+  cursor: pointer;
+}
+
+.export-opt + .export-opt,
+.export-opt + .export-opt.is-fact {
+  border-top: 1px solid var(--surface-3);
+}
+
+/* A row that states a fact rather than offering a choice — no pointer, because nothing here is
+   clickable, and a cursor that says otherwise is a promise the row does not keep. */
+.export-opt.is-fact {
+  cursor: default;
+  /* Aligned with the checkbox rows above it rather than flush, so the column of labels stays one
+     column even though this row has no box in front of it. */
+  padding-left: 43px;
+}
+
+.export-opt input[type="checkbox"] {
+  margin-top: 2px;
+  flex: none;
+  accent-color: var(--accent);
+}
+
+.export-opt.is-warn input[type="checkbox"] {
+  accent-color: var(--crit);
+}
+
+.export-opt-label {
+  font: 500 12.5px/1.3 var(--mono);
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.export-opt .note {
+  margin: 4px 0 0;
+  font: 400 11px/1.6 var(--mono);
+  color: var(--ink-3);
+}
+
+.export-opt.is-warn .note {
+  color: var(--crit);
+}
+
+.export-contents {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 15px 18px;
+  margin-bottom: 18px;
+}
+
+.export-contents h3 {
+  margin: 0 0 10px;
+  font: 600 12px/1.3 var(--sans);
+}
+
+.export-contents ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.export-contents li {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  gap: 9px;
+  align-items: baseline;
+  font: 400 11.5px/1.6 var(--mono);
+  color: var(--ink-3);
+}
+
+/* The glyph is the encoding, not the colour — `✓` against `·` reads the same to a reader who sees
+   no difference between the green and the grey. */
+.export-contents li.is-in {
+  color: var(--ink-2);
+}
+
+.export-contents li.is-in > span:first-child {
+  color: var(--good);
+}
+
+.export-dialog .payload {
+  max-height: 160px;
+}
+
+.export-dialog .banner {
+  margin-bottom: 18px;
+}
+
+.export-dialog .banner p {
+  margin: 3px 0 0;
+}
+
+/* ── Scenario FSM ──────────────────────────────────────────────────────────
+   The states a machine can be in, then the edges between them. Chips rather than a drawn graph: a
+   scenario with six states and nine edges is a diagram nobody can read at this size, and the table
+   underneath answers "what moves this" better than an arrow would. */
+
+.fsm-states {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.fsm-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font: 500 12px/1 var(--mono);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 6px 11px;
+}
+
+/* The state a flow sits in before anything has moved it — worth marking, because it is the one an
+   operator's first request will meet. */
+.fsm-state.is-initial {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.fsm-initial {
+  font: 600 9px/1 var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+/* ── Front door: tester and notes ──────────────────────────────────────────
+   The two explanatory cards sit side by side under the table; the tester is a rail, because it
+   annotates the table rather than being another row of it. */
+
+.front-door-notes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+.front-door-notes p {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.front-door-notes p:last-child {
+  margin-bottom: 0;
+}
+
+.rail-right .field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+
+.rail-right .field label {
+  font: 500 11px/1 var(--mono);
+  color: var(--ink-3);
+}
+
+/*
+ * The verdict, stated in a word before the detail. Tinted rather than only worded — but the word is
+ * the encoding and the tint reinforces it, per the status rule the token block sets out.
+ */
+.probe-verdict {
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+  padding: 12px 13px;
+  background: var(--surface-2);
+}
+
+.probe-verdict.is-hit {
+  border-color: var(--good);
+  background: var(--good-soft);
+}
+
+.probe-verdict.is-miss {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.probe-verdict strong {
+  font: 600 12.5px/1.3 var(--sans);
+}
+
+.probe-verdict p {
+  margin: 4px 0 0;
+  font: 400 11.5px/1.6 var(--mono);
+  color: var(--ink-2);
+}
+
+/* One line per route the front door would consider, in the order it would consider them. */
+.trace {
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+/*
+ * Stacked, not two columns. A route id is operator-chosen and can be any length; in a 348px rail a
+ * side-by-side layout either wraps the id mid-word or pushes the reason off the edge — both of
+ * which happened before this. The id reads as a heading over its own reason instead.
+ */
+.trace li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font: 400 11px/1.5 var(--mono);
+  color: var(--ink-3);
+  min-width: 0;
+}
+
+.trace li > span {
+  overflow-wrap: anywhere;
+}
+
+.trace li.is-hit {
+  color: var(--good);
+}
+
+.trace-id {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+
+/* ── Label/value grid ──────────────────────────────────────────────────────
+   Facts in two columns, for panels that are a list of named values rather than a table. Narrower
+   than `.detail`'s auto-fit tiles, because these read down rather than across. */
+
+.kv-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 170px) minmax(0, 1fr);
+  gap: 10px 16px;
+  margin: 0;
+  align-items: baseline;
+}
+
+.kv-grid dt {
+  font: 400 12px/1.4 var(--mono);
+  color: var(--ink-3);
+}
+
+.kv-grid dd {
+  margin: 0;
+  font: 400 12px/1.4 var(--mono);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+/* ── Danger zone ───────────────────────────────────────────────────────────
+   Every irreversible act on one object, together. The border is the signal — a red-bordered card is
+   the only one on the screen, so it reads before the labels do. */
+
+.danger-zone {
+  border-color: var(--crit);
+}
+
+.danger-zone h2 {
+  margin: 0 0 4px;
+  font: 600 13px/1.3 var(--sans);
+  color: var(--crit);
+}
+
+.danger-zone .muted {
+  margin: 0 0 14px;
+}
+
+.danger-zone .row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* A pill that reports a gap rather than offering a filter — no hover, no press state, because
+   nothing happens when it is clicked and a control that looks live and is not is worse than none. */
+.pill-filter.is-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: default;
+  color: var(--ink-3);
+}
+
+.pill-filter.is-pending:hover {
+  background: none;
+}
+
+/* The flow-state sections, shown before an imposter is chosen — inert, so they are styled as labels
+   rather than as the tab strip they preview. `aria-hidden`: the same words appear as real tabs the
+   moment a choice is made, and announcing them twice would promise controls that are not there. */
+.flow-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.flow-preview-tab {
+  font: 500 11.5px/1 var(--mono);
+  color: var(--ink-3);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 6px 12px;
+}
+
+/* ── Create wizard ─────────────────────────────────────────────────────────
+   A modal, because creating an imposter is a decision with three parts and a card in the page flow
+   let the list scroll underneath it mid-decision. */
+
+.wizard {
+  width: min(900px, 100%);
+  max-height: min(88vh, 860px);
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+  padding: 0;
+  overflow: hidden;
+}
+
+.wizard-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 20px;
+  padding: 18px 24px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.wizard-head h2 {
+  margin: 0 0 3px;
+}
+
+.wizard-head .muted {
+  margin: 0;
+  font: 400 11.5px/1.4 var(--mono);
+}
+
+/* The step indicator. An ordered list, so it announces as one — the numbered dots are decoration
+   over structure rather than instead of it. */
+.wizard-steps {
+  margin: 0 0 0 auto;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  font: 500 11.5px/1 var(--mono);
+  color: var(--ink-3);
+}
+
+.wizard-steps li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wizard-steps li.is-current {
+  color: var(--ink);
+}
+
+.wizard-dot {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--surface-3);
+  color: var(--ink-3);
+  font: 600 10.5px/1 var(--mono);
+  flex: none;
+}
+
+.wizard-steps li.is-current .wizard-dot {
+  background: var(--ink);
+  color: var(--surface);
+}
+
+.wizard-steps li.is-done .wizard-dot {
+  background: var(--good);
+  color: var(--surface);
+}
+
+/*
+ * The form is the modal's column, not its scroller. The body scrolls; the footer does not move.
+ *
+ * It was a sticky footer with a negative offset, which shifted as the body's height changed — enough
+ * that Playwright refused to click it as "not stable", and enough that a real click could land on
+ * the wrong control mid-settle.
+ */
+.wizard-form {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  gap: 0;
+}
+
+.wizard-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.wizard-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 15px 24px;
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  flex: none;
+  flex-wrap: wrap;
+}
+
+.wizard-foot .row {
+  margin-left: auto;
+  display: flex;
+  gap: 9px;
+}
+
+.wizard-review {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 18px;
+  align-items: start;
+}
+
+.wizard-review .payload {
+  max-height: 420px;
+}
+
+.wizard-aside {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.wizard-happens {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+.wizard-happens li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font: 400 11px/1.5 var(--mono);
+  color: var(--ink-3);
+}
+
+.wizard-happens b {
+  font: 500 11.5px/1.4 var(--mono);
+  color: var(--ink);
+}
+
+.field.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+@media (max-width: 820px) {
+  .wizard-review {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Usage over limit. The limit is muted because it is configuration — the eye should land on the
+   figure that moves, which is the one that is not there yet. */
+.quota-cell {
+  white-space: nowrap;
+}
+
+.quota-limit {
+  margin-left: 6px;
+  font: 400 11.5px/1 var(--mono);
+  color: var(--ink-3);
+}
+
+/* ── Toasts ────────────────────────────────────────────────────────────────
+   Bottom-right, stacked, transient. Confirmations only — failures render a persistent note beside
+   the thing that failed, because an error that disappears is an error nobody received. */
+
+.toast-host {
+  position: fixed;
+  right: 22px;
+  bottom: 20px;
+  /* Above the modals, which is deliberate: an act confirmed while a dialog is still open should be
+     readable without dismissing the dialog first. */
+  z-index: 10002;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-end;
+  /* The host spans nothing it does not need to — a full-width fixed strip would swallow clicks
+     across the bottom of every screen. */
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--r-card);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: 0 10px 30px rgba(27, 26, 24, 0.14);
+  max-width: 420px;
+  font: 400 12px/1.5 var(--sans);
+}
+
+.toast.is-good {
+  border-color: var(--good);
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+.toast.is-warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.toast-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex: none;
+  background: currentcolor;
+}
+
+.toast-msg {
+  font-weight: 500;
+}
+
+.toast-meta {
+  font: 400 10.5px/1.5 var(--mono);
+  opacity: 0.75;
+  margin-top: 2px;
+}
+
+.toast-close {
+  margin-left: 4px;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+  opacity: 0.7;
+}
+
+.toast-close:hover {
+  opacity: 1;
+}
+
+/* ── Stub workspace ────────────────────────────────────────────────────────
+   The stubs in match order beside whichever one is open. The order is the screen's subject — the
+   matcher walks it top to bottom — so it stays visible while a stub is edited, which it did not
+   when the only view of it was a table below the editor. */
+
+.stub-workspace {
+  display: grid;
+  grid-template-columns: 290px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+  min-width: 0;
+}
+
+.stub-pane {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.stub-list {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 13px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stub-list > .eyebrow {
+  padding: 0 4px 2px;
+}
+
+.stub-list-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* A button, not a link: it opens a panel beside itself rather than navigating. */
+.stub-list-row {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--r-panel);
+  background: none;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.stub-list-row:hover:not([disabled]) {
+  background: var(--surface-3);
+}
+
+.stub-list-row.is-selected {
+  background: var(--surface);
+  border-color: var(--line-2);
+}
+
+/* A stub with no id cannot be addressed by the by-id routes, so it cannot be opened. Stated as a
+   disabled control rather than a click that quietly does nothing. */
+.stub-list-row[disabled] {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.stub-list-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.stub-list-n {
+  font: 500 11px/1 var(--mono);
+  color: var(--ink-3);
+  flex: none;
+}
+
+.stub-list-method {
+  font: 600 11.5px/1 var(--mono);
+  color: var(--accent);
+  flex: none;
+}
+
+.stub-list-target {
+  font: 400 12px/1.3 var(--mono);
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stub-list-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font: 400 10.5px/1.4 var(--mono);
+  color: var(--ink-3);
+  min-width: 0;
+}
+
+.stub-list-id {
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 12ch;
+}
+
+/* A predicate-less stub answers everything from its position on, so every stub below it is
+   unreachable — the one property of this list the rows cannot show on their own. */
+.stub-list-catchall {
+  font: 600 9px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 4px;
+  padding: 3px 5px;
+  flex: none;
+}
+
+.stub-list-add {
+  border: 1px dashed var(--line-2);
+  border-radius: var(--r-panel);
+  background: none;
+  color: var(--ink-3);
+  font: 400 12px/1 var(--mono);
+  padding: 11px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+.stub-list-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+@media (max-width: 1100px) {
+  .stub-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/*
+ * A table with more columns than the viewport.
+ *
+ * `table-layout: fixed` divides the available width between the columns it has — with twelve of
+ * them it compresses every one until values clip mid-character, which is worse than a scrollbar
+ * because a clipped URI still looks like a URI. A min-width makes the columns take the space they
+ * need and hands the overflow to `.scroll-x`, which is already wrapped around every one of these.
+ */
+table.dense.wide {
+  /*
+   * `auto` + `max-content`, not a min-width.
+   *
+   * A min-width alone did nothing: at 1500px it still fitted the container, so `table-layout: fixed`
+   * went on dividing the width between twelve columns and clipping every one. Sizing to content is
+   * the actual fix — the columns take what they need, the table overflows, and `.scroll-x` scrolls
+   * it. `min-width: 100%` keeps it filling the card when the content is narrow.
+   */
+  table-layout: auto;
+  width: max-content;
+  min-width: 100%;
+}
+
+/* `overflow: hidden` on the cell is what turned "too narrow" into "clipped mid-character". With the
+   table sizing to content there is nothing to hide, and values must not wrap into two lines. */
+table.dense.wide td,
+table.dense.wide th {
+  overflow: visible;
+  white-space: nowrap;
+}
+
+/* One row per gate still holding readiness. The word carries the state; the glyph and colour
+   reinforce it, per the status rule the token block sets out. */
+.gate-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.gate-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ownership-rules {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+/* Status words in a definition list, where a pill would be too heavy for a one-line value. */
+.good-text {
+  color: var(--good);
+}
+
+.crit-text {
+  color: var(--crit);
+}
+
+.fleet-name {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+/* The scenario states a flow currently sits at, side by side — one pill per scenario. */
+.flow-states {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
 }

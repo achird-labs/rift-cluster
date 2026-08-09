@@ -23,10 +23,16 @@ test.describe("recording: start, review, promote", () => {
     await page.getByTestId("new-imposter").click();
     await page.getByLabel(/^port$/i).fill(String(RECORDING_PORT));
     await page.getByLabel(/^name$/i).fill("e2e-recorder");
+    // Identity -> First stub -> Review. The stub step is skipped deliberately: leaving the path
+    // blank creates the imposter with no stubs, which is what this test wants.
+    await page.getByTestId("wizard-next").click();
+    await page.getByTestId("wizard-next").click();
     await page.getByRole("button", { name: /create imposter/i }).click();
     await expect(page.getByText("e2e-recorder")).toBeVisible({ timeout: 10_000 });
 
-    await goToScreen(page, `/imposters/${RECORDING_PORT}`);
+    // Recording is imposter configuration, so the detail screen keeps its panel on Settings. The
+    // tab lives in the hash, so this arrives on it the way a bookmark would.
+    await goToScreen(page, `/imposters/${RECORDING_PORT}?tab=settings`);
 
     // --- start: write one proxy stub through the form -------------------------
     await page.getByRole("button", { name: /start recording/i }).click();

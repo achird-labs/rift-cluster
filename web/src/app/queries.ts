@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { UseMutationResult, UseQueryResult } from "@tanstack/react-query";
 
 import {
@@ -907,6 +907,123 @@ export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { po
  * scenarios" and "this node could not answer" are different sentences and only the type keeps them
  * apart.
  */
+/**
+ * Every imposter's default flow, read together.
+ *
+ * The flow-state screen is a fleet-wide view in the design — flows listed across imposters, with the
+ * imposter as a prefix on the flow id rather than a choice to make first. Nothing enumerates flows
+ * (#374: a space is created implicitly by whatever id a request carried), so what is actually
+ * readable is each imposter's *default* flow, and that is what this fans out for.
+ *
+ * A fan-out, and worth saying why it is acceptable here when it is not for the request journal: a
+ * flow list is a **set**, not a stream. The journal's fan-out was refused because ordering N
+ * independent reads by whichever returned first would present network timing as journal order. A
+ * set has no order to get wrong — each row is independently true, and a row that fails to load says
+ * so on its own line rather than corrupting the others.
+ *
+ * `combine` folds the results in the query layer so the screen sees one value rather than N.
+ */
+/**
+ * How many imposters a fleet-wide journal read will fan out to.
+ *
+ * A cap, because this is N requests on every poll and the request log polls at 2s: a tenant with two
+ * hundred imposters would make four hundred requests a second out of one open tab. The screen says
+ * when it has capped rather than quietly showing a partial fleet as the whole one.
+ */
+export const MERGED_JOURNAL_FANOUT = 25;
+
+/** One recorded request, tagged with the imposter it was read from. */
+export type MergedRequest = {
+  port: number;
+  request: components["schemas"]["RecordedRequest"];
+};
+
+/**
+ * A journal across every imposter, assembled here rather than read.
+ *
+ * **This is a client-side merge and the screen says so.** There is no fleet-wide journal endpoint
+ * (#362); what exists is per-imposter, each already merged across the fleet's writer shards. So this
+ * reads N of them and orders the union by each entry's recorded timestamp.
+ *
+ * That ordering is the part to be honest about. It is not the journal's own order: the timestamps
+ * come from whichever node served each request, so clock skew between nodes can transpose two
+ * entries recorded within milliseconds of each other. Adjacent rows from different ports are
+ * therefore "about this order" rather than a sequence, which is exactly the guarantee the vector
+ * cursor gives inside a single imposter's journal and cannot give across several.
+ *
+ * A port that fails to read is dropped from the union and counted, not silently omitted — the screen
+ * reports it, because a short journal that looks complete is the failure mode worth preventing.
+ */
+export function useAllRequests(ports: readonly number[]): {
+  rows: MergedRequest[];
+  pending: boolean;
+  failed: number;
+  capped: number;
+} {
+  const { tenant } = useSession();
+  const read = ports.slice(0, MERGED_JOURNAL_FANOUT);
+
+  return useQueries({
+    queries: read.map((port) => ({
+      queryKey: key(["merged-requests", port], tenant),
+      queryFn: async (): Promise<MergedRequest[]> => {
+        const body = await apiGet<unknown>(requestsPath(port), { tenant });
+        const list = Array.isArray(body)
+          ? body
+          : ((body as { requests?: unknown }).requests ?? []);
+        return (Array.isArray(list) ? list : []).map((request) => ({
+          port,
+          request: request as components["schemas"]["RecordedRequest"],
+        }));
+      },
+      ...POLLED,
+    })),
+    combine: (results) => ({
+      rows: results
+        .flatMap((result) => result.data ?? [])
+        /*
+         * Newest first, and `localeCompare` on the RFC 3339 string rather than `Date.parse`:
+         * the format sorts lexicographically when the offset matches, and parsing would turn an
+         * unexpected value into `NaN`, which sorts unpredictably rather than visibly.
+         */
+        .sort((a, b) => String(b.request.timestamp ?? "").localeCompare(String(a.request.timestamp ?? ""))),
+      pending: results.some((result) => result.isPending),
+      failed: results.filter((result) => result.isError).length,
+      capped: Math.max(0, ports.length - read.length),
+    }),
+  });
+}
+
+export function useAllScenarios(
+  ports: readonly number[],
+): { rows: { port: number; state: ScenarioState }[]; pending: boolean } {
+  const { tenant } = useSession();
+  return useQueries({
+    queries: ports.map((port) => ({
+      queryKey: key(["scenarios", port, null], tenant),
+      queryFn: async (): Promise<ScenarioState> => {
+        try {
+          return readScenarios(await apiGet<unknown>(scenariosPath(port, null), { tenant }));
+        } catch (error) {
+          return {
+            kind: "unknown" as const,
+            reason: error instanceof Error ? error.message : "this node could not be reached",
+          };
+        }
+      },
+      ...POLLED,
+    })),
+    combine: (results) => ({
+      rows: results.flatMap((result, index) => {
+        const port = ports[index];
+        if (port === undefined || result.data === undefined) return [];
+        return [{ port, state: result.data }];
+      }),
+      pending: results.some((result) => result.isPending),
+    }),
+  });
+}
+
 export function useScenarios(port: number, flow: string | null): UseQueryResult<ScenarioState> {
   const { tenant } = useSession();
   return useQuery({

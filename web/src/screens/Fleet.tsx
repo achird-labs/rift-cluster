@@ -6,6 +6,8 @@ import { FLEET_HEALTH_FIELDS, FLEET_MEMBER_FIELDS } from "../app/contract.ts";
 import type { FleetView } from "../app/fleetView.ts";
 import { useFleetView } from "../app/queries.ts";
 import { Card, ErrorNote, Ident, Status, Tile, UNKNOWN } from "../components/primitives.tsx";
+import { ControlPlane, HashRing } from "../components/fleetRail.tsx";
+import { Pending, PendingPanel } from "../components/pending.tsx";
 
 export function Fleet(): ReactNode {
   const fleet = useFleetView();
@@ -108,6 +110,77 @@ function View({ view }: { view: FleetView }): ReactNode {
           ))}
         </dl>
       </Card>
+
+      {/*
+       * Readiness gates as their own card, which is where the design puts them.
+       *
+       * `/readyz` publishes the gates that are still PENDING, not every gate and its state — so an
+       * empty card is the good case and has to say so, rather than reading as a panel that failed
+       * to load. The satisfied gates are not enumerable from here at all, which is why this counts
+       * what is outstanding rather than listing a checklist.
+       */}
+      <Card title="Readiness gates">
+        {view.pendingGates.length === 0 ? (
+          <p className="muted" data-testid="fleet-gates-clear">
+            No gate is holding readiness. <code>/readyz</code> reports only what is still pending, so
+            this is the whole of what it has to say — the gates it has already satisfied are not
+            enumerated.
+          </p>
+        ) : (
+          <ul className="gate-list" data-testid="fleet-gates-pending">
+            {view.pendingGates.map((gate) => (
+              <li key={gate}>
+                <span className="status status-warn">
+                  <span className="g" aria-hidden="true">
+                    &#9650;
+                  </span>
+                  pending
+                </span>
+                <Ident>{gate}</Ident>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      {/*
+       * The ring and its members, side by side — the shape of the fleet next to the list of who is
+       * in it. Both are read from `/_fleet/health` and `/_fleet/members`; neither is inferred.
+       */}
+      <div className="fleet-shape">
+        <Card title="Ring">
+          {/* The design heads this card with the fleet's name. Nothing publishes one (#373) — and
+              the sharper cost is not this card but the top bar: an operator with staging and
+              production open in two tabs can tell them apart only by port, while every destructive
+              act in this console is fleet-wide. */}
+          <div className="fleet-name">
+            <span className="eyebrow">Fleet</span>
+            <Pending issue={373} reason="Nothing names the fleet. Node ids identify members; no label identifies the cluster." />
+          </div>
+          <HashRing fleet={view} />
+        </Card>
+        <Card title="Members">
+          <ControlPlane fleet={view} />
+        </Card>
+      </div>
+
+      {/*
+       * The design's three operational panels. Every one of them is an *action* on the fleet —
+       * trigger a snapshot, compact the log, add a learner, remove a voter — and the admin API
+       * exposes none of them. They are drawn because the design draws them and marked because
+       * offering a button that cannot call anything would be worse than saying so.
+       */}
+      <div className="fleet-ops">
+        <Card title="Durability &amp; write path">
+          <PendingPanel issue={365} reason="The write barrier, its timeout, the flow fsync policy and the admin-write mode are configured on the node's command line and are not read back by any endpoint." />
+        </Card>
+        <Card title="Snapshots">
+          <PendingPanel issue={365} reason="No endpoint reports the last snapshot or triggers a new one. Snapshotting and log compaction are driven by the node's own thresholds." />
+        </Card>
+        <Card title="Membership">
+          <PendingPanel issue={366} reason="Adding a learner or removing a voter is a cluster-membership change with no admin-API route. A graceful leave that would drop the fleet below two voters is refused by the node itself, not from here." />
+        </Card>
+      </div>
 
       {view.singleNode ? (
         <p className="hint" data-testid="fleet-single-note">

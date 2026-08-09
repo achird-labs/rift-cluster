@@ -123,8 +123,14 @@ test.describe("roles get the console their bindings allow", () => {
     // `imposter.lifecycle` yes, `imposter.write` no — so neither authoring control is drawn.
     await expect(page.getByRole("button", { name: /add stub/i })).toHaveCount(0);
     await expect(page.getByTestId("clone-imposter")).toHaveCount(0);
-    // The read it may do still works, so this is gating rather than a screen that failed to load.
-    await expect(page.getByTestId("detail-port")).toContainText(String(imposters[0]));
+    /*
+     * The read it may do still works, so this is gating rather than a screen that failed to load.
+     *
+     * Asserted on the heading rather than the `detail-port` field: the fields moved onto the
+     * Settings tab, and the heading carries the port on every tab. That makes it the better probe
+     * for "the screen loaded" anyway — it cannot pass merely because one panel happened to render.
+     */
+    await expect(page.getByRole("heading", { level: 1 })).toContainText(String(imposters[0]));
   });
 
   test("an editor gets those same controls", async ({ page }) => {
@@ -180,13 +186,25 @@ test.describe("roles get the console their bindings allow", () => {
     await goToScreen(page, `/scenarios/${imposters[0]}`);
     await expect(page.getByTestId("reset-scenarios")).toBeVisible();
     await expect(page.getByTestId("flow-state-clear-all")).toBeVisible();
+
+    /*
+     * The space control is asserted absent ON THE TAB IT LIVES ON.
+     *
+     * Spaces became their own tab, and asserting `toHaveCount(0)` from the scenarios tab would pass
+     * for the wrong reason — the control is not rendered there for anybody, so the assertion would
+     * hold even if an operator were wrongly offered it. An absence is only evidence where the thing
+     * would otherwise be.
+     */
+    await goToScreen(page, `/scenarios/${imposters[0]}?tab=spaces`);
+    await expect(page.getByTestId("space-teardown")).toBeVisible();
     await expect(page.getByTestId("space-add-stub")).toHaveCount(0);
   });
 
   test("an editor may scope a stub into a space", async ({ page }) => {
     const { imposters } = fixture();
     await signIn(page, "editor");
-    await goToScreen(page, `/scenarios/${imposters[0]}`);
+    // Spaces are their own tab now; the tab lives in the hash, so this arrives on it directly.
+    await goToScreen(page, `/scenarios/${imposters[0]}?tab=spaces`);
     await expect(page.getByTestId("space-add-stub")).toBeVisible();
   });
 

@@ -277,6 +277,8 @@ describe("server cursor replaces client-side slicing", () => {
 
     const user = userEvent.setup();
     await user.click(screen.getByTestId("clear-requests"));
+    // A clear commits fleet-wide through Raft, so the dialog holds the act until the port is typed.
+    await user.type(screen.getByTestId("confirm-typed"), "4545");
     await user.click(screen.getByTestId("confirm-destructive"));
 
     /*

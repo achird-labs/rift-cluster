@@ -8,15 +8,18 @@ describe("nav model", () => {
     // C6 (#189) turns `requests` live and adds the front-door route editor beside it. C7 (#190)
     // turns `administration` live. #233 turns `sources` live.
     //
-    // The order is the rail's section grouping, not authoring order: the four mock screens, then
-    // fleet, then administration.
+    // The order is the nav bar's section grouping, not authoring order — and it is the design's:
+    // the four mock screens, then the two fleet-scoped ones, then administration. `sources` sits in
+    // the fleet group rather than with the mocks because a source is a fleet-wide declaration
+    // (leader-only poller, replicated to every node), which is also the only arrangement that puts
+    // it where the design draws it without breaking the group-sorted invariant asserted below.
     expect(liveEntries().map((e) => e.id)).toEqual([
       "imposters",
-      "requests",
       "routes",
       "scenarios",
-      "sources",
+      "requests",
       "cluster",
+      "sources",
       "administration",
     ]);
   });
@@ -30,11 +33,32 @@ describe("nav model", () => {
     expect(scenarios?.group).toBe("mocks");
   });
 
-  it("declares entries already sorted into rail group order", () => {
-    // The rail renders each group by filtering `NAV` in place, so an entry declared out of group
-    // order would silently render under the wrong heading rather than fail anywhere visible.
+  it("declares entries already sorted into nav group order", () => {
+    // The bar renders each group by filtering `NAV` in place, so an entry declared out of group
+    // order would silently render in the wrong run rather than fail anywhere visible.
     const positions = NAV.map((entry) => NAV_GROUPS.indexOf(groupOf(entry)));
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
+  });
+
+  it("keeps every short label a substring of the full label it stands in for", () => {
+    /*
+     * WCAG 2.5.3, Label in Name. The bar prints `short` and names the control with `label`, so a
+     * `short` that is not contained in `label` produces a link whose visible text is not in its
+     * accessible name — "click Fleet" then addresses nothing, for every speech-input user.
+     *
+     * Asserted here rather than trusted to review because the two strings live on the same object
+     * and diverge silently: shortening a label is exactly the edit that breaks this.
+     *
+     * Case-insensitively, which is the criterion rather than a loosening of it: "Routes" stands in
+     * for "Front-door routes" and speech input matches without regard to case, so requiring an
+     * exact substring would reject a label that satisfies 2.5.3 and push the fix toward a
+     * lowercased word in the bar.
+     */
+    for (const entry of liveEntries()) {
+      if (entry.short === undefined) continue;
+      expect(entry.short.length).toBeGreaterThan(0);
+      expect(entry.label.toLowerCase()).toContain(entry.short.toLowerCase());
+    }
   });
 
   it("puts every unbuilt screen last, together", () => {

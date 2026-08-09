@@ -151,7 +151,13 @@ indices. These are values an operator pastes into curl. `rift-tui` is the intera
 RFC-006 §4 names deliberately, and this is where that lineage shows.
 
 **Typography uses system stacks, not a webfont.** The CSP blocks font CDNs and the binary must work
-air-gapped, so the real console faces the same choice. Deliberately not Inter.
+air-gapped. Deliberately not Inter.
+
+> The shipped console no longer follows this prototype here. It self-hosts IBM Plex Sans and Plex
+> Mono from `web/src/fonts/`, which answers the same constraint a different way — the faces are in
+> the bundle and served same-origin, so `default-src 'self'` and the air gap both still hold, and
+> `bundle-offline.test.ts` proves it. The prototype keeps system stacks because it is a single file
+> meant to open from disk with nothing beside it.
 
 **Desktop only** (RFC-006 §10). The narrow-window collapse here is prototype convenience, not a
 mobile layout.

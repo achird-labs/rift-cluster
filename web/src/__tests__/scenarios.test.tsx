@@ -38,9 +38,23 @@ function healthy(overrides: Record<string, { json?: unknown; status?: number }> 
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  // The screen's tab lives in the hash, so a test that opened one would otherwise leave the next
+  // one on it — an order dependence that surfaces as an unrelated failure.
+  window.location.hash = "";
 });
 
-function renderScreen(role: Parameters<typeof whoamiWith>[0], flow: string | null = FLOW) {
+/**
+ * Render the screen, optionally on one of its tabs.
+ *
+ * Spaces and scenario definitions are their own tabs now, so a test about a space arrives on the
+ * one its panel lives on — by hash, the way a bookmark would, rather than by clicking through.
+ */
+function renderScreen(
+  role: Parameters<typeof whoamiWith>[0],
+  flow: string | null = FLOW,
+  tab: "scenarios" | "spaces" | "defs" = "scenarios",
+) {
+  if (tab !== "scenarios") window.location.hash = `#/?tab=${tab}`;
   return renderInApp(<Scenarios port={PORT} flow={flow} />, {
     whoami: whoamiWith(role, ["acme"]),
     tenants: ["acme"],
@@ -202,7 +216,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
      * resolve to that flow, and they never appear on the imposter's own stub list.
      */
     stubFetch(healthy());
-    renderScreen("viewer");
+    renderScreen("viewer", FLOW, "spaces");
 
     const table = await screen.findByTestId("space-stubs");
     expect(table.textContent).toBeTruthy();
@@ -231,7 +245,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
         },
       }),
     );
-    renderScreen("viewer");
+    renderScreen("viewer", FLOW, "spaces");
 
     const warning = await screen.findByTestId("space-stub-shadow-warning");
     expect(warning.textContent).toMatch(/matches every request in this space/i);
@@ -243,7 +257,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
     // `healthy()`'s default space is exactly this: one predicate-less stub, nothing after it. That
     // is an ordinary space-wide default, and warning about it would be crying wolf.
     stubFetch(healthy());
-    renderScreen("viewer");
+    renderScreen("viewer", FLOW, "spaces");
 
     await screen.findByTestId("space-stubs");
     expect(screen.queryByTestId("space-stub-shadow-warning")).toBeNull();
@@ -251,7 +265,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
 
   it("reports how many requests resolved to the space", async () => {
     stubFetch(healthy());
-    renderScreen("viewer");
+    renderScreen("viewer", FLOW, "spaces");
     expect((await screen.findByTestId("space-requests")).textContent).toContain("7");
   });
 
@@ -259,7 +273,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
     // "Nothing reached this space" is the question the operator is asking, not an answer the
     // console may supply on the node's behalf.
     stubFetch(healthy({ [SPACE_PATH]: { json: { space: FLOW, stubs: [], scenarios: [] } } }));
-    renderScreen("viewer");
+    renderScreen("viewer", FLOW, "spaces");
     await waitFor(async () =>
       expect((await screen.findByTestId("space-requests")).textContent).toContain("—"),
     );
@@ -267,21 +281,21 @@ describe("a space's stubs are not the imposter's stubs", () => {
 
   it("renders a space holding nothing as an answer", async () => {
     stubFetch(healthy({ [SPACE_PATH]: { json: { space: FLOW, stubs: [], scenarios: [], numberOfRequests: 0 } } }));
-    renderScreen("viewer");
+    renderScreen("viewer", FLOW, "spaces");
     await screen.findByTestId("space-empty");
     expect(screen.queryByTestId("space-unknown")).toBeNull();
   });
 
   it("renders a space that could not be read as the absence of one", async () => {
     stubFetch(healthy({ [SPACE_PATH]: { status: 503 } }));
-    renderScreen("viewer");
+    renderScreen("viewer", FLOW, "spaces");
     await screen.findByTestId("space-unknown");
     expect(screen.queryByTestId("space-empty")).toBeNull();
   });
 
   it("offers a viewer neither teardown nor stub-scoping", async () => {
     stubFetch(healthy());
-    renderScreen("viewer");
+    renderScreen("viewer", FLOW, "spaces");
     await screen.findByTestId("space-stubs");
     expect(screen.queryByTestId("space-teardown")).toBeNull();
     expect(screen.queryByTestId("space-add-stub")).toBeNull();
@@ -291,14 +305,14 @@ describe("a space's stubs are not the imposter's stubs", () => {
     // `SpaceTeardown` is Operator, `SpaceStubWrite` is Editor — the same disturb/redefine split as
     // the scenario controls.
     stubFetch(healthy());
-    renderScreen("operator");
+    renderScreen("operator", FLOW, "spaces");
     await screen.findByTestId("space-teardown");
     expect(screen.queryByTestId("space-add-stub")).toBeNull();
   });
 
   it("offers an editor both", async () => {
     stubFetch(healthy());
-    renderScreen("editor");
+    renderScreen("editor", FLOW, "spaces");
     await screen.findByTestId("space-add-stub");
     await screen.findByTestId("space-teardown");
   });

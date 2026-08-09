@@ -3,11 +3,22 @@ import { type FormEvent, type ReactNode, useState } from "react";
 import { ApiError, apiGetText } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
 import { IMPOSTER_COLUMNS, type ImposterColumn } from "../app/contract.ts";
-import { type TrySpec, useImportAddImposter, useImposter, useTryStub } from "../app/queries.ts";
+import type { FleetView } from "../app/fleetView.ts";
+import {
+  type TrySpec,
+  useClearRequests,
+  useDeleteImposter,
+  useFleetView,
+  useImportAddImposter,
+  useImposter,
+  useTryStub,
+} from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
-import { toHash } from "../app/routing.ts";
+import { toHash, useHashQuery } from "../app/routing.ts";
+import { DetailRail } from "../components/detailRail.tsx";
+import { Pending, PendingPanel } from "../components/pending.tsx";
 import { ImposterField } from "../components/imposterFields.tsx";
-import { Card, Empty, ErrorNote, Ident, UNKNOWN } from "../components/primitives.tsx";
+import { Card, Confirm, Empty, ErrorNote, Ident, UNKNOWN, UNNAMED } from "../components/primitives.tsx";
 import {
   type ExportProjection,
   cloneImposter,
@@ -15,9 +26,11 @@ import {
   exportQuery,
   selectImposter,
 } from "../features/imposters/portable.ts";
+import { matchOrder } from "../features/stubs/matchOrder.ts";
 import { projectPredicates } from "../features/stubs/predicates.ts";
 import { type Sample, sampleRequest, toCurl } from "../features/stubs/sample.ts";
 import { RecordingPanel } from "./RecordingPanel.tsx";
+import { RequestLog } from "./RequestLog.tsx";
 import { DeleteStubButton, StubEditor, type StubTarget } from "./StubEditor.tsx";
 
 type Imposter = components["schemas"]["Imposter"];
@@ -74,15 +87,49 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
   const [cloning, setCloning] = useState(false);
   const mayWrite = can("imposter.write");
   const mayRead = can("imposter.read");
+  // Only to annotate this port's place on the ring. A principal without the fleet scope gets the
+  // rail without the epoch, never a 404 on a screen whose own read succeeded.
+  const fleet = useFleetView({ enabled: can("fleet.read") });
+
+  // In the hash query so a tab is linkable and survives a reload, the same rule the imposter
+  // list's filters follow. An unknown value falls back rather than throwing: a stale bookmark
+  // should render the imposter, not a blank screen.
+  const [search, setSearch] = useHashQuery();
+  const requested = new URLSearchParams(search).get("tab");
+  const tab: DetailTab =
+    DETAIL_TABS.find((entry) => entry.id === requested)?.id ?? "stubs";
+  const setTab = (next: DetailTab): void => {
+    const params = new URLSearchParams(search);
+    if (next === "stubs") params.delete("tab");
+    else params.set("tab", next);
+    setSearch(params.toString());
+  };
+
+  const name = imposter.isSuccess ? imposter.data.data.name : undefined;
+  const revision = imposter.isSuccess ? imposter.data.revision : null;
 
   return (
     <section className="screen">
-      <header className="screen-head">
-        <a href={toHash({ screen: "imposters" })}>&larr; Imposters</a>
-        <h1>
-          Imposter <Ident>{port}</Ident>
-        </h1>
-        <p className="scope-label">Served by this node from replicated state.</p>
+      {/* The name and port together, then the identity line under them —
+          tenant and revision, which are the two things an operator checks before editing. */}
+      <header className="screen-head detail-head">
+        <a className="btn" href={toHash({ screen: "imposters" })}>
+          &larr; Imposters
+        </a>
+        <div className="detail-title">
+          <h1>
+            {name ?? UNNAMED} <Ident>{port}</Ident>
+          </h1>
+          <p className="scope-label">
+            tenant <Ident>{tenant ?? "—"}</Ident>
+            {revision === null ? null : (
+              <>
+                {" · "}
+                <Ident>{revision}</Ident>
+              </>
+            )}
+          </p>
+        </div>
         <div className="spacer" />
         {mayWrite ? (
           <button
@@ -96,14 +143,13 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
         ) : null}
       </header>
 
+      <DetailTabs current={tab} onPick={setTab} />
+
       {imposter.isError ? <ErrorNote error={imposter.error} context="Could not read this imposter" /> : null}
       {imposter.isPending ? <p className="muted">Reading…</p> : null}
 
       {imposter.isSuccess ? (
         <>
-          {mayRead ? (
-            <ExportImposterControl port={port} name={imposter.data.data.name} tenant={tenant} />
-          ) : null}
           {cloning ? (
             <CloneImposter
               port={port}
@@ -112,30 +158,326 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
               onCancel={() => setCloning(false)}
             />
           ) : null}
-          <dl className="tiles">
-            {DETAIL_FIELDS.map((field) => (
-              <div key={field.key} className="tile">
-                <dt>{field.label}</dt>
-                <dd data-testid={`detail-${field.key}`}>
-                  <ImposterField imposter={imposter.data.data} field={field.key} />
-                </dd>
+
+          {tab === "stubs" ? (
+            /* The design splits this tab three ways — match order, the editor, the fleet rail. `Stubs`
+               already carries the first two side by side, so the split here is between it and the
+               rail rather than a third column bolted on. */
+            <div className="screen-split">
+              <div className="screen-main">
+                <Stubs
+                  port={port}
+                  imposter={imposter.data.data}
+                  revision={imposter.data.revision}
+                  mayWrite={mayWrite}
+                  editing={editing}
+                  onEdit={setEditing}
+                />
               </div>
-            ))}
-          </dl>
-          <RecordingPanel port={port} imposter={imposter.data.data} revision={imposter.data.revision} />
-          <Stubs
-            port={port}
-            imposter={imposter.data.data}
-            revision={imposter.data.revision}
-            mayWrite={mayWrite}
-            editing={editing}
-            onEdit={setEditing}
-          />
+              <DetailRail port={port} revision={imposter.data.revision} fleet={fleet.data} />
+            </div>
+          ) : null}
+
+          {tab === "requests" ? <RequestLog port={port} /> : null}
+
+          {tab === "ownership" ? (
+            <OwnershipTab port={port} revision={imposter.data.revision} fleet={fleet.data} />
+          ) : null}
+
+          {tab === "settings" ? (
+            <>
+              <RiftKnobs />
+              {mayRead ? (
+                <ExportImposterControl port={port} name={imposter.data.data.name} tenant={tenant} />
+              ) : null}
+              <dl className="tiles">
+                {DETAIL_FIELDS.map((field) => (
+                  <div key={field.key} className="tile">
+                    <dt>{field.label}</dt>
+                    <dd data-testid={`detail-${field.key}`}>
+                      <ImposterField imposter={imposter.data.data} field={field.key} />
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+              <RecordingPanel
+                port={port}
+                imposter={imposter.data.data}
+                revision={imposter.data.revision}
+              />
+              <DangerZone port={port} name={imposter.data.data.name} />
+            </>
+          ) : null}
         </>
       ) : null}
     </section>
   );
 }
+
+const DETAIL_TABS = [
+  { id: "stubs", label: "Stubs" },
+  { id: "requests", label: "Requests" },
+  { id: "ownership", label: "Ownership" },
+  { id: "settings", label: "Settings" },
+] as const;
+
+type DetailTab = (typeof DETAIL_TABS)[number]["id"];
+
+/**
+ * The detail's tab strip.
+ *
+ * Real buttons in a `tablist`, not links: the tabs switch a panel within one screen rather than
+ * navigating, and `aria-selected` carries the choice so the underline is not the only signal. The
+ * selection lives in the hash query, so a tab is linkable and survives a reload — the same rule the
+ * imposter list's filters follow.
+ */
+function DetailTabs({
+  current,
+  onPick,
+}: {
+  current: DetailTab;
+  onPick: (tab: DetailTab) => void;
+}): ReactNode {
+  return (
+    <div className="tabs" role="tablist" aria-label="Imposter sections">
+      {DETAIL_TABS.map((entry) => (
+        <button
+          key={entry.id}
+          type="button"
+          role="tab"
+          data-testid={`detail-tab-${entry.id}`}
+          aria-selected={entry.id === current}
+          onClick={() => onPick(entry.id)}
+        >
+          {entry.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Where this imposter's flow state lives, and whether its socket came up.
+ *
+ * Two questions with one root: an imposter is an *object* on the ring, not a socket on a machine.
+ * Its flow state belongs to whichever node the ring assigns it, and its listener may have come up on
+ * some nodes and not others — and neither fact is visible from the imposter document.
+ */
+function OwnershipTab({
+  port,
+  revision,
+  fleet,
+}: {
+  port: number;
+  revision: string | null;
+  fleet: FleetView | undefined;
+}): ReactNode {
+  return (
+    <div className="screen-split">
+      <div className="screen-main">
+        <Card title="Flow-state placement">
+          <p className="muted">
+            The owner is computed from committed membership at this node&rsquo;s applied index, never
+            negotiated: rendezvous hashing picks the highest-scoring ready node for the flow id, so
+            every node that has applied the same membership reaches the same answer without talking
+            to the others.
+          </p>
+          <dl className="kv-grid">
+            <dt>Owner</dt>
+            <dd>
+              <Pending
+                issue={359}
+                reason="No endpoint maps a key to its owning member. The ring's membership and epoch are published; the assignment is not."
+              />
+            </dd>
+            <dt>Successors</dt>
+            <dd>
+              <Pending
+                issue={359}
+                reason="Who would take this flow on a handoff follows from the same ranking, and is unpublished for the same reason."
+              />
+            </dd>
+            <dt>Fencing tuple</dt>
+            <dd>
+              <Pending
+                issue={359}
+                reason="The epoch and ownership generation a write is fenced against are not exposed per flow."
+              />
+            </dd>
+            <dt>Ring epoch</dt>
+            <dd>
+              {fleet === undefined ? (
+                <Pending
+                  issue={361}
+                  reason="The fleet projection is scoped to fleet.read, and this principal is refused it."
+                />
+              ) : (
+                <Ident>{fleet.ringEpoch}</Ident>
+              )}
+            </dd>
+            <dt>On handoff</dt>
+            {/* Not a reading — a statement of what the cluster does, which is the thing an operator
+                needs before they move a node. Worth stating precisely: two of these four are
+                preserved and two are deliberately not. */}
+            <dd className="warn-text">
+              FSM and KV adopt · sequence cursors reset · proxyOnce claims are re-taken
+            </dd>
+          </dl>
+        </Card>
+
+        <Card title="Bind status per node">
+          <PendingPanel
+            issue={370}
+            reason="Whether this imposter's listener came up is not reported per node. A port can be taken on one node and free on another, so this is a real condition — and a survivable one."
+          />
+          <p className="hint">
+            A node that cannot bind still serves this imposter through the front door — dispatch
+            targets the imposter object, not its socket. What a failed bind breaks is the
+            direct-to-port path, on that node only.
+          </p>
+        </Card>
+      </div>
+      <DetailRail port={port} revision={revision} fleet={fleet} />
+    </div>
+  );
+}
+
+/**
+ * Every act on this imposter that cannot be undone from here, in one place.
+ *
+ * They existed already and were scattered — a clear on the request log, a delete on the list, a
+ * flow reset on the scenarios screen. Gathering them is the design's improvement and it is a real
+ * one: an operator about to do something irreversible should see the whole set, because the
+ * question "is this the one I want" is only answerable next to the alternatives.
+ *
+ * Each is gated on the capability that authorizes the call rather than on a blanket "may write" —
+ * `rbac.ts` makes the point that transcribing the real action is what stops the table going stale.
+ */
+function DangerZone({ port, name }: { port: number; name: string | undefined }): ReactNode {
+  const { can } = useSession();
+  const clear = useClearRequests();
+  const remove = useDeleteImposter();
+  const [confirming, setConfirming] = useState<"clear" | "delete" | null>(null);
+
+  const mayClear = can("requests.clear");
+  const mayDelete = can("imposter.delete");
+  if (!mayClear && !mayDelete) return null;
+
+  return (
+    <div className="card danger-zone" data-testid="danger-zone">
+      <div className="card-body">
+        <h2>Danger zone</h2>
+        <p className="muted">
+          Each of these is a replicated control op — it lands on every node, and nothing here undoes
+          it.
+        </p>
+        <div className="row">
+          {mayClear ? (
+            <button
+              className="btn danger"
+              type="button"
+              data-testid="danger-clear-requests"
+              onClick={() => setConfirming("clear")}
+            >
+              Clear recorded requests
+            </button>
+          ) : null}
+          {mayDelete ? (
+            <button
+              className="btn danger"
+              type="button"
+              data-testid="danger-delete-imposter"
+              onClick={() => setConfirming("delete")}
+            >
+              Delete imposter
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {confirming === "clear" ? (
+        <Confirm
+          testId="confirm-danger-clear"
+          title="Clear this imposter's recorded requests?"
+          body={
+            <>
+              This empties the recorded requests for imposter {port} <b>fleet-wide</b> — the clear
+              commits through Raft to every node, and nothing restores these rows.
+            </>
+          }
+          confirmLabel="Clear log"
+          requireTyped={String(port)}
+          busy={clear.isPending}
+          onCancel={() => setConfirming(null)}
+          onConfirm={() => {
+            clear.mutate({ port });
+            setConfirming(null);
+          }}
+        />
+      ) : null}
+
+      {confirming === "delete" ? (
+        <Confirm
+          testId="confirm-danger-delete"
+          title={`Delete ${name ?? String(port)}?`}
+          body={
+            <>
+              This removes the imposter, its stubs, its recorded requests and its flow state across
+              the fleet. Nothing undoes it.
+            </>
+          }
+          confirmLabel={`Delete ${name ?? String(port)}`}
+          requireTyped={String(port)}
+          busy={remove.isPending}
+          onCancel={() => setConfirming(null)}
+          onConfirm={() => {
+            remove.mutate({ port });
+            setConfirming(null);
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The per-imposter `_rift` knobs the design draws.
+ *
+ * None is on the document today — `_rift` carries lint warnings and nothing else — so the panel is
+ * built and its controls point at the work. `contextScope` has its own issue already (#288, under
+ * the RFC-005 state epic); the other three are #369.
+ */
+function RiftKnobs(): ReactNode {
+  return (
+    <Card title="_rift · per-imposter knobs">
+      <dl className="kv-grid">
+        <dt>flowState.contextScope</dt>
+        <dd>
+          <Pending
+            issue={288}
+            reason="The contextScope knob is tracked under the RFC-005 state epic. Until it lands, a flow's context scope is a fleet default rather than a per-imposter choice."
+          />
+        </dd>
+        <dt>flowState.durability</dt>
+        <dd>
+          <Pending issue={369} reason="Not carried on the imposter document." />
+        </dd>
+        <dt>flowIdSource</dt>
+        <dd>
+          <Pending
+            issue={369}
+            reason="How a request maps to a flow — a header, a query parameter, or one shared context — is not carried on the imposter document, and it decides whether two callers share scenario state."
+          />
+        </dd>
+        <dt>readConsistency</dt>
+        <dd>
+          <Pending issue={369} reason="Not carried on the imposter document." />
+        </dd>
+      </dl>
+    </Card>
+  );
+}
+
 
 /** Export this one imposter, in either projection (#251). */
 function ExportImposterControl({
@@ -342,17 +684,27 @@ function Stubs({
   const editingStub =
     editing?.kind === "existing" ? stubs?.find((stub) => stub.id === editing.stubId) : undefined;
 
-  return (
-    <>
-      {mayWrite ? (
-        <nav className="pager">
-          <button className="btn sm" type="button" onClick={() => onEdit({ kind: "new" })}>
-            Add stub
-          </button>
-        </nav>
-      ) : null}
+  const open = editing !== null && (editing.kind === "new" || editingStub !== undefined);
 
-      {editing !== null && (editing.kind === "new" || editingStub !== undefined) ? (
+  return (
+    /*
+     * The design's two columns: the stubs in match order, then whichever one is open.
+     *
+     * Match order is the screen's whole subject — the matcher walks this list top to bottom and the
+     * first stub whose predicates hold answers — so it stays on screen while a stub is edited. The
+     * table underneath used to be the only way to see it, which meant the order vanished the moment
+     * an operator opened a stub to change it.
+     */
+    <div className="stub-workspace">
+      <StubList
+        stubs={stubs}
+        editing={editing}
+        mayWrite={mayWrite}
+        onEdit={onEdit}
+      />
+
+      <div className="stub-pane">
+      {open ? (
         <StubEditor
           /*
            * Keyed by the target, not by the stub's content. The imposter is polled, so `original`
@@ -366,16 +718,109 @@ function Stubs({
           revision={revision}
           onDone={() => onEdit(null)}
         />
-      ) : null}
+      ) : (
+        /*
+         * Nothing open: the full table, which carries what the column cannot — route, scenario,
+         * predicate and response counts, and the per-stub try controls. The design has no such
+         * table because its list is the whole navigator; keeping it here is a console-specific
+         * choice that costs nothing while a stub is open and loses nothing while none is.
+         */
+        <StubTable
+          port={port}
+          stubs={stubs}
+          revision={revision}
+          mayWrite={mayWrite}
+          onEdit={onEdit}
+        />
+      )}
+      </div>
+    </div>
+  );
+}
 
-      <StubTable
-        port={port}
-        stubs={stubs}
-        revision={revision}
-        mayWrite={mayWrite}
-        onEdit={onEdit}
-      />
-    </>
+/**
+ * The stubs in the order the matcher walks them.
+ *
+ * Each row says what it matches and what it answers, which is the pair an operator is comparing
+ * when they ask why a request went where it did. A stub with no predicates is marked: it answers
+ * everything from that position on, so every stub below it is unreachable — the one property of
+ * this list that is invisible from the rows themselves.
+ */
+function StubList({
+  stubs,
+  editing,
+  mayWrite,
+  onEdit,
+}: {
+  stubs: Stub[] | undefined;
+  editing: StubTarget | null;
+  mayWrite: boolean;
+  onEdit: (target: StubTarget | null) => void;
+}): ReactNode {
+  const entries = matchOrder(stubs);
+
+  return (
+    <aside className="stub-list" aria-label="Stubs in match order">
+      <h2 className="eyebrow">Stubs · match order</h2>
+
+      {/*
+        Nothing said here when there is nothing to list.
+        
+        The pane beside this one already states both empty cases — no stubs, versus a response that
+        carried no stub list — with the fuller copy and the testids that pin the distinction. Saying
+        it twice put the same sentence on screen in two places, which is how it read.
+      */}
+      {entries.length === 0 ? null : (
+        <ol className="stub-list-rows">
+          {entries.map((entry) => {
+            const selected =
+              editing?.kind === "existing" && entry.id !== null && editing.stubId === entry.id;
+            return (
+              <li key={`${String(entry.index)}-${entry.id ?? "unnamed"}`}>
+                <button
+                  type="button"
+                  className={`stub-list-row${selected ? " is-selected" : ""}`}
+                  data-testid={`stub-list-${String(entry.index)}`}
+                  /* A stub with no id has no by-id address, so it cannot be opened — the same rule
+                     the table's edit action follows, stated here as a disabled control rather than
+                     a click that silently does nothing. */
+                  disabled={entry.id === null}
+                  aria-current={selected ? "true" : undefined}
+                  onClick={() => entry.id !== null && onEdit({ kind: "existing", stubId: entry.id })}
+                >
+                  <span className="stub-list-head">
+                    <span className="stub-list-n">#{entry.index}</span>
+                    {entry.method === null ? null : (
+                      <span className="stub-list-method">{entry.method}</span>
+                    )}
+                    <span className="stub-list-target">
+                      {entry.target ?? (entry.catchAll ? "matches everything" : "no path predicate")}
+                    </span>
+                  </span>
+                  <span className="stub-list-meta">
+                    {entry.catchAll ? <span className="stub-list-catchall">catch-all</span> : null}
+                    <span>{entry.answer ?? "no response"}</span>
+                    {entry.responses > 1 ? <span>· cycles {entry.responses}</span> : null}
+                    <span className="stub-list-id">{entry.id ?? "no id"}</span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+
+      {mayWrite ? (
+        <button
+          type="button"
+          className="stub-list-add"
+          data-testid="stub-list-add"
+          onClick={() => onEdit({ kind: "new" })}
+        >
+          + add stub
+        </button>
+      ) : null}
+    </aside>
   );
 }
 

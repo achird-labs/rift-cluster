@@ -402,6 +402,7 @@ export function StubEditor({
             </div>
           </div>
           <button
+            className="btn primary"
             type="button"
             disabled={effectiveRevision === null}
             onClick={() => send(effectiveRevision)}
@@ -409,6 +410,7 @@ export function StubEditor({
             Reapply my edit
           </button>
           <button
+            className="btn"
             type="button"
             onClick={() => {
               setText(conflict.theirs ?? "");
@@ -499,13 +501,14 @@ export function StubEditor({
 
       <nav className="pager">
         <button
+          className="btn primary"
           type="button"
           onClick={() => send(effectiveRevision)}
           disabled={!parsed.ok || effectiveRevision === null || write.isPending}
         >
           Save stub
         </button>
-        <button type="button" onClick={onDone}>
+        <button className="btn" type="button" onClick={onDone}>
           Cancel
         </button>
       </nav>
@@ -767,7 +770,13 @@ function DeleteStubButton({
   const remove = useDeleteStub();
   return (
     <>
+      {/* `btn sm danger`, which it never carried: this button has been rendering with the browser's
+          default chrome since it was written, sitting directly beside an `Edit` that has always been
+          `btn sm`. Invisible while the console's own buttons were also grey and square; obvious the
+          moment everything around it changed. `danger` because deleting a stub is destructive, which
+          is the same reason the imposter list's Delete carries it. */}
       <button
+        className="btn sm danger"
         type="button"
         disabled={revision === null || remove.isPending}
         onClick={() => remove.mutate({ port, stubId, revision })}

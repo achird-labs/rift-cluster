@@ -1,3 +1,5 @@
+import type { Page } from "@playwright/test";
+
 import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
 
 /**
@@ -12,9 +14,20 @@ import { expect, fixture, goToScreen, signIn, test } from "./fixture.ts";
  * in Blink and makes `accent-color` a no-op, so every checkbox in the console rendered as an empty
  * square. jsdom parses CSS but never computes the cascade or paints, so nothing there could fail.
  *
- * Runs in both `chromium` (light) and `chromium-dark`, because the token set swaps entirely on
- * `prefers-color-scheme` and a control that vanishes in one theme is a real defect.
+ * One theme, so one run. This used to run twice — `chromium` and `chromium-dark` — because the
+ * token set swapped entirely on `prefers-color-scheme` and a control that vanished in one theme was
+ * a real defect. The console ships a single palette now, so the second pass photographed the same
+ * pixels and doubled the baselines to regenerate.
  */
+
+/**
+ * The nav, by role and accessible name rather than by class.
+ *
+ * It was `nav.rail` until the bar went horizontal, and a locator that a pure restyle can break is a
+ * locator asserting the wrong thing: what this baseline is about is the set of entries a role is
+ * offered, which the accessible name identifies and the class name only happened to.
+ */
+const navBar = (page: Page) => page.getByRole("navigation", { name: "Console sections" });
 
 /** Hide anything whose content legitimately changes between runs. */
 const VOLATILE = [
@@ -23,17 +36,18 @@ const VOLATILE = [
 ];
 
 test.describe("component baselines", () => {
-  test("the nav rail", async ({ page }) => {
+  test("the nav bar", async ({ page }) => {
     await signIn(page, "fleet-admin");
-    await expect(page.locator("nav.rail")).toHaveScreenshot("rail-fleet-admin.png");
+    await expect(navBar(page)).toHaveScreenshot("nav-fleet-admin.png");
   });
 
-  test("the nav rail as a viewer, where most entries are not drawn", async ({ page }) => {
-    // The rail's shape *is* the RBAC surface. A baseline here fails if a control starts being
+  test("the nav bar as a viewer, where most entries are not drawn", async ({ page }) => {
+    // The bar's shape *is* the RBAC surface. A baseline here fails if a control starts being
     // offered to a role that cannot use it — the failure mode `rbac.ts` exists to prevent, caught
-    // visually rather than by assertion.
+    // visually rather than by assertion. Under the top-bar layout it also catches a group whose
+    // every entry is filtered away still drawing its separator.
     await signIn(page, "viewer");
-    await expect(page.locator("nav.rail")).toHaveScreenshot("rail-viewer.png");
+    await expect(navBar(page)).toHaveScreenshot("nav-viewer.png");
   });
 
   test("the topbar with identity and sign-out", async ({ page }) => {
@@ -55,7 +69,7 @@ test.describe("component baselines", () => {
     await signIn(page, "editor");
     await goToScreen(page, "/imposters");
     await page.getByTestId("new-imposter").click();
-    await expect(page.getByTestId("new-imposter-form")).toHaveScreenshot("new-imposter-form.png");
+    await expect(page.getByTestId("new-imposter-wizard")).toHaveScreenshot("new-imposter-form.png");
   });
 
   test("a checkbox renders differently checked and unchecked", async ({ page }) => {
@@ -74,7 +88,27 @@ test.describe("component baselines", () => {
   test("the imposter table", async ({ page }) => {
     await signIn(page, "editor");
     await goToScreen(page, "/imposters");
-    await expect(page.locator(".card").first()).toHaveScreenshot("imposter-table.png");
+    /*
+     * `.card:has(table.dense)`, not `.card").first()`.
+     *
+     * The first card on this screen stopped being the table when #251 added the tenant export
+     * control above it, and the baseline has been a picture of two export buttons ever since — so
+     * the table this test is named for has had no visual coverage at all, silently. A locator that
+     * says which card it wants cannot drift that way again.
+     *
+     * Filtered to one fixture imposter before capturing, because this suite shares a live fleet
+     * with the specs running beside it: `recording.spec.ts` and `oracle.spec.ts` both create
+     * throwaway imposters, so an unfiltered table is however many rows happened to exist at the
+     * moment of capture. That is exactly the "a row count and the whole page diffs" flakiness this
+     * file's header says it exists to avoid — it only became visible once the locator started
+     * capturing the real table.
+     */
+    const { imposters } = fixture();
+    await page.getByTestId("imposter-filter-text").fill(String(imposters[0]));
+    // "1 of N" once a filter is active — N moves with what the other specs have created, which is
+    // precisely why the capture is filtered, so only the "1 of" prefix is asserted.
+    await expect(page.getByTestId("imposter-filter-count")).toContainText(/^1 of /);
+    await expect(page.locator(".card:has(table.dense)")).toHaveScreenshot("imposter-table.png");
   });
 
   test("the fleet stat tiles", async ({ page }) => {
