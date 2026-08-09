@@ -82,6 +82,19 @@ impl ContextScope {
             }
         }
     }
+
+    /// The key a flow's state is actually stored and **owned** under.
+    ///
+    /// The one place this composition lives. Both callers need the identical
+    /// string or they disagree about who owns a flow: the store writes under it
+    /// ([`super::flow::ClusteredFlowStore`]), and the admin front hashes it to
+    /// answer "which node holds this flow" (#359). A second implementation is
+    /// exactly the disagreement that would send an operator to the wrong node,
+    /// so there is one function and both call it.
+    #[must_use]
+    pub fn scoped_flow_id(self, port: Option<u16>, flow_id: &str) -> String {
+        format!("{}{flow_id}", self.prefix_for(port))
+    }
 }
 
 /// The parsed `flowState` block, with everything the clustered store needs.

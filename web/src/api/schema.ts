@@ -3186,6 +3186,17 @@ export interface operations {
                         scenarios: components["schemas"]["ScenarioEntry"][];
                         /** @description Recorded requests whose resolved flow id is this space. */
                         numberOfRequests: number;
+                        /**
+                         * Format: int64
+                         * @description The node id holding this flow's state (issue #359). A space *is* a flow, and a flow is the only thing the ring assigns an owner to: imposters, stubs and config are replicated to every node, so any node serves them and none owns them. One port with several flows therefore has several owners, one per flow.
+                         *
+                         *     A node that receives a request for a flow it does not own talks to the owner rather than answering from its own copy, so this names where that flow's state actually lives.
+                         *
+                         *     Decided by the flow id under this imposter's `flowState.contextScope`, not by the id alone — under `fleet` scope two imposters' same-named spaces are one flow with one owner.
+                         *
+                         *     **Absent, never guessed**, when no membership has been applied or the imposter's scope could not be read: the field is omitted rather than defaulted, because a wrong owner sends an operator to the wrong node.
+                         */
+                        owner?: number;
                     };
                 };
             };

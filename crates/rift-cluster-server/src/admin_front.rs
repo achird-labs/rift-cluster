@@ -77,10 +77,10 @@ use rift_cluster::decorate::{
     HEADER_BIND_FAILURES, HEADER_NEXT_INDEX, HEADER_OP_ID, HEADER_PARTIAL, HEADER_REVISION,
     HEADER_TRUNCATED, HEADER_WARNINGS,
 };
-use rift_cluster::stores::{JournalCursor, JournalNet};
+use rift_cluster::stores::{ContextScope, FlowConfig, JournalCursor, JournalNet};
 use rift_cluster::{
-    ControlOutcome, ControlResponse, FLEET_SCOPE, NodeError, PullError, RaftNode,
-    SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId,
+    ControlOutcome, ControlResponse, FLEET_SCOPE, KeyClass, NodeError, NodeId, OwnedKey, PullError,
+    RaftNode, SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId,
 };
 use rift_cluster_base::seams::{
     ErrorKind, ImposterConfig, RecordedRequest, RiftScriptConfig, RouteTable, SCOPE_HEADER,
@@ -1162,6 +1162,13 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                     let number_of_requests = (list_read
                         || (req.method() == Method::GET && is_single_imposter_read(&path)))
                     .then(|| Arc::clone(&state.journal_net));
+                    // `owner` on a space read (issue #359), resolved before `proxy` moves `state`
+                    // for the same reason `degraded`/`token` are. A flow is the only thing the
+                    // ring owns, so this is the one read that can name one.
+                    let space_flow_owner = (req.method() == Method::GET)
+                        .then(|| space_read_target(&path))
+                        .flatten()
+                        .map(|(port, flow)| space_owner(&state, &tenant, port, &flow));
                     let mut response = proxy(state, req, Some(&tenant)).await;
                     if let Some(owned) = owned {
                         response = filter_imposter_list(response, &owned).await;
@@ -1169,6 +1176,9 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                     if let Some(net) = number_of_requests {
                         response =
                             decorate_number_of_requests(response, &net, JOURNAL_PEER_BUDGET).await;
+                    }
+                    if let Some(owner) = space_flow_owner {
+                        response = decorate_space_owner(response, owner).await;
                     }
                     if let Some(reason) = degraded {
                         set_header(&mut response, HEADER_BIND_FAILURES, &reason);
@@ -1955,6 +1965,73 @@ fn is_imposter_listing(path: &str) -> bool {
     matches!(path, "/imposters" | "/admin/imposters")
 }
 
+/// The `(port, flowId)` of a space read — `GET /imposters/{port}/spaces/{flowId}` — or `None`.
+///
+/// Exactly the two-segment shape upstream's router matches for `ImposterRoute::Space`; the
+/// three-segment `["spaces", flow, "stubs"]` is a different route and is deliberately excluded,
+/// the same distinction the `SpaceTeardown` delete draws.
+fn space_read_target(path: &str) -> Option<(u16, String)> {
+    let path = path.split('?').next().unwrap_or(path);
+    let rest = path
+        .strip_prefix("/admin/imposters/")
+        .or_else(|| path.strip_prefix("/imposters/"))?;
+    match rest.split('/').collect::<Vec<_>>().as_slice() {
+        [port, "spaces", flow] if !flow.is_empty() => {
+            Some((port.parse::<u16>().ok()?, (*flow).to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// The ring member holding this space's flow state (issue #359).
+///
+/// A *space* is a flow, and a flow is the only thing this cluster assigns an owner to: imposters,
+/// stubs and config are replicated to every node, so every node serves them and none owns them. One
+/// port with several flows therefore has several owners, one per flow.
+///
+/// The key is **not** the flow id from the URL. It is that id under the imposter's
+/// `flowState.contextScope` — `i{port}:` per imposter (the default), `f:` fleet-wide — which is why
+/// this reads the imposter's own config to find the scope. Under `Fleet` two imposters' same-named
+/// spaces are one flow with one owner, and hashing the bare id would name the wrong node for every
+/// imposter-scoped flow, which is the default case.
+///
+/// [`ContextScope::scoped_flow_id`] is shared with the store that writes under this key, so the two
+/// cannot drift apart.
+///
+/// Computed here rather than in the browser deliberately: HRW is reproducible in principle, but a
+/// console that re-implemented it would assert an answer the server never gave, and the first
+/// disagreement would send an operator to the wrong node.
+///
+/// Absence over error, for the reason [`imposter_read_token`] gives — the space read is served by
+/// the engine and must not start failing because an ownership lookup could not run. `None` when the
+/// node handle is gone, no membership is applied, or the config cannot be read or parsed.
+fn space_owner(state: &FrontState, tenant: &TenantId, port: u16, flow_id: &str) -> Option<NodeId> {
+    let node = state.node.upgrade()?;
+    let ring = node.ring();
+    if ring.is_empty() {
+        return None;
+    }
+    let scope: ContextScope = node
+        .imposter_config(tenant.as_str(), port)
+        .inspect_err(|e| {
+            tracing::warn!(tenant = tenant.as_str(), port, error = %e, "space read serves without an owner");
+        })
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<ImposterConfig>(&json).ok())
+        .and_then(|config| FlowConfig::from_imposter(&config).ok())
+        .map(|flow| flow.scope)
+        // The imposter exists (the read is being served) but its config could not be read back or
+        // no longer parses. `ContextScope::default()` is `Imposter`, which is both the documented
+        // default and the isolating one — guessing `Fleet` here would name the owner of a
+        // *different*, shared flow.
+        .unwrap_or_default();
+    ring.owner(OwnedKey::new(
+        KeyClass::FlowKv,
+        &scope.scoped_flow_id(Some(port), flow_id),
+    ))
+}
+
 /// The single-imposter read's `If-Match` token, or `None` when this read is not that route or the
 /// applied state holds no record to condition on (C5, issue #188).
 ///
@@ -2037,6 +2114,59 @@ fn narrow_imposter_listing(
             .is_some_and(|port| owned.contains(&port))
     });
     serde_json::to_vec(&doc).map_err(|e| format!("re-encoding the filtered imposter listing: {e}"))
+}
+
+/// Add `owner` to a proxied space read (issue #359).
+///
+/// Purely additive, which is what makes its failure handling differ from
+/// [`decorate_number_of_requests`] below. That one **fails closed** because it *corrects* a value
+/// upstream already answered wrongly — a `numberOfRequests` this node cannot vouch for is worse
+/// than a 500. This one adds a field that is optional by construction: the console renders its
+/// absence as "not known", so a body arriving without `owner` is honest, while a 500 would break a
+/// space read that upstream answered perfectly well.
+///
+/// So an unparseable body passes through **unchanged and logged**, never silently defaulted: the
+/// caller then sees exactly what upstream sent rather than a laundered version of it, and the log
+/// is what stops the pass-through from being a swallow.
+async fn decorate_space_owner(
+    response: Response<FrontBody>,
+    owner: Option<NodeId>,
+) -> Response<FrontBody> {
+    let (parts, body) = response.into_parts();
+    if !parts.status.is_success() {
+        return Response::from_parts(parts, body);
+    }
+    let Some(owner) = owner else {
+        return Response::from_parts(parts, body);
+    };
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return internal(&format!("reading the space body to decorate owner: {e}"));
+        }
+    };
+    match rewrite_space_owner(&bytes, owner) {
+        Ok(rewritten) => {
+            buffered_response(parts.status, Bytes::from(rewritten), json_content_type())
+                .unwrap_or_else(|response| response)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "the space body could not be decorated with its owner");
+            buffered_response(parts.status, bytes, json_content_type())
+                .unwrap_or_else(|response| response)
+        }
+    }
+}
+
+/// Insert `owner` into a space body. Errors rather than guessing if it is not a JSON object.
+fn rewrite_space_owner(bytes: &[u8], owner: NodeId) -> Result<Vec<u8>, String> {
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("the space body was not JSON: {e}"))?;
+    let map = doc
+        .as_object_mut()
+        .ok_or_else(|| "the space body was not a JSON object".to_owned())?;
+    map.insert("owner".to_owned(), serde_json::json!(owner));
+    serde_json::to_vec(&doc).map_err(|e| e.to_string())
 }
 
 /// Rewrite `numberOfRequests` to the fleet sum on a proxied imposter read (issue #223): after #222
@@ -5142,6 +5272,97 @@ fn set_header(response: &mut Response<FrontBody>, name: &'static str, value: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #359. The two-segment space read is the only shape that carries an owner.
+    #[test]
+    fn space_read_target_matches_only_the_space_read() {
+        assert_eq!(
+            space_read_target("/imposters/4545/spaces/qa-flow"),
+            Some((4545, "qa-flow".to_owned()))
+        );
+        assert_eq!(
+            space_read_target("/admin/imposters/4545/spaces/qa-flow"),
+            Some((4545, "qa-flow".to_owned()))
+        );
+        assert_eq!(
+            space_read_target("/imposters/4545/spaces/qa-flow?x=1"),
+            Some((4545, "qa-flow".to_owned()))
+        );
+
+        // The three-segment stubs route is a different route — the same distinction the
+        // `SpaceTeardown` delete draws, and the one a `starts_with` would get wrong.
+        assert_eq!(
+            space_read_target("/imposters/4545/spaces/qa-flow/stubs"),
+            None
+        );
+        assert_eq!(space_read_target("/imposters/4545/spaces/"), None);
+        assert_eq!(space_read_target("/imposters/4545/spaces"), None);
+        assert_eq!(space_read_target("/imposters/4545"), None);
+        assert_eq!(space_read_target("/imposters"), None);
+        assert_eq!(
+            space_read_target("/imposters/notaport/spaces/qa-flow"),
+            None
+        );
+    }
+
+    /// Issue #359, and the assertion this feature actually turns on.
+    ///
+    /// The owner is decided by the flow id **under its context scope**, not by the bare id from the
+    /// URL. An earlier draft hashed the bare id: every path and JSON test still passed, and it named
+    /// the wrong node for every imposter-scoped flow — which is the default. This pins the key.
+    #[test]
+    fn the_owner_key_is_scoped_so_the_same_flow_id_differs_by_scope() {
+        let ring = rift_cluster::Ring::new([1, 2, 3, 4, 5, 6, 7], 1);
+
+        // Same caller-chosen id, two scopes, two different keys — and so, in general, two owners.
+        let imposter_key = ContextScope::Imposter.scoped_flow_id(Some(4545), "cart");
+        let fleet_key = ContextScope::Fleet.scoped_flow_id(Some(4545), "cart");
+        assert_eq!(imposter_key, "i4545:cart");
+        assert_eq!(fleet_key, "f:cart");
+
+        // Two imposters, same flow id, imposter scope: different keys, so isolated (#152).
+        assert_ne!(
+            ContextScope::Imposter.scoped_flow_id(Some(4545), "cart"),
+            ContextScope::Imposter.scoped_flow_id(Some(4646), "cart")
+        );
+        // Under fleet scope the port is irrelevant: one flow, one owner, shared by both imposters.
+        assert_eq!(
+            ContextScope::Fleet.scoped_flow_id(Some(4545), "cart"),
+            ContextScope::Fleet.scoped_flow_id(Some(4646), "cart")
+        );
+
+        // Hashing the bare id is the bug this test exists for: it is a third key, equal to neither.
+        let bare = ring.owner(OwnedKey::new(KeyClass::FlowKv, "cart"));
+        let scoped = ring.owner(OwnedKey::new(KeyClass::FlowKv, &imposter_key));
+        assert!(bare.is_some() && scoped.is_some());
+        assert_ne!(
+            "cart", imposter_key,
+            "the URL's flow id is not the key the store owns it under"
+        );
+    }
+
+    /// Issue #359. `owner` is added without disturbing what upstream already answered.
+    #[test]
+    fn rewrite_space_owner_adds_the_owner_and_preserves_the_body() {
+        let body = br#"{"space":"qa-flow","stubs":[],"scenarios":[],"numberOfRequests":7}"#;
+        let out = rewrite_space_owner(body, 3).expect("a JSON object decorates");
+        let doc: serde_json::Value = serde_json::from_slice(&out).expect("still JSON");
+
+        assert_eq!(doc["owner"], serde_json::json!(3));
+        // Every field upstream answered survives — the decoration adds, it does not rewrite.
+        assert_eq!(doc["space"], "qa-flow");
+        assert_eq!(doc["numberOfRequests"], 7);
+        assert!(doc["stubs"].is_array());
+        assert!(doc["scenarios"].is_array());
+    }
+
+    /// Issue #359. A body that is not a JSON object errors rather than inventing a shape; the
+    /// caller logs and passes the original through, so nothing is silently defaulted.
+    #[test]
+    fn rewrite_space_owner_refuses_a_body_it_cannot_decorate() {
+        assert!(rewrite_space_owner(b"not json at all", 1).is_err());
+        assert!(rewrite_space_owner(b"[1,2,3]", 1).is_err());
+    }
 
     #[test]
     fn classify_terminates_exactly_the_config_surface() {

@@ -24,6 +24,16 @@ export type Space = {
   stubs: Stub[];
   scenarios: ScenarioEntry[];
   numberOfRequests: number;
+  /**
+   * The node holding this flow's state (#359), or `null` when the fleet did not say.
+   *
+   * `null` rather than a sentinel because the contract makes this field genuinely optional: the
+   * server omits it when no membership is applied or the imposter's context scope could not be
+   * read, which is a different situation from `numberOfRequests`, whose absence is a contract
+   * violation. Absent means "not known" and must render as such — a guessed owner sends an
+   * operator to the wrong node.
+   */
+  owner: number | null;
 };
 
 /**
@@ -128,6 +138,8 @@ export function readSpace(body: unknown): SpaceState {
        */
       numberOfRequests:
         typeof payload.numberOfRequests === "number" ? payload.numberOfRequests : -1,
+      // Optional by contract, so absence is ordinary rather than a violation — and stays absent.
+      owner: typeof payload.owner === "number" ? payload.owner : null,
     },
   };
 }
