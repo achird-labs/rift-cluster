@@ -551,10 +551,13 @@ export function Imposters(): ReactNode {
                           </th>
                         ),
                       )}
-                      {/* The design's two extra columns. `Owner` is the ring's flow owner, which
-                          nothing publishes (#359); `Provenance` is a real join this screen already
+                      {/* The design draws an `Owner` column here. There is no such thing: an
+                          imposter has no owner. Imposters, stubs and config are replicated to
+                          every node, so every node serves them — only a *flow* is owned, and a
+                          port has as many owners as it has flows (#359). The column is gone
+                          rather than pending, because a column that can never be filled is a
+                          promise, not a roadmap. `Provenance` is a real join this screen already
                           computes for its filter, so it renders. */}
-                      <th style={{ width: "14ch" }}>Owner</th>
                       <th style={{ width: "16ch" }}>Provenance</th>
                       {mayToggle || mayDelete ? <th aria-label="Actions" /> : null}
                     </tr>
@@ -760,12 +763,6 @@ function Row({
           <ImposterField imposter={imposter} field={column.key} renderName={nameLink(imposter)} />
         </td>
       ))}
-      <td>
-        <Pending
-          issue={359}
-          reason="Which ring member owns this port's flow state is not published. The ring's membership and epoch are; the assignment is not."
-        />
-      </td>
       {/*
         Provenance is real, and the three states are genuinely different facts: a source owns this
         port and has drifted from it, a source owns it cleanly, or nothing declared it. `null` — the

@@ -32,23 +32,17 @@ function pending<T>(issue: number): Pending<T> {
 export const ISSUE_URL = (issue: number): string =>
   `https://github.com/achird-labs/rift-cluster/issues/${String(issue)}`;
 
-/**
- * Which ring member owns a port's flow state.
+/*
+ * `flowOwner(key)` used to live here, and both its callers asserted something untrue: that a port
+ * has a flow owner. It does not — imposters, stubs and config are replicated to every node and are
+ * owned by none of them; only a *flow* is owned, keyed by an opaque flow id under its
+ * `ContextScope` prefix, so a port has as many owners as it has flows.
  *
- * The ring itself is real — #7 built HRW ownership with epoch fencing, and `/_fleet/health`
- * publishes the members and the epoch, so the diagram is drawn from live data. What no endpoint
- * answers is the mapping from a key to its owner.
- *
- * Deliberately not computed client-side. Rendezvous hashing is reproducible in principle, but a
- * console that re-implemented it would be asserting an answer the server never gave — and the first
- * time the two implementations disagreed, the console would confidently send an operator to the
- * wrong node.
- *
- * @see https://github.com/achird-labs/rift-cluster/issues/359
+ * It is deleted rather than re-pointed because the honest version cannot have this signature: an
+ * owner is resolved from a flow within its imposter's scope, not from a bare key. #359 lands it on
+ * the flow-state surface, where flows are actually enumerated. The fleet rail's hash-space panel
+ * keeps its own marker — "which key lands on which member" is still unpublished, and still #359.
  */
-export function flowOwner(_key: string): Pending<string> {
-  return pending(359);
-}
 
 /**
  * How many writes the fleet has accepted and not yet replayed.

@@ -174,14 +174,14 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
                   onEdit={setEditing}
                 />
               </div>
-              <DetailRail port={port} revision={imposter.data.revision} fleet={fleet.data} />
+              <DetailRail revision={imposter.data.revision} />
             </div>
           ) : null}
 
           {tab === "requests" ? <RequestLog port={port} /> : null}
 
           {tab === "ownership" ? (
-            <OwnershipTab port={port} revision={imposter.data.revision} fleet={fleet.data} />
+            <OwnershipTab revision={imposter.data.revision} fleet={fleet.data} />
           ) : null}
 
           {tab === "settings" ? (
@@ -257,18 +257,18 @@ function DetailTabs({
 }
 
 /**
- * Where this imposter's flow state lives, and whether its socket came up.
+ * How this imposter's flow state is placed, and whether its socket came up.
  *
- * Two questions with one root: an imposter is an *object* on the ring, not a socket on a machine.
- * Its flow state belongs to whichever node the ring assigns it, and its listener may have come up on
- * some nodes and not others — and neither fact is visible from the imposter document.
+ * An imposter is served by every node — its config and stubs are replicated, so dispatch targets the
+ * imposter object rather than a socket on one machine. What *is* placed is each **flow**: one node
+ * holds a given flow's state and serializes writes to it. So this tab describes the rule and the
+ * handoff, and sends the reader to the flow-state screen for any particular flow's owner — an
+ * imposter does not have one, it has as many as it has flows.
  */
 function OwnershipTab({
-  port,
   revision,
   fleet,
 }: {
-  port: number;
   revision: string | null;
   fleet: FleetView | undefined;
 }): ReactNode {
@@ -282,27 +282,18 @@ function OwnershipTab({
             every node that has applied the same membership reaches the same answer without talking
             to the others.
           </p>
+          {/*
+            There were `Owner`, `Successors` and `Fencing tuple` rows here, each pending on #359 and
+            each implying this imposter has one of them. It does not: placement is per flow, and an
+            imposter has as many owners as it has flows. Naming the scope is the honest replacement
+            — it is also the thing an operator needs, because `contextScope` decides whether two
+            imposters' same-named flows are one flow or two.
+          */}
           <dl className="kv-grid">
-            <dt>Owner</dt>
-            <dd>
-              <Pending
-                issue={359}
-                reason="No endpoint maps a key to its owning member. The ring's membership and epoch are published; the assignment is not."
-              />
-            </dd>
-            <dt>Successors</dt>
-            <dd>
-              <Pending
-                issue={359}
-                reason="Who would take this flow on a handoff follows from the same ranking, and is unpublished for the same reason."
-              />
-            </dd>
-            <dt>Fencing tuple</dt>
-            <dd>
-              <Pending
-                issue={359}
-                reason="The epoch and ownership generation a write is fenced against are not exposed per flow."
-              />
+            <dt>Placed by</dt>
+            <dd className="muted">
+              Flow id, within this imposter&rsquo;s context scope — see a flow&rsquo;s own owner on
+              the flow-state screen.
             </dd>
             <dt>Ring epoch</dt>
             <dd>
@@ -337,7 +328,7 @@ function OwnershipTab({
           </p>
         </Card>
       </div>
-      <DetailRail port={port} revision={revision} fleet={fleet} />
+      <DetailRail revision={revision} />
     </div>
   );
 }

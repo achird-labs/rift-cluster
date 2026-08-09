@@ -19,24 +19,51 @@ use xxhash_rust::xxh64::xxh64;
 
 use super::NodeId;
 
-/// The classes of key the ring owns. Phase 1 uses only [`KeyClass::Config`]; the
-/// others are reserved for later phases and share the same ownership function so
-/// the ring does not change when they arrive.
+/// The classes of key the ring owns.
+///
+/// **Only [`KeyClass::FlowKv`] is live.** The ring exists to give each *stateful
+/// flow* exactly one node that holds and mutates its state; everything else a
+/// node serves is replicated rather than owned.
+///
+/// That distinction is the one worth keeping straight, because the natural
+/// reading of "owner" is the wrong one here:
+///
+/// - **Imposters, stubs and config are not owned.** They go through Raft, so
+///   every node converges on the same set and a node that was down catches up
+///   when it returns. Any node can serve any imposter and answer a stateless
+///   request against it. There is no "owner of an imposter" to ask about.
+/// - **A flow is owned.** One node holds its state and serializes writes to it
+///   ([`super::super::stores::flow`]); a node that receives a request for a flow
+///   it does not own talks to the owner instead of answering from its own copy.
+///
+/// [`KeyClass::Config`] is **vestigial**: it belonged to the gossip-era design
+/// where a `cfg:<port>` key had a per-port config owner (RFC-001 §7.4, which the
+/// RFC itself flags as a superseded mechanism). Nothing constructs one — it is
+/// retained only so [`KeyClass::tag`] keeps its historical numbering, and to
+/// exercise class separation in this module's tests. `Sequence` and `Proxy` are
+/// reserved and share the same ownership function so the ring does not change
+/// when they arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyClass {
-    /// `cfg:<port>` — imposter configuration (Phase 1).
+    /// Vestigial — the superseded gossip-era `cfg:<port>` config owner. Unused.
     Config,
-    /// Flow key/value state (Phase 2+).
+    /// Flow key/value state — the only class the ring actually owns today.
     FlowKv,
-    /// Sequence counters (Phase 2+).
+    /// Sequence counters (reserved).
     Sequence,
-    /// Proxy recordings (Phase 2+).
+    /// Proxy recordings (reserved).
     Proxy,
 }
 
 impl KeyClass {
     /// A stable one-byte tag mixed into the hash so the same key string in two
     /// classes hashes independently.
+    ///
+    /// These values are **hash inputs, not display values**: renumbering one
+    /// re-scores every key in that class and silently reassigns live flows to
+    /// different owners. They are append-only — a new class takes the next free
+    /// number, and no existing number ever moves, including `Config`'s, which is
+    /// why that arm outlives its use.
     const fn tag(self) -> u8 {
         match self {
             KeyClass::Config => 0,
@@ -60,12 +87,17 @@ impl<'a> OwnedKey<'a> {
         Self { class, key }
     }
 
-    /// Convenience for the Phase-1 `cfg:<port>` key.
+    /// The owned key for a flow's state, keyed by its `flow_id`.
+    ///
+    /// The flow id is opaque and caller-supplied — it is not derived from a
+    /// tenant or a port, and nothing maps it back to an imposter. A port with
+    /// several flows therefore has several owners, one per flow, and asking for
+    /// "the owner of a port" has no answer.
     #[must_use]
-    pub fn config(key: &'a str) -> Self {
+    pub fn flow(flow_id: &'a str) -> Self {
         Self {
-            class: KeyClass::Config,
-            key,
+            class: KeyClass::FlowKv,
+            key: flow_id,
         }
     }
 }
@@ -190,7 +222,7 @@ mod tests {
         let forward = Ring::new([1, 2, 3, 4, 5], 10);
         let reversed = Ring::new([5, 4, 3, 2, 1], 10);
         for k in keys(200) {
-            let key = OwnedKey::config(&k);
+            let key = OwnedKey::flow(&k);
             assert_eq!(forward.owner(key), reversed.owner(key), "key {k}");
         }
     }
@@ -226,18 +258,18 @@ mod tests {
     fn empty_ring_has_no_owner() {
         let ring = Ring::new(std::iter::empty(), 0);
         assert!(ring.is_empty());
-        assert_eq!(ring.owner(OwnedKey::config("cfg:8080")), None);
-        assert_eq!(ring.i_own(1, OwnedKey::config("cfg:8080")), None);
+        assert_eq!(ring.owner(OwnedKey::flow("flow-8080")), None);
+        assert_eq!(ring.i_own(1, OwnedKey::flow("flow-8080")), None);
     }
 
     #[test]
     fn single_node_owns_everything() {
         let ring = Ring::new([7], 3);
         for k in keys(100) {
-            assert_eq!(ring.owner(OwnedKey::config(&k)), Some(7));
-            assert_eq!(ring.i_own(7, OwnedKey::config(&k)), Some(OwnStatus::Owner));
+            assert_eq!(ring.owner(OwnedKey::flow(&k)), Some(7));
+            assert_eq!(ring.i_own(7, OwnedKey::flow(&k)), Some(OwnStatus::Owner));
             assert_eq!(
-                ring.i_own(9, OwnedKey::config(&k)),
+                ring.i_own(9, OwnedKey::flow(&k)),
                 Some(OwnStatus::NotOwner(7))
             );
         }
@@ -251,7 +283,7 @@ mod tests {
         let full = Ring::new([1, 2, 3, 4, 5], 10);
         let without_3 = Ring::new([1, 2, 4, 5], 11);
         for k in keys(500) {
-            let key = OwnedKey::config(&k);
+            let key = OwnedKey::flow(&k);
             let before = full.owner(key).unwrap();
             let after = without_3.owner(key).unwrap();
             if before == 3 {
@@ -272,7 +304,7 @@ mod tests {
         let before = Ring::new([1, 2, 3], 10);
         let after = Ring::new([1, 2, 3, 4], 11);
         for k in keys(500) {
-            let key = OwnedKey::config(&k);
+            let key = OwnedKey::flow(&k);
             let old = before.owner(key).unwrap();
             let new = after.owner(key).unwrap();
             if new != old {
@@ -290,7 +322,7 @@ mod tests {
         let ring = Ring::new([1, 2, 3, 4, 5], 10);
         let mut seen = std::collections::BTreeSet::new();
         for k in keys(1000) {
-            seen.insert(ring.owner(OwnedKey::config(&k)).unwrap());
+            seen.insert(ring.owner(OwnedKey::flow(&k)).unwrap());
         }
         assert_eq!(seen.len(), 5, "every member should own some keys: {seen:?}");
     }
