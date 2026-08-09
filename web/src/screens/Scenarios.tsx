@@ -493,6 +493,19 @@ function SpaceBody({
             {hasRequestCount(space) ? space.numberOfRequests : "—"}
           </dd>
         </div>
+        <div className="kv">
+          <dt>Flow owner</dt>
+          <dd data-testid="space-owner">
+            {/* The node holding this flow's state (#359). A flow is the only thing the ring owns —
+                imposters and stubs are replicated to every node — so this is the one place in the
+                console where "owner" is a real question with a real answer.
+
+                `—` when the fleet did not say, never a guess: the server omits the field when no
+                membership is applied or the imposter's context scope could not be read, and a
+                wrong owner sends an operator to the wrong node. */}
+            {space.owner === null ? "—" : <Ident>{space.owner}</Ident>}
+          </dd>
+        </div>
       </dl>
 
       {isEmptySpace(space) ? (

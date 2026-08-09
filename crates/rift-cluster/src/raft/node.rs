@@ -1249,6 +1249,21 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// The applied config JSON for `tenant`'s `port`, or `None` if none is applied.
+    ///
+    /// Answers from the applied state machine, so a follower or a restarted node serves it without
+    /// waiting to become leader — the same read path as [`Self::imposter_revision`].
+    ///
+    /// Exists for the ownership lookup (#359): a flow's owner is decided by its id under the
+    /// imposter's `flowState.contextScope`, and that scope is only knowable from the imposter's own
+    /// config. The JSON is returned unparsed because the caller wants one field out of it and the
+    /// parse belongs where that field is interpreted.
+    pub fn imposter_config(&self, tenant: &str, port: u16) -> Result<Option<String>, NodeError> {
+        self.sm_reader
+            .read_config(tenant, port)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// Block until this node's leadership differs from `was_leader`, or until
     /// `timeout` elapses; return its leadership as of the moment this returns.
     ///

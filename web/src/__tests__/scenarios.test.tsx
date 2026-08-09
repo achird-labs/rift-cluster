@@ -279,6 +279,37 @@ describe("a space's stubs are not the imposter's stubs", () => {
     );
   });
 
+  it("names the node holding this flow's state", async () => {
+    // #359. A flow is the only thing the ring owns — imposters and stubs are replicated to every
+    // node — so this is the one place the console can honestly answer "who owns this".
+    stubFetch(
+      healthy({
+        [SPACE_PATH]: {
+          json: { space: FLOW, stubs: [], scenarios: [], numberOfRequests: 7, owner: 3 },
+        },
+      }),
+    );
+    renderScreen("viewer", FLOW, "spaces");
+    expect((await screen.findByTestId("space-owner")).textContent).toContain("3");
+  });
+
+  it("does not guess an owner the fleet did not name", async () => {
+    // The server omits `owner` when no membership is applied or the imposter's context scope could
+    // not be read. Rendering a node id here would send an operator to the wrong node — the exact
+    // failure #359 exists to avoid, and worse than showing nothing.
+    stubFetch(
+      healthy({
+        [SPACE_PATH]: {
+          json: { space: FLOW, stubs: [], scenarios: [], numberOfRequests: 7 },
+        },
+      }),
+    );
+    renderScreen("viewer", FLOW, "spaces");
+    await waitFor(async () =>
+      expect((await screen.findByTestId("space-owner")).textContent).toContain("—"),
+    );
+  });
+
   it("renders a space holding nothing as an answer", async () => {
     stubFetch(healthy({ [SPACE_PATH]: { json: { space: FLOW, stubs: [], scenarios: [], numberOfRequests: 0 } } }));
     renderScreen("viewer", FLOW, "spaces");

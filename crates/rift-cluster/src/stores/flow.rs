@@ -1154,23 +1154,27 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
 pub struct ClusteredFlowStore {
     net: Arc<FlowNet>,
     config: FlowConfig,
-    /// This imposter's flow-id namespace, rendered once at `provide` time from
-    /// [`FlowConfig::scope`] and the port (#152).
+    /// This imposter's port, which with [`FlowConfig::scope`] decides the
+    /// flow-id namespace (#152).
     ///
-    /// It is deliberately applied *at the store face* and nowhere below it:
-    /// shard tables, HRW ownership, replication, anti-entropy, adoption markers
-    /// and the admin `flow_get`/`flow_set` routes all consume whatever id the
-    /// store hands them, so scoping here covers every one of those paths
-    /// uniformly and none of them has to learn the concept. It also settles the
-    /// admission recorded at `REPAIR_DURABILITY` above — a repair path could
-    /// not previously tell which imposter a `flow_id` belonged to; now the id
-    /// itself says.
-    prefix: String,
+    /// The namespace is applied *at the store face* and nowhere below it: shard
+    /// tables, HRW ownership, replication, anti-entropy, adoption markers and
+    /// the admin `flow_get`/`flow_set` routes all consume whatever id the store
+    /// hands them, so scoping here covers every one of those paths uniformly and
+    /// none of them has to learn the concept. It also settles the admission
+    /// recorded at `REPAIR_DURABILITY` above — a repair path could not
+    /// previously tell which imposter a `flow_id` belonged to; now the id itself
+    /// says.
+    port: Option<u16>,
 }
 
 impl ClusteredFlowStore {
+    /// Held as scope+port rather than a rendered prefix so this shares
+    /// [`ContextScope::scoped_flow_id`] with the admin front's ownership lookup
+    /// (#359). Two renderings of this key would be two answers to "who owns this
+    /// flow", and the wrong one sends an operator to the wrong node.
     fn scoped(&self, flow_id: &str) -> String {
-        format!("{}{flow_id}", self.prefix)
+        self.config.scope.scoped_flow_id(self.port, flow_id)
     }
 
     fn write(&self, flow_id: &str, key: &str, op: WriteOp) -> anyhow::Result<WriteReply> {
@@ -1335,7 +1339,7 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
         Some(Arc::new(ClusteredFlowStore {
             net: Arc::clone(&self.net),
             config: flow_config,
-            prefix: flow_config.scope.prefix_for(config.port),
+            port: config.port,
         }))
     }
 }
