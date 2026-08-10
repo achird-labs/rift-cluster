@@ -16,11 +16,12 @@ import {
   Empty,
   ErrorNote,
   Ident,
+  Status,
+  type Tone,
   Truncated,
 } from "../components/primitives.tsx";
 import type { MatchOutcome, OutcomeView } from "../features/requests/diagnostics.ts";
 import { describeOutcome } from "../features/requests/diagnostics.ts";
-import { Pending } from "../components/pending.tsx";
 import type { RecordedRequest } from "../features/requests/source.ts";
 import { describeCoverage, headerValues, page } from "../features/requests/source.ts";
 import {
@@ -398,6 +399,22 @@ function Rows({
  * its own text.
  */
 const METHOD_TONES = new Set(["get", "post", "put", "patch", "delete", "head", "options"]);
+
+/**
+ * An HTTP status code, rendered through the shared `Status` (issue #364).
+ *
+ * Reused rather than given its own colour on purpose: `Status` carries the meaning in a glyph and
+ * a value as well as a hue, because green↔red is 5.8–7.2 ΔE apart under protanopia and
+ * deuteranopia. A 2xx and a 5xx distinguished only by colour would be the one pair in this table
+ * an operator most needs to tell apart, and the one they might not be able to.
+ */
+function statusTone(code: number): Tone {
+  if (code >= 500) return "bad";
+  if (code >= 400) return "warn";
+  // 3xx is neither success nor failure — a redirect is the mock doing as it was told.
+  if (code >= 300) return "idle";
+  return "ok";
+}
 
 function Method({ method }: { method: string | undefined }): ReactNode {
   if (method === undefined) return <span className="method">—</span>;
@@ -922,11 +939,11 @@ function MergedJournal(): ReactNode {
                 {rows.map((row, index) => (
                   <tr key={`${String(row.port)}-${String(index)}`} data-testid="merged-request-row">
                     <td className="ident">{row.request.timestamp ?? "—"}</td>
-                    <td>
-                      <Pending
-                        issue={364}
-                        reason="Which node served a request is not recorded. The journal merges across writer shards, but a row does not say which shard it came from."
-                      />
+                    {/* #364. Stamped by the writer at record time, so it is the node that actually
+                        served this request — not an inference from whichever shard the merge found
+                        it in. `—` for an entry recorded before the field shipped. */}
+                    <td className="ident" data-testid="merged-cell-node">
+                      {row.request.node ?? "—"}
                     </td>
                     <td className="ident">
                       <a href={toHash({ screen: "requests", port: row.port })}>
@@ -937,20 +954,26 @@ function MergedJournal(): ReactNode {
                     <td className="ident">
                       <Method method={row.request.method} /> {row.request.path ?? "—"}
                     </td>
-                    <td>
-                      <Pending
-                        issue={364}
-                        reason="The response status is not recorded — the request is, the answer is not."
-                      />
+                    {/* #364. Absent, not zero, for an entry whose outcome was never attached —
+                        the debug path returns early, and a request journalled before an error
+                        never reaches the attach. `0 ms` is a real reading; a blank is not. */}
+                    <td className="ident" data-testid="merged-cell-status">
+                      {row.request.status === undefined ? (
+                        "—"
+                      ) : (
+                        <Status
+                          tone={statusTone(row.request.status)}
+                          label={String(row.request.status)}
+                        />
+                      )}
                     </td>
                     <td className="ident">
                       <StubCell outcome={row.request.matchOutcome} />
                     </td>
-                    <td>
-                      <Pending
-                        issue={364}
-                        reason="How long the imposter took is not recorded."
-                      />
+                    <td className="ident" data-testid="merged-cell-latency">
+                      {row.request.latencyMs === undefined
+                        ? "—"
+                        : `${String(row.request.latencyMs)} ms`}
                     </td>
                   </tr>
                 ))}

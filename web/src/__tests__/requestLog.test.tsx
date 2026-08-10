@@ -1191,3 +1191,61 @@ describe("#250 — turning a request into a stub", () => {
     expect(screen.queryByTestId("stub-shadow-warning")).toBeNull();
   });
 });
+
+describe("the fleet journal's node, status and latency columns (#364)", () => {
+  // The merged journal reads every imposter the tenant has, so the fixture needs the listing as
+  // well as the per-port traffic.
+  const FLEET_JOURNAL = {
+    ...SINGLE_NODE,
+    "/imposters": { json: { imposters: [{ port: PORT, name: "payments", protocol: "http" }] } },
+  };
+
+  /*
+   * Asserted per cell, by testid, rather than over the row's text.
+   *
+   * The first draft of this test checked `row.textContent).toContain("3")` for the node id and
+   * passed while the node cell was hard-coded to a dash — because "503" in the status cell also
+   * contains a "3". A row-wide `toContain` is a assertion that cannot fail for the reason it
+   * claims to test, and the node id is exactly the kind of short value that collides.
+   */
+  it("renders the three columns the engine now records", async () => {
+    stubFetch({
+      ...FLEET_JOURNAL,
+      [REQUESTS]: {
+        json: [recorded({ node: "rift-7", status: 503, latencyMs: 42 })],
+      },
+    });
+    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+
+    expect((await screen.findByTestId("merged-cell-node")).textContent).toBe("rift-7");
+    expect((await screen.findByTestId("merged-cell-status")).textContent).toContain("503");
+    expect((await screen.findByTestId("merged-cell-latency")).textContent).toBe("42 ms");
+  });
+
+  /*
+   * The half that matters. `status` and `latencyMs` are attached after the response exists, so an
+   * entry recorded before that — the debug path, or a request journalled before an error — carries
+   * neither. Rendering `0 ms` there would report an instant answer the engine never observed, and
+   * rendering a status would invent one outright.
+   */
+  it("does not invent an outcome the engine never recorded", async () => {
+    stubFetch({ ...FLEET_JOURNAL, [REQUESTS]: { json: [recorded()] } });
+    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+
+    expect((await screen.findByTestId("merged-cell-node")).textContent).toBe("\u2014");
+    expect((await screen.findByTestId("merged-cell-status")).textContent).toBe("\u2014");
+    expect((await screen.findByTestId("merged-cell-latency")).textContent).toBe("\u2014");
+  });
+
+  // A latency of zero is a reading, not a gap: a stub answered from memory is sub-millisecond, and
+  // blanking it would hide the fact that the mock was fast rather than unmeasured.
+  it("renders a zero latency as a measurement, not as absence", async () => {
+    stubFetch({
+      ...FLEET_JOURNAL,
+      [REQUESTS]: { json: [recorded({ node: "rift-1", status: 200, latencyMs: 0 })] },
+    });
+    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+
+    expect((await screen.findByTestId("merged-cell-latency")).textContent).toBe("0 ms");
+  });
+});

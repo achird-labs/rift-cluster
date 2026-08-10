@@ -861,6 +861,18 @@ impl RequestJournal for ClusterJournal {
     }
 
     fn record_indexed(&self, port: u16, flow_id: &str, req: RecordedRequest) -> Option<u64> {
+        // Issue #364: stamp the writer's identity. Upstream carries the field but never sets it —
+        // single-node Rift has one node and no name for it — so this is the layer that knows the
+        // answer, and it is the same identity the entry is keyed by, so a merged read cannot
+        // disagree with the row it is reading.
+        //
+        // Stamped here rather than left to the merge: a reader that inferred `node` from the shard
+        // it found the entry in would be re-deriving a fact instead of reporting one, and the two
+        // would part company the moment an entry moved between shards.
+        let req = RecordedRequest {
+            node: Some(self.node_id.to_string()),
+            ..req
+        };
         let shard = self.shard(port);
         let now = self.clock.now_millis();
         // Resolved before the lock, to keep the critical section to the deque mutation and
@@ -1035,6 +1047,25 @@ impl RequestJournal for ClusterJournal {
             entries[position].request.match_outcome = Some(outcome);
         }
     }
+
+    fn attach_response(&self, port: u16, index: u64, status: u16, latency_ms: u64) {
+        let shard = self.shard(port);
+        let mut entries = shard.entries.write();
+        // Same invariant, same reason, as `attach_match` above: seqs are assigned under this write
+        // lock, so the deque stays in ascending seq order and the search is exact. A violation
+        // would not fail loudly — it would annotate the *wrong* entry — so it is asserted in debug
+        // builds where a change to eviction turns silent mis-attribution into a test failure.
+        debug_assert!(
+            entries.iter().is_sorted_by_key(|entry| entry.seq),
+            "journal deque must stay ordered by seq for attach_response to address entries"
+        );
+        // An entry that is gone (evicted, or cleared between the record and the response) is not
+        // an error: a diagnostic annotation must never be able to fail a request.
+        if let Ok(position) = entries.binary_search_by(|entry| entry.seq.cmp(&index)) {
+            entries[position].request.status = Some(status);
+            entries[position].request.latency_ms = Some(latency_ms);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1079,6 +1110,9 @@ mod tests {
             body: None,
             timestamp: "t".into(),
             match_outcome: None,
+            status: None,
+            latency_ms: None,
+            node: None,
         }
     }
 
@@ -1329,6 +1363,74 @@ mod tests {
         fresh.record_indexed(1, "f", req("/a"));
         assert!(!cursor(&fresh, 1, None).truncated);
         assert!(!cursor(&fresh, 1, Some(0)).truncated);
+    }
+
+    /// Issue #364: every entry this node writes carries this node's id, and it is the same
+    /// identity the entry is keyed by — so a merged read can never show a row whose `node`
+    /// disagrees with the shard it came from.
+    #[test]
+    fn every_recorded_entry_is_stamped_with_this_nodes_id() {
+        let j = journal();
+        j.record_indexed(1, "f", req("/a"));
+
+        let entries = j.read(1).entries;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].node.as_deref(),
+            Some(j.node_id.to_string().as_str()),
+            "the writer stamps itself; upstream never sets this field"
+        );
+    }
+
+    /// Issue #364: the response outcome lands on the entry the seq names, and on no other.
+    #[test]
+    fn attach_response_annotates_exactly_the_named_entry() {
+        let j = journal();
+        let first = j.record_indexed(1, "f", req("/a")).expect("indexed");
+        let second = j.record_indexed(1, "f", req("/b")).expect("indexed");
+        assert_ne!(first, second);
+
+        j.attach_response(1, second, 503, 42);
+
+        let entries = j.read(1).entries;
+        let a = entries.iter().find(|r| r.path == "/a").expect("/a");
+        let b = entries.iter().find(|r| r.path == "/b").expect("/b");
+        assert_eq!((b.status, b.latency_ms), (Some(503), Some(42)));
+        // Absent on the neighbour, not zeroed — `0` would read as "answered instantly".
+        assert_eq!((a.status, a.latency_ms), (None, None));
+    }
+
+    /// Issue #364, mirroring `attach_match_on_an_absent_entry_is_a_no_op`: an evicted or unknown
+    /// seq must not land on a surviving entry, and must not panic.
+    #[test]
+    fn attach_response_on_an_absent_entry_is_a_no_op() {
+        let j = journal();
+        for i in 0..(MAX_RECORDED_REQUESTS + 5) {
+            j.record_indexed(1, "f", req(&format!("/{i}")));
+        }
+        // seqs 1..=5 fell off the front; 6 is the oldest retained.
+        j.attach_response(1, 1, 200, 7);
+        j.attach_response(9999, 1, 200, 7);
+
+        let entries = j.read(1).entries;
+        assert_eq!(entries.len(), MAX_RECORDED_REQUESTS);
+        assert!(
+            entries.iter().all(|r| r.status.is_none()),
+            "attaching to an evicted seq must not land on a surviving entry"
+        );
+
+        j.attach_response(1, 6, 204, 3);
+        let entries = j.read(1).entries;
+        let annotated: Vec<_> = entries.iter().filter(|r| r.status.is_some()).collect();
+        assert_eq!(
+            annotated.len(),
+            1,
+            "exactly the retained seq 6 is annotated"
+        );
+        assert_eq!(
+            (annotated[0].status, annotated[0].latency_ms),
+            (Some(204), Some(3))
+        );
     }
 
     #[test]

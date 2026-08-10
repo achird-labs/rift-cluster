@@ -6032,6 +6032,9 @@ mod tests {
             body: None,
             timestamp: format!("2026-01-01T00:00:{:02}Z", path.len()),
             match_outcome: None,
+            status: None,
+            latency_ms: None,
+            node: None,
         }
     }
 
