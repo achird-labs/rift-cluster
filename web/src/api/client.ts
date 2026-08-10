@@ -38,6 +38,15 @@ export const TENANT_HEADER = "X-Rift-Tenant";
  */
 export const REVISION_HEADER = "Rift-Cluster-Revision";
 
+/**
+ * The header that makes a retried write safe to send (#371).
+ *
+ * The admin front derives a deterministic op id from it (`base_op_id`), and the Raft layer refuses
+ * to apply an op id it has already applied — so two requests carrying the same key are one write,
+ * however many times the network made us send it.
+ */
+export const IDEMPOTENCY_HEADER = "Idempotency-Key";
+
 /** Per-call context the schema cannot express: the tenant in view, and the write's precondition. */
 export type RequestOptions = {
   tenant?: string | null | undefined;
@@ -46,6 +55,15 @@ export type RequestOptions = {
    * it, and callers that do not hold one refuse to write rather than sending nothing.
    */
   ifMatch?: string | null | undefined;
+  /**
+   * Sent as `Idempotency-Key` on mutations (#371). Ignored on `GET`, which cannot double-apply.
+   *
+   * **Must be stable across retries of one intent and fresh for a new one** — `keyedAttempt` in
+   * `features/writes/idempotency.ts` is what maintains that, and no call site should mint one
+   * inline. A key that changes per attempt buys nothing; one that never changes is worse than
+   * nothing, because a keyed retry of a `409` dedups back to that same `409` by design.
+   */
+  idempotencyKey?: string | null | undefined;
 };
 
 /**
@@ -148,6 +166,13 @@ async function request(
   const ifMatch = options?.ifMatch;
   if (ifMatch !== undefined && ifMatch !== null && ifMatch !== "") {
     headers["If-Match"] = ifMatch;
+  }
+  const idempotencyKey = options?.idempotencyKey;
+  // Never on `GET` (#371): a read cannot double-apply, and the admin front refuses the header on
+  // one route outright (minting a principal), so sending it where it has no meaning invites a 400
+  // for nothing.
+  if (method !== "GET" && idempotencyKey !== undefined && idempotencyKey !== null && idempotencyKey !== "") {
+    headers[IDEMPOTENCY_HEADER] = idempotencyKey;
   }
 
   const response = await fetch(path, {

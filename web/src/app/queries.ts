@@ -12,6 +12,7 @@ import {
   apiSend,
 } from "../api/client.ts";
 import { type CommitOutcome, applied, settle } from "../features/writes/commit.ts";
+import { keyedAttempt } from "../features/writes/idempotency.ts";
 import {
   API_PATHS,
   auditPath,
@@ -177,9 +178,12 @@ export type SourceWrite = {
 export function useUpsertSource(): UseMutationResult<CommitOutcome, Error, SourceWrite> {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (body) => {
-      const sent = await apiSend("POST", API_PATHS.sources, body, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("POST", API_PATHS.sources, body, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -199,13 +203,14 @@ export function useUpsertSource(): UseMutationResult<CommitOutcome, Error, Sourc
 export function useDeleteSource(): UseMutationResult<CommitOutcome, Error, { id: string }> {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ id }) => {
-      const sent = await apiSend(
-        "DELETE",
-        `${API_PATHS.sources}/${encodeURIComponent(id)}`,
-        undefined,
-        { tenant },
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("DELETE", `${API_PATHS.sources}/${encodeURIComponent(id)}`, undefined, {
+          tenant,
+          idempotencyKey,
+        }),
       );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
@@ -266,13 +271,14 @@ function readPullReport(body: unknown): SourcePullReport {
 export function usePullSource(): UseMutationResult<SourcePullReport, Error, { id: string }> {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ id }) => {
-      const sent = await apiSend<unknown>(
-        "POST",
-        `${API_PATHS.sources}/${encodeURIComponent(id)}/pull`,
-        undefined,
-        { tenant },
+      const sent = await keyed((idempotencyKey) =>
+        apiSend<unknown>("POST", `${API_PATHS.sources}/${encodeURIComponent(id)}/pull`, undefined, {
+          tenant,
+          idempotencyKey,
+        }),
       );
       return readPullReport(applied(sent));
     },
@@ -298,9 +304,12 @@ export function useTryStub(
   port: number,
 ): UseMutationResult<TryResult, Error, { request: TrySpec }> {
   const { tenant } = useSession();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ request }) => {
-      const sent = await apiSend<TryResult>("POST", tryImposterPath(port), request, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend<TryResult>("POST", tryImposterPath(port), request, { tenant, idempotencyKey }),
+      );
       return applied(sent);
     },
   });
@@ -361,9 +370,12 @@ export function useLifecycleToggle(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, enable }) => {
-      const sent = await apiSend("POST", lifecyclePath(port, enable), undefined, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("POST", lifecyclePath(port, enable), undefined, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -578,10 +590,15 @@ export type StubWrite = {
  * update wearing a different hat.
  */
 function useStubWrite(
-  send: (write: StubWrite, tenant: string | null) => Promise<SendResult<unknown>>,
+  send: (
+    write: StubWrite,
+    tenant: string | null,
+    idempotencyKey: string,
+  ) => Promise<SendResult<unknown>>,
 ): UseMutationResult<CommitOutcome, Error, StubWrite> {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (write) => {
       const conflict = async (): Promise<never> => {
@@ -590,7 +607,10 @@ function useStubWrite(
         throw new StubConflict(theirs, fresh.revision);
       };
       try {
-        const outcome = await settle(await send(write, tenant), { tenant });
+        const outcome = await settle(
+          await keyed((idempotencyKey) => send(write, tenant, idempotencyKey)),
+          { tenant },
+        );
         if (outcome.kind === "failed") {
           /*
            * Under `--cluster-admin-async` the precondition is judged inside apply, AFTER the 202 —
@@ -612,19 +632,21 @@ function useStubWrite(
 }
 
 export function usePutStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
-  return useStubWrite((write, tenant) =>
+  return useStubWrite((write, tenant, idempotencyKey) =>
     apiSend("PUT", stubByIdPath(write.port, write.stubId), write.body, {
       tenant,
       ifMatch: write.revision,
+      idempotencyKey,
     }),
   );
 }
 
 export function useDeleteStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
-  return useStubWrite((write, tenant) =>
+  return useStubWrite((write, tenant, idempotencyKey) =>
     apiSend("DELETE", stubByIdPath(write.port, write.stubId), undefined, {
       tenant,
       ifMatch: write.revision,
+      idempotencyKey,
     }),
   );
 }
@@ -637,10 +659,11 @@ export function useDeleteStub(): UseMutationResult<CommitOutcome, Error, StubWri
  * It carries the same `If-Match`, so appending cannot clobber a concurrent edit either.
  */
 export function useAddStub(): UseMutationResult<CommitOutcome, Error, StubWrite> {
-  return useStubWrite((write, tenant) =>
+  return useStubWrite((write, tenant, idempotencyKey) =>
     apiSend("POST", stubsPath(write.port), addStubBody(write.body), {
       tenant,
       ifMatch: write.revision,
+      idempotencyKey,
     }),
   );
 }
@@ -701,8 +724,12 @@ export function useRecordedStubs(
  * field it never reads is cheaper than a second write pipeline that duplicates the conflict handling.
  */
 export function usePromoteRecording(): UseMutationResult<CommitOutcome, Error, StubWrite> {
-  return useStubWrite((write, tenant) =>
-    apiSend("PUT", stubsPath(write.port), write.body, { tenant, ifMatch: write.revision }),
+  return useStubWrite((write, tenant, idempotencyKey) =>
+    apiSend("PUT", stubsPath(write.port), write.body, {
+      tenant,
+      ifMatch: write.revision,
+      idempotencyKey,
+    }),
   );
 }
 
@@ -718,9 +745,12 @@ export function usePromoteRecording(): UseMutationResult<CommitOutcome, Error, S
 export function useDiscardRecording(): UseMutationResult<CommitOutcome, Error, { port: number }> {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port }) => {
-      const sent = await apiSend("DELETE", savedProxyResponsesPath(port), undefined, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("DELETE", savedProxyResponsesPath(port), undefined, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -746,9 +776,12 @@ export function useDiscardRecording(): UseMutationResult<CommitOutcome, Error, {
 export function useCreateImposter(): UseMutationResult<CommitOutcome, Error, Imposter> {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (body) => {
-      const sent = await apiSend("POST", API_PATHS.imposters, body, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("POST", API_PATHS.imposters, body, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -774,9 +807,12 @@ export function useImportAddImposter(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (imposter) => {
-      const sent = await apiSend("POST", API_PATHS.imposters, imposter, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("POST", API_PATHS.imposters, imposter, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -799,9 +835,12 @@ export function useReplaceImposters(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (body) => {
-      const sent = await apiSend("PUT", API_PATHS.imposters, body, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("PUT", API_PATHS.imposters, body, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -822,9 +861,12 @@ export function useReplaceImposters(): UseMutationResult<
 export function useDeleteImposter(): UseMutationResult<CommitOutcome, Error, { port: number }> {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port }) => {
-      const sent = await apiSend("DELETE", imposterPath(port), undefined, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("DELETE", imposterPath(port), undefined, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -873,9 +915,12 @@ export function useAuditSink(options: { enabled?: boolean } = {}) {
 
 export function usePutAuditSink(): UseMutationResult<CommitOutcome, Error, AuditSinkWrite> {
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (body) => {
-      const sent = await apiSend("PUT", API_PATHS.auditSink, body);
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("PUT", API_PATHS.auditSink, body, { idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant: null });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -886,9 +931,12 @@ export function usePutAuditSink(): UseMutationResult<CommitOutcome, Error, Audit
 
 export function useDeleteAuditSink(): UseMutationResult<CommitOutcome, Error, void> {
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async () => {
-      const sent = await apiSend("DELETE", API_PATHS.auditSink);
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("DELETE", API_PATHS.auditSink, undefined, { idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant: null });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -900,9 +948,12 @@ export function useDeleteAuditSink(): UseMutationResult<CommitOutcome, Error, vo
 export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { port: number }> {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port }) => {
-      const sent = await apiSend("DELETE", requestsPath(port), undefined, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("DELETE", requestsPath(port), undefined, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -1108,10 +1159,13 @@ export function useSetScenarioState(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, name, state, flowId }) => {
       const body = flowId === null ? { state } : { state, flowId };
-      const sent = await apiSend("PUT", scenarioStatePath(port, name), body, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("PUT", scenarioStatePath(port, name), body, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -1131,13 +1185,16 @@ export function useResetScenarios(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, flowId }) => {
-      const sent = await apiSend(
-        "POST",
-        scenariosResetPath(port),
-        flowId === null ? {} : { flowId },
-        { tenant },
+      const sent = await keyed((idempotencyKey) =>
+        apiSend(
+          "POST",
+          scenariosResetPath(port),
+          flowId === null ? {} : { flowId },
+          { tenant, idempotencyKey },
+        ),
       );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
@@ -1158,9 +1215,12 @@ export function useTeardownSpace(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, flowId }) => {
-      const sent = await apiSend("DELETE", spacePath(port, flowId), undefined, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("DELETE", spacePath(port, flowId), undefined, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -1185,9 +1245,12 @@ export function useAddSpaceStub(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, flowId, body }) => {
-      const sent = await apiSend("POST", spaceStubsPath(port, flowId), body, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("POST", spaceStubsPath(port, flowId), body, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -1215,11 +1278,15 @@ export function useSetFlowStateEntry(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, flowId, key: entryKey, body }) => {
-      const sent = await apiSend("PUT", flowStateEntryPath(port, flowId, entryKey), body, {
-        tenant,
-      });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("PUT", flowStateEntryPath(port, flowId, entryKey), body, {
+          tenant,
+          idempotencyKey,
+        }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -1242,13 +1309,16 @@ export function useClearFlowState(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, flowId, key: entryKey }) => {
       const path =
         entryKey === undefined
           ? flowStatePath(port, flowId)
           : flowStateEntryPath(port, flowId, entryKey);
-      const sent = await apiSend("DELETE", path, undefined, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("DELETE", path, undefined, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -1295,6 +1365,7 @@ export function usePutRoutes(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ draft, base }) => {
       const current = normalizeTable(
@@ -1303,11 +1374,13 @@ export function usePutRoutes(): UseMutationResult<
       if (JSON.stringify(current) !== JSON.stringify(base)) {
         throw new RouteTableConflict(current);
       }
-      const sent = await apiSend<RouteTable>(
-        "PUT",
-        API_PATHS.frontDoorRoutes,
-        { routes: draft },
-        { tenant },
+      const sent = await keyed((idempotencyKey) =>
+        apiSend<RouteTable>(
+          "PUT",
+          API_PATHS.frontDoorRoutes,
+          { routes: draft },
+          { tenant, idempotencyKey },
+        ),
       );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
@@ -1345,9 +1418,12 @@ export function usePutRoutes(): UseMutationResult<
 export function useDeleteRoute(): UseMutationResult<CommitOutcome, Error, { routeId: string }> {
   const { tenant } = useSession();
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ routeId }) => {
-      const sent = await apiSend("DELETE", frontDoorRoutePath(routeId), undefined, { tenant });
+      const sent = await keyed((idempotencyKey) =>
+        apiSend("DELETE", frontDoorRoutePath(routeId), undefined, { tenant, idempotencyKey }),
+      );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -1404,8 +1480,14 @@ export function useTenantProbe(
 
 export function useCreateTenant(): UseMutationResult<unknown, Error, TenantWrite> {
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
-    mutationFn: async (body) => applied(await apiSend("POST", API_PATHS.tenants, body)),
+    mutationFn: async (body) =>
+      applied(
+        await keyed((idempotencyKey) =>
+          apiSend("POST", API_PATHS.tenants, body, { idempotencyKey }),
+        ),
+      ),
     onSettled: () => client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY }),
   });
 }
@@ -1416,8 +1498,14 @@ export function useSaveTenant(): UseMutationResult<
   { tenantId: string; body: TenantWrite }
 > {
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
-    mutationFn: async ({ tenantId, body }) => applied(await apiSend("PUT", tenantPath(tenantId), body)),
+    mutationFn: async ({ tenantId, body }) =>
+      applied(
+        await keyed((idempotencyKey) =>
+          apiSend("PUT", tenantPath(tenantId), body, { idempotencyKey }),
+        ),
+      ),
     onSettled: (_data, _error, vars) => {
       client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY });
       client.invalidateQueries({ queryKey: adminTenantKey(vars.tenantId) });
@@ -1427,8 +1515,14 @@ export function useSaveTenant(): UseMutationResult<
 
 export function useDeleteTenant(): UseMutationResult<unknown, Error, { tenantId: string }> {
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
-    mutationFn: async ({ tenantId }) => applied(await apiSend("DELETE", tenantPath(tenantId))),
+    mutationFn: async ({ tenantId }) =>
+      applied(
+        await keyed((idempotencyKey) =>
+          apiSend("DELETE", tenantPath(tenantId), undefined, { idempotencyKey }),
+        ),
+      ),
     onSettled: () => client.invalidateQueries({ queryKey: ADMIN_TENANTS_KEY }),
   });
 }
@@ -1458,6 +1552,9 @@ export function useCreatePrincipal(
   const client = useQueryClient();
   return useMutation({
     mutationFn: async (body) => {
+      // No idempotency key (#371): the admin front rejects the header outright when minting a
+      // principal — the credential is generated per request and shown once, so a replayed
+      // request cannot return the one the original attempt issued.
       const issued = applied(await apiSend<IssuedPrincipal>("POST", principalsPath(tenantId), body));
       onIssued(issued);
       return stripApiKey(issued);
@@ -1478,9 +1575,12 @@ export function useSavePrincipal(): UseMutationResult<
   { tenantId: string; principalId: string; body: PrincipalUpdate }
 > {
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: ({ tenantId, principalId, body }) =>
-      apiSend("PUT", principalPath(tenantId, principalId), body).then(applied),
+      keyed((idempotencyKey) =>
+        apiSend("PUT", principalPath(tenantId, principalId), body, { idempotencyKey }),
+      ).then(applied),
     onSettled: (_data, _error, vars) =>
       client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
   });
@@ -1492,9 +1592,12 @@ export function useDeletePrincipal(): UseMutationResult<
   { tenantId: string; principalId: string }
 > {
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: ({ tenantId, principalId }) =>
-      apiSend("DELETE", principalPath(tenantId, principalId)).then(applied),
+      keyed((idempotencyKey) =>
+        apiSend("DELETE", principalPath(tenantId, principalId), undefined, { idempotencyKey }),
+      ).then(applied),
     onSettled: (_data, _error, vars) =>
       client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
   });
@@ -1506,9 +1609,12 @@ export function usePutBinding(): UseMutationResult<
   { tenantId: string; principalId: string; role: Role }
 > {
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: ({ tenantId, principalId, role }) =>
-      apiSend("PUT", bindingPath(tenantId, principalId), { role }).then(applied),
+      keyed((idempotencyKey) =>
+        apiSend("PUT", bindingPath(tenantId, principalId), { role }, { idempotencyKey }),
+      ).then(applied),
     onSettled: (_data, _error, vars) =>
       client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
   });
@@ -1520,9 +1626,12 @@ export function useDeleteBinding(): UseMutationResult<
   { tenantId: string; principalId: string }
 > {
   const client = useQueryClient();
+  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: ({ tenantId, principalId }) =>
-      apiSend("DELETE", bindingPath(tenantId, principalId)).then(applied),
+      keyed((idempotencyKey) =>
+        apiSend("DELETE", bindingPath(tenantId, principalId), undefined, { idempotencyKey }),
+      ).then(applied),
     onSettled: (_data, _error, vars) =>
       client.invalidateQueries({ queryKey: adminPrincipalsKey(vars.tenantId) }),
   });
