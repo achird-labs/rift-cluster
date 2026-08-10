@@ -8137,6 +8137,9 @@ mod tests {
                 body: None,
                 timestamp: "t".into(),
                 match_outcome: None,
+                status: None,
+                latency_ms: None,
+                node: None,
             },
         );
         let stamped = journal.read_shard_since(8080, 0).entries;

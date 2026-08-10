@@ -1187,6 +1187,24 @@ export interface components {
              */
             timestamp: string;
             matchOutcome?: components["schemas"]["MatchOutcome"];
+            /**
+             * @description The response status that went back (issue #364, upstream rift#940).
+             *
+             *     Attached after the response exists, like `matchOutcome` is attached after the match — the entry is journalled before either is knowable. **Absent means not recorded**, never `0`: the `X-Rift-Debug` path returns early and a request journalled before an error never reaches the attach, so absence is a real state and distinct from any status.
+             */
+            status?: number;
+            /**
+             * @description How long the imposter took to answer, in milliseconds (issue #364). Attached with `status`; the two are present or absent together.
+             *
+             *     A present `0` is an ordinary reading, not a missing one — a stub answered from memory is well under a millisecond. The resolution suits the question the column exists to answer, *is this mock the slow thing?*, where the interesting values are `behaviors.wait` delays and proxied upstreams. Measured before this node's own CORS header injection, which happens after the imposter has finished.
+             */
+            latencyMs?: number;
+            /**
+             * @description The node that served this request (issue #364), stamped by the clustered journal at record time — it is the same identity the entry is keyed by, so a merged read cannot show a row whose `node` disagrees with the shard it came from.
+             *
+             *     A string, not a number: node ids are identifiers rather than magnitudes, and an id above 2^53 would be silently rounded by any JavaScript reading it. Absent from a recording made before this shipped, and from a single-node engine, which has no name for itself.
+             */
+            node?: string;
         } & {
             [key: string]: unknown;
         };

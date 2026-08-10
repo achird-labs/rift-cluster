@@ -1649,6 +1649,9 @@ mod tests {
             body: None,
             timestamp: timestamp.into(),
             match_outcome: None,
+            status: None,
+            latency_ms: None,
+            node: None,
         }
     }
 
