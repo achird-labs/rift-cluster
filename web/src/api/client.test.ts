@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   CSRF_HEADER,
+  IDEMPOTENCY_HEADER,
   REVISION_HEADER,
   RawJsonBody,
   TENANT_HEADER,
@@ -218,5 +219,38 @@ describe("conditioning a write on a revision", () => {
     await apiSend("PUT", "/imposters/4545/stubs/by-id/s-1", new RawJsonBody(text));
     expect((fetchMock.mock.calls[0]?.[1] as RequestInit).body).toBe(text);
     expect(headersOf(fetchMock)["Content-Type"]).toBe("application/json");
+  });
+});
+
+describe("idempotency key (#371)", () => {
+  it("sends Idempotency-Key on a mutation when one is supplied", () => {
+    const fetchMock = mockFetch(json({}));
+    void apiSend("PUT", "/imposters/4545/stubs", [], { idempotencyKey: "op-1" });
+    expect(headersOf(fetchMock)[IDEMPOTENCY_HEADER]).toBe("op-1");
+  });
+
+  // The console sent none at all before this, which is the bug — so the absence case has to stay
+  // an absence, not a blank header the front would then derive an op id from.
+  it("omits the header entirely when no key is supplied", () => {
+    const fetchMock = mockFetch(json({}));
+    void apiSend("PUT", "/imposters/4545/stubs", []);
+    expect(IDEMPOTENCY_HEADER in headersOf(fetchMock)).toBe(false);
+  });
+
+  it("omits it for an empty or null key rather than sending a blank one", () => {
+    for (const key of ["", null, undefined]) {
+      const fetchMock = mockFetch(json({}));
+      void apiSend("DELETE", "/imposters/4545", undefined, { idempotencyKey: key });
+      expect(IDEMPOTENCY_HEADER in headersOf(fetchMock)).toBe(false);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // A read cannot double-apply, and one admin route refuses the header outright (minting a
+  // principal), so sending it where it has no meaning would invite a 400 for nothing.
+  it("never sends it on a GET", () => {
+    const fetchMock = mockFetch(json({ imposters: [] }));
+    void apiGet("/imposters", { idempotencyKey: "op-1" });
+    expect(IDEMPOTENCY_HEADER in headersOf(fetchMock)).toBe(false);
   });
 });
