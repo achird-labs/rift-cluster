@@ -87,7 +87,16 @@ describe("every displayed field is traceable to the contract", () => {
   it("rejects a key that only the index signature would admit", () => {
     // Guards the guard: `Imposter` ends in `& { [key: string]: unknown }`, so any string is
     // assignable to it. If `declares` ever answered on that basis the test above would be vacuous.
-    expect(declares("Imposter", "numberOfRequests")).toBe(false);
+    //
+    // `latencyMs` is the example because it is real elsewhere in the contract — it is a declared
+    // `RecordedRequest` field (#364) — and still not an `Imposter` one. A made-up key would prove
+    // the same thing more weakly: it would fail a naive `declares` that merely checked the schema
+    // for the name anywhere.
+    //
+    // It used to be `numberOfRequests`, until #363 declared that field and made this assertion
+    // false. Swapped rather than deleted: what this guards is `declares` itself, which the two
+    // tests either side of it lean on entirely.
+    expect(declares("Imposter", "latencyMs")).toBe(false);
     expect(declares("Imposter", "enabled")).toBe(true);
   });
 
@@ -130,12 +139,21 @@ describe("every displayed field is traceable to the contract", () => {
     }
   });
 
-  it("renders no field the prototype invented but the contract does not carry", () => {
-    // `numberOfRequests` drove the prototype's one chart. It is not a declared `Imposter` property —
-    // it would arrive only through the index signature — so C4 does not render it. This test is the
-    // reason that stayed a decision rather than becoming an oversight.
+  it("renders the request count only because the contract now declares it", () => {
+    /*
+     * This test used to assert the opposite: `numberOfRequests` drove the prototype's one chart,
+     * arrived only through the index signature, and so C4 refused to render it — and this pinned
+     * that as a decision rather than an oversight.
+     *
+     * #363 changed the fact underneath, not the rule. The field is a declared `Imposter` property
+     * now, so the column is allowed — and the assertion is inverted rather than dropped, because
+     * the *rule* is what matters: the column may exist only while the declaration does. Delete the
+     * schema field and this fails, which is the property the original test was protecting all
+     * along, just from the other side.
+     */
     const keys = IMPOSTER_COLUMNS.map((c) => c.key as string);
-    expect(keys).not.toContain("numberOfRequests");
+    expect(keys).toContain("numberOfRequests");
+    expect(declares("Imposter", "numberOfRequests")).toBe(true);
   });
 });
 

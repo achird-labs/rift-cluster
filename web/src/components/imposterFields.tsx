@@ -97,6 +97,17 @@ export function ImposterField({
       ) : (
         <Status tone="idle" label="disabled" />
       );
+    /*
+     * Issue #363. A **fleet** figure: the front rewrites each entry's count to the sum across every
+     * node's slot for that port, so this is not what the answering node served on its own.
+     *
+     * `—` when the field is absent, never `0`. "This response did not carry a count" and "nothing
+     * has ever hit this imposter" are the two facts an operator opens this screen to distinguish,
+     * and a zero would answer the second when only the first is known — the same reasoning the
+     * stub count above records.
+     */
+    case "numberOfRequests":
+      return <Ident>{imposter.numberOfRequests ?? UNKNOWN}</Ident>;
     default:
       return assertNever(field);
   }

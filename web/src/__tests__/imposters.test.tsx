@@ -574,3 +574,69 @@ describe("#251 — import", () => {
     expect(screen.getByTestId("export-imposters")).toBeTruthy();
   });
 });
+
+describe("the fleet-sum request tile (#363)", () => {
+  const FLEET = { "/_fleet/members": { status: 404 }, "/_fleet/health": { status: 404 } };
+
+  function withCounts(a: number | undefined, b: number | undefined): Record<string, unknown> {
+    return {
+      imposters: TWO.imposters.map((imposter, i) => ({
+        ...imposter,
+        ...(i === 0 ? (a === undefined ? {} : { numberOfRequests: a }) : b === undefined ? {} : { numberOfRequests: b }),
+      })),
+    };
+  }
+
+  it("sums every imposter's count and says the sum spans the fleet", async () => {
+    stubFetch({ ...FLEET, "/imposters": { json: withCounts(7, 5) } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    await screen.findByText("billing");
+
+    expect((await screen.findByTestId("tile-requests")).textContent).toBe("12");
+    expect(screen.getByText(/summed across every node/i)).toBeTruthy();
+  });
+
+  /*
+   * The reason this issue needed the partial header at all. The fan-out stamps
+   * `Rift-Cluster-Partial` when a node did not answer in time, and the sum is then a floor. Showing
+   * `12` under a label reading "fleet sum" would report a total the fleet never confirmed.
+   */
+  it("says the sum is a floor when a node did not answer", async () => {
+    stubFetch({
+      ...FLEET,
+      "/imposters": { json: withCounts(7, 5), headers: { "rift-cluster-partial": "true" } },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    await screen.findByText("billing");
+
+    expect((await screen.findByTestId("tile-requests")).textContent).toBe("12");
+    expect(screen.getByText(/at least this many/i)).toBeTruthy();
+    expect(screen.queryByText(/summed across every node/i)).toBeNull();
+  });
+
+  // A complete merge says nothing — a caveat that is always on is one nobody reads on the day it
+  // means something, which is the rule the request log's scope strip already follows.
+  it("carries no caveat when the merge reached every node", async () => {
+    stubFetch({ ...FLEET, "/imposters": { json: withCounts(7, 5) } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    await screen.findByText("billing");
+
+    await screen.findByTestId("tile-requests");
+    expect(screen.queryByText(/at least this many/i)).toBeNull();
+  });
+
+  /*
+   * `numberOfRequests` is optional in the contract, so a row without one has an *unknown* count.
+   * Summing it as zero would understate the fleet total while looking like an answer — the same
+   * trap the stub-count tile beside it documents.
+   */
+  it("shows no total when a row carried no count at all", async () => {
+    stubFetch({ ...FLEET, "/imposters": { json: withCounts(7, undefined) } });
+    renderInApp(<Imposters />, { whoami: whoamiWith("viewer") });
+    await screen.findByText("billing");
+
+    const tile = await screen.findByTestId("tile-requests");
+    expect(tile.textContent).not.toBe("7");
+    expect(screen.getByText(/not every imposter in this response carried a count/i)).toBeTruthy();
+  });
+});

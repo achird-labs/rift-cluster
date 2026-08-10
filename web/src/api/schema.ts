@@ -1129,6 +1129,14 @@ export interface components {
             stubs?: components["schemas"]["Stub"][];
             /** @description How many stubs this imposter has, on the list projection (`GET /imposters`), where the `stubs` array is omitted. Absent on a single-imposter read, which carries `stubs` instead. A client wanting a count for both shapes reads `stubs.length` when the array is there and falls back to this — neither field alone covers both responses. */
             stubCount?: number;
+            /**
+             * @description How many requests this imposter has served, **fleet-wide** (issue #363). Present on both the list projection and the single-imposter read.
+             *
+             *     Declared rather than left to this schema's `additionalProperties`, which is what previously kept it off the console: a field reaching the body only through the index signature is one no typed client can render without asserting a shape the contract never promised.
+             *
+             *     The value is not this node's own tally. Upstream answers its local G-counter slot, and the front rewrites it to the sum across every node's slot for this port (issue #223) — so it is the figure the design's `REQUESTS · FLEET SUM` tile claims to be. When a peer could not be reached inside the fan-out budget the response carries `Rift-Cluster-Partial`, and the sum is of the nodes that answered: a floor, not a total.
+             */
+            numberOfRequests?: number;
         } & {
             [key: string]: unknown;
         };
