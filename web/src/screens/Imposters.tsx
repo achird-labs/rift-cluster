@@ -21,7 +21,6 @@ import { toHash, useHashQuery } from "../app/routing.ts";
 import { ExportDialog } from "../components/exportDialog.tsx";
 import { FleetRail } from "../components/fleetRail.tsx";
 import { ImposterField, stubCountOf } from "../components/imposterFields.tsx";
-import { Pending } from "../components/pending.tsx";
 import { useToast } from "../components/toast.tsx";
 import {
   type BulkAction,
@@ -83,19 +82,24 @@ type SourceRecord = components["schemas"]["SourceRecord"];
  *   contract rejected one file away. The tile is genuinely fleet-wide (#223 rewrites each entry to
  *   the sum across every node's slot) and says so — or says it is a floor, when `countsArePartial`
  *   reports that the fan-out missed a node.
- * - **Parked intents** — no endpoint publishes the parked-write queue at all (#360).
+ * - **Parked intents** — real since #360. Summed across voters, so it means what the label says:
+ *   the fleet has taken work it has not finished. Says when the sum is a floor, and says nothing
+ *   when it is complete.
  */
 function ImposterTiles({
   imposters,
   sources,
   maySeeSources,
   countsArePartial,
+  fleet,
 }: {
   imposters: readonly Imposter[];
   sources: readonly SourceRecord[] | undefined;
   maySeeSources: boolean;
   /** The fleet sum could not reach every node, so it is a floor rather than a total (#363). */
   countsArePartial: boolean;
+  /** `undefined` for a principal without `fleet.read` — refused, which is not the same as zero. */
+  fleet: FleetView | undefined;
 }): ReactNode {
   /*
    * `stubCountOf`, not `stubs?.length`. The list projection omits the stub array and sends
@@ -163,13 +167,35 @@ function ImposterTiles({
         </div>
       ) : null}
 
-      <div className="tile">
-        <dt className="eyebrow">Parked intents</dt>
-        <dd className="v-plain">
-          <Pending issue={360} reason="The parked-write queue is not published. Under --cluster-admin-async a write can be accepted and replayed later, but no endpoint reports how many are outstanding." />
-        </dd>
-        <dd className="note">accepted, awaiting replay</dd>
-      </div>
+      {/*
+        Absent entirely for a principal without `fleet.read`, on the same reasoning as the sources
+        tile above: "you may not ask" and "the answer is none" are different facts, and a zero here
+        is the reassuring one.
+      */}
+      {fleet === undefined ? null : (
+        <div className={`tile${(fleet.parkedIntents ?? 0) > 0 ? " is-warn" : ""}`}>
+          <dt className="eyebrow">Parked intents</dt>
+          <dd className="v" data-testid="tile-parked">
+            {fleet.parkedIntents === null ? UNKNOWN : fleet.parkedIntents}
+          </dd>
+          {/*
+            A non-zero depth is coloured because it is the difference between a quiet fleet and one
+            that is behind — the whole reason an operator glances at this tile.
+
+            Three notes for three facts, as the request tile beside it does. A `null` depth is this
+            node failing to read its own queue, which means there is no sum at all; a partial one is
+            a peer not answering, which makes the sum a floor. Reporting either as the other would
+            be worse than reporting neither.
+          */}
+          <dd className="note">
+            {fleet.parkedIntents === null
+              ? "this node could not read its own queue"
+              : fleet.parkedIntentsPartial
+                ? "at least this many — a node did not answer"
+                : "accepted, awaiting replay"}
+          </dd>
+        </div>
+      )}
     </dl>
   );
 }
@@ -417,6 +443,7 @@ export function Imposters(): ReactNode {
           sources={sources.data?.sources}
           maySeeSources={maySeeSources}
           countsArePartial={countsArePartial}
+          fleet={fleet.data}
         />
 
         {mayExport && exporting ? (

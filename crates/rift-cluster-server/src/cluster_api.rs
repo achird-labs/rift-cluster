@@ -256,6 +256,18 @@ pub(crate) fn health_body(node: &RaftNode, readiness: &Readiness) -> serde_json:
         "state": readiness.state().as_str(),
         "pending_gates": readiness.pending(),
         "isolated": node.is_isolated(),
+        // This node's own parked-write backlog (issue #360): writes it accepted under
+        // `--cluster-admin-async` and has not replayed. A magnitude, so a number.
+        //
+        // `null` on a storage error, never `0`. A zero is the reassuring answer — "nothing
+        // outstanding" — and it is the one an operator would act on by not acting; reporting it
+        // because redb could not be read is exactly the wrong-but-quiet failure the error rules
+        // exist to prevent. The read itself must not fail the health probe, which is what
+        // `is_ready` is for.
+        "parked_intents": node
+            .parked_intent_count()
+            .inspect_err(|e| tracing::warn!(error = %e, "health serves without a parked-intent depth"))
+            .ok(),
         "ring": {
             // `m_idx` is an epoch counter — a magnitude, and small. The members are ids; see
             // `node_id` for why those are strings.

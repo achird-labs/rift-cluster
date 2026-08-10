@@ -276,7 +276,12 @@ async fn fleet_projection_matches_the_cluster_port_shapes() {
         // field it *added* is only ever the documented extension below — anything else is caught
         // just as loudly as before.
         let permitted_additions: &[&str] = match fleet_path {
+            // #361: each voter's own applied index, folded here.
             "/_fleet/members" => &["members"],
+            // #360: the parked-write depth summed across voters. `parked_intents` itself is NOT
+            // listed — it is in the shared `health_body`, so both ports carry it and it is not an
+            // addition at all. Only the fleet-wide sum is.
+            "/_fleet/health" => &["parked_intents_fleet"],
             _ => &[],
         };
         let dropped: Vec<&String> = b.iter().filter(|key| !a.contains(key)).collect();

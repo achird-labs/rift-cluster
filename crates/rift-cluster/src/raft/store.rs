@@ -68,7 +68,10 @@ use openraft::{
     SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
 use parking_lot::Mutex;
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDefinition};
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, Table,
+    TableDefinition,
+};
 use rift_cluster_base::seams::{
     ApplyReport, CompiledRoutes, ImposterConfig, ImposterError, ImposterManager, Route, RouteTable,
     Stub, StubResponse,
@@ -1882,6 +1885,33 @@ impl RedbStateMachine {
             crate::metrics::intent_unparked();
         }
         Ok(())
+    }
+
+    /// How many intents are parked, without parsing any of them (issue #360).
+    ///
+    /// Separate from [`parked_intents`](Self::parked_intents) rather than
+    /// `parked_intents()?.len()`, because the two have very different costs and
+    /// this one is on a polled path: the console's queue-depth tile reads it
+    /// every few seconds, from every node in the fleet. Parsing every parked
+    /// `ControlRequest` to arrive at a number would do work proportional to the
+    /// backlog precisely when the backlog is the problem.
+    ///
+    /// The count is the table's, so it includes rows that would not parse.
+    /// That is the honest answer for a *depth*: an unparseable row is still
+    /// work this node accepted and has not retired, and the replay loop's
+    /// decision to drop it is a separate concern from how much is outstanding.
+    #[allow(clippy::result_large_err)]
+    pub fn parked_intent_count(&self) -> StorageResult<u64> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(PENDING_INTENTS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        table
+            .len()
+            .map_err(|e| StorageIOError::read_state_machine(&e).into())
     }
 
     /// Every parked intent, parsed. An entry that no longer parses cannot ever

@@ -1117,6 +1117,17 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// How many intents this node has accepted and not yet retired (issue #360).
+    ///
+    /// The queue depth without the queue: see
+    /// [`RedbStateMachine::parked_intent_count`] for why a polled read must not
+    /// go through [`parked_intents`](Self::parked_intents).
+    pub fn parked_intent_count(&self) -> Result<u64, NodeError> {
+        self.sm_reader
+            .parked_intent_count()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// Every intent this node accepted that has not been retired yet.
     pub fn parked_intents(&self) -> Result<Vec<ControlRequest>, NodeError> {
         self.sm_reader

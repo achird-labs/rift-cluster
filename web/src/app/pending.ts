@@ -44,17 +44,13 @@ export const ISSUE_URL = (issue: number): string =>
  * keeps its own marker — "which key lands on which member" is still unpublished, and still #359.
  */
 
-/**
- * How many writes the fleet has accepted and not yet replayed.
+/*
+ * `parkedIntents()` lived here until #360 published the depth.
  *
- * `--cluster-admin-async` answers `202` the moment a write is parked; #9 built the durable-intent
- * path underneath. Nothing reports the depth of that queue.
- *
- * @see https://github.com/achird-labs/rift-cluster/issues/360
+ * `--cluster-admin-async` answers `202` the moment a write is parked and #9 built the durable path
+ * underneath; what was missing was any report of how much was outstanding. `/_fleet/health` now
+ * sums it across voters, and `FleetView.parkedIntents` carries it.
  */
-export function parkedIntents(): Pending<number> {
-  return pending(360);
-}
 
 /*
  * `peerApplied(nodeId)` lived here until #361 built the projection it was waiting for.

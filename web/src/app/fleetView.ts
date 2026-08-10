@@ -50,6 +50,21 @@ export type FleetView = {
    * show.
    */
   members: Map<string, MemberRow>;
+  /**
+   * Writes the fleet has accepted and not yet replayed (#360), summed across voters.
+   *
+   * `null` when the serving node could not read its own depth — a sum missing an unknown addend is
+   * not a sum, so the field is absent rather than reported as a total that quietly excludes a node.
+   */
+  parkedIntents: number | null;
+  /**
+   * A voter did not answer the health fan-out, so `parkedIntents` is a lower bound (#360).
+   *
+   * Distinct from `parkedIntents === null`, which is this node failing to read its *own* depth and
+   * means there is no sum at all. A floor and a missing answer are different things to tell an
+   * operator, so they are different fields.
+   */
+  parkedIntentsPartial: boolean;
 };
 
 /** One voter's own report, as the members projection carries it (#361). */
@@ -62,7 +77,11 @@ export type MemberRow = {
   reachable: boolean;
 };
 
-export function fleetView(members: FleetMembers, health: FleetHealth): FleetView {
+export function fleetView(
+  members: FleetMembers,
+  health: FleetHealth,
+  healthPartial = false,
+): FleetView {
   const ringMembers = health.ring.members;
   const degraded: Degradation[] = [];
 
@@ -115,6 +134,8 @@ export function fleetView(members: FleetMembers, health: FleetHealth): FleetView
      * contract, so a response without it is a shape the schema permits and every voter simply
      * reads as unknown — which is exactly what this panel showed before #361 published the rows.
      */
+    parkedIntents: health.parked_intents_fleet ?? null,
+    parkedIntentsPartial: healthPartial,
     members: new Map(
       (members.members ?? []).map((row) => [
         row.node_id,

@@ -708,3 +708,91 @@ describe("the control-plane panel's per-voter applied indices (#361)", () => {
     expect((await screen.findByTestId("applied-3")).textContent).toBe("—");
   });
 });
+
+describe("the parked-intent depth tile (#360)", () => {
+  const MEMBERS = {
+    node_id: "1",
+    is_leader: true,
+    current_leader: "1",
+    last_applied: 9,
+    voters: ["1"],
+  };
+  function health(extra: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ready: true,
+      state: "ready",
+      pending_gates: [],
+      isolated: false,
+      ring: { m_idx: 1, members: ["1"] },
+      ...extra,
+    };
+  }
+
+  it("shows the fleet's outstanding depth", async () => {
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/_fleet/members": { json: MEMBERS },
+      "/_fleet/health": { json: health({ parked_intents: 4, parked_intents_fleet: 11 }) },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    await screen.findByText("billing");
+
+    // The fleet sum, not this node's 4 — the label says fleet, so the number must be.
+    expect((await screen.findByTestId("tile-parked")).textContent).toBe("11");
+    expect(screen.getByText(/accepted, awaiting replay/i)).toBeTruthy();
+  });
+
+  /*
+   * A peer that did not answer makes the sum a floor. Reporting `11` under a fleet label when a
+   * node's contribution is missing is the reading an operator would act on — "the backlog is 11"
+   * when it may be far more.
+   */
+  it("says the depth is a floor when a node did not answer", async () => {
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/_fleet/members": { json: MEMBERS },
+      "/_fleet/health": {
+        json: health({ parked_intents: 4, parked_intents_fleet: 11 }),
+        headers: { "rift-cluster-partial": "true" },
+      },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    await screen.findByText("billing");
+
+    expect((await screen.findByTestId("tile-parked")).textContent).toBe("11");
+    expect(screen.getByText(/at least this many/i)).toBeTruthy();
+    expect(screen.queryByText(/accepted, awaiting replay/i)).toBeNull();
+  });
+
+  /*
+   * A missing sum is not a floor and not a zero. This node could not read its own queue, so there
+   * is no total at all — a different thing to tell an operator than "at least this many".
+   */
+  it("shows no depth at all when this node could not read its own queue", async () => {
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/_fleet/members": { json: MEMBERS },
+      "/_fleet/health": { json: health({ parked_intents: null }) },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+    await screen.findByText("billing");
+
+    const tile = await screen.findByTestId("tile-parked");
+    expect(tile.textContent).not.toBe("0");
+    expect(screen.getByText(/could not read its own queue/i)).toBeTruthy();
+  });
+
+  // "You may not ask" and "the answer is none" are different facts, so a principal refused the
+  // fleet read gets no tile rather than a zero.
+  it("omits the tile entirely for a principal without fleet.read", async () => {
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/_fleet/members": { status: 403 },
+      "/_fleet/health": { status: 403 },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("editor") });
+    await screen.findByText("billing");
+
+    expect(screen.queryByTestId("tile-parked")).toBeNull();
+  });
+});
