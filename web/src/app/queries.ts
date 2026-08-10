@@ -77,6 +77,8 @@ type IssuedPrincipal = components["schemas"]["IssuedPrincipal"];
 type Role = components["schemas"]["Role"];
 type SourceRecord = components["schemas"]["SourceRecord"];
 type SourcesNodeLocal = components["schemas"]["SourcesNodeLocal"];
+type FleetRequestPage = components["schemas"]["FleetRequestPage"];
+export type FleetJournalCoverage = components["schemas"]["FleetJournalCoverage"];
 
 /**
  * The tenant is part of every query key, not just the request headers.
@@ -942,74 +944,41 @@ export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { po
  *
  * `combine` folds the results in the query layer so the screen sees one value rather than N.
  */
-/**
- * How many imposters a fleet-wide journal read will fan out to.
- *
- * A cap, because this is N requests on every poll and the request log polls at 2s: a tenant with two
- * hundred imposters would make four hundred requests a second out of one open tab. The screen says
- * when it has capped rather than quietly showing a partial fleet as the whole one.
- */
-export const MERGED_JOURNAL_FANOUT = 25;
-
-/** One recorded request, tagged with the imposter it was read from. */
-export type MergedRequest = {
-  port: number;
-  request: components["schemas"]["RecordedRequest"];
-};
+/** One recorded request, tagged with the imposter and flow it was read from. */
+export type FleetRequestRow = FleetRequestPage["requests"][number];
 
 /**
- * A journal across every imposter, assembled here rather than read.
+ * The fleet-wide request journal — one read (#362), not the N-way client fan-out it replaces.
  *
- * **This is a client-side merge and the screen says so.** There is no fleet-wide journal endpoint
- * (#362); what exists is per-imposter, each already merged across the fleet's writer shards. So this
- * reads N of them and orders the union by each entry's recorded timestamp.
+ * The admin front now does the merge itself: `GET /admin/requests` walks every imposter the
+ * caller's tenant owns and hands back one ordered page, so this hook is a single `apiGet` in the
+ * same shape as `useSources` — no `useQueries`, no per-port cap, no client-side union.
  *
- * That ordering is the part to be honest about. It is not the journal's own order: the timestamps
- * come from whichever node served each request, so clock skew between nodes can transpose two
- * entries recorded within milliseconds of each other. Adjacent rows from different ports are
- * therefore "about this order" rather than a sequence, which is exactly the guarantee the vector
- * cursor gives inside a single imposter's journal and cannot give across several.
+ * `coverage` is carried rather than dropped, same reasoning as `useImposters`' `partial`: the
+ * server may cap how many imposters one page walks (`coverage.capped`/`coverage.omitted`), and a
+ * capped page rendered as the whole fleet is exactly the wrong-but-quiet failure this type exists
+ * to prevent. Ordering is still the part to be honest about even though the merge is now the
+ * server's: rows are ordered by each request's own recorded timestamp, stamped by whichever node
+ * served it, so entries recorded within milliseconds of each other on clock-skewed nodes can still
+ * transpose — `RequestLog.tsx`'s caveat banner says so.
  *
- * A port that fails to read is dropped from the union and counted, not silently omitted — the screen
- * reports it, because a short journal that looks complete is the failure mode worth preventing.
+ * The wire order is oldest-first, same as the per-imposter journal it merges (openapi-ee.yaml's
+ * `savedRequests` description) — the right convention for a resumable cursor walk, and the wrong
+ * one for a screen an operator reads top-down. Reversed here, once, rather than in the screen, so
+ * every caller of this hook sees the newest-first order the log has always shown.
  */
-export function useAllRequests(ports: readonly number[]): {
-  rows: MergedRequest[];
-  pending: boolean;
-  failed: number;
-  capped: number;
-} {
+export function useFleetRequests(): UseQueryResult<{
+  rows: FleetRequestRow[];
+  coverage: FleetJournalCoverage;
+}> {
   const { tenant } = useSession();
-  const read = ports.slice(0, MERGED_JOURNAL_FANOUT);
-
-  return useQueries({
-    queries: read.map((port) => ({
-      queryKey: key(["merged-requests", port], tenant),
-      queryFn: async (): Promise<MergedRequest[]> => {
-        const body = await apiGet<unknown>(requestsPath(port), { tenant });
-        const list = Array.isArray(body)
-          ? body
-          : ((body as { requests?: unknown }).requests ?? []);
-        return (Array.isArray(list) ? list : []).map((request) => ({
-          port,
-          request: request as components["schemas"]["RecordedRequest"],
-        }));
-      },
-      ...POLLED,
-    })),
-    combine: (results) => ({
-      rows: results
-        .flatMap((result) => result.data ?? [])
-        /*
-         * Newest first, and `localeCompare` on the RFC 3339 string rather than `Date.parse`:
-         * the format sorts lexicographically when the offset matches, and parsing would turn an
-         * unexpected value into `NaN`, which sorts unpredictably rather than visibly.
-         */
-        .sort((a, b) => String(b.request.timestamp ?? "").localeCompare(String(a.request.timestamp ?? ""))),
-      pending: results.some((result) => result.isPending),
-      failed: results.filter((result) => result.isError).length,
-      capped: Math.max(0, ports.length - read.length),
-    }),
+  return useQuery({
+    queryKey: key(["fleet-requests"], tenant),
+    queryFn: async () => {
+      const page = await apiGet<FleetRequestPage>(API_PATHS.fleetRequests, { tenant });
+      return { rows: [...page.requests].reverse(), coverage: page.coverage };
+    },
+    ...POLLED,
   });
 }
 

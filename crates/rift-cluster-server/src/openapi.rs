@@ -407,6 +407,8 @@ mod parity {
             Terminated::SetEnabled(4545, false),
             Terminated::ReadSavedRequests(4545),
             Terminated::StreamSavedRequests(4545),
+            Terminated::ReadFleetRequests,
+            Terminated::StreamFleetRequests,
             Terminated::ClearSavedRequests(4545),
             Terminated::ClearSavedProxyResponses(4545),
             Terminated::SpaceTeardown(4545, "flow-1".to_owned()),

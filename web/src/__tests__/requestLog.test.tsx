@@ -1192,9 +1192,135 @@ describe("#250 — turning a request into a stub", () => {
   });
 });
 
+const FLEET_REQUESTS = "/admin/requests";
+
+/** One `FleetRequestPage`, from `#362`'s merged endpoint — the shape `useFleetRequests` reads. */
+function fleetPage(
+  rows: { port: number; request: Record<string, unknown> }[],
+  coverage: Record<string, unknown> = { covered: [PORT], total: 1, omitted: [], capped: false },
+): Record<string, unknown> {
+  return {
+    requests: rows.map(({ port, request }) => ({ port, flowId: "default", request })),
+    cursor: "tok",
+    coverage,
+    joined: rows.map(({ port }) => port),
+  };
+}
+
+describe("the fleet journal is one read, not a fan-out (#362)", () => {
+  // Three imposters, so a regression to the old per-port fan-out would be visible as three reads
+  // rather than one — the acceptance criterion this epic exists to close.
+  const THREE_IMPOSTERS = {
+    ...SINGLE_NODE,
+    "/imposters": {
+      json: {
+        imposters: [
+          { port: 4545, name: "payments", protocol: "http" },
+          { port: 4546, name: "billing", protocol: "http" },
+          { port: 4547, name: "shipping", protocol: "http" },
+        ],
+      },
+    },
+  };
+
+  it("issues exactly one request to the merged endpoint, never one per imposter", async () => {
+    const { requests } = stubFetch({
+      ...THREE_IMPOSTERS,
+      [FLEET_REQUESTS]: {
+        json: fleetPage([{ port: 4545, request: recorded() }], {
+          covered: [4545, 4546, 4547],
+          total: 3,
+          omitted: [],
+          capped: false,
+        }),
+      },
+    });
+    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+
+    await screen.findByTestId("merged-request-row");
+
+    const journalReads = requests.filter((sent) => sent.path.split("?")[0] === FLEET_REQUESTS);
+    expect(journalReads.length).toBe(1);
+    // And no per-port fallback alongside it — the fan-out this replaces.
+    expect(requests.some((sent) => sent.path.startsWith("/imposters/4545/requests"))).toBe(false);
+    expect(requests.some((sent) => sent.path.startsWith("/imposters/4546/requests"))).toBe(false);
+    expect(requests.some((sent) => sent.path.startsWith("/imposters/4547/requests"))).toBe(false);
+  });
+
+  // The wire order is oldest-first (openapi-ee.yaml's `savedRequests` convention, which the merge
+  // preserves); the screen's own label says "newest first". A pass-through here would silently make
+  // that label false and show the log upside down.
+  it("renders newest first even though the server answers oldest first", async () => {
+    const ONE_IMPOSTER = {
+      ...SINGLE_NODE,
+      "/imposters": { json: { imposters: [{ port: PORT, name: "payments", protocol: "http" }] } },
+    };
+    stubFetch({
+      ...ONE_IMPOSTER,
+      [FLEET_REQUESTS]: {
+        json: fleetPage([
+          { port: PORT, request: recorded({ path: "/v1/oldest", timestamp: "2026-07-31T10:00:00Z" }) },
+          { port: PORT, request: recorded({ path: "/v1/newest", timestamp: "2026-07-31T10:00:09Z" }) },
+        ]),
+      },
+    });
+    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+
+    const rows = await screen.findAllByTestId("merged-request-row");
+    expect(rows.length).toBe(2);
+    expect(rows[0]?.textContent).toContain("/v1/newest");
+    expect(rows[1]?.textContent).toContain("/v1/oldest");
+  });
+});
+
+describe("the coverage cap banner reflects the server's coverage block (#362)", () => {
+  const ONE_IMPOSTER = {
+    ...SINGLE_NODE,
+    "/imposters": { json: { imposters: [{ port: PORT, name: "payments", protocol: "http" }] } },
+  };
+
+  it("shows the banner and names the omitted ports when coverage.capped is true", async () => {
+    stubFetch({
+      ...ONE_IMPOSTER,
+      [FLEET_REQUESTS]: {
+        json: fleetPage([{ port: PORT, request: recorded() }], {
+          covered: [PORT],
+          total: 101,
+          omitted: [4600, 4601],
+          capped: true,
+        }),
+      },
+    });
+    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+
+    const banner = await screen.findByTestId("merged-journal-partial");
+    expect(banner.textContent).toMatch(/2 of 101/);
+    expect(banner.textContent).toContain("4600");
+    expect(banner.textContent).toContain("4601");
+  });
+
+  it("shows no cap banner when coverage.capped is false, however many are covered", async () => {
+    stubFetch({
+      ...ONE_IMPOSTER,
+      [FLEET_REQUESTS]: {
+        json: fleetPage([{ port: PORT, request: recorded() }], {
+          covered: [PORT],
+          total: 1,
+          omitted: [],
+          capped: false,
+        }),
+      },
+    });
+    renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
+
+    await screen.findByTestId("merged-request-row");
+    expect(screen.queryByTestId("merged-journal-partial")).toBeNull();
+  });
+});
+
 describe("the fleet journal's node, status and latency columns (#364)", () => {
   // The merged journal reads every imposter the tenant has, so the fixture needs the listing as
-  // well as the per-port traffic.
+  // well as the fleet-wide traffic.
   const FLEET_JOURNAL = {
     ...SINGLE_NODE,
     "/imposters": { json: { imposters: [{ port: PORT, name: "payments", protocol: "http" }] } },
@@ -1211,8 +1337,8 @@ describe("the fleet journal's node, status and latency columns (#364)", () => {
   it("renders the three columns the engine now records", async () => {
     stubFetch({
       ...FLEET_JOURNAL,
-      [REQUESTS]: {
-        json: [recorded({ node: "rift-7", status: 503, latencyMs: 42 })],
+      [FLEET_REQUESTS]: {
+        json: fleetPage([{ port: PORT, request: recorded({ node: "rift-7", status: 503, latencyMs: 42 }) }]),
       },
     });
     renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
@@ -1229,7 +1355,10 @@ describe("the fleet journal's node, status and latency columns (#364)", () => {
    * rendering a status would invent one outright.
    */
   it("does not invent an outcome the engine never recorded", async () => {
-    stubFetch({ ...FLEET_JOURNAL, [REQUESTS]: { json: [recorded()] } });
+    stubFetch({
+      ...FLEET_JOURNAL,
+      [FLEET_REQUESTS]: { json: fleetPage([{ port: PORT, request: recorded() }]) },
+    });
     renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
 
     expect((await screen.findByTestId("merged-cell-node")).textContent).toBe("\u2014");
@@ -1242,7 +1371,9 @@ describe("the fleet journal's node, status and latency columns (#364)", () => {
   it("renders a zero latency as a measurement, not as absence", async () => {
     stubFetch({
       ...FLEET_JOURNAL,
-      [REQUESTS]: { json: [recorded({ node: "rift-1", status: 200, latencyMs: 0 })] },
+      [FLEET_REQUESTS]: {
+        json: fleetPage([{ port: PORT, request: recorded({ node: "rift-1", status: 200, latencyMs: 0 }) }]),
+      },
     });
     renderInApp(<RequestLog port={null} />, { whoami: whoamiWith("fleet-admin") });
 

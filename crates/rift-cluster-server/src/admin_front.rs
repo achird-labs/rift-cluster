@@ -2736,6 +2736,11 @@ async fn terminate_read_saved_requests(
 /// `tenant_owned_ports` on this node's applied state, so a port another tenant owns is never in the
 /// walk at all. That is why neither route needs the per-port ownership gate `addressed_port` gives
 /// a single-imposter route — see `Terminated::ReadFleetRequests`.
+///
+/// Carries `tenant_owned_ports`' own `result_large_err` allow, and for its reason: the error *is* a
+/// built `Response`, which is the whole point — a refusal here is already the answer to send, not a
+/// code some caller has to re-render.
+#[allow(clippy::result_large_err)]
 fn fleet_ports(
     state: &Arc<FrontState>,
     tenant: &TenantId,
@@ -2829,22 +2834,23 @@ fn terminate_read_fleet_requests(
     });
 
     match serde_json::to_vec(&body) {
-        Ok(bytes) => match buffered_response(StatusCode::OK, Bytes::from(bytes), json_content_type())
-        {
-            Ok(mut response) => {
-                // The same three headers the per-imposter read sets, meaning the same three things
-                // — so a client that already understands one read understands this one.
-                set_header(&mut response, HEADER_NEXT_INDEX, &page.next.encode());
-                if page.truncated {
-                    set_header(&mut response, HEADER_TRUNCATED, "true");
+        Ok(bytes) => {
+            match buffered_response(StatusCode::OK, Bytes::from(bytes), json_content_type()) {
+                Ok(mut response) => {
+                    // The same three headers the per-imposter read sets, meaning the same three things
+                    // — so a client that already understands one read understands this one.
+                    set_header(&mut response, HEADER_NEXT_INDEX, &page.next.encode());
+                    if page.truncated {
+                        set_header(&mut response, HEADER_TRUNCATED, "true");
+                    }
+                    if page.partial {
+                        set_header(&mut response, HEADER_PARTIAL, "true");
+                    }
+                    response
                 }
-                if page.partial {
-                    set_header(&mut response, HEADER_PARTIAL, "true");
-                }
-                response
+                Err(response) => response,
             }
-            Err(response) => response,
-        },
+        }
         // Fails closed like the per-imposter read: a body this node cannot encode must not become a
         // 200 with nothing in it, which reads as "no requests ever recorded".
         Err(e) => internal(&format!("encoding the fleet journal read: {e}")),
@@ -3290,7 +3296,9 @@ fn terminate_stream_fleet_requests(
         .body(body.boxed())
     {
         Ok(response) => response,
-        Err(e) => internal(&format!("building the fleet savedRequests stream response: {e}")),
+        Err(e) => internal(&format!(
+            "building the fleet savedRequests stream response: {e}"
+        )),
     }
 }
 
@@ -6183,7 +6191,10 @@ mod tests {
     /// policy wants that.
     #[test]
     fn the_fleet_journal_is_an_ordinary_imposter_read() {
-        assert_eq!(action_for(&Terminated::ReadFleetRequests), Action::ImposterRead);
+        assert_eq!(
+            action_for(&Terminated::ReadFleetRequests),
+            Action::ImposterRead
+        );
         assert_eq!(
             action_for(&Terminated::StreamFleetRequests),
             Action::ImposterRead
@@ -6579,7 +6590,9 @@ mod tests {
         assert_eq!(page["coverage"]["total"], 0);
         assert_eq!(page["coverage"]["capped"], false);
         assert!(
-            page["cursor"].as_str().is_some_and(|token| !token.is_empty()),
+            page["cursor"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty()),
             "even an empty page hands back a resumable position: {body}"
         );
         assert!(

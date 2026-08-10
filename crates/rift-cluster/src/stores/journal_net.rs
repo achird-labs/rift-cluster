@@ -3680,7 +3680,13 @@ mod tests {
                 ),
             ];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
 
             assert_eq!(
                 emitted(&page),
@@ -3712,7 +3718,13 @@ mod tests {
                         A,
                         vec![
                             entry_at(A, 1, 0, req_at("2026-01-01T00:00:09Z", "/late-low-seq"), 0),
-                            entry_at(A, 2, 0, req_at("2026-01-01T00:00:01Z", "/early-high-seq"), 0),
+                            entry_at(
+                                A,
+                                2,
+                                0,
+                                req_at("2026-01-01T00:00:01Z", "/early-high-seq"),
+                                0,
+                            ),
                         ],
                     )],
                 ),
@@ -3720,12 +3732,24 @@ mod tests {
                     4546,
                     vec![slice(
                         A,
-                        vec![entry_at(A, 1, 0, req_at("2026-01-01T00:00:05Z", "/middle"), 0)],
+                        vec![entry_at(
+                            A,
+                            1,
+                            0,
+                            req_at("2026-01-01T00:00:05Z", "/middle"),
+                            0,
+                        )],
                     )],
                 ),
             ];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
 
             // Within 4545 the two entries stay in **seq** order (1 then 2) even though their
             // timestamps are inverted — that is the per-shard guarantee, and it is what makes the
@@ -3789,7 +3813,13 @@ mod tests {
                     )],
                 ),
             ];
-            let first = fleet_merge(first_round, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
+            let first = fleet_merge(
+                first_round,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
             assert_eq!(emitted(&first), vec![(4545, "/a1"), (4546, "/b1")]);
 
             // The same shards, now with one more entry each.
@@ -3860,7 +3890,13 @@ mod tests {
                 ]
             };
 
-            let page = fleet_merge(shards(), Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
+            let page = fleet_merge(
+                shards(),
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
             assert_eq!(
                 emitted(&page),
                 vec![(4545, "/a1"), (4546, "/b1"), (4545, "/a2"), (4546, "/b2")]
@@ -3872,7 +3908,13 @@ mod tests {
                 .clone()
                 .expect("PerEvent folds a token onto every event");
 
-            let resumed = fleet_merge(shards(), Vec::new(), Some(&interrupted), JoinMode::Replay, IdPolicy::PerEvent);
+            let resumed = fleet_merge(
+                shards(),
+                Vec::new(),
+                Some(&interrupted),
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
 
             assert_eq!(
                 emitted(&resumed),
@@ -3892,7 +3934,13 @@ mod tests {
                 )],
             )];
 
-            let page = fleet_merge(covered, vec![4546, 4547], None, JoinMode::Replay, IdPolicy::PerEvent);
+            let page = fleet_merge(
+                covered,
+                vec![4546, 4547],
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
 
             assert_eq!(page.coverage.covered, vec![4545]);
             assert_eq!(
@@ -3918,7 +3966,13 @@ mod tests {
                 )],
             )];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Live, IdPolicy::PerEvent);
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Live,
+                IdPolicy::PerEvent,
+            );
 
             assert!(
                 page.events.is_empty(),
@@ -3947,7 +4001,13 @@ mod tests {
                 )],
             )];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
 
             assert_eq!(emitted(&page), vec![(4545, "/old")]);
             assert_eq!(
@@ -4004,7 +4064,10 @@ mod tests {
             );
 
             assert!(page.partial, "one short port makes the page short");
-            assert!(page.truncated, "one truncated port makes the page truncated");
+            assert!(
+                page.truncated,
+                "one truncated port makes the page truncated"
+            );
         }
 
         /// A port that has left coverage loses its row: the token stays bounded by the cap rather
@@ -4073,7 +4136,13 @@ mod tests {
                 )],
             )];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
 
             let last = page.events.last().expect("two entries were emitted");
             assert_eq!(last.id.as_ref(), Some(&page.next));
@@ -4179,7 +4248,13 @@ mod tests {
                 )],
             )];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PageOnly);
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PageOnly,
+            );
 
             assert_eq!(emitted(&page), vec![(4545, "/a1"), (4545, "/a2")]);
             assert!(

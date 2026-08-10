@@ -418,9 +418,17 @@ struct FleetPayload {
     scope: String,
     /// The node table every port's positions index into.
     nodes: Vec<NodeId>,
-    /// `(port, generation, [(node index, position)])`, ports ascending.
-    ports: Vec<(u16, u64, Vec<(u32, u64)>)>,
+    /// Every covered port's row, ports ascending.
+    ports: Vec<PortRow>,
 }
+
+/// One port's position on the wire: `(port, that port's clear generation, [(index into
+/// [`FleetPayload::nodes`], consumed seq)])`.
+///
+/// Named rather than written inline because it appears in three places and reads as noise in all of
+/// them — and because the node **index** is the whole point of the compact encoding, which a bare
+/// `u32` in a nest of tuples does not convey.
+type PortRow = (u16, u64, Vec<(u32, u64)>);
 
 /// The only fleet payload version this build reads — its own namespace, independent of
 /// [`CURSOR_TOKEN_VERSION`]. The two formats version separately because they change for different
@@ -551,13 +559,14 @@ impl FleetCursor {
             for (index, seq) in positions {
                 // An index outside the table is a corrupt token, not a position to guess at:
                 // silently dropping the row would rewind that shard to 0 and replay its history.
-                let node = payload
-                    .nodes
-                    .get(index as usize)
-                    .copied()
-                    .ok_or(CursorError::Corrupt(
-                        "a port position names a node outside the token's node table",
-                    ))?;
+                let node =
+                    payload
+                        .nodes
+                        .get(index as usize)
+                        .copied()
+                        .ok_or(CursorError::Corrupt(
+                            "a port position names a node outside the token's node table",
+                        ))?;
                 pos.insert(node, seq);
             }
             ports.insert(port, JournalCursor { generation, pos });
@@ -980,9 +989,7 @@ impl ClusterJournal {
     pub(crate) fn newest_timestamp(&self, port: u16) -> Option<String> {
         let shard = Arc::clone(self.ports.read().get(&port)?);
         let entries = shard.entries.read();
-        entries
-            .back()
-            .map(|entry| entry.request.timestamp.clone())
+        entries.back().map(|entry| entry.request.timestamp.clone())
     }
 
     fn shard(&self, port: u16) -> Arc<PortShard> {
@@ -1847,7 +1854,10 @@ mod tests {
 
     // ---- issue #362: the fleet cursor's own codec ------------------------------------
 
-    fn fleet_of(rows: &[(u16, u64, &[(NodeId, u64)])]) -> FleetCursor {
+    /// `(port, generation, [(node, position)])` — the test-side spelling of one port's row.
+    type Row<'a> = (u16, u64, &'a [(NodeId, u64)]);
+
+    fn fleet_of(rows: &[Row<'_>]) -> FleetCursor {
         let mut ports = BTreeMap::new();
         for (port, generation, positions) in rows {
             ports.insert(
@@ -2016,22 +2026,17 @@ mod tests {
     /// the constraint that drove the compact node-table encoding in the first place.
     #[test]
     fn a_full_cap_fleet_token_fits_in_a_header_line() {
-        let rows: Vec<(u16, u64, Vec<(NodeId, u64)>)> = (0..100u16)
-            .map(|i| {
-                (
-                    4000 + i,
-                    u64::from(i),
-                    vec![(1, 4_000_000_000), (2, 4_000_000_001), (7, 4_000_000_002)],
-                )
-            })
-            .collect();
         let mut ports = BTreeMap::new();
-        for (port, generation, positions) in &rows {
+        for i in 0..100u16 {
             ports.insert(
-                *port,
+                4000 + i,
                 JournalCursor {
-                    generation: *generation,
-                    pos: positions.iter().copied().collect(),
+                    generation: u64::from(i),
+                    // Deliberately large seqs: a token has to fit at realistic positions, not just
+                    // at the small numbers a fresh fixture would produce.
+                    pos: [(1, 4_000_000_000), (2, 4_000_000_001), (7, 4_000_000_002)]
+                        .into_iter()
+                        .collect(),
                 },
             );
         }
