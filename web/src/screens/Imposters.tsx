@@ -70,26 +70,32 @@ type SourceRecord = components["schemas"]["SourceRecord"];
 /**
  * The screen's four tiles.
  *
- * Two of them are real and two are markers, and the split is the whole point of building it this
+ * Three of them are real and one is a marker, and the split is the whole point of building it this
  * way rather than filling all four with plausible numbers:
  *
  * - **Imposters / stubs** — counted from the list this screen already holds.
  * - **Sources / drifted** — counted from `/admin/sources`, the same read the provenance filter uses.
  *   Absent entirely for a principal without `source.read`, rather than shown as zero: "you may not
  *   ask" and "the answer is none" are different facts.
- * - **Requests · fleet sum** — `numberOfRequests` reaches the imposter body only through a
- *   non-exhaustive index signature, which is exactly the client-side guess `contract.ts` was written
- *   to refuse. Summing it here would launder a value the contract rejects one file away.
- * - **Parked intents** — no endpoint publishes the parked-write queue at all.
+ * - **Requests · fleet sum** — real since #363 declared `numberOfRequests` on the contract. It had
+ *   reached the imposter body only through a non-exhaustive index signature, which is exactly the
+ *   client-side guess `contract.ts` refuses, so summing it here would have laundered a value the
+ *   contract rejected one file away. The tile is genuinely fleet-wide (#223 rewrites each entry to
+ *   the sum across every node's slot) and says so — or says it is a floor, when `countsArePartial`
+ *   reports that the fan-out missed a node.
+ * - **Parked intents** — no endpoint publishes the parked-write queue at all (#360).
  */
 function ImposterTiles({
   imposters,
   sources,
   maySeeSources,
+  countsArePartial,
 }: {
   imposters: readonly Imposter[];
   sources: readonly SourceRecord[] | undefined;
   maySeeSources: boolean;
+  /** The fleet sum could not reach every node, so it is a floor rather than a total (#363). */
+  countsArePartial: boolean;
 }): ReactNode {
   /*
    * `stubCountOf`, not `stubs?.length`. The list projection omits the stub array and sends
@@ -101,6 +107,16 @@ function ImposterTiles({
   const counts = imposters.map((imposter) => stubCountOf(imposter));
   const stubTotal = counts.every((n) => n !== null)
     ? counts.reduce((sum: number, n) => sum + (n ?? 0), 0)
+    : null;
+  /*
+   * Same discipline as `stubTotal` above, for the same reason (#363). `numberOfRequests` is
+   * optional in the contract, so a row without one has an *unknown* count — not a zero — and
+   * adding zero for it would quietly understate the fleet total while looking like an answer.
+   * The sum is therefore only shown when every row answered.
+   */
+  const requestCounts = imposters.map((imposter) => imposter.numberOfRequests);
+  const requestTotal = requestCounts.every((n) => n !== undefined)
+    ? requestCounts.reduce((sum: number, n) => sum + (n ?? 0), 0)
     : null;
   const drifted = sources?.filter((source) => source.drifted === true).length ?? 0;
 
@@ -114,12 +130,27 @@ function ImposterTiles({
         </dd>
       </div>
 
-      <div className="tile">
+      <div className={`tile${countsArePartial ? " is-warn" : ""}`}>
         <dt className="eyebrow">Requests · fleet sum</dt>
-        <dd className="v-plain">
-          <Pending issue={363} reason="No schema'd field carries a request count on the imposter list. `numberOfRequests` arrives only through the body's non-exhaustive index signature, which app/contract.ts refuses on purpose." />
+        <dd className="v" data-testid="tile-requests">
+          {requestTotal === null ? UNKNOWN : requestTotal}
         </dd>
-        <dd className="note">counted per imposter on the request log</dd>
+        {/*
+          Three different notes for three different facts, because collapsing them is how a floor
+          gets read as a total.
+
+          `countsArePartial` is per-response and says the fan-out missed a node, so the number
+          under it is a lower bound. It is not a permanent caveat: a complete merge says nothing,
+          on the same reasoning the request log's scope strip records — a warning that is always
+          on is one nobody reads on the day it means something.
+        */}
+        <dd className="note">
+          {requestTotal === null
+            ? "not every imposter in this response carried a count"
+            : countsArePartial
+              ? "at least this many — a node did not answer in time"
+              : "summed across every node"}
+        </dd>
       </div>
 
       {maySeeSources ? (
@@ -173,6 +204,12 @@ function errorText(error: unknown): string {
 export function Imposters(): ReactNode {
   const { can, tenant } = useSession();
   const imposters = useImposters();
+  /*
+   * Unwrapped once. The read carries two facts with different scopes (#363) — the rows, and
+   * whether the fleet sum on them is complete — so every use below names which one it means.
+   */
+  const listed = imposters.data?.imposters ?? [];
+  const countsArePartial = imposters.data?.partial ?? false;
   const create = useCreateImposter();
   const remove = useDeleteImposter();
   const [creating, setCreating] = useState(false);
@@ -204,7 +241,7 @@ export function Imposters(): ReactNode {
    */
   const mayReplace = mayDelete;
   const mayClear = can("requests.clear");
-  const existingPorts = imposters.data?.flatMap((i) => (i.port === undefined ? [] : [i.port])) ?? [];
+  const existingPorts = listed.flatMap((i) => (i.port === undefined ? [] : [i.port]));
 
   // ── Filter, sort, selection ───────────────────────────────────────────────
   // The query lives in the URL so a filtered view is linkable and survives a reload; the screen
@@ -224,7 +261,7 @@ export function Imposters(): ReactNode {
   const sourceOwned = sourceOwnedPorts(sources.data?.sources);
   const drifted = driftedPorts(sources.data?.sources);
 
-  const all = imposters.data ?? [];
+  const all = listed;
   const rows = visibleImposters(all, query, sourceOwned, drifted);
   const unclassified = unclassifiedCount(all, query, sourceOwned);
 
@@ -379,6 +416,7 @@ export function Imposters(): ReactNode {
           imposters={all}
           sources={sources.data?.sources}
           maySeeSources={maySeeSources}
+          countsArePartial={countsArePartial}
         />
 
         {mayExport && exporting ? (
@@ -388,7 +426,7 @@ export function Imposters(): ReactNode {
         {importing ? (
           <ImportPanel
             existingPorts={existingPorts}
-            existingCount={imposters.data?.length ?? 0}
+            existingCount={listed.length}
             mayWrite={mayCreate}
             mayReplace={mayReplace}
             onClose={() => setImporting(false)}
@@ -456,14 +494,14 @@ export function Imposters(): ReactNode {
 
         {imposters.isPending ? <p className="muted">Reading…</p> : null}
 
-        {imposters.isSuccess && imposters.data.length === 0 ? (
+        {imposters.isSuccess && listed.length === 0 ? (
           <EmptyState
             uncertain={confidence.partial || confidence.unknown}
             reason={confidence.reason}
           />
         ) : null}
 
-        {imposters.isSuccess && imposters.data.length > 0 ? (
+        {imposters.isSuccess && listed.length > 0 ? (
           <Card title="Imposters" bleed>
             <ImposterFilters
               query={query}

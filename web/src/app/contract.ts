@@ -32,16 +32,18 @@ export type ImposterColumn = {
  * `key` being `keyof Declared<Imposter>` is load-bearing: a column for a field the contract does
  * not publish fails `tsc`, and there is no second place to add one.
  *
- * `numberOfRequests` — the prototype's one chart — is deliberately absent. It reaches the body only
- * through the non-exhaustive index signature, so rendering it would be exactly the client-side
- * guess §11 forbids. Its home is the request log (#189), whose backend carries it as a schema'd
- * field.
+ * `numberOfRequests` was deliberately absent until #363: it reached the body only through the
+ * non-exhaustive index signature, so rendering it would have been exactly the client-side guess
+ * §11 forbids. It is a declared field now, and therefore a column. What it is *not* is this node's
+ * tally — the front rewrites it to the fleet sum (#223), which is why the tile above the table can
+ * call itself one.
  */
 export const IMPOSTER_COLUMNS = [
   { key: "port", label: "Port", numeric: true },
   { key: "protocol", label: "Protocol", numeric: false },
   { key: "name", label: "Name", numeric: false },
   { key: "stubs", label: "Stubs", numeric: true },
+  { key: "numberOfRequests", label: "Requests", numeric: true },
   { key: "recordRequests", label: "Recording", numeric: false },
   { key: "enabled", label: "State", numeric: false },
   // `as const` keeps the keys as literals, which is what lets `ImposterField`'s `assertNever`

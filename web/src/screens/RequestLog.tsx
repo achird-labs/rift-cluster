@@ -841,11 +841,11 @@ function formatQuery(query: Record<string, string> | undefined): string {
  */
 function MergedJournal(): ReactNode {
   const imposters = useImposters();
-  const ports = (imposters.data ?? []).flatMap((imposter) =>
+  const ports = (imposters.data?.imposters ?? []).flatMap((imposter) =>
     imposter.port === undefined ? [] : [imposter.port],
   );
   const named = new Map(
-    (imposters.data ?? []).map((imposter) => [imposter.port, imposter.name] as const),
+    (imposters.data?.imposters ?? []).map((imposter) => [imposter.port, imposter.name] as const),
   );
   const { rows, pending, failed, capped } = useAllRequests(ports);
 

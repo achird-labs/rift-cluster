@@ -89,15 +89,30 @@ function key(parts: readonly unknown[], tenant: string | null): unknown[] {
   return [...parts, { tenant }];
 }
 
-export function useImposters(): UseQueryResult<Imposter[]> {
+/**
+ * The tenant's imposters, and whether the fleet sum on them is complete.
+ *
+ * `partial` is carried rather than dropped because `numberOfRequests` is a **fleet** figure
+ * (issue #363): the front rewrites each entry's count to the sum across every node's slot for that
+ * port, and stamps `Rift-Cluster-Partial` when a peer could not be reached inside the fan-out
+ * budget. The sum is then a floor, not a total — and a floor presented as a total is the reading an
+ * operator would act on.
+ *
+ * Shaped like `useSources` rather than merged into the array: the two facts have different scopes,
+ * and a caller that does not care about coverage should have to ignore it explicitly rather than
+ * never learn it exists.
+ */
+export type ImposterList = { imposters: Imposter[]; partial: boolean };
+
+export function useImposters(): UseQueryResult<ImposterList> {
   const { tenant } = useSession();
   return useQuery({
     queryKey: key(["imposters"], tenant),
-    queryFn: async () => {
-      const body = await apiGet<{ imposters?: Imposter[] }>(API_PATHS.imposters, { tenant });
+    queryFn: async (): Promise<ImposterList> => {
+      const read = await apiGetMerged<{ imposters?: Imposter[] }>(API_PATHS.imposters, { tenant });
       // `imposters` is optional in the contract, so an absent array is a shape the schema permits —
       // a domain-optional read, not a swallowed failure. A non-2xx has already thrown in `client`.
-      return body.imposters ?? [];
+      return { imposters: read.data.imposters ?? [], partial: read.partial };
     },
     ...POLLED,
   });
