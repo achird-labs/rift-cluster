@@ -2800,6 +2800,138 @@ paths:
           $ref: '#/components/responses/WriteTimeout'
 
   # ---------------------------------------------------------------------
+  # ee: the fleet request journal (issue #362) — the tenant's whole journal
+  # as one merged, cursor-exact read, and its live sibling. Replaces a
+  # client-side fan-out that read N imposters per poll and merged them in
+  # the browser.
+  # ---------------------------------------------------------------------
+  /admin/requests:
+    get:
+      operationId: readFleetRequests
+      summary: The tenant's recorded requests across every imposter, merged and resumable
+      description: >
+        Terminates. `GET /imposters/{port}/savedRequests` across every imposter the caller's
+        tenant owns, merged server-side into one ordered, resumable answer.
+
+        **Ordering is the journal's, not the network's.** Rows are ordered by each request's own
+        recorded timestamp. That timestamp is stamped by whichever node served the request, so
+        entries recorded within milliseconds of each other on clock-skewed nodes can still
+        transpose — there is no fleet-wide sequence and this endpoint does not invent one. What
+        it removes is the *other* source of disorder: assembling this view client-side ordered
+        rows by which of N responses arrived first.
+
+        **One cursor, not N.** `cursor` in the response is a single opaque token covering every
+        port this answer covers; pass it back as `since` for the next page. Within the covered
+        set the walk is gapless and duplicate-free per shard, exactly as the per-imposter cursor
+        is. A per-imposter token presented here is refused with a `400` that says so, rather
+        than misread as a fleet position.
+
+        **The cap is stated.** A tenant may own more imposters than one answer covers. Coverage
+        ranks ports by most recent activity and keeps `--cluster-fleet-journal-port-cap` of them
+        (default 100); `coverage.omitted` names every port left out and `coverage.capped` says
+        whether the cap bit at all. Nothing is dropped silently.
+
+        **`joined`** names covered ports that had no position in the presented cursor and whose
+        history was therefore replayed — the ports a resuming client may see duplicates from.
+        On a baseline read (no `since`) that is every covered port, by definition.
+
+        No `match` parameter: the merge path evaluates no predicates, so a predicate-scoped
+        fleet read would answer with the whole tenant's requests instead of the caller's subset.
+        Predicate-scoped reads stay per-imposter.
+
+        Authorized as the ordinary `imposter.read` under `X-Rift-Tenant`. It needs no FleetAdmin
+        gate — unlike `GET /events`, whose payload spans every tenant — because its port set is
+        the caller's tenant's own imposters and nothing else can enter the walk.
+      tags: [imposters]
+      x-rift-origin: ee
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: >
+            A cursor token from a previous answer's `cursor` field or `x-rift-next-index`
+            header. Absent means a baseline read: every covered port's retained history.
+            Malformed, wrong-scope and unknown-version tokens are all refused with `400` rather
+            than defaulted — defaulting would either replay the whole journal or silently skip
+            everything recorded since the token went stale.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The merged page, its resumption cursor, and its stated coverage.
+          headers:
+            x-rift-next-index:
+              description: The same token as the body's `cursor`, for parity with the per-imposter read.
+              schema:
+                type: string
+            x-rift-truncated:
+              description: Retention dropped entries this reader had not reached, on at least one covered port.
+              schema:
+                type: boolean
+            Rift-Cluster-Partial:
+              description: >
+                At least one covered port's merged view is short — a peer was unreachable, or a
+                crash-restarted writer's entries are gone. Never set by a coverage omission,
+                which is a different fact and is reported in `coverage`.
+              schema:
+                type: boolean
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetRequestPage'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/requests/stream:
+    get:
+      operationId: streamFleetRequests
+      summary: Live tail of the tenant's recorded requests across every imposter (SSE)
+      description: >
+        The live sibling of `GET /admin/requests`, and the fleet-wide counterpart of
+        `GET /imposters/{port}/savedRequests/stream`. Answers `text/event-stream`.
+
+        Every property that route documents holds here, for the same reasons and with the same
+        token vocabulary: one contract shared with the cursor read, `Last-Event-ID` resuming
+        gaplessly and without duplicates per shard, and a declared `clusterTailLatencyMs`
+        bounding how late a peer's entry can arrive.
+
+        **Events.** `hello` first, carrying `engineVersion`, `types` (always `["requests"]`),
+        `scope` (always `"fleet"`), `clusterTailLatencyMs`, `cursor`, and `coverage`. Then
+        `request` events whose `data` is `{port, flowId, request}`, plus `index` **only** for
+        entries this node wrote. `coverage` whenever the covered set changes — the cap is
+        dynamic, so a client whose view narrowed or widened is told rather than left to guess.
+        `lagged` when retention evicted entries this reader had not reached. `partial` on every
+        transition of the degraded state. `: ping` every 15 s.
+
+        **A connect never replays**, per port: a port entering coverage — at connect or later —
+        starts from its current position and emits nothing retroactively, so a widening view
+        cannot look like a burst of traffic that never happened. Poll `GET /admin/requests` for
+        history.
+      tags: [imposters]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: >
+            An open SSE stream. Ends only when the client disconnects or the node stops.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >
+                  Server-Sent Events framing. Each event is `event:`, an optional `id:` carrying
+                  the resumption cursor, and a `data:` JSON line.
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ---------------------------------------------------------------------
   # ee: imposter sources (issue #239 read surface; #253 promotes the write
   # verbs the cluster port already served — declare, delete, pull now — to
   # this RBAC'd front, tenant-resolved rather than fixed to `default`)
@@ -4108,6 +4240,75 @@ components:
             type: object
             additionalProperties: true
       additionalProperties: true
+
+    FleetRequestPage:
+      type: object
+      description: >
+        One page of the tenant's fleet-wide request journal (issue #362) — the rows, the cursor
+        that fetches the next page, and an explicit statement of which imposters the answer
+        actually speaks for.
+      required: [requests, cursor, coverage, joined]
+      properties:
+        requests:
+          type: array
+          description: >
+            Recorded requests across the covered imposters, ordered by each request's own
+            recorded timestamp. Each row names the imposter it came from — without that a merged
+            answer is a pile of requests with no way to tell which mock served them.
+          items:
+            type: object
+            required: [port, flowId, request]
+            properties:
+              port:
+                type: integer
+                description: The imposter this request was recorded on.
+              flowId:
+                type: string
+                description: The flow (space) the request was resolved to at record time.
+              request:
+                $ref: '#/components/schemas/RecordedRequest'
+        cursor:
+          type: string
+          description: >
+            Opaque, versioned resumption token covering every port in `coverage.covered`. Pass it
+            back as `since`. Round-trip it unmodified — never parse it.
+        coverage:
+          $ref: '#/components/schemas/FleetJournalCoverage'
+        joined:
+          type: array
+          description: >
+            Covered ports that had no position in the presented cursor, so their retained history
+            was replayed into this page. A resuming client may see entries here it has already
+            seen; on a baseline read this is every covered port.
+          items:
+            type: integer
+
+    FleetJournalCoverage:
+      type: object
+      description: >
+        Which imposters a fleet journal answer speaks for, and which it left out. The cap exists
+        to bound the token size and the walk's cost; this block is what stops it being silent.
+      required: [covered, total, omitted, capped]
+      properties:
+        covered:
+          type: array
+          description: The imposters this answer walked, ascending.
+          items:
+            type: integer
+        total:
+          type: integer
+          description: Every imposter the tenant owns that was considered, covered or not.
+        omitted:
+          type: array
+          description: >
+            The imposters the cap excluded, ascending — named rather than counted, so an operator
+            can tell whose traffic they are not looking at. Ports rank by most recent activity,
+            so these are the least recently active.
+          items:
+            type: integer
+        capped:
+          type: boolean
+          description: Whether the cap actually excluded anything.
 
     RecordedRequest:
       type: object

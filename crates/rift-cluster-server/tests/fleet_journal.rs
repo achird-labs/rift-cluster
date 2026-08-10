@@ -118,6 +118,24 @@ fn one_route(path_prefix: &str, target_port: u16) -> serde_json::Value {
     })
 }
 
+/// The whole front-door route table, one entry per `(path prefix, imposter)`.
+///
+/// `PUT /front-door/routes` is a whole-table replace, so reaching a *second* imposter means putting
+/// both routes at once rather than adding one (issue #362's tests need two).
+fn routes_for(routes: &[(&str, u16)]) -> serde_json::Value {
+    json!({
+        "routes": routes
+            .iter()
+            .enumerate()
+            .map(|(index, (prefix, port))| json!({
+                "id": format!("svc-{index}"),
+                "match": { "path_prefix": prefix },
+                "target": { "port": port },
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// A three-node fleet, all ready, all voters, sharing one imposter and one
 /// front-door route — the fixture every test in this file starts from.
 struct Fleet {
@@ -189,6 +207,86 @@ impl Fleet {
         self.nodes[index].admin_addr()
     }
 
+    /// Install a second imposter behind `/svc2` and widen the route table to reach both (issue
+    /// #362). Returns its port.
+    ///
+    /// The fixture deliberately ships one imposter, because every test before this one was about a
+    /// single port's shards. A *fleet* journal cannot be tested that way: with one imposter, a walk
+    /// that silently covered only the first port would pass everything.
+    async fn add_imposter(&self) -> u16 {
+        let admin = self.admin(0);
+        let second = reserve_port();
+        let client = reqwest::Client::new();
+        let created = client
+            .post(format!("http://{admin}/imposters"))
+            .json(&minimal_imposter(second))
+            .send()
+            .await
+            .expect("post second imposter");
+        assert_eq!(
+            created.status().as_u16(),
+            201,
+            "second imposter setup must succeed"
+        );
+        let routed = client
+            .put(format!("http://{admin}/front-door/routes"))
+            .json(&routes_for(&[("/svc", self.port), ("/svc2", second)]))
+            .send()
+            .await
+            .expect("put routes");
+        assert_eq!(routed.status().as_u16(), 200, "route setup must succeed");
+
+        // Both imposters must actually dispatch before a test drives them, for `wait_dispatching`'s
+        // reason: a 404 at the front door records nothing, so an unready route would make a merged
+        // read look empty rather than wrong.
+        for index in 0..self.nodes.len() {
+            self.wait_dispatching(index).await;
+            self.wait_dispatching_on("/svc2", index).await;
+        }
+        second
+    }
+
+    /// Poll the fleet read on node `index` until `want` holds of its recorded paths.
+    ///
+    /// Peer entries reach a node's replica cache on the anti-entropy cadence, so every assertion
+    /// about *another* node's traffic has to be a poll rather than a single read. Waiting on the
+    /// specific paths, not on a weaker proxy like "both ports appear", is what keeps it from
+    /// passing before the traffic under test has arrived.
+    async fn read_until(
+        &self,
+        index: usize,
+        query: &str,
+        want: impl Fn(&BTreeSet<String>) -> bool,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        loop {
+            let (status, json) = self.fleet_read(index, query).await;
+            assert_eq!(status, 200, "the fleet read must answer: {json}");
+            let paths = read_paths(&json);
+            if want(&paths) {
+                return json;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fleet read never carried what this test waited for; saw {paths:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// `GET /admin/requests` against node `index` — the fleet journal read (issue #362).
+    async fn fleet_read(&self, index: usize, query: &str) -> (u16, serde_json::Value) {
+        let admin = self.admin(index);
+        let response = reqwest::get(format!("http://{admin}/admin/requests{query}"))
+            .await
+            .expect("fleet journal read");
+        let status = response.status().as_u16();
+        let body = response.text().await.expect("a body");
+        let json = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("fleet read body is not JSON ({e}): {body}"));
+        (status, json)
+    }
+
     /// Take the last node out of the fleet so it can be shut down or gracefully
     /// left — both consume the `ComposedServer`. Only the last is removable, so
     /// the surviving nodes keep their indices.
@@ -216,11 +314,15 @@ impl Fleet {
     /// 201 is recorded — earlier polls 404 at the front door, before any
     /// imposter sees them.
     async fn wait_dispatching(&self, index: usize) {
+        self.wait_dispatching_on("/svc", index).await;
+    }
+
+    async fn wait_dispatching_on(&self, prefix: &str, index: usize) {
         let front_door = self.front_door(index);
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(response) =
-                reqwest::get(format!("http://{front_door}/svc/ready-{index}")).await
+                reqwest::get(format!("http://{front_door}{prefix}/ready-{index}")).await
                 && response.status().as_u16() == 201
             {
                 return;
@@ -236,9 +338,13 @@ impl Fleet {
     /// Send `count` requests through node `index`'s own front door, each with a
     /// distinguishable path so the merged read can be checked as a set.
     async fn drive(&self, index: usize, tag: &str, count: usize) {
+        self.drive_on("/svc", index, tag, count).await;
+    }
+
+    async fn drive_on(&self, prefix: &str, index: usize, tag: &str, count: usize) {
         let front_door = self.front_door(index);
         for n in 0..count {
-            let response = reqwest::get(format!("http://{front_door}/svc/{tag}-{n}"))
+            let response = reqwest::get(format!("http://{front_door}{prefix}/{tag}-{n}"))
                 .await
                 .expect("request through the front door");
             assert_eq!(
@@ -612,6 +718,17 @@ impl Tail {
         query: &str,
         last_event_id: Option<&str>,
     ) -> Self {
+        Self::open_at(
+            admin,
+            &format!("/imposters/{port}/savedRequests/stream{query}"),
+            last_event_id,
+        )
+        .await
+    }
+
+    /// [`Self::open`] against an arbitrary path — the fleet tail (issue #362) is the same framing
+    /// on a different route, so it gets the same harness rather than a second copy of it.
+    async fn open_at(admin: std::net::SocketAddr, path: &str, last_event_id: Option<&str>) -> Self {
         use tokio::io::AsyncWriteExt as _;
 
         let mut socket = tokio::net::TcpStream::connect(admin)
@@ -621,7 +738,7 @@ impl Tail {
             .map(|id| format!("Last-Event-ID: {id}\r\n"))
             .unwrap_or_default();
         let request = format!(
-            "GET /imposters/{port}/savedRequests/stream{query} HTTP/1.1\r\n\
+            "GET {path} HTTP/1.1\r\n\
              Host: {admin}\r\n\
              Accept: text/event-stream\r\n\
              {resume}\r\n"
@@ -1076,4 +1193,318 @@ async fn a_peer_dying_mid_stream_is_announced_not_silently_absorbed() {
         "an unreachable voter must be declared on the stream, not silently dropped: {:?}",
         tail.events
     );
+}
+
+// ---- issue #362: the fleet journal, against a real three-node fleet ------------------------
+//
+// Everything below drives two imposters on three nodes. That combination is the point: the pure
+// merge is tested exhaustively in `journal_net`'s own module, but `JournalNet::covered_slices` and
+// `newest_by_port` fold the *replica cache* — keyed `(node, port)` — and no unit test can reach
+// them, because a `JournalNet` built in isolation has no peers to cache. A bug in either (a
+// transposed key, a stale rather than newest timestamp) would pass every unit test and lose a
+// peer's entries in production.
+
+/// The recorded paths in a fleet read body.
+fn read_paths(body: &serde_json::Value) -> BTreeSet<String> {
+    body["requests"]
+        .as_array()
+        .expect("requests is an array")
+        .iter()
+        .filter_map(|row| row.get("request")?.get("path")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The fleet read answers for **every** imposter the tenant owns, not just the first, and states
+/// its coverage.
+///
+/// Traffic is driven at both imposters through *different* nodes' front doors, so a correct answer
+/// requires the walk to cross both the port dimension and the node dimension at once — which is
+/// exactly the pair of loops the unit tests cannot exercise.
+#[tokio::test]
+async fn the_fleet_read_merges_every_imposter_the_tenant_owns() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let fleet = Fleet::start(&states).await;
+    let second = fleet.add_imposter().await;
+
+    fleet.drive_on("/svc", 0, "first", 2).await;
+    fleet.drive_on("/svc2", 1, "second", 2).await;
+
+    // Peer entries arrive on the anti-entropy cadence, so poll until the specific driven requests
+    // are present. Waiting merely for "both ports appear" would fire immediately — `wait_dispatching`
+    // already recorded a readiness probe on each — and then race the traffic this test is about.
+    let body = fleet
+        .read_until(0, "", |paths| {
+            paths.contains("/svc/first-0") && paths.contains("/svc2/second-0")
+        })
+        .await;
+
+    let paths = read_paths(&body);
+    assert!(
+        paths.contains("/svc/first-0") && paths.contains("/svc2/second-0"),
+        "one read must carry both imposters' traffic: {paths:?}"
+    );
+
+    let covered: BTreeSet<u64> = body["coverage"]["covered"]
+        .as_array()
+        .expect("coverage.covered is an array")
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    assert!(
+        covered.contains(&u64::from(fleet.port)) && covered.contains(&u64::from(second)),
+        "coverage must name both imposters: {}",
+        body["coverage"]
+    );
+    assert_eq!(
+        body["coverage"]["capped"], false,
+        "two imposters is far below the cap, so nothing may claim to be omitted"
+    );
+    assert!(
+        body["coverage"]["omitted"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "nothing was left out: {}",
+        body["coverage"]
+    );
+    assert!(
+        body["cursor"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "the read hands back a resumable position"
+    );
+}
+
+/// Resuming from the cursor a fleet read handed back delivers what arrived since, and nothing that
+/// was already delivered — the cross-port half of issue #225's guarantee.
+#[tokio::test]
+async fn a_fleet_cursor_resumes_without_replaying_what_it_already_answered() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let fleet = Fleet::start(&states).await;
+    fleet.add_imposter().await;
+
+    fleet.drive_on("/svc", 0, "before", 2).await;
+    fleet.drive_on("/svc2", 1, "before", 2).await;
+
+    // Take the cursor only once both imposters' driven traffic is actually in the answer, so the
+    // position genuinely spans both ports.
+    let first = fleet
+        .read_until(0, "", |paths| {
+            paths.contains("/svc/before-0") && paths.contains("/svc2/before-0")
+        })
+        .await;
+    let cursor = first["cursor"].as_str().expect("a cursor").to_owned();
+    let delivered = read_paths(&first);
+
+    // No fresh traffic yet, and no port joined: the cursor named them all, so a resumed read has
+    // nothing to re-serve.
+    let (status, json) = fleet.fleet_read(0, &format!("?since={cursor}")).await;
+    assert_eq!(status, 200, "resuming must be accepted: {json}");
+    assert!(
+        json["joined"].as_array().is_some_and(Vec::is_empty),
+        "no port joined: the cursor already named them all: {json}"
+    );
+
+    fleet.drive_on("/svc2", 2, "after", 1).await;
+
+    let resumed = fleet
+        .read_until(0, &format!("?since={cursor}"), |paths| {
+            paths.contains("/svc2/after-0")
+        })
+        .await;
+
+    // The property, stated without racing the cadence: a resumed read may legitimately carry an
+    // entry that was still in flight when the cursor was taken, but it must never re-deliver one
+    // the cursor already accounted for.
+    let resumed_paths = read_paths(&resumed);
+    let again: Vec<&String> = resumed_paths.intersection(&delivered).collect();
+    assert!(
+        again.is_empty(),
+        "resuming must not replay what the first page already answered: {again:?}"
+    );
+}
+
+/// The fleet tail delivers both imposters' traffic on one stream, and declares its coverage up
+/// front — the streaming half of issue #362.
+#[tokio::test]
+async fn the_fleet_tail_delivers_every_imposter_on_one_stream() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let fleet = Fleet::start(&states).await;
+    let second = fleet.add_imposter().await;
+
+    let mut tail = Tail::open_at(fleet.admin(0), "/admin/requests/stream", None).await;
+    assert!(
+        tail.headers.contains("text/event-stream"),
+        "the fleet tail must answer SSE: {}",
+        tail.headers
+    );
+
+    let hello = tail.hello();
+    assert_eq!(
+        hello.data.get("scope").and_then(serde_json::Value::as_str),
+        Some("fleet"),
+        "hello names the scope, so a client cannot confuse this with a per-imposter tail: {:?}",
+        hello.data
+    );
+    assert!(
+        hello.data.get("clusterTailLatencyMs").is_some(),
+        "the declared peer latency rides hello, as it does per imposter: {:?}",
+        hello.data
+    );
+    let covered: BTreeSet<u64> = hello
+        .data
+        .get("coverage")
+        .and_then(|coverage| coverage.get("covered"))
+        .and_then(serde_json::Value::as_array)
+        .expect("hello carries coverage")
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    assert!(
+        covered.contains(&u64::from(fleet.port)) && covered.contains(&u64::from(second)),
+        "the stream states which imposters it speaks for: {covered:?}"
+    );
+
+    // A connect never replays, so drive traffic only after the stream is open.
+    fleet.drive_on("/svc", 1, "tailed", 1).await;
+    fleet.drive_on("/svc2", 2, "tailed", 1).await;
+
+    let arrived = tail
+        .until(Duration::from_secs(45), |tail| {
+            let delivered = tail.delivered();
+            delivered.iter().any(|path| path == "/svc/tailed-0")
+                && delivered.iter().any(|path| path == "/svc2/tailed-0")
+        })
+        .await;
+    assert!(
+        arrived,
+        "both imposters' requests must arrive on one fleet stream: {:?}",
+        tail.delivered()
+    );
+
+    // Every delivered event names its imposter — a merged row without one is unreadable.
+    for event in tail.requests() {
+        assert!(
+            event
+                .data
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "a fleet row must name the imposter it came from: {:?}",
+            event.data
+        );
+        assert!(
+            event.id.is_some(),
+            "every event carries the position to resume from: {:?}",
+            event.data
+        );
+    }
+}
+
+/// A `Last-Event-ID` from the fleet tail resumes it: what was recorded while the connection was
+/// down arrives, and what was already delivered does not arrive twice.
+#[tokio::test]
+async fn a_fleet_tail_reconnect_neither_loses_nor_repeats() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let fleet = Fleet::start(&states).await;
+    fleet.add_imposter().await;
+
+    let mut tail = Tail::open_at(fleet.admin(0), "/admin/requests/stream", None).await;
+    fleet.drive_on("/svc", 0, "seen", 1).await;
+    assert!(
+        tail.until(Duration::from_secs(45), |tail| {
+            tail.delivered().iter().any(|path| path == "/svc/seen-0")
+        })
+        .await,
+        "the first request must arrive before the disconnect: {:?}",
+        tail.delivered()
+    );
+    let resume = tail
+        .requests()
+        .last()
+        .and_then(|event| event.id.clone())
+        .expect("a delivered event carries an id");
+    let already = tail.delivered();
+    drop(tail);
+
+    // Recorded while nothing is listening — the gap a reconnect has to close.
+    fleet.drive_on("/svc2", 1, "missed", 1).await;
+
+    let mut resumed = Tail::open_at(
+        fleet.admin(0),
+        "/admin/requests/stream",
+        Some(resume.as_str()),
+    )
+    .await;
+    assert!(
+        resumed
+            .until(Duration::from_secs(45), |tail| {
+                tail.delivered().iter().any(|path| path == "/svc2/missed-0")
+            })
+            .await,
+        "a reconnect must deliver what was recorded while it was away: {:?}",
+        resumed.delivered()
+    );
+    assert!(
+        !resumed
+            .delivered()
+            .iter()
+            .any(|path| already.contains(path)),
+        "and must not redeliver what the previous connection already had: {:?} after {:?}",
+        resumed.delivered(),
+        already
+    );
+}
+
+/// An unusable `Last-Event-ID` is refused, never defaulted — including a *per-imposter* token,
+/// which is a good cursor at the wrong endpoint and must say so rather than be read as a fleet
+/// position.
+#[tokio::test]
+async fn an_unusable_fleet_last_event_id_is_refused_rather_than_defaulted() {
+    let states = [
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    ];
+    let fleet = Fleet::start(&states).await;
+    let admin = fleet.admin(0);
+
+    // The per-imposter tail's own token: structurally valid, wrong scope.
+    let per_imposter = Tail::open(admin, fleet.port, "", None).await;
+    let borrowed = per_imposter
+        .hello()
+        .data
+        .get("cursor")
+        .and_then(serde_json::Value::as_str)
+        .expect("the per-imposter hello carries a cursor")
+        .to_owned();
+    drop(per_imposter);
+
+    for (label, token) in [
+        ("garbage", "not-a-cursor!!"),
+        ("legacy scalar", "42"),
+        ("per-imposter token", borrowed.as_str()),
+    ] {
+        let refused = Tail::open_at(admin, "/admin/requests/stream", Some(token)).await;
+        assert!(
+            refused.headers.starts_with("HTTP/1.1 400"),
+            "{label} must be refused, not defaulted to a position: {}",
+            refused.headers
+        );
+    }
 }

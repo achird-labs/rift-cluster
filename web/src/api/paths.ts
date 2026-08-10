@@ -25,6 +25,11 @@ export const API_PATHS = {
    * (see `routing.ts`).
    */
   sources: "/admin/sources",
+  /**
+   * The tenant's recorded requests across every imposter, merged server-side (#362) — replaces the
+   * console's own N-way fan-out over `requestsPath(port)`. One read, one cursor, one stated coverage.
+   */
+  fleetRequests: "/admin/requests",
 } as const satisfies Record<string, ApiPath>;
 
 /** Path builders for the templated routes, so a port is interpolated in exactly one place. */

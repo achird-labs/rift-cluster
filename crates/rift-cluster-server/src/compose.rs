@@ -828,6 +828,7 @@ async fn attach_data_plane(
     let api_key = cli.oss.api_key.clone();
     let allow_injection = cli.oss.allow_injection;
     let scripts_dir = cli.oss.scripts_dir.clone();
+    let fleet_journal_port_cap = cli.cluster.cluster_fleet_journal_port_cap;
     cli.oss.host = "127.0.0.1".to_owned();
     cli.oss.port = 0;
     // Withheld from the loopback deliberately (issue #161, B4): upstream's own
@@ -955,6 +956,7 @@ async fn attach_data_plane(
             readiness: Arc::clone(readiness),
             puller: Arc::clone(&puller),
             journal_net: Arc::clone(&journal_net),
+            fleet_journal_port_cap,
         },
         node,
     )

@@ -222,6 +222,67 @@ stream therefore emits each page in a linear extension of per-shard seq order
 The page-level token never had this problem — it advances to everything a shard
 holds — so this is specific to handing out a token per event.
 
+### Across every imposter at once (issue #362)
+
+The same walk again, one level up: `GET /admin/requests` and
+`GET /admin/requests/stream` serve across **every imposter the caller's tenant
+owns** what the two routes above serve for one. Both terminate at the front —
+there is no upstream fleet surface to proxy to, and a per-node one could not
+answer for a fleet anyway.
+
+**There is still no fleet-wide sequence, and this does not invent one.** Entries
+are keyed `(node_id, seq, clear_gen)` per *port shard*, so `seq` orders within a
+shard and nothing orders across shards or across ports. The merge falls back to
+the recorded timestamp, stamped by whichever node served the request, so two
+entries recorded milliseconds apart on clock-skewed nodes can transpose. The
+console's ordering banner therefore stays. What the endpoint removes is the
+*other* source of disorder, which was real and fixable: the console used to read
+N imposters per poll and sort whatever came back, so the order was partly an
+artifact of which response arrived first.
+
+**A fleet cursor is a different shape, not an extension.** `JournalCursor` is a
+vector over nodes scoped to one port; a port's seq numbering is unrelated to any
+other port's, so the only sound cross-port position is one whole per-port cursor
+per port. `FleetCursor` is exactly that — `BTreeMap<port, JournalCursor>`,
+encoded with the node ids written once and each port's positions referencing them
+by index, because the token has to survive a `Last-Event-ID` header. It carries
+its own version namespace and a scope tag, so a per-imposter token presented here
+(or the reverse) is refused with a typed 400 naming the mismatch rather than
+misread as a position. The pre-#223 bare scalar is refused here too: it names a
+position in no port in particular.
+
+**The cap is the honest part.** A tenant can own more imposters than one answer
+can carry, so coverage ranks ports by their most recent recorded entry and keeps
+`--cluster-fleet-journal-port-cap` of them (default 100). What it leaves out it
+*names*: `coverage.omitted` carries the ports, and the stream re-announces the
+block whenever the covered set moves. This replaces a client-side cap of 25 that
+was applied quietly. A port that leaves coverage loses its cursor row, which is
+what keeps the token bounded; re-entry is a join, and the two read modes want
+opposite things from one — a stream adopts the port's current position and
+replays nothing (a connect never replays), while a read serves the history and
+declares the port in `joined` so a resuming client knows where duplicates are
+possible.
+
+Ranking deliberately does **not** touch a port's shard. `ClusterJournal::shard`
+creates lazily and `known_ports` drives the anti-entropy `peers × ports` fan-out,
+so ranking through the ordinary read would enroll every port it merely
+*considered* into the fleet's inter-node traffic, permanently. Only covered ports
+are walked, so enrollment stays bounded by the cap rather than by imposter count.
+
+The hazard #348 found repeats here one level up, and is worth stating because
+getting it wrong is silent. Shards must be keyed `(port, node_id)`, never
+`node_id` alone: one node's counters on two ports are unrelated sequences, and
+splicing them into one seq-sorted list would push a port's high-water mark past
+entries it never emitted. `fleet_stream_order` keys on the pair; a test
+mutation-verifies that collapsing the key is caught.
+
+**Scope is the tenant, not the fleet**, which is what keeps the `/events`
+asymmetry below coherent. The port set is `tenant_owned_ports` on applied state,
+so another tenant's imposter cannot enter the walk at all — ownership by
+construction rather than by check, which is why these two routes carry neither a
+per-port ownership gate nor a FleetAdmin one, and are authorized as the ordinary
+`imposter.read` the per-imposter read already is.
+
 **`GET /events` stays proxied per-node and FleetAdmin-gated**, and the asymmetry
 is deliberate: its payload spans every tenant and is not yet filtered
 server-side, so the gate is stricter than RFC-002 §4.2 asks until #163 lands the

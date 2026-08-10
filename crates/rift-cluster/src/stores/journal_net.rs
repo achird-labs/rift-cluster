@@ -18,7 +18,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use super::journal::{ClusterJournal, JournalCursor, ShardEntry, ShardRead};
+use super::journal::{ClusterJournal, FleetCursor, JournalCursor, ShardEntry, ShardRead};
 use crate::raft::{NodeId, RaftNode};
 use crate::rpc::{HandlerFuture, Router, RpcError};
 use rift_cluster_base::seams::RequestJournal;
@@ -369,6 +369,353 @@ fn advanced_by(cursor: &JournalCursor, entry: &ShardEntry) -> JournalCursor {
     next
 }
 
+/// Which ports a fleet page actually walked, and which the cap left out (issue #362).
+///
+/// The omitted list is the ports themselves rather than a count, because the two answer different
+/// questions and only one of them is actionable: "3 imposters were left out" tells an operator
+/// their view is short, while naming them tells them *whose* traffic they are not looking at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// Ports this page walked, ascending.
+    pub covered: Vec<u16>,
+    /// Ports the cap excluded, ascending. Empty whenever the tenant owns no more ports than the cap.
+    pub omitted: Vec<u16>,
+}
+
+impl Coverage {
+    /// Every port considered, covered or not.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.covered.len() + self.omitted.len()
+    }
+
+    /// Whether the cap actually bit. The honest signal a client renders.
+    #[must_use]
+    pub fn is_capped(&self) -> bool {
+        !self.omitted.is_empty()
+    }
+}
+
+/// What a *covered* port with no row in the presented cursor means (issue #362).
+///
+/// The two read modes want opposite things from a joining port, and neither is wrong:
+///
+/// * [`Self::Live`] — a stream. The port adopts its current baseline and replays nothing, which is
+///   upstream's own "a connect never replays" contract applied per port. No duplicates.
+/// * [`Self::Replay`] — a read. The port's retained history is served and the port is named in
+///   [`FleetPage::joined`], so a resuming client knows duplicates are possible for exactly it.
+///   Completeness wins; the declaration is what keeps that honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinMode {
+    Live,
+    Replay,
+}
+
+/// One covered port's shards, as [`fleet_merge`] consumes them.
+///
+/// `pub(crate)` for [`ShardSlice`]'s reason: only [`JournalNet::fleet_page`] builds these and only
+/// [`fleet_merge`] reads them.
+#[derive(Debug, Clone)]
+pub(crate) struct PortSlices {
+    pub port: u16,
+    pub slices: Vec<ShardSlice>,
+    /// This port's own partial verdict — the fleet answer is the OR across covered ports.
+    pub partial: bool,
+}
+
+/// Whether every event carries its own resumption token (issue #362).
+///
+/// A stream needs one per event, because a client can disconnect between any two of them. A read
+/// needs only the page token — and paying the per-event fold anyway is not a rounding error: the
+/// token is a map over every covered port, so folding one per entry makes a baseline read allocate
+/// `entries x covered ports` cursors to produce a value nothing reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdPolicy {
+    /// Fold a token per event — an SSE `id:` line.
+    PerEvent,
+    /// Produce [`FleetPage::next`] only; every [`FleetTailEvent::id`] is `None`.
+    PageOnly,
+}
+
+/// One entry of a fleet tail, tagged with the port it came from and carrying the *whole fleet*
+/// position a client resumes from if this is the last event it receives (issue #362).
+///
+/// The id is a full [`FleetCursor`], not this port's row: a reader that resumed from a single
+/// port's position would rewind every other covered port to a join.
+#[derive(Debug, Clone)]
+pub struct FleetTailEvent {
+    pub port: u16,
+    pub entry: ShardEntry,
+    /// `Some` under [`IdPolicy::PerEvent`], `None` under [`IdPolicy::PageOnly`].
+    ///
+    /// A consumer that finds `None` where it wanted a token must **omit the `id:` line**, never
+    /// substitute the page token: the page token is the position *after the whole drain*, so
+    /// handing it to a client mid-page would advance them past entries they have not received —
+    /// silent loss. Omitting the line instead leaves the client on its previous id, which costs a
+    /// duplicate on reconnect and loses nothing.
+    pub id: Option<FleetCursor>,
+}
+
+/// One drain of the fleet walk — [`JournalNet::fleet_page`]'s answer.
+#[derive(Debug, Clone)]
+pub struct FleetPage {
+    /// In emission order: each `(port, node)` shard in its own seq order, interleaved across shards
+    /// by recorded timestamp.
+    pub events: Vec<FleetTailEvent>,
+    /// The position to hold after this drain. Adopted even when `events` is empty.
+    pub next: FleetCursor,
+    /// Which ports this page speaks for, and which the cap excluded.
+    pub coverage: Coverage,
+    /// Covered ports that had no row in the presented cursor and whose history was therefore
+    /// *replayed* — [`JoinMode::Replay`] only. A client resuming a read must expect duplicates for
+    /// exactly these ports.
+    pub joined: Vec<u16>,
+    /// The merged view is currently short on at least one covered port — both senses of
+    /// [`MergeOutcome::partial`]. Never set by a coverage omission: that is a different fact, is
+    /// reported separately in [`Self::coverage`], and conflating the two would make a deliberately
+    /// capped answer indistinguishable from a degraded fleet.
+    pub partial: bool,
+    /// Retention dropped entries this reader had not reached, on at least one covered port.
+    pub truncated: bool,
+}
+
+/// Re-order one fleet drain into an order a **per-entry** fleet cursor can address (issue #362) —
+/// the cross-port sibling of [`stream_order`], and the place this design's named hazard lives.
+///
+/// Shards are keyed `(port, node_id)`, **never `node_id` alone**. One node's `seq` counters on two
+/// different ports are unrelated sequences: port 4545's seq 2 and port 4546's seq 1 have no
+/// ordering relationship whatsoever. Bucketing per node would splice those two counters into one
+/// list and sort it by seq, which both invents an order the journal never had *and* breaks the
+/// per-shard ascending invariant [`advanced_by`] is only sound over — so a fold over that order
+/// would push a port's high-water mark past entries it never emitted, withholding them from every
+/// later read. Permanent, silent loss, exactly as [`stream_order`] documents one level down.
+///
+/// Cross-shard, entries compete by recorded timestamp between each shard's *next unemitted* entry,
+/// with `(port, node, seq)` as the tiebreak so two nodes answering the same request set agree on
+/// one order.
+#[must_use]
+fn fleet_stream_order(per_port: Vec<(u16, Vec<ShardEntry>)>) -> Vec<(u16, ShardEntry)> {
+    let mut by_shard: BTreeMap<(u16, NodeId), std::collections::VecDeque<ShardEntry>> =
+        BTreeMap::new();
+    for (port, entries) in per_port {
+        for entry in entries {
+            by_shard
+                .entry((port, entry.node_id))
+                .or_default()
+                .push_back(entry);
+        }
+    }
+    for shard in by_shard.values_mut() {
+        shard.make_contiguous().sort_by_key(|entry| entry.seq);
+    }
+
+    // A heap over the shard heads rather than a rescan per emitted entry.
+    //
+    // `stream_order` one level down rescans, and is right to: its shard count is the *node* count,
+    // so the scan is a handful of comparisons. Here the shard count is `covered ports × nodes` —
+    // up to a few hundred at the default cap — and this runs on every drain of every open tail, so
+    // the same shape would be `O(entries × shards)` string comparisons on the hot path. The heap
+    // makes it `O(entries × log shards)` for byte-identical output: the ordering rule lives in
+    // `Head`'s `Ord`, which is the merge comparator verbatim.
+    #[derive(PartialEq, Eq)]
+    struct Head {
+        timestamp: String,
+        port: u16,
+        node: NodeId,
+        seq: u64,
+    }
+    impl Ord for Head {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            // Reversed at the end so `BinaryHeap`'s max-heap pops the *smallest* head, which is the
+            // one the merge order emits next.
+            self.timestamp
+                .cmp(&other.timestamp)
+                .then_with(|| self.port.cmp(&other.port))
+                .then_with(|| self.node.cmp(&other.node))
+                .then_with(|| self.seq.cmp(&other.seq))
+                .reverse()
+        }
+    }
+    impl PartialOrd for Head {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let head_of = |shard: &std::collections::VecDeque<ShardEntry>, port: u16| {
+        shard.front().map(|entry| Head {
+            timestamp: entry.request.timestamp.clone(),
+            port,
+            node: entry.node_id,
+            seq: entry.seq,
+        })
+    };
+
+    let mut heap = std::collections::BinaryHeap::with_capacity(by_shard.len());
+    for ((port, node), shard) in &by_shard {
+        if let Some(head) = head_of(shard, *port) {
+            debug_assert_eq!(head.node, *node, "a shard's entries all share its node");
+            heap.push(head);
+        }
+    }
+
+    let mut out = Vec::with_capacity(by_shard.values().map(std::collections::VecDeque::len).sum());
+    while let Some(head) = heap.pop() {
+        let key = (head.port, head.node);
+        let Some(shard) = by_shard.get_mut(&key) else {
+            continue;
+        };
+        if let Some(entry) = shard.pop_front() {
+            out.push((head.port, entry));
+        }
+        if let Some(next_head) = head_of(shard, head.port) {
+            heap.push(next_head);
+        }
+    }
+    out
+}
+
+/// The fleet walk (issue #362): [`merge_shards_since`] run per covered port, interleaved into one
+/// ordered page, with one resumable position across all of them.
+///
+/// Every per-port guarantee is [`merge_shards_since`]'s, unchanged and un-reimplemented — gapless
+/// and duplicate-free per shard, monotone positions, truncation honesty. This function adds exactly
+/// three things on top:
+///
+/// **One order.** [`fleet_stream_order`] interleaves the ports by recorded timestamp. That order is
+/// skew-limited and always will be: the timestamp is stamped by whichever node served the request,
+/// so two entries recorded milliseconds apart on clock-skewed nodes can transpose. What it is *not*
+/// any more is an artifact of which of N reads returned first, which is the whole of AC1.
+///
+/// **One position.** [`FleetPage::next`] carries a row per covered port, so a reader holds a single
+/// token instead of N independent ones and cannot drop or replay entries at a poll boundary.
+///
+/// **A bounded, declared membership.** Only covered ports get a row; a port that has left coverage
+/// loses its row rather than growing the token forever. The seed for the per-event fold is
+/// therefore the presented cursor *restricted to covered ports*, so a mid-page id and the page
+/// token agree about which ports they speak for — otherwise a client resuming mid-page would carry
+/// a row the page token had already dropped.
+///
+/// The trade that membership buys is real and worth naming: a port that leaves coverage and later
+/// returns re-joins under `join`, so it live-joins (no replay, no duplicates) or replay-joins
+/// (history re-served, and declared in [`FleetPage::joined`]). Coverage ranks by recency, so the
+/// ports that can flap across the boundary are by construction the ones with no recent entries —
+/// a port that just recorded something ranks at the top and cannot be the one displaced.
+#[must_use]
+pub(crate) fn fleet_merge(
+    covered: Vec<PortSlices>,
+    omitted: Vec<u16>,
+    cursor: Option<&FleetCursor>,
+    join: JoinMode,
+    ids: IdPolicy,
+) -> FleetPage {
+    let mut next = FleetCursor::default();
+    let mut joined = Vec::new();
+    let mut per_port: Vec<(u16, Vec<ShardEntry>)> = Vec::new();
+    let mut covered_ports = Vec::with_capacity(covered.len());
+    // Where each covered port's row starts for the per-event fold. Built alongside `next` rather
+    // than derived from the presented cursor alone, because a port can be covered while the cursor
+    // holds no row for it — see the seeding note below.
+    let mut seeds: Vec<(u16, JournalCursor)> = Vec::new();
+    let mut partial = false;
+    let mut truncated = false;
+
+    for PortSlices {
+        port,
+        slices,
+        partial: port_partial,
+    } in covered
+    {
+        covered_ports.push(port);
+        partial |= port_partial;
+
+        let held = cursor.and_then(|cursor| cursor.get(port));
+        let since = merge_shards_since(&slices, port_partial, held);
+        truncated |= since.truncated;
+
+        match (held, join) {
+            // A position this reader already holds: serve what is above it, and fold from there.
+            (Some(row), _) => {
+                seeds.push((port, row.clone()));
+                per_port.push((port, since.entries));
+            }
+            // A read joining a port: serve its history, and say so. The fold starts at no
+            // consumed position — that is what a replay means — but at the *current* generation,
+            // so a mid-page id is never behind its own page token.
+            (None, JoinMode::Replay) => {
+                joined.push(port);
+                seeds.push((
+                    port,
+                    JournalCursor {
+                        generation: since.next.generation,
+                        pos: BTreeMap::new(),
+                    },
+                ));
+                per_port.push((port, since.entries));
+            }
+            // A stream joining a port: adopt the baseline and emit nothing. `since.entries` is
+            // deliberately dropped — that is what "a connect never replays" means per port.
+            //
+            // The seed is the baseline itself, not an absent row, and that is load-bearing: this
+            // port emits nothing, so if it had no seed it would appear in `next` but in no
+            // per-event id. A client that disconnected mid-page and resumed from one of those ids
+            // would present a cursor with no row for this port, live-join it a *second* time to a
+            // now-later baseline, and never receive anything it served in between — silently, with
+            // no `lagged` and no `truncated`. Seeding it keeps every id in the page agreeing with
+            // the page token about this port.
+            (None, JoinMode::Live) => seeds.push((port, since.next.clone())),
+        }
+        next.ports.insert(port, since.next);
+    }
+
+    // Exactly the covered ports, each at the position its own arm above chose. Membership therefore
+    // matches `next` in **both** directions: no row `next` dropped (a port that left coverage), and
+    // no row `next` has that an id lacks (a port that joined). Either mismatch is a silent hole at
+    // a mid-page resume, which is the one failure a per-event token exists to prevent.
+    let mut running = FleetCursor {
+        ports: seeds.into_iter().collect(),
+    };
+
+    let ordered = fleet_stream_order(per_port);
+    let last = ordered.len().saturating_sub(1);
+    let mut events = Vec::with_capacity(ordered.len());
+    for (index, (port, entry)) in ordered.into_iter().enumerate() {
+        let id = match ids {
+            IdPolicy::PageOnly => None,
+            IdPolicy::PerEvent => {
+                let row = running
+                    .ports
+                    .entry(port)
+                    .or_insert_with(JournalCursor::start);
+                *row = advanced_by(row, &entry);
+                // The last event carries the page token rather than the running fold, for
+                // `tail_page`'s reason one level down: they agree about everything delivered, but
+                // the page token additionally covers ranges the shards hold and did not surface
+                // (evicted, or dropped by a clear generation), so a stream left at the running fold
+                // would re-examine and re-reject them on every wake for the life of the connection.
+                Some(if index == last {
+                    next.clone()
+                } else {
+                    running.clone()
+                })
+            }
+        };
+        events.push(FleetTailEvent { port, entry, id });
+    }
+
+    FleetPage {
+        events,
+        next,
+        coverage: Coverage {
+            covered: covered_ports,
+            omitted,
+        },
+        joined,
+        partial,
+        truncated,
+    }
+}
+
 /// The highest seq any slice reports `node` as having evicted through (inclusive).
 fn evicted_through(slices: &[ShardSlice], node: NodeId) -> u64 {
     slices
@@ -542,6 +889,15 @@ const COUNTS_PATH: &str = "/_cluster/journal/counts";
 /// here — every node pulls every peer, since this journal has no owner) heals
 /// within one tick.
 pub const DEFAULT_ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many imposters one fleet journal answer covers by default (issue #362).
+///
+/// Four times what the console silently truncated to before this existed, and chosen against the
+/// two costs a higher number actually pays: the resumption token carries a row per covered port and
+/// has to survive a `Last-Event-ID` header (measured at roughly a fifth of an 8 KiB budget here),
+/// and each covered port is one more shard the walk touches per drain. Above the cap the answer
+/// says what it left out — a stated cap is the point, not the number.
+pub const DEFAULT_FLEET_JOURNAL_PORT_CAP: usize = 100;
 
 /// Budget for one whole anti-entropy tick, across every `(peer, port)` pair — the same shape as
 /// [`Self::merge_read`]'s per-read budget, scoped to the tick as a whole rather than one pull: a
@@ -725,6 +1081,194 @@ impl JournalNet {
             partial: page.partial,
             truncated: page.truncated,
         }
+    }
+
+    /// One drain of the fleet walk (issue #362): rank `ports` by recency, keep the most recently
+    /// active `cap` of them, and walk those from `cursor`.
+    ///
+    /// This is [`Self::tail_page`]'s cross-port sibling and shares its cost model exactly: it reads
+    /// the replica cache the anti-entropy tick already maintains and never fans out to peers on the
+    /// read path, so a fleet tail costs the same inter-node traffic as no tail at all. That is what
+    /// makes one endpoint per poll strictly cheaper than the console's N-per-poll fan-out rather
+    /// than merely tidier.
+    ///
+    /// **Only covered ports are touched.** `read_shard_since` creates a port's shard on first
+    /// touch, and [`ClusterJournal::known_ports`] is what drives the tick's `peers x ports` fan-out
+    /// — so touching every port a tenant owns would enroll all of them in the tick and make the
+    /// fleet's inter-node traffic grow with imposter count. Ranking therefore peeks
+    /// ([`ClusterJournal::newest_timestamp`], which does *not* create) and only the covered set is
+    /// walked, keeping enrollment bounded by `cap`.
+    ///
+    /// The visible consequence, which the answer declares rather than hides: in a tenant that owns
+    /// more than `cap` ports, a port with no recorded traffic ranks stale and is omitted — and an
+    /// omitted port is named in [`Coverage::omitted`], never silently dropped.
+    #[must_use]
+    pub fn fleet_page(
+        &self,
+        ports: &[u16],
+        cap: usize,
+        cursor: Option<&FleetCursor>,
+        join: JoinMode,
+        ids: IdPolicy,
+    ) -> FleetPage {
+        let coverage = self.coverage_for(ports, cap);
+        let covered = self.covered_slices(&coverage.covered, cursor);
+        fleet_merge(covered, coverage.omitted, cursor, join, ids)
+    }
+
+    /// Split `ports` into the most recently active `cap` and the rest (issue #362).
+    ///
+    /// Recency is the newest *recorded timestamp* known for the port — the same string-compared
+    /// stamp [`merge_shards`] orders by, so coverage and ordering cannot disagree about what
+    /// "recent" means. Ties, including the all-unknown case, break by port ascending: coverage has
+    /// to be a deterministic function of the same inputs on every node, or two nodes would answer
+    /// the same client with different fleets.
+    ///
+    /// A port nothing is known about sorts last. That is the honest ranking — there is no evidence
+    /// it is active — and it is safe because the cap only bites above `cap` ports, where the
+    /// omission is stated.
+    #[must_use]
+    pub fn coverage_for(&self, ports: &[u16], cap: usize) -> Coverage {
+        let newest = self.newest_by_port(ports);
+
+        let mut ranked: Vec<u16> = {
+            let mut unique: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+            unique.extend(ports.iter().copied());
+            unique.into_iter().collect()
+        };
+        ranked.sort_by(|a, b| {
+            newest
+                .get(b)
+                .map(String::as_str)
+                .cmp(&newest.get(a).map(String::as_str))
+                .then_with(|| a.cmp(b))
+        });
+
+        let mut covered: Vec<u16> = ranked.iter().copied().take(cap).collect();
+        let mut omitted: Vec<u16> = ranked.into_iter().skip(cap).collect();
+        // Ranked order is by activity; both lists are presented by port so a reader can find one.
+        covered.sort_unstable();
+        omitted.sort_unstable();
+        Coverage { covered, omitted }
+    }
+
+    /// The newest recorded timestamp known for each of `ports`, across this node's own shards and
+    /// every cached replica — in one pass over the replica map rather than one scan per port.
+    ///
+    /// The pass matters: `replicas` is keyed `(node, port)`, so asking it per port would rescan the
+    /// whole map `ports` times — quadratic in exactly the dimension this feature grows in.
+    fn newest_by_port(&self, ports: &[u16]) -> HashMap<u16, String> {
+        let wanted: std::collections::BTreeSet<u16> = ports.iter().copied().collect();
+        let mut newest: HashMap<u16, String> = HashMap::new();
+
+        let mut offer = |port: u16, timestamp: &str| {
+            match newest.entry(port) {
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    if timestamp > held.get().as_str() {
+                        held.insert(timestamp.to_owned());
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(timestamp.to_owned());
+                }
+            };
+        };
+
+        for &port in &wanted {
+            if let Some(timestamp) = self.journal.newest_timestamp(port) {
+                offer(port, &timestamp);
+            }
+        }
+        for ((_, port), cached) in self.replicas.read().iter() {
+            if !wanted.contains(port) {
+                continue;
+            }
+            // The cache is folded by seq (`merge_reply`), so the last entry is the newest this peer
+            // had told us about — the same "highest seq is the most recent record" reading
+            // `newest_timestamp` uses for the local shard.
+            if let Some(entry) = cached.read.entries.last() {
+                offer(*port, &entry.request.timestamp);
+            }
+        }
+        newest
+    }
+
+    /// [`Self::slices_above`] for many ports, in one pass over the replica map (issue #362).
+    ///
+    /// Same result as calling `slices_above` per port and same narrowing — each shard carries only
+    /// the entries above that `(port, node)`'s cursor position — but the replica map is scanned
+    /// once instead of once per port, which is the difference between `O(nodes x ports)` and
+    /// `O(nodes x ports^2)` on a surface whose whole point is to cover many ports at once.
+    fn covered_slices(&self, ports: &[u16], cursor: Option<&FleetCursor>) -> Vec<PortSlices> {
+        let this_node = self.journal.node_id();
+        let position_of = |port: u16, node: NodeId| {
+            cursor
+                .and_then(|cursor| cursor.get(port))
+                .and_then(|row| row.pos.get(&node).copied())
+                .unwrap_or(0)
+        };
+
+        let mut by_port: BTreeMap<u16, Vec<ShardSlice>> = ports
+            .iter()
+            .map(|&port| {
+                (
+                    port,
+                    vec![ShardSlice {
+                        node_id: this_node,
+                        read: self
+                            .journal
+                            .read_shard_since(port, position_of(port, this_node)),
+                    }],
+                )
+            })
+            .collect();
+
+        // KNOWN COST, stated rather than hidden: the read guard is held across the entry clones
+        // below, and this loop spans the whole covered set rather than one port.
+        //
+        // A cursored drain clones only what is above each shard's position, which is small — that
+        // is the shape this endpoint is built for. A *baseline* read clones every retained entry of
+        // every covered port on every peer, still under the guard, and parking_lot is fair, so a
+        // `merge_reply` writer queued behind it delays every reader behind that. The console polls
+        // baselines today, so this is reachable rather than theoretical.
+        //
+        // Not fixed here because the fix is not local: hoisting the clone out means holding
+        // `Arc<CachedShard>` in `replicas`, which changes `merge_reply`'s in-place mutation and
+        // every other reader of the cache (issues #223/#340). That is its own change with its own
+        // tests, not a rider on this one.
+        for ((node_id, port), cached) in self.replicas.read().iter() {
+            let Some(bucket) = by_port.get_mut(port) else {
+                continue;
+            };
+            let position = position_of(*port, *node_id);
+            bucket.push(ShardSlice {
+                node_id: *node_id,
+                read: ShardRead {
+                    entries: cached
+                        .read
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.seq > position)
+                        .cloned()
+                        .collect(),
+                    // The same max as `slices_above` (issue #340): the origin's watermark raised by
+                    // whatever this cache itself dropped under cap pressure.
+                    evicted_below_seq: cached.read.evicted_below_seq.max(cached.dropped_below_seq),
+                    clear_gen: cached.read.clear_gen,
+                    space_gens: cached.read.space_gens.clone(),
+                    count_slot: cached.read.count_slot,
+                },
+            });
+        }
+
+        by_port
+            .into_iter()
+            .map(|(port, slices)| PortSlices {
+                port,
+                slices,
+                partial: self.tick_partial(port),
+            })
+            .collect()
     }
 
     /// [`Self::slices_for`], but each shard carries only the entries **above** that shard's
@@ -3149,6 +3693,712 @@ mod tests {
                 !changes
                     .has_changed()
                     .expect("sender outlives this receiver")
+            );
+        }
+    }
+
+    /// Issue #362 — the fleet walk: one merged, cursor-exact page across every *covered* port.
+    ///
+    /// These drive the pure [`fleet_merge`] rather than a live [`JournalNet`], for the same reason
+    /// the per-port merge tests do: the invariants under test are properties of the merge, and a
+    /// net would only add scheduling noise between the assertion and the thing asserted. The
+    /// cache-shaped half (coverage ranking off real shards) is covered separately, where the seam
+    /// actually lives.
+    mod fleet_walk {
+        use super::*;
+
+        const A: NodeId = 1;
+        const B: NodeId = 2;
+
+        fn port(port: u16, slices: Vec<ShardSlice>) -> PortSlices {
+            PortSlices {
+                port,
+                slices,
+                partial: false,
+            }
+        }
+
+        fn emitted(page: &FleetPage) -> Vec<(u16, &str)> {
+            page.events
+                .iter()
+                .map(|event| (event.port, event.entry.request.path.as_str()))
+                .collect()
+        }
+
+        /// AC1. Ordering is a property of the journal, not of which read returned first: entries
+        /// from different ports interleave by their own recorded timestamps.
+        #[test]
+        fn fleet_page_orders_by_recorded_timestamp_across_ports() {
+            let covered = vec![
+                port(
+                    4545,
+                    vec![slice(
+                        A,
+                        vec![
+                            entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/first"), 0),
+                            entry_at(A, 2, 0, req_at("2026-01-01T00:00:03Z", "/third"), 0),
+                        ],
+                    )],
+                ),
+                port(
+                    4546,
+                    vec![slice(
+                        B,
+                        vec![
+                            entry_at(B, 1, 0, req_at("2026-01-01T00:00:02Z", "/second"), 0),
+                            entry_at(B, 2, 0, req_at("2026-01-01T00:00:04Z", "/fourth"), 0),
+                        ],
+                    )],
+                ),
+            ];
+
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+
+            assert_eq!(
+                emitted(&page),
+                vec![
+                    (4545, "/first"),
+                    (4546, "/second"),
+                    (4545, "/third"),
+                    (4546, "/fourth"),
+                ],
+                "the two ports must interleave by recorded timestamp, not append port by port"
+            );
+        }
+
+        /// THE HAZARD this design named in advance: one node's `seq` counters on two ports are
+        /// unrelated sequences. A stream order that bucketed by `node_id` alone would treat
+        /// `(4545, seq 2)` and `(4546, seq 1)` as one sequence and force them into seq order,
+        /// breaking the per-shard ascending invariant the per-event token fold is only sound over
+        /// — and losing entries permanently and silently.
+        ///
+        /// Here one node wrote both ports, and the *later* seq on 4545 carries the *earlier*
+        /// timestamp. Correct output interleaves by timestamp; a per-node fold would emit 4545's
+        /// seq 1 first because it is the lower seq.
+        #[test]
+        fn fleet_stream_order_does_not_fold_two_ports_of_one_node() {
+            let covered = vec![
+                port(
+                    4545,
+                    vec![slice(
+                        A,
+                        vec![
+                            entry_at(A, 1, 0, req_at("2026-01-01T00:00:09Z", "/late-low-seq"), 0),
+                            entry_at(
+                                A,
+                                2,
+                                0,
+                                req_at("2026-01-01T00:00:01Z", "/early-high-seq"),
+                                0,
+                            ),
+                        ],
+                    )],
+                ),
+                port(
+                    4546,
+                    vec![slice(
+                        A,
+                        vec![entry_at(
+                            A,
+                            1,
+                            0,
+                            req_at("2026-01-01T00:00:05Z", "/middle"),
+                            0,
+                        )],
+                    )],
+                ),
+            ];
+
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+
+            // Within 4545 the two entries stay in **seq** order (1 then 2) even though their
+            // timestamps are inverted — that is the per-shard guarantee, and it is what makes the
+            // token fold sound. Across ports, 4546's entry competes on timestamp against 4545's
+            // *head* (seq 1, at :09), wins at :05, and so is emitted first.
+            //
+            // Bucketing by `node_id` alone would splice both ports into one seq-sorted list and
+            // emit `[(4545,/late-low-seq), (4546,/middle), (4545,/early-high-seq)]` instead — the
+            // two 'seq 1's ordered by nothing but the sort's stability. That is the wrong answer
+            // this assertion exists to catch.
+            assert_eq!(
+                emitted(&page),
+                vec![
+                    (4546, "/middle"),
+                    (4545, "/late-low-seq"),
+                    (4545, "/early-high-seq"),
+                ],
+                "each port keeps its own seq order; ports interleave by timestamp"
+            );
+
+            // And the fold must advance each port independently. 4545's row moves only on 4545's
+            // own entries: absent while 4546's entry is emitted, then its own seq, then the page
+            // token's high-water mark. A per-node fold would have advanced it on the very first
+            // event and read `[1, 1, 2]`.
+            let ids: Vec<u64> = page
+                .events
+                .iter()
+                .map(|event| {
+                    event
+                        .id
+                        .as_ref()
+                        .and_then(|id| id.get(4545))
+                        .and_then(|row| row.pos.get(&A).copied())
+                        .unwrap_or(0)
+                })
+                .collect();
+            assert_eq!(
+                ids,
+                vec![0, 1, 2],
+                "4545's position must move only when 4545's own entry is emitted"
+            );
+        }
+
+        /// AC2. Resuming from the token a page handed back yields every later entry exactly once,
+        /// across ports — no drop at the boundary, no replay.
+        #[test]
+        fn fleet_cursor_walk_is_gapless_and_dupe_free_across_ports() {
+            let first_round = vec![
+                port(
+                    4545,
+                    vec![slice(
+                        A,
+                        vec![entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0)],
+                    )],
+                ),
+                port(
+                    4546,
+                    vec![slice(
+                        B,
+                        vec![entry_at(B, 1, 0, req_at("2026-01-01T00:00:02Z", "/b1"), 0)],
+                    )],
+                ),
+            ];
+            let first = fleet_merge(
+                first_round,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+            assert_eq!(emitted(&first), vec![(4545, "/a1"), (4546, "/b1")]);
+
+            // The same shards, now with one more entry each.
+            let second_round = vec![
+                port(
+                    4545,
+                    vec![slice(
+                        A,
+                        vec![
+                            entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0),
+                            entry_at(A, 2, 0, req_at("2026-01-01T00:00:03Z", "/a2"), 0),
+                        ],
+                    )],
+                ),
+                port(
+                    4546,
+                    vec![slice(
+                        B,
+                        vec![
+                            entry_at(B, 1, 0, req_at("2026-01-01T00:00:02Z", "/b1"), 0),
+                            entry_at(B, 2, 0, req_at("2026-01-01T00:00:04Z", "/b2"), 0),
+                        ],
+                    )],
+                ),
+            ];
+
+            let second = fleet_merge(
+                second_round,
+                Vec::new(),
+                Some(&first.next),
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+
+            assert_eq!(
+                emitted(&second),
+                vec![(4545, "/a2"), (4546, "/b2")],
+                "exactly the entries above the presented position, from both ports"
+            );
+        }
+
+        /// A resumption token taken from the *middle* of a page is absolute: it addresses every
+        /// covered port, so resuming from it replays nothing before it and drops nothing after.
+        #[test]
+        fn a_mid_page_id_resumes_without_gap_or_repeat() {
+            let shards = || {
+                vec![
+                    port(
+                        4545,
+                        vec![slice(
+                            A,
+                            vec![
+                                entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0),
+                                entry_at(A, 2, 0, req_at("2026-01-01T00:00:03Z", "/a2"), 0),
+                            ],
+                        )],
+                    ),
+                    port(
+                        4546,
+                        vec![slice(
+                            B,
+                            vec![
+                                entry_at(B, 1, 0, req_at("2026-01-01T00:00:02Z", "/b1"), 0),
+                                entry_at(B, 2, 0, req_at("2026-01-01T00:00:04Z", "/b2"), 0),
+                            ],
+                        )],
+                    ),
+                ]
+            };
+
+            let page = fleet_merge(
+                shards(),
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+            assert_eq!(
+                emitted(&page),
+                vec![(4545, "/a1"), (4546, "/b1"), (4545, "/a2"), (4546, "/b2")]
+            );
+
+            // A client that received only the first two events and then dropped the connection.
+            let interrupted = page.events[1]
+                .id
+                .clone()
+                .expect("PerEvent folds a token onto every event");
+
+            let resumed = fleet_merge(
+                shards(),
+                Vec::new(),
+                Some(&interrupted),
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+
+            assert_eq!(
+                emitted(&resumed),
+                vec![(4545, "/a2"), (4546, "/b2")],
+                "resume from a mid-page id must deliver exactly the untransmitted tail"
+            );
+        }
+
+        /// AC3. The cap is not silent: what it left out is named, in the answer itself.
+        #[test]
+        fn coverage_states_omitted_ports() {
+            let covered = vec![port(
+                4545,
+                vec![slice(
+                    A,
+                    vec![entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0)],
+                )],
+            )];
+
+            let page = fleet_merge(
+                covered,
+                vec![4546, 4547],
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+
+            assert_eq!(page.coverage.covered, vec![4545]);
+            assert_eq!(
+                page.coverage.omitted,
+                vec![4546, 4547],
+                "an omitted port must be named, not merely counted"
+            );
+            assert_eq!(page.coverage.total(), 3);
+        }
+
+        /// The stream's join: a covered port the reader holds no position for starts at its current
+        /// baseline and replays nothing — upstream's "connect never replays", applied per port.
+        #[test]
+        fn a_live_join_emits_nothing_and_adopts_the_baseline() {
+            let covered = vec![port(
+                4545,
+                vec![slice(
+                    A,
+                    vec![
+                        entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/old"), 0),
+                        entry_at(A, 2, 0, req_at("2026-01-01T00:00:02Z", "/older"), 0),
+                    ],
+                )],
+            )];
+
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Live,
+                IdPolicy::PerEvent,
+            );
+
+            assert!(
+                page.events.is_empty(),
+                "a live join must not replay history"
+            );
+            assert_eq!(
+                page.next.get(4545).and_then(|row| row.pos.get(&A).copied()),
+                Some(2),
+                "but it must adopt the position, or the next drain replays everything"
+            );
+            assert!(
+                page.joined.is_empty(),
+                "`joined` is the read's duplicate warning; a live join has no duplicates to warn about"
+            );
+        }
+
+        /// The read's join: history is served, and the port is named so a resuming client knows
+        /// duplicates are possible for exactly that port.
+        #[test]
+        fn a_replay_join_emits_history_and_names_the_port() {
+            let covered = vec![port(
+                4545,
+                vec![slice(
+                    A,
+                    vec![entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/old"), 0)],
+                )],
+            )];
+
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+
+            assert_eq!(emitted(&page), vec![(4545, "/old")]);
+            assert_eq!(
+                page.joined,
+                vec![4545],
+                "a replayed port must be declared, or the duplicates look like new traffic"
+            );
+        }
+
+        /// Both honesty bits are the OR across covered ports: one degraded port makes the whole
+        /// answer degraded, because the reader cannot tell which row is missing.
+        #[test]
+        fn partial_and_truncated_are_the_or_across_covered_ports() {
+            let healthy = port(
+                4545,
+                vec![slice(
+                    A,
+                    vec![entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0)],
+                )],
+            );
+            let degraded = PortSlices {
+                port: 4546,
+                slices: vec![ShardSlice {
+                    node_id: B,
+                    read: ShardRead {
+                        entries: vec![entry_at(B, 9, 0, req_at("2026-01-01T00:00:02Z", "/b9"), 0)],
+                        // The reader's presented position (0) is below this, so the walk must
+                        // report a real hole.
+                        evicted_below_seq: 5,
+                        clear_gen: 0,
+                        space_gens: Vec::new(),
+                        count_slot: 1,
+                    },
+                }],
+                partial: true,
+            };
+
+            // A cursor that names both ports, so neither is a join and truncation is reachable.
+            let presented = FleetCursor {
+                ports: [
+                    (4545, JournalCursor::start()),
+                    (4546, JournalCursor::start()),
+                ]
+                .into_iter()
+                .collect(),
+            };
+
+            let page = fleet_merge(
+                vec![healthy, degraded],
+                Vec::new(),
+                Some(&presented),
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+
+            assert!(page.partial, "one short port makes the page short");
+            assert!(
+                page.truncated,
+                "one truncated port makes the page truncated"
+            );
+        }
+
+        /// A port that has left coverage loses its row: the token stays bounded by the cap rather
+        /// than growing forever with every port the reader has ever seen.
+        #[test]
+        fn the_page_token_drops_rows_for_ports_that_left_coverage() {
+            let presented = FleetCursor {
+                ports: [
+                    (4545, JournalCursor::start()),
+                    (
+                        4546,
+                        JournalCursor {
+                            generation: 0,
+                            pos: [(B, 7)].into_iter().collect(),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            };
+
+            // Only 4545 is covered this round; 4546 fell out.
+            let page = fleet_merge(
+                vec![port(
+                    4545,
+                    vec![slice(
+                        A,
+                        vec![entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0)],
+                    )],
+                )],
+                vec![4546],
+                Some(&presented),
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+
+            assert!(
+                page.next.get(4546).is_none(),
+                "an uncovered port must not keep a row, or the token is unbounded"
+            );
+            assert!(page.next.get(4545).is_some());
+
+            // The same must hold of the per-event ids, or a mid-page resume would carry a row the
+            // page token has already dropped.
+            for event in &page.events {
+                assert!(
+                    event.id.as_ref().and_then(|id| id.get(4546)).is_none(),
+                    "a per-event id must agree with the page token about membership"
+                );
+            }
+        }
+
+        /// The last event of a drain carries the page token, which additionally covers ranges the
+        /// shards no longer hold — the same rule `tail_page` follows per port, and for the same
+        /// reason: a cursor left at the running fold re-examines cleared ranges forever.
+        #[test]
+        fn the_last_event_of_a_page_carries_the_page_token() {
+            let covered = vec![port(
+                4545,
+                vec![slice(
+                    A,
+                    vec![
+                        entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0),
+                        entry_at(A, 2, 0, req_at("2026-01-01T00:00:02Z", "/a2"), 0),
+                    ],
+                )],
+            )];
+
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PerEvent,
+            );
+
+            let last = page.events.last().expect("two entries were emitted");
+            assert_eq!(last.id.as_ref(), Some(&page.next));
+        }
+
+        /// AC3, at the seam the pure merge cannot reach: ranking reads real shards, so this drives a
+        /// real journal rather than hand-built slices.
+        ///
+        /// Three ports, a cap of two. The two most recently active are covered and the stalest is
+        /// named as omitted — not silently dropped, and not chosen by port order, which is what the
+        /// console's `MERGED_JOURNAL_FANOUT` did.
+        #[test]
+        fn coverage_ranks_by_recency_and_names_what_the_cap_omits() {
+            use crate::stores::journal::{JournalConfig, MonotonicClock};
+            use rift_cluster_base::seams::RequestJournal as _;
+
+            let journal = ClusterJournal::with_parts(
+                1,
+                JournalConfig::default(),
+                Arc::new(MonotonicClock::default()),
+            );
+            // Recorded oldest-first so the stalest port is unambiguous.
+            journal.record(4547, "f", req_at("2026-01-01T00:00:01Z", "/stale"));
+            journal.record(4545, "f", req_at("2026-01-01T00:00:05Z", "/recent"));
+            journal.record(4546, "f", req_at("2026-01-01T00:00:09Z", "/newest"));
+            let net = JournalNet::new(journal);
+
+            let coverage = net.coverage_for(&[4545, 4546, 4547], 2);
+
+            assert_eq!(
+                coverage.covered,
+                vec![4545, 4546],
+                "the two most recently active ports, presented by port"
+            );
+            assert_eq!(
+                coverage.omitted,
+                vec![4547],
+                "the stalest port is named, never silently dropped"
+            );
+            assert_eq!(coverage.total(), 3);
+            assert!(coverage.is_capped());
+        }
+
+        /// Under the cap nothing is omitted and nothing claims to be capped — the ordinary case,
+        /// which must not inherit the capped case's warning.
+        #[test]
+        fn coverage_below_the_cap_omits_nothing() {
+            use crate::stores::journal::{JournalConfig, MonotonicClock};
+            use rift_cluster_base::seams::RequestJournal as _;
+
+            let journal = ClusterJournal::with_parts(
+                1,
+                JournalConfig::default(),
+                Arc::new(MonotonicClock::default()),
+            );
+            journal.record(4545, "f", req_at("2026-01-01T00:00:01Z", "/a"));
+            let net = JournalNet::new(journal);
+
+            let coverage = net.coverage_for(&[4545, 4546], 100);
+
+            assert_eq!(coverage.covered, vec![4545, 4546]);
+            assert!(coverage.omitted.is_empty());
+            assert!(!coverage.is_capped());
+        }
+
+        /// Ranking must not create shards: `known_ports` drives the anti-entropy fan-out, so a port
+        /// merely *considered* for coverage must not thereby enroll itself in every future tick.
+        #[test]
+        fn ranking_does_not_enroll_ports_in_the_anti_entropy_fan_out() {
+            use crate::stores::journal::{JournalConfig, MonotonicClock};
+            use rift_cluster_base::seams::RequestJournal as _;
+
+            let journal = ClusterJournal::with_parts(
+                1,
+                JournalConfig::default(),
+                Arc::new(MonotonicClock::default()),
+            );
+            journal.record(4545, "f", req_at("2026-01-01T00:00:01Z", "/a"));
+            let net = JournalNet::new(Arc::clone(&journal));
+
+            let _ = net.coverage_for(&[4545, 4546, 4547, 4548], 100);
+
+            assert_eq!(
+                journal.known_ports(),
+                vec![4545],
+                "only the port that actually recorded may be known; ranking must not create shards"
+            );
+        }
+
+        /// A port that live-joins emits nothing, so it is easy for it to end up in the page token
+        /// and in **no** per-event id. That gap is silent and permanent: a client that disconnects
+        /// mid-page and resumes from one of those ids presents no row for the joining port, so the
+        /// port live-joins a second time — to a *later* baseline — and everything it served in
+        /// between is never delivered, with no `lagged` and no `truncated` to show for it.
+        ///
+        /// So every covered port's row must appear in every id of the page, whether or not that
+        /// port emitted anything.
+        #[test]
+        fn a_live_joining_port_still_has_a_row_in_every_per_event_id() {
+            let presented = FleetCursor {
+                ports: [(4545, JournalCursor::start())].into_iter().collect(),
+            };
+            let covered = vec![
+                // Emits: the reader holds a position here.
+                port(
+                    4545,
+                    vec![slice(
+                        A,
+                        vec![
+                            entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0),
+                            entry_at(A, 2, 0, req_at("2026-01-01T00:00:02Z", "/a2"), 0),
+                        ],
+                    )],
+                ),
+                // Live-joins: covered, but absent from the presented cursor, so it emits nothing.
+                port(
+                    4546,
+                    vec![slice(
+                        B,
+                        vec![entry_at(B, 5, 0, req_at("2026-01-01T00:00:03Z", "/b5"), 0)],
+                    )],
+                ),
+            ];
+
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                Some(&presented),
+                JoinMode::Live,
+                IdPolicy::PerEvent,
+            );
+
+            assert_eq!(
+                emitted(&page),
+                vec![(4545, "/a1"), (4545, "/a2")],
+                "the joining port replays nothing"
+            );
+            for event in &page.events {
+                let id = event
+                    .id
+                    .as_ref()
+                    .expect("PerEvent folds a token onto every event");
+                assert_eq!(
+                    id.get(4546),
+                    page.next.get(4546),
+                    "every id must carry the joining port's row, or resuming from it re-joins and \
+                     loses whatever that port served in between"
+                );
+            }
+        }
+
+        /// A read asks for no per-event tokens, and must not pay for them: the page token is still
+        /// exact, and every event's id is absent rather than quietly set to something a consumer
+        /// could mistake for a mid-page position.
+        #[test]
+        fn a_page_only_read_folds_no_per_event_tokens() {
+            let covered = vec![port(
+                4545,
+                vec![slice(
+                    A,
+                    vec![
+                        entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0),
+                        entry_at(A, 2, 0, req_at("2026-01-01T00:00:02Z", "/a2"), 0),
+                    ],
+                )],
+            )];
+
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                None,
+                JoinMode::Replay,
+                IdPolicy::PageOnly,
+            );
+
+            assert_eq!(emitted(&page), vec![(4545, "/a1"), (4545, "/a2")]);
+            assert!(
+                page.events.iter().all(|event| event.id.is_none()),
+                "PageOnly must not fold a token per event"
+            );
+            assert_eq!(
+                page.next.get(4545).and_then(|row| row.pos.get(&A).copied()),
+                Some(2),
+                "the page token is still exact"
             );
         }
     }

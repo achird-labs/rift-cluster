@@ -102,6 +102,23 @@ pub struct ClusterArgs {
     )]
     pub cluster_audit_retention: u64,
 
+    /// How many imposters one fleet request-journal answer may cover (issue #362).
+    ///
+    /// The fleet journal (`GET /admin/requests` and its stream) walks the caller's tenant's
+    /// imposters ranked by most recent activity and covers this many. What it leaves out is
+    /// **named** in the answer's `coverage` block, so raising or lowering this changes how much one
+    /// answer covers, never whether a short answer admits to being short.
+    ///
+    /// Node-local, unlike the audit retention above: it bounds the work and the token size of a
+    /// read this node serves, and nothing about it has to agree across the fleet.
+    #[arg(
+        long,
+        value_name = "PORTS",
+        default_value_t = rift_cluster::stores::DEFAULT_FLEET_JOURNAL_PORT_CAP,
+        env = "RIFT_CLUSTER_FLEET_JOURNAL_PORT_CAP"
+    )]
+    pub cluster_fleet_journal_port_cap: usize,
+
     /// Snapshot every N log entries and purge immediately, forcing a lagging node to be caught up
     /// by a real `install_snapshot` over the wire (issue #183).
     ///

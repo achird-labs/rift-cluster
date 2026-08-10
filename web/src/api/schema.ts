@@ -785,6 +785,55 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The tenant's recorded requests across every imposter, merged and resumable
+         * @description Terminates. `GET /imposters/{port}/savedRequests` across every imposter the caller's tenant owns, merged server-side into one ordered, resumable answer.
+         *     **Ordering is the journal's, not the network's.** Rows are ordered by each request's own recorded timestamp. That timestamp is stamped by whichever node served the request, so entries recorded within milliseconds of each other on clock-skewed nodes can still transpose — there is no fleet-wide sequence and this endpoint does not invent one. What it removes is the *other* source of disorder: assembling this view client-side ordered rows by which of N responses arrived first.
+         *     **One cursor, not N.** `cursor` in the response is a single opaque token covering every port this answer covers; pass it back as `since` for the next page. Within the covered set the walk is gapless and duplicate-free per shard, exactly as the per-imposter cursor is. A per-imposter token presented here is refused with a `400` that says so, rather than misread as a fleet position.
+         *     **The cap is stated.** A tenant may own more imposters than one answer covers. Coverage ranks ports by most recent activity and keeps `--cluster-fleet-journal-port-cap` of them (default 100); `coverage.omitted` names every port left out and `coverage.capped` says whether the cap bit at all. Nothing is dropped silently.
+         *     **`joined`** names covered ports that had no position in the presented cursor and whose history was therefore replayed — the ports a resuming client may see duplicates from. On a baseline read (no `since`) that is every covered port, by definition.
+         *     No `match` parameter: the merge path evaluates no predicates, so a predicate-scoped fleet read would answer with the whole tenant's requests instead of the caller's subset. Predicate-scoped reads stay per-imposter.
+         *     Authorized as the ordinary `imposter.read` under `X-Rift-Tenant`. It needs no FleetAdmin gate — unlike `GET /events`, whose payload spans every tenant — because its port set is the caller's tenant's own imposters and nothing else can enter the walk.
+         */
+        get: operations["readFleetRequests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/requests/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Live tail of the tenant's recorded requests across every imposter (SSE)
+         * @description The live sibling of `GET /admin/requests`, and the fleet-wide counterpart of `GET /imposters/{port}/savedRequests/stream`. Answers `text/event-stream`.
+         *     Every property that route documents holds here, for the same reasons and with the same token vocabulary: one contract shared with the cursor read, `Last-Event-ID` resuming gaplessly and without duplicates per shard, and a declared `clusterTailLatencyMs` bounding how late a peer's entry can arrive.
+         *     **Events.** `hello` first, carrying `engineVersion`, `types` (always `["requests"]`), `scope` (always `"fleet"`), `clusterTailLatencyMs`, `cursor`, and `coverage`. Then `request` events whose `data` is `{port, flowId, request}`, plus `index` **only** for entries this node wrote. `coverage` whenever the covered set changes — the cap is dynamic, so a client whose view narrowed or widened is told rather than left to guess. `lagged` when retention evicted entries this reader had not reached. `partial` on every transition of the degraded state. `: ping` every 15 s.
+         *     **A connect never replays**, per port: a port entering coverage — at connect or later — starts from its current position and emits nothing retroactively, so a widening view cannot look like a burst of traffic that never happened. Poll `GET /admin/requests` for history.
+         */
+        get: operations["streamFleetRequests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/sources": {
         parameters: {
             query?: never;
@@ -1159,6 +1208,33 @@ export interface components {
             }[];
         } & {
             [key: string]: unknown;
+        };
+        /** @description One page of the tenant's fleet-wide request journal (issue #362) — the rows, the cursor that fetches the next page, and an explicit statement of which imposters the answer actually speaks for. */
+        FleetRequestPage: {
+            /** @description Recorded requests across the covered imposters, ordered by each request's own recorded timestamp. Each row names the imposter it came from — without that a merged answer is a pile of requests with no way to tell which mock served them. */
+            requests: {
+                /** @description The imposter this request was recorded on. */
+                port: number;
+                /** @description The flow (space) the request was resolved to at record time. */
+                flowId: string;
+                request: components["schemas"]["RecordedRequest"];
+            }[];
+            /** @description Opaque, versioned resumption token covering every port in `coverage.covered`. Pass it back as `since`. Round-trip it unmodified — never parse it. */
+            cursor: string;
+            coverage: components["schemas"]["FleetJournalCoverage"];
+            /** @description Covered ports that had no position in the presented cursor, so their retained history was replayed into this page. A resuming client may see entries here it has already seen; on a baseline read this is every covered port. */
+            joined: number[];
+        };
+        /** @description Which imposters a fleet journal answer speaks for, and which it left out. The cap exists to bound the token size and the walk's cost; this block is what stops it being silent. */
+        FleetJournalCoverage: {
+            /** @description The imposters this answer walked, ascending. */
+            covered: number[];
+            /** @description Every imposter the tenant owns that was considered, covered or not. */
+            total: number;
+            /** @description The imposters the cap excluded, ascending — named rather than counted, so an operator can tell whose traffic they are not looking at. Ports rank by most recent activity, so these are the least recently active. */
+            omitted: number[];
+            /** @description Whether the cap actually excluded anything. */
+            capped: boolean;
         };
         /**
          * @description One request an imposter recorded, exactly as the engine serializes it (upstream `rift-mock-core::imposter::types::RecordedRequest`). Non-exhaustive.
@@ -4405,6 +4481,61 @@ export interface operations {
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
             504: components["responses"]["WriteTimeout"];
+        };
+    };
+    readFleetRequests: {
+        parameters: {
+            query?: {
+                /** @description A cursor token from a previous answer's `cursor` field or `x-rift-next-index` header. Absent means a baseline read: every covered port's retained history. Malformed, wrong-scope and unknown-version tokens are all refused with `400` rather than defaulted — defaulting would either replay the whole journal or silently skip everything recorded since the token went stale. */
+                since?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The merged page, its resumption cursor, and its stated coverage. */
+            200: {
+                headers: {
+                    /** @description The same token as the body's `cursor`, for parity with the per-imposter read. */
+                    "x-rift-next-index"?: string;
+                    /** @description Retention dropped entries this reader had not reached, on at least one covered port. */
+                    "x-rift-truncated"?: boolean;
+                    /** @description At least one covered port's merged view is short — a peer was unreachable, or a crash-restarted writer's entries are gone. Never set by a coverage omission, which is a different fact and is reported in `coverage`. */
+                    "Rift-Cluster-Partial"?: boolean;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FleetRequestPage"];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    streamFleetRequests: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description An open SSE stream. Ends only when the client disconnects or the node stops. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
         };
     };
     listSources: {

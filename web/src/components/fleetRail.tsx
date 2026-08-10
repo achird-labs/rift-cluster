@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 import type { FleetView } from "../app/fleetView.ts";
+import { useFleetRequests } from "../app/queries.ts";
 import { Pending, PendingPanel } from "./pending.tsx";
 
 /**
@@ -157,26 +158,64 @@ export function ControlPlane({ fleet }: { fleet: FleetView | undefined }): React
 }
 
 /**
- * The merged tail.
+ * The merged tail — the newest requests across every imposter the tenant owns (#362).
  *
- * Per-imposter recorded requests do exist (`/imposters/{port}/requests`, merged across writer shards
- * since #223), but a fleet-wide tail across every imposter — which is what the design draws, and
- * what the heading promises — has no endpoint. Assembling one client-side by fanning out across
- * every imposter would be a different thing wearing the same label: N reads on a 5s poll, ordered by
- * whatever came back first, presented as a single ordered stream.
+ * Reads `GET /admin/requests`, which merges the fleet server-side, rather than fanning out across
+ * imposters here: this panel used to be a placeholder precisely because assembling it client-side
+ * would have been a different thing wearing the same label — N reads per poll, ordered by whichever
+ * came back first, presented as one ordered stream.
+ *
+ * "Live" here means polled, like every other live surface in this console: the session is an
+ * HttpOnly cookie and `EventSource` cannot carry the `X-Rift-Tenant` header, so the server's SSE
+ * tail (`/admin/requests/stream`) is not reachable from the browser without a transport this
+ * console does not yet have. The poll shares `useFleetRequests`' cache with the request log, so
+ * opening both costs one read, not two.
+ *
+ * Capped to the newest few rows — this is a rail, not the log. The request log is the whole answer,
+ * and the footer says so rather than letting a truncated rail read as the complete picture.
  */
+const TAIL_ROWS = 8;
+
 function LiveTail(): ReactNode {
+  const fleet = useFleetRequests();
+  const rows = (fleet.data?.rows ?? []).slice(0, TAIL_ROWS);
+
   return (
     <section className="rail-sect" style={{ flex: 1, minHeight: 0 }}>
-      <h2 className="eyebrow">
-        Live tail · merged
-        
-      </h2>
-      {/* `app/pending.ts::mergedTail` is the call site this fills once #362 lands. */}
-      <PendingPanel
-        issue={362}
-        reason="Recorded requests are readable per imposter on the request log. One ordered stream across every imposter is not an endpoint the fleet offers yet."
-      />
+      <h2 className="eyebrow">Live tail · merged</h2>
+      {fleet.isError ? (
+        <p className="muted" data-testid="merged-tail-error">
+          Could not read the fleet journal.
+        </p>
+      ) : rows.length === 0 ? (
+        <p className="muted" data-testid="merged-tail-empty">
+          {fleet.isPending ? "Reading…" : "No requests recorded yet."}
+        </p>
+      ) : (
+        <ul className="tail-list" data-testid="merged-tail">
+          {rows.map((row, index) => (
+            <li
+              // The journal has no fleet-wide identity to key on — that is the whole premise of
+              // #362 — so position within this page is the only stable key available.
+              key={`${String(row.port)}-${String(index)}`}
+              className="tail-line"
+              data-testid="merged-tail-row"
+            >
+              <span className="mono">{row.port}</span>{" "}
+              <span className="mono">{row.request.method}</span>{" "}
+              <span className="tail-path">{row.request.path}</span>
+              {row.request.status === undefined ? null : (
+                <span className="mono muted"> {row.request.status}</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="muted tail-foot">
+        Newest {rows.length === 0 ? "" : `${String(rows.length)} `}across this tenant — ordered by
+        recorded timestamp, so rows from different imposters are about this order rather than a
+        sequence. The request log is the full journal.
+      </p>
     </section>
   );
 }

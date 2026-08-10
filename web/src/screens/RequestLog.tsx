@@ -2,9 +2,8 @@ import { type ReactNode, useState } from "react";
 
 import type { components } from "../api/schema.ts";
 import {
-  MERGED_JOURNAL_FANOUT,
-  useAllRequests,
   useClearRequests,
+  useFleetRequests,
   useImposter,
   useImposters,
   useRequestLog,
@@ -829,25 +828,25 @@ function formatQuery(query: Record<string, string> | undefined): string {
 /**
  * The fleet request journal — every imposter's recorded traffic in one table.
  *
- * The design's screen, assembled rather than read. There is no fleet-wide journal endpoint (#362):
- * what exists is per-imposter, each already merged across the fleet's writer shards. So this reads
- * several and orders the union by recorded timestamp.
+ * Read, not assembled: `useFleetRequests` is one call to `GET /admin/requests` (#362), which walks
+ * every imposter the caller's tenant owns and merges them server-side. This screen renders that
+ * page and states what the response itself says about it — the coverage cap, and the ordering
+ * guarantee the endpoint documents.
  *
- * The panel states that, because the ordering is the part that cannot be guaranteed. Within one
- * imposter the vector cursor makes the sequence authoritative; across imposters the timestamps come
- * from whichever node served each request, so clock skew can transpose two entries recorded
- * milliseconds apart. Adjacent rows from different ports are "about this order", and an operator
- * reasoning about causality between two mocks needs to know that before they do it.
+ * The ordering caveat stays even though the merge is now the server's: rows are ordered by each
+ * request's own recorded timestamp, which is stamped by whichever node served it. Clock skew
+ * between nodes can still transpose two entries recorded milliseconds apart, so adjacent rows from
+ * different imposters are "about this order" rather than a known sequence — an operator reasoning
+ * about causality between two mocks needs to know that before they do it.
  */
 function MergedJournal(): ReactNode {
   const imposters = useImposters();
-  const ports = (imposters.data?.imposters ?? []).flatMap((imposter) =>
-    imposter.port === undefined ? [] : [imposter.port],
-  );
   const named = new Map(
     (imposters.data?.imposters ?? []).map((imposter) => [imposter.port, imposter.name] as const),
   );
-  const { rows, pending, failed, capped } = useAllRequests(ports);
+  const fleet = useFleetRequests();
+  const rows = fleet.data?.rows ?? [];
+  const coverage = fleet.data?.coverage ?? null;
 
   return (
     <section className="screen">
@@ -861,7 +860,10 @@ function MergedJournal(): ReactNode {
       {imposters.isError ? (
         <ErrorNote error={imposters.error} context="Could not read the imposter list" />
       ) : null}
-      {imposters.isPending || pending ? <p className="muted">Reading…</p> : null}
+      {fleet.isError ? (
+        <ErrorNote error={fleet.error} context="Could not read the fleet request journal" />
+      ) : null}
+      {imposters.isPending || fleet.isPending ? <p className="muted">Reading…</p> : null}
 
       {/*
        * The caveat rides above the table, permanently, and is not dismissible: it qualifies every
@@ -873,18 +875,17 @@ function MergedJournal(): ReactNode {
           &#9670;
         </span>
         <div>
-          <strong>Merged by this console, not by the fleet.</strong>
+          <strong>Ordered by recorded timestamp, not by a fleet-wide sequence.</strong>
           <p>
-            Each imposter&rsquo;s journal is authoritative on its own — merged across the writer
-            shards and ordered by a vector cursor. This table unions several of them and sorts by
-            recorded timestamp, so two rows from <em>different</em> ports are in about this order
-            rather than in a known one: the timestamps come from whichever node served each request.
-            A fleet-wide journal is <a href="https://github.com/achird-labs/rift-cluster/issues/362" target="_blank" rel="noreferrer">#362</a>.
+            Rows are ordered by each request&rsquo;s own recorded timestamp, stamped by whichever
+            node served it. Clock skew between nodes can still transpose two entries recorded
+            within milliseconds of each other, so two rows from <em>different</em> imposters are in
+            about this order rather than a known one — adjacent rows are not necessarily a sequence.
           </p>
         </div>
       </div>
 
-      {capped > 0 || failed > 0 ? (
+      {coverage?.capped ? (
         <div className="banner warn" data-testid="merged-journal-partial" role="status">
           <span className="b-glyph" aria-hidden="true">
             &#9650;
@@ -892,19 +893,20 @@ function MergedJournal(): ReactNode {
           <div>
             <strong>This is not the whole fleet.</strong>
             <p>
-              {capped > 0
-                ? `${String(capped)} imposter${capped === 1 ? " was" : "s were"} not read — the fan-out is capped at ${String(MERGED_JOURNAL_FANOUT)}, because this screen polls every two seconds. `
-                : ""}
-              {failed > 0
-                ? `${String(failed)} read failed. `
-                : ""}
-              Open an imposter&rsquo;s own log for a complete answer about it.
+              {/*
+                Rendered only when `coverage.capped`, and the server sets that exactly when
+                `omitted` is non-empty — so there is always at least one port to name here, and
+                no empty or zero case to branch on.
+              */}
+              {coverage.omitted.length} of {coverage.total} imposters were left out of this page —
+              ports {coverage.omitted.join(", ")}. Open an imposter&rsquo;s own log for a complete
+              answer about it.
             </p>
           </div>
         </div>
       ) : null}
 
-      {rows.length === 0 && !pending ? (
+      {rows.length === 0 && !fleet.isPending && !fleet.isError ? (
         <Empty
           testId="merged-journal-empty"
           title="No requests recorded across this tenant"
@@ -917,7 +919,7 @@ function MergedJournal(): ReactNode {
           <div className="card-head">
             <h2>Fleet request journal</h2>
             <span className="muted">
-              {rows.length} across {Math.min(ports.length, MERGED_JOURNAL_FANOUT)} imposters
+              {rows.length} across {coverage?.covered.length ?? 0} imposters
             </span>
             <div className="spacer" />
             <span className="muted">node, status and latency are not recorded per request</span>
