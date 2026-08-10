@@ -56,18 +56,15 @@ export function parkedIntents(): Pending<number> {
   return pending(360);
 }
 
-/**
- * A peer's applied index.
+/*
+ * `peerApplied(nodeId)` lived here until #361 built the projection it was waiting for.
  *
- * Not merely unbuilt: the console is served under `default-src 'self'`, so the page can only ever
- * dial the node serving it. This can only arrive through a fleet-wide projection the serving node
- * assembles — which is what the issue asks for.
- *
- * @see https://github.com/achird-labs/rift-cluster/issues/361
+ * Its reason for existing is worth keeping, because it is the shape of every remaining entry in
+ * this file: the console is served under `default-src 'self'`, so the page can only ever dial the
+ * node that served it, and a peer's applied index was therefore unreachable from the browser *by
+ * construction* — not merely unbuilt. `/_fleet/members` now folds each voter's own report into one
+ * body, and `FleetView.members` carries it.
  */
-export function peerApplied(_nodeId: string): Pending<number> {
-  return pending(361);
-}
 
 /** One line of the merged tail, once there is one to read. */
 export type TailLine = {

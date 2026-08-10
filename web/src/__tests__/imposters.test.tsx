@@ -640,3 +640,71 @@ describe("the fleet-sum request tile (#363)", () => {
     expect(screen.getByText(/not every imposter in this response carried a count/i)).toBeTruthy();
   });
 });
+
+describe("the control-plane panel's per-voter applied indices (#361)", () => {
+  const MEMBERS = {
+    node_id: "2",
+    is_leader: false,
+    current_leader: "1",
+    last_applied: 412,
+    voters: ["1", "2", "3"],
+    members: [
+      { node_id: "1", last_applied: 415, is_leader: true, reachable: true },
+      { node_id: "2", last_applied: 412, is_leader: false, reachable: true },
+      { node_id: "3", last_applied: null, is_leader: null, reachable: false },
+    ],
+  };
+  const HEALTH = {
+    ready: true,
+    state: "ready",
+    pending_gates: [],
+    isolated: false,
+    ring: { m_idx: 7, members: ["1", "2", "3"] },
+  };
+
+  it("shows each voter's own applied index, not just this node's", async () => {
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/_fleet/members": { json: MEMBERS },
+      "/_fleet/health": { json: HEALTH },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+
+    // The peer's index is the point: before #361 only this node's row carried a number.
+    expect((await screen.findByTestId("applied-1")).textContent).toBe("415");
+    expect((await screen.findByTestId("applied-2")).textContent).toBe("412");
+  });
+
+  /*
+   * A voter that did not answer has an unknown index. Rendering `0` would say "that node has
+   * applied nothing" — an alarm about the fleet raised by a fan-out that merely timed out.
+   */
+  it("renders an unreachable voter as unknown, never as zero", async () => {
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/_fleet/members": { json: MEMBERS },
+      "/_fleet/health": { json: HEALTH },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+
+    const cell = await screen.findByTestId("applied-3");
+    expect(cell.textContent).toBe("—");
+    expect(cell.textContent).not.toBe("0");
+    // And it says which of the two unknowns it is.
+    expect(cell.getAttribute("title")).toMatch(/did not answer/i);
+  });
+
+  // The list is the membership. A voter whose row is missing must still appear, or the panel
+  // reports a fleet that shrank when the truth is one node was slow.
+  it("still lists a voter the projection carried no row for", async () => {
+    stubFetch({
+      "/imposters": { json: TWO },
+      "/_fleet/members": { json: { ...MEMBERS, members: [MEMBERS.members[0]] } },
+      "/_fleet/health": { json: HEALTH },
+    });
+    renderInApp(<Imposters />, { whoami: whoamiWith("fleet-admin") });
+
+    expect((await screen.findByTestId("applied-1")).textContent).toBe("415");
+    expect((await screen.findByTestId("applied-3")).textContent).toBe("—");
+  });
+});

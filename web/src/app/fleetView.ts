@@ -37,6 +37,29 @@ export type FleetView = {
   /** A one-voter fleet is a supported deployment, not a fleet missing two nodes. */
   singleNode: boolean;
   degraded: Degradation[];
+  /**
+   * What each voter reports about itself (#361), keyed by node id.
+   *
+   * The console is served under `default-src 'self'`, so the page can only ever dial the node that
+   * served it — a peer's applied index is unreachable from the browser by construction and arrives
+   * only through this projection, which the serving node assembles by asking each peer.
+   *
+   * Keyed rather than an array so `voters` stays the single source of *who is in the fleet*: a row
+   * is looked up, and a voter with no row renders as unknown rather than disappearing from the
+   * list. A membership that shrank because a peer was slow is the one thing this panel must not
+   * show.
+   */
+  members: Map<string, MemberRow>;
+};
+
+/** One voter's own report, as the members projection carries it (#361). */
+export type MemberRow = {
+  /** `null` when that node did not answer — an unknown index, never `0`. */
+  lastApplied: number | null;
+  /** `null` when that node did not answer. */
+  isLeader: boolean | null;
+  /** Whether the serving node got an answer from this voter inside its fan-out budget. */
+  reachable: boolean;
 };
 
 export function fleetView(members: FleetMembers, health: FleetHealth): FleetView {
@@ -87,6 +110,21 @@ export function fleetView(members: FleetMembers, health: FleetHealth): FleetView
     // which is a fault, not the supported single-node deployment.
     singleNode: members.voters.length === 1,
     degraded,
+    /*
+     * `?? []` is a domain-optional read, not a swallowed failure: `members` is optional in the
+     * contract, so a response without it is a shape the schema permits and every voter simply
+     * reads as unknown — which is exactly what this panel showed before #361 published the rows.
+     */
+    members: new Map(
+      (members.members ?? []).map((row) => [
+        row.node_id,
+        {
+          lastApplied: row.last_applied ?? null,
+          isLeader: row.is_leader ?? null,
+          reachable: row.reachable,
+        },
+      ]),
+    ),
   };
 }
 

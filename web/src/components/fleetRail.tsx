@@ -112,28 +112,42 @@ export function ControlPlane({ fleet }: { fleet: FleetView | undefined }): React
     <section className="rail-sect">
       <h2 className="eyebrow">Control plane</h2>
       <div style={{ display: "flex", flexDirection: "column", gap: "9px" }}>
+        {/*
+          Iterated over `voters`, not over the rows. Membership is what this panel is a list of, so
+          a voter whose row is missing must still appear — showing a shorter list would report a
+          fleet that shrank, when the truth is one node did not answer.
+        */}
         {fleet.voters.map((id) => {
           const isSelf = id === fleet.nodeId;
           const isLeader = id === fleet.leader;
+          const row = fleet.members.get(id);
+          // Self is answered from the top-level read either way: this node never has to ask itself,
+          // so its index is known even when the fan-out reached nobody.
+          const applied = isSelf ? fleet.lastApplied : (row?.lastApplied ?? null);
+          const unreachable = !isSelf && row?.reachable === false;
           return (
             <div className={`node-row${isSelf ? " is-self" : ""}`} key={id}>
               <span className={`dot ${isLeader ? "is-good" : "is-idle"}`} aria-hidden="true" />
               <span className="nid nobreak">{id}</span>
               {isLeader ? <span className="tag">leader</span> : null}
-              {isSelf && fleet.lastApplied !== null ? (
-                <span className="applied">{fleet.lastApplied}</span>
-              ) : (
-                <span className="applied">
-                  <Pending
-                    issue={361}
-                    reason={
-                      isSelf
-                        ? "This node reported no applied index."
-                        : "The console is served under connect-src 'self', so it can only ever query its own node. A peer's applied index needs a fleet-wide projection the serving node assembles."
-                    }
-                  />
-                </span>
-              )}
+              {/*
+                `—` for an index this node could not obtain, never `0`. A zero here reads as "that
+                node has applied nothing", which is an alarm about the fleet raised by a fan-out
+                that merely timed out. The title says which of the two it is.
+              */}
+              <span
+                className="applied"
+                data-testid={`applied-${id}`}
+                title={
+                  applied !== null
+                    ? undefined
+                    : unreachable
+                      ? "This node did not answer inside the members fan-out budget, so its applied index is unknown."
+                      : "No applied index was reported for this voter."
+                }
+              >
+                {applied ?? "—"}
+              </span>
             </div>
           );
         })}
