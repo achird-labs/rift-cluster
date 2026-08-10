@@ -893,11 +893,14 @@ function MergedJournal(): ReactNode {
           <div>
             <strong>This is not the whole fleet.</strong>
             <p>
-              {coverage.omitted.length} of {coverage.total} imposter
-              {coverage.total === 1 ? "" : "s"} {coverage.omitted.length === 1 ? "was" : "were"}{" "}
-              left out of this page
-              {coverage.omitted.length > 0 ? ` — ports ${coverage.omitted.join(", ")}. ` : ". "}
-              Open an imposter&rsquo;s own log for a complete answer about it.
+              {/*
+                Rendered only when `coverage.capped`, and the server sets that exactly when
+                `omitted` is non-empty — so there is always at least one port to name here, and
+                no empty or zero case to branch on.
+              */}
+              {coverage.omitted.length} of {coverage.total} imposters were left out of this page —
+              ports {coverage.omitted.join(", ")}. Open an imposter&rsquo;s own log for a complete
+              answer about it.
             </p>
           </div>
         </div>

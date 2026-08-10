@@ -3139,13 +3139,17 @@ fn terminate_stream_fleet_requests(
         }
     };
 
-    let ports = match fleet_ports(state, tenant) {
-        Ok(ports) => ports,
-        Err(response) => return response,
-    };
+    // Resolved once here only to fail fast — a caller whose tenant cannot be read should get a
+    // status code, not an SSE stream that dies on its first drain. The value is deliberately NOT
+    // carried into the task: see the re-resolution inside the loop.
+    if let Err(response) = fleet_ports(state, tenant) {
+        return response;
+    }
 
     let journal_net = Arc::clone(&state.journal_net);
     let cap = state.fleet_journal_port_cap;
+    let owner = Arc::clone(state);
+    let subject = tenant.clone();
     let tail_latency = journal_net.tail_latency();
     let this_node = journal_net.node_id();
 
@@ -3159,6 +3163,8 @@ fn terminate_stream_fleet_requests(
     // A plain connect is live-only — every covered port adopts its baseline and replays nothing,
     // which is `JoinMode::Live` applied across the set. A reconnect starts from the presented
     // token, so its first drain IS the catch-up, and that is where zero-loss comes from.
+    // The set as it stands at connect, for `hello` only. Every drain re-derives its own.
+    let ports = fleet_ports(state, tenant).unwrap_or_default();
     let (mut cursor, mut drain_now) = match resume {
         Some(cursor) => (cursor, true),
         None => (
@@ -3199,6 +3205,19 @@ fn terminate_stream_fleet_requests(
         loop {
             if drain_now {
                 drain_now = false;
+                // **Re-resolved every drain, never captured.** A stream lives indefinitely and the
+                // tenant's imposter set does not: a port can be deleted and the number reissued to
+                // another tenant, and an imposter created after the connect belongs in the walk. A
+                // set frozen at connect would keep reading a shard this tenant no longer owns —
+                // emitting another tenant's recorded requests to a connection that was authorized
+                // before the handover — and would never show a new imposter at all. The read path
+                // re-resolves per request for the same reason; this is what makes the two agree
+                // about what "the tenant's fleet" means at any instant.
+                let Ok(ports) = fleet_ports(&owner, &subject) else {
+                    // Only reachable when the node is shutting down. Ending the stream is the
+                    // honest answer — the client reconnects and gets a status code.
+                    return;
+                };
                 let page = journal_net.fleet_page(
                     &ports,
                     cap,

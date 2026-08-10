@@ -62,28 +62,6 @@ export const ISSUE_URL = (issue: number): string =>
  * body, and `FleetView.members` carries it.
  */
 
-/** One line of the merged tail, once there is one to read. */
-export type TailLine = {
-  timestamp: string;
-  node: string;
-  port: number;
-  request: string;
-  status: number;
-};
-
-/**
- * The fleet-wide request tail, across every imposter.
- *
- * Per-imposter merged reads exist (#223, and #348's SSE tail). One ordered stream across all of them
- * does not, and fanning out client-side would produce an ordering that is an artifact of network
- * timing rather than of the journal — the exact thing the vector cursor exists to prevent.
- *
- * @see https://github.com/achird-labs/rift-cluster/issues/362
- */
-export function mergedTail(): Pending<readonly TailLine[]> {
-  return pending(362);
-}
-
 /**
  * How many requests an imposter has served.
  *

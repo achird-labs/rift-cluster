@@ -509,26 +509,67 @@ fn fleet_stream_order(per_port: Vec<(u16, Vec<ShardEntry>)>) -> Vec<(u16, ShardE
         shard.make_contiguous().sort_by_key(|entry| entry.seq);
     }
 
+    // A heap over the shard heads rather than a rescan per emitted entry.
+    //
+    // `stream_order` one level down rescans, and is right to: its shard count is the *node* count,
+    // so the scan is a handful of comparisons. Here the shard count is `covered ports × nodes` —
+    // up to a few hundred at the default cap — and this runs on every drain of every open tail, so
+    // the same shape would be `O(entries × shards)` string comparisons on the hot path. The heap
+    // makes it `O(entries × log shards)` for byte-identical output: the ordering rule lives in
+    // `Head`'s `Ord`, which is the merge comparator verbatim.
+    #[derive(PartialEq, Eq)]
+    struct Head {
+        timestamp: String,
+        port: u16,
+        node: NodeId,
+        seq: u64,
+    }
+    impl Ord for Head {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            // Reversed at the end so `BinaryHeap`'s max-heap pops the *smallest* head, which is the
+            // one the merge order emits next.
+            self.timestamp
+                .cmp(&other.timestamp)
+                .then_with(|| self.port.cmp(&other.port))
+                .then_with(|| self.node.cmp(&other.node))
+                .then_with(|| self.seq.cmp(&other.seq))
+                .reverse()
+        }
+    }
+    impl PartialOrd for Head {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let head_of = |shard: &std::collections::VecDeque<ShardEntry>, port: u16| {
+        shard.front().map(|entry| Head {
+            timestamp: entry.request.timestamp.clone(),
+            port,
+            node: entry.node_id,
+            seq: entry.seq,
+        })
+    };
+
+    let mut heap = std::collections::BinaryHeap::with_capacity(by_shard.len());
+    for ((port, node), shard) in &by_shard {
+        if let Some(head) = head_of(shard, *port) {
+            debug_assert_eq!(head.node, *node, "a shard's entries all share its node");
+            heap.push(head);
+        }
+    }
+
     let mut out = Vec::with_capacity(by_shard.values().map(std::collections::VecDeque::len).sum());
-    loop {
-        let next = by_shard
-            .iter()
-            .filter_map(|(key, shard)| shard.front().map(|entry| (*key, entry)))
-            .min_by(|((a_port, a_node), a), ((b_port, b_node), b)| {
-                a.request
-                    .timestamp
-                    .cmp(&b.request.timestamp)
-                    .then_with(|| a_port.cmp(b_port))
-                    .then_with(|| a_node.cmp(b_node))
-                    .then_with(|| a.seq.cmp(&b.seq))
-            })
-            .map(|(key, _)| key);
-        let Some(key) = next else { break };
-        if let Some(entry) = by_shard
-            .get_mut(&key)
-            .and_then(std::collections::VecDeque::pop_front)
-        {
-            out.push((key.0, entry));
+    while let Some(head) = heap.pop() {
+        let key = (head.port, head.node);
+        let Some(shard) = by_shard.get_mut(&key) else {
+            continue;
+        };
+        if let Some(entry) = shard.pop_front() {
+            out.push((head.port, entry));
+        }
+        if let Some(next_head) = head_of(shard, head.port) {
+            heap.push(next_head);
         }
     }
     out
@@ -572,6 +613,10 @@ pub(crate) fn fleet_merge(
     let mut joined = Vec::new();
     let mut per_port: Vec<(u16, Vec<ShardEntry>)> = Vec::new();
     let mut covered_ports = Vec::with_capacity(covered.len());
+    // Where each covered port's row starts for the per-event fold. Built alongside `next` rather
+    // than derived from the presented cursor alone, because a port can be covered while the cursor
+    // holds no row for it — see the seeding note below.
+    let mut seeds: Vec<(u16, JournalCursor)> = Vec::new();
     let mut partial = false;
     let mut truncated = false;
 
@@ -589,32 +634,46 @@ pub(crate) fn fleet_merge(
         truncated |= since.truncated;
 
         match (held, join) {
-            // A position this reader already holds: serve what is above it.
-            (Some(_), _) => per_port.push((port, since.entries)),
-            // A read joining a port: serve its history, and say so.
-            (None, JoinMode::Replay) => {
-                joined.push(port);
+            // A position this reader already holds: serve what is above it, and fold from there.
+            (Some(row), _) => {
+                seeds.push((port, row.clone()));
                 per_port.push((port, since.entries));
             }
-            // A stream joining a port: adopt the baseline below and emit nothing. `since.entries`
-            // is deliberately dropped — that is what "a connect never replays" means per port.
-            (None, JoinMode::Live) => {}
+            // A read joining a port: serve its history, and say so. The fold starts at no
+            // consumed position — that is what a replay means — but at the *current* generation,
+            // so a mid-page id is never behind its own page token.
+            (None, JoinMode::Replay) => {
+                joined.push(port);
+                seeds.push((
+                    port,
+                    JournalCursor {
+                        generation: since.next.generation,
+                        pos: BTreeMap::new(),
+                    },
+                ));
+                per_port.push((port, since.entries));
+            }
+            // A stream joining a port: adopt the baseline and emit nothing. `since.entries` is
+            // deliberately dropped — that is what "a connect never replays" means per port.
+            //
+            // The seed is the baseline itself, not an absent row, and that is load-bearing: this
+            // port emits nothing, so if it had no seed it would appear in `next` but in no
+            // per-event id. A client that disconnected mid-page and resumed from one of those ids
+            // would present a cursor with no row for this port, live-join it a *second* time to a
+            // now-later baseline, and never receive anything it served in between — silently, with
+            // no `lagged` and no `truncated`. Seeding it keeps every id in the page agreeing with
+            // the page token about this port.
+            (None, JoinMode::Live) => seeds.push((port, since.next.clone())),
         }
         next.ports.insert(port, since.next);
     }
 
-    let covered_set: std::collections::BTreeSet<u16> = covered_ports.iter().copied().collect();
+    // Exactly the covered ports, each at the position its own arm above chose. Membership therefore
+    // matches `next` in **both** directions: no row `next` dropped (a port that left coverage), and
+    // no row `next` has that an id lacks (a port that joined). Either mismatch is a silent hole at
+    // a mid-page resume, which is the one failure a per-event token exists to prevent.
     let mut running = FleetCursor {
-        ports: cursor
-            .map(|cursor| {
-                cursor
-                    .ports
-                    .iter()
-                    .filter(|(port, _)| covered_set.contains(port))
-                    .map(|(port, row)| (*port, row.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        ports: seeds.into_iter().collect(),
     };
 
     let ordered = fleet_stream_order(per_port);
@@ -1164,6 +1223,19 @@ impl JournalNet {
             })
             .collect();
 
+        // KNOWN COST, stated rather than hidden: the read guard is held across the entry clones
+        // below, and this loop spans the whole covered set rather than one port.
+        //
+        // A cursored drain clones only what is above each shard's position, which is small — that
+        // is the shape this endpoint is built for. A *baseline* read clones every retained entry of
+        // every covered port on every peer, still under the guard, and parking_lot is fair, so a
+        // `merge_reply` writer queued behind it delays every reader behind that. The console polls
+        // baselines today, so this is reachable rather than theoretical.
+        //
+        // Not fixed here because the fix is not local: hoisting the clone out means holding
+        // `Arc<CachedShard>` in `replicas`, which changes `merge_reply`'s in-place mutation and
+        // every other reader of the cache (issues #223/#340). That is its own change with its own
+        // tests, not a rider on this one.
         for ((node_id, port), cached) in self.replicas.read().iter() {
             let Some(bucket) = by_port.get_mut(port) else {
                 continue;
@@ -4230,6 +4302,68 @@ mod tests {
                 vec![4545],
                 "only the port that actually recorded may be known; ranking must not create shards"
             );
+        }
+
+        /// A port that live-joins emits nothing, so it is easy for it to end up in the page token
+        /// and in **no** per-event id. That gap is silent and permanent: a client that disconnects
+        /// mid-page and resumes from one of those ids presents no row for the joining port, so the
+        /// port live-joins a second time — to a *later* baseline — and everything it served in
+        /// between is never delivered, with no `lagged` and no `truncated` to show for it.
+        ///
+        /// So every covered port's row must appear in every id of the page, whether or not that
+        /// port emitted anything.
+        #[test]
+        fn a_live_joining_port_still_has_a_row_in_every_per_event_id() {
+            let presented = FleetCursor {
+                ports: [(4545, JournalCursor::start())].into_iter().collect(),
+            };
+            let covered = vec![
+                // Emits: the reader holds a position here.
+                port(
+                    4545,
+                    vec![slice(
+                        A,
+                        vec![
+                            entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0),
+                            entry_at(A, 2, 0, req_at("2026-01-01T00:00:02Z", "/a2"), 0),
+                        ],
+                    )],
+                ),
+                // Live-joins: covered, but absent from the presented cursor, so it emits nothing.
+                port(
+                    4546,
+                    vec![slice(
+                        B,
+                        vec![entry_at(B, 5, 0, req_at("2026-01-01T00:00:03Z", "/b5"), 0)],
+                    )],
+                ),
+            ];
+
+            let page = fleet_merge(
+                covered,
+                Vec::new(),
+                Some(&presented),
+                JoinMode::Live,
+                IdPolicy::PerEvent,
+            );
+
+            assert_eq!(
+                emitted(&page),
+                vec![(4545, "/a1"), (4545, "/a2")],
+                "the joining port replays nothing"
+            );
+            for event in &page.events {
+                let id = event
+                    .id
+                    .as_ref()
+                    .expect("PerEvent folds a token onto every event");
+                assert_eq!(
+                    id.get(4546),
+                    page.next.get(4546),
+                    "every id must carry the joining port's row, or resuming from it re-joins and \
+                     loses whatever that port served in between"
+                );
+            }
         }
 
         /// A read asks for no per-event tokens, and must not pay for them: the page token is still
