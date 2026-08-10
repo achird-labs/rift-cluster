@@ -1,8 +1,8 @@
 # Observability pack
 
-Prometheus + Grafana for the 3-node `rift-cluster` compose (issue #227,
-RFC-003 SS5/SS6). This closes the latency-analytics parity line without
-building a TSDB: every target customer already runs Prometheus, so this pack
+Prometheus + Grafana for the 3-node `rift-cluster` compose (issue #227).
+This closes the fleet latency-analytics gap without building a TSDB:
+anyone running a fleet already runs Prometheus, so this pack
 ships the scrape config, the recording/alert rules, and the dashboards that
 make a rift fleet correct to observe — not a hosted metrics backend.
 

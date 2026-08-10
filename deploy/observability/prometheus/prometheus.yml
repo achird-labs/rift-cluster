@@ -1,5 +1,4 @@
-# Prometheus config for the rift-cluster observability pack (issue #227,
-# RFC-003 SS5/SS6).
+# Prometheus config for the rift-cluster observability pack (issue #227).
 #
 # One `rift-cluster` job scrapes all three compose nodes directly, by their
 # docker-compose service names, rather than through any service discovery
