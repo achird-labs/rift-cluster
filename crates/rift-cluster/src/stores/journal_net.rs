@@ -423,6 +423,20 @@ pub(crate) struct PortSlices {
     pub partial: bool,
 }
 
+/// Whether every event carries its own resumption token (issue #362).
+///
+/// A stream needs one per event, because a client can disconnect between any two of them. A read
+/// needs only the page token — and paying the per-event fold anyway is not a rounding error: the
+/// token is a map over every covered port, so folding one per entry makes a baseline read allocate
+/// `entries x covered ports` cursors to produce a value nothing reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdPolicy {
+    /// Fold a token per event — an SSE `id:` line.
+    PerEvent,
+    /// Produce [`FleetPage::next`] only; every [`FleetTailEvent::id`] is `None`.
+    PageOnly,
+}
+
 /// One entry of a fleet tail, tagged with the port it came from and carrying the *whole fleet*
 /// position a client resumes from if this is the last event it receives (issue #362).
 ///
@@ -432,7 +446,14 @@ pub(crate) struct PortSlices {
 pub struct FleetTailEvent {
     pub port: u16,
     pub entry: ShardEntry,
-    pub id: FleetCursor,
+    /// `Some` under [`IdPolicy::PerEvent`], `None` under [`IdPolicy::PageOnly`].
+    ///
+    /// A consumer that finds `None` where it wanted a token must **omit the `id:` line**, never
+    /// substitute the page token: the page token is the position *after the whole drain*, so
+    /// handing it to a client mid-page would advance them past entries they have not received —
+    /// silent loss. Omitting the line instead leaves the client on its previous id, which costs a
+    /// duplicate on reconnect and loses nothing.
+    pub id: Option<FleetCursor>,
 }
 
 /// One drain of the fleet walk — [`JournalNet::fleet_page`]'s answer.
@@ -545,6 +566,7 @@ pub(crate) fn fleet_merge(
     omitted: Vec<u16>,
     cursor: Option<&FleetCursor>,
     join: JoinMode,
+    ids: IdPolicy,
 ) -> FleetPage {
     let mut next = FleetCursor::default();
     let mut joined = Vec::new();
@@ -599,20 +621,25 @@ pub(crate) fn fleet_merge(
     let last = ordered.len().saturating_sub(1);
     let mut events = Vec::with_capacity(ordered.len());
     for (index, (port, entry)) in ordered.into_iter().enumerate() {
-        let row = running
-            .ports
-            .entry(port)
-            .or_insert_with(JournalCursor::start);
-        *row = advanced_by(row, &entry);
-        // The last event carries the page token rather than the running fold, for `tail_page`'s
-        // reason one level down: they agree about everything delivered, but the page token
-        // additionally covers ranges the shards hold and did not surface (evicted, or dropped by a
-        // clear generation), so a stream left at the running fold would re-examine and re-reject
-        // them on every wake for the life of the connection.
-        let id = if index == last {
-            next.clone()
-        } else {
-            running.clone()
+        let id = match ids {
+            IdPolicy::PageOnly => None,
+            IdPolicy::PerEvent => {
+                let row = running
+                    .ports
+                    .entry(port)
+                    .or_insert_with(JournalCursor::start);
+                *row = advanced_by(row, &entry);
+                // The last event carries the page token rather than the running fold, for
+                // `tail_page`'s reason one level down: they agree about everything delivered, but
+                // the page token additionally covers ranges the shards hold and did not surface
+                // (evicted, or dropped by a clear generation), so a stream left at the running fold
+                // would re-examine and re-reject them on every wake for the life of the connection.
+                Some(if index == last {
+                    next.clone()
+                } else {
+                    running.clone()
+                })
+            }
         };
         events.push(FleetTailEvent { port, entry, id });
     }
@@ -803,6 +830,15 @@ const COUNTS_PATH: &str = "/_cluster/journal/counts";
 /// here — every node pulls every peer, since this journal has no owner) heals
 /// within one tick.
 pub const DEFAULT_ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many imposters one fleet journal answer covers by default (issue #362).
+///
+/// Four times what the console silently truncated to before this existed, and chosen against the
+/// two costs a higher number actually pays: the resumption token carries a row per covered port and
+/// has to survive a `Last-Event-ID` header (measured at roughly a fifth of an 8 KiB budget here),
+/// and each covered port is one more shard the walk touches per drain. Above the cap the answer
+/// says what it left out — a stated cap is the point, not the number.
+pub const DEFAULT_FLEET_JOURNAL_PORT_CAP: usize = 100;
 
 /// Budget for one whole anti-entropy tick, across every `(peer, port)` pair — the same shape as
 /// [`Self::merge_read`]'s per-read budget, scoped to the tick as a whole rather than one pull: a
@@ -1014,10 +1050,11 @@ impl JournalNet {
         cap: usize,
         cursor: Option<&FleetCursor>,
         join: JoinMode,
+        ids: IdPolicy,
     ) -> FleetPage {
         let coverage = self.coverage_for(ports, cap);
         let covered = self.covered_slices(&coverage.covered, cursor);
-        fleet_merge(covered, coverage.omitted, cursor, join)
+        fleet_merge(covered, coverage.omitted, cursor, join, ids)
     }
 
     /// Split `ports` into the most recently active `cap` and the rest (issue #362).
@@ -3643,7 +3680,7 @@ mod tests {
                 ),
             ];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay);
+            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
 
             assert_eq!(
                 emitted(&page),
@@ -3688,7 +3725,7 @@ mod tests {
                 ),
             ];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay);
+            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
 
             // Within 4545 the two entries stay in **seq** order (1 then 2) even though their
             // timestamps are inverted — that is the per-shard guarantee, and it is what makes the
@@ -3719,7 +3756,8 @@ mod tests {
                 .map(|event| {
                     event
                         .id
-                        .get(4545)
+                        .as_ref()
+                        .and_then(|id| id.get(4545))
                         .and_then(|row| row.pos.get(&A).copied())
                         .unwrap_or(0)
                 })
@@ -3751,7 +3789,7 @@ mod tests {
                     )],
                 ),
             ];
-            let first = fleet_merge(first_round, Vec::new(), None, JoinMode::Replay);
+            let first = fleet_merge(first_round, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
             assert_eq!(emitted(&first), vec![(4545, "/a1"), (4546, "/b1")]);
 
             // The same shards, now with one more entry each.
@@ -3783,6 +3821,7 @@ mod tests {
                 Vec::new(),
                 Some(&first.next),
                 JoinMode::Replay,
+                IdPolicy::PerEvent,
             );
 
             assert_eq!(
@@ -3821,16 +3860,19 @@ mod tests {
                 ]
             };
 
-            let page = fleet_merge(shards(), Vec::new(), None, JoinMode::Replay);
+            let page = fleet_merge(shards(), Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
             assert_eq!(
                 emitted(&page),
                 vec![(4545, "/a1"), (4546, "/b1"), (4545, "/a2"), (4546, "/b2")]
             );
 
             // A client that received only the first two events and then dropped the connection.
-            let interrupted = page.events[1].id.clone();
+            let interrupted = page.events[1]
+                .id
+                .clone()
+                .expect("PerEvent folds a token onto every event");
 
-            let resumed = fleet_merge(shards(), Vec::new(), Some(&interrupted), JoinMode::Replay);
+            let resumed = fleet_merge(shards(), Vec::new(), Some(&interrupted), JoinMode::Replay, IdPolicy::PerEvent);
 
             assert_eq!(
                 emitted(&resumed),
@@ -3850,7 +3892,7 @@ mod tests {
                 )],
             )];
 
-            let page = fleet_merge(covered, vec![4546, 4547], None, JoinMode::Replay);
+            let page = fleet_merge(covered, vec![4546, 4547], None, JoinMode::Replay, IdPolicy::PerEvent);
 
             assert_eq!(page.coverage.covered, vec![4545]);
             assert_eq!(
@@ -3876,7 +3918,7 @@ mod tests {
                 )],
             )];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Live);
+            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Live, IdPolicy::PerEvent);
 
             assert!(
                 page.events.is_empty(),
@@ -3905,7 +3947,7 @@ mod tests {
                 )],
             )];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay);
+            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
 
             assert_eq!(emitted(&page), vec![(4545, "/old")]);
             assert_eq!(
@@ -3958,6 +4000,7 @@ mod tests {
                 Vec::new(),
                 Some(&presented),
                 JoinMode::Replay,
+                IdPolicy::PerEvent,
             );
 
             assert!(page.partial, "one short port makes the page short");
@@ -3995,6 +4038,7 @@ mod tests {
                 vec![4546],
                 Some(&presented),
                 JoinMode::Replay,
+                IdPolicy::PerEvent,
             );
 
             assert!(
@@ -4007,7 +4051,7 @@ mod tests {
             // page token has already dropped.
             for event in &page.events {
                 assert!(
-                    event.id.get(4546).is_none(),
+                    event.id.as_ref().and_then(|id| id.get(4546)).is_none(),
                     "a per-event id must agree with the page token about membership"
                 );
             }
@@ -4029,10 +4073,124 @@ mod tests {
                 )],
             )];
 
-            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay);
+            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PerEvent);
 
             let last = page.events.last().expect("two entries were emitted");
-            assert_eq!(last.id, page.next);
+            assert_eq!(last.id.as_ref(), Some(&page.next));
+        }
+
+        /// AC3, at the seam the pure merge cannot reach: ranking reads real shards, so this drives a
+        /// real journal rather than hand-built slices.
+        ///
+        /// Three ports, a cap of two. The two most recently active are covered and the stalest is
+        /// named as omitted — not silently dropped, and not chosen by port order, which is what the
+        /// console's `MERGED_JOURNAL_FANOUT` did.
+        #[test]
+        fn coverage_ranks_by_recency_and_names_what_the_cap_omits() {
+            use crate::stores::journal::{JournalConfig, MonotonicClock};
+            use rift_cluster_base::seams::RequestJournal as _;
+
+            let journal = ClusterJournal::with_parts(
+                1,
+                JournalConfig::default(),
+                Arc::new(MonotonicClock::default()),
+            );
+            // Recorded oldest-first so the stalest port is unambiguous.
+            journal.record(4547, "f", req_at("2026-01-01T00:00:01Z", "/stale"));
+            journal.record(4545, "f", req_at("2026-01-01T00:00:05Z", "/recent"));
+            journal.record(4546, "f", req_at("2026-01-01T00:00:09Z", "/newest"));
+            let net = JournalNet::new(journal);
+
+            let coverage = net.coverage_for(&[4545, 4546, 4547], 2);
+
+            assert_eq!(
+                coverage.covered,
+                vec![4545, 4546],
+                "the two most recently active ports, presented by port"
+            );
+            assert_eq!(
+                coverage.omitted,
+                vec![4547],
+                "the stalest port is named, never silently dropped"
+            );
+            assert_eq!(coverage.total(), 3);
+            assert!(coverage.is_capped());
+        }
+
+        /// Under the cap nothing is omitted and nothing claims to be capped — the ordinary case,
+        /// which must not inherit the capped case's warning.
+        #[test]
+        fn coverage_below_the_cap_omits_nothing() {
+            use crate::stores::journal::{JournalConfig, MonotonicClock};
+            use rift_cluster_base::seams::RequestJournal as _;
+
+            let journal = ClusterJournal::with_parts(
+                1,
+                JournalConfig::default(),
+                Arc::new(MonotonicClock::default()),
+            );
+            journal.record(4545, "f", req_at("2026-01-01T00:00:01Z", "/a"));
+            let net = JournalNet::new(journal);
+
+            let coverage = net.coverage_for(&[4545, 4546], 100);
+
+            assert_eq!(coverage.covered, vec![4545, 4546]);
+            assert!(coverage.omitted.is_empty());
+            assert!(!coverage.is_capped());
+        }
+
+        /// Ranking must not create shards: `known_ports` drives the anti-entropy fan-out, so a port
+        /// merely *considered* for coverage must not thereby enroll itself in every future tick.
+        #[test]
+        fn ranking_does_not_enroll_ports_in_the_anti_entropy_fan_out() {
+            use crate::stores::journal::{JournalConfig, MonotonicClock};
+            use rift_cluster_base::seams::RequestJournal as _;
+
+            let journal = ClusterJournal::with_parts(
+                1,
+                JournalConfig::default(),
+                Arc::new(MonotonicClock::default()),
+            );
+            journal.record(4545, "f", req_at("2026-01-01T00:00:01Z", "/a"));
+            let net = JournalNet::new(Arc::clone(&journal));
+
+            let _ = net.coverage_for(&[4545, 4546, 4547, 4548], 100);
+
+            assert_eq!(
+                journal.known_ports(),
+                vec![4545],
+                "only the port that actually recorded may be known; ranking must not create shards"
+            );
+        }
+
+        /// A read asks for no per-event tokens, and must not pay for them: the page token is still
+        /// exact, and every event's id is absent rather than quietly set to something a consumer
+        /// could mistake for a mid-page position.
+        #[test]
+        fn a_page_only_read_folds_no_per_event_tokens() {
+            let covered = vec![port(
+                4545,
+                vec![slice(
+                    A,
+                    vec![
+                        entry_at(A, 1, 0, req_at("2026-01-01T00:00:01Z", "/a1"), 0),
+                        entry_at(A, 2, 0, req_at("2026-01-01T00:00:02Z", "/a2"), 0),
+                    ],
+                )],
+            )];
+
+            let page = fleet_merge(covered, Vec::new(), None, JoinMode::Replay, IdPolicy::PageOnly);
+
+            assert_eq!(emitted(&page), vec![(4545, "/a1"), (4545, "/a2")]);
+            assert!(
+                page.events.iter().all(|event| event.id.is_none()),
+                "PageOnly must not fold a token per event"
+            );
+            assert_eq!(
+                page.next.get(4545).and_then(|row| row.pos.get(&A).copied()),
+                Some(2),
+                "the page token is still exact"
+            );
         }
     }
 }

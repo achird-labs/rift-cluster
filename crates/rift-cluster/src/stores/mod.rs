@@ -28,7 +28,7 @@ pub use flow_config::{ContextScope, FlowConfig, ReadConsistency};
 // one into `x-rift-next-index` after it, so unlike the merge internals below these are part of
 // the surface a caller outside this crate legitimately reaches for.
 pub use journal::{
-    ClusterJournal, CursorError, JournalConfig, JournalCursor, ShardEntry, ShardRead,
+    ClusterJournal, CursorError, FleetCursor, JournalConfig, JournalCursor, ShardEntry, ShardRead,
 };
 pub use proxy::{ClusterProxyStore, ProxyBindConfig, ProxyNet, proxy_routes, proxy_sig_key};
 // Trimmed to what is used outside this module (issue #223 review): the wire types, `ShardSlice`,
@@ -39,7 +39,8 @@ pub use proxy::{ClusterProxyStore, ProxyBindConfig, ProxyNet, proxy_routes, prox
 // legitimately calls. `MergeOutcome` stays out of this list for the same "not used outside" reason
 // even though its own declaration stays `pub` — see its doc for why it cannot be `pub(crate)`.
 pub use journal_net::{
-    DEFAULT_ANTI_ENTROPY_INTERVAL, JournalNet, TailEvent, TailPage, journal_routes,
+    Coverage, DEFAULT_ANTI_ENTROPY_INTERVAL, DEFAULT_FLEET_JOURNAL_PORT_CAP, FleetPage,
+    FleetTailEvent, IdPolicy, JoinMode, JournalNet, TailEvent, TailPage, journal_routes,
     spawn_anti_entropy,
 };
 pub use shard::{Durability, FlowShard, ShardConfig, ShardError, Versioned};

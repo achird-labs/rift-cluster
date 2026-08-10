@@ -307,6 +307,12 @@ mod parity {
             Terminated::StreamSavedRequests(_) => {
                 RouteKey::new(&Method::GET, "/imposters/{port}/savedRequests/stream")
             }
+            // The fleet journal (issue #362). One path each, no aliases: both are EE-only surfaces
+            // this front invented, so there is no upstream spelling to mirror.
+            Terminated::ReadFleetRequests => RouteKey::new(&Method::GET, "/admin/requests"),
+            Terminated::StreamFleetRequests => {
+                RouteKey::new(&Method::GET, "/admin/requests/stream")
+            }
             Terminated::ClearSavedRequests(_) => {
                 RouteKey::new(&Method::DELETE, "/imposters/{port}/savedRequests")
             }
