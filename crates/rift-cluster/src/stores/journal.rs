@@ -267,6 +267,28 @@ pub enum CursorError {
     /// this build has never seen could mean anything about the shape that follows it.
     #[error("cursor token version {0} is not supported by this node")]
     UnsupportedVersion(u32),
+    /// A well-formed token of the *other* scope (issue #362): a per-imposter [`JournalCursor`]
+    /// token presented to the fleet walk, or a [`FleetCursor`] token presented to a single
+    /// imposter's.
+    ///
+    /// Named rather than folded into [`Self::Payload`] because the two are different mistakes with
+    /// different fixes, and because the alternative is worse than a bad error message: both tokens
+    /// are opaque base64 of a JSON object, so a decoder that merely tried the other shape and
+    /// failed would report "not a cursor payload" for a token that is a perfectly good cursor
+    /// pointed at the wrong endpoint. The 400 this maps to can then say which endpoint takes it.
+    #[error("this is a {found} cursor token; this endpoint takes a {expected} cursor")]
+    WrongScope {
+        expected: &'static str,
+        found: &'static str,
+    },
+    /// The token decoded and is of the right scope and version, but its contents are not
+    /// self-consistent — a [`FleetCursor`] position naming a node index outside its own node table
+    /// (issue #362).
+    ///
+    /// Refused rather than repaired by dropping the offending row, for the reason every other
+    /// variant is refused: a dropped row rewinds that shard to zero and replays its whole history.
+    #[error("cursor token is internally inconsistent: {0}")]
+    Corrupt(&'static str),
 }
 
 impl JournalCursor {
@@ -314,7 +336,21 @@ impl JournalCursor {
         use base64::Engine as _;
 
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token)?;
-        let payload: CursorPayload = serde_json::from_slice(&bytes)?;
+        let payload: CursorPayload = match serde_json::from_slice(&bytes) {
+            Ok(payload) => payload,
+            Err(e) => {
+                // The mirror of `FleetCursor::decode`'s check (issue #362), and load-bearing for
+                // the same reason: a fleet token presented here is a good cursor at the wrong
+                // endpoint, and saying so is what lets the 400 name the endpoint that takes it.
+                if serde_json::from_slice::<FleetPayload>(&bytes).is_ok() {
+                    return Err(CursorError::WrongScope {
+                        expected: "per-imposter",
+                        found: "fleet",
+                    });
+                }
+                return Err(CursorError::Payload(e));
+            }
+        };
         if payload.v != CURSOR_TOKEN_VERSION {
             return Err(CursorError::UnsupportedVersion(payload.v));
         }
@@ -337,6 +373,196 @@ impl JournalCursor {
             return Ok(Self { generation: 0, pos });
         }
         Self::decode(token)
+    }
+}
+
+/// A reader's position across every *covered port* of a tenant's fleet (issue #362) — what the
+/// fleet request walk hands back and takes in.
+///
+/// This is a different shape from [`JournalCursor`], not an extension of one. A `JournalCursor` is
+/// a vector over **nodes**, scoped to a single port, because that port's shards are what a merge of
+/// one imposter combines. A fleet walk combines those merges across **ports**, and a port's `seq`
+/// numbering is unrelated to any other port's — so the only sound fleet position is one whole
+/// per-port cursor per port, which is exactly what this holds.
+///
+/// **Only covered ports occupy a row.** Coverage is capped (see `JournalNet::fleet_page`), so this
+/// token is bounded by that cap rather than by how many imposters the tenant owns. A port that
+/// leaves coverage loses its row; what re-entry means is the walk's join rule, not the token's.
+///
+/// `BTreeMap` for [`JournalCursor::pos`]'s reason, one level up: the encoding must be byte-stable
+/// across processes, so the port order — and each port's node order — has to be deterministic.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FleetCursor {
+    /// `port -> that port's merged position`. Absent means this reader holds no position for that
+    /// port, which the walk reads as a *join* rather than as a position of zero — the two differ,
+    /// and the difference is the whole reason this is not a `BTreeMap<u16, u64>`.
+    pub ports: BTreeMap<u16, JournalCursor>,
+}
+
+/// On-wire shape of an encoded [`FleetCursor`], in its own version namespace.
+///
+/// Deliberately compact, because this token rides `Last-Event-ID` through proxies that cap header
+/// lines around 8 KiB. The node ids are written **once** into `nodes` and each port's positions
+/// reference them by index, so a fleet of N nodes covering P ports costs roughly `P × (4 + 9N)`
+/// bytes rather than repeating a full node id per port per node. At the default cap that leaves the
+/// encoded token comfortably inside the header budget.
+///
+/// `scope` is the field that makes [`CursorError::WrongScope`] answerable: [`CursorPayload`] has no
+/// such field, so the two shapes are distinguishable without either one having to parse as the
+/// other by accident.
+#[derive(Debug, Serialize, Deserialize)]
+struct FleetPayload {
+    v: u32,
+    /// Always [`FLEET_CURSOR_SCOPE`]. Present so a per-imposter token cannot be mistaken for a
+    /// fleet one even if a future `CursorPayload` grew structurally similar fields.
+    scope: String,
+    /// The node table every port's positions index into.
+    nodes: Vec<NodeId>,
+    /// `(port, generation, [(node index, position)])`, ports ascending.
+    ports: Vec<(u16, u64, Vec<(u32, u64)>)>,
+}
+
+/// The only fleet payload version this build reads — its own namespace, independent of
+/// [`CURSOR_TOKEN_VERSION`]. The two formats version separately because they change for different
+/// reasons.
+const FLEET_CURSOR_TOKEN_VERSION: u32 = 1;
+
+/// The `scope` tag every fleet token carries.
+const FLEET_CURSOR_SCOPE: &str = "fleet";
+
+impl FleetCursor {
+    /// An explicit position at the very beginning: no ports at all.
+    ///
+    /// As with [`JournalCursor::start`], this is **not** what an absent token means. Absent is a
+    /// baseline (the walk decides per port what that implies); this is a reader asserting it holds
+    /// no position anywhere.
+    #[must_use]
+    pub fn start() -> Self {
+        Self::default()
+    }
+
+    /// This reader's position for `port`, if it holds one.
+    #[must_use]
+    pub fn get(&self, port: u16) -> Option<&JournalCursor> {
+        self.ports.get(&port)
+    }
+
+    /// Encode as a versioned, opaque, unpadded base64url token — safe in a query string and in an
+    /// SSE `id:` line, exactly like [`JournalCursor::encode`].
+    #[must_use]
+    pub fn encode(&self) -> String {
+        use base64::Engine as _;
+
+        // The node table: every node named by any port, once, ascending so the token is stable.
+        let nodes: Vec<NodeId> = self
+            .ports
+            .values()
+            .flat_map(|cursor| cursor.pos.keys().copied())
+            .collect::<std::collections::BTreeSet<NodeId>>()
+            .into_iter()
+            .collect();
+        let index_of: HashMap<NodeId, u32> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                // `usize -> u32` cannot truncate here: `index` is bounded by the number of distinct
+                // nodes in the cursor, and a roster that large is not representable upstream. The
+                // saturating form keeps this arithmetic total rather than reaching for a cast that
+                // clippy would (rightly) refuse.
+                (*node, u32::try_from(index).unwrap_or(u32::MAX))
+            })
+            .collect();
+
+        let ports = self
+            .ports
+            .iter()
+            .map(|(port, cursor)| {
+                let positions = cursor
+                    .pos
+                    .iter()
+                    .map(|(node, seq)| (index_of.get(node).copied().unwrap_or(u32::MAX), *seq))
+                    .collect();
+                (*port, cursor.generation, positions)
+            })
+            .collect();
+
+        let payload = FleetPayload {
+            v: FLEET_CURSOR_TOKEN_VERSION,
+            scope: FLEET_CURSOR_SCOPE.to_owned(),
+            nodes,
+            ports,
+        };
+        // Infallible for the same reason `JournalCursor::encode`'s is — every field is a JSON
+        // primitive or a vector of them — and the fallback exists for the same reason: a token that
+        // fails to decode, never one that decodes to a wrong-but-plausible position.
+        let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Decode a token [`Self::encode`] produced.
+    ///
+    /// Refuses, never defaults, for [`JournalCursor`]'s reasons: a defaulted position either
+    /// replays the whole journal or silently skips everything recorded since the token went stale.
+    /// Two refusals are specific to this scope:
+    ///
+    /// * a **bare `u64`** — the pre-#223 legacy scalar. [`JournalCursor::decode_or_legacy`] accepts
+    ///   that shape because it names a position in the receiving node's own shard; across a fleet it
+    ///   names a position in no port in particular, so it is refused with the scope error that can
+    ///   point at the endpoint which does take it.
+    /// * a **per-imposter token** — see [`CursorError::WrongScope`].
+    pub fn decode(token: &str) -> Result<Self, CursorError> {
+        use base64::Engine as _;
+
+        if token.parse::<u64>().is_ok() {
+            return Err(CursorError::WrongScope {
+                expected: "fleet",
+                found: "legacy per-imposter index",
+            });
+        }
+
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token)?;
+        let payload: FleetPayload = match serde_json::from_slice(&bytes) {
+            Ok(payload) => payload,
+            Err(e) => {
+                // Only *then* ask whether this was the other scope's token, so a genuinely
+                // malformed token still reports as malformed rather than as a scope mistake.
+                if serde_json::from_slice::<CursorPayload>(&bytes).is_ok() {
+                    return Err(CursorError::WrongScope {
+                        expected: "fleet",
+                        found: "per-imposter",
+                    });
+                }
+                return Err(CursorError::Payload(e));
+            }
+        };
+        if payload.v != FLEET_CURSOR_TOKEN_VERSION {
+            return Err(CursorError::UnsupportedVersion(payload.v));
+        }
+        if payload.scope != FLEET_CURSOR_SCOPE {
+            return Err(CursorError::WrongScope {
+                expected: "fleet",
+                found: "per-imposter",
+            });
+        }
+
+        let mut ports = BTreeMap::new();
+        for (port, generation, positions) in payload.ports {
+            let mut pos = BTreeMap::new();
+            for (index, seq) in positions {
+                // An index outside the table is a corrupt token, not a position to guess at:
+                // silently dropping the row would rewind that shard to 0 and replay its history.
+                let node = payload
+                    .nodes
+                    .get(index as usize)
+                    .copied()
+                    .ok_or(CursorError::Corrupt(
+                        "a port position names a node outside the token's node table",
+                    ))?;
+                pos.insert(node, seq);
+            }
+            ports.insert(port, JournalCursor { generation, pos });
+        }
+        Ok(Self { ports })
     }
 }
 
@@ -737,6 +963,26 @@ impl ClusterJournal {
     #[must_use]
     pub(crate) fn clear_gen(&self, port: u16) -> u64 {
         self.shard(port).clear_gen.load(Ordering::SeqCst)
+    }
+
+    /// The newest recorded timestamp this node holds for `port`, or `None` if it holds none.
+    ///
+    /// **Deliberately does not create the shard**, which is the whole reason this exists rather
+    /// than the caller reaching for [`Self::read_shard_since`]. [`Self::shard`] creates on first
+    /// touch and [`Self::known_ports`] drives the anti-entropy tick's `peers x ports` fan-out, so a
+    /// caller that merely wants to *rank* ports by recency — the fleet walk's coverage step, issue
+    /// #362 — would otherwise enroll every port it ranked into the fleet's inter-node traffic, and
+    /// permanently.
+    ///
+    /// Reads the back of the deque rather than scanning it: seqs are assigned under the write lock
+    /// in record order, so the deque's last entry is this node's most recently recorded one. That
+    /// makes this `O(1)` on a path the fleet tail runs on every wake, for every covered port.
+    pub(crate) fn newest_timestamp(&self, port: u16) -> Option<String> {
+        let shard = Arc::clone(self.ports.read().get(&port)?);
+        let entries = shard.entries.read();
+        entries
+            .back()
+            .map(|entry| entry.request.timestamp.clone())
     }
 
     fn shard(&self, port: u16) -> Arc<PortShard> {
@@ -1597,6 +1843,212 @@ mod tests {
     fn decode_or_legacy_still_rejects_what_is_neither() {
         assert!(JournalCursor::decode_or_legacy("-1", 7).is_err());
         assert!(JournalCursor::decode_or_legacy("not base64!!", 7).is_err());
+    }
+
+    // ---- issue #362: the fleet cursor's own codec ------------------------------------
+
+    fn fleet_of(rows: &[(u16, u64, &[(NodeId, u64)])]) -> FleetCursor {
+        let mut ports = BTreeMap::new();
+        for (port, generation, positions) in rows {
+            ports.insert(
+                *port,
+                JournalCursor {
+                    generation: *generation,
+                    pos: positions.iter().copied().collect(),
+                },
+            );
+        }
+        FleetCursor { ports }
+    }
+
+    /// AC2. Every port's whole position — nodes, seqs and generation — survives the round trip
+    /// through the compact node-table encoding.
+    #[test]
+    fn a_fleet_cursor_round_trips_through_its_token() {
+        let cursor = fleet_of(&[
+            (4545, 3, &[(1, 10), (7, 4)]),
+            (4546, 0, &[(7, 99)]),
+            (9000, 12, &[(1, 1), (2, 2), (7, 3)]),
+        ]);
+
+        let decoded = FleetCursor::decode(&cursor.encode()).expect("its own token decodes");
+
+        assert_eq!(decoded, cursor, "the node table must rebuild exactly");
+    }
+
+    /// The token is a cache key and a value tests assert on, so the same cursor must encode to the
+    /// same bytes every time — the reason both maps are `BTreeMap`s, one level up from
+    /// `JournalCursor`'s own stability requirement.
+    #[test]
+    fn a_fleet_token_is_byte_stable() {
+        let one = fleet_of(&[(4545, 0, &[(7, 1), (1, 2)]), (4546, 0, &[(2, 3)])]);
+        // The same cursor, built with the ports and nodes offered in the opposite order.
+        let two = fleet_of(&[(4546, 0, &[(2, 3)]), (4545, 0, &[(1, 2), (7, 1)])]);
+
+        assert_eq!(one.encode(), two.encode());
+    }
+
+    #[test]
+    fn an_empty_fleet_cursor_round_trips() {
+        let decoded = FleetCursor::decode(&FleetCursor::start().encode()).expect("decodes");
+        assert_eq!(decoded, FleetCursor::start());
+        assert!(decoded.ports.is_empty());
+    }
+
+    /// AC2. A per-imposter token presented to the fleet walk is a *good cursor at the wrong
+    /// endpoint*, and must say so — never be read as a fleet position, and never be reported as
+    /// mere garbage.
+    #[test]
+    fn a_per_imposter_token_is_refused_by_the_fleet_walk_as_wrong_scope() {
+        let per_port = JournalCursor {
+            generation: 2,
+            pos: [(1, 5), (7, 9)].into_iter().collect(),
+        };
+
+        let refused = FleetCursor::decode(&per_port.encode()).expect_err("must not be accepted");
+
+        assert!(
+            matches!(
+                refused,
+                CursorError::WrongScope {
+                    expected: "fleet",
+                    found: "per-imposter"
+                }
+            ),
+            "expected a scope error, got {refused:?}"
+        );
+    }
+
+    /// The mirror: a fleet token presented to a single imposter's walk.
+    #[test]
+    fn a_fleet_token_is_refused_by_the_per_imposter_walk_as_wrong_scope() {
+        let fleet = fleet_of(&[(4545, 0, &[(1, 5)])]);
+
+        let refused = JournalCursor::decode(&fleet.encode()).expect_err("must not be accepted");
+
+        assert!(
+            matches!(
+                refused,
+                CursorError::WrongScope {
+                    expected: "per-imposter",
+                    found: "fleet"
+                }
+            ),
+            "expected a scope error, got {refused:?}"
+        );
+    }
+
+    /// The legacy bare scalar names a position in one node's shard of one port. Across a fleet it
+    /// names a position in no port in particular, so it is refused — pointedly, so the 400 can
+    /// name the endpoint that does take it.
+    #[test]
+    fn the_legacy_scalar_is_refused_by_the_fleet_walk() {
+        let refused = FleetCursor::decode("42").expect_err("a scalar has no fleet meaning");
+
+        assert!(
+            matches!(
+                refused,
+                CursorError::WrongScope {
+                    expected: "fleet",
+                    found: "legacy per-imposter index"
+                }
+            ),
+            "expected a scope error, got {refused:?}"
+        );
+    }
+
+    /// Garbage must still read as garbage: the scope check must not swallow genuinely malformed
+    /// tokens into a misleading "wrong endpoint" answer.
+    #[test]
+    fn a_malformed_fleet_token_is_not_reported_as_a_scope_mistake() {
+        assert!(matches!(
+            FleetCursor::decode("not base64!!"),
+            Err(CursorError::Encoding(_))
+        ));
+
+        use base64::Engine as _;
+        let nonsense =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"hello":"world"}"#);
+        assert!(matches!(
+            FleetCursor::decode(&nonsense),
+            Err(CursorError::Payload(_))
+        ));
+    }
+
+    /// A position naming a node the token's own table does not contain is refused, not repaired:
+    /// dropping the row would rewind that shard to zero and replay its history.
+    #[test]
+    fn a_fleet_token_with_a_dangling_node_index_is_refused() {
+        use base64::Engine as _;
+        let payload = serde_json::json!({
+            "v": 1,
+            "scope": "fleet",
+            "nodes": [1],
+            "ports": [[4545, 0, [[9, 5]]]],
+        });
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("test payload encodes"));
+
+        assert!(matches!(
+            FleetCursor::decode(&token),
+            Err(CursorError::Corrupt(_))
+        ));
+    }
+
+    /// A version this build has never seen could mean anything about the shape behind it, and the
+    /// fleet format versions independently of the per-imposter one.
+    #[test]
+    fn an_unknown_fleet_token_version_is_refused() {
+        use base64::Engine as _;
+        let payload = serde_json::json!({
+            "v": 2, "scope": "fleet", "nodes": [], "ports": [],
+        });
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("test payload encodes"));
+
+        assert!(matches!(
+            FleetCursor::decode(&token),
+            Err(CursorError::UnsupportedVersion(2))
+        ));
+    }
+
+    /// The token has to survive a proxy's `Last-Event-ID` header limit at the default cap, which is
+    /// the constraint that drove the compact node-table encoding in the first place.
+    #[test]
+    fn a_full_cap_fleet_token_fits_in_a_header_line() {
+        let rows: Vec<(u16, u64, Vec<(NodeId, u64)>)> = (0..100u16)
+            .map(|i| {
+                (
+                    4000 + i,
+                    u64::from(i),
+                    vec![(1, 4_000_000_000), (2, 4_000_000_001), (7, 4_000_000_002)],
+                )
+            })
+            .collect();
+        let mut ports = BTreeMap::new();
+        for (port, generation, positions) in &rows {
+            ports.insert(
+                *port,
+                JournalCursor {
+                    generation: *generation,
+                    pos: positions.iter().copied().collect(),
+                },
+            );
+        }
+        let cursor = FleetCursor { ports };
+
+        let token = cursor.encode();
+
+        assert!(
+            token.len() < 8192,
+            "100 ports x 3 nodes must stay inside a proxy header budget, got {} bytes",
+            token.len()
+        );
+        assert_eq!(
+            FleetCursor::decode(&token).expect("decodes"),
+            cursor,
+            "and it must still be exact at that size"
+        );
     }
 
     proptest::proptest! {
