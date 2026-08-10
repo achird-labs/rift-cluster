@@ -38,20 +38,41 @@ import { ApiError } from "../../api/client.ts";
  * That is the whole of it. It protects exactly the case that was broken and stays out of the way of
  * the case the server explicitly warns about.
  *
- * ## What this does and does not close, stated rather than assumed
+ * ## Send it exactly where the contract declares it (#389)
  *
- * The key is honoured on the routes that flow through the admin front's `build_and_run` (imposters,
- * stubs, lifecycle, routes, scenarios, flow state) and through its tenancy surface (tenants,
- * principals, bindings) — those derive their op id from the header via `base_op_id`.
+ * `openapi-ee.yaml` declares `Idempotency-Key` on fifteen routes — the ones reaching the admin
+ * front's `build_and_run` (imposters, stubs, lifecycle, front-door routes, scenarios, flow state)
+ * and its tenancy surface (tenants, principals, bindings). Those derive their op id from the header
+ * via `base_op_id`, and those are the ones {@link keyedAttempt} is for.
  *
- * Four routes accept the header and **ignore** it today, because they return from `terminate`
- * before it is read (sources: put, delete and pull; and `try`) or mint a fresh op id unconditionally
- * (space teardown). Sending the key there is harmless and costs nothing, and all four happen to be
- * idempotent or convergent by nature — an upsert by id, a delete, a re-pull that reapplies the same
- * source, a generation bump that is monotone, and a `try` that writes no state at all. So the
- * exposure is small, but it is not zero and it is not what a reader would assume from seeing the
- * header go out. Closing it is a server-side change and is tracked separately.
+ * The routes in {@link UNDECLARED} do **not** declare the parameter, and the fleet does not read it
+ * on them — the source writes and `try` return from `terminate` before the header is parsed, and
+ * space teardown mints its own op id. An earlier revision of this console sent a key there anyway.
+ * It was harmless on the wire and wrong as documentation: a reader seeing the header go out would
+ * reasonably conclude those writes were retry-safe by key, when what actually makes them safe to
+ * repeat is that each is convergent on its own terms — an upsert by id, a delete, a re-pull that
+ * reapplies the same source, a monotone generation bump, and a `try` that writes no state at all.
+ *
+ * So the console now sends the key where it means something and not where it does not, and the
+ * reason each of those routes is safe is recorded above rather than implied by a header.
  */
+
+/**
+ * Write routes that do **not** declare `Idempotency-Key`, and why repeating each is safe anyway.
+ *
+ * Exported so the rule is checkable rather than a convention: a test asserts the console sends no
+ * key on these, which is what stops the next call site from quietly re-adding one.
+ */
+export const UNDECLARED: Readonly<Record<string, string>> = Object.freeze({
+  // Keyed by the contract's own path templates, because that is what the test resolves them
+  // against — `{sourceId}`, not the console's `{id}`.
+  "POST /admin/sources": "an upsert by id — a repeat converges on the same record",
+  "DELETE /admin/sources/{sourceId}": "a delete — absent is the same outcome as removed",
+  "POST /admin/sources/{sourceId}/pull": "re-applies the same source content",
+  "POST /admin/imposters/{port}/try":
+    "writes no state; a repeat is a second probe, not a second write",
+  "DELETE /imposters/{port}/spaces/{flowId}": "the journal generation bump is monotone",
+});
 
 /**
  * A fresh key.
