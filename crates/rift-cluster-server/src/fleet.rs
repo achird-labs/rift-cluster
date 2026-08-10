@@ -6,9 +6,22 @@
 //! without also holding a credential this surface was never meant to hand
 //! out. `/_fleet/*` re-exposes the same bodies on the admin port instead —
 //! by calling the cluster port's own builders rather than reimplementing
-//! them, so the two ports cannot drift. Two independent implementations
-//! checked by a test can still diverge between test runs; one implementation
-//! called twice cannot.
+//! them. Two independent implementations checked by a test can still diverge
+//! between test runs; one implementation called twice cannot.
+//!
+//! The two ports are no longer key-for-key identical, and the distinction
+//! matters. This projection may **add** to the cluster port's body — the
+//! per-voter `members` fan-out (#361), the fleet-wide `parked_intents_fleet`
+//! sum (#360) — but may never **drop** or restate a field. Every addition is
+//! a fold over the cluster port's own builder, asked once per node, so there
+//! is still exactly one implementation of each fact. What the rule forbids is
+//! the two ports answering the *same* question differently, and a sum of N
+//! answers is not a second opinion about one of them.
+//!
+//! The cluster port stays node-local on purpose: it is the target of these
+//! fan-outs, so making it fleet-wide would have every peer ask every other
+//! peer — and it is how an operator asks *one* node what it thinks.
+//! `fleet_projection_matches_the_cluster_port_shapes` enforces exactly this.
 //!
 //! This module is deliberately pure: it classifies a request into a
 //! [`FleetRoute`] and renders a body. It does not authenticate, authorize, or
@@ -90,10 +103,100 @@ pub(crate) async fn body(
 ) -> Result<Option<FleetBody>, String> {
     match route {
         FleetRoute::Members => Ok(Some(merged_members(node).await)),
-        FleetRoute::Health => Ok(Some(FleetBody::local(health_body(node, readiness)))),
+        FleetRoute::Health => Ok(Some(fleet_health(node, readiness).await)),
         FleetRoute::Op(op_id) => op_body(node, op_id)
             .map(|found| found.map(FleetBody::local))
             .map_err(|e| e.to_string()),
+    }
+}
+
+/// `health_body`, plus the fleet's total parked-write backlog (#360).
+///
+/// The tile this feeds sits beside imposter and source counts that are fleet-wide, and it means
+/// "the fleet has taken work it has not finished". A single node's figure under that label would
+/// read as the whole fleet's and understate it, so the depth is summed across voters — each node
+/// answering for itself, exactly as the members fan-out works.
+///
+/// `/_cluster/health` keeps carrying only this node's `parked_intents` and does not fan out: it is
+/// the target of this fan-out, so making it fleet-wide would have every peer ask every other peer,
+/// and it is also how an operator asks *one* node how far behind its own replay is.
+///
+/// `parked_intents_fleet` is **absent** rather than partial-and-silent when this node could not
+/// read its own depth — a sum missing an unknown addend is not a sum. When a *peer* fails to
+/// answer, the sum is a floor and the response says so through `Rift-Cluster-Partial`.
+async fn fleet_health(node: &Arc<RaftNode>, readiness: &Readiness) -> FleetBody {
+    let mut value = health_body(node, readiness);
+    let status = node.status();
+    let me = status.node_id;
+
+    // This node's own contribution comes from the body just built, so the two can never disagree
+    // about the same number.
+    let Some(mine) = value
+        .get("parked_intents")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        // Already logged where it failed; the field is `null` above and the fleet sum is omitted
+        // rather than reported as a total that silently excludes this node.
+        return FleetBody {
+            value,
+            partial: true,
+        };
+    };
+
+    let mut set = tokio::task::JoinSet::new();
+    for peer in status.voters.iter().copied().filter(|&id| id != me) {
+        let node = Arc::clone(node);
+        set.spawn(async move {
+            let outcome = node
+                .call_member(peer, "GET", "/_cluster/health", Vec::new())
+                .await
+                .and_then(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())
+                });
+            (peer, outcome)
+        });
+    }
+
+    let mut total = mine;
+    let mut unanswered = 0usize;
+    let drained = tokio::time::timeout(MEMBER_PEER_BUDGET, async {
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((peer, Ok(reply))) => {
+                    match reply
+                        .get("parked_intents")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        Some(depth) => total = total.saturating_add(depth),
+                        // The peer answered but could not read its own depth. Its contribution is
+                        // unknown, which makes the sum a floor exactly as an unreachable peer does.
+                        None => {
+                            unanswered += 1;
+                            tracing::warn!(peer, "health fan-out: peer reported no parked depth");
+                        }
+                    }
+                }
+                Ok((peer, Err(e))) => {
+                    unanswered += 1;
+                    tracing::warn!(peer, error = %e, "health fan-out: peer did not answer");
+                }
+                Err(e) => {
+                    unanswered += 1;
+                    tracing::warn!(error = %e, "health fan-out: task failed");
+                }
+            }
+        }
+    })
+    .await;
+
+    // A timeout leaves tasks unjoined and their nodes uncounted; dropping the set aborts them.
+    let timed_out = drained.is_err();
+    if let Some(map) = value.as_object_mut() {
+        map.insert("parked_intents_fleet".to_owned(), serde_json::json!(total));
+    }
+    FleetBody {
+        value,
+        partial: timed_out || unanswered > 0,
     }
 }
 

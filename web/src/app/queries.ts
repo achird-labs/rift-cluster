@@ -321,9 +321,13 @@ export function useFleetView(
     queryFn: async () => {
       const [members, health] = await Promise.all([
         apiGet<FleetMembers>(API_PATHS.fleetMembers),
-        apiGet<FleetHealth>(API_PATHS.fleetHealth),
+        // `apiGetMerged` for health alone: its `parked_intents_fleet` is summed across voters
+        // (#360), and `Rift-Cluster-Partial` is the only signal that a node did not answer and the
+        // sum is therefore a floor. The members read carries its coverage per row instead, so it
+        // needs no header.
+        apiGetMerged<FleetHealth>(API_PATHS.fleetHealth),
       ]);
-      return fleetView(members, health);
+      return fleetView(members, health.data, health.partial);
     },
     enabled: options.enabled ?? true,
     /*

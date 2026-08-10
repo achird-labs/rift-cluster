@@ -1605,6 +1605,22 @@ export interface components {
             state: "ready" | "not-ready" | "draining";
             /** @description Startup gates this node has not yet satisfied (e.g. `cluster-joined`, `cluster-reconciled`); empty once `ready`. */
             pending_gates: string[];
+            /**
+             * Format: int64
+             * @description Writes **this node** accepted under `--cluster-admin-async` and has not replayed yet (issue #360). A magnitude, so a number.
+             *
+             *     `null`, never `0`, when the depth could not be read: zero is the reassuring answer — "nothing outstanding" — and it is the one an operator acts on by not acting. Reporting it because storage could not be read is the wrong-but-quiet failure this API avoids everywhere else.
+             */
+            parked_intents?: number | null;
+            /**
+             * Format: int64
+             * @description The same depth summed across every voter (issue #360). Present on `/_fleet/health` only — `/_cluster/health` is node-local, because it is the target of this fan-out and is also how an operator asks one node how far behind its own replay is.
+             *
+             *     The tile this feeds sits beside fleet-wide counts and means "the fleet has taken work it has not finished", so a single node's figure under that label would understate it.
+             *
+             *     **Absent** when this node could not read its own depth — a sum missing an unknown addend is not a sum. When a *peer* fails to answer, the field is present but is a **floor**, and the response carries `Rift-Cluster-Partial` to say so.
+             */
+            parked_intents_fleet?: number;
             /** @description Whether this node currently sees itself as network-isolated from the rest of the fleet. */
             isolated: boolean;
             ring: {
