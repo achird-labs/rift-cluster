@@ -1,5 +1,4 @@
-# Recording rules for the rift-cluster observability pack (issue #227,
-# RFC-003 SS5/SS6).
+# Recording rules for the rift-cluster observability pack (issue #227).
 #
 # The correctness core of this file is a single rule about *how* percentiles
 # are computed, so it gets said once, here, instead of once per rule below:

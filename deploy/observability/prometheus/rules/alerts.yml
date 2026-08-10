@@ -1,5 +1,4 @@
-# Alerting rules for the rift-cluster observability pack (issue #227,
-# RFC-003 SS5/SS6).
+# Alerting rules for the rift-cluster observability pack (issue #227).
 #
 # Every `for:` below is chosen relative to how the underlying series is
 # produced, not picked to "feel about right":

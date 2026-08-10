@@ -5050,8 +5050,8 @@ fn fixture_probe_paths() -> std::collections::BTreeSet<String> {
 }
 
 /// C28 (#228): the fleet journal is exact under node kill —
-/// `test_journal_merge_exact` in anger, the RFC-003 §6 M3 exit bar's "under
-/// node kill" clause.
+/// `test_journal_merge_exact` in anger, against the "exact under node kill"
+/// exit bar.
 ///
 /// Refinement against the implemented merge semantics (issue #223): the merge's
 /// roster is the **applied membership**, so a SIGKILLed node — which by

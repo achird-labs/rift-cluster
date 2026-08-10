@@ -74,7 +74,7 @@
           "sort": "desc"
         }
       },
-      "description": "Fleet-wide percentiles merged at the histogram-bucket level (RFC-003 SS5) \u2014 never averaged from per-node quantiles. See the recording rules in deploy/observability/prometheus/rules/recording.yml."
+      "description": "Fleet-wide percentiles merged at the histogram-bucket level \u2014 never averaged from per-node quantiles. See the recording rules in deploy/observability/prometheus/rules/recording.yml."
     },
     {
       "id": 2,

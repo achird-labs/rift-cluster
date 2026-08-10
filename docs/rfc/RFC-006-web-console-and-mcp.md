@@ -5,7 +5,7 @@
 | **Status** | v1 — design draft for review |
 | **Tracking issue** | [achird-labs/rift-cluster#150](https://github.com/achird-labs/rift-cluster/issues/150) (console, M6a) · [#151](https://github.com/achird-labs/rift-cluster/issues/151) (MCP, M6b) |
 | **Canonical location** | `rift-cluster:docs/rfc/RFC-006-web-console-and-mcp.md` |
-| **Depends on** | **RFC-002** (principals, roles, API keys — the console's auth substrate); **ADR-001 / #14** (the control plane every write lands in). References, without depending on for v1: RFC-003 (parity umbrella, sibling in review), RFC-004 (spec-driven mocking), RFC-005 (data sources & state), `docs/architecture/07-verification-plane.md`, `docs/architecture/13-front-door-and-sources.md` |
+| **Depends on** | **RFC-002** (principals, roles, API keys — the console's auth substrate); **ADR-001 / #14** (the control plane every write lands in). References, without depending on for v1: RFC-004 (spec-driven mocking), RFC-005 (data sources & state), `docs/architecture/07-verification-plane.md`, `docs/architecture/13-front-door-and-sources.md` |
 | **Ground truth** | verified at `rift-cluster@5b98fef`, `vendor/rift@v0.16.0-4-g97757f0` |
 | **Author** | Mohsen Zainalpour |
 | **Date** | 2026-07-26 |

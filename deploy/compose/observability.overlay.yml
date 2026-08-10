@@ -1,4 +1,4 @@
-# Observability overlay for the 3-node compose (issue #227, RFC-003 SS5/SS6).
+# Observability overlay for the 3-node compose (issue #227).
 #
 # Adds Prometheus and Grafana over the shipped topology, never baked into it:
 #
