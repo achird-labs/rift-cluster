@@ -976,14 +976,23 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                         "cluster node is shutting down",
                     );
                 };
-                match fleet::body(&route, &node, &state.readiness) {
-                    Ok(Some(body)) => match serde_json::to_vec(&body) {
-                        Ok(bytes) => buffered_response(
-                            StatusCode::OK,
-                            Bytes::from(bytes),
-                            json_content_type(),
-                        )
-                        .unwrap_or_else(|response| response),
+                match fleet::body(&route, &node, &state.readiness).await {
+                    Ok(Some(body)) => match serde_json::to_vec(&body.value) {
+                        Ok(bytes) => {
+                            let mut response = buffered_response(
+                                StatusCode::OK,
+                                Bytes::from(bytes),
+                                json_content_type(),
+                            )
+                            .unwrap_or_else(|response| response);
+                            // Same header, same meaning, as the journal merge stamps (#361): the
+                            // members list is folded across peers, and a voter that did not answer
+                            // leaves a row this node could not fill.
+                            if body.partial {
+                                set_header(&mut response, HEADER_PARTIAL, "true");
+                            }
+                            response
+                        }
                         Err(e) => internal(&e.to_string()),
                     },
                     // The one case `fleet::body` can 404 on: a well-formed but unknown op id.

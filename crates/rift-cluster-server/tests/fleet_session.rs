@@ -185,13 +185,17 @@ async fn curl_can_log_in_hold_a_cookie_and_read_fleet_health() {
     server.shutdown().await;
 }
 
-/// AC3: the projection and the cluster port report the *same shape*.
+/// AC3: the projection reports everything the cluster port does, and adds only what it documents.
 ///
 /// Asserted against the cluster port's live body rather than a hand-written fixture, exactly as the
 /// issue asks. The bodies are built by one shared function, so this is a regression guard on the
-/// wiring rather than the primary guarantee — but if the two ever diverge, operators reading
-/// `/_cluster/*` and a console reading `/_fleet/*` would disagree about the same fleet, which is
-/// worse than either being absent.
+/// wiring rather than the primary guarantee — but if the projection ever *dropped* a field,
+/// operators reading `/_cluster/*` and a console reading `/_fleet/*` would disagree about the same
+/// fleet, which is worse than either being absent.
+///
+/// Since #361 the two are no longer key-for-key identical: `/_fleet/members` carries a `members`
+/// fan-out the cluster port deliberately does not. See the assertion for why that direction is
+/// allowed and the other is not.
 #[tokio::test]
 async fn fleet_projection_matches_the_cluster_port_shapes() {
     let state = TempDir::new().expect("tempdir");
@@ -258,10 +262,38 @@ async fn fleet_projection_matches_the_cluster_port_shapes() {
             .collect();
         a.sort();
         b.sort();
+
+        // The fleet projection may **add**, never **drop** (issue #361).
+        //
+        // This was an equality assertion until `/_fleet/members` gained `members`, the per-voter
+        // fan-out the console needs and the cluster port deliberately does not serve — it is the
+        // target of that fan-out, so making it fleet-wide too would have every peer fan out to
+        // every other peer.
+        //
+        // Split rather than relaxed, because the two directions mean opposite things. A field the
+        // projection *dropped* is the drift this test was written to catch: an operator reading the
+        // cluster port and a console reading the fleet port would disagree about the same fleet. A
+        // field it *added* is only ever the documented extension below — anything else is caught
+        // just as loudly as before.
+        let permitted_additions: &[&str] = match fleet_path {
+            "/_fleet/members" => &["members"],
+            _ => &[],
+        };
+        let dropped: Vec<&String> = b.iter().filter(|key| !a.contains(key)).collect();
+        let added: Vec<&str> = a
+            .iter()
+            .filter(|key| !b.contains(key))
+            .map(String::as_str)
+            .collect();
+
+        assert!(
+            dropped.is_empty(),
+            "{fleet_path} dropped {dropped:?} that {cluster_path} reports — the projection has \
+             drifted from the surface it projects"
+        );
         assert_eq!(
-            a, b,
-            "{fleet_path} and {cluster_path} report different fields — the projection has drifted \
-             from the surface it projects"
+            added, permitted_additions,
+            "{fleet_path} adds fields {cluster_path} does not, beyond the documented extension"
         );
     }
 

@@ -4871,11 +4871,24 @@ components:
     FleetMembers:
       type: object
       description: >
-        This node's view of raft membership — the `/_fleet/members`
-        read-only admin-port projection (RFC-006 §5.2) of
-        `cluster_api.rs`'s `members_body`, byte-identical to
-        `/_cluster/members` on the cluster port. One builder, two ports,
-        so the two cannot drift.
+        Raft membership as this node sees it, plus one row per voter
+        carrying that voter's own applied index (issue #361).
+
+
+        The top-level fields are `cluster_api.rs`'s `members_body`, the same
+        builder `/_cluster/members` serves on the cluster port. `members` is
+        added on top and is the one difference between the two ports: this
+        projection folds that builder across every voter, asking each peer the
+        question the cluster port already answers, while `/_cluster/members`
+        stays node-local — it is the target of that fan-out, and it is also how
+        an operator asks *one* node what it thinks when isolating a node that
+        is behind.
+
+
+        So there is still exactly one implementation of "a node's own applied
+        index", read once here and once per peer. What the two ports must not
+        do is answer the same question differently; a fold over one builder is
+        not that.
       required: [node_id, is_leader, current_leader, last_applied, voters]
       properties:
         node_id:
@@ -4909,6 +4922,52 @@ components:
           description: >
             Voter node ids in the currently effective membership. Strings for
             the same reason as `node_id`.
+        members:
+          type: array
+          description: >
+            One row per voter, in `voters` order (issue #361). Present on
+            `/_fleet/members` only — `/_cluster/members` is node-local.
+
+
+            The console is served under `default-src 'self'`, so the page can
+            only ever dial the node that served it: a peer's applied index is
+            unreachable from the browser by construction, and can only arrive
+            through an aggregate the serving node assembles. This is it.
+
+
+            When a voter does not answer inside the fan-out budget its row is
+            still present with `reachable: false` and a `null` index, and the
+            response carries `Rift-Cluster-Partial`. The row is not omitted —
+            a missing voter would read as a fleet that shrank.
+          items:
+            type: object
+            required: [node_id, reachable]
+            properties:
+              node_id:
+                type: string
+                description: The voter's raft id, a string for the same reason as above.
+              last_applied:
+                type: integer
+                format: int64
+                nullable: true
+                description: >
+                  What that node reports about itself, read back from its own
+                  body rather than recomputed here.
+
+
+                  `null`, never `0`, when the node did not answer: an unknown
+                  index rendered as zero reads as "this node has applied
+                  nothing", which is an alarm raised by the fan-out rather than
+                  by the fleet.
+              is_leader:
+                type: boolean
+                nullable: true
+                description: Whether that node believes it is the leader. `null` when it did not answer.
+              reachable:
+                type: boolean
+                description: >
+                  Whether this node got an answer from that voter inside the
+                  budget. `false` is why the fields above are `null`.
 
     FleetHealth:
       type: object

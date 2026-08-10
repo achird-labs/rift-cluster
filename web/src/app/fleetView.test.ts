@@ -166,3 +166,58 @@ describe("viewConfidence", () => {
     expect(confidence.reason).toMatch(/isolated/i);
   });
 });
+
+describe("per-voter applied indices (#361)", () => {
+  it("carries what each voter reported about itself", () => {
+    const view = fleetView(
+      {
+        ...THREE_NODE,
+        members: [
+          { node_id: A, last_applied: 412, is_leader: true, reachable: true },
+          { node_id: B, last_applied: 409, is_leader: false, reachable: true },
+          { node_id: C, last_applied: 411, is_leader: false, reachable: true },
+        ],
+      },
+      HEALTHY,
+    );
+
+    expect(view.members.get(B)?.lastApplied).toBe(409);
+    expect(view.members.get(C)?.lastApplied).toBe(411);
+    // The ids survive as strings — a `Number(id)` anywhere in the parse would round these two.
+    expect([...view.members.keys()]).toEqual([A, B, C]);
+  });
+
+  /*
+   * The assertion this feature exists to protect. A voter that did not answer has an *unknown*
+   * index; rendering it as `0` would report "that node has applied nothing" — an alarm about the
+   * fleet raised by a fan-out that merely timed out.
+   */
+  it("keeps an unreachable voter's index unknown rather than zero", () => {
+    const view = fleetView(
+      {
+        ...THREE_NODE,
+        members: [
+          { node_id: A, last_applied: 412, is_leader: true, reachable: true },
+          { node_id: B, last_applied: null, is_leader: null, reachable: false },
+          { node_id: C, last_applied: 411, is_leader: false, reachable: true },
+        ],
+      },
+      HEALTHY,
+    );
+
+    expect(view.members.get(B)?.lastApplied).toBeNull();
+    expect(view.members.get(B)?.lastApplied).not.toBe(0);
+    expect(view.members.get(B)?.reachable).toBe(false);
+    // The voter list is untouched: a fleet does not shrink because one node was slow.
+    expect(view.voters).toEqual([A, B, C]);
+  });
+
+  // `members` is optional in the contract, so a body without it is a shape the schema permits —
+  // every voter simply reads as unknown, which is what this panel showed before #361.
+  it("treats an absent members array as every voter unknown, not as an empty fleet", () => {
+    const view = fleetView(THREE_NODE, HEALTHY);
+
+    expect(view.members.size).toBe(0);
+    expect(view.voters).toEqual([A, B, C]);
+  });
+});
