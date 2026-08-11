@@ -80,6 +80,22 @@ export type FleetView = {
   parkedIntentsPartial: boolean;
 };
 
+/**
+ * What one voter reports about its own bind attempts (#369), as a discriminated union rather than
+ * three loose nullable fields.
+ *
+ * The wire carries `bound_ports`/`bind_failures`/`bind_status_unavailable` as three independently
+ * nullable fields because that is what a rolling upgrade and a fan-out timeout can each produce —
+ * but nothing downstream of this module should have to re-derive "so is this node's answer usable"
+ * from three nulls every time it asks. `known: false` collapses every reason that derivation can
+ * fail into the one fact that matters to a caller: there is no positive answer for this node, so
+ * every port on it reads as unknown. `why` is kept only because the two unusable cases want
+ * different sentences on screen ("did not answer" vs "did not report").
+ */
+export type BindReport =
+  | { known: true; boundPorts: number[]; failures: Record<string, string> }
+  | { known: false; why: "unreachable" | "unreported" };
+
 /** One voter's own report, as the members projection carries it (#361). */
 export type MemberRow = {
   /** `null` when that node did not answer — an unknown index, never `0`. */
@@ -88,7 +104,42 @@ export type MemberRow = {
   isLeader: boolean | null;
   /** Whether the serving node got an answer from this voter inside its fan-out budget. */
   reachable: boolean;
+  /** That voter's own bind report (#369). See `BindReport` for why it is a union, not three fields. */
+  bind: BindReport;
 };
+
+/**
+ * A voter's raw bind fields, reduced to the shape `bindStatus` actually needs.
+ *
+ * Unreachable is checked first and independently of the other three: an unreachable row's
+ * `bound_ports`/`bind_failures`/`bind_status_unavailable` are `null` for the same reason its
+ * `last_applied` is — nobody answered — and that is a different fact from a reachable node that
+ * answered with nothing to report.
+ */
+function bindReportOf(row: {
+  reachable: boolean;
+  bound_ports?: number[] | null;
+  bind_failures?: Record<string, string> | null;
+  bind_status_unavailable?: boolean | null;
+}): BindReport {
+  if (!row.reachable) return { known: false, why: "unreachable" };
+  /*
+   * Any of the three missing, `null`, or an explicit `bind_status_unavailable: true` means this
+   * node has no usable answer — a pre-#369 peer omits the keys entirely, and a node that could not
+   * read its own config sends them `null` even though it *did* answer the fan-out. `?? []`/`?? {}`
+   * here would turn either case into "checked, nothing failed", which is the exact silent-bound
+   * defect this field exists to prevent.
+   */
+  if (
+    row.bound_ports == null ||
+    row.bind_failures == null ||
+    row.bind_status_unavailable == null ||
+    row.bind_status_unavailable
+  ) {
+    return { known: false, why: "unreported" };
+  }
+  return { known: true, boundPorts: row.bound_ports, failures: row.bind_failures };
+}
 
 export function fleetView(
   members: FleetMembers,
@@ -160,6 +211,7 @@ export function fleetView(
           lastApplied: row.last_applied ?? null,
           isLeader: row.is_leader ?? null,
           reachable: row.reachable,
+          bind: bindReportOf(row),
         },
       ]),
     ),
@@ -222,4 +274,62 @@ export function viewConfidence(state: FleetReadState): ViewConfidence {
     reason: state.view.degraded.map((degradation) => WORDING[degradation]).join("; "),
     unknown: false,
   };
+}
+
+/**
+ * A single voter's answer for a single port (#369).
+ *
+ * Three states, and deliberately no fourth: "unknown" carries `why` rather than being three
+ * separate states of its own, because every screen that renders this treats all three the same
+ * way (a neutral row, never a green one) and only needs the reason for the hover text. Collapsing
+ * "bound" and "unknown" into one optimistic default is exactly the defect `bound_ports` being a
+ * positive list exists to prevent — see `BindReport` for why.
+ */
+export type BindState =
+  | { state: "bound" }
+  | { state: "failed"; reason: string }
+  | { state: "unknown"; why: "unreachable" | "unreported" | "not-applied" };
+
+/**
+ * Per-node bind status for `port`, one entry per voter, keyed by node id (#369).
+ *
+ * Iterates `view.voters`, not `view.members.keys()`, for the same reason `view.members` itself is
+ * keyed rather than an array: a voter with no row must render as unknown, not vanish from the
+ * panel. A membership that appears to have shrunk because one node was slow to answer the bind
+ * fan-out is the one thing this must not show.
+ */
+export function bindStatus(view: FleetView, port: number): Map<string, BindState> {
+  return new Map(
+    view.voters.map((voter): [string, BindState] => {
+      const row = view.members.get(voter);
+      if (row === undefined) return [voter, { state: "unknown", why: "unreported" }];
+      const { bind } = row;
+      if (!bind.known) return [voter, { state: "unknown", why: bind.why }];
+      const reason = bind.failures[String(port)];
+      if (reason !== undefined) return [voter, { state: "failed", reason }];
+      if (bind.boundPorts.includes(port)) return [voter, { state: "bound" }];
+      /*
+       * In neither list: this node answered and reported nothing wrong, but it also never claimed
+       * the socket — raft lag (the imposter is committed but not yet applied here) and "this node
+       * has never heard of this port" both look like this. `bound_ports` is positive precisely so
+       * this case is representable instead of defaulting to "bound".
+       */
+      return [voter, { state: "unknown", why: "not-applied" }];
+    }),
+  );
+}
+
+/**
+ * The fleet-wide answer for one port (#369): "failed" if any voter reports a failed bind, "bound"
+ * only if every voter confirms it, "unknown" otherwise.
+ *
+ * `"bound"` requires unanimity on purpose. Two of three voters confirming the socket says nothing
+ * about the third — it might be bound, failed, or not yet applied — and asserting "bound" from a
+ * majority would be the same optimistic-default failure `bindStatus` exists to refuse, one level up.
+ */
+export function bindVerdict(view: FleetView, port: number): "bound" | "failed" | "unknown" {
+  const statuses = [...bindStatus(view, port).values()];
+  if (statuses.some((status) => status.state === "failed")) return "failed";
+  if (statuses.length > 0 && statuses.every((status) => status.state === "bound")) return "bound";
+  return "unknown";
 }

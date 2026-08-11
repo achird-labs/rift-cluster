@@ -35,7 +35,7 @@ use std::time::Duration;
 use hyper::Method;
 use rift_cluster::{NodeId, RaftNode};
 
-use crate::cluster_api::{health_body, members_body, op_body};
+use crate::cluster_api::{BindFields, health_body, members_body, op_body};
 use crate::readiness::Readiness;
 
 /// A recognized `/_fleet/*` route.
@@ -227,6 +227,29 @@ async fn merged_members(node: &Arc<RaftNode>) -> FleetBody {
     let status = node.status();
     let me = status.node_id;
 
+    // This node's own bind fields, read back off the body just built rather than recomputed after
+    // the fan-out below (issue #369, blocker B1). `local_bind_state` reads live engine state, and
+    // the fan-out awaits for up to `MEMBER_PEER_BUDGET` (2s) — calling it a second time after that
+    // await could observe a bind that failed (or recovered) in between, producing a response that
+    // claims this node is bound at the top level and failed in its own `members[]` row, or the
+    // reverse. Reading the one value both places use makes that divergence unrepresentable rather
+    // than merely unlikely, the same choice already made here for `last_applied`/`is_leader` via
+    // `status`.
+    let local_bind = BindFields {
+        bound_ports: value
+            .get("bound_ports")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        bind_failures: value
+            .get("bind_failures")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        bind_status_unavailable: value
+            .get("bind_status_unavailable")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    };
+
     // Peers are asked concurrently: serially, one unreachable node would spend the whole budget
     // before the next was tried, so a single dead peer would blank every row after it.
     let mut set = tokio::task::JoinSet::new();
@@ -269,42 +292,115 @@ async fn merged_members(node: &Arc<RaftNode>) -> FleetBody {
         .iter()
         .copied()
         .map(|id| {
-            if id == me {
-                return serde_json::json!({
-                    "node_id": id.to_string(),
-                    "last_applied": status.last_applied,
-                    "is_leader": status.is_leader,
-                    "reachable": true,
-                });
-            }
-            match answered.get(&id) {
-                // `last_applied` is read back from the peer's own body rather than recomputed:
-                // whatever that node reports about itself is the answer, and this node has no
-                // second opinion to offer.
-                Some(reply) => serde_json::json!({
-                    "node_id": id.to_string(),
-                    "last_applied": reply.get("last_applied").cloned().unwrap_or(serde_json::Value::Null),
-                    "is_leader": reply.get("is_leader").cloned().unwrap_or(serde_json::Value::Null),
-                    "reachable": true,
-                }),
-                // `null`, never `0`. A voter that did not answer has an *unknown* applied index,
-                // and a zero would render as "this node has applied nothing" — which is the alarm
-                // an operator would act on, raised by the fan-out rather than by the fleet.
-                None => serde_json::json!({
-                    "node_id": id.to_string(),
-                    "last_applied": serde_json::Value::Null,
-                    "is_leader": serde_json::Value::Null,
-                    "reachable": false,
-                }),
-            }
+            member_row(
+                id,
+                id == me,
+                status.last_applied,
+                status.is_leader,
+                answered.get(&id),
+                &local_bind,
+            )
         })
         .collect();
 
-    let partial = timed_out || rows.iter().any(|row| row["reachable"] == false);
+    let partial = members_partial(timed_out, &rows);
     if let Some(map) = value.as_object_mut() {
         map.insert("members".to_owned(), serde_json::Value::Array(rows));
     }
     FleetBody { value, partial }
+}
+
+/// Build one row of `/_fleet/members`'s `members` array (#361, #369).
+///
+/// Extracted out of `merged_members`'s fan-out so the row shape is under test on its own — every
+/// wire test that exercises it runs a solo node, so `is_me: false` was previously reachable by no
+/// test at all (blocker T2).
+///
+/// `local_bind` is this node's own bind fields, computed once by the caller before the fan-out
+/// starts (blocker B1) — passed in rather than recomputed here for the same reason.
+fn member_row(
+    id: NodeId,
+    is_me: bool,
+    status_last_applied: Option<u64>,
+    status_is_leader: bool,
+    answered: Option<&serde_json::Value>,
+    local_bind: &BindFields,
+) -> serde_json::Value {
+    if is_me {
+        // This node observing itself: `status_last_applied`/`status_is_leader` come from the same
+        // `status()` snapshot the caller already took, and `local_bind` from the same body build —
+        // both single reads reused here rather than asked again, so this row and the top-level body
+        // cannot disagree about this node.
+        return serde_json::json!({
+            "node_id": id.to_string(),
+            "last_applied": status_last_applied,
+            "is_leader": status_is_leader,
+            "reachable": true,
+            "bound_ports": local_bind.bound_ports.clone(),
+            "bind_failures": local_bind.bind_failures.clone(),
+            "bind_status_unavailable": local_bind.bind_status_unavailable.clone(),
+        });
+    }
+    match answered {
+        // `last_applied` is read back from the peer's own body rather than recomputed: whatever
+        // that node reports about itself is the answer, and this node has no second opinion to
+        // offer. `BindFields::from_reply` applies the same rule to the bind fields, and
+        // additionally folds a reply missing them to "unknown" rather than "nothing bound".
+        Some(reply) => {
+            let bind = BindFields::from_reply(Some(reply));
+            serde_json::json!({
+                "node_id": id.to_string(),
+                "last_applied": reply.get("last_applied").cloned().unwrap_or(serde_json::Value::Null),
+                "is_leader": reply.get("is_leader").cloned().unwrap_or(serde_json::Value::Null),
+                "reachable": true,
+                "bound_ports": bind.bound_ports,
+                "bind_failures": bind.bind_failures,
+                "bind_status_unavailable": bind.bind_status_unavailable,
+            })
+        }
+        // `null`, never `0`. A voter that did not answer has an *unknown* applied index, and a
+        // zero would render as "this node has applied nothing" — which is the alarm an operator
+        // would act on, raised by the fan-out rather than by the fleet. Its bind fields are
+        // equally unknown, via `BindFields::unknown()`.
+        None => {
+            let bind = BindFields::unknown();
+            serde_json::json!({
+                "node_id": id.to_string(),
+                "last_applied": serde_json::Value::Null,
+                "is_leader": serde_json::Value::Null,
+                "reachable": false,
+                "bound_ports": bind.bound_ports,
+                "bind_failures": bind.bind_failures,
+                "bind_status_unavailable": bind.bind_status_unavailable,
+            })
+        }
+    }
+}
+
+/// Whether `/_fleet/members` fell short of a complete answer.
+///
+/// Widened by issue #369 beyond the original #361 rule (timeout, or an unreachable voter) with two
+/// more ways a row can be reachable and still leave a gap:
+///
+/// - a voter that *answered* but could not read its own bind status
+///   (`bind_status_unavailable: true`);
+/// - a voter that answered with **no bind status at all** — a reply from a pre-#369 build, valid
+///   `200` and everything, that simply omits the three bind keys. `BindFields::from_reply` folds
+///   that (and the previous case) to `bound_ports: null`, so keying off `bound_ports` being `null`
+///   on an otherwise-reachable row catches both: neither the old rule (`reachable`) nor the
+///   `bind_status_unavailable` rule alone fires for this third case, since it is `reachable: true`
+///   and `bind_status_unavailable: null` — a response that would otherwise claim to be complete
+///   while carrying no bind status for that node.
+///
+/// In every case the row is reachable but the body is missing a fact it claims to carry, which is
+/// exactly what `Rift-Cluster-Partial` exists to flag. Extracted to a free function so each rule is
+/// under test on its own rather than only reachable through the timing of a real fan-out.
+fn members_partial(timed_out: bool, rows: &[serde_json::Value]) -> bool {
+    timed_out
+        || rows.iter().any(|row| row["reachable"] == false)
+        || rows
+            .iter()
+            .any(|row| row["reachable"] == true && row["bound_ports"].is_null())
 }
 
 #[cfg(test)]
@@ -349,5 +445,177 @@ mod tests {
     #[test]
     fn a_non_get_method_names_no_route() {
         assert_eq!(classify(&Method::POST, "/_fleet/members"), None);
+    }
+
+    /// A voter that did not answer has an **unknown** bind status, not a healthy one.
+    ///
+    /// The same reasoning `last_applied` already uses: `null`, never a value that reads as an
+    /// answer. An empty `bound_ports` here would be worse than the `0` that rule was written for —
+    /// the console renders "bound" from *absence*, so an empty-but-present list would make every
+    /// port on an unreachable node render as an outage, and an empty `bind_failures` would make it
+    /// render as healthy. Both are claims this node cannot make about a peer it never reached.
+    #[test]
+    fn an_unreachable_peer_reports_unknown_bind_status_and_never_a_healthy_one() {
+        assert_eq!(BindFields::from_reply(None), BindFields::unknown());
+    }
+
+    /// A peer running a build from before this field existed must read as unknown, not as bound.
+    ///
+    /// This is the rolling-upgrade shape, and it is the one a `.unwrap_or_default()` would get
+    /// silently wrong: the peer answers `200` with a perfectly valid body that simply has no bind
+    /// fields in it, so nothing fails and the default would be "no failures anywhere".
+    #[test]
+    fn a_peer_that_omits_the_bind_fields_reports_unknown_not_bound() {
+        let reply = serde_json::json!({ "node_id": "7", "last_applied": 12, "is_leader": false });
+        assert_eq!(BindFields::from_reply(Some(&reply)), BindFields::unknown());
+    }
+
+    /// A peer's own report is echoed verbatim — this node has no second opinion about a peer's
+    /// sockets, exactly as it has none about the peer's `last_applied`.
+    #[test]
+    fn a_peer_row_carries_the_peers_own_bind_report() {
+        let reply = serde_json::json!({
+            "node_id": "7",
+            "bound_ports": [8080],
+            "bind_failures": { "9090": "Address already in use" },
+            "bind_status_unavailable": false,
+        });
+
+        assert_eq!(
+            BindFields::from_reply(Some(&reply)),
+            BindFields {
+                bound_ports: serde_json::json!([8080]),
+                bind_failures: serde_json::json!({ "9090": "Address already in use" }),
+                bind_status_unavailable: serde_json::json!(false),
+            }
+        );
+    }
+
+    /// A complete answer from every voter is not partial.
+    ///
+    /// Carries `bound_ports`/`bind_failures` — not just `bind_status_unavailable: false` — because
+    /// the widened rule below now keys off `bound_ports` being present, not merely off the old flag.
+    /// A row missing `bound_ports` reads as unknown whatever `bind_status_unavailable` says, so a
+    /// "complete" fixture has to actually carry it or this test would trip the new clause and fail
+    /// for the wrong reason.
+    #[test]
+    fn a_fleet_that_answered_in_full_is_not_partial() {
+        let rows = vec![serde_json::json!({
+            "reachable": true,
+            "bound_ports": [8080],
+            "bind_failures": {},
+            "bind_status_unavailable": false,
+        })];
+        assert!(!members_partial(false, &rows));
+    }
+
+    /// An unreachable voter makes the answer partial — the pre-existing rule, restated so the
+    /// widening below cannot quietly drop it.
+    #[test]
+    fn an_unreachable_voter_makes_the_answer_partial() {
+        let rows = vec![
+            serde_json::json!({ "reachable": true, "bind_status_unavailable": false }),
+            serde_json::json!({ "reachable": false, "bind_status_unavailable": null }),
+        ];
+        assert!(members_partial(false, &rows));
+    }
+
+    /// A voter that answered but could not read its own config also makes the answer partial.
+    ///
+    /// It is reachable, so the old rule would call this complete — but the body is missing a fact
+    /// it claims to carry, which is precisely what `Rift-Cluster-Partial` means.
+    #[test]
+    fn a_voter_that_could_not_read_its_own_bind_status_makes_the_answer_partial() {
+        let rows = vec![
+            serde_json::json!({ "reachable": true, "bind_status_unavailable": false }),
+            serde_json::json!({ "reachable": true, "bind_status_unavailable": true }),
+        ];
+        assert!(members_partial(false, &rows));
+    }
+
+    /// A fan-out that ran out of budget is partial whatever the rows say.
+    #[test]
+    fn a_timed_out_fan_out_is_partial() {
+        let rows = vec![serde_json::json!({
+            "reachable": true,
+            "bind_status_unavailable": false,
+        })];
+        assert!(members_partial(true, &rows));
+    }
+
+    /// A peer that answered but published no bind status leaves a gap the header must declare.
+    /// It is `reachable: true`, so the pre-#369 rule alone would call this body complete — while it
+    /// carries no bind status at all for that node. This is the rolling-upgrade shape.
+    #[test]
+    fn a_reachable_voter_that_published_no_bind_status_makes_the_answer_partial() {
+        let rows = vec![
+            serde_json::json!({ "reachable": true, "bound_ports": [8080], "bind_failures": {}, "bind_status_unavailable": false }),
+            serde_json::json!({ "reachable": true, "bound_ports": null, "bind_failures": null, "bind_status_unavailable": null }),
+        ];
+        assert!(members_partial(false, &rows));
+    }
+
+    /// The local row carries this node's own bind fields verbatim, and `reachable` is always `true`
+    /// for it — this node always has an answer about itself.
+    #[test]
+    fn the_local_row_carries_this_nodes_own_bind_fields() {
+        let local_bind = BindFields {
+            bound_ports: serde_json::json!([8080, 8081]),
+            bind_failures: serde_json::json!({ "9090": "Address already in use" }),
+            bind_status_unavailable: serde_json::json!(false),
+        };
+
+        let row = member_row(7, true, Some(412), true, None, &local_bind);
+
+        assert_eq!(row["reachable"], serde_json::json!(true));
+        assert_eq!(row["bound_ports"], local_bind.bound_ports);
+        assert_eq!(row["bind_failures"], local_bind.bind_failures);
+        assert_eq!(
+            row["bind_status_unavailable"],
+            local_bind.bind_status_unavailable
+        );
+    }
+
+    /// The whole row, asserted against a literal — the test that catches a swapped key, a dropped
+    /// field, or the local state leaking into a peer's row. No wire test exercises this path: every
+    /// one of them runs a solo node, so `is_me: false` was reachable by nothing before this test.
+    #[test]
+    fn a_peer_row_places_the_peers_bind_fields_under_the_right_keys() {
+        let local_bind = BindFields::unknown();
+        let answered = serde_json::json!({
+            "last_applied": 12,
+            "is_leader": false,
+            "bound_ports": [8080],
+            "bind_failures": { "9090": "Address already in use" },
+            "bind_status_unavailable": false,
+        });
+
+        let row = member_row(9, false, Some(999), true, Some(&answered), &local_bind);
+
+        assert_eq!(
+            row,
+            serde_json::json!({
+                "node_id": "9",
+                "last_applied": 12,
+                "is_leader": false,
+                "reachable": true,
+                "bound_ports": [8080],
+                "bind_failures": { "9090": "Address already in use" },
+                "bind_status_unavailable": false,
+            })
+        );
+    }
+
+    /// A peer that never answered is unknown in every bind field, and `reachable: false`.
+    #[test]
+    fn a_silent_peer_row_is_unknown_in_every_bind_field() {
+        let local_bind = BindFields::unknown();
+
+        let row = member_row(9, false, Some(999), true, None, &local_bind);
+
+        assert_eq!(row["reachable"], serde_json::json!(false));
+        assert_eq!(row["bound_ports"], serde_json::Value::Null);
+        assert_eq!(row["bind_failures"], serde_json::Value::Null);
+        assert_eq!(row["bind_status_unavailable"], serde_json::Value::Null);
     }
 }

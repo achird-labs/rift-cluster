@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { components } from "../api/schema.ts";
-import { fleetView, viewConfidence } from "./fleetView.ts";
+import { bindStatus, bindVerdict, fleetView, viewConfidence } from "./fleetView.ts";
 
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
@@ -261,5 +261,158 @@ describe("the fleet name (#373)", () => {
 
     expect(view.fleetName).toBeNull();
     expect(view.fleetNameUnavailable).toBe(false);
+  });
+});
+
+/*
+ * #369 — per-node bind status.
+ *
+ * The panel these back answers one question per node: did this imposter's listener actually come
+ * up? Three answers are real — bound, failed, unknown — and the tests below exist mostly to stop
+ * the fourth from appearing: a confident "bound" derived from an absence.
+ */
+describe("bindStatus", () => {
+  const members = (
+    rows: NonNullable<FleetMembers["members"]>,
+  ): FleetMembers => ({ ...THREE_NODE, members: rows });
+
+  const bound = (node: string, ports: number[]) => ({
+    node_id: node,
+    last_applied: 412,
+    is_leader: node === A,
+    reachable: true,
+    bound_ports: ports,
+    bind_failures: {},
+    bind_status_unavailable: false,
+  });
+
+  it("reports every voter as bound when every voter holds the socket", () => {
+    const view = fleetView(
+      members([bound(A, [8080]), bound(B, [8080]), bound(C, [8080])]),
+      HEALTHY,
+    );
+
+    expect(bindStatus(view, 8080)).toEqual(
+      new Map([
+        [A, { state: "bound" }],
+        [B, { state: "bound" }],
+        [C, { state: "bound" }],
+      ]),
+    );
+    expect(bindVerdict(view, 8080)).toBe("bound");
+  });
+
+  it("names the failing node and carries the reason an operator needs", () => {
+    const view = fleetView(
+      members([
+        bound(A, [8080]),
+        {
+          ...bound(B, []),
+          bind_failures: { "8080": "Address already in use" },
+        },
+        bound(C, [8080]),
+      ]),
+      HEALTHY,
+    );
+
+    expect(bindStatus(view, 8080).get(B)).toEqual({
+      state: "failed",
+      reason: "Address already in use",
+    });
+    // The other two are untouched by their neighbour's failure — the condition is per node.
+    expect(bindStatus(view, 8080).get(A)).toEqual({ state: "bound" });
+    expect(bindVerdict(view, 8080)).toBe("failed");
+  });
+
+  it("reports an unreachable voter as unknown, never as bound", () => {
+    const view = fleetView(
+      members([
+        bound(A, [8080]),
+        bound(B, [8080]),
+        {
+          node_id: C,
+          last_applied: null,
+          is_leader: null,
+          reachable: false,
+          bound_ports: null,
+          bind_failures: null,
+          bind_status_unavailable: null,
+        },
+      ]),
+      HEALTHY,
+    );
+
+    expect(bindStatus(view, 8080).get(C)).toEqual({
+      state: "unknown",
+      why: "unreachable",
+    });
+    // And the fleet-level verdict is not "bound": two of three is not an answer about the third.
+    expect(bindVerdict(view, 8080)).toBe("unknown");
+  });
+
+  /*
+   * The rolling-upgrade shape. A peer on an older build answers 200 with a valid body that simply
+   * has no bind fields, so nothing fails — which is exactly why a `?? []` here would be a silent
+   * defect rather than a loud one.
+   */
+  it("reports a voter that does not publish bind status as unknown, not as bound", () => {
+    const view = fleetView(
+      members([
+        bound(A, [8080]),
+        { node_id: B, last_applied: 412, is_leader: false, reachable: true },
+      ]),
+      HEALTHY,
+    );
+
+    expect(bindStatus(view, 8080).get(B)).toEqual({
+      state: "unknown",
+      why: "unreported",
+    });
+  });
+
+  it("reports a voter that could not read its own config as unknown", () => {
+    const view = fleetView(
+      members([
+        bound(A, [8080]),
+        {
+          node_id: B,
+          last_applied: 412,
+          is_leader: false,
+          reachable: true,
+          bound_ports: null,
+          bind_failures: null,
+          bind_status_unavailable: true,
+        },
+      ]),
+      HEALTHY,
+    );
+
+    expect(bindStatus(view, 8080).get(B)).toEqual({
+      state: "unknown",
+      why: "unreported",
+    });
+  });
+
+  /*
+   * Raft lag: the imposter is committed but node C has not applied it yet, so C holds no socket
+   * for it and records no failure either. "Absent from both" is the case that must NOT render as
+   * bound — it is the whole reason the wire carries a positive `bound_ports` list.
+   */
+  it("reports a voter that has not applied the imposter as unknown, not as bound", () => {
+    const view = fleetView(
+      members([bound(A, [8080]), bound(B, [8080]), bound(C, [])]),
+      HEALTHY,
+    );
+
+    expect(bindStatus(view, 8080).get(C)).toEqual({
+      state: "unknown",
+      why: "not-applied",
+    });
+    expect(bindVerdict(view, 8080)).toBe("unknown");
+  });
+
+  it("says nothing about a port when no voter published a row", () => {
+    const view = fleetView(THREE_NODE, HEALTHY);
+    expect(bindVerdict(view, 8080)).toBe("unknown");
   });
 });

@@ -1267,6 +1267,15 @@ impl RaftNode {
         self.sm_reader.is_locally_bound(port)
     }
 
+    /// Every port this node's engine holds, split by bound vs. failed (issue #369, blocker B4). See
+    /// [`RedbStateMachine::local_bind_report`] — a single in-memory pass over the engine's own
+    /// imposter set, not a redb transaction, which is what makes it safe to call on every 5-second
+    /// `/_cluster/members` poll.
+    #[must_use]
+    pub fn local_bind_report(&self) -> Option<(Vec<u16>, BTreeMap<u16, String>)> {
+        self.sm_reader.local_bind_report()
+    }
+
     /// `(tenant, port)` for every port this node has a committed config for,
     /// fleet-wide, ascending. Like [`Self::get_imposter`], this answers from
     /// applied local state. Fleet-wide and not tenant-scoped on purpose — it

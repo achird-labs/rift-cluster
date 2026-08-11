@@ -1,4 +1,6 @@
 import type { components } from "../../api/schema.ts";
+import type { FleetView } from "../../app/fleetView.ts";
+import { bindVerdict } from "../../app/fleetView.ts";
 import { recordingState } from "../recording/state.ts";
 
 type Imposter = components["schemas"]["Imposter"];
@@ -23,6 +25,16 @@ export type SortDirection = "asc" | "desc";
 
 export type DriftFilter = "all" | "drifted";
 
+/**
+ * Whether an imposter's bind status (#369) fails on at least one voter.
+ *
+ * Only "failed", not "bound"/"unknown" as separate values: `bindVerdict` already reduces the whole
+ * fleet to one of three answers, and "show me the ones with a problem" is the one question a quick
+ * filter needs to answer in one click. An operator wanting the finer distinction reads the imposter's
+ * own Ownership tab.
+ */
+export type BindFilter = "all" | "failed";
+
 export type ImposterQuery = {
   text: string;
   state: StateFilter;
@@ -45,6 +57,8 @@ export type ImposterQuery = {
    * them together would make "source-owned AND drifted" unaskable.
    */
   drifted: DriftFilter;
+  /** #369 — see `BindFilter`. */
+  bind: BindFilter;
   sort: SortKey;
   direction: SortDirection;
 };
@@ -55,6 +69,7 @@ export const EMPTY_QUERY: ImposterQuery = {
   recording: "all",
   owner: "all",
   drifted: "all",
+  bind: "all",
   sort: "port",
   direction: "asc",
 };
@@ -66,6 +81,7 @@ export function isEmptyQuery(query: ImposterQuery): boolean {
     query.recording === EMPTY_QUERY.recording &&
     query.owner === EMPTY_QUERY.owner &&
     query.drifted === EMPTY_QUERY.drifted &&
+    query.bind === EMPTY_QUERY.bind &&
     query.sort === EMPTY_QUERY.sort &&
     query.direction === EMPTY_QUERY.direction
   );
@@ -88,6 +104,7 @@ export function encodeQuery(query: ImposterQuery): string {
   if (query.recording !== EMPTY_QUERY.recording) params.set("rec", query.recording);
   if (query.owner !== EMPTY_QUERY.owner) params.set("owner", query.owner);
   if (query.drifted !== EMPTY_QUERY.drifted) params.set("drifted", query.drifted);
+  if (query.bind !== EMPTY_QUERY.bind) params.set("bind", query.bind);
   if (query.sort !== EMPTY_QUERY.sort) params.set("sort", query.sort);
   if (query.direction !== EMPTY_QUERY.direction) params.set("dir", query.direction);
   return params.toString();
@@ -105,6 +122,7 @@ export function decodeQuery(search: string): ImposterQuery {
     recording: oneOf(params.get("rec"), ["all", "has", "none"], EMPTY_QUERY.recording),
     owner: oneOf(params.get("owner"), ["all", "source", "hand"], EMPTY_QUERY.owner),
     drifted: oneOf(params.get("drifted"), ["all", "drifted"], EMPTY_QUERY.drifted),
+    bind: oneOf(params.get("bind"), ["all", "failed"], EMPTY_QUERY.bind),
     sort: oneOf(params.get("sort"), ["port", "name", "stubs"], EMPTY_QUERY.sort),
     direction: oneOf(params.get("dir"), ["asc", "desc"], EMPTY_QUERY.direction),
   };
@@ -179,17 +197,32 @@ function matchesOwner(
   return filter === "source" ? owned : !owned;
 }
 
+/**
+ * `fleet` is `null` for exactly the reasons `sourceOwned` is: refused (`fleet.read` withheld), not
+ * yet loaded, or the caller does not have one to offer. A port with no fleet reading to check is
+ * `unknown`, never `failed` — the same `driftedPorts === null → false` rule `visibleImposters`
+ * documents further down, chosen for the same reason: an operator asking for failures must never
+ * see "none" stand in for "could not check", nor "everything" stand in for it either.
+ */
+function matchesBind(imposter: Imposter, filter: BindFilter, fleet: FleetView | null): boolean {
+  if (filter === "all") return true;
+  if (fleet === null || imposter.port === undefined) return false;
+  return bindVerdict(fleet, imposter.port) === "failed";
+}
+
 export function filterImposters(
   imposters: readonly Imposter[],
   query: ImposterQuery,
   sourceOwned: ReadonlySet<number> | null = null,
+  fleet: FleetView | null = null,
 ): Imposter[] {
   return imposters.filter(
     (imposter) =>
       matchesText(imposter, query.text) &&
       matchesState(imposter, query.state) &&
       matchesRecording(imposter, query.recording) &&
-      matchesOwner(imposter, query.owner, sourceOwned),
+      matchesOwner(imposter, query.owner, sourceOwned) &&
+      matchesBind(imposter, query.bind, fleet),
   );
 }
 
@@ -211,6 +244,7 @@ export function unclassifiedCount(
   imposters: readonly Imposter[],
   query: ImposterQuery,
   sourceOwned: ReadonlySet<number> | null = null,
+  fleet: FleetView | null = null,
 ): number {
   if (query.recording === "all") return 0;
   /*
@@ -222,8 +256,39 @@ export function unclassifiedCount(
    * its stubs" — the count that exists to name the right reason, naming the wrong one. Deriving it
    * from `filterImposters` means a filter added later cannot be forgotten here.
    */
-  return filterImposters(imposters, { ...query, recording: "all" }, sourceOwned).filter(
+  return filterImposters(imposters, { ...query, recording: "all" }, sourceOwned, fleet).filter(
     (imposter) => classifyRecording(imposter) === "unknown",
+  ).length;
+}
+
+/**
+ * How many rows the bind-failures filter could not classify (#369), because their verdict is
+ * `"unknown"` rather than a real "no failure".
+ *
+ * Same shape as `unclassifiedCount` and for the same reason: `bind: "failed"` excludes a row whose
+ * `bindVerdict` is `"unknown"` exactly as it excludes one that is genuinely `"bound"`, and those are
+ * different facts an operator deserves to be told apart. Silently folding "could not confirm" into
+ * "not failing" is the one thing a bind-status filter must never do.
+ *
+ * `fleet === null` is not folded into "nothing to report" (blocker B3). `query.bind` is decoded
+ * from the URL, so `?bind=failed` is reachable from a shared link by a session that cannot read the
+ * fleet — `matchesBind` then excludes every row (no fleet reading to check any of them against),
+ * and returning `0` here on top of that would render as "0 of N: nothing is failing", the exact
+ * "checked and found healthy" claim this session never earned. So when there is no fleet reading at
+ * all, every row the *other* filters admit is unclassified — not just the ones whose fleet-derived
+ * verdict says so, because there is no such verdict to consult.
+ */
+export function bindUnclassifiedCount(
+  imposters: readonly Imposter[],
+  query: ImposterQuery,
+  sourceOwned: ReadonlySet<number> | null = null,
+  fleet: FleetView | null = null,
+): number {
+  if (query.bind === "all") return 0;
+  const admitted = filterImposters(imposters, { ...query, bind: "all" }, sourceOwned, fleet);
+  if (fleet === null) return admitted.length;
+  return admitted.filter(
+    (imposter) => imposter.port !== undefined && bindVerdict(fleet, imposter.port) === "unknown",
   ).length;
 }
 
@@ -278,8 +343,9 @@ export function visibleImposters(
   query: ImposterQuery,
   sourceOwned: ReadonlySet<number> | null = null,
   driftedPorts: ReadonlySet<number> | null = null,
+  fleet: FleetView | null = null,
 ): Imposter[] {
-  const matched = filterImposters(imposters, query, sourceOwned).filter((imposter) => {
+  const matched = filterImposters(imposters, query, sourceOwned, fleet).filter((imposter) => {
     if (query.drifted === "all") return true;
     /*
      * `null` is "the drift set could not be read" — the same shape `sourceOwned` uses — and it

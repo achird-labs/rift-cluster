@@ -1755,6 +1755,28 @@ export interface components {
              */
             fleet_name_unavailable?: boolean;
             /**
+             * @description Ports this node's engine actually holds the socket for (issue #369), fleet-wide and deduplicated. A **positive** list, not just "every configured port minus `bind_failures`": a port this node has never applied config for also has no recorded failure, so a failures-only projection would have the console infer "absent ⇒ bound" and render a confident green row for a node that never received the imposter. This is the field that makes the panel a claim about what is actually listening rather than an inference from what has not (yet) failed.
+             *
+             *     A **failed** bind is not a failed imposter: the node still serves that port's imposter in-process through the front door and the `/__rift/:port` gateway route (RFC-001 §7.4.6) — it just is not the process holding the socket. `bound_ports` says which case applies; it is not a health signal on its own.
+             *
+             *     Deliberately **not** in `required`, for the same rolling-upgrade reason as `fleet_name`: a pre-#369 peer's reply omits this key entirely, and `/_fleet/members` may be answered by whichever node the caller reached. Absent means "unknown", exactly like `null` — never "nothing bound". See `bind_status_unavailable` for why a present-but-empty answer is not interchangeable with either.
+             */
+            bound_ports?: number[] | null;
+            /**
+             * @description Why each port in this map failed to bind, keyed by port number as a string (issue #369) — e.g. `{"9090": "Address already in use"}`. A port is never a key here **and** a member of `bound_ports`; see that field for what a failed bind does and does not mean for the imposter it names.
+             *
+             *     An empty object is the healthy answer once this node has actually read its own state: it means "checked every configured port, nothing failed" — a different claim from `null`, which means "this node could not check". Not in `required`, for the same rolling-upgrade reason as `bound_ports`.
+             */
+            bind_failures?: {
+                [key: string]: string;
+            } | null;
+            /**
+             * @description Whether the answering node has no local engine to observe binds with at all, as distinct from having an engine and finding nothing bound or nothing failed. The same `fleet_name`/`fleet_name_unavailable` split (#373), applied here: `bound_ports` and `bind_failures` both arrive `null` whether the cause is "no local engine" or "peer is unreachable and said nothing", and without this flag those two are the same byte on the wire.
+             *
+             *     `false` once a node has an engine and has checked its ports, whether or not anything is bound. `null` (or the key absent) only for a peer this node could not reach or that predates this field — the same "unknown, not unhealthy" rule `bound_ports` documents. A reachable voter reporting `true` here is enough on its own to mark `/_fleet/members`'s response `Rift-Cluster-Partial`, the same as an unreachable one.
+             */
+            bind_status_unavailable?: boolean | null;
+            /**
              * @description One row per voter, in `voters` order (issue #361). Present on `/_fleet/members` only — `/_cluster/members` is node-local.
              *
              *     The console is served under `default-src 'self'`, so the page can only ever dial the node that served it: a peer's applied index is unreachable from the browser by construction, and can only arrive through an aggregate the serving node assembles. This is it.
@@ -1775,6 +1797,14 @@ export interface components {
                 is_leader?: boolean | null;
                 /** @description Whether this node got an answer from that voter inside the budget. `false` is why the fields above are `null`. */
                 reachable: boolean;
+                /** @description That voter's own `bound_ports` (issue #369), echoed verbatim from its reply — this node has no second opinion about a peer's sockets, exactly as it has none about the peer's `last_applied`. See `FleetMembers.bound_ports` for the field's meaning and why it is a positive list. `null` when the voter is unreachable, predates this field, or reported no answer for it. */
+                bound_ports?: number[] | null;
+                /** @description That voter's own `bind_failures`, echoed verbatim. See `FleetMembers.bind_failures`. */
+                bind_failures?: {
+                    [key: string]: string;
+                } | null;
+                /** @description That voter's own `bind_status_unavailable`, echoed verbatim. `true` here — on an otherwise `reachable: true` row — is on its own enough to mark this response `Rift-Cluster-Partial`: the row is reachable but the body is missing a fact it claims to carry. See `FleetMembers.bind_status_unavailable`. */
+                bind_status_unavailable?: boolean | null;
             }[];
         };
         /** @description This node's readiness plus its ring view — the `/_fleet/health` read-only admin-port projection (RFC-006 §5.2) of `cluster_api.rs`'s `health_body`. */

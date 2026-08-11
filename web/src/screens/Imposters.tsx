@@ -35,6 +35,7 @@ import {
   actionablePorts,
   decodeQuery,
   encodeQuery,
+  bindUnclassifiedCount,
   driftedPorts,
   sourceOwnedPorts,
   unclassifiedCount,
@@ -288,8 +289,12 @@ export function Imposters(): ReactNode {
   const drifted = driftedPorts(sources.data?.sources);
 
   const all = listed;
-  const rows = visibleImposters(all, query, sourceOwned, drifted);
-  const unclassified = unclassifiedCount(all, query, sourceOwned);
+  // `null`, not `fleet.data ?? undefined`, when the fleet reading is unread or refused: `list.ts`
+  // treats that the same way it treats `sourceOwned === null` — "cannot check" matches nothing.
+  const fleetForBind = fleet.data ?? null;
+  const rows = visibleImposters(all, query, sourceOwned, drifted, fleetForBind);
+  const unclassified = unclassifiedCount(all, query, sourceOwned, fleetForBind);
+  const bindUnclassified = bindUnclassifiedCount(all, query, sourceOwned, fleetForBind);
 
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
 
@@ -538,6 +543,8 @@ export function Imposters(): ReactNode {
               total={all.length}
               unclassified={unclassified}
               showOwner={sourceOwned !== null}
+              bindFilterAvailable={fleetForBind !== null}
+              bindUnclassified={bindUnclassified}
             />
 
             {bulkActions.length > 0 ? (
