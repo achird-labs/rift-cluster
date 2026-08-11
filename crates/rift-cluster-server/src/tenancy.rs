@@ -1535,4 +1535,77 @@ mod tests {
             .expect_err("a body with no name must be a real refusal");
         assert!(matches!(err, TenancyError::BadRequest(_)), "{err:?}");
     }
+
+    // -- issue #401: `usage_view` (issue #372) had zero unit tests, and every
+    // wire test exercises a single tenant, so the per-tenant port filter
+    // below was never actually checked against a second tenant's ports. -----
+
+    #[test]
+    fn usage_view_sums_flow_entries_for_only_this_tenants_own_ports() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "acme".to_owned(),
+            TenantConfigUsage {
+                imposters: 2,
+                max_stubs: 5,
+                ports: vec![8001, 8002],
+                incomplete: false,
+            },
+        );
+        let mut flow_counts = HashMap::new();
+        flow_counts.insert(8001, 10);
+        flow_counts.insert(8002, 7);
+
+        let view = usage_view(&tenant("acme"), &configs, &flow_counts);
+
+        assert_eq!(view.imposters, 2);
+        assert_eq!(view.stubs_per_imposter, 5);
+        assert_eq!(view.flow_entries, 17);
+    }
+
+    /// The mutation this test exists to kill: dropping the per-tenant port
+    /// filter sums `flow_counts` fleet-wide, so a second tenant's entries
+    /// leak into this tenant's total. `acme` owns only `8001`; `8099` belongs
+    /// to a different tenant and must not be counted.
+    #[test]
+    fn usage_view_never_counts_a_different_tenants_ports() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "acme".to_owned(),
+            TenantConfigUsage {
+                imposters: 1,
+                max_stubs: 3,
+                ports: vec![8001],
+                incomplete: false,
+            },
+        );
+        let mut flow_counts = HashMap::new();
+        flow_counts.insert(8001, 4);
+        // Another tenant's port, present in the fleet-wide map handed to
+        // every tenant's fold — must not leak into `acme`'s total.
+        flow_counts.insert(8099, 999_999);
+
+        let view = usage_view(&tenant("acme"), &configs, &flow_counts);
+
+        assert_eq!(
+            view.flow_entries, 4,
+            "a second tenant's port count must not be summed into this tenant's usage"
+        );
+    }
+
+    /// A tenant with no `configs` row (no imposters) reads as `0`/`0`/`0`,
+    /// never an absent field or an error — the contract [`TenantView`]'s doc
+    /// states.
+    #[test]
+    fn usage_view_with_no_config_row_reads_as_all_zeros() {
+        let configs = HashMap::new();
+        let mut flow_counts = HashMap::new();
+        flow_counts.insert(8001, 42);
+
+        let view = usage_view(&tenant("acme"), &configs, &flow_counts);
+
+        assert_eq!(view.imposters, 0);
+        assert_eq!(view.stubs_per_imposter, 0);
+        assert_eq!(view.flow_entries, 0);
+    }
 }
