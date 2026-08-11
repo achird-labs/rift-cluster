@@ -178,12 +178,11 @@ export type SourceWrite = {
 export function useUpsertSource(): UseMutationResult<CommitOutcome, Error, SourceWrite> {
   const { tenant } = useSession();
   const client = useQueryClient();
-  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async (body) => {
-      const sent = await keyed((idempotencyKey) =>
-        apiSend("POST", API_PATHS.sources, body, { tenant, idempotencyKey }),
-      );
+      // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
+      // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
+      const sent = await apiSend("POST", API_PATHS.sources, body, { tenant });
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;
@@ -203,14 +202,15 @@ export function useUpsertSource(): UseMutationResult<CommitOutcome, Error, Sourc
 export function useDeleteSource(): UseMutationResult<CommitOutcome, Error, { id: string }> {
   const { tenant } = useSession();
   const client = useQueryClient();
-  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ id }) => {
-      const sent = await keyed((idempotencyKey) =>
-        apiSend("DELETE", `${API_PATHS.sources}/${encodeURIComponent(id)}`, undefined, {
-          tenant,
-          idempotencyKey,
-        }),
+      // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
+      // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
+      const sent = await apiSend(
+        "DELETE",
+        `${API_PATHS.sources}/${encodeURIComponent(id)}`,
+        undefined,
+        { tenant },
       );
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
@@ -271,14 +271,15 @@ function readPullReport(body: unknown): SourcePullReport {
 export function usePullSource(): UseMutationResult<SourcePullReport, Error, { id: string }> {
   const { tenant } = useSession();
   const client = useQueryClient();
-  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ id }) => {
-      const sent = await keyed((idempotencyKey) =>
-        apiSend<unknown>("POST", `${API_PATHS.sources}/${encodeURIComponent(id)}/pull`, undefined, {
-          tenant,
-          idempotencyKey,
-        }),
+      // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
+      // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
+      const sent = await apiSend<unknown>(
+        "POST",
+        `${API_PATHS.sources}/${encodeURIComponent(id)}/pull`,
+        undefined,
+        { tenant },
       );
       return readPullReport(applied(sent));
     },
@@ -304,12 +305,11 @@ export function useTryStub(
   port: number,
 ): UseMutationResult<TryResult, Error, { request: TrySpec }> {
   const { tenant } = useSession();
-  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ request }) => {
-      const sent = await keyed((idempotencyKey) =>
-        apiSend<TryResult>("POST", tryImposterPath(port), request, { tenant, idempotencyKey }),
-      );
+      // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
+      // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
+      const sent = await apiSend<TryResult>("POST", tryImposterPath(port), request, { tenant });
       return applied(sent);
     },
   });
@@ -1215,12 +1215,11 @@ export function useTeardownSpace(): UseMutationResult<
 > {
   const { tenant } = useSession();
   const client = useQueryClient();
-  const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ port, flowId }) => {
-      const sent = await keyed((idempotencyKey) =>
-        apiSend("DELETE", spacePath(port, flowId), undefined, { tenant, idempotencyKey }),
-      );
+      // Unkeyed (#389): the contract does not declare `Idempotency-Key` on this route, and
+      // the fleet would ignore one — see `UNDECLARED` in features/writes/idempotency.ts.
+      const sent = await apiSend("DELETE", spacePath(port, flowId), undefined, { tenant });
       const outcome = await settle(sent, { tenant });
       if (outcome.kind === "failed") throw new Error(outcome.detail);
       return outcome;

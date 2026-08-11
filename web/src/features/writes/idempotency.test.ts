@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ApiError } from "../../api/client.ts";
-import { keyedAttempt, mintKey } from "./idempotency.ts";
+import { UNDECLARED, keyedAttempt, mintKey } from "./idempotency.ts";
 
 /**
  * #371. The two policies that look reasonable are both wrong, in opposite directions, and these
@@ -117,5 +117,49 @@ describe("minted keys", () => {
 
   it("are non-empty strings, so the client never sends a blank header", () => {
     expect(mintKey().length).toBeGreaterThan(0);
+  });
+});
+
+describe("the console keys only what the contract declares (#389)", () => {
+  /*
+   * The rule this pins, and the mistake it exists to stop repeating: an earlier revision sent a key
+   * on every write, including five routes the contract never declared it on. Harmless on the wire,
+   * wrong as documentation — the header implied a retry-safety those routes get from being
+   * convergent, not from any key.
+   *
+   * Read against `openapi-ee.yaml` rather than a hand-copied list, so the day a route starts
+   * declaring the parameter this fails and asks to be updated.
+   */
+  const CONTRACT = new URL("../../../../docs/api/openapi-ee.yaml", import.meta.url);
+
+  function declaresIdempotency(spec: string, path: string): boolean {
+    const lines = spec.split("\n");
+    const start = lines.findIndex((line) => line.trimEnd() === `  ${path}:`);
+    if (start < 0) throw new Error(`${path} is not in the contract`);
+    for (let i = start + 1; i < lines.length; i += 1) {
+      // The next path at the same indent ends this block.
+      if (/^ {2}\/\S*:\s*$/.test(lines[i] ?? "")) return false;
+      if ((lines[i] ?? "").includes("IdempotencyKey")) return true;
+    }
+    return false;
+  }
+
+  it("every route in UNDECLARED really is undeclared in openapi-ee.yaml", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const spec = await readFile(CONTRACT, "utf8");
+
+    for (const route of Object.keys(UNDECLARED)) {
+      const path = route.slice(route.indexOf(" ") + 1);
+      expect(
+        declaresIdempotency(spec, path),
+        `${route} now declares Idempotency-Key — key it in queries.ts and drop it from UNDECLARED`,
+      ).toBe(false);
+    }
+  });
+
+  it("names a reason for each, so 'safe to repeat' is argued rather than asserted", () => {
+    for (const [route, reason] of Object.entries(UNDECLARED)) {
+      expect(reason.length, `${route} needs a reason`).toBeGreaterThan(10);
+    }
   });
 });
