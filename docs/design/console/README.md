@@ -235,9 +235,16 @@ node runs with:
 - `snapshot_policy = LogsSinceLast(5000)` — a snapshot every 5000 entries since the last, automatic;
 - `max_in_snapshot_log_to_keep = 1000` — logs a snapshot already covers are purged automatically.
 
-The single override, `NodeConfig::snapshot_log_entries`, is a documented testability knob wired from
-nothing but the chaos overlay (#183). `a_shipped_fleet_snapshots_and_purges_without_being_asked`
-pins the property, deliberately as a *different* claim from the older
+The single override is `NodeConfig::snapshot_log_entries`, reachable through a **hidden** flag —
+`--cluster-snapshot-log-entries`, env `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES` — that exists so the
+container chaos tier can exercise the snapshot wire path at all (#183). It is `hide = true`, unset
+on every shipped path, and its own doc says a fleet that sets it "is trading away log retention for
+nothing". Note that setting it does **not** reach a manual posture either: `Some(n)` means
+`LogsSinceLast(n)`, still automatic, and it additionally forces `max_in_snapshot_log_to_keep = 0`.
+Both paths are covered — `a_shipped_fleet_snapshots_and_purges_without_being_asked` for the default,
+`the_snapshot_knob_sets_the_policy_and_purges_immediately` for the override.
+
+The first of those is deliberately a *different* claim from the older
 `raft_config_default_leaves_the_snapshot_knobs_untouched`: that one says "we do not override
 openraft", which would still pass if a future openraft defaulted to `SnapshotPolicy::Never` — a mode
 that waits for a manual trigger nothing here calls, letting the log grow without bound.
