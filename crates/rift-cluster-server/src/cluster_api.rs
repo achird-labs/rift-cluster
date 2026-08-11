@@ -235,6 +235,25 @@ fn node_id(id: impl std::fmt::Display) -> serde_json::Value {
 
 pub(crate) fn members_body(node: &RaftNode) -> serde_json::Value {
     let status = node.status();
+    // `fleet_name()` is the one read here that can fail, and it is `Result<Option<String>, _>` —
+    // which is why it cannot use `.ok()` the way `parked_intents` does a few lines below. That
+    // read is `Result<u64, _>`: it has no legitimate `None`, so a `null` there unambiguously
+    // means "could not be read". Here `Ok(None)` is the *ordinary* answer — every fleet starts
+    // unnamed — so folding the error into `None` too would put "storage could not answer" and
+    // "nobody has named this fleet" on the same wire byte, and the console would render both as
+    // `Unnamed`. That is the wrong-but-quiet shape the error rules exist to prevent.
+    //
+    // The endpoint deliberately still answers: `status()` is read from in-memory raft metrics, so
+    // everything else in this body is trustworthy even when redb is not, and an operator
+    // debugging that failure needs the membership view rather than a 500. The ambiguity is closed
+    // by reporting the failure as its own field instead (issue #373).
+    let (fleet_name, fleet_name_unavailable) = match node.fleet_name() {
+        Ok(name) => (name, false),
+        Err(e) => {
+            tracing::error!(error = %e, "fleet members body: fleet name could not be read");
+            (None, true)
+        }
+    };
     serde_json::json!({
         "node_id": node_id(status.node_id),
         "is_leader": status.is_leader,
@@ -243,6 +262,8 @@ pub(crate) fn members_body(node: &RaftNode) -> serde_json::Value {
         "current_leader": status.current_leader.map(node_id),
         "last_applied": status.last_applied,
         "voters": status.voters.iter().map(node_id).collect::<Vec<_>>(),
+        "fleet_name": fleet_name,
+        "fleet_name_unavailable": fleet_name_unavailable,
     })
 }
 

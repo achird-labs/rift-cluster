@@ -2640,6 +2640,77 @@ async fn sink_and_checkpoint_survive_a_node_restart() {
     cluster.shutdown_all().await;
 }
 
+/// The fleet's name survives a process death (issue #373).
+///
+/// **Restart, not snapshot install** — the same correction this file already records for the
+/// audit sink and checkpoint above, and for chaos C18/C22. `snapshot_round_trips_the_fleet_name`
+/// in `raft/store.rs` drives `build_snapshot`/`install_snapshot` directly against a *fresh* state
+/// machine; it never closes and reopens the same redb file. A restart is the far more common
+/// event of the two — the default `LogEntries(5000)` policy means most nodes come back by
+/// replaying their own persisted state, not by installing a snapshot — so a name that lived only
+/// in a snapshot payload would be lost in exactly the ordinary case.
+///
+/// The failure it would produce is quiet, which is why it is worth a scenario: the node comes
+/// back and every console reading the fleet through it says `Unnamed`, with nothing logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fleet_name_survives_a_node_restart() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("a leader");
+
+    let leader = cluster.leader().expect("a leader to accept the name");
+    leader
+        .submit(ControlRequest {
+            op_id: uuid::Uuid::new_v4(),
+            principal: None,
+            issued_at_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            expected_revision: None,
+            op: rift_cluster::ControlOp::FleetNamePut {
+                tenant: rift_cluster::TenantId::new(rift_cluster::FLEET_SCOPE),
+                name: "rift-prod-eu".to_owned(),
+            },
+        })
+        .await
+        .expect("the fleet name commits");
+
+    let victim = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|id| Some(*id) != cluster.leader().map(RaftNode::id))
+        .expect("a follower");
+    cluster.restart(victim).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("a leader after the restart");
+
+    let restarted = cluster
+        .member(victim)
+        .node
+        .as_ref()
+        .expect("the restarted node");
+    let start = Instant::now();
+    while restarted.fleet_name().expect("read") != Some("rift-prod-eu".to_owned())
+        && start.elapsed() < CONVERGE_DEADLINE
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        restarted.fleet_name().expect("read fleet name"),
+        Some("rift-prod-eu".to_owned()),
+        "a node that came back without the fleet's name would answer `Unnamed` to every console \
+         reading the fleet through it, with nothing logged to say why"
+    );
+
+    cluster.shutdown_all().await;
+}
+
 /// AC5: a backlog that ages past retention is counted and logged, never
 /// silently dropped.
 ///

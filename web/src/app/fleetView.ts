@@ -38,6 +38,19 @@ export type FleetView = {
   singleNode: boolean;
   degraded: Degradation[];
   /**
+   * The fleet's operator-set name (#373), or `null` when nobody has named it yet. `null` is an
+   * absence, the same as `leader` above — never rendered as an empty string, which on screen
+   * would be indistinguishable from a name that failed to load.
+   */
+  fleetName: string | null;
+  /**
+   * Whether the answering node could not *read* the name, as opposed to there being none to read
+   * (#373). Two different facts that would otherwise both arrive as `fleetName: null`, and they
+   * want opposite reactions: "nobody has named this fleet" is a thing to go and fix in the
+   * console, "this node's storage did not answer" is a thing to go and fix on the node.
+   */
+  fleetNameUnavailable: boolean;
+  /**
    * What each voter reports about itself (#361), keyed by node id.
    *
    * The console is served under `default-src 'self'`, so the page can only ever dial the node that
@@ -129,6 +142,10 @@ export function fleetView(
     // which is a fault, not the supported single-node deployment.
     singleNode: members.voters.length === 1,
     degraded,
+    fleetName: members.fleet_name ?? null,
+    // `?? false` is a domain-optional read, not a swallow: the field is optional in the contract,
+    // and a node that does not send it is one that had nothing to report as unreadable.
+    fleetNameUnavailable: members.fleet_name_unavailable ?? false,
     /*
      * `?? []` is a domain-optional read, not a swallowed failure: `members` is optional in the
      * contract, so a response without it is a shape the schema permits and every voter simply

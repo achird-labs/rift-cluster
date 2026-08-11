@@ -1387,3 +1387,161 @@ async fn a_tenant_admin_is_refused_on_every_audit_sink_method() {
 
     server.shutdown().await;
 }
+
+// -- the fleet's name admin surface (issue #373 review: the write half) ------
+//
+// Exactly the gap this file's audit-sink section above was written to close,
+// one feature later. `tenancy.rs`'s unit tests cover `classify`, `Route::
+// scope()`, `Route::action()` and the body parse for `PUT /admin/fleet/name`,
+// and `fleet_session.rs` proves the name reaches `/_fleet/members` on the
+// wire — but nothing called `dispatch()` for the write, so the line that
+// builds the `ControlOp` was untested. It is the same line that already
+// shipped wrong once for the sink: `TenantId::default()` instead of
+// `TenantId::new(FLEET_SCOPE)`.
+
+/// The round trip a fleet admin can do end to end: name the fleet over real
+/// HTTP, see the change attributed to the fleet scope in the audit stream —
+/// **the point of this test** — and get refused a body that names nothing.
+#[tokio::test]
+async fn the_fleet_name_surface_round_trips_for_a_fleet_admin_and_is_audited_under_the_fleet_scope()
+{
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "tenancy-fleet-name";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+
+    let seen = Seen::of(
+        client
+            .put(format!("http://{admin}/admin/fleet/name"))
+            .header("authorization", fleet_key)
+            .json(&json!({ "name": "rift-prod-eu" }))
+            .send()
+            .await
+            .expect("name the fleet"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "naming the fleet: {seen}");
+
+    // It really committed, rather than answering 200 over a no-op.
+    assert_eq!(
+        node.fleet_name().expect("read fleet name"),
+        Some("rift-prod-eu".to_owned()),
+        "the write answered 200 without the name reaching applied state"
+    );
+
+    // THE POINT OF THIS TEST: attributed to the fleet scope under
+    // `cluster.admin`, not to whatever `TenantId::default()` would have named.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/audit"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read audit"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "{seen}");
+    let rows: Vec<Value> = serde_json::from_str(&seen.body).expect("audit body is JSON");
+    let admin_rows: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["action"] == "cluster.admin")
+        .collect();
+    assert!(
+        !admin_rows.is_empty(),
+        "no audit row named the rename at all: {rows:?}"
+    );
+    assert!(
+        admin_rows.iter().all(|r| r["tenant"] == FLEET_SCOPE),
+        "the rename must be attributed to the fleet scope (\"{FLEET_SCOPE}\"): a regression to \
+         TenantId::default() would file a fleet-wide rename under an ordinary tenant's name: \
+         {rows:?}"
+    );
+
+    // A body that names nothing is a real refusal, never a silently-defaulted
+    // 200 that would leave the fleet renamed to the empty string.
+    for body in [json!({}), json!({ "name": "" }), json!({ "name": "  " })] {
+        let seen = Seen::of(
+            client
+                .put(format!("http://{admin}/admin/fleet/name"))
+                .header("authorization", fleet_key)
+                .json(&body)
+                .send()
+                .await
+                .expect("malformed put"),
+        )
+        .await;
+        assert_eq!(
+            seen.status / 100,
+            4,
+            "{body} must be refused, not defaulted: {seen}"
+        );
+    }
+
+    // And the refusals left the committed name alone.
+    assert_eq!(
+        node.fleet_name().expect("read fleet name"),
+        Some("rift-prod-eu".to_owned()),
+        "a refused rename must not have disturbed the name already set"
+    );
+
+    server.shutdown().await;
+}
+
+/// A tenant admin cannot rename the fleet, and learns nothing from trying.
+///
+/// The unit test `the_fleet_name_route_is_fleet_scoped_and_cluster_admin` pins
+/// `scope()`/`action()`; this pins that the wiring actually refuses at the
+/// wire, with RFC-002 §8.4's `404` rather than a `403` that would confirm the
+/// route exists.
+#[tokio::test]
+async fn a_tenant_admin_cannot_rename_the_fleet() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "tenancy-fleet-name-owner";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+    let (_id, tenant_key) =
+        mint_principal(&client, &admin, fleet_key, "acme", Role::TenantAdmin).await;
+
+    let seen = Seen::of(
+        client
+            .put(format!("http://{admin}/admin/fleet/name"))
+            .header("authorization", tenant_key)
+            .header("x-rift-tenant", "acme")
+            .json(&json!({ "name": "acme-owns-this" }))
+            .send()
+            .await
+            .expect("tenant admin rename attempt"),
+    )
+    .await;
+    assert_eq!(
+        seen.status, 404,
+        "a tenant admin must be refused with §8.4's 404, not a 403 that confirms the route: {seen}"
+    );
+
+    assert_eq!(
+        node.fleet_name().expect("read fleet name"),
+        None,
+        "the refused write must not have named the fleet"
+    );
+
+    server.shutdown().await;
+}

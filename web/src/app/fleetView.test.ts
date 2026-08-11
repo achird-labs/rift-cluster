@@ -221,3 +221,45 @@ describe("per-voter applied indices (#361)", () => {
     expect(view.voters).toEqual([A, B, C]);
   });
 });
+
+/*
+ * The fleet's name (#373). Pinned here, in the file whose whole job is this transform, rather than
+ * only through the two components that render it — a `?? null` or `?? false` flipped here would
+ * otherwise be caught only indirectly, if at all.
+ */
+describe("the fleet name (#373)", () => {
+  it("carries the name through", () => {
+    const view = fleetView({ ...THREE_NODE, fleet_name: "rift-prod-eu" }, HEALTHY);
+
+    expect(view.fleetName).toBe("rift-prod-eu");
+    expect(view.fleetNameUnavailable).toBe(false);
+  });
+
+  it("reads an explicit null as unnamed, not unavailable", () => {
+    const view = fleetView({ ...THREE_NODE, fleet_name: null }, HEALTHY);
+
+    expect(view.fleetName).toBeNull();
+    expect(view.fleetNameUnavailable).toBe(false);
+  });
+
+  it("keeps 'could not be read' distinct from 'nobody named it'", () => {
+    // The whole reason the server sends two fields. Collapsing them here would undo that server
+    // side decision silently, and both states render as `null` on this side.
+    const view = fleetView(
+      { ...THREE_NODE, fleet_name: null, fleet_name_unavailable: true },
+      HEALTHY,
+    );
+
+    expect(view.fleetName).toBeNull();
+    expect(view.fleetNameUnavailable).toBe(true);
+  });
+
+  it("treats a node that sends neither field as having nothing to report", () => {
+    // The pre-#373 wire shape, which an older node in a mixed-version fleet still sends. It has not
+    // failed to read anything, so it must not read as unavailable.
+    const view = fleetView(THREE_NODE, HEALTHY);
+
+    expect(view.fleetName).toBeNull();
+    expect(view.fleetNameUnavailable).toBe(false);
+  });
+});

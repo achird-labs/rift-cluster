@@ -731,6 +731,85 @@ async fn fleet_ops_reports_a_committed_op() {
     server.shutdown().await;
 }
 
+/// `GET /_fleet/members` really carries the fleet's name (issue #373).
+///
+/// The unit tests either side of this one prove the pieces — that a `FleetNamePut` applies, that
+/// `fleet_name()` reads it back, that the route classifies and authorizes. None of them proves the
+/// value reaches the wire, which is the entire point of the feature: the console reads this body
+/// and nothing else. Without this test the field could be dropped from `members_body` and every
+/// other test would stay green.
+///
+/// Both states are asserted, because the unnamed one is not an edge case — it is what every
+/// existing deployment looks like the moment it upgrades, and `null` there has to be a fact
+/// ("nobody has named this fleet") rather than a gap.
+#[tokio::test]
+async fn fleet_members_carries_the_fleet_name() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let key = "fleet-name-read";
+    seed_fleet_admin(node, &mut op_id, key).await;
+
+    let members = |client: reqwest::Client, admin: String| async move {
+        Seen::of(
+            client
+                .get(format!("http://{admin}/_fleet/members"))
+                .header("authorization", key)
+                .send()
+                .await
+                .expect("fleet members read"),
+        )
+        .await
+    };
+
+    // Before anyone names it: an absence, reported as one.
+    let seen = members(client.clone(), admin.clone()).await;
+    assert_eq!(seen.status, 200, "{seen}");
+    assert_eq!(
+        seen.json().get("fleet_name"),
+        Some(&serde_json::Value::Null),
+        "an unnamed fleet must report `null`, not omit the field and not invent a name: {seen}"
+    );
+    assert_eq!(
+        seen.json().get("fleet_name_unavailable"),
+        Some(&serde_json::Value::Bool(false)),
+        "nothing failed to read, so the unavailable flag must say so: {seen}"
+    );
+
+    op_id += 1;
+    seed(
+        node,
+        op_id,
+        ControlOp::FleetNamePut {
+            tenant: TenantId::new(FLEET_SCOPE),
+            name: "rift-prod-eu".to_owned(),
+        },
+    )
+    .await;
+
+    let seen = members(client, admin).await;
+    assert_eq!(seen.status, 200, "{seen}");
+    assert_eq!(
+        seen.json().get("fleet_name").and_then(|v| v.as_str()),
+        Some("rift-prod-eu"),
+        "the committed fleet name must reach the body the console actually reads: {seen}"
+    );
+    assert_eq!(
+        seen.json().get("fleet_name_unavailable"),
+        Some(&serde_json::Value::Bool(false)),
+        "{seen}"
+    );
+
+    server.shutdown().await;
+}
+
 /// The legacy `--api-key` cannot hold a console session.
 ///
 /// It resolves to a synthetic identity with no principal row, and a session token names a principal

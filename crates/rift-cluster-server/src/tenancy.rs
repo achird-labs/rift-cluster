@@ -53,6 +53,14 @@ const AUDIT_PATH: &str = "/admin/audit";
 /// hand a `TenantAdmin` the fleet's sink under an `AuditRead` authorization.
 const AUDIT_SINK_PATH: &str = "/admin/audit/sink";
 
+/// Where the fleet's operator-set name (issue #373) is written.
+///
+/// Checked with the other exact-path routes, ahead of the `/admin/tenants/`
+/// prefix strip below, for the same defensive reason [`AUDIT_SINK_PATH`] is:
+/// this path must never be reachable through a broader matcher's
+/// authorization tier by accident.
+const FLEET_NAME_PATH: &str = "/admin/fleet/name";
+
 /// Rows returned when the caller names no `limit`, and the ceiling on what they
 /// may ask for. A bound rather than an option: the audit table is a journal, so
 /// an unbounded read is an unbounded response, and the endpoint that answers it
@@ -113,6 +121,12 @@ pub(crate) enum Route {
     /// checkpoint (`AuditSink::revision` is what a re-declared sink resumes
     /// from, not this delete).
     AuditSinkDelete,
+    /// `PUT /admin/fleet/name` (issue #373): set or rename the fleet's
+    /// operator-facing name. No `GET` here — the name is read on
+    /// `/_cluster/members` and `/_fleet/members`, which every node already
+    /// answers unauthenticated; a second, authenticated read surface for the
+    /// same fact would be redundant. No `DELETE` — out of scope for #373.
+    FleetNamePut,
 }
 
 impl Route {
@@ -138,7 +152,12 @@ impl Route {
             // must not become eligible for a route this decision pins to `*`.
             | Route::AuditSinkRead
             | Route::AuditSinkPut
-            | Route::AuditSinkDelete => Some(TenantId::new(FLEET_SCOPE)),
+            | Route::AuditSinkDelete
+            // The fleet name is fleet state for the identical reason: one name,
+            // fleet-wide, never a tenant's own record. A `TenantAdmin` of `acme`
+            // sending `X-Rift-Tenant: acme` must not become eligible to rename
+            // the fleet every other tenant is also looking at.
+            | Route::FleetNamePut => Some(TenantId::new(FLEET_SCOPE)),
             Route::TenantRead(tenant)
             | Route::TenantPut(tenant)
             | Route::TenantDelete(tenant)
@@ -202,7 +221,10 @@ impl Route {
             // trusted to redirect where every tenant's rows are shipped.
             | Route::AuditSinkRead
             | Route::AuditSinkPut
-            | Route::AuditSinkDelete => Action::ClusterAdmin,
+            | Route::AuditSinkDelete
+            // Same tier as the audit sink and for the same reason: a fleet-wide
+            // rename is a fleet-scoped decision, not a tenant-scoped one.
+            | Route::FleetNamePut => Action::ClusterAdmin,
             Route::PrincipalCreate(_) | Route::PrincipalList(_) => Action::TenantManage,
             // Deliberately NOT `TenantManage` (RFC-002 §4.1): reading who did
             // what and changing who may do what are different powers, so a
@@ -240,6 +262,16 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
     if path == AUDIT_PATH {
         return match *method {
             Method::GET => Some(audit_route(query)),
+            _ => None,
+        };
+    }
+    // Checked ahead of the `/admin/tenants/` prefix strip below, for the same defensive reason
+    // `AUDIT_SINK_PATH` is: this route must never be reachable through a broader matcher by
+    // accident, and `None` here (rather than falling through) is what makes an unserved method
+    // a 404/405 instead of an accidental match further down.
+    if path == FLEET_NAME_PATH {
+        return match *method {
+            Method::PUT => Some(Route::FleetNamePut),
             _ => None,
         };
     }
@@ -389,6 +421,16 @@ pub(crate) struct AuditSinkBody {
     /// would be the wrong way to enforce that.
     #[serde(default)]
     pub batch_max_rows: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FleetNameBody {
+    /// Required, deliberately not `#[serde(default)]`: an operator who omitted the field asked
+    /// for nothing, and a blank fleet name is the confusing state this whole feature exists to
+    /// remove, not a neutral default to fall back to. A missing field is a `BadRequest`, same as
+    /// any other malformed body.
+    pub name: String,
 }
 
 /// The sink as the admin surface reports it: what `AuditSink` itself carries
@@ -691,6 +733,21 @@ pub(crate) fn dispatch(
             status: StatusCode::NO_CONTENT,
             then: None,
         }),
+        Route::FleetNamePut => {
+            let parsed: FleetNameBody = parse(body)?;
+            Ok(Outcome::Commit {
+                op: ControlOp::FleetNamePut {
+                    // The fleet scope, not `TenantId::default()` — same reasoning as
+                    // `AuditSinkPut` just above: this op is audited, and a fleet-wide rename
+                    // filed under one ordinary tenant's name would be a wrong audit row, not
+                    // just a wrong route.
+                    tenant: TenantId::new(FLEET_SCOPE),
+                    name: parsed.name,
+                },
+                status: StatusCode::OK,
+                then: None,
+            })
+        }
         Route::TenantCreate => {
             let parsed: TenantBody = parse(body)?;
             let Some(id) = parsed.id.as_deref() else {
@@ -1307,5 +1364,55 @@ mod tests {
         let parsed: AuditSinkBody =
             parse(br#"{"uri":"https://collector.example/audit"}"#).expect("parses");
         assert_eq!(parsed.batch_max_rows, None);
+    }
+
+    // -- issue #373: the fleet's operator-set name ----------------------------
+
+    #[test]
+    fn classify_routes_put_admin_fleet_name() {
+        assert_eq!(
+            classify(&Method::PUT, "/admin/fleet/name", None),
+            Some(Route::FleetNamePut)
+        );
+    }
+
+    #[test]
+    fn the_fleet_name_path_rejects_methods_it_does_not_serve() {
+        // `None` here is what makes the surface a 404/405 rather than an accidental fall-through
+        // into the `/admin/tenants/` matcher below it.
+        for method in [Method::GET, Method::POST, Method::DELETE, Method::PATCH] {
+            assert_eq!(
+                classify(&method, "/admin/fleet/name", None),
+                None,
+                "{method} /admin/fleet/name is not a route this surface serves"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fleet_name_route_is_fleet_scoped_and_cluster_admin() {
+        // Both halves matter and they fail differently: the wrong scope lets a tenant admin
+        // sending `X-Rift-Tenant: acme` become eligible at all; the wrong action lets a
+        // tenant-tier principal through once eligible.
+        assert_eq!(
+            Route::FleetNamePut.scope(),
+            Some(TenantId::new(FLEET_SCOPE))
+        );
+        assert_eq!(Route::FleetNamePut.action(), Action::ClusterAdmin);
+    }
+
+    #[test]
+    fn a_fleet_name_body_parses_its_name() {
+        let parsed: FleetNameBody = parse(br#"{"name":"rift-prod-eu"}"#).expect("parses");
+        assert_eq!(parsed.name, "rift-prod-eu");
+    }
+
+    #[test]
+    fn a_fleet_name_body_without_a_name_is_refused() {
+        // Not defaulted to "": an operator who omitted the field asked for nothing, and a blank
+        // fleet name is the confusing state, not a neutral one.
+        let err = parse::<FleetNameBody>(br#"{}"#)
+            .expect_err("a body with no name must be a real refusal");
+        assert!(matches!(err, TenancyError::BadRequest(_)), "{err:?}");
     }
 }

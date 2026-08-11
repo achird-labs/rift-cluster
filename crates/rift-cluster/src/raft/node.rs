@@ -1506,6 +1506,16 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
+    /// The fleet's operator-set name, or `None` when nobody has named it yet (issue #373).
+    ///
+    /// # Errors
+    /// Storage I/O.
+    pub fn fleet_name(&self) -> Result<Option<String>, NodeError> {
+        self.sm_reader
+            .fleet_name()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// The last revision shipped to the audit export sink; `0` when nothing has
     /// shipped (issue #164).
     ///
