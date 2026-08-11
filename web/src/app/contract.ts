@@ -18,7 +18,17 @@ type Declared<T> = {
   [K in keyof T as string extends K ? never : number extends K ? never : K]: T[K];
 };
 
-export type ImposterField = keyof Declared<Imposter>;
+/**
+ * The declared imposter fields that render as a **cell** — a table column or a detail tile.
+ *
+ * `_rift` is excluded because it is not one: it is a nested block with its own panel
+ * (`RiftKnobs`, #370), and every field here must have a single-value rendering in
+ * `ImposterField`'s `switch`. Excluding it keeps that exhaustiveness check meaningful — the
+ * alternative is a case arm rendering a composite as one cell, which is what the check exists to
+ * prevent. Anything else the contract declares still has to be handled, so a new scalar field
+ * still fails `tsc` until it is given a rendering.
+ */
+export type ImposterField = Exclude<keyof Declared<Imposter>, "_rift">;
 
 export type ImposterColumn = {
   key: ImposterField;

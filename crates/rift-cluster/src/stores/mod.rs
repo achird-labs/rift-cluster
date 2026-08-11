@@ -22,7 +22,7 @@ pub mod proxy;
 pub mod shard;
 
 pub use flow::{ClusteredFlowStoreProvider, FlowBindConfig, FlowNet, flow_routes};
-pub use flow_config::{ContextScope, FlowConfig, ReadConsistency};
+pub use flow_config::{ContextScope, FlowConfig, ReadConsistency, ResolvedKnobs};
 // `JournalCursor`/`CursorError` join this list because the front door names them directly
 // (issue #225): it decodes the client's `?since=` token before the read and encodes the issued
 // one into `x-rift-next-index` after it, so unlike the merge internals below these are part of

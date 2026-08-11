@@ -1,4 +1,4 @@
-import { type FormEvent, type ReactNode, useState } from "react";
+import { Fragment, type FormEvent, type ReactNode, useState } from "react";
 
 import { ApiError, apiGetText } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
@@ -186,7 +186,7 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
 
           {tab === "settings" ? (
             <>
-              <RiftKnobs />
+              <RiftKnobs imposter={imposter.data.data} />
               {mayRead ? (
                 <ExportImposterControl port={port} name={imposter.data.data.name} tenant={tenant} />
               ) : null}
@@ -431,14 +431,51 @@ function DangerZone({ port, name }: { port: number; name: string | undefined }):
   );
 }
 
+/** The knobs #370 publishes, in the order the design draws them. */
+const RIFT_KNOBS = [
+  { key: "durability", label: "flowState.durability" },
+  { key: "flowIdSource", label: "flowIdSource" },
+  { key: "readConsistency", label: "readConsistency" },
+] as const;
+
+/**
+ * One knob's value, and whether this imposter chose it.
+ *
+ * "Inherited" is the compiled-in default, not a fleet-level setting — there is no fleet override
+ * for these knobs, so the badge must not imply there is somewhere else to go and change it.
+ */
+function Knob({ knob }: { knob: components["schemas"]["ResolvedKnob"] }): ReactNode {
+  const inherited = knob.source === "default";
+  return (
+    <>
+      <Ident>{knob.value}</Ident>{" "}
+      <span
+        className={inherited ? "badge muted" : "badge"}
+        title={
+          inherited
+            ? "Inherited: this imposter does not set the key, so the built-in default applies."
+            : "Set on this imposter: the key is on its document, so changing the default will not change this."
+        }
+      >
+        {inherited ? "inherited" : "set here"}
+      </span>
+    </>
+  );
+}
+
 /**
  * The per-imposter `_rift` knobs the design draws.
  *
- * None is on the document today — `_rift` carries lint warnings and nothing else — so the panel is
- * built and its controls point at the work. `contextScope` has its own issue already (#288, under
- * the RFC-005 state epic); the other three are #369.
+ * Three of the four are published on the imposter document (#370): `durability` and
+ * `readConsistency` are decorated onto the read by the EE front, because upstream's `_rift` is an
+ * allowlist that deliberately omits them, and `flowIdSource` is repeated into the same block so all
+ * three read with one shape. `contextScope` is still pending under the RFC-005 state epic (#288).
+ *
+ * Read-only: the issue asks for the document to *carry* the knobs. Writing them through the panel
+ * is not part of it.
  */
-function RiftKnobs(): ReactNode {
+function RiftKnobs({ imposter }: { imposter: Imposter }): ReactNode {
+  const resolved = imposter._rift?.flowStateResolved;
   return (
     <Card title="_rift · per-imposter knobs">
       <dl className="kv-grid">
@@ -449,21 +486,18 @@ function RiftKnobs(): ReactNode {
             reason="The contextScope knob is tracked under the RFC-005 state epic. Until it lands, a flow's context scope is a fleet default rather than a per-imposter choice."
           />
         </dd>
-        <dt>flowState.durability</dt>
-        <dd>
-          <Pending issue={369} reason="Not carried on the imposter document." />
-        </dd>
-        <dt>flowIdSource</dt>
-        <dd>
-          <Pending
-            issue={369}
-            reason="How a request maps to a flow — a header, a query parameter, or one shared context — is not carried on the imposter document, and it decides whether two callers share scenario state."
-          />
-        </dd>
-        <dt>readConsistency</dt>
-        <dd>
-          <Pending issue={369} reason="Not carried on the imposter document." />
-        </dd>
+        {RIFT_KNOBS.map(({ key, label }) => (
+          // A Fragment, not a wrapper element: `dt`/`dd` must be direct children of the `dl` for
+          // the grid to lay out and for assistive tech to pair them.
+          <Fragment key={key}>
+            <dt>{label}</dt>
+            <dd data-testid={`rift-knob-${key}`}>
+              {/* Optional-chained per knob, not just on the block: a response carrying a partial
+                  `flowStateResolved` should degrade to "unknown" rather than throw on the tab. */}
+              {resolved?.[key] ? <Knob knob={resolved[key]} /> : UNKNOWN}
+            </dd>
+          </Fragment>
+        ))}
       </dl>
     </Card>
   );

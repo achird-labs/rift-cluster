@@ -161,6 +161,197 @@ async fn post_imposter_commits_binds_and_carries_cluster_headers() {
     server.shutdown().await;
 }
 
+/// Issue #370, end to end through the live read path.
+///
+/// The unit tests cover the parser and the body rewriter separately, with a hand-built
+/// `ResolvedKnobs`. This one covers the piece between them — resolving the *stored* config off the
+/// state machine — which is the only part touching live cluster state, and which fails open (no
+/// decoration) at three separate points. Nothing else proves those three are wired to a real
+/// applied record rather than to each other.
+#[tokio::test]
+async fn the_imposter_read_publishes_the_rift_knobs_with_their_provenance() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let mut imposter = minimal_imposter(port);
+    // `durability` is pinned to its own default deliberately: it must still read as `set`, because
+    // provenance is presence of the key rather than difference from the default.
+    imposter["_rift"] = json!({
+        "flowState": {
+            "backend": "inmemory",
+            "durability": "async",
+            "readConsistency": "local",
+            "flowIdSource": "header:X-Session",
+        },
+    });
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&imposter)
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(Seen::of(response).await.status, 201);
+
+    let read: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("proxied get")
+        .json()
+        .await
+        .expect("json");
+
+    let resolved = &read["_rift"]["flowStateResolved"];
+    assert_eq!(
+        resolved["durability"],
+        json!({"value": "async", "source": "set"}),
+        "{read}"
+    );
+    assert_eq!(
+        resolved["readConsistency"],
+        json!({"value": "local", "source": "set"}),
+        "{read}"
+    );
+    assert_eq!(
+        resolved["flowIdSource"],
+        json!({"value": "header:X-Session", "source": "set"}),
+        "{read}"
+    );
+
+    // Upstream's own block is untouched, and `flowIdSource` there is still the flat string
+    // rift-verify reads.
+    assert_eq!(
+        read["_rift"]["flowState"]["flowIdSource"], "header:X-Session",
+        "{read}"
+    );
+    // #288's knob is not claimed here.
+    assert!(resolved.get("contextScope").is_none(), "{read}");
+
+    // The listing does NOT carry the block: it has no knobs panel, and resolving them per entry
+    // would mean a stored-config read per imposter on the list screen. Only the
+    // `is_single_imposter_read` guard keeps it off, so assert it rather than assume it.
+    let listing: serde_json::Value = reqwest::get(format!("http://{admin}/imposters"))
+        .await
+        .expect("listing")
+        .json()
+        .await
+        .expect("json");
+    for entry in listing["imposters"].as_array().expect("an imposters array") {
+        assert!(
+            entry["_rift"].get("flowStateResolved").is_none(),
+            "the listing must not carry the resolved knobs: {entry}"
+        );
+    }
+
+    server.shutdown().await;
+}
+
+/// Issue #370. An imposter that never mentioned `_rift` reads as three inherited defaults — the
+/// console renders one panel per imposter, so this is the common case, not an edge one.
+#[tokio::test]
+async fn an_imposter_with_no_rift_block_reads_as_three_inherited_defaults() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(port))
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(Seen::of(response).await.status, 201);
+
+    let read: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("proxied get")
+        .json()
+        .await
+        .expect("json");
+
+    let resolved = &read["_rift"]["flowStateResolved"];
+    assert_eq!(
+        resolved["durability"],
+        json!({"value": "async", "source": "default"}),
+        "{read}"
+    );
+    assert_eq!(
+        resolved["readConsistency"],
+        json!({"value": "strong", "source": "default"}),
+        "{read}"
+    );
+    assert_eq!(
+        resolved["flowIdSource"],
+        json!({"value": "imposter_port", "source": "default"}),
+        "{read}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #370 — the security boundary, asserted on a **live** response rather than on the rewriter
+/// in isolation. Upstream's allowlist strips `flowState.redis` because it can carry a credentialed
+/// URL; the EE decoration must not put it back on the way out.
+#[tokio::test]
+async fn the_imposter_read_never_exposes_the_redis_connection_url() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    let mut imposter = minimal_imposter(port);
+    imposter["_rift"] = json!({
+        "flowState": {
+            "backend": "inmemory",
+            "durability": "sync",
+            "redis": { "url": "redis://user:hunter2@redis.internal:6379", "keyPrefix": "rift:" },
+        },
+    });
+    let response = reqwest::Client::new()
+        .post(format!("http://{admin}/imposters"))
+        .json(&imposter)
+        .send()
+        .await
+        .expect("post imposter");
+    assert_eq!(Seen::of(response).await.status, 201);
+
+    let body = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("proxied get")
+        .text()
+        .await
+        .expect("body");
+
+    assert!(
+        !body.contains("hunter2"),
+        "the redis credential must not survive the read: {body}"
+    );
+    assert!(
+        !body.contains("redis://"),
+        "the redis URL must not survive the read: {body}"
+    );
+
+    // The knob that IS published still came through, so this is not passing by serving nothing.
+    let read: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        read["_rift"]["flowStateResolved"]["durability"],
+        json!({"value": "sync", "source": "set"}),
+        "{read}"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn stub_crud_terminates_and_replicates_order() {
     let state = TempDir::new().expect("tempdir");

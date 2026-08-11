@@ -174,6 +174,26 @@ Bounds that keep the tier honest: per-flow TTL (default 1 h), 100k entries per
 node with whole-flow LRU shedding (never single keys — a half-evicted scenario
 would be torn state), both counted in metrics.
 
+### Reading the knobs back (#370)
+
+`durability`, `readConsistency` and `flowIdSource` are readable on `GET
+/imposters/:port`, as `_rift.flowStateResolved`, each carrying **whether this
+imposter set it or inherited the default**. The distinction is the point: a
+control that cannot tell "the default happens to be this" from "someone chose
+this" invites an operator to go and change the wrong one — and for these knobs
+there is nothing else to change, because the defaults are compiled in rather
+than fleet configuration.
+
+So provenance is presence of the key, never equality with the default value.
+An imposter pinning `durability: "async"` reads as `set`.
+
+The first two are published there or nowhere: upstream's `_rift.flowState` is
+an allowlist that omits them (`flowState.redis` can hold a credentialed URL, so
+unknown keys are excluded rather than leaked), and the EE front decorates the
+read from the parsed knobs — never from the stored document, which is what
+keeps that redaction intact. `contextScope` is not included; it arrives with
+#288.
+
 ## The strict escape hatch
 
 For customers whose requirements exceed AP-with-bounded-windows — strict

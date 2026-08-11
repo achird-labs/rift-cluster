@@ -1138,6 +1138,48 @@ round trip per peer for every listed port at once — the same 2 s budget and
 metric family: it is a body decoration on an otherwise-proxied response, not
 a termination.
 
+**`_rift.flowStateResolved`** on `GET /imposters/:port` (#370) carries the
+three per-imposter flow-state knobs the cluster acts on, each as
+`{ value, source }`:
+
+```json
+"_rift": {
+  "flowState": { "backend": "inmemory", "ttlSeconds": 300 },
+  "flowStateResolved": {
+    "durability":      { "value": "async",            "source": "default" },
+    "readConsistency": { "value": "strong",           "source": "default" },
+    "flowIdSource":    { "value": "header:X-Session", "source": "set" }
+  }
+}
+```
+
+Two of the three are published here or nowhere. Upstream's `_rift.flowState`
+is an **allowlist** — `backend`, `ttlSeconds`, and `flowIdSource` only when
+set — because `flowState.redis` can carry a credentialed connection URL, so
+anything added later is excluded by default rather than leaked.
+`durability` and `readConsistency` live in that block's open `extra` map and
+therefore never reach a client through the proxy. The decoration is built from
+the *parsed* knobs rather than from the stored document, which is what keeps
+upstream's redaction intact through the addition.
+
+The block is **additive**: upstream's `_rift.flowState` is left exactly as it
+arrives, `flowIdSource` included as the flat string it renders there — that
+shape is what rift-verify reads to drive correlated isolation, and the `parity`
+job exists to catch EE diverging from it. `flowIdSource` is repeated into the
+resolved block deliberately, so a client reads all three knobs with one shape
+instead of inferring provenance for the third from its absence upstream.
+
+`source` is **presence of the key, not equality with the default value**: an
+imposter that explicitly pins `durability: "async"` reads as `set`, because
+that was a choice. `default` means the compiled-in default — there is no
+fleet-level override for these knobs, so it never means "inherited from
+somewhere you could go and change".
+
+`contextScope` is deliberately absent; it is tracked under #288 (RFC-005 S1).
+Like `owner` on a space read, the decoration is additive and so a body it
+cannot parse passes through unchanged and logged, rather than failing the read
+the way the `numberOfRequests` correction does.
+
 ## The clustered front door (#131)
 
 Upstream's front door (`--front-door <ADDR>`, env `RIFT_FRONT_DOOR`; a
