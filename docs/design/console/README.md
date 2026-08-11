@@ -80,6 +80,18 @@ length descending, then header-clause count, then id. That order is **independen
 an editor showing the order you typed would be showing something that decides nothing. Disabled routes
 are excluded from dispatch and shown with `—`.
 
+**A non-default tenant's table is never in any order at all.** `desired_routes` compiles only the
+default tenant's routes into the shared front door (`08-tenancy-security.md`), so for every other
+tenant the screen is showing stored state that cannot take a request. The server says so with
+`installed: false` on `GET /front-door/route-hits`, and the screen spends it four ways (#400): a
+`role="status"` banner naming the fact and its reason, `—` in every rank cell, `not installed` in
+place of the tie-break prose, and the rows listed in **stored** order rather than
+`effective_order()` — sorting by a chain that is never evaluated would be the same fabrication the
+rank column is being muted to avoid. Editing stays enabled — the table is real replicated state — and
+all of it keys on a positive `installed: false`, never on a hits read that merely failed. That last
+point is the rule, not an implementation detail: rendering "cannot take a request" off the back of a
+read the console could not complete would be a confident claim sourced from an unknown.
+
 The editor validates before the write, mirroring `RouteTable::validate` / `Route::validate`:
 
 | Error | Condition |
