@@ -55,7 +55,18 @@ Design points that carry weight (full spec in #19):
   through the front door. On Kubernetes and behind managed LBs this makes the
   front-door port the *only* data port a Service ever needs to expose.
 - **Tenancy-aware** (#17): routes belong to tenants and may only target their
-  tenant's imposters; shared catch-alls are fleet-admin territory.
+  tenant's imposters; shared catch-alls are fleet-admin territory. Only the
+  default tenant's routes are actually compiled into the listener — see
+  Chapter 8, and `routes_installed_for`, which is the one definition of that
+  rule.
+- **Dispatches are counted** (#368): upstream calls a `RouteObserver` once per
+  request a route *claims*, before its target answers, so a route that only
+  ever 404s still counts — a route claiming traffic and failing is exactly
+  what an operator needs to see. The counts are per node and in memory, summed
+  across the fleet by `GET /front-door/route-hits` and stamped
+  `Rift-Cluster-Partial` when a peer could not be reached. The figure that
+  matters most is a zero: a route that has never taken a request is either
+  wrong or dead.
 
 ## Imposter sources: mocks come from somewhere
 

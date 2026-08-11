@@ -225,9 +225,13 @@ pub mod seams {
     /// is why the clustered admin front provides it as a replicated
     /// control-plane object (issue #131) rather than proxying to an upstream
     /// endpoint that does not exist.
+    ///
+    /// [`RouteObserver`] and [`bind_front_door_with_observer`] are the counting seam (issue #368):
+    /// upstream calls the observer once per request a route claims, which is what backs the admin
+    /// plane's per-route HITS figure. Single-node Rift installs none and pays nothing for it.
     pub use rift_http_proxy::front_door::{
-        CompiledRoutes, HeaderMatch, Route, RouteMatch, RouteTable, RouteTableError, RouteTarget,
-        RunningFrontDoor, bind_front_door,
+        CompiledRoutes, HeaderMatch, Route, RouteMatch, RouteObserver, RouteTable, RouteTableError,
+        RouteTarget, RunningFrontDoor, bind_front_door, bind_front_door_with_observer,
     };
 }
 
@@ -391,6 +395,9 @@ mod tests {
         _named::<CompiledRoutes>();
         _named::<RunningFrontDoor>();
         let _ = bind_front_door;
+        // Issue #368's counting seam.
+        _named::<&dyn RouteObserver>();
+        let _ = bind_front_door_with_observer;
     }
 
     /// A provider-supplied store can read its own options out of `flowState`.

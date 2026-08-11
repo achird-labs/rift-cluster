@@ -1875,3 +1875,117 @@ async fn an_empty_tenant_reports_zero_usage() {
 
     server.shutdown().await;
 }
+
+/// Issue #368: a non-default tenant's route hits report `not installed`, never `0`.
+///
+/// Only the default tenant's routes are compiled into the shared front door (`desired_routes`,
+/// and Chapter 8 for why). A tenanted route is still stored and still read back — the tenant sees
+/// what it wrote — but it can never take a dispatch. Reporting `0` for it would assert it took no
+/// traffic, when the truth is that it cannot take any: the same bound-vs-unknown error #369 fixed
+/// for bind status.
+///
+/// Lives here rather than in `front_door.rs` because reaching a non-default tenant at all needs a
+/// real principal bound to one — under the no-principal bypass `X-Rift-Tenant` is deliberately
+/// ignored and every request targets `default`, so a bypass-only test would silently assert the
+/// default tenant's behaviour twice.
+#[tokio::test]
+async fn a_non_default_tenants_route_hits_report_not_installed_never_zero() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "tenancy-fleet-route-hits";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+    let (_, acme_key) = mint_principal(&client, &admin, fleet_key, "acme", Role::Editor).await;
+
+    // `X-Rift-Tenant` on every acme request: the header is what names the tenant a caller acts
+    // as, and it is intersected with the principal's bindings. Without it the request asks for
+    // `default`, which this principal is not bound to — a 404 by RFC-002 §8.4.
+
+    let put = client
+        .put(format!("http://{admin}/front-door/routes"))
+        .header("authorization", &acme_key)
+        .header("x-rift-tenant", "acme")
+        .json(&json!({
+            "routes": [{ "id": "svc", "match": { "path_prefix": "/svc" }, "target": { "port": 4545 } }],
+        }))
+        .send()
+        .await
+        .expect("put routes as acme");
+    assert_eq!(put.status().as_u16(), 200, "acme may write its own table");
+
+    // Stored and readable: the tenant sees what it wrote.
+    let routes: Value = client
+        .get(format!("http://{admin}/front-door/routes"))
+        .header("authorization", &acme_key)
+        .header("x-rift-tenant", "acme")
+        .send()
+        .await
+        .expect("get routes as acme")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(routes["routes"][0]["id"], "svc", "{routes}");
+
+    let hits: Value = client
+        .get(format!("http://{admin}/front-door/route-hits"))
+        .header("authorization", &acme_key)
+        .header("x-rift-tenant", "acme")
+        .send()
+        .await
+        .expect("get route hits as acme")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        hits,
+        json!({ "installed": false, "hits": null }),
+        "stored but never installed, so no count is claimable: {hits}"
+    );
+
+    // The default tenant on the same fleet still reports an installed table, so the flag tracks
+    // installation and not merely "this tenant wrote no routes".
+    let default_hits: Value = client
+        .get(format!("http://{admin}/front-door/route-hits"))
+        .header("authorization", fleet_key)
+        .send()
+        .await
+        .expect("get route hits as the fleet admin")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        default_hits,
+        json!({ "installed": true, "hits": {} }),
+        "{default_hits}"
+    );
+
+    // The hits read is gated exactly as the table read is (`Action::ImposterRead`, same tenant
+    // resolution). Both are hardcoded at their own call site in `handle`, so nothing but this
+    // would notice one drifting from the other — and a hits read that authorized more loosely
+    // than the table it describes would leak which routes another tenant has, by id.
+    for path in ["/front-door/routes", "/front-door/route-hits"] {
+        let unbound = client
+            .get(format!("http://{admin}{path}"))
+            .header("authorization", &acme_key)
+            .send()
+            .await
+            .expect("read without naming acme");
+        assert_eq!(
+            unbound.status().as_u16(),
+            404,
+            "{path}: an acme principal asking for `default` is not bound to it, and RFC-002 §8.4 \
+             makes that indistinguishable from the tenant not existing"
+        );
+    }
+
+    server.shutdown().await;
+}

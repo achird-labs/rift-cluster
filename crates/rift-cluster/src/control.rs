@@ -24,6 +24,23 @@ pub struct TenantId(String);
 /// remove — the fleet must always have somewhere for an unscoped request to land.
 pub const DEFAULT_TENANT: &str = "default";
 
+/// Whether routes stored under `tenant` are compiled into the shared front door.
+///
+/// **The single definition of that rule.** The state machine's route compiler filters on it, and
+/// the admin plane's per-route hit read reports it (issue #368) — two call sites, one answer, so
+/// they cannot drift into a console that says a table is live while the fleet never installed it.
+///
+/// Only the default tenant's routes are installed today. The reasoning is long and lives with the
+/// compiler that enforces it (`RedbStateMachine::desired_routes`): the front door is a single
+/// listener with no tenant discriminator, so a unioned table would let any tenant publish a
+/// catch-all that captures the whole fleet's front-door traffic. Tenanted routes are still stored
+/// and still read back per tenant, so a tenant sees what it wrote — they are simply never
+/// compiled in. When the front door grows a tenant dimension, this function is what changes.
+#[must_use]
+pub fn routes_installed_for(tenant: &str) -> bool {
+    tenant == DEFAULT_TENANT
+}
+
 /// The reserved fleet-wide scope (RFC-002 §3.3, §8.4): not a real tenant —
 /// there is no [`ControlOp::TenantPut`] record for it, [`validate`] refuses one
 /// — and the only scope [`Role::FleetAdmin`] may bind against. Every other

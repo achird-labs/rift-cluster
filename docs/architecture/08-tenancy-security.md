@@ -601,6 +601,19 @@ sees what it wrote; they are simply not compiled into the shared front door.
 That is a real remaining limit of this slice, recorded here rather than left to
 be discovered.
 
+**Where that limit becomes visible to an operator: `GET /front-door/route-hits`**
+(issue #368). The per-route dispatch count answers `installed: false` with a
+`null` count map for any tenant whose routes are not compiled in, rather than the
+zeros it reports for an installed route that has taken no traffic. The two are
+different facts — "took none" versus "cannot take any" — and a zero for the
+second would be a claim about traffic where the truth is about installation.
+`routes_installed_for` is the single definition of that rule: `desired_routes`
+filters on it and the hit read reports it, so the table the front door compiles
+and the state the console displays cannot drift apart. When the front door grows
+a tenant dimension, that one function is what changes. The rest of the route
+screen still presents a non-default tenant's stored table as though it were live;
+that gap is tracked separately (issue #400).
+
 Serving every tenant into one engine reopens the door the old guard was built
 to close: an authorized `acme` caller could address `beta`'s port and read it,
 simply by knowing the number. The replacement is narrower than the guard it

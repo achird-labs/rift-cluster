@@ -1,10 +1,16 @@
 import { type FormEvent, type ReactNode, useEffect, useState } from "react";
 
 import { ApiError } from "../api/client.ts";
-import { RouteTableConflict, useDeleteRoute, usePutRoutes, useRouteTable } from "../app/queries.ts";
+import {
+  type RouteHits,
+  RouteTableConflict,
+  useDeleteRoute,
+  usePutRoutes,
+  useRouteHits,
+  useRouteTable,
+} from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
 import { Card, Empty, ErrorNote, Ident, Status, UnconfirmedNote } from "../components/primitives.tsx";
-import { Pending } from "../components/pending.tsx";
 import type { Route } from "../features/routes/order.ts";
 import { effectiveOrder, orderReason, validateTable } from "../features/routes/order.ts";
 import { probeRoutes } from "../features/routes/probe.ts";
@@ -48,6 +54,9 @@ export function RouteTableScreen(): ReactNode {
 }
 
 function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): ReactNode {
+  // Read here rather than in `RouteTableScreen`: the counts belong to the table this component
+  // renders, and the screen above it does not render a row.
+  const hits = useRouteHits();
   const [draft, setDraft] = useState<Route[]>(loaded);
   const [adding, setAdding] = useState(false);
   const [base, setBase] = useState<Route[]>(loaded);
@@ -223,6 +232,21 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
 
       <section className="card">
         <div className="scroll-x">
+      {hits.data?.partial ? (
+        <div className="scope" data-testid="route-hits-partial" role="status">
+          <span className="eyebrow">Hits</span>
+          <span className="pill accent">
+            <span className="g" aria-hidden="true">
+              &#x25c8;
+            </span>
+            partial merge
+          </span>
+          <span className="coverage">
+            A node could not be reached, so each count is a floor — at least this many, possibly
+            more.
+          </span>
+        </div>
+      ) : null}
       <table className="dense">
         <thead>
           <tr>
@@ -230,9 +254,6 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
             <th>Id</th>
             <th>Match</th>
             <th>Target</th>
-            {/* The design's HITS column. Nothing counts dispatches per route, so the figure is
-                pending on #368 — the column is here because a route that has never taken a request
-                is either wrong or dead, and both are worth a place to show. */}
             <th style={{ width: "12ch" }} className="numeric">
               Hits
             </th>
@@ -261,12 +282,12 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
                 <Ident>{route.target.port}</Ident>
                 {route.target.strip_prefix ? " · strips prefix" : ""}
               </td>
-              <td className="numeric">
-                <Pending
-                  issue={368}
-                  reason="Nothing counts dispatches per route. A counter is fleet-wide state, so it wants the merge-on-read treatment the request journal already has."
-                />
-              </td>
+              <HitsCell
+                id={route.id}
+                enabled={route.enabled}
+                hits={hits.data}
+                unavailable={hits.isError}
+              />
               <td className="muted">{route.enabled ? orderReason(route) : "disabled"}</td>
               {mayWrite ? (
                 <td>
@@ -616,5 +637,87 @@ function RouteTester({ routes }: { routes: readonly Route[] }): ReactNode {
         </p>
       </section>
     </aside>
+  );
+}
+
+/**
+ * One route's HITS figure, in the four states it can honestly be in.
+ *
+ * The zero is the reason this column exists — a route that has never taken a request is either
+ * wrong or dead — so it is rendered as a number and flagged, never as an empty cell. The other
+ * three states all avoid printing a number the fleet did not actually report: "not installed" for
+ * a tenant whose routes are never compiled into the shared front door (they cannot take a
+ * dispatch, so a zero would be a claim about traffic), and a dash while the count is unknown.
+ */
+function HitsCell({
+  id,
+  enabled,
+  hits,
+  unavailable,
+}: {
+  id: string;
+  enabled: boolean;
+  hits: RouteHits | undefined;
+  unavailable: boolean;
+}): ReactNode {
+  if (unavailable || hits === undefined) {
+    return (
+      <td className="numeric muted" data-testid="route-hits" title="Dispatch counts unavailable">
+        &#x2014;
+      </td>
+    );
+  }
+  if (!hits.installed) {
+    return (
+      <td
+        className="numeric muted"
+        data-testid="route-hits"
+        title="Stored, but never compiled into the shared front door — only the default tenant's routes are installed, so this route cannot take a dispatch at all."
+      >
+        not installed
+      </td>
+    );
+  }
+  const count = hits.hits?.[id];
+  if (count === undefined) {
+    // The server keys the map by every id in the table it read, so this means the table moved
+    // between the two reads. Unknown, not zero.
+    return (
+      <td className="numeric muted" data-testid="route-hits" title="No count reported for this route">
+        &#x2014;
+      </td>
+    );
+  }
+  // A disabled route is filtered out of the dispatch chain by `effective_order`, so its zero is
+  // explained rather than alarming — flagging it would tell an operator their route is broken
+  // seconds after they switched it off with the button in the next column. The count itself still
+  // shows: a route disabled after taking 40 requests really did take 40.
+  if (count === 0 && !enabled) {
+    return (
+      <td
+        className="numeric muted"
+        data-testid="route-hits"
+        title="Disabled, so it is excluded from dispatch and can claim nothing."
+      >
+        {count}
+      </td>
+    );
+  }
+  return (
+    <td
+      className={count === 0 ? "numeric warn-text" : "numeric"}
+      data-testid="route-hits"
+      // A statement of fact, not a diagnosis. "Wrong or dead" is the usual explanation and the
+      // reason this column exists, but it is not the only one — a fleet with no front-door
+      // listener bound anywhere reports honest zeros for routes that are configured correctly —
+      // and the cell should not assert a cause it cannot know.
+      title={
+        count === 0
+          ? "No request has reached this route since the fleet started."
+          : undefined
+      }
+    >
+      {count}
+    </td>
   );
 }

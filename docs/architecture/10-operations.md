@@ -81,6 +81,7 @@ flowchart TB
 | `GET /_cluster/kv/:flow_id` | owner value vs local replica — the *why is my scenario stuck* endpoint |
 | `GET /_cluster/ops/:op_id` | intent state: pending / applied / failed (Chapter 4) |
 | `GET /_cluster/health` | rolled-up diagnostics |
+| `GET /_cluster/route-hits` | this node's per-route dispatch counts, in memory since process start — the node-local input the admin port's `GET /front-door/route-hits` sums across the fleet |
 
 **Metrics that page** (Prometheus, served by the standard metrics port).
 

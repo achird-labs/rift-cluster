@@ -83,7 +83,7 @@ use rift_cluster::stores::{
 };
 use rift_cluster::{
     ControlOutcome, ControlResponse, FLEET_SCOPE, KeyClass, NodeError, NodeId, OwnedKey, PullError,
-    RaftNode, SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId,
+    RaftNode, SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId, routes_installed_for,
 };
 use rift_cluster_base::seams::{
     ErrorKind, ImposterConfig, RecordedRequest, RiftScriptConfig, RouteTable, SCOPE_HEADER,
@@ -104,6 +104,7 @@ use crate::fleet;
 use crate::openapi;
 use crate::principal;
 use crate::readiness::Readiness;
+use crate::route_hits::{self, RouteHitCounter, RouteHits};
 use crate::session;
 use crate::tenancy;
 
@@ -165,6 +166,11 @@ pub struct FrontConfig {
     /// `GET /admin/sources` (issue #239) — the last poll error per source is
     /// deliberately node-local state, reachable only through it.
     pub puller: Arc<SourcePuller>,
+    /// This node's per-route dispatch counts (issue #368). Read directly rather than over the
+    /// loopback cluster port: the same reason `/_fleet/members` reads its own bind fields off the
+    /// body it already built — a node asking itself over the wire can observe a different moment
+    /// than the one it is reporting.
+    pub route_hits: Arc<RouteHitCounter>,
     /// This node's view of the fleet request journal (issue #223): the merged read, the
     /// `numberOfRequests` decoration, and the transitional `DELETE savedRequests` fan-out all
     /// reach the fleet through it.
@@ -298,6 +304,8 @@ struct FrontState {
     readiness: Arc<Readiness>,
     /// See [`FrontConfig::puller`].
     puller: Arc<SourcePuller>,
+    /// See [`FrontConfig::route_hits`].
+    route_hits: Arc<RouteHitCounter>,
     /// See [`FrontConfig::journal_net`].
     journal_net: Arc<JournalNet>,
     /// See [`FrontConfig::flow_net`].
@@ -333,6 +341,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         export_status: config.export_status,
         readiness: config.readiness,
         puller: config.puller,
+        route_hits: config.route_hits,
         journal_net: config.journal_net,
         flow_net: config.flow_net,
         fleet_journal_port_cap: config.fleet_journal_port_cap,
@@ -1096,6 +1105,20 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
         };
     }
 
+    // `GET /front-door/route-hits` (issue #368): the same read, same tenant addressing and same
+    // action as the route table above — it reports on exactly the rows that read returns.
+    //
+    // A separate path rather than a field on the routes body, because that body is a config
+    // document a client `PUT`s back verbatim, and because this one pays a fleet fan-out that a
+    // config read should not. Spelled `route-hits` and not `routes/hits`: a route id is a
+    // user-chosen string, `hits` is a legal one, and `/front-door/routes/{id}` is already a route.
+    if req.method() == Method::GET && path == "/front-door/route-hits" {
+        return match authorize_action(&state, &req, Action::ImposterRead, None, None) {
+            Ok((tenant, ..)) => read_route_hits(&state, &tenant).await,
+            Err(response) => response,
+        };
+    }
+
     // `GET /admin/whoami` is the one admin route with **no** action (RFC-002
     // §4.1): it reports the caller's own identity and bindings and nothing
     // else, so there is nothing to authorize beyond having authenticated.
@@ -1345,6 +1368,64 @@ async fn read_routes(
         HEADER_REVISION,
         &format!("{}@{revision}", TenantId::default()),
     );
+    response
+}
+
+/// `GET /front-door/route-hits`: how many requests each of `tenant`'s routes has claimed, summed
+/// across the fleet (issue #368).
+///
+/// Three answers, kept apart on purpose:
+///
+/// - `{"installed": true, "hits": {...}}` — one entry per id in this tenant's stored table, `0`
+///   included. The zero is the point: a route that has never taken a request is wrong or dead.
+/// - `{"installed": false, "hits": null}` — this tenant's routes are stored but never compiled
+///   into the shared front door, so none of them *can* take a dispatch. A map of zeros here would
+///   assert they took no traffic, which is a claim about traffic where the truth is about
+///   installation (the same bound-vs-unknown error #369 fixed for bind status).
+/// - either of the above with `Rift-Cluster-Partial: true` — a voter could not be reached, so the
+///   sums are floors.
+async fn read_route_hits(state: &Arc<FrontState>, tenant: &TenantId) -> Response<FrontBody> {
+    let Some(node) = state.node.upgrade() else {
+        return typed_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Unavailable,
+            "cluster node is shutting down",
+        );
+    };
+
+    // Not installed is decided before anything else: there is nothing to sum, and no reason to
+    // spend the fan-out budget discovering that.
+    if !routes_installed_for(tenant.as_str()) {
+        return route_hits_response(&RouteHits::NotInstalled, false);
+    }
+
+    // The same read `GET /front-door/routes` answers from, so the ids reported here are exactly
+    // the rows the console is rendering. A counter for an id this table no longer names is
+    // stranded and deliberately not reported.
+    let table = match node.route_table(tenant.as_str()) {
+        Ok(table) => table,
+        Err(e) => return internal(&e.to_string()),
+    };
+    let ids: Vec<String> = table.routes.into_iter().map(|route| route.id).collect();
+
+    let local = state.route_hits.snapshot();
+    let peers = route_hits::peer_hits(&node).await;
+    let (hits, partial) = route_hits::merge_route_hits(&ids, &local, &peers);
+    route_hits_response(&RouteHits::Installed(hits), partial)
+}
+
+fn route_hits_response(hits: &RouteHits, partial: bool) -> Response<FrontBody> {
+    let body = match serde_json::to_vec(&hits.body()) {
+        Ok(body) => body,
+        Err(e) => return internal(&e.to_string()),
+    };
+    let mut response =
+        match buffered_response(StatusCode::OK, Bytes::from(body), json_content_type()) {
+            Ok(response) | Err(response) => response,
+        };
+    if partial {
+        set_header(&mut response, HEADER_PARTIAL, "true");
+    }
     response
 }
 
@@ -6629,6 +6710,34 @@ mod tests {
         }
     }
 
+    /// A floor is stamped as one (issue #368).
+    ///
+    /// `merge_route_hits` deciding `partial` correctly is worth nothing if the flag never reaches
+    /// the wire, and no wire test can catch that: every one of them runs a solo node, where there
+    /// is no peer to be unknown and `partial` is always false. This is #369's own bug shape — a
+    /// merge computed right and plumbed wrong — so the plumbing is asserted directly.
+    #[test]
+    fn a_partial_route_hits_answer_is_stamped_and_a_complete_one_is_not() {
+        let hits = RouteHits::Installed(std::collections::BTreeMap::from([("svc".to_owned(), 3)]));
+
+        let floor = route_hits_response(&hits, true);
+        assert_eq!(
+            floor
+                .headers()
+                .get(HEADER_PARTIAL)
+                .and_then(|value| value.to_str().ok()),
+            Some("true"),
+            "a sum missing an unreachable node's contribution must say so"
+        );
+
+        let complete = route_hits_response(&hits, false);
+        assert!(
+            complete.headers().get(HEADER_PARTIAL).is_none(),
+            "a complete answer must not claim degraded coverage"
+        );
+        assert_eq!(complete.status(), StatusCode::OK);
+    }
+
     /// The source inspection surface (issue #239): the two reads terminate,
     /// everything else on the path falls through to the proxy and answers
     /// upstream's own 404/405.
@@ -6871,6 +6980,7 @@ mod tests {
                 puller: Arc::new(SourcePuller::new(
                     rift_cluster_base::seams::SourceRegistry::default(),
                 )),
+                route_hits: Arc::new(RouteHitCounter::default()),
                 journal_net: JournalNet::new(Arc::clone(&journal)),
                 // In-memory and never bound to `node`'s ring: nothing in this file's
                 // tests exercises `/admin/tenants`'s flow-entry fan-out, so this only

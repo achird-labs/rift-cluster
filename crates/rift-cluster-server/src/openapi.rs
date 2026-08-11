@@ -105,8 +105,9 @@ pub(crate) fn contract_json() -> Result<Vec<u8>, &'static str> {
 ///
 /// Public so that integration test can reach it; a duplicated list is exactly how the two halves
 /// would drift.
-pub const HANDLE_DIRECT_ROUTES: [(&str, &str); 8] = [
+pub const HANDLE_DIRECT_ROUTES: [(&str, &str); 9] = [
     ("GET", "/front-door/routes"),
+    ("GET", "/front-door/route-hits"),
     ("GET", "/admin/whoami"),
     ("GET", "/openapi.json"),
     // C2 (#185): the read-only fleet projection and the session exchange.

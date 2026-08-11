@@ -83,6 +83,7 @@ use crate::control::{
     self, AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
     FLEET_SCOPE, OnDrift, PreconditionTarget, Principal, Quotas, Role, SessionKey, SourceMode,
     SourceProvenance, StubEdit, StubEditScript, Tenant, TenantConfigUsage, TenantId,
+    routes_installed_for,
 };
 use crate::stores::journal::ClusterJournal;
 
@@ -2691,7 +2692,10 @@ impl RedbStateMachine {
         for item in table.iter()? {
             let (key, value) = item?;
             let (tenant, id) = key.value();
-            if tenant != DEFAULT_TENANT {
+            // The rule itself lives in `routes_installed_for`, which the admin plane's hit read
+            // also calls — so what is compiled here and what the console reports as installed are
+            // the same decision, not two copies of it (issue #368).
+            if !routes_installed_for(tenant) {
                 continue;
             }
             match serde_json::from_str::<Route>(value.value()) {
