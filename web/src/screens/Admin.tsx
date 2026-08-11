@@ -38,7 +38,6 @@ import {
   UNKNOWN,
   UnconfirmedNote,
 } from "../components/primitives.tsx";
-import { Pending } from "../components/pending.tsx";
 import { failureReason, hasMorePages, isApplied, nextSince } from "../features/admin/audit.ts";
 import { KEY_NOT_SHOWN_AGAIN } from "../features/admin/key.ts";
 import { assignableRoles } from "../features/admin/roles.ts";
@@ -302,7 +301,7 @@ function TenantsTab(): ReactNode {
             </tr>
           </thead>
           <tbody>
-            {tenants.data.map((row) =>
+            {tenants.data.tenants.map((row) =>
               editing === row.id ? (
                 <TenantEditRow
                   key={row.id}
@@ -317,6 +316,9 @@ function TenantsTab(): ReactNode {
                   key={row.id}
                   tenant={row}
                   mayManage={mayManage}
+                  // `imposters`/`stubsPerImposter` come from the replicated config set, not the
+                  // fan-out, so only `flowEntries` reads this flag (see `TenantList` in `queries.ts`).
+                  flowEntriesPartial={tenants.data.partial}
                   onEdit={() => setEditing(row.id)}
                   onDelete={() => del.mutate({ tenantId: row.id })}
                 />
@@ -331,14 +333,45 @@ function TenantsTab(): ReactNode {
   );
 }
 
+/**
+ * The `used` half of a `used / limit` quota cell (#372).
+ *
+ * `—` when the figure is absent, never `0`. "The response did not carry usage" and "this tenant
+ * uses none" are the two facts an operator opens this table to tell apart, and a zero would answer
+ * the second when only the first is known.
+ *
+ * `partial` marks a figure the fleet fan-out could not fully confirm (`Rift-Cluster-Partial`) — a
+ * floor, not a total. Only `flowEntries` is ever gathered that way (#372); `imposters` and
+ * `stubsPerImposter` come from the replicated config set and are always exact, so callers for those
+ * leave `partial` `false`. Same badge-plus-`title` shape as `Knob` in `ImposterDetail.tsx`.
+ */
+function QuotaUsed({ used, partial = false }: { used: number | undefined; partial?: boolean }): ReactNode {
+  return (
+    <span className="quota-used">
+      {used ?? UNKNOWN}
+      {partial && used !== undefined ? (
+        <span
+          className="badge muted"
+          title="At least this many — a node did not answer the flow entry fan-out in time, so this is a floor, not a total."
+        >
+          partial
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 function TenantRow({
   tenant,
   mayManage,
+  flowEntriesPartial,
   onEdit,
   onDelete,
 }: {
   tenant: Tenant;
   mayManage: boolean;
+  /** Whether the fleet fan-out behind `usage.flowEntries` could not confirm every node (#372). */
+  flowEntriesPartial: boolean;
   onEdit: () => void;
   onDelete: () => void;
 }): ReactNode {
@@ -348,16 +381,16 @@ function TenantRow({
         <Ident>{tenant.id}</Ident>
       </td>
       <td>{tenant.displayName}</td>
-      <td className="numeric quota-cell">
-        <Pending issue={372} reason="Per-tenant usage is not published — only the limit is." />
+      <td className="numeric quota-cell" data-testid="quota-imposters">
+        <QuotaUsed used={tenant.usage?.imposters} />
         <span className="quota-limit">/ {tenant.quotas?.maxImposters ?? UNKNOWN}</span>
       </td>
-      <td className="numeric quota-cell">
-        <Pending issue={372} reason="Per-tenant usage is not published — only the limit is." />
+      <td className="numeric quota-cell" data-testid="quota-stubs">
+        <QuotaUsed used={tenant.usage?.stubsPerImposter} />
         <span className="quota-limit">/ {tenant.quotas?.maxStubsPerImposter ?? UNKNOWN}</span>
       </td>
-      <td className="numeric quota-cell">
-        <Pending issue={372} reason="Per-tenant usage is not published — only the limit is." />
+      <td className="numeric quota-cell" data-testid="quota-flow-entries">
+        <QuotaUsed used={tenant.usage?.flowEntries} partial={flowEntriesPartial} />
         <span className="quota-limit">/ {tenant.quotas?.maxFlowEntries ?? UNKNOWN}</span>
       </td>
       <td>{tenant.journalRetentionSecs === 0 ? "unlimited" : `${tenant.journalRetentionSecs}s`}</td>

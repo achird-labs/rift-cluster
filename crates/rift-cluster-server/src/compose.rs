@@ -184,6 +184,10 @@ pub struct ComposedServer {
     /// that leaves them serving would strand every bound port (visible
     /// in-process; in a container the process exit hides it).
     manager: Option<Arc<ImposterManager>>,
+    /// The flow-state subsystem, when clustering is on. Exposed for tests and
+    /// embedders that need to drive `FlowStore` directly (issue #372's usage
+    /// tests are the first caller), the same reason [`Self::node`] is public.
+    flow_net: Option<Arc<FlowNet>>,
     readiness: Arc<Readiness>,
     leave_timeout: Duration,
     /// The cluster state directory, when clustering is on: where a confirmed
@@ -254,6 +258,15 @@ impl ComposedServer {
     #[must_use]
     pub fn node(&self) -> Option<&Arc<RaftNode>> {
         self.node.as_ref()
+    }
+
+    /// The flow-state subsystem, when clustering is on (issue #372). Hands out
+    /// the same `Arc<FlowNet>` the admin front and the engine's clustered
+    /// stores share, for embedders and tests that need to drive `FlowStore`
+    /// directly rather than through an imposter's real HTTP traffic.
+    #[must_use]
+    pub fn flow_net(&self) -> Option<&Arc<FlowNet>> {
+        self.flow_net.as_ref()
     }
 
     /// Serve until the admin API stops.
@@ -449,6 +462,7 @@ pub async fn start_with_runtimes(
             intent_replayer: None,
             cluster_addr: None,
             manager: None,
+            flow_net: None,
             readiness: Arc::new(Readiness::awaiting([])),
             leave_timeout: Duration::ZERO,
             state_dir: None,
@@ -765,6 +779,7 @@ pub async fn start_with_runtimes(
         front_door_routes,
         Arc::clone(&puller),
         Arc::clone(&journal_net),
+        Arc::clone(&flow_net),
         Arc::clone(&export_status),
     )
     .await
@@ -782,6 +797,7 @@ pub async fn start_with_runtimes(
             node: Some(node),
             cluster_addr: Some(cluster_addr),
             manager: Some(manager),
+            flow_net: Some(flow_net),
             readiness,
             leave_timeout,
             state_dir: Some(state_dir),
@@ -810,6 +826,7 @@ async fn attach_data_plane(
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
     puller: Arc<SourcePuller>,
     journal_net: Arc<JournalNet>,
+    flow_net: Arc<FlowNet>,
     export_status: Arc<ExportStatus>,
 ) -> anyhow::Result<(
     RunningServer,
@@ -956,6 +973,7 @@ async fn attach_data_plane(
             readiness: Arc::clone(readiness),
             puller: Arc::clone(&puller),
             journal_net: Arc::clone(&journal_net),
+            flow_net: Arc::clone(&flow_net),
             fleet_journal_port_cap,
         },
         node,

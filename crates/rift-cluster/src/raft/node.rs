@@ -9,7 +9,7 @@
 //! that arrives in the sliver before installation gets a retryable "not ready"
 //! rather than reaching a half-built node.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +34,7 @@ use super::store::{self, RedbStateMachine, SourceRecord, SourceRow};
 use super::{NodeId, TypeConfig};
 use crate::control::{
     AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, Principal, Role, SessionKey,
-    SourceProvenance, Tenant, TenantId,
+    SourceProvenance, Tenant, TenantConfigUsage, TenantId,
 };
 use crate::rpc::{
     Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcError, RpcServer,
@@ -1456,6 +1456,16 @@ impl RaftNode {
     pub fn tenants(&self) -> Result<Vec<Tenant>, NodeError> {
         self.sm_reader
             .tenants()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Every tenant's config-table usage, id-keyed, in one scan (issue #372) —
+    /// the imposter/stub half of what `GET /admin/tenants` reports alongside
+    /// `quotas`. See [`RedbStateMachine::tenant_config_usage`] for why one scan
+    /// serves every tenant.
+    pub fn tenant_config_usage(&self) -> Result<HashMap<String, TenantConfigUsage>, NodeError> {
+        self.sm_reader
+            .tenant_config_usage()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 

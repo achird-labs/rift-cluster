@@ -128,6 +128,36 @@ impl Default for Quotas {
     }
 }
 
+/// One tenant's config-table usage against [`Quotas`] (issue #372): what
+/// `GET /admin/tenants` and `GET /admin/tenants/:id` report alongside the
+/// limits themselves. Built by [`crate::raft::RedbStateMachine::tenant_config_usage`]
+/// in a single scan of `sm_configs` for every tenant at once — see that
+/// method's doc for why a per-tenant scan is not an option (issue #372's AC7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantConfigUsage {
+    /// Committed imposters this tenant holds — compared against
+    /// [`Quotas::max_imposters`].
+    pub imposters: u32,
+    /// The **maximum** `stubs.len()` across this tenant's imposters, not the
+    /// sum: [`Quotas::max_stubs_per_imposter`] is a per-imposter ceiling, so a
+    /// sum would report a tenant as over quota (or nowhere near it) for a
+    /// number no single imposter ever carried.
+    pub max_stubs: u32,
+    /// Every port this tenant holds a config on — what the flow-entry usage
+    /// fan-out (`FlowNet::fleet_entry_counts`) is asked to count against.
+    pub ports: Vec<u16>,
+    /// At least one of this tenant's `sm_configs` rows failed to parse and was
+    /// excluded (see `RedbStateMachine::tenant_config_usage`). A per-tenant
+    /// field rather than one flag for the whole scan: the corrupt row's key
+    /// still names its tenant even when its value does not decode, so the
+    /// scan already knows *which* tenant's figures are undercounted, and
+    /// flagging every other tenant along with it would be a fabricated
+    /// warning about numbers that are actually exact. `dispatch` ORs this
+    /// into the response's `Rift-Cluster-Partial`, next to the flow-entry
+    /// fan-out's own reason for that header.
+    pub incomplete: bool,
+}
+
 /// A tenant record (RFC-002 §3.1): the scope every resource op is keyed
 /// under.
 ///

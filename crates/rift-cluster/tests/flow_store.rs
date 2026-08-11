@@ -1250,3 +1250,129 @@ async fn an_unbound_store_fails_loud_never_silently_local() {
         "the refusal must say the cluster is starting, got: {err}"
     );
 }
+
+/// Issue #372: `FlowNet::fleet_entry_counts`'s partial flag, with an
+/// unreachable peer. A full multi-node HTTP round trip through
+/// `GET /admin/tenants` is not the practical place to inject "peer
+/// unreachable" — this unit-tests the fan-out itself, the same layer
+/// `a_delayed_put_cannot_resurrect_a_deleted_key` above reaches into for its
+/// owner/replica split.
+///
+/// Node death **without** a membership change is the honest shape of
+/// "unreachable": the ring still lists the dead node (nothing removed it), so
+/// the fan-out must still try to reach it and fail — exactly what a real
+/// network partition looks like from the surviving node's side, and exactly
+/// why the answer must degrade to `partial: true` rather than silently
+/// omitting that peer's share.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_peer_marks_the_flow_entry_usage_partial() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    // Pick whichever member owns this flow so the write — and the count this
+    // test asserts on — survives the other member's death.
+    let ring = members[0].node.ring();
+    let owner_id = ring
+        .owner(rift_cluster::OwnedKey::new(
+            rift_cluster::KeyClass::FlowKv,
+            &stored("flow-usage-partial"),
+        ))
+        .expect("two members");
+    let (owner, other) = if members[0].node.id() == owner_id {
+        (&members[0], &members[1])
+    } else {
+        (&members[1], &members[0])
+    };
+
+    let store = store_on(owner, serde_json::json!({}));
+    blocking(move || store.set("flow-usage-partial", "k", serde_json::json!("v")))
+        .await
+        .expect("write through the owner");
+
+    // Kill the other member's cluster port without a membership change: the
+    // owner's own ring still lists it, so the fan-out has to try it.
+    other.node.shutdown().await.expect("shutdown the peer");
+
+    let (counts, partial) = owner
+        .net
+        .fleet_entry_counts(&[TEST_PORT], Duration::from_millis(500))
+        .await;
+
+    assert!(
+        partial,
+        "an unreachable ring member must mark the answer partial, never a \
+         silently complete one"
+    );
+    assert_eq!(
+        counts.get(&TEST_PORT).copied(),
+        Some(1),
+        "partial must not mean discarded: the reachable owner's own entry \
+         must still be counted: {counts:?}"
+    );
+
+    owner.node.shutdown().await.expect("shutdown owner");
+}
+
+/// Issue #372: the ring-divergence half of the fan-out's `partial` contract,
+/// isolated the same way `a_stale_fencing_token_is_rejected_and_counted`
+/// isolates fencing above — a hand-built wire body straight at
+/// `/_cluster/flow/counts`, because provoking *real* ring divergence needs an
+/// in-flight membership change racing a fan-out, which is exactly the kind of
+/// timing-dependent setup the neighbouring `an_unreachable_peer_...` test's
+/// doc comment already rules out as impractical.
+///
+/// `owned_port_counts` decides ownership from the *serving* node's own ring,
+/// so two nodes whose rings disagree (mid membership-change) could each
+/// answer under a different view — one flow claimed by both (double count) or
+/// by neither (undercount), and both would report `partial: false`. The fix
+/// is the caller stamping its `m_idx` on the request and the callee refusing
+/// on a mismatch, which routes into the same peer-failure path
+/// `an_unreachable_peer_marks_the_flow_entry_usage_partial` proves turns into
+/// `partial: true` — so this test only needs to pin the refusal itself: a
+/// stale `m_idx` is rejected, and the current one is answered normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ring_divergence_marks_the_flow_entry_usage_partial() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    let target = members[1].node.id();
+    let current_m_idx = members[0].node.ring().m_idx();
+
+    let stale = serde_json::to_vec(&serde_json::json!({
+        "ports": [TEST_PORT],
+        "m_idx": current_m_idx + 1,
+    }))
+    .expect("encode");
+    let stale_reply = members[0]
+        .node
+        .call_member(target, "POST", "/_cluster/flow/counts", stale)
+        .await;
+    assert!(
+        stale_reply.is_err(),
+        "a caller `m_idx` the serving node's ring does not share must be \
+         refused, not answered under whichever view the peer happens to \
+         hold: {stale_reply:?}"
+    );
+
+    // Control: the current token is answered normally, so the refusal above
+    // is really about the mismatch and not some other request-shape problem.
+    let fresh = serde_json::to_vec(&serde_json::json!({
+        "ports": [TEST_PORT],
+        "m_idx": current_m_idx,
+    }))
+    .expect("encode");
+    let fresh_reply = members[0]
+        .node
+        .call_member(target, "POST", "/_cluster/flow/counts", fresh)
+        .await
+        .expect("a matching m_idx must be answered");
+    let fresh_reply: serde_json::Value = serde_json::from_slice(&fresh_reply).expect("json reply");
+    assert!(
+        fresh_reply.get("slots").is_some(),
+        "a matching m_idx must get a real counts reply, got {fresh_reply}"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
