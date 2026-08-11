@@ -1196,11 +1196,7 @@ impl FlowNet {
                 match joined {
                     Ok((peer, Ok(reply))) => {
                         answered.insert(peer);
-                        for (port, count) in reply.slots {
-                            if let Some(total) = totals.get_mut(&port) {
-                                *total = total.saturating_add(count);
-                            }
-                        }
+                        merge_peer_counts(&mut totals, &reply.slots);
                     }
                     Ok((peer, Err(e))) => {
                         answered.insert(peer);
@@ -1224,6 +1220,26 @@ impl FlowNet {
         }
 
         (totals, partial)
+    }
+}
+
+/// Fold one peer's `POST /_cluster/flow/counts` reply into the running fleet-wide per-port totals
+/// (issue #401).
+///
+/// Extracted out of `fleet_entry_counts`'s fan-out so the merge arithmetic is under direct test —
+/// the existing multi-node wire tests only kill or diverge the peer, so this line (an *answering*
+/// peer's counts actually landing in the total) previously ran under no test at all.
+///
+/// A port absent from `totals` is one this node never asked about (see
+/// `fleet_entry_counts`'s "nothing to fan out for" guard, which means `totals` only ever holds the
+/// caller's requested ports) and is skipped rather than inserted — growing the map to a port
+/// nobody requested would put a key the caller cannot use into the response. `saturating_add`
+/// matches the totals' own construction in `owned_port_counts`.
+fn merge_peer_counts(totals: &mut HashMap<u16, u64>, peer_slots: &[(u16, u64)]) {
+    for &(port, count) in peer_slots {
+        if let Some(total) = totals.get_mut(&port) {
+            *total = total.saturating_add(count);
+        }
     }
 }
 
@@ -1569,5 +1585,56 @@ impl rift_cluster_base::seams::FlowStoreProvider for ClusteredFlowStoreProvider 
             config: flow_config,
             port: config.port,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- issue #401: `merge_peer_counts` (the `fleet_entry_counts` peer fold) -
+
+    /// A peer answering with real counts is added, per port, to the running totals — the mutation
+    /// this test exists to kill turned this line into a no-op, so every 2-node wire test that only
+    /// killed or diverged the peer still passed while an answering peer's counts went uncounted.
+    #[test]
+    fn a_peer_answering_with_real_counts_is_added_to_the_running_totals_per_port() {
+        let mut totals: HashMap<u16, u64> = HashMap::from([(8001, 5), (8002, 10)]);
+
+        merge_peer_counts(&mut totals, &[(8001, 3), (8002, 7)]);
+
+        assert_eq!(totals, HashMap::from([(8001, 8), (8002, 17)]));
+    }
+
+    /// A port the peer does not mention is left exactly as it was.
+    #[test]
+    fn a_port_the_peer_does_not_mention_is_unchanged() {
+        let mut totals: HashMap<u16, u64> = HashMap::from([(8001, 5), (8002, 10)]);
+
+        merge_peer_counts(&mut totals, &[(8001, 3)]);
+
+        assert_eq!(totals, HashMap::from([(8001, 8), (8002, 10)]));
+    }
+
+    /// A port the peer reports that this node never requested is not inserted — `totals` only
+    /// ever holds the caller's own requested ports (see `fleet_entry_counts`), and a peer's count
+    /// for anything else must not grow the response with a key the caller cannot use.
+    #[test]
+    fn a_port_this_node_never_requested_is_not_inserted() {
+        let mut totals: HashMap<u16, u64> = HashMap::from([(8001, 5)]);
+
+        merge_peer_counts(&mut totals, &[(8001, 3), (9999, 100)]);
+
+        assert_eq!(totals, HashMap::from([(8001, 8)]));
+    }
+
+    /// The merge saturates rather than overflows, matching `owned_port_counts`'s own arithmetic.
+    #[test]
+    fn the_merge_saturates_instead_of_overflowing() {
+        let mut totals: HashMap<u16, u64> = HashMap::from([(8001, u64::MAX - 1)]);
+
+        merge_peer_counts(&mut totals, &[(8001, 10)]);
+
+        assert_eq!(totals, HashMap::from([(8001, u64::MAX)]));
     }
 }

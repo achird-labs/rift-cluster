@@ -163,24 +163,24 @@ async fn fleet_health(node: &Arc<RaftNode>, readiness: &Readiness) -> FleetBody 
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((peer, Ok(reply))) => {
-                    match reply
-                        .get("parked_intents")
-                        .and_then(serde_json::Value::as_u64)
-                    {
-                        Some(depth) => total = total.saturating_add(depth),
+                    let (new_total, usable) = add_peer_depth(total, Some(&reply));
+                    total = new_total;
+                    if !usable {
                         // The peer answered but could not read its own depth. Its contribution is
                         // unknown, which makes the sum a floor exactly as an unreachable peer does.
-                        None => {
-                            unanswered += 1;
-                            tracing::warn!(peer, "health fan-out: peer reported no parked depth");
-                        }
+                        unanswered += 1;
+                        tracing::warn!(peer, "health fan-out: peer reported no parked depth");
                     }
                 }
                 Ok((peer, Err(e))) => {
+                    let (new_total, _usable) = add_peer_depth(total, None);
+                    total = new_total;
                     unanswered += 1;
                     tracing::warn!(peer, error = %e, "health fan-out: peer did not answer");
                 }
                 Err(e) => {
+                    let (new_total, _usable) = add_peer_depth(total, None);
+                    total = new_total;
                     unanswered += 1;
                     tracing::warn!(error = %e, "health fan-out: task failed");
                 }
@@ -197,6 +197,31 @@ async fn fleet_health(node: &Arc<RaftNode>, readiness: &Readiness) -> FleetBody 
     FleetBody {
         value,
         partial: timed_out || unanswered > 0,
+    }
+}
+
+/// Fold one peer's `/_cluster/health` reply into the running fleet-wide `parked_intents` sum
+/// (issue #401).
+///
+/// Extracted out of `fleet_health`'s fan-out so the "peer answered" and "peer did not answer"
+/// arms are under direct test rather than reachable only through a real fan-out — every wire test
+/// here runs a solo node, so an *answering* peer's contribution to the sum was previously
+/// reachable by no test at all.
+///
+/// `reply` is `None` for every way a peer can fail to contribute a number to this call: it did not
+/// answer, its task panicked, or (the caller passes `Some` but the value has no field) it answered
+/// with a body that carries no `parked_intents`. All three collapse to the same outcome here
+/// because they mean the same thing to the sum: this peer's depth is *unknown*, not `0` — folding
+/// it in as `0` would let an incomplete sum read as an exact one. The returned `bool` is `true`
+/// only when a real depth was added, so the caller can tell "contributed" from "did not" without
+/// re-deriving it from the total.
+fn add_peer_depth(total: u64, reply: Option<&serde_json::Value>) -> (u64, bool) {
+    match reply
+        .and_then(|r| r.get("parked_intents"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(depth) => (total.saturating_add(depth), true),
+        None => (total, false),
     }
 }
 
@@ -617,5 +642,36 @@ mod tests {
         assert_eq!(row["bound_ports"], serde_json::Value::Null);
         assert_eq!(row["bind_failures"], serde_json::Value::Null);
         assert_eq!(row["bind_status_unavailable"], serde_json::Value::Null);
+    }
+
+    // -- issue #401: `add_peer_depth` (the `fleet_health` peer fold) --------
+
+    /// A peer that answers with a real depth grows the total by exactly that much, and is
+    /// reported as having contributed.
+    #[test]
+    fn a_peer_that_answers_with_a_depth_grows_the_total_by_exactly_that_depth() {
+        let (total, usable) = add_peer_depth(10, Some(&serde_json::json!({ "parked_intents": 7 })));
+        assert_eq!(total, 17);
+        assert!(usable);
+    }
+
+    /// A peer that answers but carries no `parked_intents` field leaves the total unchanged, and
+    /// is reported as not having contributed — the mutation this test exists to kill would let an
+    /// answering-but-empty peer be counted as `+0` and still marked complete.
+    #[test]
+    fn a_peer_that_answers_with_no_parked_intents_field_leaves_the_total_unchanged_and_is_marked_unusable()
+     {
+        let (total, usable) = add_peer_depth(10, Some(&serde_json::json!({ "node_id": "9" })));
+        assert_eq!(total, 10);
+        assert!(!usable);
+    }
+
+    /// A peer that never answered at all leaves the total unchanged, and is reported as not
+    /// having contributed — `None` must never be silently folded in as a `0` depth.
+    #[test]
+    fn an_unreachable_peer_leaves_the_total_unchanged_and_is_marked_unusable() {
+        let (total, usable) = add_peer_depth(10, None);
+        assert_eq!(total, 10);
+        assert!(!usable);
     }
 }
