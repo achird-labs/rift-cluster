@@ -122,4 +122,70 @@ describe("imposter detail", () => {
 
     expect((await screen.findByRole("alert")).textContent).toMatch(/could not read this imposter/i);
   });
+
+  it("renders the three _rift knobs, distinguishing inherited from set here (#370)", async () => {
+    onDetailTab("settings");
+    stubFetch({
+      "/imposters/4545": {
+        json: {
+          ...IMPOSTER,
+          _rift: {
+            flowState: { backend: "inmemory", ttlSeconds: 300 },
+            flowStateResolved: {
+              durability: { value: "sync", source: "set" },
+              readConsistency: { value: "strong", source: "default" },
+              flowIdSource: { value: "header:X-Session", source: "set" },
+            },
+          },
+        },
+      },
+    });
+    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("viewer") });
+
+    // The value AND its provenance: a panel that showed only the value is the one the issue calls
+    // out as inviting an operator to change the wrong thing.
+    const durability = await screen.findByTestId("rift-knob-durability");
+    expect(durability.textContent).toContain("sync");
+    expect(durability.textContent).toContain("set here");
+
+    const readConsistency = screen.getByTestId("rift-knob-readConsistency");
+    expect(readConsistency.textContent).toContain("strong");
+    expect(readConsistency.textContent).toContain("inherited");
+
+    const flowIdSource = screen.getByTestId("rift-knob-flowIdSource");
+    expect(flowIdSource.textContent).toContain("header:X-Session");
+    expect(flowIdSource.textContent).toContain("set here");
+  });
+
+  it("links contextScope to #288 and no longer links the published knobs to #369", async () => {
+    // #369 is per-node bind status — a different issue. The panel used to link all three published
+    // knobs there, so this pins the correction as much as the feature.
+    onDetailTab("settings");
+    stubFetch({ "/imposters/4545": { json: IMPOSTER } });
+    const { container } = renderInApp(<ImposterDetail port={4545} />, {
+      whoami: whoamiWith("viewer"),
+    });
+    await screen.findByTestId("rift-knob-durability");
+
+    // `Pending` wraps the number in a visually-hidden sentence, so match the rendered text rather
+    // than expecting the anchor's textContent to be the bare "#288".
+    const issueLinks = [...container.querySelectorAll("a.issue")]
+      .map((a) => a.textContent ?? "")
+      .join(" ");
+    expect(issueLinks).toMatch(/#288\b/);
+    expect(issueLinks).not.toMatch(/#369\b/);
+  });
+
+  it("says the knobs are unknown rather than inventing defaults when the read carried none", async () => {
+    // Absence of `flowStateResolved` means the front could not resolve them (an out-of-band record,
+    // or a node that could not read the stored config back) — NOT that the imposter is running on
+    // defaults. Rendering "async · inherited" here would state a fact the response never carried.
+    onDetailTab("settings");
+    stubFetch({ "/imposters/4545": { json: IMPOSTER } });
+    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("viewer") });
+
+    const durability = await screen.findByTestId("rift-knob-durability");
+    expect(durability.textContent).not.toContain("inherited");
+    expect(durability.textContent).not.toContain("async");
+  });
 });

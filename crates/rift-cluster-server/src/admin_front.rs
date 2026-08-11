@@ -79,7 +79,7 @@ use rift_cluster::decorate::{
 };
 use rift_cluster::stores::{
     ContextScope, Coverage, FleetCursor, FleetTailEvent, FlowConfig, IdPolicy, JoinMode,
-    JournalCursor, JournalNet,
+    JournalCursor, JournalNet, ResolvedKnobs,
 };
 use rift_cluster::{
     ControlOutcome, ControlResponse, FLEET_SCOPE, KeyClass, NodeError, NodeId, OwnedKey, PullError,
@@ -1248,6 +1248,21 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                         .then(|| space_read_target(&path))
                         .flatten()
                         .map(|(port, flow)| space_owner(&state, &tenant, port, &flow));
+                    // The resolved `_rift` knobs (issue #370), read from the applied config before
+                    // `proxy` moves `state` for the same reason as everything above. Single-imposter
+                    // read only: the listing carries no knobs panel, and resolving them per entry
+                    // would be a stored-config read per imposter on the list screen.
+                    //
+                    // This read and the proxied body are two reads of the same imposter, so a write
+                    // landing between them makes the response describe two revisions at once. The
+                    // same window every decoration here has; harmless for a knobs panel, which
+                    // reports configuration rather than acting on it, and the response's
+                    // `Rift-Cluster-Revision` names the record the *write* path will condition on.
+                    let flow_knobs = (req.method() == Method::GET
+                        && is_single_imposter_read(&path))
+                    .then(|| port_param(&target.params))
+                    .flatten()
+                    .and_then(|port| flow_state_resolved(&state, &tenant, port));
                     let mut response = proxy(state, req, Some(&tenant)).await;
                     if let Some(owned) = owned {
                         response = filter_imposter_list(response, &owned).await;
@@ -1258,6 +1273,9 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                     }
                     if let Some(owner) = space_flow_owner {
                         response = decorate_space_owner(response, owner).await;
+                    }
+                    if let Some(knobs) = flow_knobs {
+                        response = decorate_flow_state_resolved(response, knobs).await;
                     }
                     if let Some(reason) = degraded {
                         set_header(&mut response, HEADER_BIND_FAILURES, &reason);
@@ -2235,6 +2253,132 @@ async fn decorate_space_owner(
                 .unwrap_or_else(|response| response)
         }
     }
+}
+
+/// Add `_rift.flowStateResolved` to a proxied single-imposter read (issue #370).
+///
+/// Additive, and so it takes [`decorate_space_owner`]'s failure polarity rather than
+/// [`decorate_number_of_requests`]'s: an unparseable body passes through **unchanged and logged**,
+/// never silently defaulted. That is safe here in a way it would not be if this rendered the stored
+/// config — the block is built from the already-parsed knobs ([`ResolvedKnobs`]), so upstream's
+/// redaction of the credentialed `flowState.redis` block cannot be undone by any path through here,
+/// including the failure path.
+async fn decorate_flow_state_resolved(
+    response: Response<FrontBody>,
+    knobs: ResolvedKnobs,
+) -> Response<FrontBody> {
+    let (parts, body) = response.into_parts();
+    if !parts.status.is_success() {
+        return Response::from_parts(parts, body);
+    }
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return internal(&format!(
+                "reading the imposter body to decorate flowStateResolved: {e}"
+            ));
+        }
+    };
+    let (body, failed) = match rewrite_flow_state_resolved(&bytes, &knobs) {
+        Ok(rewritten) => (Bytes::from(rewritten), None),
+        Err(e) => (bytes, Some(e)),
+    };
+    if let Some(e) = failed {
+        tracing::error!(error = %e, "the imposter body could not be decorated with its resolved flow-state knobs");
+    }
+    let mut response = buffered_response(parts.status, body, json_content_type())
+        .unwrap_or_else(|response| response);
+    carry_over_headers(&mut response, &parts.headers);
+    response
+}
+
+/// Move the headers an earlier decoration set onto a rebuilt response.
+///
+/// [`buffered_response`] starts from an **empty** header map. That is right for the first
+/// decoration in a chain and wrong for any later one, and this is the first decoration that runs
+/// after another: on the single-imposter read [`decorate_number_of_requests`] has already stamped
+/// `Rift-Cluster-Partial` when the fleet fan-out could not reach a peer, and dropping it would make
+/// a count that is knowingly missing a node's slot arrive looking authoritative — the wrong-but-
+/// quiet failure that decoration fails closed to avoid in the first place.
+///
+/// `content-type` is left as the rebuild set it, and `content-length` is deliberately not carried:
+/// the body it described is not the body being sent.
+fn carry_over_headers(response: &mut Response<FrontBody>, previous: &hyper::HeaderMap) {
+    let headers = response.headers_mut();
+    // `iter()` rather than `into_iter()`: the owning iterator yields `None` for the name of a
+    // repeated header's second and later values, so a name-keyed loop over it silently drops them.
+    // `append` keeps every value of a multi-valued header.
+    for (name, value) in previous {
+        if name == hyper::header::CONTENT_TYPE || name == hyper::header::CONTENT_LENGTH {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+}
+
+/// Insert `_rift.flowStateResolved` into an imposter body, creating `_rift` if upstream sent none.
+///
+/// Upstream's own `_rift.flowState` keeps every key and value it arrived with — `flowIdSource`
+/// included, and still as the flat string upstream renders. That is a compatibility contract, not
+/// tidiness: rift-verify reads it there to drive correlated isolation, so rewriting it in EE would
+/// break rift-verify against an EE cluster, which is what this repo's `parity` job exists to catch.
+///
+/// Not *byte*-identical: the document round-trips through `serde_json::Value` without
+/// `preserve_order`, so key order comes out normalised. Already true of this path — the
+/// `numberOfRequests` decoration re-serialises the same way — and no consumer depends on it.
+fn rewrite_flow_state_resolved(bytes: &[u8], knobs: &ResolvedKnobs) -> Result<Vec<u8>, String> {
+    let mut doc: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("the imposter body was not JSON: {e}"))?;
+    let map = doc
+        .as_object_mut()
+        .ok_or_else(|| "the imposter body was not a JSON object".to_owned())?;
+    let rift = map
+        .entry("_rift")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let rift = rift
+        .as_object_mut()
+        .ok_or_else(|| "the imposter body's `_rift` was not a JSON object".to_owned())?;
+    rift.insert("flowStateResolved".to_owned(), knobs.to_json());
+    serde_json::to_vec(&doc).map_err(|e| e.to_string())
+}
+
+/// The three published `_rift` knobs for one imposter, read from the applied config (issue #370).
+///
+/// Resolved from the *stored* document rather than from upstream's response because that is the
+/// only place the inherited-vs-set distinction survives: parsing resolves an absent key to its
+/// default, and upstream's allowlist never emits two of the three knobs at all.
+fn flow_state_resolved(state: &FrontState, tenant: &TenantId, port: u16) -> Option<ResolvedKnobs> {
+    let node = state.node.upgrade()?;
+    let config = node
+        .imposter_config(tenant.as_str(), port)
+        .inspect_err(|e| {
+            tracing::warn!(tenant = tenant.as_str(), port, error = %e, "imposter read serves without its resolved flow-state knobs");
+        })
+        .ok()
+        // `Ok(None)` — no committed record on this node's applied state — is deliberately silent,
+        // and is the one branch here that is not a fault. Upstream answered the read from its own
+        // engine, so this node is serving an imposter whose config it has not applied yet: an
+        // ordinary lag window on a node still catching up. The console renders the knobs as unknown
+        // for as long as it lasts, which is the honest answer, and logging every such read would
+        // make a routine catch-up look like an error.
+        .flatten()?;
+    // `error`, not `warn`, for the two below: admission validates both before a record commits, so
+    // either one failing means an applied record that should not exist — an integrity signal worth
+    // alerting on, not just something to find by grepping afterwards. The `warn` above is the
+    // different, benign case of a read that simply could not be served.
+    let config: ImposterConfig = serde_json::from_str(&config)
+        .inspect_err(|e| {
+            tracing::error!(tenant = tenant.as_str(), port, error = %e, "the stored imposter config did not parse; serving without resolved flow-state knobs");
+        })
+        .ok()?;
+    // A stored value the knobs cannot interpret is left off the response rather than published as
+    // a default: admission refuses those, so reaching here means a record written out of band, and
+    // "async, inherited" over a document that says otherwise is the wrong-but-quiet answer.
+    ResolvedKnobs::from_imposter(&config)
+        .inspect_err(|e| {
+            tracing::error!(tenant = tenant.as_str(), port, error = %e, "the stored flow-state knobs did not resolve; serving without them");
+        })
+        .ok()
 }
 
 /// Insert `owner` into a space body. Errors rather than guessing if it is not a JSON object.
@@ -5807,6 +5951,179 @@ mod tests {
     fn rewrite_space_owner_refuses_a_body_it_cannot_decorate() {
         assert!(rewrite_space_owner(b"not json at all", 1).is_err());
         assert!(rewrite_space_owner(b"[1,2,3]", 1).is_err());
+    }
+
+    /// The knobs an imposter document carries when nothing was configured (#370).
+    fn default_knobs() -> ResolvedKnobs {
+        let config = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+        }))
+        .expect("parses");
+        ResolvedKnobs::from_imposter(&config).expect("valid")
+    }
+
+    /// Issue #370. `_rift.flowStateResolved` is added beside upstream's `_rift.flowState`, and
+    /// every key and value in upstream's block survives unchanged.
+    ///
+    /// This is a compatibility contract, not tidiness: upstream renders
+    /// `_rift.flowState.flowIdSource` as a flat string and rift-verify reads it there to drive
+    /// correlated isolation. Rewriting it in EE would break rift-verify against an EE cluster and
+    /// diverge EE from a field upstream owns — which the `parity` CI job exists to catch.
+    #[test]
+    fn upstream_flow_state_is_left_untouched_by_the_decoration() {
+        let body = br#"{"port":4545,"protocol":"http","_rift":{"flowState":{"backend":"inmemory","ttlSeconds":300,"flowIdSource":"header:X-Mock-Space"},"warnings":[]}}"#;
+
+        let out = rewrite_flow_state_resolved(body, &default_knobs()).expect("decorates");
+        let doc: serde_json::Value = serde_json::from_slice(&out).expect("still JSON");
+
+        // Upstream's block, exactly as it arrived — including the flat-string flowIdSource.
+        assert_eq!(
+            doc["_rift"]["flowState"]["flowIdSource"],
+            "header:X-Mock-Space"
+        );
+        assert!(doc["_rift"]["flowState"]["flowIdSource"].is_string());
+        assert_eq!(doc["_rift"]["flowState"]["backend"], "inmemory");
+        assert_eq!(doc["_rift"]["flowState"]["ttlSeconds"], 300);
+        assert!(doc["_rift"]["warnings"].is_array());
+        // And the rest of the document survives — the decoration adds, it does not rewrite.
+        assert_eq!(doc["port"], 4545);
+        assert_eq!(doc["protocol"], "http");
+        // The new sibling block is present.
+        assert_eq!(
+            doc["_rift"]["flowStateResolved"]["durability"]["value"],
+            "async"
+        );
+    }
+
+    /// Issue #370 — **security regression test**.
+    ///
+    /// Upstream's `expose_flow_state` is an allowlist precisely because `flowState.redis.url` can
+    /// carry a credentialed connection string (`redis://user:secret@host`), and it has its own test
+    /// asserting the credential survives nowhere in the exposed value. A decoration that rendered
+    /// the *stored* config rather than the parsed knobs would undo that redaction from the EE side —
+    /// so this asserts the boundary holds through EE's addition, both when upstream has already
+    /// stripped `redis` and in the belt-and-braces case where a `redis` block is present in the body
+    /// being decorated.
+    #[test]
+    fn the_redis_block_is_never_exposed_by_the_decoration() {
+        let config = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+            "_rift": { "flowState": {
+                "backend": "redis",
+                "redis": { "url": "redis://user:secret@host:6379", "keyPrefix": "rift:" },
+                "durability": "sync",
+            }},
+        }))
+        .expect("parses");
+        let knobs = ResolvedKnobs::from_imposter(&config).expect("valid");
+
+        // Upstream's allowlist has already stripped `redis` from what it answered.
+        let body = br#"{"port":4545,"_rift":{"flowState":{"backend":"redis","ttlSeconds":300}}}"#;
+        let out = rewrite_flow_state_resolved(body, &knobs).expect("decorates");
+        let text = String::from_utf8(out).expect("utf-8");
+
+        assert!(
+            !text.contains("secret"),
+            "the credential must not survive: {text}"
+        );
+        assert!(
+            !text.contains("redis://"),
+            "the connection URL must not survive: {text}"
+        );
+        let doc: serde_json::Value = serde_json::from_slice(text.as_bytes()).expect("still JSON");
+        assert!(doc["_rift"]["flowStateResolved"].get("redis").is_none());
+        assert!(doc["_rift"]["flowState"].get("redis").is_none());
+        // The knob that *is* published still came through.
+        assert_eq!(
+            doc["_rift"]["flowStateResolved"]["durability"]["value"],
+            "sync"
+        );
+        assert_eq!(
+            doc["_rift"]["flowStateResolved"]["durability"]["source"],
+            "set"
+        );
+    }
+
+    /// Issue #370. An imposter whose body carries no `_rift` at all still gets the resolved block —
+    /// the console renders one panel for every imposter, so "absent" must mean "inherited", not
+    /// "no panel".
+    #[test]
+    fn the_resolved_block_is_added_when_the_body_has_no_rift_at_all() {
+        let body = br#"{"port":4545,"protocol":"http"}"#;
+        let out = rewrite_flow_state_resolved(body, &default_knobs()).expect("decorates");
+        let doc: serde_json::Value = serde_json::from_slice(&out).expect("still JSON");
+
+        assert_eq!(
+            doc["_rift"]["flowStateResolved"]["readConsistency"]["value"],
+            "strong"
+        );
+        assert_eq!(
+            doc["_rift"]["flowStateResolved"]["readConsistency"]["source"],
+            "default"
+        );
+        assert_eq!(
+            doc["_rift"]["flowStateResolved"]["flowIdSource"]["value"],
+            "imposter_port"
+        );
+    }
+
+    /// Issue #370 — regression. The knobs decoration is the first that runs *after* another one, so
+    /// it is the first that can destroy what an earlier one set.
+    ///
+    /// `decorate_number_of_requests` stamps `Rift-Cluster-Partial` on the single-imposter read when
+    /// the fleet fan-out could not reach a peer, and the knobs decoration rebuilds the response
+    /// through `buffered_response`, whose header map starts empty. Losing the stamp would leave a
+    /// count that is knowingly missing a node's slot looking authoritative.
+    ///
+    /// Asserted on both branches, because the rebuild happens on the failure path too.
+    #[tokio::test]
+    async fn the_knobs_decoration_keeps_headers_an_earlier_decoration_set() {
+        for body in [
+            &br#"{"port":4545,"_rift":{"flowState":{}}}"#[..],
+            // The un-decoratable body: the pass-through branch rebuilds the response as well.
+            &b"not json at all"[..],
+        ] {
+            let mut response =
+                buffered_response(StatusCode::OK, Bytes::from(body), json_content_type())
+                    .expect("a response");
+            set_header(&mut response, HEADER_PARTIAL, "true");
+            set_header(&mut response, HEADER_REVISION, "default:4545@7.1");
+
+            let out = decorate_flow_state_resolved(response, default_knobs()).await;
+
+            assert_eq!(
+                out.headers()
+                    .get(HEADER_PARTIAL)
+                    .map(|v| v.to_str().expect("ascii")),
+                Some("true"),
+                "the partial stamp must survive the knobs decoration"
+            );
+            assert_eq!(
+                out.headers()
+                    .get(HEADER_REVISION)
+                    .map(|v| v.to_str().expect("ascii")),
+                Some("default:4545@7.1"),
+            );
+            // The rebuild's own content-type is kept, not the carried one.
+            assert_eq!(
+                out.headers()
+                    .get("content-type")
+                    .map(|v| v.to_str().expect("ascii")),
+                Some("application/json"),
+            );
+        }
+    }
+
+    /// Issue #370. Same polarity as [`rewrite_space_owner`]: a body that is not a JSON object
+    /// errors, and the caller logs and passes the original through rather than inventing a shape.
+    #[test]
+    fn rewrite_flow_state_resolved_refuses_a_body_it_cannot_decorate() {
+        assert!(rewrite_flow_state_resolved(b"not json at all", &default_knobs()).is_err());
+        assert!(rewrite_flow_state_resolved(b"[1,2,3]", &default_knobs()).is_err());
+        // `_rift` present but not an object is equally undecoratable.
+        assert!(rewrite_flow_state_resolved(br#"{"_rift":"nope"}"#, &default_knobs()).is_err());
     }
 
     #[test]

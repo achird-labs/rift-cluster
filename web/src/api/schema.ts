@@ -1206,8 +1206,50 @@ export interface components {
              *     The value is not this node's own tally. Upstream answers its local G-counter slot, and the front rewrites it to the sum across every node's slot for this port (issue #223) — so it is the figure the design's `REQUESTS · FLEET SUM` tile claims to be. When a peer could not be reached inside the fan-out budget the response carries `Rift-Cluster-Partial`, and the sum is of the nodes that answered: a floor, not a total.
              */
             numberOfRequests?: number;
+            _rift?: components["schemas"]["RiftExtensions"];
         } & {
             [key: string]: unknown;
+        };
+        /** @description Rift's own extensions to the Mountebank-compatible imposter document. Non-exhaustive — declared here only as far as the console reads it. */
+        RiftExtensions: {
+            /**
+             * @description Upstream's flow-state block, **proxied verbatim**. Upstream emits an allowlist of it — `backend`, `ttlSeconds`, and `flowIdSource` only when set — because `flowState.redis` can carry a credentialed connection URL, and anything added later is therefore excluded by default rather than leaked.
+             *
+             *     The EE front does not rewrite this block. `flowIdSource` in particular stays the flat string upstream renders, because rift-verify reads it there to drive correlated isolation; the resolved view with provenance is the sibling `flowStateResolved` (issue #370), which is additive precisely so this contract holds.
+             */
+            flowState?: {
+                [key: string]: unknown;
+            };
+            flowStateResolved?: components["schemas"]["FlowStateResolved"];
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * @description The per-imposter flow-state knobs with their **provenance** (issue #370), added by the EE front to the single-imposter read. Absent from the list projection, which has no knobs panel.
+         *
+         *     Two of the three cannot reach a client any other way: `durability` and `readConsistency` are parsed by the cluster but are not on upstream's allowlist, so they are published here or nowhere. `flowIdSource` is repeated from `flowState` deliberately, so the console reads one block with one shape rather than two knobs from here and a third from upstream's, inferring provenance for that one from absence.
+         *
+         *     `contextScope` is deliberately **not** here: it is tracked under #288 (RFC-005 S1), and publishing it would claim a knob still being designed.
+         */
+        FlowStateResolved: {
+            /** @description How a flow-state write is made durable — `none`, `async` (the default) or `sync`. */
+            durability: components["schemas"]["ResolvedKnob"];
+            /** @description Which copy a flow-state read consults — `strong` (the default, owner-authoritative) or `local` (the replica, at most one replication push behind). */
+            readConsistency: components["schemas"]["ResolvedKnob"];
+            /** @description How a request is mapped to a flow — `imposter_port` (the default: one context per imposter) or `header:<Name>`. This is what decides whether two callers share scenario state. */
+            flowIdSource: components["schemas"]["ResolvedKnob"];
+        };
+        /** @description One knob's effective value and where it came from. */
+        ResolvedKnob: {
+            /** @description The value in force for this imposter. */
+            value: string;
+            /**
+             * @description `set` when the imposter's document carries the key, `default` when it does not and the built-in applies.
+             *
+             *     This is **presence of the key, not equality with the default value**: an imposter that explicitly pins `durability: "async"` reads as `set`, because the operator made a choice. Rendering that as inherited would invite the next operator to change a fleet default instead — and there is no fleet-level override for these knobs, so "inherited" means the compiled-in default and nothing else.
+             * @enum {string}
+             */
+            source: "default" | "set";
         };
         /** @description One request-matching rule and its response(s). Non-exhaustive. */
         Stub: {

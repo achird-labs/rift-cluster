@@ -19,7 +19,11 @@ use rift_cluster_base::seams::ImposterConfig;
 use super::shard::Durability;
 
 /// Which copy a flow-state read consults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// The `lowercase` serialization is the same vocabulary [`FlowConfig::from_imposter`] parses, so
+/// the knob the admin read publishes (#370) round-trips through the value an operator wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReadConsistency {
     /// Every read is answered by the key's owner — correct under any load
     /// balancing, one LAN RPC when the owner is another node.
@@ -213,6 +217,114 @@ impl FlowConfig {
     }
 }
 
+/// Upstream's default when `flowState.flowIdSource` is absent: each imposter is its own flow.
+const DEFAULT_FLOW_ID_SOURCE: &str = "imposter_port";
+
+/// Where a published knob's effective value came from (#370).
+///
+/// `pub(crate)`: [`ResolvedKnobs`] renders itself, so no caller outside this crate ever names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KnobSource {
+    /// The imposter never mentioned the key, so the built-in default applies.
+    Default,
+    /// The imposter set the key explicitly — whatever value it chose, *including* one that
+    /// happens to equal the default.
+    Set,
+}
+
+impl KnobSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Set => "set",
+        }
+    }
+
+    /// Provenance is presence of the key, never equality with the default value: an operator who
+    /// pinned `durability: "async"` deliberately made a choice, and rendering that as "inherited"
+    /// would invite the next operator to go and change a fleet default instead.
+    const fn of(present: bool) -> Self {
+        if present { Self::Set } else { Self::Default }
+    }
+}
+
+/// The three per-imposter `_rift` knobs the admin imposter read publishes (#370).
+///
+/// Upstream's `expose_flow_state` is an allowlist — `backend`, `ttlSeconds` and `flowIdSource`
+/// only — because `flowState.redis` can carry a credentialed connection URL. `durability` and
+/// `readConsistency` therefore never reach a client by passthrough, and this is what the EE front
+/// decorates the read with instead.
+///
+/// It is built from the *parsed* knobs rather than from the stored document, which is what keeps
+/// upstream's redaction intact: there is no path by which `redis` can enter this struct.
+/// Provenance is read separately from the raw config, because parsing resolves `None => default`
+/// and destroys it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedKnobs {
+    durability: Knob<Durability>,
+    read_consistency: Knob<ReadConsistency>,
+    flow_id_source: Knob<String>,
+}
+
+/// One knob's effective value and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Knob<T> {
+    value: T,
+    source: KnobSource,
+}
+
+impl<T: serde::Serialize> Knob<T> {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "value": self.value, "source": self.source.as_str() })
+    }
+}
+
+impl ResolvedKnobs {
+    /// Resolve the three published knobs and where each came from.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`FlowConfig::from_imposter`] — a value this module cannot interpret for a key it
+    /// owns. Admission refuses those before they commit, so reaching this is a record written out
+    /// of band; publishing it as a default would be exactly the wrong-but-quiet answer.
+    pub fn from_imposter(config: &ImposterConfig) -> Result<Self, String> {
+        let parsed = FlowConfig::from_imposter(config)?;
+        let flow_state = config.rift.as_ref().and_then(|r| r.flow_state.as_ref());
+
+        let present = |key: &str| flow_state.is_some_and(|fs| fs.extra.contains_key(key));
+        let flow_id_source = flow_state.and_then(|fs| fs.flow_id_source.as_deref());
+
+        Ok(Self {
+            durability: Knob {
+                value: parsed.durability,
+                source: KnobSource::of(present(KEY_DURABILITY)),
+            },
+            read_consistency: Knob {
+                value: parsed.read_consistency,
+                source: KnobSource::of(present(KEY_READ_CONSISTENCY)),
+            },
+            flow_id_source: Knob {
+                value: flow_id_source
+                    .map_or_else(|| DEFAULT_FLOW_ID_SOURCE.to_owned(), str::to_owned),
+                source: KnobSource::of(flow_id_source.is_some()),
+            },
+        })
+    }
+
+    /// Render as the `_rift.flowStateResolved` block.
+    ///
+    /// `contextScope` is deliberately absent: it belongs to #288, and publishing it here would
+    /// quietly claim ownership of a knob another issue is still designing.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "durability": self.durability.to_json(),
+            "readConsistency": self.read_consistency.to_json(),
+            "flowIdSource": self.flow_id_source.to_json(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +499,129 @@ mod tests {
         })))
         .expect("valid");
         assert_eq!(parsed.ttl_seconds, None);
+    }
+
+    /// Issue #370. An imposter that never mentioned `_rift` still reads as three knobs at their
+    /// built-in defaults — not as an error, and not as a missing block. The console's panel has to
+    /// render *something* for every imposter, and "inherited" is the honest answer.
+    #[test]
+    fn resolved_knobs_report_defaults_when_the_rift_block_is_absent() {
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+        }))
+        .expect("parses");
+
+        let knobs = ResolvedKnobs::from_imposter(&config).expect("valid");
+        let json = knobs.to_json();
+
+        assert_eq!(json["durability"]["value"], "async");
+        assert_eq!(json["durability"]["source"], "default");
+        assert_eq!(json["readConsistency"]["value"], "strong");
+        assert_eq!(json["readConsistency"]["source"], "default");
+        assert_eq!(json["flowIdSource"]["value"], "imposter_port");
+        assert_eq!(json["flowIdSource"]["source"], "default");
+    }
+
+    /// Issue #370. Each knob set explicitly reads back as `set`, carrying the value that was set.
+    #[test]
+    fn resolved_knobs_report_set_when_the_key_is_present() {
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+            "_rift": { "flowState": {
+                "durability": "sync",
+                "readConsistency": "local",
+                "flowIdSource": "header:X-Session",
+            }},
+        }))
+        .expect("parses");
+
+        let json = ResolvedKnobs::from_imposter(&config)
+            .expect("valid")
+            .to_json();
+
+        assert_eq!(
+            json["durability"],
+            serde_json::json!({"value": "sync", "source": "set"})
+        );
+        assert_eq!(
+            json["readConsistency"],
+            serde_json::json!({"value": "local", "source": "set"})
+        );
+        assert_eq!(
+            json["flowIdSource"],
+            serde_json::json!({"value": "header:X-Session", "source": "set"})
+        );
+    }
+
+    /// Issue #370, and the test that matters most. Provenance is **presence of the key**, not
+    /// equality with the default value. An operator who deliberately pinned `durability: "async"`
+    /// has made a choice, and a panel that renders it as "inherited" invites the next operator to
+    /// change the fleet default instead — which is the confusion the whole inherited-vs-set
+    /// distinction exists to prevent. Implementing this by comparing against the default is the
+    /// obvious shortcut, and this is what fails when someone takes it.
+    #[test]
+    fn a_knob_set_to_its_own_default_value_still_reads_as_set() {
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+            "_rift": { "flowState": {
+                "durability": "async",
+                "readConsistency": "strong",
+                "flowIdSource": "imposter_port",
+            }},
+        }))
+        .expect("parses");
+
+        let json = ResolvedKnobs::from_imposter(&config)
+            .expect("valid")
+            .to_json();
+
+        assert_eq!(json["durability"]["value"], "async");
+        assert_eq!(json["durability"]["source"], "set");
+        assert_eq!(json["readConsistency"]["value"], "strong");
+        assert_eq!(json["readConsistency"]["source"], "set");
+        assert_eq!(json["flowIdSource"]["value"], "imposter_port");
+        assert_eq!(json["flowIdSource"]["source"], "set");
+    }
+
+    /// Issue #370 publishes three knobs. `contextScope` is #288's (RFC-005 S1), and putting it here
+    /// would quietly claim ownership of a knob another issue is still designing.
+    #[test]
+    fn context_scope_is_not_in_the_resolved_block() {
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+            "_rift": { "flowState": { "contextScope": "fleet" }},
+        }))
+        .expect("parses");
+
+        let json = ResolvedKnobs::from_imposter(&config)
+            .expect("valid")
+            .to_json();
+
+        assert!(
+            json.get("contextScope").is_none(),
+            "contextScope belongs to #288"
+        );
+        assert_eq!(json.as_object().expect("an object").len(), 3);
+    }
+
+    /// Issue #370. A stored value this module cannot interpret is refused rather than published as
+    /// a default — the same polarity `from_imposter` already has. Admission should have caught it,
+    /// so reaching here means the record predates the check or was written out of band; either way
+    /// a knob rendered as "async, inherited" when the document says something else is the
+    /// wrong-but-quiet failure this repo's error rules exist to prevent.
+    #[test]
+    fn resolved_knobs_refuse_a_value_they_cannot_interpret() {
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+            "_rift": { "flowState": { "durability": "sometimes" }},
+        }))
+        .expect("parses");
+
+        assert!(ResolvedKnobs::from_imposter(&config).is_err());
     }
 }
