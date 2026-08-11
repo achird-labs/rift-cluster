@@ -179,9 +179,16 @@ fn store_on(member: &FlowMember, flow_state: serde_json::Value) -> Arc<dyn FlowS
 /// verbatim, so a bare id there addresses a namespace no store ever writes to,
 /// and any assertion made through the store face against it is vacuously true.
 fn stored(flow_id: &str) -> String {
+    stored_on(TEST_PORT, flow_id)
+}
+
+/// [`stored`], parameterized over the port — needed by the handful of tests (the fleet-wide
+/// spaces listing among them) that write through a port other than [`TEST_PORT`] and still need
+/// the identical scoping arithmetic the store itself uses.
+fn stored_on(port: u16, flow_id: &str) -> String {
     format!(
         "{}{flow_id}",
-        rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(TEST_PORT))
+        rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(port))
     )
 }
 
@@ -1370,6 +1377,306 @@ async fn a_ring_divergence_marks_the_flow_entry_usage_partial() {
     assert!(
         fresh_reply.get("slots").is_some(),
         "a matching m_idx must get a real counts reply, got {fresh_reply}"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Issue #374 — the property the whole listing rests on: it is **fleet-wide and
+/// duplicate-free**, and it does not depend on which node you ask.
+///
+/// A flow keeps `REPLICAS` copies, so the two obvious implementations are both
+/// wrong: reading the local shard lists whatever copies this node happens to
+/// hold (incomplete, and different per node), while summing every node's copies
+/// lists each space several times. Filtering to the ring **owner** is what makes
+/// the union exactly the set of live flows, which is what this asserts — from
+/// *both* nodes, so a listing that silently answered only from local state
+/// fails on whichever node owns less.
+#[tokio::test(flavor = "multi_thread")]
+async fn spaces_listing_is_fleet_wide_duplicate_free_and_node_independent() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    const PORT: u16 = 6400;
+    const SPACES: [&str; 6] = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+
+    // Written through one node; ownership lands wherever HRW puts each flow, so
+    // in a 2-voter cluster both nodes typically own some and each node's answer
+    // needs the other's share to be complete.
+    let writer = store_on_port(&members[0], PORT, serde_json::json!({}));
+    for (i, space) in SPACES.iter().enumerate() {
+        let store = Arc::clone(&writer);
+        let owned = (*space).to_owned();
+        blocking(move || store.set(&owned, "step", serde_json::json!(i)))
+            .await
+            .unwrap_or_else(|e| panic!("write {space}: {e}"));
+    }
+
+    let mut expected: Vec<String> = SPACES.iter().map(|s| (*s).to_owned()).collect();
+    expected.sort_unstable();
+
+    for (i, member) in members.iter().enumerate() {
+        let (rows, partial) = member
+            .net
+            .fleet_spaces(PORT, "i6400:", Duration::from_secs(5))
+            .await;
+
+        assert!(
+            !partial,
+            "node {} answered partial with both voters up",
+            i + 1
+        );
+
+        let mut listed: Vec<String> = rows.iter().map(|row| row.space.clone()).collect();
+        listed.sort_unstable();
+        assert_eq!(
+            listed,
+            expected,
+            "node {} listed {listed:?}; every space exactly once was expected",
+            i + 1
+        );
+
+        // Stated separately from the equality above so a regression that
+        // duplicated rows names itself, rather than reading as a sort mismatch.
+        let unique: std::collections::HashSet<&str> =
+            rows.iter().map(|row| row.space.as_str()).collect();
+        assert_eq!(
+            unique.len(),
+            rows.len(),
+            "node {} listed a replicated space more than once",
+            i + 1
+        );
+
+        for row in &rows {
+            assert_eq!(
+                row.entry_count, 1,
+                "space {} was written exactly one key",
+                row.space
+            );
+            // The real-wire peer branch stamps a row with the peer that reported it
+            // (`merge_space_rows`); only the synthetic `merge_space_rows` unit test pinned that
+            // before now, so a transposition bug (every row stamped `me` regardless of which
+            // node actually owns it) sailed through this end-to-end test with green everywhere.
+            let expected_owner = member
+                .node
+                .ring()
+                .owner(rift_cluster::OwnedKey::new(
+                    rift_cluster::KeyClass::FlowKv,
+                    &stored_on(PORT, &row.space),
+                ))
+                .expect("two members");
+            assert_eq!(
+                row.owner,
+                expected_owner,
+                "node {} reported space {} as owned by {}, ring says {}",
+                i + 1,
+                row.space,
+                row.owner,
+                expected_owner
+            );
+        }
+    }
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Issue #374. An imposter with no flows has a **knowable** zero, and it must be
+/// reported as one — `partial: false` — so the console can say "no spaces"
+/// rather than "cannot tell". The unknowable zero (a peer that did not answer)
+/// is the case that stamps `partial`, and collapsing the two would let the
+/// screen state absence as fact.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_imposter_with_no_spaces_reports_a_knowable_zero() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    let (rows, partial) = members[0]
+        .net
+        .fleet_spaces(6599, "i6599:", Duration::from_secs(5))
+        .await;
+
+    assert!(rows.is_empty());
+    assert!(!partial, "both voters answered; this zero is knowable");
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Issue #374, the spaces-listing sibling of `an_unreachable_peer_marks_the_flow_entry_usage_partial`:
+/// a dead peer must not make the listing look complete. `fleet_spaces` still owes the caller
+/// whatever this node itself owns — `partial` is how the caller is told the *other* member's share
+/// is missing, not a licence to answer nothing at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_peer_marks_the_spaces_listing_partial() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    let ring = members[0].node.ring();
+    let owner_id = ring
+        .owner(rift_cluster::OwnedKey::new(
+            rift_cluster::KeyClass::FlowKv,
+            &stored("flow-spaces-partial"),
+        ))
+        .expect("two members");
+    let (owner, other) = if members[0].node.id() == owner_id {
+        (&members[0], &members[1])
+    } else {
+        (&members[1], &members[0])
+    };
+
+    let store = store_on(owner, serde_json::json!({}));
+    blocking(move || store.set("flow-spaces-partial", "k", serde_json::json!("v")))
+        .await
+        .expect("write through the owner");
+
+    // Same sabotage as the entry-usage test: kill the peer's cluster port without a membership
+    // change, so the owner's ring still lists it and the fan-out has to try it.
+    other.node.shutdown().await.expect("shutdown the peer");
+
+    let (rows, partial) = owner
+        .net
+        .fleet_spaces(
+            TEST_PORT,
+            &rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(TEST_PORT)),
+            Duration::from_millis(500),
+        )
+        .await;
+
+    assert!(
+        partial,
+        "an unreachable ring member must mark the listing partial, never a silently complete one"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.space.as_str())
+            .collect::<Vec<_>>(),
+        vec!["flow-spaces-partial"],
+        "partial must not mean discarded: the reachable owner's own space must still be listed: \
+         {rows:?}"
+    );
+
+    owner.node.shutdown().await.expect("shutdown owner");
+}
+
+/// Issue #374, isolating the spaces wire route's ring-divergence refusal the same way
+/// `a_ring_divergence_marks_the_flow_entry_usage_partial` isolates the counts route's: a
+/// hand-built body straight at `/_cluster/flow/spaces`, because provoking real ring divergence
+/// needs an in-flight membership change racing a fan-out. `SpacesReq`'s fields (`port`, `prefix`,
+/// `m_idx`) are read off the struct in `stores/flow.rs` rather than imported — it is
+/// crate-private, and the wire body is exactly what an out-of-process peer would send.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ring_divergence_is_refused_by_the_spaces_wire_route() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    let target = members[1].node.id();
+    let current_m_idx = members[0].node.ring().m_idx();
+    let prefix = rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(TEST_PORT));
+
+    let stale = serde_json::to_vec(&serde_json::json!({
+        "port": TEST_PORT,
+        "prefix": prefix,
+        "m_idx": current_m_idx + 1,
+    }))
+    .expect("encode");
+    let stale_reply = members[0]
+        .node
+        .call_member(target, "POST", "/_cluster/flow/spaces", stale)
+        .await;
+    assert!(
+        stale_reply.is_err(),
+        "a caller `m_idx` the serving node's ring does not share must be refused, not answered \
+         under whichever view the peer happens to hold: {stale_reply:?}"
+    );
+
+    // Control: the current token is answered normally, so the refusal above is really about the
+    // mismatch and not some other request-shape problem.
+    let fresh = serde_json::to_vec(&serde_json::json!({
+        "port": TEST_PORT,
+        "prefix": prefix,
+        "m_idx": current_m_idx,
+    }))
+    .expect("encode");
+    let fresh_reply = members[0]
+        .node
+        .call_member(target, "POST", "/_cluster/flow/spaces", fresh)
+        .await
+        .expect("a matching m_idx must be answered");
+    let fresh_reply: serde_json::Value = serde_json::from_slice(&fresh_reply).expect("json reply");
+    assert!(
+        fresh_reply.get("rows").is_some(),
+        "a matching m_idx must get a real spaces reply, got {fresh_reply}"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Issue #374: the listing's own isolation contract, alongside the store-level one
+/// `imposter_scope_isolates_two_imposters_sharing_one_flow_id` already pins. Two imposters at the
+/// default (`Imposter`) scope that both use the same caller-chosen flow id are still two separate
+/// spaces once scoped (`i6400:x-session-abc` vs `i6401:x-session-abc`) — the listing must not let
+/// one port's write show up under the other port's enumeration.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_imposters_sharing_a_flow_id_do_not_list_each_others_spaces() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    const SHARED: &str = "x-session-abc";
+    const PORT_A: u16 = 6400;
+    const PORT_B: u16 = 6401;
+
+    let store_a = store_on_port(&members[0], PORT_A, serde_json::json!({}));
+    let store_b = store_on_port(&members[0], PORT_B, serde_json::json!({}));
+    blocking(move || store_a.set(SHARED, "step", serde_json::json!("a")))
+        .await
+        .expect("write through imposter A");
+    blocking(move || store_b.set(SHARED, "step", serde_json::json!("b")))
+        .await
+        .expect("write through imposter B");
+
+    let (rows_a, partial_a) = members[0]
+        .net
+        .fleet_spaces(
+            PORT_A,
+            &rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(PORT_A)),
+            Duration::from_secs(5),
+        )
+        .await;
+    let (rows_b, partial_b) = members[0]
+        .net
+        .fleet_spaces(
+            PORT_B,
+            &rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(PORT_B)),
+            Duration::from_secs(5),
+        )
+        .await;
+
+    assert!(
+        !partial_a && !partial_b,
+        "both voters up: neither list should be partial"
+    );
+    assert_eq!(
+        rows_a
+            .iter()
+            .map(|row| row.space.as_str())
+            .collect::<Vec<_>>(),
+        vec![SHARED],
+        "imposter A's listing must show its own write: {rows_a:?}"
+    );
+    assert_eq!(
+        rows_b
+            .iter()
+            .map(|row| row.space.as_str())
+            .collect::<Vec<_>>(),
+        vec![SHARED],
+        "imposter B's listing must show its own write: {rows_b:?}"
     );
 
     for member in &members {

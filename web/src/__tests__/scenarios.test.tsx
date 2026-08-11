@@ -11,6 +11,7 @@ const FLOW = "checkout-1";
 
 const SCENARIOS_PATH = `/imposters/${PORT}/scenarios?flowId=${FLOW}`;
 const SPACE_PATH = `/imposters/${PORT}/spaces/${FLOW}`;
+const SPACES_PATH = `/imposters/${PORT}/spaces`;
 
 /** A node that answers every read this screen makes, for the flow the route names. */
 function healthy(overrides: Record<string, { json?: unknown; status?: number }> = {}) {
@@ -30,6 +31,15 @@ function healthy(overrides: Record<string, { json?: unknown; status?: number }> 
         stubs: [{ responses: [{ is: { statusCode: 200 } }] }],
         scenarios: [{ name: "checkout", state: "awaiting-payment" }],
         numberOfRequests: 7,
+      },
+    },
+    // The Spaces tab's own panel, benign by default so tests about the *other* panel on that tab
+    // (`SpacePanel`) do not have to model this route just to avoid an unmatched-path failure.
+    [SPACES_PATH]: {
+      json: {
+        durability: { value: "async", source: "default" },
+        spaces: [],
+        partial: false,
       },
     },
     ...overrides,
@@ -285,7 +295,7 @@ describe("a space's stubs are not the imposter's stubs", () => {
     stubFetch(
       healthy({
         [SPACE_PATH]: {
-          json: { space: FLOW, stubs: [], scenarios: [], numberOfRequests: 7, owner: 3 },
+          json: { space: FLOW, stubs: [], scenarios: [], numberOfRequests: 7, owner: "3" },
         },
       }),
     );
@@ -346,6 +356,161 @@ describe("a space's stubs are not the imposter's stubs", () => {
     renderScreen("editor", FLOW, "spaces");
     await screen.findByTestId("space-add-stub");
     await screen.findByTestId("space-teardown");
+  });
+});
+
+describe("active spaces — the imposter's own listing (#374)", () => {
+  it("lists space id, entry count and owner per row", async () => {
+    stubFetch(
+      healthy({
+        [SPACES_PATH]: {
+          json: {
+            durability: { value: "async", source: "default" },
+            spaces: [{ space: "qa-flow", entryCount: 12, owner: "3" }],
+            partial: false,
+          },
+        },
+      }),
+    );
+    renderScreen("viewer", FLOW, "spaces");
+
+    const row = await screen.findByTestId("active-space-row-qa-flow");
+    expect(row.textContent).toContain("qa-flow");
+    expect((await screen.findByTestId("active-space-entries-qa-flow")).textContent).toContain("12");
+    expect((await screen.findByTestId("active-space-owner-qa-flow")).textContent).toContain("3");
+  });
+
+  it("renders a large owner id exactly, never through a JS number", async () => {
+    // 2^53 + 1 — the smallest integer a JSON number cannot round-trip through an IEEE-754 double.
+    // If the owner were ever coerced with `Number(...)`, this would render as ...992 or ...994.
+    const bigOwner = "9007199254740993";
+    stubFetch(
+      healthy({
+        [SPACES_PATH]: {
+          json: {
+            spaces: [{ space: "qa-flow", entryCount: 1, owner: bigOwner }],
+            partial: false,
+          },
+        },
+      }),
+    );
+    renderScreen("viewer", FLOW, "spaces");
+
+    expect((await screen.findByTestId("active-space-owner-qa-flow")).textContent).toBe(bigOwner);
+  });
+
+  it("says the listing is incomplete when the fleet fan-out could not reach every node", async () => {
+    stubFetch(
+      healthy({
+        [SPACES_PATH]: {
+          json: {
+            spaces: [{ space: "qa-flow", entryCount: 1, owner: "3" }],
+            partial: true,
+          },
+        },
+      }),
+    );
+    renderScreen("viewer", FLOW, "spaces");
+
+    const partial = await screen.findByTestId("active-spaces-partial");
+    expect(partial.textContent).toMatch(/not the complete list/i);
+    // A row can still be shown alongside the caveat — partial does not mean nothing came back.
+    await screen.findByTestId("active-space-row-qa-flow");
+  });
+
+  it("renders `spaces: []` with `partial: false` as a definite 'no spaces' state", async () => {
+    stubFetch(healthy({ [SPACES_PATH]: { json: { spaces: [], partial: false } } }));
+    renderScreen("viewer", FLOW, "spaces");
+
+    await screen.findByTestId("active-spaces-empty");
+    expect(screen.queryByTestId("active-spaces-partial")).toBeNull();
+  });
+
+  it("does NOT render a definite 'no spaces' state for `spaces: []` with `partial: true`", async () => {
+    // The rule this whole panel exists to enforce: an empty list under a degraded read means
+    // "cannot tell you", not "this imposter has none" — the exact defect class #365/#366/#368 hit.
+    stubFetch(healthy({ [SPACES_PATH]: { json: { spaces: [], partial: true } } }));
+    renderScreen("viewer", FLOW, "spaces");
+
+    await screen.findByTestId("active-spaces-partial");
+    expect(screen.queryByTestId("active-spaces-empty")).toBeNull();
+  });
+
+  it("renders an absent durability knob as unknown, never as a default value", async () => {
+    stubFetch(healthy({ [SPACES_PATH]: { json: { spaces: [], partial: false } } }));
+    renderScreen("viewer", FLOW, "spaces");
+
+    const durability = await screen.findByTestId("active-spaces-durability");
+    expect(durability.textContent).toMatch(/unknown/i);
+    expect(durability.textContent).not.toContain("async");
+  });
+
+  it("renders a present durability knob once, not per row", async () => {
+    stubFetch(
+      healthy({
+        [SPACES_PATH]: {
+          json: {
+            durability: { value: "sync", source: "set" },
+            spaces: [
+              { space: "qa-flow", entryCount: 1, owner: "3" },
+              { space: "qa-flow-2", entryCount: 2, owner: "4" },
+            ],
+            partial: false,
+          },
+        },
+      }),
+    );
+    renderScreen("viewer", FLOW, "spaces");
+
+    const durability = await screen.findByTestId("active-spaces-durability");
+    expect(durability.textContent).toContain("sync");
+    // One knob element for the whole panel — not one per row.
+    expect(screen.getAllByTestId("active-spaces-durability")).toHaveLength(1);
+  });
+
+  it("renders an unreadable listing as unknown, never as an imposter with no spaces", async () => {
+    stubFetch(healthy({ [SPACES_PATH]: { status: 503 } }));
+    renderScreen("viewer", FLOW, "spaces");
+
+    const unknown = await screen.findByTestId("active-spaces-unknown");
+    expect(unknown.textContent).toMatch(/unknown, not empty/i);
+    expect(screen.queryByTestId("active-spaces-empty")).toBeNull();
+  });
+
+  it("renders the fleet-scope refusal distinctly from the generic partial banner", async () => {
+    stubFetch(
+      healthy({
+        [SPACES_PATH]: {
+          json: { spaces: [], partial: true, unavailable: "fleet-scope" },
+        },
+      }),
+    );
+    renderScreen("viewer", FLOW, "spaces");
+
+    const banner = await screen.findByTestId("active-spaces-fleet-scope");
+    expect(banner.textContent).toMatch(/contextScope.*fleet/i);
+    expect(banner.textContent).toMatch(/not a failure/i);
+    // Neither the generic partial banner nor the definite empty state renders alongside it.
+    expect(screen.queryByTestId("active-spaces-partial")).toBeNull();
+    expect(screen.queryByTestId("active-spaces-empty")).toBeNull();
+  });
+
+  it("renders the scope-unresolved refusal distinctly, and as transient", async () => {
+    stubFetch(
+      healthy({
+        [SPACES_PATH]: {
+          json: { spaces: [], partial: true, unavailable: "scope-unresolved" },
+        },
+      }),
+    );
+    renderScreen("viewer", FLOW, "spaces");
+
+    const banner = await screen.findByTestId("active-spaces-scope-unresolved");
+    expect(banner.textContent).toMatch(/could not read/i);
+    expect(banner.textContent).toMatch(/retry/i);
+    expect(screen.queryByTestId("active-spaces-fleet-scope")).toBeNull();
+    expect(screen.queryByTestId("active-spaces-partial")).toBeNull();
+    expect(screen.queryByTestId("active-spaces-empty")).toBeNull();
   });
 });
 

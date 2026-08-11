@@ -91,6 +91,15 @@ export const scenarioStatePath = (port: number, scenarioName: string): string =>
 
 export const scenariosResetPath = (port: number): string => `/imposters/${port}/scenarios/reset`;
 
+/**
+ * Every correlated-isolation space this imposter currently holds, fleet-wide (#374).
+ *
+ * Deliberately the collection root, not a member path: `spacePath` addresses one space by the flow
+ * id a caller already knows, and this addresses "which flow ids exist", which is EE-only — there is
+ * no upstream route for this shape at all.
+ */
+export const spacesPath = (port: number): string => `/imposters/${port}/spaces`;
+
 /** One correlated-isolation space, addressed by its flow id. */
 export const spacePath = (port: number, flowId: string): string =>
   `/imposters/${port}/spaces/${encodeURIComponent(flowId)}`;

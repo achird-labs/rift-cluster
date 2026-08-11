@@ -323,6 +323,15 @@ impl ResolvedKnobs {
             "flowIdSource": self.flow_id_source.to_json(),
         })
     }
+
+    /// The `durability` knob alone, as `{value, source}` (issue #374): the spaces listing publishes
+    /// this one knob on its envelope — an imposter's resolved durability governs every space it
+    /// holds alike — without pulling in `readConsistency`/`flowIdSource`, which belong to the
+    /// single-imposter read's `_rift.flowStateResolved` block, not to a route about spaces.
+    #[must_use]
+    pub fn durability_json(&self) -> serde_json::Value {
+        self.durability.to_json()
+    }
 }
 
 #[cfg(test)]

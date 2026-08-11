@@ -40,6 +40,25 @@ Two properties make this the right seam:
   than passing ids through bare, so a caller-chosen id that happens to look like
   `i6400:cart` still cannot address imposter 6400's `cart`.
 
+`f:` is disjoint from `i<port>:`, but it is **not** per-tenant: the prefix carries
+no tenant component, and one `FlowNet` shard serves every imposter on a node. So
+two tenants that both opt into `fleet` share one namespace and can read or
+overwrite each other's flow state by naming the same id. That is inherent to what
+`fleet` means today and is gated by nothing — RFC-005 §S1 specifies an
+admission gate on `FleetAdmin`, which has not shipped (issue #288).
+
+The consequence for admin surfaces is the part worth stating, because it is not
+obvious from the table: **a fleet-scoped imposter's spaces are not enumerable
+per-imposter.** `GET /imposters/{port}/spaces` (issue #374) refuses them with
+`unavailable: "fleet-scope"` rather than scanning `f:`, which would hand one
+tenant another tenant's flow ids, entry counts and owning nodes. Reading a *named*
+space (`GET .../spaces/{flowId}`) is unaffected: it answers about an id the caller
+already holds, whereas a listing is what turns "know the id" into "enumerate
+them", and flow ids routinely come from request headers (`flowIdSource:
+header:X-Session`), so the ids themselves can carry customer identifiers.
+The refusal is not narrowed to non-admins because the `FleetAdmin` gate does not
+exist yet; when #288 lands, it is what the listing should be gated on instead.
+
 It also settles a limitation the durable tier records below: a repair path could
 not previously tell which imposter a `flow_id` belonged to. Now the id says.
 

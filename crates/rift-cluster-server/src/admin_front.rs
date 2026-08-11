@@ -505,6 +505,17 @@ pub(crate) enum Terminated {
     /// `ClearSavedRequests` commit above. Not routed through `build_mutation` — there is no
     /// loopback path to `FetchAfter`/`Captured` render from; the response is the proxy's own.
     SpaceTeardown(u16, String),
+    /// `GET /imposters/{port}/spaces` (issue #374): every correlated-isolation space this imposter
+    /// currently holds live flow-KV entries under, fleet-wide, with each row's live entry count
+    /// and owning node plus the imposter's resolved `durability` on the envelope.
+    ///
+    /// Terminates — there is nothing to proxy to. Unlike [`Self::SpaceTeardown`], which proxies its
+    /// flow-state half and adds a journal commit alongside it, upstream's router has no bare
+    /// `["spaces"]` shape at all: only the two-segment single-space read and the three-segment
+    /// stubs write exist there. This is a merge-on-read fan-out over `FlowNet::fleet_spaces`, the
+    /// same shape [`Self::ReadFleetRequests`] and the `numberOfFlowEntries` decoration already use
+    /// for a fleet-scoped read that has no single node's answer to trust.
+    SpacesList(u16),
     /// `POST /admin/imposters/{port}/try` (issue #335): send a sample request to this imposter and
     /// hand back what it answered, so an operator can tell whether a stub matches without leaving
     /// the console.
@@ -597,6 +608,7 @@ fn addressed_port(kind: &Terminated) -> Option<u16> {
         | Terminated::ClearSavedRequests(port)
         | Terminated::ClearSavedProxyResponses(port)
         | Terminated::SpaceTeardown(port, _)
+        | Terminated::SpacesList(port)
         // Issue #335: this is not merely *a* tenant check for the try endpoint, it is the **only**
         // one. Returning the port here is what makes an unknown port and another tenant's port
         // answer the same §8.4 404 — and what stops the endpoint dialling a port the caller does
@@ -648,6 +660,7 @@ fn scope_for(kind: &Terminated) -> Option<TenantId> {
         | Terminated::ClearSavedRequests(_)
         | Terminated::ClearSavedProxyResponses(_)
         | Terminated::SpaceTeardown(_, _)
+        | Terminated::SpacesList(_)
         | Terminated::TryImposter(_)
         | Terminated::PutRoutes
         | Terminated::DeleteRoute(_)
@@ -785,6 +798,19 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
             Method::DELETE => Some(Terminated::DeleteAllImposters),
             _ => None,
         };
+    }
+    // The spaces **listing** (issue #374): `GET /imposters/{port}/spaces`, and its
+    // `/admin/imposters/` alias — the same one the `requests`/`savedRequests` block just below
+    // already treats interchangeably, for the identical reason: upstream's router has no bare
+    // `["spaces"]` shape at all, so there is no "proxy, then decorate" fallback the way the
+    // single-space read has one. Matched here, ahead of both prefix-specific blocks below, because
+    // `spaces_list_target` already normalises both spellings and the trailing-slash form in one
+    // pass; a second copy inside each block would be the alias drifting again, the exact failure
+    // #223's own review found for `requests`.
+    if *method == Method::GET
+        && let Some(port) = spaces_list_target(path)
+    {
+        return Some(Terminated::SpacesList(port));
     }
     // The savedRequests alias under `/admin/imposters/` (issue #223 review, Important):
     // upstream's own `/admin/imposters/` prefix is otherwise reserved for flow-state inspection
@@ -958,6 +984,13 @@ fn action_for(kind: &Terminated) -> Action {
         // this terminated): a space teardown is the Operator-tier "disturb" sibling of
         // `FlowStateClear`, distinguished by the canonical (non-`/admin/imposters/`) prefix.
         Terminated::SpaceTeardown(_, _) => Action::SpaceTeardown,
+        // Exactly upstream's own mapping for a space *read* (`principal::map_action`'s
+        // `IMPOSTER_READ` arm folds every route onto `ImposterRead` regardless of `has_space`):
+        // the single-space `GET .../spaces/{flowId}` already carries this action via the proxied
+        // path, and the listing is the same read at a coarser grain — a fleet-wide merge instead of
+        // one flow — so it takes the identical action rather than a new one a role table would need
+        // to learn separately.
+        Terminated::SpacesList(_) => Action::ImposterRead,
         // Issue #335. Not `ImposterRead`, despite the caller only wanting to look: a try is a
         // write in *effect* — it advances scenario state, appends to the request log and can
         // trigger proxyOnce recording — which is the Operator-tier "disturb" shape. See
@@ -2087,6 +2120,55 @@ fn space_read_target(path: &str) -> Option<(u16, String)> {
     }
 }
 
+/// The `port` of a spaces **listing** — `GET /imposters/{port}/spaces` — or `None` (issue #374).
+///
+/// Exactly the one-segment shape [`space_read_target`] rejects (its `[port, "spaces", flow]` arm
+/// requires a third, non-empty segment): the two parsers partition every `.../spaces...` shape
+/// between them rather than overlapping, so neither can shadow the other. A trailing slash
+/// (`/spaces/`) is the same resource, not a space whose id is empty — matched here as `flow == ""`
+/// on the three-segment shape, the same way `space_read_target`'s `!flow.is_empty()` guard rejects
+/// it from the other side.
+fn spaces_list_target(path: &str) -> Option<u16> {
+    let path = path.split('?').next().unwrap_or(path);
+    let rest = path
+        .strip_prefix("/admin/imposters/")
+        .or_else(|| path.strip_prefix("/imposters/"))?;
+    match rest.split('/').collect::<Vec<_>>().as_slice() {
+        [port, "spaces"] | [port, "spaces", ""] => port.parse::<u16>().ok(),
+        _ => None,
+    }
+}
+
+/// This imposter's `ContextScope`, resolved from applied config the way every scope-dependent EE
+/// route needs it — shared by [`space_owner`] and the spaces listing (#374) so the two cannot
+/// answer with two different scopes for the same imposter.
+///
+/// `None` when the config could not be read or no longer parses — **the caller decides what that
+/// means**, because the same failure is survivable at one call site and not at the other.
+///
+/// [`space_owner`] folds `None` to `ContextScope::default()` (`Imposter`, the isolating choice) and
+/// serves the read anyway: there it costs one advisory `owner` field on a single flow, and the read
+/// itself is the engine's to answer. The spaces listing cannot do that. There the scope *selects
+/// which set of flows is enumerated at all*, so a wrong guess does not degrade one field — it
+/// returns a confident, complete-looking list of the wrong namespace, or of nothing. A
+/// fleet-scoped imposter whose config read hiccups would answer `{"spaces":[],"partial":false}`,
+/// which the console renders as "this imposter holds no spaces" while it holds several.
+///
+/// That is why this returns `Option` rather than keeping the `unwrap_or_default()` it was extracted
+/// from: a default that is *harmless* as a fallback for one field is a data-path swallow when it
+/// picks the query.
+fn imposter_scope(node: &RaftNode, tenant: &TenantId, port: u16) -> Option<ContextScope> {
+    node.imposter_config(tenant.as_str(), port)
+        .inspect_err(|e| {
+            tracing::warn!(tenant = tenant.as_str(), port, error = %e, "the imposter's context scope could not be resolved");
+        })
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<ImposterConfig>(&json).ok())
+        .and_then(|config| FlowConfig::from_imposter(&config).ok())
+        .map(|flow| flow.scope)
+}
+
 /// The ring member holding this space's flow state (issue #359).
 ///
 /// A *space* is a flow, and a flow is the only thing this cluster assigns an owner to: imposters,
@@ -2115,21 +2197,10 @@ fn space_owner(state: &FrontState, tenant: &TenantId, port: u16, flow_id: &str) 
     if ring.is_empty() {
         return None;
     }
-    let scope: ContextScope = node
-        .imposter_config(tenant.as_str(), port)
-        .inspect_err(|e| {
-            tracing::warn!(tenant = tenant.as_str(), port, error = %e, "space read serves without an owner");
-        })
-        .ok()
-        .flatten()
-        .and_then(|json| serde_json::from_str::<ImposterConfig>(&json).ok())
-        .and_then(|config| FlowConfig::from_imposter(&config).ok())
-        .map(|flow| flow.scope)
-        // The imposter exists (the read is being served) but its config could not be read back or
-        // no longer parses. `ContextScope::default()` is `Imposter`, which is both the documented
-        // default and the isolating one — guessing `Fleet` here would name the owner of a
-        // *different*, shared flow.
-        .unwrap_or_default();
+    // `Imposter` is both the documented default and the isolating one, and #359's contract is that
+    // an owner lookup never fails a read it decorates. Unchanged from before `imposter_scope` was
+    // extracted — see that function's doc for why the listing must NOT make the same fold.
+    let scope = imposter_scope(&node, tenant, port).unwrap_or_default();
     ring.owner(OwnedKey::new(
         KeyClass::FlowKv,
         &scope.scoped_flow_id(Some(port), flow_id),
@@ -2395,7 +2466,13 @@ fn rewrite_space_owner(bytes: &[u8], owner: NodeId) -> Result<Vec<u8>, String> {
     let map = doc
         .as_object_mut()
         .ok_or_else(|| "the space body was not a JSON object".to_owned())?;
-    map.insert("owner".to_owned(), serde_json::json!(owner));
+    // A **string**, for the reason `cluster_api::node_id` gives and this route originally missed
+    // (issue #359 shipped it as a bare number): a raft id is a `u64`, and every id above
+    // 2^53 - 1 silently rounds when a JavaScript reader parses it — the console would render a
+    // neighbouring node's id and send an operator to the wrong node, quietly. The listing added by
+    // issue #374 renders the same field the same way; two spellings of one field across two
+    // adjacent routes is a contract a client has to special-case.
+    map.insert("owner".to_owned(), serde_json::json!(owner.to_string()));
     serde_json::to_vec(&doc).map_err(|e| e.to_string())
 }
 
@@ -2718,6 +2795,12 @@ async fn terminate(
         Terminated::SpaceTeardown(port, flow) => {
             return terminate_space_teardown(&state, &node, req, port, flow, &tenant, principal_id)
                 .await;
+        }
+        // A merge-on-read fan-out has nothing to commit, so it returns here for the same reason
+        // `ReadSavedRequests`/`ReadFleetRequests` do above — none of the `If-Match`/`_rift.script`/
+        // loopback-render machinery below applies to a read.
+        Terminated::SpacesList(port) => {
+            return terminate_spaces_list(&state, &node, port, &tenant).await;
         }
         _ => {}
     }
@@ -3596,6 +3679,105 @@ async fn terminate_space_teardown(
         return refusal_response(reason);
     }
     response
+}
+
+/// `GET /imposters/{port}/spaces` (issue #374): the fleet-wide list of correlated-isolation spaces
+/// this imposter currently holds live flow-KV entries under.
+///
+/// Tenant scoping already ran in `authorize_action`'s ownership gate before `terminate` ever
+/// dispatched here (the same §8.4 404 every other port-addressed route gets — see
+/// `Terminated::SpacesList`'s entry in `addressed_port`), so by the time this runs `port` is known
+/// to belong to `tenant`; there is nothing left here to check for existence.
+///
+/// Unlike [`terminate_space_teardown`], there is no upstream body to proxy and then decorate: the
+/// whole response is built from `FlowNet::fleet_spaces`'s fan-out plus the imposter's resolved
+/// `durability` knob, both read fresh from this node's applied state.
+///
+/// Two refusals are folded into `partial` rather than into a wrong list, because for an enumeration
+/// the scope is not a detail of the answer — it *is* the query:
+///
+/// - **The scope could not be resolved.** Guessing would enumerate the wrong namespace and report
+///   it as complete (see [`imposter_scope`]).
+/// - **The scope is `Fleet`.** `ContextScope::Fleet` renders the prefix `f:`, which carries **no
+///   tenant component**, and one `FlowNet` shard serves every tenant's imposters on this node. So
+///   a `f:` scan matches every fleet-scoped flow in the cluster, whoever created it, and this route
+///   would hand one tenant another tenant's flow ids, entry counts and owning nodes. #359's
+///   single-space read does not have this problem: it answers about an id the caller already
+///   named, whereas this route is precisely what turns "know the id" into "enumerate them".
+///   Filtering by tenant is not available — the `f:` key records none — so this fails closed and
+///   says why, which is the standing rule for a classifier that cannot establish its boundary.
+///   RFC-005 §S1 specifies `fleet` as `FleetAdmin`-gated; that gate does not exist yet (issue
+///   #288), so the refusal cannot be narrowed to non-admins today either.
+async fn terminate_spaces_list(
+    state: &Arc<FrontState>,
+    node: &Arc<RaftNode>,
+    port: u16,
+    tenant: &TenantId,
+) -> Response<FrontBody> {
+    let scope = imposter_scope(node, tenant, port);
+    let unavailable = match scope {
+        None => Some("scope-unresolved"),
+        Some(ContextScope::Fleet) => Some("fleet-scope"),
+        Some(ContextScope::Imposter) => None,
+    };
+
+    // Nothing is enumerated at all when the scope is unusable — not even under the `Imposter`
+    // default. A `f:` imposter scanned as `i{port}:` finds nothing and would look definitively
+    // empty; scanning `f:` for real would leak. Refusing is the only answer that is neither.
+    let (rows, partial) = match unavailable {
+        Some(_) => (Vec::new(), true),
+        None => {
+            let prefix = ContextScope::Imposter.prefix_for(Some(port));
+            state
+                .flow_net
+                .fleet_spaces(port, &prefix, JOURNAL_PEER_BUDGET)
+                .await
+        }
+    };
+
+    let spaces: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "space": row.space,
+                "entryCount": row.entry_count,
+                // A decimal STRING, not a JSON number — `cluster_api::node_id`'s reasoning
+                // verbatim: a `NodeId` is a `u64`, JSON numbers are IEEE-754 doubles wherever the
+                // reader is JavaScript, and an id above 2^53-1 would round silently on the way in.
+                // Unlike `last_applied`/`m_idx`, a node id is an identifier, never a magnitude, so
+                // a string costs nothing and is the only encoding that survives the round trip.
+                "owner": row.owner.to_string(),
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "spaces": spaces,
+        "partial": partial,
+    });
+    // Machine-readable, and distinct from `partial` alone: both say "this is not the whole list",
+    // but only this says the list was never attempted and why. Without it the console can only
+    // render "some node was slow", which for a fleet-scoped imposter would be a plain lie about a
+    // listing that is refused by policy and will not improve on a retry.
+    if let Some(reason) = unavailable {
+        body["unavailable"] = serde_json::json!(reason);
+    }
+    // Only ever inserted, never defaulted: `flow_state_resolved` already folds an unreadable or
+    // unparseable config to `None` rather than a guess (see its own doc), and publishing a default
+    // `durability` here would be indistinguishable from a real one — the wrong-but-quiet answer
+    // the error rules exist to prevent. `spaces`/`partial` are still served either way; a knobs
+    // read failing must not take the listing down with it.
+    if let Some(knobs) = flow_state_resolved(state, tenant, port) {
+        body["durability"] = knobs.durability_json();
+    }
+
+    match serde_json::to_vec(&body) {
+        Ok(bytes) => buffered_response(StatusCode::OK, Bytes::from(bytes), json_content_type())
+            .unwrap_or_else(|response| response),
+        // `serde_json::Value` built entirely from strings/numbers/bools/vecs of the same never
+        // fails to serialize; this arm exists so a future field that *can* fail (arbitrary map
+        // keys, NaN floats) does not silently drop the body instead of answering `500`.
+        Err(e) => internal(&format!("rendering the spaces listing: {e}")),
+    }
 }
 
 /// One terminated mutation: what to commit, and how to answer afterwards.
@@ -5247,6 +5429,11 @@ async fn build_mutation(
         Terminated::SpaceTeardown(_, _) => Err(internal(
             "space teardown is served by terminate_space_teardown, not build_mutation",
         )),
+        // A merge-on-read fan-out, not a `ControlOp` — same shape as the saved-requests reads
+        // above. Diverts to `terminate_spaces_list` in `terminate` before this is ever reached.
+        Terminated::SpacesList(_) => Err(internal(
+            "the spaces listing is served by terminate_spaces_list, not build_mutation",
+        )),
         // A try commits nothing — it is an outbound exchange whose whole result is the response
         // body. Diverts to `terminate_try_imposter` in `terminate`, same shape as the source
         // writes, the tenancy surface and the space teardown above.
@@ -5912,6 +6099,32 @@ mod tests {
         );
     }
 
+    /// Issue #374. The listing is the *one*-segment shape, and is exactly the shape
+    /// `space_read_target` rejects — the two parsers partition the `spaces` routes between them
+    /// rather than overlapping, so neither can shadow the other.
+    #[test]
+    fn spaces_list_target_matches_only_the_bare_listing() {
+        assert_eq!(spaces_list_target("/imposters/4545/spaces"), Some(4545));
+        assert_eq!(
+            spaces_list_target("/admin/imposters/4545/spaces"),
+            Some(4545)
+        );
+        assert_eq!(spaces_list_target("/imposters/4545/spaces?x=1"), Some(4545));
+
+        // A trailing slash is the same resource, not a space whose id is empty.
+        assert_eq!(spaces_list_target("/imposters/4545/spaces/"), Some(4545));
+
+        // Every deeper shape belongs to another route.
+        assert_eq!(spaces_list_target("/imposters/4545/spaces/qa-flow"), None);
+        assert_eq!(
+            spaces_list_target("/imposters/4545/spaces/qa-flow/stubs"),
+            None
+        );
+        assert_eq!(spaces_list_target("/imposters/4545"), None);
+        assert_eq!(spaces_list_target("/imposters"), None);
+        assert_eq!(spaces_list_target("/imposters/notaport/spaces"), None);
+    }
+
     /// Issue #359, and the assertion this feature actually turns on.
     ///
     /// The owner is decided by the flow id **under its context scope**, not by the bare id from the
@@ -5955,12 +6168,29 @@ mod tests {
         let out = rewrite_space_owner(body, 3).expect("a JSON object decorates");
         let doc: serde_json::Value = serde_json::from_slice(&out).expect("still JSON");
 
-        assert_eq!(doc["owner"], serde_json::json!(3));
+        assert_eq!(doc["owner"], serde_json::json!("3"));
         // Every field upstream answered survives — the decoration adds, it does not rewrite.
         assert_eq!(doc["space"], "qa-flow");
         assert_eq!(doc["numberOfRequests"], 7);
         assert!(doc["stubs"].is_array());
         assert!(doc["scenarios"].is_array());
+    }
+
+    /// Issues #359 and #374. A raft id is a `u64`; JSON numbers are read back by JavaScript as
+    /// IEEE-754 doubles, so every id above 2^53 - 1 rounds. `9_007_199_254_740_993` is
+    /// 2^53 + 1 — the smallest id that survives a round trip only as a string, and the value
+    /// `cluster_api`'s own node-id tests pin for the same reason.
+    ///
+    /// This is a regression test in the literal sense: the single-space read shipped this field
+    /// as a bare number in #359, so a fleet whose ids ran that high would have sent an operator
+    /// to a *neighbouring* node with no error anywhere.
+    #[test]
+    fn a_space_owner_above_the_js_safe_integer_survives_the_round_trip() {
+        let body = br#"{"space":"qa-flow","stubs":[],"scenarios":[],"numberOfRequests":0}"#;
+        let out = rewrite_space_owner(body, 9_007_199_254_740_993).expect("decorates");
+        let doc: serde_json::Value = serde_json::from_slice(&out).expect("still JSON");
+
+        assert_eq!(doc["owner"], serde_json::json!("9007199254740993"));
     }
 
     /// Issue #359. A body that is not a JSON object errors rather than inventing a shape; the
@@ -6173,6 +6403,9 @@ mod tests {
             // proxied *inside* `terminate_space_teardown`, but `classify` itself now recognizes
             // the route rather than falling through entirely.
             (Method::DELETE, "/imposters/4545/spaces/flow-1"),
+            // Issue #374: the spaces **listing** terminates too — there is no upstream
+            // `["spaces"]` route to proxy to at all (see `spaces_list_target`'s doc).
+            (Method::GET, "/imposters/4545/spaces"),
         ];
         for (method, path) in terminated {
             assert!(
@@ -6180,6 +6413,14 @@ mod tests {
                 "{method} {path} must terminate"
             );
         }
+
+        // The listing's two-segment shape must not swallow the three-segment single-space read:
+        // `spaces_list_target` requires an absent or empty third segment, so a real flow id keeps
+        // this proxied to the engine exactly as it always has been.
+        assert!(
+            classify(&Method::GET, "/imposters/4545/spaces/qa-flow", None).is_none(),
+            "GET .../spaces/{{flowId}} must stay proxied, not be swept into the listing route"
+        );
 
         // Runtime-state mutations and every read stay proxied: replicating
         // them is #15/#16 territory, and reads must hit the live engine.
@@ -6319,6 +6560,239 @@ mod tests {
 
         // An unparseable port is not this surface's route at all.
         assert!(classify(&Method::DELETE, "/imposters/not-a-port", None).is_none());
+    }
+
+    // ---- Spaces listing (issue #374) ---------------------------------------------------------
+    //
+    // `GET /imposters/{port}/spaces` had zero HTTP-level coverage: everything above pins
+    // `classify`, but nothing drove a real request through `terminate` into
+    // `terminate_spaces_list` and inspected the body it renders. These do, over `test_front_over`
+    // — the same bound-front-plus-reqwest harness `read_fleet_requests`/`read_requests` already
+    // use for the other merge-on-read routes, since GET reads terminate exactly like writes do
+    // (see `classify`'s own routing) and nothing here needs `upstream_admin` dialled.
+    //
+    // Most of these run over `test_front_over` as-is, whose `FlowNet` is deliberately never bound
+    // to `node`'s ring (see its own doc) — exactly right for pinning the envelope (field names,
+    // `unavailable`'s two refusal states, `durability`'s presence/absence), since an unbound net
+    // answers `fleet_spaces` via its own cluster-view-unavailable arm regardless of scope. The one
+    // test below that needs a real row builds its own front over a bound one-voter ring instead
+    // (`test_front_with_bound_flow`), the same way the cursor tests above build their own front
+    // over a caller-supplied journal rather than stretching `test_front_over` to cover every case.
+
+    /// `GET /imposters/{port}/spaces` against the bound front, returned as `(status, body)` —
+    /// no headers needed here, unlike `read_requests`/`read_fleet_requests`, since this route
+    /// carries no cursor.
+    async fn read_spaces(front: &AdminFront, port: u16) -> (u16, String) {
+        let addr = front.local_addr();
+        let response = reqwest::get(format!("http://{addr}/imposters/{port}/spaces"))
+            .await
+            .expect("the front answers");
+        let status = response.status().as_u16();
+        let body = response.text().await.expect("a body");
+        (status, body)
+    }
+
+    /// Commit `port`'s config through Raft so `terminate_spaces_list` has something to resolve a
+    /// scope from. A one-voter `cluster_init` is enough to commit locally — nothing here depends
+    /// on quorum size, only on the config being *applied*, which is what `imposter_scope` and
+    /// `flow_state_resolved` both read from.
+    async fn seed_imposter(node: &Arc<RaftNode>, port: u16, flow_state: serde_json::Value) {
+        node.put_imposter(
+            serde_json::from_value(serde_json::json!({
+                "port": port,
+                "protocol": "http",
+                "_rift": { "flowState": flow_state },
+            }))
+            .expect("imposter config parses"),
+        )
+        .await
+        .expect("commit the imposter");
+    }
+
+    /// A port with no applied config at all resolves no scope (`imposter_config` reads
+    /// `Ok(None)`, which `imposter_scope` flattens the identical way a read error would — see
+    /// that function's own doc on why the two are not worth telling apart to the caller). This
+    /// pins two things at once because they share the one cause: `unavailable` names it, and
+    /// `durability` is omitted rather than defaulted (`flow_state_resolved` hits the same
+    /// `Ok(None)` and returns early).
+    #[tokio::test]
+    async fn spaces_list_with_no_imposter_is_scope_unresolved_and_omits_durability() {
+        let (front, _node, _journal, _dir) =
+            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
+
+        let (status, body) = read_spaces(&front, 9999).await;
+
+        assert_eq!(status, 200, "body: {body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(doc["unavailable"], "scope-unresolved", "{body}");
+        assert_eq!(doc["spaces"], serde_json::json!([]), "{body}");
+        assert_eq!(doc["partial"], true, "{body}");
+        assert!(
+            doc.get("durability").is_none(),
+            "an unresolvable scope means the knobs could not be read either; durability must be \
+             omitted, never defaulted to \"async\": {body}"
+        );
+    }
+
+    /// `contextScope: "fleet"` is refused for the policy reason `terminate_spaces_list`'s doc
+    /// gives (the `f:` namespace carries no tenant component) — distinct from the unresolved
+    /// case above, and the body must say which.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spaces_list_for_a_fleet_scoped_imposter_is_unavailable_fleet_scope() {
+        let (front, node, _journal, _dir) =
+            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
+        node.cluster_init()
+            .await
+            .expect("single-voter cluster init");
+        seed_imposter(&node, 4545, serde_json::json!({ "contextScope": "fleet" })).await;
+
+        let (status, body) = read_spaces(&front, 4545).await;
+
+        assert_eq!(status, 200, "body: {body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(doc["unavailable"], "fleet-scope", "{body}");
+        assert_eq!(doc["spaces"], serde_json::json!([]), "{body}");
+        assert_eq!(doc["partial"], true, "{body}");
+    }
+
+    /// The ordinary path: a resolvable, imposter-scoped config carries no `unavailable` key at
+    /// all — its absence is itself the signal the console keys the generic partial banner off,
+    /// so a regression that started stamping it unconditionally would silently break that gate.
+    /// Also pins the envelope's field names (`spaces`/`partial`/`durability`); a row's own field
+    /// names (`space`/`entryCount`/`owner`) are pinned by
+    /// `spaces_list_row_shape_and_content_reflect_a_real_write` below, which is the one test in
+    /// this group that actually has a row to inspect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spaces_list_for_an_ordinary_imposter_carries_no_unavailable_key() {
+        let (front, node, _journal, _dir) =
+            test_front_over(rift_cluster::stores::ClusterJournal::new(1)).await;
+        node.cluster_init()
+            .await
+            .expect("single-voter cluster init");
+        // Default scope: `contextScope` absent entirely, exactly like an imposter nobody has
+        // touched `_rift.flowState` on.
+        seed_imposter(&node, 4545, serde_json::json!({})).await;
+
+        let (status, body) = read_spaces(&front, 4545).await;
+
+        assert_eq!(status, 200, "body: {body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        let obj = doc.as_object().expect("an object");
+        assert!(
+            !obj.contains_key("unavailable"),
+            "a resolvable imposter scope must not carry the refusal field: {body}"
+        );
+        assert!(obj.contains_key("spaces"), "{body}");
+        assert!(obj.contains_key("partial"), "{body}");
+        assert_eq!(
+            doc["durability"],
+            serde_json::json!({ "value": "async", "source": "default" }),
+            "the knobs are readable here, so durability must publish the resolved value, not be \
+             omitted: {body}"
+        );
+        // No entries were ever written into this harness's (deliberately unbound) `FlowNet`, so
+        // the list itself is empty here — `spaces_list_row_shape_and_content_reflect_a_real_write`
+        // below is the one test in this group with a bound ring and a real row to inspect.
+        assert_eq!(doc["spaces"], serde_json::json!([]), "{body}");
+    }
+
+    /// [`test_front_over`], but with the flow subsystem actually bound to `node`'s own (one-voter)
+    /// ring rather than left detached — the one thing that harness's own doc says it does not do.
+    /// Needed here, and only here, because a row in the spaces listing requires `fleet_spaces` to
+    /// resolve a real owner rather than answer through its cluster-view-unavailable arm.
+    async fn test_front_with_bound_flow()
+    -> (AdminFront, Arc<RaftNode>, Arc<FlowNet>, tempfile::TempDir) {
+        let (node, dir) = test_node().await;
+        node.cluster_init()
+            .await
+            .expect("single-voter cluster init");
+        let net = FlowNet::new(rift_cluster::stores::FlowShard::in_memory(
+            rift_cluster::stores::ShardConfig::default(),
+        ));
+        net.bind(
+            &node,
+            rift_cluster::stores::FlowBindConfig {
+                bridge: rift_cluster::BridgeConfig::for_workers(1),
+                // Effectively off: this test writes directly through the owner and reads back
+                // immediately, so the anti-entropy loop has nothing to do and no reason to run
+                // mid-test.
+                anti_entropy_interval: Duration::from_secs(3600),
+            },
+        )
+        .expect("bind flow net");
+        let front = bind(
+            FrontConfig {
+                public_addr: "127.0.0.1:0".to_owned(),
+                upstream_admin: "127.0.0.1:1".parse().expect("addr"),
+                api_key: None,
+                legacy_key_is_fleet_admin: true,
+                allow_injection: false,
+                scripts_dir: None,
+                barrier: crate::cli::WriteBarrier::None,
+                barrier_timeout: Duration::from_secs(1),
+                admin_async: false,
+                export_status: None,
+                readiness: Arc::new(crate::readiness::Readiness::awaiting([])),
+                puller: Arc::new(SourcePuller::new(
+                    rift_cluster_base::seams::SourceRegistry::default(),
+                )),
+                journal_net: JournalNet::new(rift_cluster::stores::ClusterJournal::new(1)),
+                flow_net: Arc::clone(&net),
+                fleet_journal_port_cap: rift_cluster::stores::DEFAULT_FLEET_JOURNAL_PORT_CAP,
+            },
+            &node,
+        )
+        .await
+        .expect("front binds");
+        (front, node, net, dir)
+    }
+
+    /// The row shape `terminate_spaces_list` renders for a real space: `space`/`entryCount`/
+    /// `owner` field names, `owner` as the decimal-string encoding the doc on that mapping
+    /// explains (never a JSON number — a `NodeId` above 2^53-1 would round on the wire), and
+    /// `partial: false` because the one-voter ring has no peer to time out on. The filtering
+    /// logic that decides *which* entries are "this node's own" is `owned_spaces`'s pure unit
+    /// coverage in `stores/flow.rs`; this test only owns what the HTTP envelope does with the row
+    /// that logic hands back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spaces_list_row_shape_and_content_reflect_a_real_write() {
+        use rift_cluster_base::seams::FlowStoreProvider as _;
+
+        let (front, node, net, _dir) = test_front_with_bound_flow().await;
+        seed_imposter(&node, 4545, serde_json::json!({})).await;
+
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+        }))
+        .expect("config parses");
+        let store = rift_cluster::stores::ClusteredFlowStoreProvider::new(Arc::clone(&net))
+            .provide(&config)
+            .expect("the clustered provider always provides");
+        tokio::task::spawn_blocking(move || {
+            store.set("checkout", "step", serde_json::json!("paid"))
+        })
+        .await
+        .expect("blocking op")
+        .expect("write through the owner");
+
+        let (status, body) = read_spaces(&front, 4545).await;
+
+        assert_eq!(status, 200, "body: {body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        let rows = doc["spaces"].as_array().expect("a spaces array");
+        assert_eq!(rows.len(), 1, "exactly the one space written: {body}");
+        assert_eq!(rows[0]["space"], "checkout", "{body}");
+        assert_eq!(rows[0]["entryCount"], 1, "{body}");
+        assert_eq!(
+            rows[0]["owner"],
+            serde_json::json!(node.id().to_string()),
+            "the owner must be the decimal-string NodeId, not a bare number: {body}"
+        );
+        assert_eq!(
+            doc["partial"], false,
+            "a one-voter ring has no peer to fail; this answer is complete: {body}"
+        );
     }
 
     /// Issue #224: `?match=` must keep `terminate`'s scoped-vs-unscoped dispatch on the

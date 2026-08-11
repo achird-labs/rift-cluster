@@ -32,6 +32,7 @@ import {
   scenariosResetPath,
   spacePath,
   spaceStubsPath,
+  spacesPath,
   stubByIdPath,
   stubsPath,
   tenantPath,
@@ -49,10 +50,12 @@ import {
 import {
   type FlowStateRead,
   type ScenarioState,
+  type SpaceListState,
   type SpaceState,
   readFlowStateEntry,
   readScenarios,
   readSpace,
+  readSpaceList,
 } from "../features/scenarios/space.ts";
 import { type Route, normalizeTable } from "../features/routes/order.ts";
 import { type FleetView, fleetView } from "./fleetView.ts";
@@ -983,9 +986,11 @@ export function useClearRequests(): UseMutationResult<CommitOutcome, Error, { po
  * Every imposter's default flow, read together.
  *
  * The flow-state screen is a fleet-wide view in the design — flows listed across imposters, with the
- * imposter as a prefix on the flow id rather than a choice to make first. Nothing enumerates flows
- * (#374: a space is created implicitly by whatever id a request carried), so what is actually
- * readable is each imposter's *default* flow, and that is what this fans out for.
+ * imposter as a prefix on the flow id rather than a choice to make first. This still fans out over
+ * each imposter's *default* flow rather than enumerating every space across the fleet: `listSpaces`
+ * (#374, see `useSpaces`) answers "which spaces does one imposter hold", not "every flow on every
+ * imposter", and turning N single-imposter listings into one fleet-wide table is not what this hook
+ * does today.
  *
  * A fan-out, and worth saying why it is acceptable here when it is not for the request journal: a
  * flow list is a **set**, not a stream. The journal's fan-out was refused because ordering N
@@ -1105,6 +1110,32 @@ export function useSpace(port: number, flowId: string | null): UseQueryResult<Sp
       }
     },
     enabled: flowId !== null,
+    ...POLLED,
+  });
+}
+
+/**
+ * Every correlated-isolation space this imposter currently holds, fleet-wide (#374).
+ *
+ * Unlike `useSpace`, this needs no flow id: `listSpaces` is the union of every ring member's own
+ * owned share, answered entirely from applied cluster state, so it is readable the moment a port is
+ * known. Polled like the rest of this screen — a space list changes as traffic resolves new flow
+ * ids and existing ones pick up entries, the same reasoning `useScenarios` and `useSpace` follow.
+ */
+export function useSpaces(port: number): UseQueryResult<SpaceListState> {
+  const { tenant } = useSession();
+  return useQuery({
+    queryKey: key(["spaces", port], tenant),
+    queryFn: async (): Promise<SpaceListState> => {
+      try {
+        return readSpaceList(await apiGet<unknown>(spacesPath(port), { tenant }));
+      } catch (error) {
+        return {
+          kind: "unknown",
+          reason: error instanceof Error ? error.message : "this node could not be reached",
+        };
+      }
+    },
     ...POLLED,
   });
 }

@@ -322,6 +322,7 @@ mod parity {
             Terminated::SpaceTeardown(_, _) => {
                 RouteKey::new(&Method::DELETE, "/imposters/{port}/spaces/{flowId}")
             }
+            Terminated::SpacesList(_) => RouteKey::new(&Method::GET, "/imposters/{port}/spaces"),
             Terminated::TryImposter(_) => {
                 RouteKey::new(&Method::POST, "/admin/imposters/{port}/try")
             }
@@ -413,6 +414,7 @@ mod parity {
             Terminated::ClearSavedRequests(4545),
             Terminated::ClearSavedProxyResponses(4545),
             Terminated::SpaceTeardown(4545, "flow-1".to_owned()),
+            Terminated::SpacesList(4545),
             Terminated::TryImposter(4545),
             Terminated::PutRoutes,
             Terminated::DeleteRoute("svc".to_owned()),
