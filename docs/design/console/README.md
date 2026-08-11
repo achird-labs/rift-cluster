@@ -191,6 +191,87 @@ This section exists because the mockup is still the artifact people design from,
 signals that these three elements are wrong. If you are porting a screen from it, this is the one
 place that says so.
 
+## The mockup's `Membership` panel is wrong — do not rebuild it
+
+The fleet screen's **`Membership`** panel, with its **Add learner** and **Remove voter** actions, has
+been **removed** rather than implemented. It was not a missing endpoint. It is not coming.
+
+**Membership changes only ever happen through a node's own lifecycle**: a node is started and
+attempts to join, or a node leaves. The console is deliberately neither an admission nor an eviction
+vector.
+
+Why the distinction matters, rather than being a matter of taste:
+
+- Admission today is initiated by the **joining node**, over the signed cluster port (`join_via` →
+  `/internal/v1/cluster/join` → `admit`). What can enter the fleet is therefore bounded by what an
+  operator chose to *start*.
+- An admin-API "add learner" taking an advertise address would be a second and weaker entry point —
+  operator-supplied input written straight into the replicated membership log, which is the one log
+  where a bad address is removable only by another membership change (#68).
+- "Remove voter" is the milder half, but it belongs to the same lifecycle: a node leaves by leaving.
+  The voter floor that makes departure safe (#69, #71) is enforced by the node and the leader, not
+  by whoever is looking at a console.
+
+Note that the *facts* [#366](https://github.com/achird-labs/rift-cluster/issues/366) asserted were
+all correct — the machinery is internal-only, there really is no admin route, the floor really is
+enforced. It was wrong about what **should** exist, which is why a premise check that only verifies
+facts will wave this class of issue through. Treat "the console cannot do X to the fleet" as a
+question about whether it *should*, not only whether it *can*.
+
+The read-only fleet surface is unaffected: `/_fleet/members` and the `Members` panel continue to
+show membership, because observing it and changing it are different powers.
+
+## The mockup's `Snapshots` panel is wrong — do not rebuild it
+
+Same ruling, same reason. **Trigger snapshot** and **Compact log** have been **removed** rather than
+implemented. Snapshotting and log compaction are the cluster's own business, and an operator button
+for them is not an operator's to press — not even a fleet admin's.
+
+Unlike the Membership panel, this one was not merely unwise: it was **redundant**. The fleet already
+does both, unprompted. `RaftNode::raft_config` (`crates/rift-cluster/src/raft/node.rs`) builds
+openraft's `Config::default()` and overrides only the election and heartbeat timings, so a shipped
+node runs with:
+
+- `snapshot_policy = LogsSinceLast(5000)` — a snapshot every 5000 entries since the last, automatic;
+- `max_in_snapshot_log_to_keep = 1000` — logs a snapshot already covers are purged automatically.
+
+The single override is `NodeConfig::snapshot_log_entries`, reachable through a **hidden** flag —
+`--cluster-snapshot-log-entries`, env `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES` — that exists so the
+container chaos tier can exercise the snapshot wire path at all (#183). It is `hide = true`, unset
+on every shipped path, and its own doc says a fleet that sets it "is trading away log retention for
+nothing". Note that setting it does **not** reach a manual posture either: `Some(n)` means
+`LogsSinceLast(n)`, still automatic, and it additionally forces `max_in_snapshot_log_to_keep = 0`.
+Both paths are covered — `a_shipped_fleet_snapshots_and_purges_without_being_asked` for the default,
+`the_snapshot_knob_sets_the_policy_and_purges_immediately` for the override.
+
+The first of those is deliberately a *different* claim from the older
+`raft_config_default_leaves_the_snapshot_knobs_untouched`: that one says "we do not override
+openraft", which would still pass if a future openraft defaulted to `SnapshotPolicy::Never` — a mode
+that waits for a manual trigger nothing here calls, letting the log grow without bound.
+
+Worth noting so it is not re-litigated: openraft *does* expose both operations, and they *are*
+distinct (`trigger().snapshot()` and `trigger().purge_log(upto)`). The panel was buildable. It is
+declined anyway.
+
+The panel's third of the `fleet-ops` row, **`Durability & write path`**, survives — it is the only
+one of the three that asked to *read* rather than to *act*, and reading back what a node is
+configured to do changes nothing. Tracked as
+[#394](https://github.com/achird-labs/rift-cluster/issues/394).
+
+## The pattern across all three corrections
+
+`OWNER` (#359), `Membership` (#366) and `Snapshots` (#365) were each specified against machinery
+that was described **accurately**. Every API named exists; every constraint cited is real. A design
+review that checks whether the facts are right approves all three.
+
+The question that catches them is different, and it is worth asking of every panel in this mockup
+before porting it:
+
+> Not "can the console do this?" but "**should** it?"
+
+A design document can be internally coherent, correct about every API it names, and still describe a
+product that should not exist.
+
 ## What this prototype is not
 
 - Not the component architecture. It is one file of vanilla JS; the real thing is React + TanStack

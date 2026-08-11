@@ -3332,6 +3332,38 @@ mod tests {
         );
     }
 
+    /// A shipped fleet maintains its own log without being asked (#365).
+    ///
+    /// The console has no snapshot or compaction control, and it never will: that is the cluster's
+    /// own business. The claim only holds while the effective default is an *automatic* policy.
+    /// `SnapshotPolicy::Never` would make openraft wait for a manual
+    /// `trigger().snapshot()` — which nothing in this codebase calls — and the log would grow
+    /// without bound while no follower could ever be caught up by `install_snapshot`.
+    ///
+    /// Deliberately not the same claim as
+    /// `raft_config_default_leaves_the_snapshot_knobs_untouched`, which pins "we do not override
+    /// openraft" and would keep passing if a future openraft shipped `Never` as *its* default.
+    /// This pins the property an operator actually depends on.
+    #[test]
+    fn a_shipped_fleet_snapshots_and_purges_without_being_asked() {
+        let ours = RaftNode::raft_config(None).expect("default config validates");
+        match ours.snapshot_policy {
+            SnapshotPolicy::LogsSinceLast(threshold) => assert!(
+                threshold > 0,
+                "a zero threshold would rebuild a snapshot on every entry"
+            ),
+            SnapshotPolicy::Never => panic!(
+                "the shipped default must snapshot on its own — nothing calls trigger().snapshot(), \
+                 so `Never` means the log is never compacted"
+            ),
+        }
+        assert!(
+            ours.max_in_snapshot_log_to_keep < u64::MAX,
+            "logs a snapshot already covers must eventually be purged, or snapshotting buys \
+             nothing back"
+        );
+    }
+
     /// …and the knob sets **both** halves. Setting only the policy is the trap issue #183 exists to
     /// remove: snapshots would be built but no follower would ever need one over the wire, because
     /// the log it is missing would still be there to replicate.
