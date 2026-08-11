@@ -6,6 +6,7 @@ import {
   readFlowStateEntry,
   readScenarios,
   readSpace,
+  readSpaceList,
 } from "./space.ts";
 
 describe("readScenarios — unknown is not empty", () => {
@@ -79,6 +80,102 @@ describe("readSpace", () => {
     expect(state.kind).toBe("space");
     if (state.kind !== "space") throw new Error("unreachable");
     expect(hasRequestCount(state.space)).toBe(false);
+  });
+});
+
+describe("readSpaceList", () => {
+  it("reads a well-formed listing, with durability and rows", () => {
+    const state = readSpaceList({
+      durability: { value: "sync", source: "set" },
+      spaces: [{ space: "checkout-1", entryCount: 3, owner: "7" }],
+      partial: false,
+    });
+    expect(state).toEqual({
+      kind: "list",
+      list: {
+        durability: { value: "sync", source: "set" },
+        spaces: [{ space: "checkout-1", entryCount: 3, owner: "7" }],
+        partial: false,
+        unavailable: null,
+      },
+    });
+  });
+
+  it("reads the two unavailable reasons, both forcing spaces empty and partial true in practice", () => {
+    for (const reason of ["fleet-scope", "scope-unresolved"] as const) {
+      const state = readSpaceList({ spaces: [], partial: true, unavailable: reason });
+      expect(state).toEqual({
+        kind: "list",
+        list: { durability: null, spaces: [], partial: true, unavailable: reason },
+      });
+    }
+  });
+
+  it("reads an absent unavailable field as null, not as a reason the server never gave", () => {
+    const state = readSpaceList({ spaces: [], partial: false });
+    expect(state.kind).toBe("list");
+    if (state.kind !== "list") throw new Error("unreachable");
+    expect(state.list.unavailable).toBeNull();
+  });
+
+  it("reads a body that is not an object as unknown", () => {
+    for (const body of [null, undefined, "nope", 42, []]) {
+      expect([body, readSpaceList(body).kind]).toEqual([body, "unknown"]);
+    }
+  });
+
+  it("reads a body whose spaces is not an array as unknown", () => {
+    for (const body of [{ partial: false }, { spaces: {}, partial: false }, { spaces: "x", partial: false }]) {
+      expect([body, readSpaceList(body).kind]).toEqual([body, "unknown"]);
+    }
+  });
+
+  it("reads a body whose partial is not a boolean as unknown", () => {
+    for (const body of [
+      { spaces: [] },
+      { spaces: [], partial: "false" },
+      { spaces: [], partial: 0 },
+      { spaces: [], partial: null },
+    ]) {
+      expect([body, readSpaceList(body).kind]).toEqual([body, "unknown"]);
+    }
+  });
+
+  it("reads a row missing a required field as unknown, never as a partial row", () => {
+    for (const row of [
+      null,
+      "nope",
+      {},
+      { entryCount: 1, owner: "1" },
+      { space: "s", owner: "1" },
+      { space: "s", entryCount: 1 },
+      { space: 7, entryCount: 1, owner: "1" },
+      { space: "s", entryCount: "1", owner: "1" },
+      { space: "s", entryCount: 1, owner: 1 },
+    ]) {
+      const body = { spaces: [row], partial: false };
+      expect([row, readSpaceList(body).kind]).toEqual([row, "unknown"]);
+    }
+  });
+
+  it("reads a malformed unavailable as unknown rather than silently dropping it to null", () => {
+    // A stray reason this console does not recognise is exactly the case `durability`'s own
+    // value/source check already refuses elsewhere in this module — an unrecognised enum member
+    // must not fall back to "no reason given", which would read as a generic partial banner
+    // instead of the unrecognised body it actually is.
+    for (const unavailable of ["not-a-real-reason", 7, {}, [], true]) {
+      const body = { spaces: [], partial: true, unavailable };
+      expect([unavailable, readSpaceList(body).kind]).toEqual([unavailable, "unknown"]);
+    }
+  });
+
+  it("reads a malformed durability knob as null rather than as a guessed default", () => {
+    for (const durability of ["async", { value: "async" }, { value: "paranoid", source: "set" }, 7]) {
+      const state = readSpaceList({ spaces: [], partial: false, durability });
+      expect(state.kind).toBe("list");
+      if (state.kind !== "list") throw new Error("unreachable");
+      expect([durability, state.list.durability]).toEqual([durability, null]);
+    }
   });
 });
 

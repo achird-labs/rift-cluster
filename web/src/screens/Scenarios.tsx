@@ -13,6 +13,7 @@ import {
   useSetFlowStateEntry,
   useSetScenarioState,
   useSpace,
+  useSpaces,
   useTeardownSpace,
 } from "../app/queries.ts";
 import { useSession } from "../app/session.tsx";
@@ -20,12 +21,14 @@ import { useHashQuery } from "../app/routing.ts";
 import { Card, Confirm, Empty, ErrorNote, Ident, Truncated, UNNAMED } from "../components/primitives.tsx";
 import { shadowingStubIndex } from "../features/requests/stubFromRequest.ts";
 import { scenarioDefinitions } from "../features/scenarios/definitions.ts";
-import { Pending, PendingPanel } from "../components/pending.tsx";
+import { Pending } from "../components/pending.tsx";
 import {
   ABSENT_ENTRY_CAVEAT,
   SPACE_STUB_CAVEAT,
   type ScenarioEntry,
   type Space,
+  type SpaceDurability,
+  type SpaceListEntry,
   hasRequestCount,
   isEmptySpace,
 } from "../features/scenarios/space.ts";
@@ -127,7 +130,7 @@ function ForImposter({ port, flow }: { port: number; flow: string | null }): Rea
       {tab === "spaces" ? (
         <>
           <SpacePanel port={port} flowId={resolvedFlow} />
-          <ActiveSpaces />
+          <ActiveSpaces port={port} />
         </>
       ) : null}
 
@@ -903,10 +906,11 @@ function FlowStateResult({
  * a worse first screen and the wrong shape — the question is "what is the fleet's flow state", and
  * an operator who wanted one imposter can still click into it.
  *
- * What is listed is each imposter's DEFAULT flow. Nothing enumerates the others: a space is created
- * implicitly by whatever flow id a request carried, so there is no route that lists them (#374).
- * That limit is stated on the screen rather than left to be discovered — a table that silently
- * showed one flow per imposter would read as "these are the flows".
+ * What is listed here is still each imposter's DEFAULT flow, not every flow across the fleet: this
+ * table is a fan-out over `useAllScenarios`, one read per imposter, and turning that into a
+ * fleet-wide table of every space is a different aggregation this screen does not do. Issue #374
+ * did add a per-imposter listing (`ActiveSpaces`, the "Spaces" tab on one imposter's own screen) —
+ * that limit is stated there, next to the table it actually applies to, rather than repeated here.
  */
 function AllFlows(): ReactNode {
   const imposters = useImposters();
@@ -924,7 +928,8 @@ function AllFlows(): ReactNode {
         <h1>Scenarios &amp; state</h1>
         <p className="scope-label">
           Every imposter&rsquo;s default flow. A flow is created implicitly by whatever id a request
-          carried, and no route lists them, so the others are reachable only by naming one.
+          carried, so the others are reachable only by naming one here — or by opening an imposter
+          and its own &ldquo;Spaces&rdquo; tab, which lists every space that imposter holds.
         </p>
       </header>
 
@@ -1183,19 +1188,195 @@ function OwnershipRules(): ReactNode {
 }
 
 /**
- * The spaces this imposter actually has.
+ * The spaces this imposter actually has, fleet-wide (#374).
  *
- * Not readable: `GET .../spaces/{flowId}` reads one space by id and nothing lists them. A space is
- * created implicitly by whatever flow id a request carried, so "which exist" is exactly the
- * question an operator arrives with — and today they infer it from the request log.
+ * `listSpaces` is EE-only and answered entirely from applied cluster state — the union of every
+ * ring member's own owned share of live flow-KV entries, duplicate-free by construction and
+ * complete regardless which node answers. `durability` is a per-*imposter* knob, not a per-space
+ * setting, so it renders once above the table rather than as a column that would imply spaces can
+ * each carry their own — they cannot; there is nowhere on the imposter to set that per flow.
  */
-function ActiveSpaces(): ReactNode {
+function ActiveSpaces({ port }: { port: number }): ReactNode {
+  const spaces = useSpaces(port);
+
   return (
-    <Card title="Active spaces">
-      <PendingPanel
-        issue={374}
-        reason="No endpoint lists an imposter's spaces — one can be read by id, but they are created implicitly by whatever flow id a request carried, so there is nothing to enumerate them."
-      />
+    <Card title="Active spaces" testId="active-spaces-card">
+      {spaces.isPending ? <p className="muted">Reading…</p> : null}
+
+      {spaces.data?.kind === "unknown" ? (
+        /*
+         * Not an empty list. A listing that could not be read says nothing about whether this
+         * imposter holds any spaces — rendering it as none would be the exact defect class
+         * #365/#366/#368 already hit: a zero standing in for "cannot tell you".
+         */
+        <div className="banner crit" data-testid="active-spaces-unknown" role="alert">
+          <span className="b-glyph" aria-hidden="true">
+            ■
+          </span>
+          <div>
+            <strong>This listing is unknown, not empty.</strong>
+            <p>
+              It could not be read, so nothing here says which spaces this imposter holds.{" "}
+              {spaces.data.reason}
+            </p>
+          </div>
+        </div>
+      ) : null}
+
+      {spaces.data?.kind === "list" ? (
+        <>
+          <dl className="detail">
+            <div className="kv">
+              <dt>flowState.durability</dt>
+              <dd data-testid="active-spaces-durability">
+                <DurabilityKnob durability={spaces.data.list.durability} />
+              </dd>
+            </div>
+          </dl>
+
+          {spaces.data.list.unavailable === "fleet-scope" ? (
+            /*
+             * A policy refusal, not a degraded read — distinct from the generic partial banner
+             * below because the fix and the framing are both different: this one never improves on
+             * a retry, so telling an operator to wait or retry would be a false promise.
+             */
+            <div className="banner info" data-testid="active-spaces-fleet-scope" role="status">
+              <span className="b-glyph" aria-hidden="true">
+                &#9670;
+              </span>
+              <div>
+                <strong>This imposter&rsquo;s spaces cannot be listed.</strong>
+                <p>
+                  This imposter uses <code>contextScope: &quot;fleet&quot;</code>, whose spaces are
+                  shared cluster-wide and carry no tenant marker, so they cannot be enumerated
+                  per-imposter. This is not a failure and will not change on a retry. Individual
+                  spaces remain readable by id.
+                </p>
+              </div>
+            </div>
+          ) : spaces.data.list.unavailable === "scope-unresolved" ? (
+            /*
+             * The other refusal reason, and unlike the one above this is transient: the node just
+             * could not read the imposter's own config, which a retry (or the node catching up)
+             * may resolve.
+             */
+            <div className="banner warn" data-testid="active-spaces-scope-unresolved" role="status">
+              <span className="b-glyph" aria-hidden="true">
+                &#9650;
+              </span>
+              <div>
+                <strong>This imposter&rsquo;s spaces cannot be listed right now.</strong>
+                <p>
+                  This node could not read the imposter&rsquo;s flow-state configuration, so which
+                  spaces it holds is unknown. This is transient — a retry may succeed.
+                </p>
+              </div>
+            </div>
+          ) : spaces.data.list.partial ? (
+            /*
+             * The rule this panel exists to enforce: `spaces: []` here is not "this imposter has no
+             * spaces", it is "the fleet could not be asked in time" — the same shape as a genuinely
+             * empty read, and not the same fact. Rendered whether or not any row came back, because
+             * a partial read that did return some rows is still not the complete list.
+             */
+            <div className="banner warn" data-testid="active-spaces-partial" role="status">
+              <span className="b-glyph" aria-hidden="true">
+                &#9650;
+              </span>
+              <div>
+                <strong>This is not the complete list.</strong>
+                <p>
+                  At least one ring member could not be reached in time, or this node&rsquo;s own
+                  cluster view was unavailable. The spaces below are only the ones that answered —
+                  this imposter may hold others that are not shown here.
+                </p>
+              </div>
+            </div>
+          ) : null}
+
+          {spaces.data.list.spaces.length === 0 && !spaces.data.list.partial ? (
+            <Empty
+              testId="active-spaces-empty"
+              title="No spaces"
+              body="This imposter holds no correlated-isolation spaces right now. One appears the moment a request names a flow id that has not been seen before."
+            />
+          ) : null}
+
+          {spaces.data.list.spaces.length > 0 ? (
+            <div className="scroll-x">
+              <table className="dense" data-testid="active-spaces-table">
+                <thead>
+                  <tr>
+                    <th>Space</th>
+                    <th style={{ width: "14ch" }}>Entries</th>
+                    <th style={{ width: "16ch" }}>Owner</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {spaces.data.list.spaces.map((row) => (
+                    <ActiveSpaceRow key={row.space} row={row} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </>
+      ) : null}
     </Card>
+  );
+}
+
+function ActiveSpaceRow({ row }: { row: SpaceListEntry }): ReactNode {
+  return (
+    <tr data-testid={`active-space-row-${row.space}`}>
+      <td>
+        <Truncated value={row.space} />
+      </td>
+      <td data-testid={`active-space-entries-${row.space}`}>{row.entryCount}</td>
+      <td data-testid={`active-space-owner-${row.space}`}>
+        {/* A decimal string, rendered as-is — never through `Number(...)`, which would silently
+            round a raft id above 2^53-1 and name a neighbouring node (same reasoning as `Space.owner`
+            on the single-space read). */}
+        <Ident>{row.owner}</Ident>
+      </td>
+    </tr>
+  );
+}
+
+/**
+ * The imposter's resolved `flowState.durability` knob, or the honest "could not be read" when the
+ * server omitted it — never the compiled-in default standing in for a read that failed.
+ *
+ * Same shape and rendering as `ImposterDetail.tsx`'s `Knob`, duplicated rather than shared: that one
+ * is scoped to the `_rift` block's `ResolvedKnob`, which is always present once the block itself
+ * reads; this renders the same `{value, source}` pair off a response where the whole knob can be
+ * absent, so the two cannot share one prop type without one of them lying about optionality.
+ */
+function DurabilityKnob({ durability }: { durability: SpaceDurability | null }): ReactNode {
+  if (durability === null) {
+    return (
+      <span
+        className="muted"
+        title="This node's knobs could not be read, so nothing here is a default."
+      >
+        unknown
+      </span>
+    );
+  }
+  const inherited = durability.source === "default";
+  return (
+    <>
+      <Ident>{durability.value}</Ident>{" "}
+      <span
+        className={inherited ? "badge muted" : "badge"}
+        title={
+          inherited
+            ? "Inherited: this imposter does not set the key, so the built-in default applies."
+            : "Set on this imposter: the key is on its document, so changing the default will not change this."
+        }
+      >
+        {inherited ? "inherited" : "set here"}
+      </span>
+    </>
   );
 }

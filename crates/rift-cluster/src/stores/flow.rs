@@ -91,6 +91,7 @@ const GET_PATH: &str = "/_cluster/flow/get";
 const REPLICATE_PATH: &str = "/_cluster/flow/replicate";
 const SYNC_PATH: &str = "/_cluster/flow/sync";
 const COUNTS_PATH: &str = "/_cluster/flow/counts";
+const SPACES_PATH: &str = "/_cluster/flow/spaces";
 
 /// How often a replica pulls the flows it holds from their owners (#16's
 /// anti-entropy interval). A missed push heals within one tick. Deliberately
@@ -301,6 +302,51 @@ struct CountsReply {
     /// through one is a decode failure waiting to happen.
     slots: Vec<(u16, u64)>,
 }
+
+/// `POST /_cluster/flow/spaces` — this node's OWNED spaces under `prefix` (#374): the per-row
+/// counterpart to [`CountsReq`]'s per-port totals, needed because the admin listing must name each
+/// space and its own live entry count, not just sum them.
+#[derive(Debug, Serialize, Deserialize)]
+struct SpacesReq {
+    /// Diagnostic only — the same role `CountsReq::ports` plays in its own handler's log lines.
+    /// `prefix` is what [`owned_spaces`] actually filters on; a fleet-scoped (`f:`) prefix names no
+    /// port at all, so `port` cannot substitute for it.
+    port: u16,
+    prefix: String,
+    /// [`CountsReq::m_idx`]'s fencing token, reused verbatim: a peer whose ring has since diverged
+    /// from the caller's must refuse rather than answer under a view nobody asked for.
+    m_idx: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SpacesReply {
+    /// `(unscoped space id, live entry count)` — [`owned_spaces`]'s own return shape, carried
+    /// verbatim. No [`NodeId`] rides along: the caller already knows which peer answered from the
+    /// connection that carried the reply, and stamping it here too would be a second copy of that
+    /// fact, free to disagree with the first — see [`merge_space_rows`]'s doc for why that
+    /// disagreement is exactly the bug this design avoids by construction.
+    rows: Vec<(String, u64)>,
+}
+
+/// One correlated-isolation space (#374): its unscoped id, how many live flow-KV entries it
+/// currently holds, and which ring member owns it.
+///
+/// `owner` is not `Option`: a row is only ever produced by [`merge_space_rows`] stamping the node
+/// that actually reported it (this node for `local`, that peer for a peer's own share), so the
+/// owner is known by construction rather than looked up separately and possibly disagreeing.
+#[derive(Debug, Clone)]
+pub struct SpaceRow {
+    pub space: String,
+    pub entry_count: u64,
+    pub owner: NodeId,
+}
+
+/// One peer's answer to a spaces fan-out, paired with which peer it came from: `None` means "did
+/// not answer" (an error, a panicked task, or one still outstanding when the budget expired) —
+/// [`SpacesReply::rows`]'s decoded shape, carried alongside the peer id so [`merge_space_rows`] can
+/// stamp each row with the peer that actually reported it. Named so the signatures below stay
+/// readable rather than tripping clippy's `type_complexity`.
+type PeerSpaceRows = Vec<(NodeId, Option<Vec<(String, u64)>>)>;
 
 // ---------------------------------------------------------------------------
 // FlowNet — the per-node subsystem.
@@ -1221,6 +1267,116 @@ impl FlowNet {
 
         (totals, partial)
     }
+
+    /// The fleet-wide list of correlated-isolation spaces held under `prefix` (#374): this node's
+    /// owned share, plus a budgeted fan-out to every other ring member for theirs — the identical
+    /// shape [`Self::fleet_entry_counts`] uses for totals, right down to the `m_idx` ring-divergence
+    /// gate (see the `SPACES_PATH` handler below), because a space listing has the same correctness
+    /// requirement a count total does: filtered to the owner so the union is duplicate-free by
+    /// construction, never a per-node sum that could double- or under-count a replicated flow.
+    ///
+    /// `prefix` is the caller's already-rendered [`super::flow_config::ContextScope::prefix_for`]
+    /// output, not a port: a fleet-scoped listing's prefix (`f:`) names no port at all, and this
+    /// function has no business re-deriving what the admin front already resolved from the
+    /// imposter's own config.
+    ///
+    /// `partial` carries [`Self::fleet_entry_counts`]'s identical contract: `true` when any peer's
+    /// answer is missing (an error, a panicked task, a ring-divergence refusal, or one still
+    /// outstanding when `budget` expires) — never a fabricated empty list standing in for "no
+    /// spaces". A local ring that is not yet available answers `(vec![], true)` for the same reason.
+    #[must_use]
+    pub async fn fleet_spaces(
+        self: &Arc<Self>,
+        port: u16,
+        prefix: &str,
+        budget: Duration,
+    ) -> (Vec<SpaceRow>, bool) {
+        let (node, ring) = match self.view() {
+            Ok(view) => view,
+            Err(reason) => {
+                tracing::warn!(error = %reason, "flow spaces: cluster view unavailable");
+                return (Vec::new(), true);
+            }
+        };
+        let me = node.id();
+        let local = owned_spaces(
+            &self.shard.entries_by_flow(),
+            prefix,
+            |scoped_id| ring.owner(OwnedKey::new(KeyClass::FlowKv, scoped_id)),
+            me,
+        );
+
+        let peers: Vec<NodeId> = ring
+            .members()
+            .iter()
+            .copied()
+            .filter(|&id| id != me)
+            .collect();
+        if peers.is_empty() {
+            return merge_space_rows(local, me, Vec::new(), false);
+        }
+
+        let caller_m_idx = ring.m_idx();
+        let mut set = tokio::task::JoinSet::new();
+        for peer in peers.iter().copied() {
+            let node = Arc::clone(&node);
+            let req = SpacesReq {
+                port,
+                prefix: prefix.to_owned(),
+                m_idx: caller_m_idx,
+            };
+            set.spawn(async move {
+                let outcome = async {
+                    let body = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+                    let reply = node
+                        .call_member(peer, "POST", SPACES_PATH, body)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    serde_json::from_slice::<SpacesReply>(&reply).map_err(|e| e.to_string())
+                }
+                .await;
+                (peer, outcome)
+            });
+        }
+
+        let mut peer_rows: PeerSpaceRows = Vec::new();
+        let mut answered: HashSet<NodeId> = HashSet::new();
+        let drained = tokio::time::timeout(budget, async {
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok((peer, Ok(reply))) => {
+                        answered.insert(peer);
+                        peer_rows.push((peer, Some(reply.rows)));
+                    }
+                    Ok((peer, Err(e))) => {
+                        answered.insert(peer);
+                        tracing::warn!(peer, error = %e, "flow spaces: peer pull failed");
+                        peer_rows.push((peer, None));
+                    }
+                    Err(e) => {
+                        // No peer id survives a panicked join (`JoinSet` erases it on that path);
+                        // the unanswered-peer sweep below is what accounts for this one instead.
+                        tracing::warn!(error = %e, "flow spaces: peer pull task panicked");
+                    }
+                }
+            }
+        })
+        .await;
+        let mut timed_out = false;
+        if drained.is_err() {
+            timed_out = true;
+            set.abort_all();
+        }
+        // Covers both a budget cutoff (peers still outstanding when `drained` failed) and a
+        // panicked task (never recorded above): either way the peer is not in `answered`, and its
+        // share is unknown rather than empty.
+        for &peer in peers.iter().filter(|peer| !answered.contains(peer)) {
+            tracing::warn!(peer, "flow spaces: peer pull lost (timeout or panic)");
+            peer_rows.push((peer, None));
+        }
+
+        merge_space_rows(local, me, peer_rows, timed_out)
+    }
 }
 
 /// Fold one peer's `POST /_cluster/flow/counts` reply into the running fleet-wide per-port totals
@@ -1255,7 +1411,79 @@ fn imposter_port(scoped_flow_id: &str) -> Option<u16> {
         .and_then(|(port, _)| port.parse().ok())
 }
 
-/// The wire surface: four POST routes on the cluster port, HMAC-authed and
+/// This node's owned share of the spaces under `prefix` (#374): keep an entry whose scoped id
+/// starts with `prefix` **and** whose owner (per `owner_of`, closing over the ring) is `me`, and
+/// return it with the prefix stripped exactly once.
+///
+/// `strip_prefix`, never `replace`/`trim_start_matches`: a caller-chosen flow id can itself look
+/// like a scope prefix (`i6400:i6400:foo`, scoped becomes `i6400:i6400:foo`), and stripping every
+/// occurrence would hand back `foo` — a different space than the one stripped once, `i6400:foo`.
+///
+/// Pure and free-standing rather than a method on [`FlowNet`], deliberately: the gate tests pin
+/// this filter and the prefix arithmetic without standing a ring (or even a `FlowNet`) up at all.
+fn owned_spaces(
+    entries: &[(String, usize)],
+    prefix: &str,
+    owner_of: impl Fn(&str) -> Option<NodeId>,
+    me: NodeId,
+) -> Vec<(String, u64)> {
+    entries
+        .iter()
+        .filter_map(|(scoped_id, count)| {
+            let unscoped = scoped_id.strip_prefix(prefix)?;
+            if owner_of(scoped_id) != Some(me) {
+                return None;
+            }
+            Some((unscoped.to_owned(), *count as u64))
+        })
+        .collect()
+}
+
+/// The union of this node's owned share and every peer's (#374): [`SpaceRow`]s stamped with
+/// `me` for `local` and with **that peer's own id** for its rows — never `me` for all of them,
+/// which is exactly the transposition bug run 32 shipped (see the test this doc references).
+///
+/// Duplicate-free by construction, not by a dedup pass: each flow has exactly one owner, so the
+/// union of every node's owned share can never name the same space twice under two different
+/// owners, and `local`/each peer's share can never name the same space under itself either.
+///
+/// `partial` is `timed_out || any peer's answer was `None`` — the identical polarity
+/// [`FlowNet::fleet_entry_counts`] uses, so a `[]` result and a genuinely-empty imposter cannot be
+/// told apart from a `[]` a fan-out simply failed to complete: `partial: true` in the latter case is
+/// what keeps the console from stating "no spaces" as fact when the truth is "cannot tell you".
+///
+/// Pure and free-standing for the same reason [`owned_spaces`] is: testable without a cluster.
+fn merge_space_rows(
+    local: Vec<(String, u64)>,
+    me: NodeId,
+    peers: PeerSpaceRows,
+    timed_out: bool,
+) -> (Vec<SpaceRow>, bool) {
+    let mut rows: Vec<SpaceRow> = local
+        .into_iter()
+        .map(|(space, entry_count)| SpaceRow {
+            space,
+            entry_count,
+            owner: me,
+        })
+        .collect();
+    let mut partial = timed_out;
+    for (peer, answer) in peers {
+        match answer {
+            Some(peer_rows) => {
+                rows.extend(peer_rows.into_iter().map(|(space, entry_count)| SpaceRow {
+                    space,
+                    entry_count,
+                    owner: peer,
+                }))
+            }
+            None => partial = true,
+        }
+    }
+    (rows, partial)
+}
+
+/// The wire surface: six POST routes on the cluster port, HMAC-authed and
 /// version-negotiated by the transport like every other route.
 #[must_use]
 pub fn flow_routes(net: Arc<FlowNet>) -> Router {
@@ -1263,7 +1491,8 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
     let write_net = Arc::clone(&net);
     let replicate_net = Arc::clone(&net);
     let sync_net = Arc::clone(&net);
-    let counts_net = net;
+    let counts_net = Arc::clone(&net);
+    let spaces_net = net;
 
     Router::new()
         .route(
@@ -1386,6 +1615,42 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
                 })
             }),
         )
+        .route(
+            "POST",
+            SPACES_PATH,
+            Arc::new(move |body: Vec<u8>| -> HandlerFuture {
+                let net = Arc::clone(&spaces_net);
+                Box::pin(async move {
+                    let req: SpacesReq = serde_json::from_slice(&body)
+                        .map_err(|e| RpcError::Handler(format!("flow/spaces decode: {e}")))?;
+                    // Same refusal as `COUNTS_PATH`, and the identical reason: without a ring
+                    // there is no way to tell an owned space from a replica's copy, and answering
+                    // an unfiltered local scan would be exactly the wrong-but-quiet failure
+                    // `owned_spaces`'s caller depends on this handler never producing.
+                    let (node, ring) = net.view().map_err(RpcError::Handler)?;
+                    // `COUNTS_PATH`'s divergence gate, unchanged: the caller computed its own
+                    // share under its own ring, and answering under a different one here is how a
+                    // flow ends up claimed by two nodes or by none during a membership change.
+                    if req.m_idx != ring.m_idx() {
+                        return Err(RpcError::Handler(format!(
+                            "flow/spaces: ring diverged for port {} (caller m_idx {}, this node {})",
+                            req.port,
+                            req.m_idx,
+                            ring.m_idx()
+                        )));
+                    }
+                    let me = node.id();
+                    let rows = owned_spaces(
+                        &net.shard.entries_by_flow(),
+                        &req.prefix,
+                        |scoped_id| ring.owner(OwnedKey::new(KeyClass::FlowKv, scoped_id)),
+                        me,
+                    );
+                    serde_json::to_vec(&SpacesReply { rows })
+                        .map_err(|e| RpcError::Handler(e.to_string()))
+                })
+            }),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,6 +1717,18 @@ impl ClusteredFlowStore {
 }
 
 impl rift_cluster_base::seams::FlowStore for ClusteredFlowStore {
+    // `flow_ids`/`entry_count` are deliberately **not** overridden here, so both keep upstream's
+    // default `Ok(None)` ("cannot enumerate"). At this face — one store, one imposter, whatever
+    // this node's local shard happens to hold — the correctness constraint that shapes `FlowNet`'s
+    // own admin surface (#374, see `owned_spaces`/`fleet_spaces`) applies just as hard: a flow
+    // keeps `REPLICAS` copies, only the owner's copy is authoritative, and a store answering from
+    // its local shard alone would be node-dependent and, for a non-owned copy, simply wrong. There
+    // is no ring to consult from inside upstream's synchronous, per-imposter `FlowStore` trait —
+    // that fan-out is exactly what `FlowNet::fleet_spaces` exists to do instead, over the admin
+    // front's `GET /imposters/{port}/spaces`, which is the surface an "Active spaces" listing
+    // should actually be built against. Implementing these two here would mean either answering
+    // wrong (this node's raw local set) or reinventing the fan-out one layer too low; `None` is the
+    // honest "ask the admin surface" answer.
     fn get(&self, flow_id: &str, key: &str) -> anyhow::Result<Option<Value>> {
         // Scoped above the consistency branch, not inside one: the namespace is
         // a property of the imposter, not of which copy answers the read.
@@ -1636,5 +1913,140 @@ mod tests {
         merge_peer_counts(&mut totals, &[(8001, 10)]);
 
         assert_eq!(totals, HashMap::from([(8001, u64::MAX)]));
+    }
+
+    /// `owner_of` as a lookup table, so these tests pin the filter and the
+    /// prefix arithmetic without standing a ring up.
+    fn owners<'a>(pairs: &'a [(&'a str, NodeId)]) -> impl Fn(&str) -> Option<NodeId> + 'a {
+        move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, node)| *node)
+    }
+
+    #[test]
+    fn owned_spaces_keeps_only_this_nodes_flows_and_strips_the_scope_prefix() {
+        let entries = vec![
+            ("i6400:alpha".to_owned(), 3usize),
+            ("i6400:beta".to_owned(), 7usize),
+        ];
+        let owner_of = owners(&[("i6400:alpha", 1), ("i6400:beta", 2)]);
+
+        let mine = owned_spaces(&entries, "i6400:", owner_of, 1);
+
+        assert_eq!(mine, vec![("alpha".to_owned(), 3u64)]);
+    }
+
+    #[test]
+    fn owned_spaces_strips_a_prefix_shaped_flow_id_exactly_once() {
+        // The user's own flow id is `i6400:foo`; scoped for port 6400 it becomes
+        // `i6400:i6400:foo`. Stripping twice would hand back `foo` — a different
+        // space, and one the operator never named.
+        let entries = vec![("i6400:i6400:foo".to_owned(), 1usize)];
+        let owner_of = owners(&[("i6400:i6400:foo", 1)]);
+
+        let mine = owned_spaces(&entries, "i6400:", owner_of, 1);
+
+        assert_eq!(mine, vec![("i6400:foo".to_owned(), 1u64)]);
+    }
+
+    #[test]
+    fn owned_spaces_does_not_match_an_adjacent_ports_prefix() {
+        // `i64000:` shares its first six characters with `i6400:`; the colon is
+        // the only thing that separates port 6400 from port 64000.
+        let entries = vec![("i64000:alpha".to_owned(), 5usize)];
+        let owner_of = owners(&[("i64000:alpha", 1)]);
+
+        let mine = owned_spaces(&entries, "i6400:", owner_of, 1);
+
+        assert_eq!(mine, Vec::<(String, u64)>::new());
+    }
+
+    #[test]
+    fn owned_spaces_lists_fleet_scoped_flows_under_the_f_prefix() {
+        let entries = vec![
+            ("f:shared".to_owned(), 4usize),
+            ("i6400:private".to_owned(), 9usize),
+        ];
+        let owner_of = owners(&[("f:shared", 1), ("i6400:private", 1)]);
+
+        let mine = owned_spaces(&entries, "f:", owner_of, 1);
+
+        assert_eq!(mine, vec![("shared".to_owned(), 4u64)]);
+    }
+
+    #[test]
+    fn a_peer_row_is_stamped_with_the_peers_node_id_not_this_nodes() {
+        // Run 32 shipped a peer-row transposition that passed the entire suite
+        // because every wire test was solo-node. This is that branch, executed.
+        let (rows, _partial) = merge_space_rows(
+            vec![("mine".to_owned(), 1u64)],
+            7,
+            vec![(9, Some(vec![("theirs".to_owned(), 2u64)]))],
+            false,
+        );
+
+        let theirs = rows
+            .iter()
+            .find(|row| row.space == "theirs")
+            .expect("the peer's space must be listed");
+        assert_eq!(theirs.owner, 9, "a peer's row must name the peer as owner");
+        assert_eq!(theirs.entry_count, 2);
+
+        let mine = rows
+            .iter()
+            .find(|row| row.space == "mine")
+            .expect("this node's space must be listed");
+        assert_eq!(mine.owner, 7);
+    }
+
+    #[test]
+    fn merge_is_the_union_of_owned_shares_with_no_duplicate_space() {
+        let (rows, partial) = merge_space_rows(
+            vec![("a".to_owned(), 1u64)],
+            1,
+            vec![
+                (2, Some(vec![("b".to_owned(), 2u64)])),
+                (3, Some(vec![("c".to_owned(), 3u64)])),
+            ],
+            false,
+        );
+
+        let mut spaces: Vec<&str> = rows.iter().map(|row| row.space.as_str()).collect();
+        spaces.sort_unstable();
+        assert_eq!(spaces, vec!["a", "b", "c"]);
+        assert!(!partial);
+    }
+
+    #[test]
+    fn a_missing_peer_answer_stamps_partial() {
+        let (rows, partial) =
+            merge_space_rows(vec![("a".to_owned(), 1u64)], 1, vec![(2, None)], false);
+
+        assert_eq!(rows.len(), 1, "the surviving share is still served");
+        assert!(
+            partial,
+            "a peer that did not answer must not be reported as having no spaces"
+        );
+    }
+
+    #[test]
+    fn a_timeout_stamps_partial_even_when_every_peer_answered() {
+        let (_rows, partial) = merge_space_rows(
+            vec![],
+            1,
+            vec![(2, Some(vec![("b".to_owned(), 1u64)]))],
+            true,
+        );
+
+        assert!(partial);
+    }
+
+    #[test]
+    fn no_spaces_anywhere_is_a_knowable_zero_not_a_partial() {
+        // The distinction the console renders: `[]` with `partial: false` is
+        // "this imposter has no spaces"; `[]` with `partial: true` is "cannot
+        // tell you". Collapsing them would state the first as fact.
+        let (rows, partial) = merge_space_rows(vec![], 1, vec![(2, Some(vec![]))], false);
+
+        assert!(rows.is_empty());
+        assert!(!partial);
     }
 }

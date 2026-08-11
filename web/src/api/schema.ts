@@ -408,6 +408,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/imposters/{port}/spaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List an imposter's correlated-isolation spaces (issue #374)
+         * @description Every space (flow) this imposter currently exists under, fleet-wide — not just the ones this node happens to hold a replica of. A row means the space exists, and `entryCount` is its live key count, which may be `0`: the in-memory shard never runs a background sweep of expired keys, so a space every key of which has expired is still a space, reachable and listed, with `entryCount: 0`. A flow keeps several replicated copies for durability, but each flow has exactly one **owner** (the ring member Raft assigns it), and this listing is the union of every ring member's own owned share: by construction duplicate-free, and complete regardless which node answers the request.
+         *
+         *     There is no upstream route for this shape at all — only the single-space read and the per-space stubs write exist there — so unlike `GET /imposters/{port}/spaces/{flowId}`, which proxies to the core engine, this is EE-only and answered entirely from this node's applied cluster state.
+         *
+         *     A fleet-scoped imposter (`flowState.contextScope: "fleet"`) shares its flow-id namespace with every other fleet-scoped imposter, so its spaces are not necessarily private to the one imposter named in the path. Imposter-scoped spaces (the default) are private to this port. `owner` is reported per space, never once for the whole list, because a flow — not a port — is the only thing the ring assigns an owner to: one imposter's spaces can legitimately have different owners.
+         */
+        get: operations["listSpaces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/imposters/{port}/spaces/{flowId}": {
         parameters: {
             query?: never;
@@ -3441,6 +3468,67 @@ export interface operations {
             };
         };
     };
+    listSpaces: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The imposter's port number. */
+                port: components["parameters"]["Port"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The imposter's spaces. `spaces: []` with `partial: false` means the imposter genuinely holds none right now; `spaces: []` with `partial: true` means the fleet could not be asked in time (or its view was not yet available) and nothing should be inferred from the empty list — the same "cannot tell you" distinction `Rift-Cluster-Partial` marks elsewhere in this API, folded into the body here since this route has no header convention of its own to reuse. When `unavailable` is present the listing was never attempted at all — always `spaces: []` and `partial: true` — and `unavailable` says why. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description This imposter's resolved `durability` knob (issue #370) — omitted entirely, never defaulted, when the applied config could not be read or parsed. `spaces`/`partial` are still served either way; a knobs read failing must not take the listing down with it. */
+                        durability?: {
+                            /** @enum {string} */
+                            value: "none" | "async" | "sync";
+                            /** @enum {string} */
+                            source: "default" | "set";
+                        };
+                        spaces: {
+                            /** @description The flow id, with the imposter's scope prefix stripped. */
+                            space: string;
+                            /** @description Live (non-expired, non-tombstoned) flow-KV keys currently held under this space. */
+                            entryCount: number;
+                            /** @description The node id holding this space's flow state, as a decimal string — not a JSON number, because a node id is a 64-bit identifier and JSON numbers are IEEE-754 doubles wherever the reader is JavaScript: an id above 2^53-1 would round silently on the way in. Known by construction, never guessed: a row is only ever produced by the node that actually owns it. */
+                            owner: string;
+                        }[];
+                        /** @description `true` when at least one ring member could not be reached within budget (or this node's own cluster view was unavailable), so `spaces` reflects only the members that did answer and must not be read as the complete list. Also `true`, unconditionally, whenever `unavailable` is present. */
+                        partial: boolean;
+                        /**
+                         * @description Present only when the listing was refused outright rather than merely incomplete — `spaces` is then always `[]` and `partial` is always `true`. Absent on an ordinary read, whether or not that read is itself partial.
+                         *
+                         *     `fleet-scope` is a **policy refusal, not a transient failure**: the imposter is `flowState.contextScope: "fleet"`, whose `f:` key prefix carries no tenant component, so scanning it would either match nothing (wrong prefix) or return another tenant's fleet-scoped flows alongside this one's (right prefix, no way to filter by tenant). It will not resolve on a retry; the caller's own single-space read (`GET /imposters/{port}/spaces/{flowId}`) is unaffected and still answers by id.
+                         *
+                         *     `scope-unresolved` means this imposter's own config could not be read or parsed, so its `contextScope` — and therefore which flow-id namespace to enumerate — is unknown. Guessing would risk scanning the wrong namespace and reporting it complete, so this refuses instead. Unlike `fleet-scope`, this may clear on a retry (a node still catching up, or the config being fixed).
+                         * @enum {string}
+                         */
+                        unavailable?: "fleet-scope" | "scope-unresolved";
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description No such imposter for this tenant, or owned by another tenant. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getSpace: {
         parameters: {
             query?: never;
@@ -3470,8 +3558,9 @@ export interface operations {
                         /** @description Recorded requests whose resolved flow id is this space. */
                         numberOfRequests: number;
                         /**
-                         * Format: int64
-                         * @description The node id holding this flow's state (issue #359). A space *is* a flow, and a flow is the only thing the ring assigns an owner to: imposters, stubs and config are replicated to every node, so any node serves them and none owns them. One port with several flows therefore has several owners, one per flow.
+                         * @description The node id holding this flow's state (issue #359). A **string**, not an integer, for the same reason as `FleetMembers.node_id`: a raft id is a `u64`, and JavaScript reads a JSON number back as an IEEE-754 double, so every id above 2^53 - 1 would round silently and name a neighbouring node. Corrected in issue #374, which publishes the same field on the listing and would otherwise have given one field two types on adjacent routes.
+                         *
+                         *     A space *is* a flow, and a flow is the only thing the ring assigns an owner to: imposters, stubs and config are replicated to every node, so any node serves them and none owns them. One port with several flows therefore has several owners, one per flow.
                          *
                          *     A node that receives a request for a flow it does not own talks to the owner rather than answering from its own copy, so this names where that flow's state actually lives.
                          *
@@ -3479,7 +3568,7 @@ export interface operations {
                          *
                          *     **Absent, never guessed**, when no membership has been applied or the imposter's scope could not be read: the field is omitted rather than defaulted, because a wrong owner sends an operator to the wrong node.
                          */
-                        owner?: number;
+                        owner?: string;
                     };
                 };
             };
