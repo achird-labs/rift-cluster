@@ -80,6 +80,18 @@ pub enum RpcError {
         op_id: Option<String>,
     },
 
+    /// The peer answered, but it is not the leader and this request needs one.
+    /// `leader` is openraft's own hint — the leader's advertise authority —
+    /// absent while an election is unsettled.
+    ///
+    /// Distinct from [`Self::Handler`] because it is *actionable* rather than a
+    /// failure: the peer did its job by naming where to go. Flattening it into
+    /// `Handler` is what made a node seeded at a follower retry the same
+    /// follower until its join deadline expired, with the leader's address
+    /// sitting unused in the message text (issue #391).
+    #[error("not the leader{}", leader.as_ref().map(|l| format!("; leader is {l}")).unwrap_or_default())]
+    NotLeader { leader: Option<String> },
+
     /// The registered handler failed.
     #[error("handler error: {0}")]
     Handler(String),
@@ -99,6 +111,7 @@ impl RpcError {
             Self::Shed => "shed",
             Self::BadRequest(_) => "bad_request",
             Self::Unavailable { .. } => "unavailable",
+            Self::NotLeader { .. } => "not_leader",
             Self::Handler(_) => "handler",
         }
     }
@@ -117,6 +130,11 @@ impl RpcError {
             Self::Shed => 503,
             Self::BadRequest(_) => 400,
             Self::Unavailable { .. } => 503,
+            // "Misdirected Request": this request reached a node that cannot
+            // produce the answer. Deliberately not a 3xx — nothing here is a
+            // resource that moved, and no HTTP client should follow it
+            // automatically over the signed cluster transport.
+            Self::NotLeader { .. } => 421,
             Self::Handler(_) => 500,
         }
     }
@@ -186,6 +204,14 @@ mod tests {
             (RpcError::Transport("reset".into()), "transport", 502),
             (RpcError::Shed, "shed", 503),
             (RpcError::Handler("boom".into()), "handler", 500),
+            (
+                RpcError::NotLeader {
+                    leader: Some("10.0.0.7:7000".into()),
+                },
+                "not_leader",
+                421,
+            ),
+            (RpcError::NotLeader { leader: None }, "not_leader", 421),
         ];
         for (err, reason, status) in cases {
             assert_eq!(err.reason(), reason, "{err:?}");
@@ -218,8 +244,30 @@ mod tests {
                 detail: "no quorum".into(),
                 op_id: None,
             },
+            // #391: a follower answers the same way until an election moves
+            // leadership. Retrying the same peer only burns the caller's
+            // deadline — the hint *is* the retry, and it points elsewhere.
+            RpcError::NotLeader {
+                leader: Some("10.0.0.7:7000".into()),
+            },
+            RpcError::NotLeader { leader: None },
         ] {
             assert!(!err.is_retryable(), "{err:?}");
+        }
+    }
+
+    /// #391: a follower that redirects is a *healthy* peer — it answered.
+    /// Counting a redirect against its health would put the one node that told
+    /// us where the leader is into a cooldown, which is precisely backwards.
+    #[test]
+    fn a_leader_redirect_is_not_evidence_the_peer_is_unhealthy() {
+        for err in [
+            RpcError::NotLeader {
+                leader: Some("10.0.0.7:7000".into()),
+            },
+            RpcError::NotLeader { leader: None },
+        ] {
+            assert!(!err.is_liveness_failure(), "{err:?}");
         }
     }
 }

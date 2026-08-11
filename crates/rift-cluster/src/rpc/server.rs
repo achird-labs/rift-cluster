@@ -163,6 +163,15 @@ fn error_response(err: &RpcError) -> Response<Full<Bytes>> {
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header("content-type", "application/json");
+    // The leader hint travels as a field, not just inside the rendered message:
+    // a caller that has to parse prose to find the leader cannot act on it, which
+    // is exactly how a join at a follower burned its whole deadline (#391).
+    if let RpcError::NotLeader {
+        leader: Some(leader),
+    } = err
+    {
+        body["leader"] = serde_json::Value::String(leader.clone());
+    }
     if let RpcError::Unavailable {
         op_id: Some(op_id), ..
     } = err

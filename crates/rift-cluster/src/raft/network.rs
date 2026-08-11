@@ -533,7 +533,8 @@ pub(crate) async fn local_write(
 /// catch up, then promote it to voter if the cluster is still under the
 /// ceiling — at the ceiling the joiner is admitted as a learner only (#55).
 /// Must run on the leader — on any other node openraft returns a
-/// `ForwardToLeader` error, surfaced here so the caller can retry the leader.
+/// `ForwardToLeader` error, surfaced here as a typed [`RpcError::NotLeader`]
+/// carrying the leader's address so the caller can re-issue there (#391).
 ///
 /// The handler passes [`MAX_AUTO_VOTERS`]; tests pass a small ceiling to
 /// provoke the race without an 11-node cluster.
@@ -783,6 +784,14 @@ where
         match submit().await {
             Ok(resp) => return wait_applied(raft, resp.log_id.index, what).await,
             Err(e) => {
+                // Checked before the generic arm: openraft answers a membership
+                // change on a non-leader with `ForwardToLeader`, and folding
+                // that into a `Handler` string is what stranded a node whose
+                // only seed was a follower — the leader's address survived only
+                // as prose nobody could act on (#391).
+                if let Some(leader) = forward_to_leader(&e) {
+                    return Err(RpcError::NotLeader { leader });
+                }
                 let Some(pending) = in_progress(&e) else {
                     return Err(RpcError::Handler(format!("{what}: {e}")));
                 };
@@ -818,6 +827,22 @@ async fn wait_applied(raft: &Raft<TypeConfig>, index: u64, what: &str) -> Result
         .await
         .map(|_| ())
         .map_err(|e| RpcError::Handler(format!("{what}: awaiting membership entry {index}: {e}")))
+}
+
+/// openraft's "you are asking the wrong node" rejection, carrying the leader's
+/// advertise address when it knows one. The outer `Option` distinguishes "this
+/// is a redirect" from "this is some other error"; the inner one carries the
+/// hint, which is absent while an election is unsettled.
+///
+/// Structural match on the typed error for the same reason [`in_progress`] is:
+/// the rendered message is not an interface.
+fn forward_to_leader(e: &MembershipError) -> Option<Option<String>> {
+    match e {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
+            Some(forward.leader_node.as_ref().map(|node| node.addr.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// The typed "a membership change is already under way" rejection, or `None` for

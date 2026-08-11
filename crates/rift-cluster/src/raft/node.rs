@@ -37,7 +37,7 @@ use crate::control::{
     SourceProvenance, Tenant, TenantId,
 };
 use crate::rpc::{
-    Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcServer,
+    Authority, DnsResolver, PeerResolver, Router, RpcClient, RpcClientConfig, RpcError, RpcServer,
     RpcServerConfig, Signer, TrackedPeerHealth, Verifier,
 };
 use crate::stores::journal::ClusterJournal;
@@ -502,6 +502,19 @@ impl RaftNode {
     /// Ask an existing cluster member `seed` to admit this node: the seed (if
     /// leader) adds it as a learner, waits for catch-up, and promotes it to voter
     /// while the cluster is under the auto-promote ceiling.
+    ///
+    /// The seed need not be the leader. A follower answers with a typed
+    /// [`RpcError::NotLeader`] naming who is, and this re-issues the join there,
+    /// chasing a leadership that moves mid-join. The budget is
+    /// [`Self::FORWARD_ATTEMPTS`] *sends* — the seed plus that many less one
+    /// redirects — for the same reason the write path's [`submit`](Self::submit)
+    /// bounds its forwards: a flapping election must not park the caller (#391).
+    /// It is one send stingier than `submit`, which spends a local write before
+    /// its forwards; the difference is not worth a second constant.
+    ///
+    /// Seeding at a follower is not an exotic case: `--cluster-seeds` pointing at
+    /// one stable member is the obvious thing for an operator to configure, and
+    /// before this the joiner retried that member until its deadline expired.
     pub async fn join_via(&self, seed: &Authority) -> Result<(), NodeError> {
         let request = JoinRequest {
             node_id: self.id,
@@ -509,10 +522,16 @@ impl RaftNode {
         };
         let body =
             serde_json::to_vec(&request).map_err(|e| NodeError::Membership(e.to_string()))?;
-        self.call_any(seed.as_str(), "POST", CLUSTER_JOIN_PATH, body)
-            .await
-            .map_err(NodeError::Membership)?;
-        Ok(())
+
+        chase_join(seed.as_str(), Self::FORWARD_ATTEMPTS, |target| {
+            let body = body.clone();
+            async move {
+                self.call_any_typed(&target, "POST", CLUSTER_JOIN_PATH, body)
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await
     }
 
     /// Best-effort, deadline-bounded departure from the cluster (issue #6).
@@ -780,6 +799,40 @@ impl RaftNode {
     /// replication uses — including its literal-address fast path.
     async fn resolve(&self, authority: &str) -> std::io::Result<Vec<SocketAddr>> {
         network::resolve_authority(&self.resolver, authority).await
+    }
+
+    /// [`call_any`](Self::call_any) with the typed error preserved.
+    ///
+    /// Same address-sweep contract as `call_any` with one deliberate difference:
+    /// a peer that *answers* ends the sweep even when the answer is a refusal.
+    /// Only a liveness failure — unreachable, timed out, shed — is worth trying
+    /// the next address for. Without that, a `NotLeader` redirect recovered from
+    /// the first address would be overwritten by a later address's transport
+    /// error and the hint lost (#391).
+    ///
+    /// Kept separate from `call_any` rather than made its implementation: the
+    /// four other callers have relied on the try-every-address-on-any-error
+    /// sweep since #79, and this fix has no business changing them.
+    async fn call_any_typed(
+        &self,
+        authority: &str,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, RpcError> {
+        let addrs = self
+            .resolve(authority)
+            .await
+            .map_err(|e| RpcError::Transport(format!("resolve {authority}: {e}")))?;
+        let mut last = RpcError::Transport(format!("{authority}: no addresses to try"));
+        for peer in &addrs {
+            match self.client.call(*peer, method, path, body.clone()).await {
+                Ok(reply) => return Ok(reply),
+                Err(e) if e.is_liveness_failure() => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
     }
 
     /// Resolve `authority` and call it, trying every address the name yields
@@ -1674,6 +1727,66 @@ fn map_write_err(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> N
     }
 }
 
+/// Drive one join across at most `max_attempts` sends, following a leader
+/// redirect between them by calling `send` with the address to try next.
+///
+/// `max_attempts` counts *sends*, not redirects followed: the first is the seed
+/// itself, so the budget allows `max_attempts - 1` hops. Split out from
+/// [`RaftNode::join_via`] so that bound is testable without a flapping cluster —
+/// the transport is the closure's business, the give-up rule is this function's.
+/// A leadership that keeps moving must cost a bounded number of round trips,
+/// never a ping-pong between two nodes each naming the other.
+async fn chase_join<F, Fut>(seed: &str, max_attempts: usize, mut send: F) -> Result<(), NodeError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<(), RpcError>>,
+{
+    let mut target = seed.to_owned();
+    for attempt in 0..max_attempts {
+        // Counted here rather than where the hint arrives: the last hint of an
+        // exhausted chase is never acted on, and a counter of "joins forwarded"
+        // that includes a forward that never happened is a lie an operator
+        // would read as one more round trip than the fleet actually made.
+        if attempt > 0 {
+            crate::metrics::join_forwarded();
+        }
+        let Err(error) = send(target.clone()).await else {
+            return Ok(());
+        };
+        // Only a named leader is worth another hop. A hintless refusal means an
+        // election is unsettled, and there is nowhere better to ask — the
+        // caller's own seed loop backs off, which is the right place to wait.
+        let Some(next) = next_join_hop(&error) else {
+            // Named, because after a hop the failure belongs to the node we
+            // were redirected *to*. The caller prefixes the original seed, so
+            // without this a leader's failure is reported against the follower
+            // that correctly sent us there.
+            return Err(NodeError::Membership(format!("{target}: {error}")));
+        };
+        target = next;
+    }
+    // Naming the last target separates the two shapes an operator has to tell
+    // apart: a genuine flap (a different leader each attempt, cluster unstable)
+    // and a cycle (two nodes each naming the other, a real misconfiguration).
+    Err(NodeError::Membership(format!(
+        "gave up after {max_attempts} attempts while joining via {seed} \
+         (last redirected to {target})"
+    )))
+}
+
+/// Where to re-issue a join after a failed attempt, or `None` to stop.
+///
+/// Only a [`RpcError::NotLeader`] that actually names someone is worth another
+/// hop. A hintless one means an election is in flight: there is no better node
+/// to ask, and looping here would spin inside a single join attempt instead of
+/// letting the caller's seed loop back off, which is where waiting belongs.
+fn next_join_hop(error: &RpcError) -> Option<String> {
+    match error {
+        RpcError::NotLeader { leader } => leader.clone(),
+        _ => None,
+    }
+}
+
 impl Drop for RaftNode {
     /// Best-effort teardown, deliberately asymmetric with [`RaftNode::shutdown`]:
     /// only the listener is released here. The Raft core stops and drops its
@@ -2341,6 +2454,151 @@ mod tests {
         n1.shutdown().await.ok();
         n2.shutdown().await.ok();
         n3.shutdown().await.ok();
+    }
+
+    /// #391: a joiner whose only seed is a healthy *follower* must still join.
+    ///
+    /// openraft answers `add_learner` on a non-leader with `ForwardToLeader`,
+    /// naming the leader. Before the fix that hint was flattened into an
+    /// `RpcError::Handler` string, so the joiner retried the same follower until
+    /// `SEED_JOIN_DEADLINE` and died with the leader's address sitting unused in
+    /// the error text. This is the operator-facing shape too: `--cluster-seeds`
+    /// pointing at one stable member is the obvious thing to configure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_seeded_at_a_follower_joins_by_chasing_the_leader() {
+        let (d1, d2, d3) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        n2.join_via(n1.advertise())
+            .await
+            .expect("n2 join via leader");
+
+        // Asserted, not assumed: if leadership happened to move to n2 the join
+        // below would succeed locally and prove nothing at all.
+        let seed_status = n2.status();
+        assert!(
+            !seed_status.is_leader,
+            "the seed must be a follower for this gate to mean anything"
+        );
+        assert_eq!(
+            seed_status.current_leader,
+            Some(1),
+            "n1 must still hold leadership when n3 seeds at n2"
+        );
+
+        let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+        n3.join_via(n2.advertise())
+            .await
+            .expect("a node seeded at a follower must chase the leader and join");
+
+        let voters = n1.status().voters;
+        assert!(
+            voters.contains(&3),
+            "the follower-seeded joiner must reach the leader and be promoted, got {voters:?}"
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+        n3.shutdown().await.ok();
+    }
+
+    /// #391: the classifier that decides whether a failed admit is worth
+    /// re-issuing elsewhere. Only a `NotLeader` carrying an address is — a
+    /// hintless `NotLeader` (election unsettled) and every other error must stop
+    /// the chase so the caller's outer seed loop can back off instead of
+    /// spinning inside one join attempt.
+    #[test]
+    fn only_a_named_leader_redirects_the_join() {
+        use crate::rpc::RpcError;
+
+        assert_eq!(
+            next_join_hop(&RpcError::NotLeader {
+                leader: Some("10.0.0.7:7000".into()),
+            }),
+            Some("10.0.0.7:7000".to_owned()),
+        );
+        assert_eq!(
+            next_join_hop(&RpcError::NotLeader { leader: None }),
+            None,
+            "an unsettled election names nobody; retrying here would spin"
+        );
+        assert_eq!(
+            next_join_hop(&RpcError::Handler("add learner: boom".into())),
+            None,
+            "a genuine handler failure is not a redirect"
+        );
+        assert_eq!(next_join_hop(&RpcError::Timeout), None);
+    }
+
+    /// #391: a leadership that never settles must cost a bounded number of
+    /// round trips. Two nodes each naming the other is the shape that would
+    /// otherwise ping-pong forever inside a single join attempt, with the
+    /// caller's own deadline the only thing stopping it.
+    #[tokio::test]
+    async fn a_join_gives_up_after_a_bounded_number_of_redirects() {
+        use crate::rpc::RpcError;
+        use std::cell::RefCell;
+
+        let seen = RefCell::new(Vec::new());
+        // Every hop redirects, and the two addresses point at each other.
+        let err = chase_join("a:1", RaftNode::FORWARD_ATTEMPTS, |target| {
+            seen.borrow_mut().push(target.clone());
+            async move {
+                Err(RpcError::NotLeader {
+                    leader: Some(if target == "a:1" { "b:2" } else { "a:1" }.to_owned()),
+                })
+            }
+        })
+        .await
+        .expect_err("an endless redirect must not be followed forever");
+
+        assert_eq!(
+            seen.borrow().len(),
+            RaftNode::FORWARD_ATTEMPTS,
+            "exactly {} attempts, no more and no fewer",
+            RaftNode::FORWARD_ATTEMPTS
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("last redirected to"),
+            "giving up must name where the chase ended, so a flap and a cycle \
+             can be told apart: {message}"
+        );
+    }
+
+    /// #391: a hop that succeeds ends the chase immediately — the bound is a
+    /// ceiling, not a number of attempts to make.
+    #[tokio::test]
+    async fn a_join_stops_at_the_first_hop_that_succeeds() {
+        use crate::rpc::RpcError;
+        use std::cell::RefCell;
+
+        let calls = RefCell::new(0_usize);
+        chase_join("a:1", RaftNode::FORWARD_ATTEMPTS, |_target| {
+            let n = {
+                let mut c = calls.borrow_mut();
+                *c += 1;
+                *c
+            };
+            async move {
+                if n == 1 {
+                    Err(RpcError::NotLeader {
+                        leader: Some("b:2".to_owned()),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .expect("the second hop succeeds");
+
+        assert_eq!(*calls.borrow(), 2, "one redirect, then done");
     }
 
     /// The same contention, repeated. One concurrent pass can get lucky on the
