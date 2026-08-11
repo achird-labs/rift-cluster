@@ -372,6 +372,33 @@ impl FlowShard {
         self.inner.memory.read().keys().cloned().collect()
     }
 
+    /// A snapshot of every held flow's live entry count, keyed by its
+    /// (already scoped) flow id — the per-tenant usage rollup's building
+    /// block (#372).
+    ///
+    /// Counts only what [`Self::get`] would also serve: not-yet-expired AND
+    /// not a tombstone. [`Self::flow`]'s "tombstones included" filter is
+    /// wrong here on purpose — a deleted key must not inflate a usage figure
+    /// for the up-to-[`TOMBSTONE_TTL`](super::flow) seconds its tombstone
+    /// still lives, the same way it does not reappear in an ordinary read.
+    #[must_use]
+    pub fn entries_by_flow(&self) -> Vec<(String, usize)> {
+        let now = now_millis();
+        self.inner
+            .memory
+            .read()
+            .iter()
+            .map(|(flow_id, flow)| {
+                let live = flow
+                    .keys
+                    .values()
+                    .filter(|entry| is_live(entry, now) && !entry.deleted)
+                    .count();
+                (flow_id.clone(), live)
+            })
+            .collect()
+    }
+
     /// Write a key at `durability`, returning once that level is satisfied.
     ///
     /// The in-memory mirror is updated before the durable write is awaited, so a

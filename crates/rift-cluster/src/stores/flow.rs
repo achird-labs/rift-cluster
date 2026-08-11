@@ -55,6 +55,7 @@
 //!   owner's copy is always right, and flow-level tombstones are not worth
 //!   their complexity for a rare admin op).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -89,6 +90,7 @@ const WRITE_PATH: &str = "/_cluster/flow/write";
 const GET_PATH: &str = "/_cluster/flow/get";
 const REPLICATE_PATH: &str = "/_cluster/flow/replicate";
 const SYNC_PATH: &str = "/_cluster/flow/sync";
+const COUNTS_PATH: &str = "/_cluster/flow/counts";
 
 /// How often a replica pulls the flows it holds from their owners (#16's
 /// anti-entropy interval). A missed push heals within one tick. Deliberately
@@ -274,6 +276,30 @@ struct SyncReply {
     /// content is simple to reason about. Bandwidth cost noted in the module
     /// doc.
     flows: Vec<(String, Vec<(String, Versioned)>)>,
+}
+
+/// `POST /_cluster/flow/counts` — this node's OWNED entry count per port
+/// (#372), the flow-state half of a tenant's `numberOfFlowEntries` usage.
+#[derive(Debug, Serialize, Deserialize)]
+struct CountsReq {
+    ports: Vec<u16>,
+    /// The caller's own ring index, checked against the serving node's
+    /// (RFC-001 §7.6's fencing token, reused here rather than invented
+    /// afresh). A membership change can leave two nodes' rings disagreeing
+    /// about who owns a flow for a window — long enough for one flow to be
+    /// claimed by both (double-counted) or by neither (undercounted) if each
+    /// side just answers under its own view. Comparing tokens turns that into
+    /// a detectable divergence instead of a silently wrong number.
+    m_idx: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CountsReply {
+    /// `(port, this node's owned live-entry count)`. A list rather than a
+    /// `HashMap<u16, _>`, matching [`super::journal_net::CountsReply`]'s own
+    /// reasoning: a JSON object's keys are strings, and a `u16` round-tripping
+    /// through one is a decode failure waiting to happen.
+    slots: Vec<(u16, u64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,16 +1077,177 @@ impl FlowNet {
             })
             .map_err(|e| anyhow::anyhow!("flow store: {e}"))
     }
+
+    /// This node's OWNED share of `numberOfFlowEntries` for `ports` (#372): the
+    /// live entry count of every imposter-scoped flow this node currently owns.
+    ///
+    /// Filtered to the **owner** only, never every holder of a copy: a flow keeps
+    /// [`REPLICAS`] copies for durability, so a raw per-node sum (this node's plus
+    /// every peer's) would count each entry up to [`REPLICAS`] times. Restricting
+    /// to the owner makes the fleet-wide sum in [`Self::fleet_entry_counts`]
+    /// exactly the union of live entries, with no coordination beyond the ring
+    /// every node already agrees on.
+    ///
+    /// Fleet-scoped (`f:`) flows never match [`imposter_port`]'s `i{port}:`
+    /// prefix, so they contribute to no port's count — they are shared by
+    /// construction, and charging them to any one imposter would be arbitrary.
+    fn owned_port_counts(&self, node: &RaftNode, ring: &Ring, ports: &[u16]) -> HashMap<u16, u64> {
+        let wanted: HashSet<u16> = ports.iter().copied().collect();
+        // Seeded with every requested port at `0`, not only the ones this node
+        // happens to own something for: `fleet_entry_counts` folds a peer's reply
+        // into this map by key, and a port absent here would silently drop that
+        // peer's count instead of adding to zero.
+        let mut totals: HashMap<u16, u64> = ports.iter().map(|&port| (port, 0)).collect();
+        for (flow_id, count) in self.shard.entries_by_flow() {
+            let Some(port) = imposter_port(&flow_id) else {
+                continue;
+            };
+            if !wanted.contains(&port) {
+                continue;
+            }
+            let owned = OwnedKey::new(KeyClass::FlowKv, &flow_id);
+            if ring.owner(owned) != Some(node.id()) {
+                continue;
+            }
+            *totals.entry(port).or_insert(0) += count as u64;
+        }
+        totals
+    }
+
+    /// `numberOfFlowEntries` for a batch of ports (#372): this node's own owned
+    /// share, plus a budgeted fan-out to every other ring member for theirs —
+    /// the same shape as [`super::journal_net::JournalNet::fleet_counts`]. Flow
+    /// entries carry no analogue of a journal port's clear generation, but the
+    /// ring's own `m_idx` (RFC-001 §7.6) is exactly that kind of gate: each
+    /// peer answers under its own ring, and a membership change in flight can
+    /// leave rings disagreeing about who owns a flow, so the fan-out stamps
+    /// its caller `m_idx` on every request and a peer whose ring has since
+    /// diverged refuses rather than answer under a view the caller never
+    /// asked for (see the `COUNTS_PATH` handler).
+    ///
+    /// `partial` is `true` when any peer's answer was missing (an error, a
+    /// panicked task, a ring-divergence refusal, or one still outstanding when
+    /// `budget` expired) — the same "never a fabricated zero" contract
+    /// [`JournalNet::fleet_counts`] upholds. A local ring that is not yet
+    /// available (still starting, or no applied membership) answers an empty
+    /// map with `partial: true` rather than a count this node cannot vouch
+    /// for.
+    #[must_use]
+    pub async fn fleet_entry_counts(
+        self: &Arc<Self>,
+        ports: &[u16],
+        budget: Duration,
+    ) -> (HashMap<u16, u64>, bool) {
+        // Nothing to fan out for: a tenant with no imposters has a locally
+        // computable (empty) answer, and asking every peer anyway would stamp
+        // `partial: true` on a `0/0/0` body the instant any one of them
+        // failed to answer in time — for no reason, since there is nothing
+        // for their answers to add.
+        if ports.is_empty() {
+            return (HashMap::new(), false);
+        }
+
+        let (node, ring) = match self.view() {
+            Ok(view) => view,
+            Err(reason) => {
+                tracing::warn!(error = %reason, "flow entry counts: cluster view unavailable");
+                return (HashMap::new(), true);
+            }
+        };
+        let mut totals = self.owned_port_counts(&node, &ring, ports);
+
+        let peers: Vec<NodeId> = ring
+            .members()
+            .iter()
+            .copied()
+            .filter(|&id| id != node.id())
+            .collect();
+        if peers.is_empty() {
+            return (totals, false);
+        }
+
+        let caller_m_idx = ring.m_idx();
+        let mut set = tokio::task::JoinSet::new();
+        for peer in peers.iter().copied() {
+            let node = Arc::clone(&node);
+            let req_ports = ports.to_vec();
+            set.spawn(async move {
+                let outcome = async {
+                    let body = serde_json::to_vec(&CountsReq {
+                        ports: req_ports,
+                        m_idx: caller_m_idx,
+                    })
+                    .map_err(|e| e.to_string())?;
+                    let reply = node
+                        .call_member(peer, "POST", COUNTS_PATH, body)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    serde_json::from_slice::<CountsReply>(&reply).map_err(|e| e.to_string())
+                }
+                .await;
+                (peer, outcome)
+            });
+        }
+
+        let mut partial = false;
+        let mut answered: HashSet<NodeId> = HashSet::new();
+        let drained = tokio::time::timeout(budget, async {
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok((peer, Ok(reply))) => {
+                        answered.insert(peer);
+                        for (port, count) in reply.slots {
+                            if let Some(total) = totals.get_mut(&port) {
+                                *total = total.saturating_add(count);
+                            }
+                        }
+                    }
+                    Ok((peer, Err(e))) => {
+                        answered.insert(peer);
+                        tracing::warn!(peer, error = %e, "flow entry counts: peer pull failed");
+                        partial = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "flow entry counts: peer pull task panicked");
+                        partial = true;
+                    }
+                }
+            }
+        })
+        .await;
+        if drained.is_err() {
+            partial = true;
+            set.abort_all();
+            for &peer in peers.iter().filter(|peer| !answered.contains(peer)) {
+                tracing::warn!(peer, "flow entry counts: peer pull lost to budget");
+            }
+        }
+
+        (totals, partial)
+    }
 }
 
-/// The wire surface: three POST routes on the cluster port, HMAC-authed and
+/// The imposter port a scoped flow id belongs to, or `None` for a fleet-scoped
+/// (`f:`) id or the unreachable `i?:` placeholder namespace ([`ContextScope::prefix_for`]) —
+/// both deliberately excluded from any port's count: a fleet-scoped flow is
+/// shared by construction, so charging its entries to any one imposter's port
+/// would be arbitrary, and the placeholder names no real port to charge at all.
+fn imposter_port(scoped_flow_id: &str) -> Option<u16> {
+    scoped_flow_id
+        .strip_prefix('i')
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(port, _)| port.parse().ok())
+}
+
+/// The wire surface: four POST routes on the cluster port, HMAC-authed and
 /// version-negotiated by the transport like every other route.
 #[must_use]
 pub fn flow_routes(net: Arc<FlowNet>) -> Router {
     let get_net = Arc::clone(&net);
     let write_net = Arc::clone(&net);
     let replicate_net = Arc::clone(&net);
-    let sync_net = net;
+    let sync_net = Arc::clone(&net);
+    let counts_net = net;
 
     Router::new()
         .route(
@@ -1138,6 +1325,47 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
                         .map(|flow_id| (flow_id.clone(), net.shard.flow(flow_id)))
                         .collect();
                     serde_json::to_vec(&SyncReply { flows })
+                        .map_err(|e| RpcError::Handler(e.to_string()))
+                })
+            }),
+        )
+        .route(
+            "POST",
+            COUNTS_PATH,
+            Arc::new(move |body: Vec<u8>| -> HandlerFuture {
+                let net = Arc::clone(&counts_net);
+                Box::pin(async move {
+                    let req: CountsReq = serde_json::from_slice(&body)
+                        .map_err(|e| RpcError::Handler(format!("flow/counts decode: {e}")))?;
+                    // Errors rather than answering an unfiltered (and therefore
+                    // over-counted) local sum: without a ring there is no way to
+                    // tell an owned entry from a replica's copy, and a wrong
+                    // count that looks like a real one is worse than the asker
+                    // marking this peer's contribution `partial`.
+                    let (node, ring) = net.view().map_err(RpcError::Handler)?;
+                    // The caller computed `owned_port_counts` decisions under
+                    // its own ring; answering under a *different* one here is
+                    // exactly how a flow gets claimed by two nodes (both
+                    // think they own it) or by none (both think the other
+                    // does) during a membership change. Refusing rather than
+                    // guessing routes this into the same peer-failure path
+                    // every other unreachable/erroring peer takes, so the
+                    // caller marks its answer `partial` instead of trusting a
+                    // count computed under a view it never asked for.
+                    if req.m_idx != ring.m_idx() {
+                        return Err(RpcError::Handler(format!(
+                            "flow/counts: ring diverged (caller m_idx {}, this node {})",
+                            req.m_idx,
+                            ring.m_idx()
+                        )));
+                    }
+                    let totals = net.owned_port_counts(&node, &ring, &req.ports);
+                    let slots = req
+                        .ports
+                        .iter()
+                        .map(|&port| (port, totals.get(&port).copied().unwrap_or(0)))
+                        .collect();
+                    serde_json::to_vec(&CountsReply { slots })
                         .map_err(|e| RpcError::Handler(e.to_string()))
                 })
             }),

@@ -1443,15 +1443,30 @@ const adminTenantKey = (tenantId: string): unknown[] => ["admin-tenant", tenantI
 const adminPrincipalsKey = (tenantId: string): unknown[] => ["admin-principals", tenantId];
 
 /**
+ * The tenant list, and whether its usage figures are complete.
+ *
+ * `flowEntries` on each tenant's `usage` is gathered by a fleet fan-out (#372), so the same
+ * `Rift-Cluster-Partial` discipline `useImposters` applies to `numberOfRequests` (#363) applies
+ * here: `apiGet` would discard the header the server stamps when a peer did not answer in time,
+ * and the console would render a floor as if it were a total. `imposters`/`stubsPerImposter` come
+ * from the replicated config set instead — unaffected by the fan-out — so only `flowEntries` reads
+ * this flag; see `QuotaUsed` in `Admin.tsx`.
+ */
+export type TenantList = { tenants: Tenant[]; partial: boolean };
+
+/**
  * `enabled` is the caller's decision because `TenantList` is `Action::ClusterAdmin` scoped to the
  * **fleet**, not to the caller's tenant. A tenant-admin holds no `*` binding, so this read is a
  * permanent 404 for them — asking anyway turns their Administration landing into a red error every
  * five seconds, which is the failure the `cluster.admin` capability was introduced to stop.
  */
-export function useTenants(options: { enabled?: boolean } = {}): UseQueryResult<Tenant[]> {
+export function useTenants(options: { enabled?: boolean } = {}): UseQueryResult<TenantList> {
   return useQuery({
     queryKey: ADMIN_TENANTS_KEY,
-    queryFn: () => apiGet<Tenant[]>(API_PATHS.tenants),
+    queryFn: async (): Promise<TenantList> => {
+      const read = await apiGetMerged<Tenant[]>(API_PATHS.tenants);
+      return { tenants: read.data, partial: read.partial };
+    },
     enabled: options.enabled ?? true,
     ...POLLED,
   });

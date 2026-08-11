@@ -151,8 +151,12 @@ nodes, it lands on three disks with no new replication machinery:
 
 ```
 flow_kv:   (flow_id, key) → { m_idx, v, origin, expires_at, value }
-flow_meta: flow_id        → { last_touch, entry_count }     // TTL + LRU sweeps
+flow_meta: flow_id        → { last_touch }                  // TTL + LRU sweeps
 ```
+
+`flow_meta` carries `last_touch` and nothing else: TTL and LRU both order by it, and neither needs
+a count. An entry count is therefore not a stored figure — it is the size of the flow's in-memory
+mirror, which is what the per-tenant usage fan-out (#372) reads.
 
 Per-imposter durability knob (`_rift.flowState.durability`), mapping 1:1 onto
 `redb`'s per-commit durability levels:

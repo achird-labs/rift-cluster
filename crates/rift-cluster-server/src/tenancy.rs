@@ -27,12 +27,15 @@
 use hyper::{Method, StatusCode};
 use rift_cluster::audit_export::{ExportStatus, ExportStatusSnapshot};
 use rift_cluster::control::{
-    AuthSource, FLEET_SCOPE, Principal, PrincipalId, Quotas, Role, Tenant, api_key_principal_id,
-    generate_api_key, hash_api_key,
+    AuthSource, FLEET_SCOPE, Principal, PrincipalId, Quotas, Role, Tenant, TenantConfigUsage,
+    api_key_principal_id, generate_api_key, hash_api_key,
 };
+use rift_cluster::stores::FlowNet;
 use rift_cluster::{ControlOp, ControlRequest, DEFAULT_AUDIT_BATCH_MAX_ROWS, RaftNode, TenantId};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::authz::Action;
@@ -67,6 +70,13 @@ const FLEET_NAME_PATH: &str = "/admin/fleet/name";
 /// is one any tenant admin can reach.
 const AUDIT_DEFAULT_LIMIT: usize = 500;
 const AUDIT_MAX_LIMIT: usize = 5_000;
+
+/// Budget for the flow-entry usage fan-out on a tenants read (issue #372):
+/// this node's own owned count, plus every other ring member's, bounded so one
+/// slow or unreachable peer degrades the answer to `Rift-Cluster-Partial: true`
+/// rather than hanging the request on it. Matches `admin_front`'s
+/// `JOURNAL_PEER_BUDGET` — the same shape of fan-out, the same reasoning.
+const FLOW_USAGE_BUDGET: Duration = Duration::from_secs(2);
 
 const TENANTS_PATH: &str = "/admin/tenants";
 const TENANTS_PREFIX: &str = "/admin/tenants/";
@@ -480,21 +490,68 @@ struct TenantView {
     id: String,
     display_name: String,
     quotas: Quotas,
+    /// Usage against `quotas` (issue #372). Always present — a tenant holding
+    /// nothing reads `0`/`0`/`0`, never an absent field or an error, so a
+    /// client can render it unconditionally.
+    usage: TenantUsageView,
     created_at_secs: u64,
     deleted: bool,
     journal_retention_secs: u64,
 }
 
-impl From<Tenant> for TenantView {
-    fn from(t: Tenant) -> Self {
+impl TenantView {
+    fn new(t: Tenant, usage: TenantUsageView) -> Self {
         Self {
             id: t.id.to_string(),
             display_name: t.display_name,
             quotas: t.quotas,
+            usage,
             created_at_secs: t.created_at_secs,
             deleted: t.deleted,
             journal_retention_secs: t.journal_retention_secs,
         }
+    }
+}
+
+/// The usage half of a [`TenantView`] (issue #372).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TenantUsageView {
+    imposters: u32,
+    /// The **worst** single imposter's stub count, not the sum — matching
+    /// [`TenantConfigUsage::max_stubs`], which exists precisely because
+    /// `maxStubsPerImposter` is a per-imposter ceiling, not a fleet-wide one.
+    stubs_per_imposter: u32,
+    flow_entries: u64,
+}
+
+/// Fold one tenant's config usage and the fleet-wide flow-entry counts
+/// (already fetched for the union of every listed tenant's ports) into its
+/// [`TenantUsageView`].
+///
+/// `configs` has no row for a tenant holding no imposters, so `HashMap::get`
+/// answering `None` there is exactly what makes an empty tenant's `0`/`0`/`0`
+/// fall out of the ordinary path below rather than needing a special case.
+fn usage_view(
+    tenant: &TenantId,
+    configs: &HashMap<String, TenantConfigUsage>,
+    flow_counts: &HashMap<u16, u64>,
+) -> TenantUsageView {
+    let Some(config_usage) = configs.get(tenant.as_str()) else {
+        return TenantUsageView {
+            imposters: 0,
+            stubs_per_imposter: 0,
+            flow_entries: 0,
+        };
+    };
+    TenantUsageView {
+        imposters: config_usage.imposters,
+        stubs_per_imposter: config_usage.max_stubs,
+        flow_entries: config_usage
+            .ports
+            .iter()
+            .filter_map(|port| flow_counts.get(port))
+            .sum(),
     }
 }
 
@@ -590,6 +647,13 @@ pub(crate) enum Outcome {
     Body {
         status: StatusCode,
         body: Vec<u8>,
+        /// Whether the body reflects an incomplete fleet-wide fan-out (issue
+        /// #372's flow-entry usage, so far the only reader this applies to).
+        /// The caller renders this as `Rift-Cluster-Partial: true`, never as a
+        /// field inside the body — the same split every other cluster
+        /// decoration in this codebase draws between data and its own
+        /// confidence in that data.
+        partial: bool,
     },
     Commit {
         op: ControlOp,
@@ -615,7 +679,7 @@ fn json(value: &impl Serialize) -> Result<Vec<u8>, String> {
 /// `Err(reason)` is a client-shaped refusal message; the caller renders it as a
 /// `400`. Storage failures are `Err` too and render as `500` — never as an
 /// empty success.
-pub(crate) fn dispatch(
+pub(crate) async fn dispatch(
     node: &Arc<RaftNode>,
     route: Route,
     body: &[u8],
@@ -629,6 +693,11 @@ pub(crate) fn dispatch(
     // already treats a follower's own absent status as unremarkable, so a
     // wholly absent exporter is unremarkable too.
     export_status: Option<&ExportStatus>,
+    // The flow-state subsystem (issue #372): `Route::TenantList` and
+    // `Route::TenantRead` are the only arms that reach it, to fan out
+    // `numberOfFlowEntries`. This is why `dispatch` is `async` at all — every
+    // other route answers from local applied state alone.
+    flow_net: &Arc<FlowNet>,
 ) -> Result<Outcome, TenancyError> {
     match route {
         Route::AuditRead { since, limit } => {
@@ -673,6 +742,7 @@ pub(crate) fn dispatch(
             Ok(Outcome::Body {
                 status: StatusCode::OK,
                 body: json(&rows).map_err(TenancyError::Storage)?,
+                partial: false,
             })
         }
         Route::AuditSinkRead => {
@@ -703,6 +773,7 @@ pub(crate) fn dispatch(
             Ok(Outcome::Body {
                 status: StatusCode::OK,
                 body: json(&view).map_err(TenancyError::Storage)?,
+                partial: false,
             })
         }
         Route::AuditSinkPut => {
@@ -779,15 +850,42 @@ pub(crate) fn dispatch(
             then: None,
         }),
         Route::TenantList => {
-            let tenants: Vec<TenantView> = node
+            let tenants = node
                 .tenants()
-                .map_err(|e| TenancyError::Storage(e.to_string()))?
+                .map_err(|e| TenancyError::Storage(e.to_string()))?;
+            let configs = node
+                .tenant_config_usage()
+                .map_err(|e| TenancyError::Storage(e.to_string()))?;
+            // The union of every listed tenant's ports, in one fan-out rather
+            // than one per tenant — the same "the listing pays for the scan
+            // once" reasoning `tenant_config_usage` itself gives for the
+            // config table.
+            let ports: Vec<u16> = configs
+                .values()
+                .flat_map(|usage| usage.ports.iter().copied())
+                .collect::<BTreeSet<u16>>()
                 .into_iter()
-                .map(TenantView::from)
+                .collect();
+            let (flow_counts, fan_out_partial) =
+                flow_net.fleet_entry_counts(&ports, FLOW_USAGE_BUDGET).await;
+            // Two independent reasons this response cannot fully vouch for its
+            // own usage figures, ORed rather than picked between: the fan-out
+            // missing a peer, and a corrupt `sm_configs` row this node's own
+            // scan skipped (`TenantConfigUsage::incomplete`). Either alone is
+            // real partiality; the client only needs to know that at least one
+            // applies, not which.
+            let partial = fan_out_partial || configs.values().any(|usage| usage.incomplete);
+            let views: Vec<TenantView> = tenants
+                .into_iter()
+                .map(|t| {
+                    let usage = usage_view(&t.id, &configs, &flow_counts);
+                    TenantView::new(t, usage)
+                })
                 .collect();
             Ok(Outcome::Body {
                 status: StatusCode::OK,
-                body: json(&tenants).map_err(TenancyError::Storage)?,
+                body: json(&views).map_err(TenancyError::Storage)?,
+                partial,
             })
         }
         Route::TenantRead(tenant) => {
@@ -795,10 +893,31 @@ pub(crate) fn dispatch(
                 .tenant(tenant.as_str())
                 .map_err(|e| TenancyError::Storage(e.to_string()))?;
             match found {
-                Some(record) => Ok(Outcome::Body {
-                    status: StatusCode::OK,
-                    body: json(&TenantView::from(record)).map_err(TenancyError::Storage)?,
-                }),
+                Some(record) => {
+                    let configs = node
+                        .tenant_config_usage()
+                        .map_err(|e| TenancyError::Storage(e.to_string()))?;
+                    let ports: Vec<u16> = configs
+                        .get(tenant.as_str())
+                        .map(|usage| usage.ports.clone())
+                        .unwrap_or_default();
+                    let (flow_counts, fan_out_partial) =
+                        flow_net.fleet_entry_counts(&ports, FLOW_USAGE_BUDGET).await;
+                    // Same OR as `TenantList` above: a corrupt config row for
+                    // this one tenant is just as much a reason to mark the
+                    // read partial as a peer the fan-out could not reach.
+                    let partial = fan_out_partial
+                        || configs
+                            .get(tenant.as_str())
+                            .is_some_and(|usage| usage.incomplete);
+                    let usage = usage_view(&tenant, &configs, &flow_counts);
+                    Ok(Outcome::Body {
+                        status: StatusCode::OK,
+                        body: json(&TenantView::new(record, usage))
+                            .map_err(TenancyError::Storage)?,
+                        partial,
+                    })
+                }
                 None => Err(TenancyError::NotFound),
             }
         }
@@ -848,6 +967,7 @@ pub(crate) fn dispatch(
             Ok(Outcome::Body {
                 status: StatusCode::OK,
                 body: json(&principals).map_err(TenancyError::Storage)?,
+                partial: false,
             })
         }
         Route::PrincipalPut(tenant, principal_id) => {

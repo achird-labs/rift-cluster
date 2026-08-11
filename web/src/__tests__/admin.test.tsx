@@ -463,6 +463,113 @@ describe("quota fields refuse a half-typed value", () => {
     await userEvent.setup().click(screen.getByRole("button", { name: /edit acme/i }));
     expect((screen.getByLabelText(/max flow entries/i) as HTMLInputElement).value).toBe("100000");
   });
+
+  // Issue #372. The limit was always rendered; the usage numerator is the half an operator actually
+  // looks at, because a limit is a fact about configuration and only usage changes.
+  it("renders used / limit for all three quotas", async () => {
+    stubFetch({
+      [TENANTS]: {
+        json: [
+          {
+            ...TENANT_ROWS[0],
+            usage: { imposters: 3, stubsPerImposter: 12, flowEntries: 4201 },
+          },
+        ],
+      },
+    });
+    renderInApp(<Admin tab="tenants" tenant="acme" />, {
+      whoami: whoamiWith("fleet-admin", ["acme"]),
+      tenant: "acme",
+    });
+    await waitFor(() => expect(screen.getAllByTestId("tenant-row").length).toBe(1));
+
+    expect(screen.getByTestId("quota-imposters").textContent).toMatch(/3\s*\/\s*1000/);
+    expect(screen.getByTestId("quota-stubs").textContent).toMatch(/12\s*\/\s*1000/);
+    expect(screen.getByTestId("quota-flow-entries").textContent).toMatch(/4201\s*\/\s*100000/);
+  });
+
+  // Issue #372. Absence of `usage` means the response did not carry it; it does NOT mean the tenant
+  // uses nothing. Rendering `0` would answer a question the body never answered — the same
+  // absent-vs-zero distinction the stub-count and numberOfRequests cells already keep straight.
+  it("renders an absent usage figure as unknown, never as zero", async () => {
+    stubFetch({ [TENANTS]: { json: TENANT_ROWS } });
+    renderInApp(<Admin tab="tenants" tenant="acme" />, {
+      whoami: whoamiWith("fleet-admin", ["acme"]),
+      tenant: "acme",
+    });
+    await waitFor(() => expect(screen.getAllByTestId("tenant-row").length).toBe(1));
+
+    const imposters = screen.getByTestId("quota-imposters").textContent ?? "";
+    expect(imposters).toContain("/ 1000");
+    expect(imposters).not.toMatch(/(^|[^\d])0\s*\//);
+  });
+
+  // Issue #372 publishes these three, so the panel must stop advertising them as pending.
+  it("no longer links the quota cells to #372", async () => {
+    stubFetch({
+      [TENANTS]: {
+        json: [
+          { ...TENANT_ROWS[0], usage: { imposters: 3, stubsPerImposter: 12, flowEntries: 4201 } },
+        ],
+      },
+    });
+    const { container } = renderInApp(<Admin tab="tenants" tenant="acme" />, {
+      whoami: whoamiWith("fleet-admin", ["acme"]),
+      tenant: "acme",
+    });
+    await waitFor(() => expect(screen.getAllByTestId("tenant-row").length).toBe(1));
+
+    const issueLinks = [...container.querySelectorAll("a.issue")]
+      .map((a) => a.textContent ?? "")
+      .join(" ");
+    expect(issueLinks).not.toMatch(/#372\b/);
+  });
+
+  // `flowEntries` is gathered by a fleet fan-out (#372); `imposters` and `stubsPerImposter` are
+  // not — they come straight off the replicated config set — so only the flow-entries cell may
+  // ever carry the partial affordance, and only when the server actually stamps the header.
+  it("marks_a_partial_flow_entry_count_as_a_floor_not_a_total", async () => {
+    stubFetch({
+      [TENANTS]: {
+        json: [
+          { ...TENANT_ROWS[0], usage: { imposters: 3, stubsPerImposter: 12, flowEntries: 4201 } },
+        ],
+        headers: { "rift-cluster-partial": "true" },
+      },
+    });
+    renderInApp(<Admin tab="tenants" tenant="acme" />, {
+      whoami: whoamiWith("fleet-admin", ["acme"]),
+      tenant: "acme",
+    });
+    await waitFor(() => expect(screen.getAllByTestId("tenant-row").length).toBe(1));
+
+    // Not the plain `/4201\s*\/\s*100000/` match the sibling tests use: the
+    // badge's own text sits between the number and the limit, so the number
+    // and the limit are asserted separately instead of as one contiguous run.
+    const flowEntries = screen.getByTestId("quota-flow-entries");
+    expect(flowEntries.textContent).toContain("4201");
+    expect(flowEntries.textContent).toMatch(/100000/);
+    expect(flowEntries.querySelector(".badge")).toBeTruthy();
+    expect(screen.getByTestId("quota-imposters").querySelector(".badge")).toBeNull();
+    expect(screen.getByTestId("quota-stubs").querySelector(".badge")).toBeNull();
+  });
+
+  it("does not mark the flow entry count partial when the server did not stamp the header", async () => {
+    stubFetch({
+      [TENANTS]: {
+        json: [
+          { ...TENANT_ROWS[0], usage: { imposters: 3, stubsPerImposter: 12, flowEntries: 4201 } },
+        ],
+      },
+    });
+    renderInApp(<Admin tab="tenants" tenant="acme" />, {
+      whoami: whoamiWith("fleet-admin", ["acme"]),
+      tenant: "acme",
+    });
+    await waitFor(() => expect(screen.getAllByTestId("tenant-row").length).toBe(1));
+
+    expect(screen.getByTestId("quota-flow-entries").querySelector(".badge")).toBeNull();
+  });
 });
 
 describe("audit viewer", () => {

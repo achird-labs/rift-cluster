@@ -1474,6 +1474,33 @@ export interface components {
             /** Format: int64 */
             createdAtSecs?: number;
             deleted?: boolean;
+            usage?: components["schemas"]["QuotaUsage"];
+        };
+        /**
+         * @description What this tenant is currently using against each of its `quotas` (issue #372). A limit is a fact about configuration; usage is a fact about the fleet, and only the second one changes.
+         *
+         *     **A point-in-time reading, not a guarantee.** Quota enforcement happens at *apply*, not at submit, so a parked write is judged against the quota as it stands on replay. These figures say what was true when the read was served, and nothing about whether the next write will be admitted.
+         *
+         *     Every field is present and zero for a tenant holding nothing — absent would mean "not reported", which is a different fact.
+         */
+        QuotaUsage: {
+            /** @description How many imposters this tenant holds, counted from the replicated config set. Exact: it is the same set `maxImposters` is enforced against at apply. */
+            imposters: number;
+            /**
+             * @description The stub count of this tenant's **largest single imposter** — not the sum across its imposters.
+             *
+             *     `maxStubsPerImposter` is a per-imposter limit, so the worst single imposter is the only reading against which `used / limit` means anything. A tenant-wide sum would render `5000 / 1000` while nothing was over quota at all.
+             */
+            stubsPerImposter: number;
+            /**
+             * Format: int64
+             * @description Live flow-state entries held on this tenant's imposter ports, summed across the fleet. Unlike the two above this is **not** read from the replicated config set: flow state is sharded per node and volatile (TTL and whole-flow LRU shedding), so it is gathered by a fan-out to every node. `Rift-Cluster-Partial` marks a response where a peer could not be reached inside the budget — the sum is then of the nodes that answered: a floor, not a total.
+             *
+             *     **Fleet-scoped flows are counted against no tenant.** A flow under `contextScope: "fleet"` is shared by construction, so charging it to every tenant would double-count it and charging it to one would be arbitrary. Only imposter-scoped flows, on ports this tenant owns, are counted here.
+             *
+             *     ⚠️ **`maxFlowEntries` currently enforces nothing.** Unlike the other two quotas it is checked on no write path, so this figure is reported against a ceiling that refuses nothing today. It is a observability reading, not a budget.
+             */
+            flowEntries: number;
         };
         /** @description All three fields are required when `quotas` is present. `Quotas` carries no `serde(default)` on the struct or on any field, so a present-but-partial object fails deserialization with `missing field` and answers `400` — only an entirely absent `quotas` is defaulted (`TenantBody.quotas` is `serde(default)`). */
         Quotas: {
@@ -3959,6 +3986,7 @@ export interface operations {
             /** @description Every tenant. */
             200: {
                 headers: {
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -4045,6 +4073,7 @@ export interface operations {
             /** @description The tenant. */
             200: {
                 headers: {
+                    "Rift-Cluster-Partial": components["headers"]["RiftClusterPartial"];
                     [name: string]: unknown;
                 };
                 content: {

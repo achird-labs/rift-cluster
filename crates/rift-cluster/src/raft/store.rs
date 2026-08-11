@@ -54,7 +54,7 @@
 //! fatal to the node, and that is the correct severity for a log that can no
 //! longer be applied.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
@@ -82,7 +82,7 @@ use super::TypeConfig;
 use crate::control::{
     self, AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
     FLEET_SCOPE, OnDrift, PreconditionTarget, Principal, Quotas, Role, SessionKey, SourceMode,
-    SourceProvenance, StubEdit, StubEditScript, Tenant, TenantId,
+    SourceProvenance, StubEdit, StubEditScript, Tenant, TenantConfigUsage, TenantId,
 };
 use crate::stores::journal::ClusterJournal;
 
@@ -1587,6 +1587,67 @@ impl RedbStateMachine {
             out.push(tenant);
         }
         Ok(out)
+    }
+
+    /// Every tenant's config-table usage (issue #372), in **one** scan of
+    /// `sm_configs` — not one scan per tenant. `GET /admin/tenants` needs every
+    /// listed tenant's usage in the same response, and a per-tenant scan there
+    /// would turn a page of N tenants into N full-table scans (the listing's
+    /// AC7); this builds the whole map from a single pass instead, the same way
+    /// [`Self::desired_configs`] builds its whole engine-desired set from one.
+    ///
+    /// A row that will not parse is skipped for this tenant's usage rather than
+    /// aborting the whole map: unlike [`Self::desired_configs`] (which drives
+    /// the engine and must not silently shrink what it tears down), a usage
+    /// figure is advisory, and one corrupt imposter must not blank out every
+    /// other tenant's numbers. It is still loud — logged at `error` — so the
+    /// corruption itself is not silently lost, and [`TenantConfigUsage::incomplete`]
+    /// carries the fact forward into the response as `Rift-Cluster-Partial`
+    /// rather than letting the skip quietly shrink `imposters`/`max_stubs`
+    /// with nothing to say so. The skip has a second-order effect worth
+    /// naming too: a skipped row's port never reaches `ports`, so that
+    /// imposter's flow entries also vanish from the flow-entry fan-out
+    /// (`FlowNet::fleet_entry_counts` is only ever asked about ports this map
+    /// reports) — one corrupt row understates two figures, not one.
+    #[allow(clippy::result_large_err)]
+    pub fn tenant_config_usage(&self) -> StorageResult<HashMap<String, TenantConfigUsage>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut usage: HashMap<String, TenantConfigUsage> = HashMap::new();
+        for item in table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (tenant, port) = key.value();
+            let stored: StoredImposter = match serde_json::from_str(value.value()) {
+                Ok(stored) => stored,
+                Err(e) => {
+                    tracing::error!(tenant, port, error = %e, "corrupt stored imposter; excluded from usage");
+                    usage.entry(tenant.to_owned()).or_default().incomplete = true;
+                    continue;
+                }
+            };
+            let config: ImposterConfig = match serde_json::from_str(&stored.config_json) {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::error!(tenant, port, error = %e, "corrupt stored config; excluded from usage");
+                    usage.entry(tenant.to_owned()).or_default().incomplete = true;
+                    continue;
+                }
+            };
+            let entry = usage.entry(tenant.to_owned()).or_default();
+            entry.imposters = entry.imposters.saturating_add(1);
+            let stubs = u32::try_from(config.stubs.len()).unwrap_or(u32::MAX);
+            entry.max_stubs = entry.max_stubs.max(stubs);
+            entry.ports.push(port);
+        }
+        Ok(usage)
     }
 
     /// Every principal bound to `tenant`, with the role each holds there,
@@ -10378,6 +10439,114 @@ mod tests {
             sm.owning_tenant(19099).expect("read"),
             None,
             "an unconfigured port owns nothing"
+        );
+    }
+
+    /// `tenant_config_usage` builds every tenant's usage from **one** call —
+    /// not one scan per tenant (issue #372, AC7). A single `sm.tenant_config_usage()`
+    /// here must already carry the right imposter count, the right ports, and
+    /// the right worst-single-imposter stub count for every tenant at once;
+    /// there is no second call this test could make that a per-tenant-scan
+    /// implementation would need and a single-scan one would not.
+    #[tokio::test]
+    async fn the_listing_scans_the_config_table_once() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(
+            1,
+            put_in(1, "acme", 19051, json!([{"id": "s1"}, {"id": "s2"}])),
+        )])
+        .await
+        .expect("apply acme imposter 1");
+        sm.apply(vec![entry(
+            2,
+            put_in(
+                2,
+                "acme",
+                19052,
+                json!([{"id": "s1"}, {"id": "s2"}, {"id": "s3"}, {"id": "s4"}, {"id": "s5"},
+                       {"id": "s6"}, {"id": "s7"}]),
+            ),
+        )])
+        .await
+        .expect("apply acme imposter 2");
+        sm.apply(vec![entry(
+            3,
+            put_in(3, "globex", 19053, json!([{"id": "only"}])),
+        )])
+        .await
+        .expect("apply globex imposter");
+
+        let usage = sm.tenant_config_usage().expect("one-scan usage");
+
+        let acme = usage.get("acme").expect("acme present");
+        assert_eq!(acme.imposters, 2, "acme holds two imposters");
+        assert_eq!(
+            acme.max_stubs, 7,
+            "the worst imposter (7 stubs), not the sum (9)"
+        );
+        let mut acme_ports = acme.ports.clone();
+        acme_ports.sort_unstable();
+        assert_eq!(acme_ports, vec![19051, 19052]);
+
+        let globex = usage.get("globex").expect("globex present, same call");
+        assert_eq!(globex.imposters, 1);
+        assert_eq!(globex.max_stubs, 1);
+        assert_eq!(globex.ports, vec![19053]);
+
+        assert!(
+            !usage.contains_key("unconfigured-tenant"),
+            "a tenant with no config rows has no entry, not a zeroed one"
+        );
+    }
+
+    /// Issue #372: a corrupt `sm_configs` row must not silently shrink
+    /// `imposters`/`max_stubs`/`ports` with nothing to say so — the skip has
+    /// to leave a mark `dispatch` can turn into `Rift-Cluster-Partial`.
+    #[tokio::test]
+    async fn a_corrupt_config_row_marks_the_tenant_usage_partial() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(
+            1,
+            put_in(1, "acme", 19061, json!([{"id": "a"}, {"id": "b"}])),
+        )])
+        .await
+        .expect("apply acme's readable imposter");
+        // A second, corrupt row for acme — bypassing validation, since the
+        // broken-record path is unreachable through the public API.
+        sm.inject_raw_config("acme", 19062, "not json");
+        // A wholly separate tenant, readable end to end, to prove one
+        // tenant's corruption does not spill onto another's figures.
+        sm.apply(vec![entry(
+            2,
+            put_in(2, "globex", 19063, json!([{"id": "only"}])),
+        )])
+        .await
+        .expect("apply globex's readable imposter");
+
+        let usage = sm
+            .tenant_config_usage()
+            .expect("a corrupt row must not fail the scan");
+
+        let acme = usage.get("acme").expect("acme present");
+        assert_eq!(
+            acme.imposters, 1,
+            "the corrupt row is excluded from the count, not counted as one"
+        );
+        assert_eq!(
+            acme.ports,
+            vec![19061],
+            "the corrupt row's port never reaches `ports`"
+        );
+        assert!(
+            acme.incomplete,
+            "a skipped row must mark this tenant's usage incomplete, not just log and move on"
+        );
+
+        let globex = usage.get("globex").expect("globex present");
+        assert_eq!(globex.imposters, 1);
+        assert!(
+            !globex.incomplete,
+            "a tenant with no corrupt rows of its own must not inherit another tenant's flag"
         );
     }
 

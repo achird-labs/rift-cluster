@@ -9,11 +9,14 @@
 //! surface for them existed — these tests use the surface itself, which is
 //! what this slice adds.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use rift_cluster::control::{FLEET_SCOPE, PrincipalId, Quotas, Role, argon2_verifications};
+use rift_cluster::stores::{ClusteredFlowStoreProvider, FlowNet};
 use rift_cluster::{ControlOp, ControlRequest, RaftNode, TenantId};
+use rift_cluster_base::seams::{FlowStoreProvider, ImposterConfig};
 use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose::{self, ComposedServer};
 use serde_json::{Value, json};
@@ -1542,6 +1545,333 @@ async fn a_tenant_admin_cannot_rename_the_fleet() {
         None,
         "the refused write must not have named the fleet"
     );
+
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #372: `usage` alongside `quotas` on `GET /admin/tenants[/:id]`.
+// ---------------------------------------------------------------------------
+
+/// A minimal imposter with `stub_count` stubs — every other test file in this
+/// crate keeps its own local copy of a `minimal_imposter`-shaped helper
+/// (`rbac.rs`, `write_path.rs`, `fleet_journal.rs`) rather than sharing one
+/// through `common`; this follows that precedent, with a stub count because
+/// the "worst imposter, not the sum" test needs to vary it.
+fn imposter_with_stubs(port: u16, stub_count: usize) -> Value {
+    let stubs: Vec<Value> = (0..stub_count)
+        .map(|i| {
+            json!({
+                "id": format!("s{i}"),
+                "responses": [{ "is": { "statusCode": 200, "body": "hi" } }],
+            })
+        })
+        .collect();
+    json!({
+        "port": port,
+        "protocol": "http",
+        "stubs": stubs,
+    })
+}
+
+/// Commit an imposter with `stub_count` stubs, in `tenant`, at `port` — the
+/// config-table half of usage (`imposters`, `stubsPerImposter`).
+async fn put_imposter(
+    node: &RaftNode,
+    op_id: &mut u128,
+    tenant: &str,
+    port: u16,
+    stub_count: usize,
+) {
+    seed(
+        node,
+        *op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::new(tenant),
+            config: Box::new(
+                serde_json::from_value(imposter_with_stubs(port, stub_count))
+                    .expect("config parses"),
+            ),
+        },
+    )
+    .await;
+    *op_id += 1;
+}
+
+/// Write `n` flow entries through the real clustered store face
+/// (`ClusteredFlowStoreProvider`/`FlowStore`) — the exact seam a script's
+/// `ctx.state` call reaches (`crates/rift-cluster/tests/flow_store.rs` drives
+/// the same seam). Exercising this through real HTTP stub/script traffic
+/// would test the script engine, not the usage rollup this feature adds.
+async fn write_flow_entries(
+    flow_net: &Arc<FlowNet>,
+    config: &ImposterConfig,
+    flow_id: &str,
+    n: usize,
+) {
+    let store = ClusteredFlowStoreProvider::new(Arc::clone(flow_net))
+        .provide(config)
+        .expect("the clustered provider always provides");
+    let flow_id = flow_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        for i in 0..n {
+            store
+                .set(&flow_id, &format!("k{i}"), json!({ "i": i }))
+                .expect("flow write");
+        }
+    })
+    .await
+    .expect("blocking flow write");
+}
+
+/// Same shape as [`imposter_with_stubs`], but scoped `fleet` (#152) — the
+/// prefix under which its flow entries are charged to no tenant.
+fn fleet_scoped_config(port: u16) -> ImposterConfig {
+    let mut value = imposter_with_stubs(port, 1);
+    value["_rift"] = json!({ "flowState": { "contextScope": "fleet" } });
+    serde_json::from_value(value).expect("config parses")
+}
+
+fn imposter_config(port: u16) -> ImposterConfig {
+    serde_json::from_value(imposter_with_stubs(port, 1)).expect("config parses")
+}
+
+/// `usage.imposters` on the admin surface counts only the addressed tenant's
+/// own config rows — a second tenant's imposters must be invisible both ways.
+#[tokio::test]
+async fn tenant_usage_counts_only_its_own_imposters() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "usage-own-imposters";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+    create_tenant(&client, &admin, fleet_key, "globex").await;
+
+    put_imposter(node, &mut op_id, "acme", 21001, 1).await;
+    put_imposter(node, &mut op_id, "acme", 21002, 1).await;
+    put_imposter(node, &mut op_id, "globex", 21003, 1).await;
+
+    let acme = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/tenants/acme"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read acme"),
+    )
+    .await;
+    let body: Value = serde_json::from_str(&acme.body).expect("json");
+    assert_eq!(body["usage"]["imposters"], 2, "{acme}");
+
+    let globex = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/tenants/globex"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read globex"),
+    )
+    .await;
+    let body: Value = serde_json::from_str(&globex.body).expect("json");
+    assert_eq!(
+        body["usage"]["imposters"], 1,
+        "globex must not see acme's imposters: {globex}"
+    );
+
+    server.shutdown().await;
+}
+
+/// `usage.stubsPerImposter` is the **worst** single imposter's stub count, not
+/// the sum — the test that fails if someone implements it as a sum.
+#[tokio::test]
+async fn stubs_usage_is_the_worst_single_imposter_not_the_sum() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "usage-worst-not-sum";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+
+    put_imposter(node, &mut op_id, "acme", 21011, 3).await;
+    put_imposter(node, &mut op_id, "acme", 21012, 7).await;
+
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/tenants/acme"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read acme"),
+    )
+    .await;
+    let body: Value = serde_json::from_str(&seen.body).expect("json");
+    assert_eq!(
+        body["usage"]["stubsPerImposter"], 7,
+        "must report the worst imposter (7), not the sum (10): {seen}"
+    );
+
+    server.shutdown().await;
+}
+
+/// `usage.flowEntries` counts flow-state entries written on the tenant's own
+/// imposter ports.
+#[tokio::test]
+async fn flow_entry_usage_counts_entries_on_the_tenants_ports() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let flow_net = server.flow_net().expect("clustered").clone();
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "usage-flow-entries";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+    put_imposter(node, &mut op_id, "acme", 21021, 1).await;
+
+    write_flow_entries(&flow_net, &imposter_config(21021), "cart", 5).await;
+
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/tenants/acme"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read acme"),
+    )
+    .await;
+    let body: Value = serde_json::from_str(&seen.body).expect("json");
+    assert_eq!(
+        body["usage"]["flowEntries"], 5,
+        "the 5 keys written on the tenant's own imposter must be counted: {seen}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Fleet-scoped (`f:`) flow entries are shared by construction and must be
+/// charged to no tenant — neither the imposter they were written against, nor
+/// any other.
+#[tokio::test]
+async fn fleet_scoped_flows_are_charged_to_no_tenant() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let flow_net = server.flow_net().expect("clustered").clone();
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "usage-fleet-scope-excluded";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+    create_tenant(&client, &admin, fleet_key, "globex").await;
+    put_imposter(node, &mut op_id, "acme", 21031, 1).await;
+    put_imposter(node, &mut op_id, "globex", 21032, 1).await;
+
+    // Genuine imposter-scoped traffic on acme's own port, so this test also
+    // proves the fleet-scoped writes below did not just zero out everything.
+    write_flow_entries(&flow_net, &imposter_config(21031), "cart", 3).await;
+    // Fleet-scoped: the `f:` prefix carries no port, so this is charged to no
+    // tenant regardless of which imposter's config built the store.
+    write_flow_entries(&flow_net, &fleet_scoped_config(21031), "shared-session", 4).await;
+
+    let acme = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/tenants/acme"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read acme"),
+    )
+    .await;
+    let body: Value = serde_json::from_str(&acme.body).expect("json");
+    assert_eq!(
+        body["usage"]["flowEntries"], 3,
+        "acme must see only its own 3 imposter-scoped entries, not the 4 fleet-scoped ones: {acme}"
+    );
+
+    let globex = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/tenants/globex"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read globex"),
+    )
+    .await;
+    let body: Value = serde_json::from_str(&globex.body).expect("json");
+    assert_eq!(
+        body["usage"]["flowEntries"], 0,
+        "globex must not be charged for the fleet-scoped entries either: {globex}"
+    );
+
+    server.shutdown().await;
+}
+
+/// A tenant holding nothing reads `0`/`0`/`0` — present, not absent, not an
+/// error.
+#[tokio::test]
+async fn an_empty_tenant_reports_zero_usage() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "usage-empty-tenant";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/tenants/acme"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("read acme"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "{seen}");
+    let body: Value = serde_json::from_str(&seen.body).expect("json");
+    assert!(
+        body.get("usage").is_some(),
+        "usage must be present, not omitted: {seen}"
+    );
+    assert_eq!(body["usage"]["imposters"], 0, "{seen}");
+    assert_eq!(body["usage"]["stubsPerImposter"], 0, "{seen}");
+    assert_eq!(body["usage"]["flowEntries"], 0, "{seen}");
 
     server.shutdown().await;
 }

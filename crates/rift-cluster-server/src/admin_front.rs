@@ -78,7 +78,7 @@ use rift_cluster::decorate::{
     HEADER_TRUNCATED, HEADER_WARNINGS,
 };
 use rift_cluster::stores::{
-    ContextScope, Coverage, FleetCursor, FleetTailEvent, FlowConfig, IdPolicy, JoinMode,
+    ContextScope, Coverage, FleetCursor, FleetTailEvent, FlowConfig, FlowNet, IdPolicy, JoinMode,
     JournalCursor, JournalNet, ResolvedKnobs,
 };
 use rift_cluster::{
@@ -169,6 +169,10 @@ pub struct FrontConfig {
     /// `numberOfRequests` decoration, and the transitional `DELETE savedRequests` fan-out all
     /// reach the fleet through it.
     pub journal_net: Arc<JournalNet>,
+    /// The flow-state subsystem (issue #372): `GET /admin/tenants` and
+    /// `GET /admin/tenants/:id` reach it through `tenancy::dispatch` to fan out
+    /// `numberOfFlowEntries`.
+    pub flow_net: Arc<FlowNet>,
     /// How many imposters one fleet journal answer may cover (issue #362).
     ///
     /// A cap exists because the resumption token carries a row per covered port and rides a
@@ -296,6 +300,8 @@ struct FrontState {
     puller: Arc<SourcePuller>,
     /// See [`FrontConfig::journal_net`].
     journal_net: Arc<JournalNet>,
+    /// See [`FrontConfig::flow_net`].
+    flow_net: Arc<FlowNet>,
     /// See [`FrontConfig::fleet_journal_port_cap`].
     fleet_journal_port_cap: usize,
     /// Streams proxied requests through unchanged (SSE included).
@@ -328,6 +334,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         readiness: config.readiness,
         puller: config.puller,
         journal_net: config.journal_net,
+        flow_net: config.flow_net,
         fleet_journal_port_cap: config.fleet_journal_port_cap,
         proxy: Client::builder(TokioExecutor::new()).build_http(),
         fetch: Client::builder(TokioExecutor::new()).build_http(),
@@ -4704,7 +4711,10 @@ async fn terminate_tenancy(
         authorized_tenant,
         bindings,
         state.export_status.as_deref(),
-    ) {
+        &state.flow_net,
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(tenancy::TenancyError::BadRequest(reason)) => {
             return typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &reason);
@@ -4717,9 +4727,17 @@ async fn terminate_tenancy(
     };
 
     let (op, status, rendered) = match outcome {
-        tenancy::Outcome::Body { status, body } => {
-            return buffered_response(status, Bytes::from(body), json_content_type())
+        tenancy::Outcome::Body {
+            status,
+            body,
+            partial,
+        } => {
+            let mut response = buffered_response(status, Bytes::from(body), json_content_type())
                 .unwrap_or_else(|response| response);
+            if partial {
+                set_header(&mut response, HEADER_PARTIAL, "true");
+            }
+            return response;
         }
         tenancy::Outcome::Commit { op, status, then } => (op, status, then),
     };
@@ -6854,6 +6872,12 @@ mod tests {
                     rift_cluster_base::seams::SourceRegistry::default(),
                 )),
                 journal_net: JournalNet::new(Arc::clone(&journal)),
+                // In-memory and never bound to `node`'s ring: nothing in this file's
+                // tests exercises `/admin/tenants`'s flow-entry fan-out, so this only
+                // needs to satisfy `FrontConfig`'s required field.
+                flow_net: FlowNet::new(rift_cluster::stores::FlowShard::in_memory(
+                    rift_cluster::stores::ShardConfig::default(),
+                )),
                 fleet_journal_port_cap: rift_cluster::stores::DEFAULT_FLEET_JOURNAL_PORT_CAP,
             },
             &node,
