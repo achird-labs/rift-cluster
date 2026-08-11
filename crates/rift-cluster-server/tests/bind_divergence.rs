@@ -439,3 +439,149 @@ async fn the_node_rebinds_and_clears_the_failure_once_the_port_frees_up() {
 
     server.shutdown().await;
 }
+
+/// `GET /_fleet/members` off the admin port — the projection the console actually reads (#361).
+///
+/// No credential: these tests create no principal, so the admin plane is still in its
+/// open-bootstrap state.
+async fn fleet_members(server: &ComposedServer) -> serde_json::Value {
+    let admin = server.admin_addr();
+    let seen = Seen::of(
+        reqwest::get(format!("http://{admin}/_fleet/members"))
+            .await
+            .expect("GET /_fleet/members"),
+    )
+    .await;
+    assert_eq!(seen.status, 200, "{seen}");
+    seen.json().clone()
+}
+
+/// The read half of #369: the fleet projection names the port this node could not bind, and does
+/// **not** list it among the ports it is holding.
+///
+/// Both halves are asserted because either alone would pass a wrong implementation. Reporting the
+/// failure while still listing the port as bound is the contradiction the console would resolve by
+/// whichever branch it happened to test first.
+#[tokio::test]
+async fn fleet_members_reports_the_port_this_node_could_not_bind() {
+    let port = reserve_port();
+    let blocker = squat(port).await;
+
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+
+    let created = Seen::of(
+        reqwest::Client::new()
+            .post(format!("http://{admin}/imposters"))
+            .json(&imposter(port, "served-while-unbound"))
+            .send()
+            .await
+            .expect("post imposter"),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{created}");
+    assert!(reports_bind_failure(&server, port), "the bind did fail");
+
+    let body = fleet_members(&server).await;
+
+    let reason = body
+        .get("bind_failures")
+        .and_then(|f| f.get(port.to_string()))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the projection names the failed port: {body}"));
+    assert!(
+        !reason.is_empty(),
+        "the failure carries the reason the operator needs: {body}"
+    );
+
+    let bound = body
+        .get("bound_ports")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("bound_ports is present on a node that read its config: {body}"));
+    assert!(
+        !bound.contains(&serde_json::json!(port)),
+        "a port whose bind failed must not also be listed as held: {body}"
+    );
+
+    assert_eq!(
+        body.get("bind_status_unavailable"),
+        Some(&serde_json::Value::Bool(false)),
+        "this node read its own config, so the unavailable flag must say so: {body}"
+    );
+
+    // The same facts on this node's own `members[]` row, which is what the console reads
+    // per node. A field that reaches only the top level renders nothing in the panel.
+    let row = body
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rows| rows.first())
+        .unwrap_or_else(|| panic!("the solo node has a members row: {body}"));
+    assert_eq!(
+        row.get("bind_failures")
+            .and_then(|f| f.get(port.to_string()))
+            .and_then(serde_json::Value::as_str),
+        Some(reason),
+        "the member row carries the same failure as the top level: {body}"
+    );
+
+    drop(blocker);
+    server.shutdown().await;
+}
+
+/// The half that makes the panel readable rather than merely alarming: a healthy imposter is
+/// **positively** listed as bound.
+///
+/// This is the test the whole wire shape exists for. If the projection carried only failures, the
+/// console would have to infer "not failed ⇒ bound" — and `bind_failure(p).is_none()` is equally
+/// true for a port the node has never heard of, so a node that had not applied the imposter at all
+/// would render as healthy. `is_locally_bound`'s own doc comment warns against exactly that
+/// inference; this test is what stops the implementation from taking the cheaper shape.
+#[tokio::test]
+async fn a_healthy_imposter_is_positively_listed_as_bound() {
+    let port = reserve_port();
+
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+
+    let created = Seen::of(
+        reqwest::Client::new()
+            .post(format!("http://{admin}/imposters"))
+            .json(&imposter(port, "bound-and-well"))
+            .send()
+            .await
+            .expect("post imposter"),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{created}");
+    assert!(
+        !reports_bind_failure(&server, port),
+        "nothing is squatting the port, so the bind must have succeeded"
+    );
+
+    let body = fleet_members(&server).await;
+
+    let bound = body
+        .get("bound_ports")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("bound_ports is present: {body}"));
+    assert!(
+        bound.contains(&serde_json::json!(port)),
+        "a bound port is named, not merely left out of the failure map: {body}"
+    );
+
+    assert_eq!(
+        body.get("bind_failures"),
+        Some(&serde_json::json!({})),
+        "a healthy node reports an empty failure map, which is a different claim from `null`: {body}"
+    );
+
+    server.shutdown().await;
+}

@@ -47,6 +47,8 @@ export function ImposterFilters({
   total,
   unclassified,
   showOwner,
+  bindFilterAvailable,
+  bindUnclassified,
 }: {
   query: ImposterQuery;
   onChange: (query: ImposterQuery) => void;
@@ -60,6 +62,14 @@ export function ImposterFilters({
    * wearing the clothes of a real one.
    */
   showOwner: boolean;
+  /**
+   * Whether this session holds `fleet.read` (#369). Without it there is no bind reading to filter
+   * on, so the pill stays in its pending form rather than silently filtering nothing — the same
+   * reasoning `showOwner` above follows for the provenance filter.
+   */
+  bindFilterAvailable: boolean;
+  /** Rows the bind filter excluded because their verdict is `"unknown"`, not because it is clean. */
+  bindUnclassified: number;
 }): ReactNode {
   const filtered = shown !== total;
 
@@ -167,12 +177,30 @@ export function ImposterFilters({
         >
           Paused
         </button>
-        {/* The design's fourth pill. Whether an imposter's listener came up is not reported per
-            node (#370), so this states the gap rather than offering a filter that cannot filter. */}
-        <span className="pill-filter is-pending">
-          Bind failures{" "}
-          <Pending issue={370} reason="Per-node bind status is not reported, so the console cannot tell which imposters failed to bind anywhere." />
-        </span>
+        {/* The design's fourth pill (#369). Real once this session holds `fleet.read` — without it
+            there is no bind reading to filter on, and the pill says so rather than filtering
+            nothing, the same rule `showOwner` follows for provenance above. */}
+        {bindFilterAvailable ? (
+          <button
+            type="button"
+            className="pill-filter"
+            data-testid="quick-bind-failures"
+            aria-pressed={query.bind === "failed"}
+            onClick={() =>
+              onChange({ ...query, bind: query.bind === "failed" ? "all" : "failed" })
+            }
+          >
+            Bind failures
+          </button>
+        ) : (
+          <span className="pill-filter is-pending">
+            Bind failures{" "}
+            <Pending
+              issue={369}
+              reason="The fleet projection is out of scope for this principal, so the console cannot tell which imposters failed to bind anywhere."
+            />
+          </span>
+        )}
       </div>
 
       <span className="muted" data-testid="imposter-filter-count" aria-live="polite">
@@ -195,6 +223,18 @@ export function ImposterFilters({
         <span className="warn-text" data-testid="imposter-filter-unclassified">
           {unclassified} not shown: this node’s list did not include their stubs, so whether they
           are recording is unknown.
+        </span>
+      ) : null}
+
+      {/*
+        Same idiom as the recording filter's note above, for the bind filter (#369). A row whose
+        `bindVerdict` is `"unknown"` is excluded from "Bind failures" exactly as a genuinely bound
+        one is — the two must not be told apart by silence.
+      */}
+      {bindUnclassified > 0 ? (
+        <span className="warn-text" data-testid="imposter-filter-bind-unclassified">
+          {bindUnclassified} not shown: bind status could not be confirmed for every voter, so
+          whether they are failing is unknown.
         </span>
       ) : null}
     </div>

@@ -74,7 +74,7 @@ flowchart TB
 
 | Endpoint | Answers |
 |---|---|
-| `GET /_cluster/members` | roster: id, address, voter/learner, Ready, applied index |
+| `GET /_cluster/members` | roster: id, address, voter/learner, Ready, applied index; plus this node's own `bound_ports` / `bind_failures` (Chapter 2 divergence) |
 | `GET /_cluster/config` | per port: revision @ every node, `converged: bool` — the CI wait target |
 | `GET /_cluster/imposters` | per-(port, node) bind status (Chapter 2 divergence) |
 | `GET /_cluster/ring?key=…` | computed owner + m_idx — "who owns this flow right now" |

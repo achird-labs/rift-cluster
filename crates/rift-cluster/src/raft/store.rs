@@ -1904,6 +1904,43 @@ impl RedbStateMachine {
         })
     }
 
+    /// Every port this node's engine holds, split by whether it actually got the socket (issue
+    /// #369, blocker B4). `None` when there is no local engine — this node cannot observe binds at
+    /// all, which is a different claim from "it observed nothing wrong".
+    ///
+    /// A single in-memory pass over [`ImposterManager::list_imposters`], not a redb transaction:
+    /// `/_cluster/members` (and therefore `/_fleet/members`) used to derive this from
+    /// `configured_ports`, a redb read transaction scanning the fleet-wide `SM_CONFIGS` table and
+    /// allocating a `TenantId` per row — turning a 5-second console poll, fanned out to every peer,
+    /// into an O(all imposters in the fleet) table scan on every node. The engine already holds
+    /// exactly the set this needs, in memory, so this walks that instead.
+    ///
+    /// The same narrowing [`Self::bind_failure`] documents applies per port: a port the engine
+    /// holds and has bound goes in `bound_ports`; a port it holds, has not bound, and has a
+    /// recorded failure for goes in the failure map (never the general `apply_failures` failure —
+    /// a parse, cert, or stub-patch failure must not be mislabelled as a bind failure); a port the
+    /// engine does not hold at all — never applied on this node — lands in **neither** collection.
+    /// `is_bound()` is tested first, so the two collections stay disjoint by construction, the same
+    /// invariant `bind_failure`/`is_locally_bound` rest on.
+    #[must_use]
+    pub fn local_bind_report(&self) -> Option<(Vec<u16>, BTreeMap<u16, String>)> {
+        let engine = self.engine.as_ref()?;
+        let apply_failures = self.apply_failures.lock();
+        let mut bound_ports = Vec::new();
+        let mut failures = BTreeMap::new();
+        for imposter in engine.list_imposters() {
+            let Some(port) = imposter.config.port else {
+                continue;
+            };
+            if imposter.is_bound() {
+                bound_ports.push(port);
+            } else if let Some(reason) = apply_failures.get(&port) {
+                failures.insert(port, reason.clone());
+            }
+        }
+        Some((bound_ports, failures))
+    }
+
     /// Durably park an accepted intent (issue #9 R4). Runs with `Immediate`
     /// durability because this write IS the acceptance boundary: once the
     /// client hears anything other than a hard error, the op must survive a

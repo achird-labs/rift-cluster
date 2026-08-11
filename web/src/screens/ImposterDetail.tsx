@@ -3,7 +3,7 @@ import { Fragment, type FormEvent, type ReactNode, useState } from "react";
 import { ApiError, apiGetText } from "../api/client.ts";
 import type { components } from "../api/schema.ts";
 import { IMPOSTER_COLUMNS, type ImposterColumn } from "../app/contract.ts";
-import type { FleetView } from "../app/fleetView.ts";
+import { type BindState, type FleetView, bindStatus } from "../app/fleetView.ts";
 import {
   type TrySpec,
   useClearRequests,
@@ -16,7 +16,7 @@ import {
 import { useSession } from "../app/session.tsx";
 import { toHash, useHashQuery } from "../app/routing.ts";
 import { DetailRail } from "../components/detailRail.tsx";
-import { Pending, PendingPanel } from "../components/pending.tsx";
+import { Pending } from "../components/pending.tsx";
 import { ImposterField } from "../components/imposterFields.tsx";
 import { Card, Confirm, Empty, ErrorNote, Ident, UNKNOWN, UNNAMED } from "../components/primitives.tsx";
 import {
@@ -181,7 +181,7 @@ export function ImposterDetail({ port }: { port: number }): ReactNode {
           {tab === "requests" ? <RequestLog port={port} /> : null}
 
           {tab === "ownership" ? (
-            <OwnershipTab revision={imposter.data.revision} fleet={fleet.data} />
+            <OwnershipTab port={port} revision={imposter.data.revision} fleet={fleet.data} />
           ) : null}
 
           {tab === "settings" ? (
@@ -266,9 +266,11 @@ function DetailTabs({
  * imposter does not have one, it has as many as it has flows.
  */
 function OwnershipTab({
+  port,
   revision,
   fleet,
 }: {
+  port: number;
   revision: string | null;
   fleet: FleetView | undefined;
 }): ReactNode {
@@ -317,11 +319,21 @@ function OwnershipTab({
         </Card>
 
         <Card title="Bind status per node">
-          <PendingPanel
-            issue={370}
-            reason="Whether this imposter's listener came up is not reported per node. A port can be taken on one node and free on another, so this is a real condition — and a survivable one."
-          />
-          <p className="hint">
+          {fleet === undefined ? (
+            <Pending
+              issue={369}
+              reason="The fleet projection is scoped to fleet.read, and this principal is refused it."
+            />
+          ) : (
+            <ul className="bind-status-list">
+              {[...bindStatus(fleet, port)].map(([nodeId, status]) => (
+                <li key={nodeId} data-testid={`bind-node-${nodeId}`}>
+                  <Ident>{nodeId}</Ident> <BindStatusValue status={status} />
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="hint" data-testid="bind-status-note">
             A node that cannot bind still serves this imposter through the front door — dispatch
             targets the imposter object, not its socket. What a failed bind breaks is the
             direct-to-port path, on that node only.
@@ -331,6 +343,31 @@ function OwnershipTab({
       <DetailRail revision={revision} />
     </div>
   );
+}
+
+/**
+ * One voter's bind row, rendered (#369).
+ *
+ * "Unknown" never mentions bound or binding — `imposter-detail.test.tsx` pins that a node which
+ * did not answer must not read as bound even by accident of wording, so the unreported/unreachable/
+ * not-applied sentences are phrased without the word.
+ */
+function BindStatusValue({ status }: { status: BindState }): ReactNode {
+  if (status.state === "bound") return <span className="status status-ok">Bound</span>;
+  if (status.state === "failed") {
+    return (
+      <span className="status status-bad">
+        Failed &mdash; {status.reason}
+      </span>
+    );
+  }
+  const why =
+    status.why === "unreachable"
+      ? "this node did not answer"
+      : status.why === "unreported"
+        ? "this node has not reported its bind status"
+        : "this node has not applied this imposter's config yet";
+  return <span className="status status-idle">Unknown &mdash; {why}</span>;
 }
 
 /**

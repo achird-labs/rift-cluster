@@ -254,6 +254,7 @@ pub(crate) fn members_body(node: &RaftNode) -> serde_json::Value {
             (None, true)
         }
     };
+    let bind_fields = local_bind_state(node).fields();
     serde_json::json!({
         "node_id": node_id(status.node_id),
         "is_leader": status.is_leader,
@@ -264,7 +265,153 @@ pub(crate) fn members_body(node: &RaftNode) -> serde_json::Value {
         "voters": status.voters.iter().map(node_id).collect::<Vec<_>>(),
         "fleet_name": fleet_name,
         "fleet_name_unavailable": fleet_name_unavailable,
+        // Issue #369: what this node knows about its own listeners. See `BindFields` and
+        // `LocalBindState` for the shape and why it is a positive list, not just a failure map.
+        "bound_ports": bind_fields.bound_ports,
+        "bind_failures": bind_fields.bind_failures,
+        "bind_status_unavailable": bind_fields.bind_status_unavailable,
     })
+}
+
+/// The three bind fields a `members` row carries (issue #369): what a node knows about its own
+/// listeners, or what a caller could learn about a peer's.
+///
+/// One struct rather than three loose values because the three only ever travel together — every
+/// producer below (`LocalBindState::fields`, `BindFields::unknown`, `BindFields::from_reply`) sets
+/// all three at once, and a caller that forgot one would leave a row with two fresh facts and one
+/// stale `null`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct BindFields {
+    pub(crate) bound_ports: serde_json::Value,
+    pub(crate) bind_failures: serde_json::Value,
+    pub(crate) bind_status_unavailable: serde_json::Value,
+}
+
+impl BindFields {
+    /// All three `null`. Used when nothing at all is known: an unreachable peer, or a peer reply
+    /// missing the fields.
+    ///
+    /// Not `{ bound_ports: [], bind_failures: {} }` — an empty `bound_ports` is the claim "this
+    /// node holds no ports", and an empty `bind_failures` is the claim "nothing has failed". Both
+    /// are answers this node has no basis to give about a peer it never heard from; `null` is the
+    /// only encoding that says "no answer" rather than "a reassuring answer".
+    pub(crate) fn unknown() -> BindFields {
+        BindFields {
+            bound_ports: serde_json::Value::Null,
+            bind_failures: serde_json::Value::Null,
+            bind_status_unavailable: serde_json::Value::Null,
+        }
+    }
+
+    /// Read the three bind fields back off a peer's own `/_cluster/members` reply, exactly as
+    /// `merged_members` already does for `last_applied`: a peer's own report is echoed verbatim,
+    /// never recomputed here, because this node has no second opinion about a peer's sockets.
+    ///
+    /// `None`, or a reply missing *any* of the three keys, both fold to [`Self::unknown`] rather
+    /// than `.unwrap_or_default()`-ing the missing ones in isolation. A reply from a node running a
+    /// pre-#369 build omits all three keys and is otherwise a perfectly valid `200` — the exact
+    /// shape `fleet_name_unavailable` (#373) already had to account for — so treating a partial
+    /// read as "the missing fields are empty" would render a peer that has not upgraded yet as a
+    /// peer with nothing bound.
+    pub(crate) fn from_reply(reply: Option<&serde_json::Value>) -> BindFields {
+        let Some(reply) = reply else {
+            return BindFields::unknown();
+        };
+        let (Some(bound_ports), Some(bind_failures), Some(bind_status_unavailable)) = (
+            reply.get("bound_ports"),
+            reply.get("bind_failures"),
+            reply.get("bind_status_unavailable"),
+        ) else {
+            return BindFields::unknown();
+        };
+        BindFields {
+            bound_ports: bound_ports.clone(),
+            bind_failures: bind_failures.clone(),
+            bind_status_unavailable: bind_status_unavailable.clone(),
+        }
+    }
+}
+
+/// What a node can say about its own listeners (issue #369).
+#[derive(Debug)]
+pub(crate) enum LocalBindState {
+    /// This node walked its engine's own imposter set and checked each one's socket.
+    Observed {
+        bound_ports: Vec<u16>,
+        failures: std::collections::BTreeMap<u16, String>,
+    },
+    /// No local engine ([`RaftNode::local_bind_report`] returned `None`), so this node knows
+    /// nothing about any port — not even that a given port is unbound, since it has no engine to
+    /// check against.
+    Unavailable,
+}
+
+impl LocalBindState {
+    /// Render as the three wire fields.
+    pub(crate) fn fields(&self) -> BindFields {
+        match self {
+            LocalBindState::Observed {
+                bound_ports,
+                failures,
+            } => BindFields {
+                bound_ports: serde_json::Value::Array(
+                    bound_ports
+                        .iter()
+                        .copied()
+                        .map(serde_json::Value::from)
+                        .collect(),
+                ),
+                bind_failures: serde_json::Value::Object(
+                    failures
+                        .iter()
+                        .map(|(port, reason)| {
+                            (port.to_string(), serde_json::Value::String(reason.clone()))
+                        })
+                        .collect(),
+                ),
+                bind_status_unavailable: serde_json::Value::Bool(false),
+            },
+            // `null`, never `[]`/`{}`: see `BindFields::unknown` for why an empty answer would be
+            // the wrong-but-quiet one. This differs from `unknown()` only in the third field —
+            // `bind_status_unavailable` is `true` here because *this* node is the one with nothing
+            // to report (no local engine, so no bind observations exist) and can say so, where
+            // `unknown()` is for a peer this node cannot even ask.
+            LocalBindState::Unavailable => BindFields {
+                bound_ports: serde_json::Value::Null,
+                bind_failures: serde_json::Value::Null,
+                bind_status_unavailable: serde_json::Value::Bool(true),
+            },
+        }
+    }
+}
+
+/// What `node` knows about the ports its own engine holds (issue #369, RFC-001 §7.4.6).
+///
+/// `bound_ports` is a **positive** list, not just "every configured port minus the failures" —
+/// `bind_failure(p).is_none()` is equally true for a port this node has never applied at all, and
+/// [`RaftNode::is_locally_bound`]'s own doc comment warns against exactly that inference. Without
+/// the positive list, a peer that never received the imposter (or has no local engine at all) would
+/// have no failure recorded for it and would render as bound.
+///
+/// A port that is neither locally bound nor recorded as a bind failure is in **neither** collection
+/// — that means "not applied on this node", and is deliberately distinct from both "bound" and
+/// "failed to bind".
+///
+/// Built from [`RaftNode::local_bind_report`] — an in-memory pass over the engine's own imposter
+/// set — rather than from [`RaftNode::configured_ports`] (blocker B4). `configured_ports` opens a
+/// redb read transaction that scans the fleet-wide `SM_CONFIGS` table, which made every 5-second
+/// `/_fleet/members` poll from every open console tab, fanned out to every peer, an O(all imposters
+/// in the fleet) table scan; `local_bind_report` answers from memory in one pass over the ports
+/// this node's engine actually holds. `Unavailable` therefore now means "no local engine" — never
+/// "the config read failed", since there is no config read here to fail.
+pub(crate) fn local_bind_state(node: &RaftNode) -> LocalBindState {
+    match node.local_bind_report() {
+        Some((bound_ports, failures)) => LocalBindState::Observed {
+            bound_ports,
+            failures,
+        },
+        None => LocalBindState::Unavailable,
+    }
 }
 
 /// Build the `/_cluster/health` body: readiness plus this node's ring view.
@@ -347,7 +494,60 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::node_id;
+    use std::collections::BTreeMap;
+
+    use super::{BindFields, LocalBindState, node_id};
+
+    /// The healthy shape, asserted against literal JSON rather than against the constructor's own
+    /// output — a round trip through `LocalBindState` would pass for any encoding at all.
+    #[test]
+    fn an_observed_node_lists_the_ports_it_holds_and_the_ports_it_could_not_bind() {
+        let state = LocalBindState::Observed {
+            bound_ports: vec![8080, 8081],
+            failures: BTreeMap::from([(9090, "Address already in use".to_owned())]),
+        };
+
+        assert_eq!(
+            state.fields(),
+            BindFields {
+                bound_ports: serde_json::json!([8080, 8081]),
+                bind_failures: serde_json::json!({ "9090": "Address already in use" }),
+                bind_status_unavailable: serde_json::json!(false),
+            }
+        );
+    }
+
+    /// A node with no local engine cannot observe binds at all, and must say so.
+    ///
+    /// `null`, never `[]`/`{}`: an empty list is the claim "I looked and every port is fine", which
+    /// is exactly the wrong-but-quiet answer — the console would render a confident green row for a
+    /// node that answered nothing. Follows `fleet_name_unavailable` (#373) rather than `.ok()`.
+    ///
+    /// Note the trigger, because it is not a runtime failure: `local_bind_report` reads the
+    /// engine's in-memory imposter set and touches no storage, so there is no config read left to
+    /// fail. `Unavailable` is reached only by a node that has no engine to ask — a static property
+    /// of that node's role, which is why nothing logs an error on this path.
+    #[test]
+    fn a_node_with_no_local_engine_reports_null_not_an_empty_healthy_answer() {
+        assert_eq!(
+            LocalBindState::Unavailable.fields(),
+            BindFields {
+                bound_ports: serde_json::Value::Null,
+                bind_failures: serde_json::Value::Null,
+                bind_status_unavailable: serde_json::json!(true),
+            }
+        );
+    }
+
+    // The "a port is never both bound and failed" invariant used to have a unit test here that
+    // hand-built two disjoint `Vec`/`BTreeMap` literals and asserted them disjoint — never calling
+    // `local_bind_state`, the function whose invariant it claimed to name, so it could not have
+    // caught a regression in it. The real check lives in the wire test
+    // `fleet_members_reports_the_port_this_node_could_not_bind`
+    // (`crates/rift-cluster-server/tests/bind_divergence.rs`), which asserts the failed port is
+    // absent from `bound_ports` against a live bind failure — a literal-constructed unit test
+    // cannot pin this, because the invariant depends on `Imposter::is_bound()` and the engine's own
+    // state, not on anything expressible as two hand-picked collections.
 
     /// The encoding property the whole change rests on: a `u64` id survives verbatim.
     ///

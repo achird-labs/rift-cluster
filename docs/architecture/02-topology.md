@@ -123,6 +123,16 @@ Two port-level details complete the picture:
   `GET /_cluster/imposters` and a `Rift-Cluster-Warnings` header on create),
   and can still serve that imposter via the gateway listener. In L4/port-based
   deployments, per-port LB health checks route around the failed bind.
+
+  Each node also reports its own bind state on the members projection —
+  `bound_ports`, `bind_failures` and `bind_status_unavailable` on
+  `GET /_cluster/members`, merged across voters by `GET /_fleet/members` (#369),
+  which is what lets the console show one row per node for a single imposter
+  without a client-side fan-out. `bound_ports` is a **positive** list on purpose:
+  "not recorded as failed" is equally true of a port a node has never applied, so
+  a node that is silent, unreachable, or running an older build reads as
+  *unknown* rather than as bound. A failed bind is a degraded path, not a failed
+  imposter — dispatch targets the imposter object, not its socket.
 - **Auto-assigned ports** are minted once, by the config leader during the
   write, and fixed in the replicated config — nodes never re-mint on bind
   failure, because the port number is the imposter's identity.

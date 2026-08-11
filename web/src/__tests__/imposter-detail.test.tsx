@@ -189,3 +189,124 @@ describe("imposter detail", () => {
     expect(durability.textContent).not.toContain("async");
   });
 });
+
+/*
+ * #369 — Bind status per node.
+ *
+ * A port can be taken on one node and free on another, so an imposter can be bound on two voters
+ * and failed on the third. The panel's job is to name which — and, just as much, to keep an
+ * operator from reading a failed bind as a dead imposter, because the front door still serves it.
+ */
+describe("bind status per node", () => {
+  const A = "3342140982834931156";
+  const B = "3481475601826307430";
+
+  const fleetWith = (members: unknown[]) => ({
+    "/imposters/4545": { json: IMPOSTER },
+    "/_fleet/members": {
+      json: {
+        node_id: A,
+        is_leader: true,
+        current_leader: A,
+        last_applied: 9,
+        voters: [A, B],
+        bound_ports: [4545],
+        bind_failures: {},
+        bind_status_unavailable: false,
+        members,
+      },
+    },
+    "/_fleet/health": {
+      json: {
+        ready: true,
+        state: "ready",
+        pending_gates: [],
+        isolated: false,
+        ring: { m_idx: 1, members: [A, B] },
+      },
+    },
+  });
+
+  const bound = (node: string) => ({
+    node_id: node,
+    last_applied: 9,
+    is_leader: node === A,
+    reachable: true,
+    bound_ports: [4545],
+    bind_failures: {},
+    bind_status_unavailable: false,
+  });
+
+  it("names the node whose listener did not come up, and the reason", async () => {
+    onDetailTab("ownership");
+    stubFetch(
+      fleetWith([
+        bound(A),
+        {
+          ...bound(B),
+          bound_ports: [],
+          bind_failures: { "4545": "Address already in use" },
+        },
+      ]),
+    );
+    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("fleet-admin") });
+
+    const failed = await screen.findByTestId(`bind-node-${B}`);
+    expect(failed.textContent).toContain("Address already in use");
+    // And the healthy node is stated positively, not merely left silent.
+    expect(screen.getByTestId(`bind-node-${A}`).textContent).toMatch(/bound/i);
+  });
+
+  /*
+   * The sentence that makes this panel safe rather than alarming. Dispatch targets the imposter
+   * object, not its socket, so the mock still works on the node that could not bind — what breaks
+   * is the direct-to-port path. An operator who reads this row as an outage will go looking for a
+   * fault that is not there, or worse, delete the imposter.
+   */
+  it("does not present a failed bind as a failed imposter", async () => {
+    onDetailTab("ownership");
+    stubFetch(
+      fleetWith([
+        bound(A),
+        {
+          ...bound(B),
+          bound_ports: [],
+          bind_failures: { "4545": "Address already in use" },
+        },
+      ]),
+    );
+    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("fleet-admin") });
+    await screen.findByTestId(`bind-node-${B}`);
+
+    expect(screen.getByTestId("bind-status-note").textContent).toMatch(
+      /still serves this imposter through the front door/i,
+    );
+  });
+
+  /*
+   * The failure this shape exists to prevent: a node that never answered rendering as healthy.
+   * "Not reported as failed" is not the same claim as "bound", and only one of them is true here.
+   */
+  it("reports a node that did not answer as unknown, never as bound", async () => {
+    onDetailTab("ownership");
+    stubFetch(
+      fleetWith([
+        bound(A),
+        {
+          node_id: B,
+          last_applied: null,
+          is_leader: null,
+          reachable: false,
+          bound_ports: null,
+          bind_failures: null,
+          bind_status_unavailable: null,
+        },
+      ]),
+    );
+    renderInApp(<ImposterDetail port={4545} />, { whoami: whoamiWith("fleet-admin") });
+
+    const unknown = await screen.findByTestId(`bind-node-${B}`);
+    expect(unknown.textContent).toMatch(/unknown/i);
+    expect(unknown.textContent).not.toMatch(/bound/i);
+  });
+});
