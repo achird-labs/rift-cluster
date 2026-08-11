@@ -28,8 +28,10 @@ const SECRET: &str = "front-door-test-secret";
 /// `front_door` is a parameter, not a hardcoded `:0`, so the double-bind test
 /// below can ask for a fixed address without depending on clap's
 /// last-flag-wins behavior for a repeated `--front-door`.
-fn cluster_cli_with_front_door(state: &TempDir, front_door: &str, extra: &[&str]) -> EeCli {
-    let mut args = vec![
+/// Everything a solo clustered node needs except the front door itself, which is what the three
+/// wrappers below differ on.
+fn base_args(state: &TempDir) -> Vec<String> {
+    vec![
         "rift-cluster-server".to_owned(),
         "--port".to_owned(),
         "0".to_owned(),
@@ -45,15 +47,28 @@ fn cluster_cli_with_front_door(state: &TempDir, front_door: &str, extra: &[&str]
         "--cluster-state-dir".to_owned(),
         state.path().to_string_lossy().into_owned(),
         "--cluster-allow-solo".to_owned(),
-        "--front-door".to_owned(),
-        front_door.to_owned(),
-    ];
+    ]
+}
+
+/// `front_door` is a parameter, not a hardcoded `:0`, so the double-bind test
+/// below can ask for a fixed address without depending on clap's
+/// last-flag-wins behavior for a repeated `--front-door`.
+fn cluster_cli_with_front_door(state: &TempDir, front_door: &str, extra: &[&str]) -> EeCli {
+    let mut args = base_args(state);
+    args.push("--front-door".to_owned());
+    args.push(front_door.to_owned());
     args.extend(extra.iter().map(|s| (*s).to_owned()));
     EeCli::try_parse_from(args).expect("parses")
 }
 
 fn cluster_cli(state: &TempDir, extra: &[&str]) -> EeCli {
     cluster_cli_with_front_door(state, "127.0.0.1:0", extra)
+}
+
+/// The same node with **no** `--front-door` at all — it never binds a listener, so it can never
+/// count a dispatch.
+fn cluster_cli_without_front_door(state: &TempDir) -> EeCli {
+    EeCli::try_parse_from(base_args(state)).expect("parses")
 }
 
 async fn wait_ready(server: &ComposedServer) {
@@ -621,5 +636,140 @@ async fn cluster_off_front_door_is_upstream_unchanged() {
         Some(format!("127.0.0.1:{fixed_port}").parse().unwrap()),
         "upstream's own ServerBuilder bound it — nothing in this crate touched it"
     );
+    server.shutdown().await;
+}
+
+/// Issue #368: the HITS column's source. Counted on route *claim*, so a route whose target then
+/// fails still counts — a route claiming traffic and failing is exactly what the column exists to
+/// reveal — and a route that has taken nothing reports a `0`, never an absence.
+#[tokio::test]
+async fn front_door_dispatches_are_counted_per_route() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let front_door = server
+        .front_door_addr()
+        .expect("--front-door was given, must bind");
+    let served = reserve_port();
+    // Deliberately never given an imposter: dispatches to it 404, and must still count.
+    let dead = reserve_port();
+    put_imposter(admin, served, "from-a").await;
+
+    let table = json!({
+        "routes": [
+            { "id": "busy", "match": { "path_prefix": "/busy" }, "target": { "port": served } },
+            { "id": "idle", "match": { "path_prefix": "/idle" }, "target": { "port": dead } },
+        ],
+    });
+    let put = reqwest::Client::new()
+        .put(format!("http://{admin}/front-door/routes"))
+        .json(&table)
+        .send()
+        .await
+        .expect("put routes");
+    assert_eq!(put.status().as_u16(), 200);
+
+    let before: serde_json::Value = reqwest::get(format!("http://{admin}/front-door/route-hits"))
+        .await
+        .expect("get route hits")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        before,
+        json!({ "installed": true, "hits": { "busy": 0, "idle": 0 } }),
+        "an untouched table is all zeros, not an empty map: {before}"
+    );
+
+    for _ in 0..3 {
+        let dispatched = reqwest::get(format!("http://{front_door}/busy/anything"))
+            .await
+            .expect("request through the front door");
+        assert_eq!(dispatched.status().as_u16(), 201);
+    }
+
+    // A path no route claims counts against nothing.
+    let unmatched = reqwest::get(format!("http://{front_door}/unclaimed"))
+        .await
+        .expect("request through the front door");
+    assert_eq!(unmatched.status().as_u16(), 404);
+
+    let after_traffic: serde_json::Value =
+        reqwest::get(format!("http://{admin}/front-door/route-hits"))
+            .await
+            .expect("get route hits")
+            .json()
+            .await
+            .expect("json");
+    assert_eq!(
+        after_traffic,
+        json!({ "installed": true, "hits": { "busy": 3, "idle": 0 } }),
+        "three claims for `busy`, and `idle` still an explicit zero: {after_traffic}"
+    );
+
+    // `idle` targets a port with no imposter, so this 404s — and still counts. "Hits" is what the
+    // route claimed, not what succeeded.
+    let failed = reqwest::get(format!("http://{front_door}/idle/x"))
+        .await
+        .expect("request through the front door");
+    assert_eq!(failed.status().as_u16(), 404);
+
+    let after_failure: serde_json::Value =
+        reqwest::get(format!("http://{admin}/front-door/route-hits"))
+            .await
+            .expect("get route hits")
+            .json()
+            .await
+            .expect("json");
+    assert_eq!(
+        after_failure,
+        json!({ "installed": true, "hits": { "busy": 3, "idle": 1 } }),
+        "a claimed-then-failed request counts: {after_failure}"
+    );
+
+    server.shutdown().await;
+}
+
+/// A node with no front door still answers, and answers zeros (issue #368, E12).
+///
+/// Routes are replicated control-plane objects, so `GET /front-door/route-hits` must answer
+/// identically on every node — including one that binds no listener. Its honest contribution to
+/// the fleet sum is zero, not an error and not an absence: it really has dispatched nothing.
+#[tokio::test]
+async fn a_node_with_no_front_door_reports_zeros_rather_than_failing() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli_without_front_door(&state))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    assert!(
+        server.front_door_addr().is_none(),
+        "this fixture must not bind a front door, or it proves nothing"
+    );
+
+    let put = reqwest::Client::new()
+        .put(format!("http://{admin}/front-door/routes"))
+        .json(&one_route("svc", "/svc", reserve_port()))
+        .send()
+        .await
+        .expect("put routes");
+    assert_eq!(put.status().as_u16(), 200);
+
+    let hits: serde_json::Value = reqwest::get(format!("http://{admin}/front-door/route-hits"))
+        .await
+        .expect("get route hits")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        hits,
+        json!({ "installed": true, "hits": { "svc": 0 } }),
+        "the table is installed fleet-wide even where no listener is bound: {hits}"
+    );
+
     server.shutdown().await;
 }

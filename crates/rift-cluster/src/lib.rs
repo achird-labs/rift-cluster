@@ -39,7 +39,7 @@ pub use control::{
     ControlResponse, DEFAULT_AUDIT_BATCH_MAX_ROWS, DEFAULT_TENANT, Digest, FLEET_SCOPE,
     MAX_AUDIT_BATCH_MAX_ROWS, MAX_SOURCE_PAYLOAD_BYTES, OnDrift, PreconditionTarget, RecordedStub,
     RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey, SourceMode, SourceProvenance, StubEdit,
-    StubEditScript, TenantId, precondition_target,
+    StubEditScript, TenantId, precondition_target, routes_installed_for,
 };
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;

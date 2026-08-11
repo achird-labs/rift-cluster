@@ -2696,6 +2696,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "parking_lot",
  "prometheus",
  "rand 0.8.6",
  "reqwest",

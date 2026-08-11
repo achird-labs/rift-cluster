@@ -13,6 +13,7 @@ export const API_PATHS = {
   fleetHealth: "/_fleet/health",
   session: "/session",
   frontDoorRoutes: "/front-door/routes",
+  frontDoorRouteHits: "/front-door/route-hits",
   audit: "/admin/audit",
   /**
    * Where the fleet ships its audit rows. Fleet-scoped: a `TenantAdmin` trusted to read their own

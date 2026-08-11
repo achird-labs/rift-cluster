@@ -62,6 +62,10 @@ subtle.workspace = true
 uuid.workspace = true
 tokio-util.workspace = true
 arc-swap.workspace = true
+# Per-route dispatch counting (issue #368), on the front door's hot path. Same primitive the
+# request journal's own per-port counter uses, and non-poisoning: a counter that starts returning
+# errors because an unrelated thread panicked would be worse than the count it protects.
+parking_lot.workspace = true
 # Session-cookie signing (RFC-006 §5.3, issue #185): HMAC-SHA256 over a base64url payload.
 hmac.workspace = true
 sha2.workspace = true

@@ -2240,6 +2240,80 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /front-door/route-hits:
+    get:
+      operationId: getFrontDoorRouteHits
+      summary: Read how many requests each of the tenant's routes has claimed
+      description: >
+        Terminates: the dispatch count for every route id in the caller's
+        tenant's current table, summed across the fleet. A separate path from
+        `GET /front-door/routes` because that body is a config document a
+        client `PUT`s back verbatim, and because this read pays a fleet
+        fan-out a config read should not.
+
+
+        **A hit is a route *claiming* a request, not a request succeeding.**
+        The count is taken the moment a route matches, before its target is
+        dispatched to, so a route whose imposter is gone and which answers
+        nothing but `404` still counts every one. That is deliberate: a route
+        claiming traffic and failing is exactly what this figure exists to
+        reveal.
+
+
+        **Counts are in memory, per node, since that node's process started.**
+        They are observations a node made, not replicated state, so a restart
+        resets that node's contribution and the fleet sum drops. Only
+        unreachable peers are flagged, via `Rift-Cluster-Partial` — a restart
+        is not, and cannot be, distinguished from quiet traffic.
+
+
+        **Only ids in the current table are reported.** A `PUT` that replaces
+        the table, or a `DELETE`, strands the counters for ids the new table
+        does not name; they are simply never read. An id deleted and later
+        recreated resumes the count still held by any node that never
+        restarted in between.
+
+
+        `installed: false` means this tenant's routes are stored, and readable
+        through `GET /front-door/routes`, but are never compiled into the
+        shared front door — so none of them can take a dispatch at all. `hits`
+        is then `null` rather than a map of zeros, because a zero would assert
+        the routes took no traffic when the truth is that they cannot take
+        any. Only the default tenant's routes are installed today.
+      tags: [front-door]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: >
+            Per-route dispatch counts, or `installed: false` for a tenant whose
+            routes are not compiled into the front door.
+          headers:
+            Rift-Cluster-Partial:
+              $ref: '#/components/headers/RiftClusterPartial'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteHits'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Caller is not bound to the tenant named (`X-Rift-Tenant` or
+            default) — indistinguishable from that tenant not existing
+            (RFC-002 §8.4).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
   /front-door/routes/{routeId}:
     delete:
       operationId: deleteFrontDoorRoute
@@ -4887,6 +4961,33 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Route'
+
+    RouteHits:
+      type: object
+      required: [installed, hits]
+      properties:
+        installed:
+          type: boolean
+          description: >
+            Whether this tenant's routes are compiled into the shared front
+            door. False means they are stored but can never take a dispatch.
+        hits:
+          type: object
+          nullable: true
+          description: >
+            One entry per route id in the tenant's current table — including
+            `0` for a route that has taken nothing, which is the figure this
+            endpoint exists to publish. `null` when `installed` is false: a
+            zero there would claim the route took no traffic, when the truth
+            is that it cannot take any.
+          additionalProperties:
+            type: integer
+            format: int64
+            minimum: 0
+            description: >
+              Requests this route has claimed across every node that answered.
+              A floor, not an exact count, when `Rift-Cluster-Partial` is set.
+      additionalProperties: false
 
     Route:
       type: object

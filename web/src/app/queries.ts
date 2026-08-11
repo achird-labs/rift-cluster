@@ -1367,6 +1367,54 @@ export function useRouteTable(): UseQueryResult<Route[]> {
   });
 }
 
+/**
+ * How many requests each of the tenant's routes has claimed, fleet-wide (#368).
+ *
+ * `hits` is `null` exactly when `installed` is false — this tenant's routes are stored but never
+ * compiled into the shared front door, so they cannot take a dispatch and a zero would be a false
+ * claim about traffic. `partial` means a node could not be reached, so the counts are floors.
+ */
+export type RouteHits = {
+  installed: boolean;
+  hits: Record<string, number> | null;
+  partial: boolean;
+};
+
+/**
+ * Deliberately its own query, not folded into {@link useRouteTable}: the counts are a fleet
+ * fan-out and the table is a local read, so a fan-out that degrades must not take the table's
+ * rendering down with it. A failure here leaves the Hits column unknown and the table intact.
+ */
+export function useRouteHits(): UseQueryResult<RouteHits> {
+  const { tenant } = useSession();
+  return useQuery({
+    queryKey: key(["front-door-route-hits"], tenant),
+    queryFn: async (): Promise<RouteHits> => {
+      const read = await apiGetMerged<{
+        installed?: boolean;
+        hits?: Record<string, number> | null;
+      }>(API_PATHS.frontDoorRouteHits, { tenant });
+      // `installed` is **required** by the contract, so an absent one is a broken read, not a
+      // domain value — and defaulting it to `false` would be the worst available guess: the screen
+      // renders that as "not installed", a specific and confident claim that this tenant's routes
+      // can never take a dispatch. Failing the query instead leaves the column an honest dash.
+      // Same reasoning as `useSources` above, and the same distinction this whole endpoint exists
+      // to preserve: unknown is not a state you may substitute a definite answer for.
+      if (typeof read.data.installed !== "boolean") {
+        throw new Error("front-door route hits: the response carried no `installed` flag");
+      }
+      return {
+        installed: read.data.installed,
+        // Absent counts stay absent rather than becoming zeros; `HitsCell` renders an unreported
+        // id as a dash, because a zero is a claim about traffic.
+        hits: read.data.hits ?? null,
+        partial: read.partial,
+      };
+    },
+    ...POLLED,
+  });
+}
+
 /** Raised when the table moved underneath the editor, so the screen can offer refresh-and-reapply. */
 export class RouteTableConflict extends Error {
   readonly current: Route[];

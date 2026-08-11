@@ -27,8 +27,9 @@ use rift_cluster::{
     PullOnMissInterceptor, RaftNode, SourcePuller, SourceScheduler, metrics,
 };
 use rift_cluster_base::seams::{
-    CompiledRoutes, FileSource, HttpSource, ImposterManager, RunningFrontDoor, RunningServer,
-    ServerBuilder, SourceRef, SourceRegistry, TlsDefaults, bind_front_door, parse_uri_list,
+    CompiledRoutes, FileSource, HttpSource, ImposterManager, RouteObserver, RunningFrontDoor,
+    RunningServer, ServerBuilder, SourceRef, SourceRegistry, TlsDefaults,
+    bind_front_door_with_observer, parse_uri_list,
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -37,6 +38,7 @@ use crate::cli::EeCli;
 use crate::cluster_api::{self, NodeSlot};
 use crate::probes::{self, ProbeListener};
 use crate::readiness::{GATE_JOINED, GATE_RECONCILED, Readiness};
+use crate::route_hits::RouteHitCounter;
 
 /// How long a starting node keeps trying its seeds before giving up.
 ///
@@ -613,6 +615,13 @@ pub async fn start_with_runtimes(
     // `GET /front-door/routes` must answer identically on every node.
     let front_door_routes = Arc::new(ArcSwap::from_pointee(CompiledRoutes::default()));
 
+    // Per-route dispatch counts (issue #368). Created here, before the node, because the cluster
+    // port's route table is built below and needs it — and unconditionally, whether or not this
+    // node binds a front door: a node with no listener has counted nothing, which is the honest
+    // zero contribution to the fleet sum, and `GET /front-door/route-hits` must answer on every
+    // node exactly as `GET /front-door/routes` does.
+    let route_hits = Arc::new(RouteHitCounter::default());
+
     // Imposter sources (issue #134). Built before the node for the same reason
     // the flow net and the pull-on-miss hook are: its routes go into the
     // `NodeConfig.routes` seam that binds the cluster port, whose address the
@@ -654,6 +663,7 @@ pub async fn start_with_runtimes(
                     flow_routes(Arc::clone(&flow_net)),
                     slot.clone(),
                     Arc::clone(&readiness),
+                    Arc::clone(&route_hits),
                 ),
                 Arc::clone(&puller),
             )
@@ -777,6 +787,7 @@ pub async fn start_with_runtimes(
         &readiness,
         Arc::clone(&manager),
         front_door_routes,
+        Arc::clone(&route_hits),
         Arc::clone(&puller),
         Arc::clone(&journal_net),
         Arc::clone(&flow_net),
@@ -824,6 +835,7 @@ async fn attach_data_plane(
     readiness: &Arc<Readiness>,
     manager: Arc<ImposterManager>,
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
+    route_hits: Arc<RouteHitCounter>,
     puller: Arc<SourcePuller>,
     journal_net: Arc<JournalNet>,
     flow_net: Arc<FlowNet>,
@@ -947,7 +959,17 @@ async fn attach_data_plane(
     // was attached before `Raft::new` and catch-up replay drives it like any
     // other commit.
     let front_door = if let Some(addr) = front_door_addr {
-        match bind_front_door(addr, Arc::clone(&manager), front_door_routes).await {
+        // With an observer (issue #368), unlike single-node Rift: the clustered admin plane has a
+        // HITS column to feed. `bind_front_door` stays the no-observer entry point upstream
+        // embedders call.
+        match bind_front_door_with_observer(
+            addr,
+            Arc::clone(&manager),
+            front_door_routes,
+            Some(Arc::clone(&route_hits) as Arc<dyn RouteObserver>),
+        )
+        .await
+        {
             Ok(running) => Some(running),
             Err(e) => {
                 server.shutdown().await;
@@ -972,6 +994,7 @@ async fn attach_data_plane(
             export_status: Some(export_status),
             readiness: Arc::clone(readiness),
             puller: Arc::clone(&puller),
+            route_hits: Arc::clone(&route_hits),
             journal_net: Arc::clone(&journal_net),
             flow_net: Arc::clone(&flow_net),
             fleet_journal_port_cap,
