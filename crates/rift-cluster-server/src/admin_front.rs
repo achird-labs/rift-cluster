@@ -6817,6 +6817,7 @@ mod tests {
                 puller: Arc::new(SourcePuller::new(
                     rift_cluster_base::seams::SourceRegistry::default(),
                 )),
+                route_hits: Arc::new(RouteHitCounter::default()),
                 journal_net: JournalNet::new(rift_cluster::stores::ClusterJournal::new(1)),
                 flow_net: Arc::clone(&net),
                 fleet_journal_port_cap: rift_cluster::stores::DEFAULT_FLEET_JOURNAL_PORT_CAP,
