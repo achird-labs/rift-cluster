@@ -2612,8 +2612,15 @@ async fn sink_and_checkpoint_survive_a_node_restart() {
         .node
         .as_ref()
         .expect("the restarted node");
+    // At least, not exactly: `task.abort()` above does not stop an exporter
+    // mid-iteration, so one already in flight can still advance the checkpoint
+    // after `expected_checkpoint` was sampled. The invariant here is that the
+    // restart did not *lose* ground — an overshoot means more was exported and
+    // less will be re-shipped, which is the safe direction. Demanding equality
+    // made this fail under load with left > right, a passing state read as a
+    // failure (seen at 13 vs 8).
     let start = Instant::now();
-    while restarted.audit_checkpoint().expect("read") != expected_checkpoint
+    while restarted.audit_checkpoint().expect("read") < expected_checkpoint
         && start.elapsed() < CONVERGE_DEADLINE
     {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2624,9 +2631,8 @@ async fn sink_and_checkpoint_survive_a_node_restart() {
         "a node that came back without the sink record would stop exporting the moment it \
          won an election, silently"
     );
-    assert_eq!(
-        restarted.audit_checkpoint().expect("read checkpoint"),
-        expected_checkpoint,
+    assert!(
+        restarted.audit_checkpoint().expect("read checkpoint") >= expected_checkpoint,
         "a node that came back without the checkpoint would re-ship the entire retained \
          history to the customer's bucket on its first election"
     );

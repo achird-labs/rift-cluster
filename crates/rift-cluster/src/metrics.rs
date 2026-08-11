@@ -77,6 +77,17 @@ lazy_static! {
     )
     .expect("rift_cluster_write_forwards_total registers once");
 
+    /// `rift_cluster_join_forwards_total` — join attempts re-issued to the node
+    /// a seed named as leader (one per hop). A steadily rising count says the
+    /// configured `--cluster-seeds` habitually point at a follower: harmless
+    /// now that the join chases, but one round-trip per join that a better seed
+    /// list would save (#391).
+    static ref JOIN_FORWARDS: IntCounter = register_int_counter!(
+        "rift_cluster_join_forwards_total",
+        "Cluster joins re-issued from a seed toward the leader it named"
+    )
+    .expect("rift_cluster_join_forwards_total registers once");
+
     /// `rift_cluster_barrier_waits_total` — write barriers run.
     static ref BARRIER_WAITS: IntCounter = register_int_counter!(
         "rift_cluster_barrier_waits_total",
@@ -543,6 +554,11 @@ pub(crate) fn write_forwarded() {
     WRITE_FORWARDS.inc();
 }
 
+/// One join handed toward the leader a seed named (per hop).
+pub(crate) fn join_forwarded() {
+    JOIN_FORWARDS.inc();
+}
+
 /// A barrier ran; `unapplied` is how many members had not confirmed by its
 /// deadline (0 = clean).
 pub(crate) fn barrier_observed(unapplied: usize) {
@@ -772,7 +788,7 @@ static RPC_FAILURES: [AtomicU64; REASONS.len()] = [const { AtomicU64::new(0) }; 
 ///
 /// `handler` is last because it doubles as the bucket for a reason this table
 /// does not know — see [`rpc_failure`].
-const REASONS: [&str; 12] = [
+const REASONS: [&str; 15] = [
     "malformed",
     "bad_mac",
     "stale_timestamp",
@@ -784,6 +800,9 @@ const REASONS: [&str; 12] = [
     "timeout",
     "transport",
     "shed",
+    "bad_request",
+    "unavailable",
+    "not_leader",
     "handler",
 ];
 
@@ -892,13 +911,54 @@ mod tests {
             RpcError::Timeout,
             RpcError::Transport(String::new()),
             RpcError::Shed,
+            RpcError::BadRequest(String::new()),
+            RpcError::Unavailable {
+                detail: String::new(),
+                op_id: None,
+            },
+            RpcError::NotLeader { leader: None },
             RpcError::Handler(String::new()),
         ];
-        for err in all {
+
+        // The list above is hand-written, so on its own it only proves the
+        // variants someone remembered. This match has no `_` arm: adding a
+        // variant to `RpcError` stops compiling here until it is listed, which
+        // is the part that actually holds. Without it `bad_request`,
+        // `unavailable` and `not_leader` each reached production with no bucket
+        // of their own, silently counted as `handler` — i.e. as this node
+        // failing — which for a leader redirect is the opposite of the truth
+        // (#391).
+        fn _every_variant_is_listed_above(e: &RpcError) {
+            match e {
+                RpcError::Unauthorized(_)
+                | RpcError::VersionSkew { .. }
+                | RpcError::UnknownRoute { .. }
+                | RpcError::BodyTooLarge { .. }
+                | RpcError::Timeout
+                | RpcError::Transport(_)
+                | RpcError::Shed
+                | RpcError::BadRequest(_)
+                | RpcError::Unavailable { .. }
+                | RpcError::NotLeader { .. }
+                | RpcError::Handler(_) => {}
+            }
+        }
+
+        for err in &all {
             assert!(
                 REASONS.contains(&err.reason()),
                 "no bucket for {:?}",
                 err.reason()
+            );
+        }
+
+        // And the other direction: a bucket nothing can emit is dead weight on
+        // every dashboard that renders the label set.
+        let emitted: Vec<&str> = all.iter().map(RpcError::reason).collect();
+        for bucket in REASONS {
+            assert!(
+                emitted.contains(&bucket),
+                "bucket {bucket:?} is not produced by any RpcError variant"
             );
         }
     }
@@ -1022,6 +1082,7 @@ mod tests {
     fn config_sync_families_reach_the_registry() {
         let _guard = counter_guard();
         write_forwarded();
+        join_forwarded();
         barrier_observed(0);
         barrier_observed(2);
         intent_parked();
@@ -1050,6 +1111,7 @@ mod tests {
             .collect();
         for name in [
             "rift_cluster_write_forwards_total",
+            "rift_cluster_join_forwards_total",
             "rift_cluster_barrier_waits_total",
             "rift_cluster_barrier_timeouts_total",
             "rift_cluster_pull_on_miss_checks_total",

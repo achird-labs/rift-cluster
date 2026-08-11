@@ -555,6 +555,11 @@ fallback dispatch, §7.4.6) stay cluster.
     tracks a DNS record that changes underneath it.
   - `--cluster-seeds <addr,addr,...>` — DNS names allowed and **re-resolved on every
     (re)join attempt** (required for Kubernetes, §11.5). Mutual seeding supported.
+    **A seed need not be the leader**: admission is a Raft membership write, so a seed
+    that is a follower answers with the leader's address and the joiner re-issues the
+    join there, within a bounded number of attempts. A single stable seed address is
+    therefore a supported configuration rather than one that works only while that node
+    happens to lead (#391).
   - `--cluster-allow-solo` — explicit opt-in to form/serve a cluster of one (see §7.1.3).
   - `--cluster-secret <string>` / `--cluster-secret-file <path>` — **required**; refuse to
     start clustered without it unless `--cluster-insecure` (§11.2).

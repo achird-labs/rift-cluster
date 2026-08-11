@@ -452,6 +452,12 @@ fn status_to_error(status: u16, body: &[u8], method: &str, path: &str) -> RpcErr
             path: path.to_owned(),
         },
         413 => RpcError::BodyTooLarge { limit: 0 },
+        // The peer is a follower and named the leader (or an election is in
+        // flight and it could not). Recovered as a field rather than parsed out
+        // of `message`, so the caller can re-issue to the named node (#391).
+        421 => RpcError::NotLeader {
+            leader: field("leader"),
+        },
         426 => RpcError::VersionSkew {
             peer: None,
             ours: PROTO_VERSION,
@@ -692,6 +698,41 @@ mod tests {
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    /// #391: the leader hint has to survive the wire as *data*. Before the fix
+    /// it existed only inside a 500's rendered message, which no caller could
+    /// act on without parsing prose.
+    #[test]
+    fn a_421_carries_the_leader_hint_back_as_typed_data() {
+        match mapped(
+            421,
+            br#"{"error":"not_leader","message":"not the leader; leader is 10.0.0.7:7000","leader":"10.0.0.7:7000"}"#,
+        ) {
+            RpcError::NotLeader { leader } => {
+                assert_eq!(leader.as_deref(), Some("10.0.0.7:7000"));
+            }
+            other => panic!("expected NotLeader, got {other:?}"),
+        }
+
+        // An election in flight names nobody. The variant must still come back
+        // typed — "no leader yet" and "not this node" are the same class of
+        // answer and the caller distinguishes them by the absent hint.
+        match mapped(421, br#"{"error":"not_leader","message":"not the leader"}"#) {
+            RpcError::NotLeader { leader } => assert_eq!(leader, None),
+            other => panic!("expected a hintless NotLeader, got {other:?}"),
+        }
+    }
+
+    /// #391 skew guard: the join reply must stay a non-2xx. A structured
+    /// "forward" carried in a 200 would read as success to any deployed joiner,
+    /// which ignores the join reply body — it would record itself joined
+    /// without being a member.
+    #[test]
+    fn a_redirect_is_never_a_success_status() {
+        let err = mapped(421, br#"{"error":"not_leader"}"#);
+        assert_eq!(err.status(), 421);
+        assert!(!(200..300).contains(&err.status()));
     }
 
     #[test]
