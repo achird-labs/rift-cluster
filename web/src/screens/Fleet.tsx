@@ -165,22 +165,26 @@ function View({ view }: { view: FleetView }): ReactNode {
       </div>
 
       {/*
-       * The design drew three operational panels; two remain. Both are *actions* on the fleet —
-       * trigger a snapshot, compact the log — that the admin API does not expose yet. They are
-       * drawn because the design draws them and marked because offering a button that cannot call
-       * anything would be worse than saying so.
+       * The design drew three operational panels. One remains, and it is the only one of the three
+       * that asked to *read* rather than to *act*.
        *
-       * The third, Membership, is gone rather than pending. Adding or removing a learner or a
-       * voter is not a missing endpoint: membership changes only ever happen by starting a node
-       * that joins, or by a node leaving. The console is deliberately not an admission or eviction
-       * vector, so a panel promising one was advertising a capability that will not arrive (#366).
+       * Membership (#366) and Snapshots (#365) are gone rather than pending. Neither was a missing
+       * endpoint:
+       *
+       * - Membership changes happen only through a node's own lifecycle — a node is started and
+       *   joins, or a node leaves. The console is deliberately not an admission or eviction vector.
+       * - Snapshotting and log compaction are the cluster's own business. openraft's shipped
+       *   defaults snapshot every 5000 entries and purge what a snapshot already covers, with no
+       *   operator involvement; `a_shipped_fleet_snapshots_and_purges_without_being_asked` in
+       *   `raft/node.rs` pins that. A button to force one would be an operator taking over a job
+       *   the fleet already does.
+       *
+       * A pending panel is not neutral — it promises the capability arrives later. These two do
+       * not, so they are removed instead.
        */}
       <div className="fleet-ops">
         <Card title="Durability &amp; write path">
-          <PendingPanel issue={365} reason="The write barrier, its timeout, the flow fsync policy and the admin-write mode are configured on the node's command line and are not read back by any endpoint." />
-        </Card>
-        <Card title="Snapshots">
-          <PendingPanel issue={365} reason="No endpoint reports the last snapshot or triggers a new one. Snapshotting and log compaction are driven by the node's own thresholds." />
+          <PendingPanel issue={394} reason="The write barrier, its timeout, the flow fsync policy and the admin-write mode are configured on the node's command line and are not read back by any endpoint." />
         </Card>
       </div>
 

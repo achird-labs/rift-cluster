@@ -88,31 +88,18 @@ export function requestOutcome(_index: number): Pending<RequestOutcome> {
   return pending(364);
 }
 
-/** The last snapshot, once a route reports one. */
-export type Snapshot = { index: number; bytes: number; ageSeconds: number; complete: boolean };
-
-/**
- * Snapshot state and the operations over it.
- *
- * Snapshotting and compaction run on the node's own thresholds; nothing reports the last one or
- * triggers a new one.
- *
- * @see https://github.com/achird-labs/rift-cluster/issues/365
- */
-export function lastSnapshot(): Pending<Snapshot> {
-  return pending(365);
-}
-
 /**
  * The durability settings a write actually rode.
  *
  * The write barrier, its timeout, the flow fsync policy and the admin-write mode are all command
- * line flags on the node and none is read back by any endpoint. Folded into the snapshot issue's
- * neighbourhood rather than filed separately — it is the same "the fleet does not describe its own
- * configuration" gap.
+ * line flags on the node and none is read back by any endpoint.
  *
- * @see https://github.com/achird-labs/rift-cluster/issues/365
+ * Split out of the snapshot issue (#365) when that was closed as rejected-by-design: triggering a
+ * snapshot or a compaction from here is not something the console should be able to do at all,
+ * whereas *reading back* what a node is configured to do changes nothing and is a real gap.
+ *
+ * @see https://github.com/achird-labs/rift-cluster/issues/394
  */
 export function durability(): Pending<{ barrier: string; timeoutMs: number; fsync: string }> {
-  return pending(365);
+  return pending(394);
 }
