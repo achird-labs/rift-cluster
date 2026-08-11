@@ -165,10 +165,15 @@ function View({ view }: { view: FleetView }): ReactNode {
       </div>
 
       {/*
-       * The design's three operational panels. Every one of them is an *action* on the fleet —
-       * trigger a snapshot, compact the log, add a learner, remove a voter — and the admin API
-       * exposes none of them. They are drawn because the design draws them and marked because
-       * offering a button that cannot call anything would be worse than saying so.
+       * The design drew three operational panels; two remain. Both are *actions* on the fleet —
+       * trigger a snapshot, compact the log — that the admin API does not expose yet. They are
+       * drawn because the design draws them and marked because offering a button that cannot call
+       * anything would be worse than saying so.
+       *
+       * The third, Membership, is gone rather than pending. Adding or removing a learner or a
+       * voter is not a missing endpoint: membership changes only ever happen by starting a node
+       * that joins, or by a node leaving. The console is deliberately not an admission or eviction
+       * vector, so a panel promising one was advertising a capability that will not arrive (#366).
        */}
       <div className="fleet-ops">
         <Card title="Durability &amp; write path">
@@ -176,9 +181,6 @@ function View({ view }: { view: FleetView }): ReactNode {
         </Card>
         <Card title="Snapshots">
           <PendingPanel issue={365} reason="No endpoint reports the last snapshot or triggers a new one. Snapshotting and log compaction are driven by the node's own thresholds." />
-        </Card>
-        <Card title="Membership">
-          <PendingPanel issue={366} reason="Adding a learner or removing a voter is a cluster-membership change with no admin-API route. A graceful leave that would drop the fleet below two voters is refused by the node itself, not from here." />
         </Card>
       </div>
 

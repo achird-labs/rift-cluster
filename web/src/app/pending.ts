@@ -104,18 +104,6 @@ export function lastSnapshot(): Pending<Snapshot> {
 }
 
 /**
- * Whether membership can be changed from here.
- *
- * The voter floor is real and enforced (#69, #71) — what is missing is a route to *request* a
- * change, so today membership moves by starting and stopping nodes rather than by asking the fleet.
- *
- * @see https://github.com/achird-labs/rift-cluster/issues/366
- */
-export function membershipOps(): Pending<{ canAddLearner: boolean; canRemoveVoter: boolean }> {
-  return pending(366);
-}
-
-/**
  * The durability settings a write actually rode.
  *
  * The write barrier, its timeout, the flow fsync policy and the admin-write mode are all command

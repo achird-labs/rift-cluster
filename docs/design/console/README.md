@@ -191,6 +191,36 @@ This section exists because the mockup is still the artifact people design from,
 signals that these three elements are wrong. If you are porting a screen from it, this is the one
 place that says so.
 
+## The mockup's `Membership` panel is wrong — do not rebuild it
+
+The fleet screen's **`Membership`** panel, with its **Add learner** and **Remove voter** actions, has
+been **removed** rather than implemented. It was not a missing endpoint. It is not coming.
+
+**Membership changes only ever happen through a node's own lifecycle**: a node is started and
+attempts to join, or a node leaves. The console is deliberately neither an admission nor an eviction
+vector.
+
+Why the distinction matters, rather than being a matter of taste:
+
+- Admission today is initiated by the **joining node**, over the signed cluster port (`join_via` →
+  `/internal/v1/cluster/join` → `admit`). What can enter the fleet is therefore bounded by what an
+  operator chose to *start*.
+- An admin-API "add learner" taking an advertise address would be a second and weaker entry point —
+  operator-supplied input written straight into the replicated membership log, which is the one log
+  where a bad address is removable only by another membership change (#68).
+- "Remove voter" is the milder half, but it belongs to the same lifecycle: a node leaves by leaving.
+  The voter floor that makes departure safe (#69, #71) is enforced by the node and the leader, not
+  by whoever is looking at a console.
+
+Note that the *facts* [#366](https://github.com/achird-labs/rift-cluster/issues/366) asserted were
+all correct — the machinery is internal-only, there really is no admin route, the floor really is
+enforced. It was wrong about what **should** exist, which is why a premise check that only verifies
+facts will wave this class of issue through. Treat "the console cannot do X to the fleet" as a
+question about whether it *should*, not only whether it *can*.
+
+The read-only fleet surface is unaffected: `/_fleet/members` and the `Members` panel continue to
+show membership, because observing it and changing it are different powers.
+
 ## What this prototype is not
 
 - Not the component architecture. It is one file of vanilla JS; the real thing is React + TanStack
