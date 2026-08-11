@@ -7,7 +7,7 @@ import type { FleetView } from "../app/fleetView.ts";
 import { useFleetView } from "../app/queries.ts";
 import { Card, ErrorNote, Ident, Status, Tile, UNKNOWN } from "../components/primitives.tsx";
 import { ControlPlane, HashRing } from "../components/fleetRail.tsx";
-import { Pending, PendingPanel } from "../components/pending.tsx";
+import { PendingPanel } from "../components/pending.tsx";
 
 export function Fleet(): ReactNode {
   const fleet = useFleetView();
@@ -149,13 +149,20 @@ function View({ view }: { view: FleetView }): ReactNode {
        */}
       <div className="fleet-shape">
         <Card title="Ring">
-          {/* The design heads this card with the fleet's name. Nothing publishes one (#373) — and
-              the sharper cost is not this card but the top bar: an operator with staging and
-              production open in two tabs can tell them apart only by port, while every destructive
-              act in this console is fleet-wide. */}
+          {/* The design heads this card with the fleet's name (#373). "Unnamed" rather than a
+              blank: a fleet nobody has named yet is a real, honest state, not a loading gap —
+              and the sharper place an operator actually needs this is the top bar (`Shell.tsx`),
+              which is where staging and production, both open in two tabs, get told apart.
+
+              "Unavailable" is deliberately a third word, not a second spelling of "Unnamed": the
+              answering node reporting it could not read the name is a fault on that node, while
+              an unnamed fleet is merely one nobody has got round to naming. Rendering both as
+              "Unnamed" would send an operator to the wrong place. */}
           <div className="fleet-name">
             <span className="eyebrow">Fleet</span>
-            <Pending issue={373} reason="Nothing names the fleet. Node ids identify members; no label identifies the cluster." />
+            <span className="ident" data-testid="fleet-name">
+              {view.fleetNameUnavailable ? "Unavailable" : (view.fleetName ?? "Unnamed")}
+            </span>
           </div>
           <HashRing fleet={view} />
         </Card>

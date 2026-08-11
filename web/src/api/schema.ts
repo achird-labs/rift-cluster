@@ -942,6 +942,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/fleet/name": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set or rename the fleet's operator-set name
+         * @description Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — same tier as `putAuditSink`, for the same reason: this is a fleet-wide rename, not a tenant-scoped one. Replicated via a new `ControlOp` rather than a per-node command-line flag, so every node — and every console session, regardless of which node it happens to be talking to — agrees on one name. Setting the first name and renaming are the same write: the new value replaces whatever was there.
+         */
+        put: operations["putFleetName"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/_fleet/members": {
         parameters: {
             query?: never;
@@ -1491,6 +1511,10 @@ export interface components {
                 };
             };
         };
+        FleetNameWrite: {
+            /** @description Required — an omitted field is refused, not defaulted to an empty name. Trimmed non-empty, at most 128 characters, and free of control characters; otherwise unconstrained, since this is chrome text a human reads rather than an id anything parses back. */
+            name: string;
+        };
         AuditSinkWrite: {
             uri: string;
             /** @description Name of a credential the fleet already holds; never a raw credential. */
@@ -1647,6 +1671,20 @@ export interface components {
             last_applied: number | null;
             /** @description Voter node ids in the currently effective membership. Strings for the same reason as `node_id`. */
             voters: string[];
+            /**
+             * @description The fleet's operator-set name (issue #373), or `null` when nobody has named it yet. A label, not an identity — node ids remain what every endpoint on this document addresses; this exists only so a console user, or an operator with several fleets open, can tell them apart at a glance.
+             *
+             *     Deliberately **not** in `required`, unlike `current_leader` and `last_applied` which share its always-present-but-nullable shape. Those predate every node in any live fleet; this field does not. During a rolling upgrade the node answering this request may be a pre-#373 build that omits the key altogether, and `/_fleet/members` is answered by whichever node the caller reached — so absent is a genuinely reachable state, not a hypothetical one. Requiring it would make the shape an older node really sends unrepresentable in every generated client.
+             *
+             *     Consumers therefore fold absent into `null`: both mean "no name to show". What neither means is "the name could not be read" — that is `fleet_name_unavailable` below, and keeping the two apart is the whole point of there being two fields.
+             */
+            fleet_name?: string | null;
+            /**
+             * @description Whether the answering node could not *read* the name, as distinct from there being none to read. Both arrive as `fleet_name: null`, and without this flag they are the same byte on the wire — so a storage fault on the answering node would render exactly like a fleet nobody has named, which is the wrong-but-quiet failure the error rules exist to prevent.
+             *
+             *     The read deliberately still answers `200` when this is `true`: everything else in this body comes from in-memory raft metrics and is still trustworthy, and an operator diagnosing that fault wants the membership view rather than a `500`. Absent is equivalent to `false`.
+             */
+            fleet_name_unavailable?: boolean;
             /**
              * @description One row per voter, in `voters` order (issue #361). Present on `/_fleet/members` only — `/_cluster/members` is node-local.
              *
@@ -4803,6 +4841,48 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
+        };
+    };
+    putFleetName: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FleetNameWrite"];
+            };
+        };
+        responses: {
+            /** @description Name stored; body is empty (`terminate_tenancy` renders no body — only principal creation returns one). */
+            200: {
+                headers: {
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Caller lacks fleet-scoped access (RFC-002 §8.4 — not a 403). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            413: components["responses"]["PayloadTooLarge"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["Unavailable"];
+            504: components["responses"]["WriteTimeout"];
         };
     };
     getFleetMembers: {

@@ -11,6 +11,7 @@ import { Sources } from "../screens/Sources.tsx";
 import { GROUP_LABEL, ISSUE_URL, NAV, NAV_GROUPS, type NavGroup, groupOf } from "./nav.ts";
 import { ToastHost } from "../components/toast.tsx";
 import { SignOut } from "./SignOut.tsx";
+import { useFleetView } from "./queries.ts";
 import { useSession } from "./session.tsx";
 import { type Route, toHash, useRoute } from "./routing.ts";
 
@@ -27,6 +28,7 @@ export function Shell(): ReactNode {
         </div>
         <Nav current={route} />
         <div className="who">
+          <FleetName />
           <TenantSwitcher />
           <Identity />
           <SignOut />
@@ -145,6 +147,37 @@ function Nav({ current }: { current: Route }): ReactNode {
         );
       })}
     </nav>
+  );
+}
+
+/**
+ * The fleet's operator-set name (#373), beside the tenant it is a rename for — the sharper use
+ * the issue calls out: an operator with staging and production open in two tabs can otherwise
+ * tell them apart only by port, while every destructive act this console offers is fleet-wide.
+ *
+ * Renders nothing rather than "Unnamed" here, unlike the Fleet screen's Ring card. That card is
+ * the one place this fact has a card to itself and can afford to state absence as a fact; on
+ * every other screen a global "Unnamed" fleet label would be noise before an operator has ever
+ * named anything, and the read is `ClusterAdmin`-scoped, so it is also unavailable to most
+ * principals most of the time. Genuinely nothing to report either way, same as `TenantSwitcher`
+ * below when no tenant is selected.
+ */
+function FleetName(): ReactNode {
+  const { can } = useSession();
+  // Gated, for the reason `useFleetView`'s own doc gives: a principal without the fleet scope gets
+  // no label rather than a 404. Ungated this would be the *worst* case of the two the doc weighs —
+  // the imposter list's two guaranteed 404s happen once per list load, whereas this component is
+  // mounted on every screen, so it would put them behind every page a tenant-scoped principal ever
+  // opens, to render nothing either way.
+  const fleet = useFleetView({ enabled: can("fleet.read"), polled: false });
+
+  if (!fleet.isSuccess || fleet.data.fleetName === null) return null;
+
+  return (
+    <div className="fleet-name-badge" data-testid="topbar-fleet-name">
+      <span className="eyebrow">Fleet</span>
+      <span className="ident">{fleet.data.fleetName}</span>
+    </div>
   );
 }
 

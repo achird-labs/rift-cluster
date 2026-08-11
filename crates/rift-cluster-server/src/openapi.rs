@@ -378,6 +378,7 @@ mod parity {
             Route::AuditSinkRead => RouteKey::new(&Method::GET, "/admin/audit/sink"),
             Route::AuditSinkPut => RouteKey::new(&Method::PUT, "/admin/audit/sink"),
             Route::AuditSinkDelete => RouteKey::new(&Method::DELETE, "/admin/audit/sink"),
+            Route::FleetNamePut => RouteKey::new(&Method::PUT, "/admin/fleet/name"),
         }
     }
 
@@ -433,6 +434,7 @@ mod parity {
             Terminated::Tenancy(Route::AuditSinkRead),
             Terminated::Tenancy(Route::AuditSinkPut),
             Terminated::Tenancy(Route::AuditSinkDelete),
+            Terminated::Tenancy(Route::FleetNamePut),
             Terminated::SourceList,
             Terminated::SourceRead("payments".to_owned()),
             Terminated::SourcePut,

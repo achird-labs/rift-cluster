@@ -174,3 +174,70 @@ describe("identity", () => {
     expect(identity.textContent).toMatch(/authorization disabled/i);
   });
 });
+
+/*
+ * The fleet name in the top bar (#373) — the placement the issue argues actually matters, because
+ * it is the only one visible on every screen. An operator with staging and production open in two
+ * tabs can otherwise tell them apart only by port number, while every destructive act this console
+ * offers is fleet-wide.
+ */
+describe("the fleet name in the top bar", () => {
+  const NAMED = {
+    ...QUIET,
+    "/_fleet/members": {
+      json: {
+        node_id: 1,
+        is_leader: true,
+        current_leader: 1,
+        last_applied: 9,
+        voters: [1],
+        fleet_name: "rift-prod-eu",
+        fleet_name_unavailable: false,
+      },
+    },
+    "/_fleet/health": {
+      json: {
+        ready: true,
+        state: "ready",
+        pending_gates: [],
+        isolated: false,
+        ring: { m_idx: 1, members: [1] },
+      },
+    },
+  };
+
+  it("shows the name beside the tenant", async () => {
+    stubFetch(NAMED);
+    renderInApp(<Shell />, { whoami: whoamiWith("fleet-admin") });
+
+    expect((await screen.findByTestId("topbar-fleet-name")).textContent).toContain("rift-prod-eu");
+  });
+
+  it("shows nothing at all when the fleet read is not available to this principal", async () => {
+    // `QUIET` answers `/_fleet/members` with 404 — the shape a principal without a fleet-scoped
+    // binding sees (RFC-002 §8.4). The badge must stay absent rather than render a placeholder:
+    // an operator who cannot read the fleet is not thereby on an unnamed one, and every screen
+    // would otherwise carry a permanent empty label.
+    stubFetch(QUIET);
+    renderInApp(<Shell />, { whoami: whoamiWith("operator", ["acme"]), tenant: "acme" });
+
+    await screen.findByTestId("identity");
+    expect(screen.queryByTestId("topbar-fleet-name")).toBeNull();
+  });
+
+  it("shows nothing when the fleet is readable but unnamed", async () => {
+    // Deliberately different from the Ring card, which says "Unnamed" — that card is the one place
+    // the fact has a panel to itself. A global chrome label reading "Unnamed" on every screen,
+    // before anyone has ever set a name, is noise.
+    stubFetch({
+      ...NAMED,
+      "/_fleet/members": {
+        json: { ...NAMED["/_fleet/members"].json, fleet_name: null },
+      },
+    });
+    renderInApp(<Shell />, { whoami: whoamiWith("fleet-admin") });
+
+    await screen.findByTestId("identity");
+    expect(screen.queryByTestId("topbar-fleet-name")).toBeNull();
+  });
+});

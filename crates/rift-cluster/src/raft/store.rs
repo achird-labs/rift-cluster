@@ -187,6 +187,14 @@ const SM_SESSION_KEY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("
 /// [`AUDIT_SINK_KEY`] is: it reads like the rest of the schema and a second signing key, if one
 /// is ever wanted, is a key change and not a schema migration.
 const SESSION_KEY_ROW: &str = "key";
+/// The fleet's operator-set name as a plain string, under [`FLEET_NAME_ROW`] (issue #373). A
+/// one-row table, same shape as `sm_session_key` and for the same reason: it snapshots, installs
+/// and gets cleared through exactly the same code path as every other replicated table, rather
+/// than through a hand-written special case.
+const SM_FLEET_NAME_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_fleet_name");
+/// The single key `sm_fleet_name` uses, named rather than `()` for the same reason
+/// [`SESSION_KEY_ROW`] is: it reads like the rest of the schema.
+const FLEET_NAME_ROW: &str = "name";
 /// `(tenant, port, space-tag) -> generation` (issue #224): the applied clear-generation
 /// counters `ControlOp::JournalClearGen` bumps. Modelled on `sm_audit_checkpoint` — a small,
 /// monotone, per-key counter table — except the key is three-part: `space-tag` is
@@ -572,6 +580,15 @@ struct SnapshotPayload {
     /// field exists to prevent from happening by accident.
     #[serde(default)]
     session_key: Option<String>,
+    /// The `sm_fleet_name` row, if an operator has ever set one (issue #373). `#[serde(default)]`
+    /// for the #134/#137 reason every table above carries it: a snapshot built before this field
+    /// existed must still install, and a table omitted from this payload is a table that
+    /// vanishes on the next follower catch-up. The failure if it were forgotten here is quieter
+    /// than most of its siblings but still real: a node that joins by snapshot would silently
+    /// forget the fleet's name and every surface reading it through that node would show
+    /// "unnamed" until the next rename.
+    #[serde(default)]
+    fleet_name: Option<String>,
     /// `(tenant, port, space, generation)` rows of `sm_journal_gens` (issue #224).
     /// `#[serde(default)]` for the #134/#137 reason every table above carries it: a snapshot
     /// built before this field existed must still install, and the empty vec it decodes to means
@@ -645,6 +662,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
             .open_table(SM_AUDIT_GC_WATERMARK_TABLE)
             .map_err(io)?;
         write_txn.open_table(SM_SESSION_KEY_TABLE).map_err(io)?;
+        write_txn.open_table(SM_FLEET_NAME_TABLE).map_err(io)?;
         write_txn.open_table(SM_JOURNAL_GENS_TABLE).map_err(io)?;
         write_txn.open_table(SM_PROXY_RECORDED_TABLE).map_err(io)?;
         write_txn.open_table(SM_DEDUP_TABLE).map_err(io)?;
@@ -2365,6 +2383,33 @@ impl RedbStateMachine {
         Ok(Some(record))
     }
 
+    /// The fleet's operator-set name, or `None` when nobody has named it yet (issue #373).
+    /// Answered from local applied state, like `session_key`.
+    ///
+    /// Stored as the bare string rather than a JSON-wrapped record: unlike `SessionKey` there is
+    /// no revision or other metadata to carry alongside it, so wrapping it would only add a
+    /// parse step with nothing to parse.
+    ///
+    /// # Errors
+    /// Storage I/O.
+    #[allow(clippy::result_large_err)]
+    pub fn fleet_name(&self) -> StorageResult<Option<String>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_FLEET_NAME_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let Some(value) = table
+            .get(FLEET_NAME_ROW)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(value.value().to_owned()))
+    }
+
     /// The last revision shipped to the sink; `0` when nothing has shipped
     /// (issue #164).
     ///
@@ -2978,6 +3023,7 @@ impl RedbStateMachine {
         audit_sink: &mut Table<'_, &'static str, &'static str>,
         audit_checkpoint: &mut Table<'_, &'static str, u64>,
         session_key: &mut Table<'_, &'static str, &'static str>,
+        fleet_name: &mut Table<'_, &'static str, &'static str>,
         journal_gens: &mut Table<'_, (&'static str, u16, &'static str), u64>,
         proxy_recorded: &mut Table<'_, (&'static str, u16, &'static str), &'static str>,
         // The local journal to push a committed generation into (issue #224), resolved once by
@@ -3795,6 +3841,16 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
+            ControlOp::FleetNamePut { name, .. } => {
+                // Overwrites unconditionally, same reasoning as `SessionKeyPut` above: setting
+                // the first name and renaming are one op, so the second write must replace the
+                // first outright rather than accumulate — a fleet with two names is exactly the
+                // confusion this feature exists to make impossible.
+                fleet_name
+                    .insert(FLEET_NAME_ROW, name.as_str())
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
             ControlOp::JournalClearGen {
                 tenant,
                 port,
@@ -4152,6 +4208,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             audit_checkpoint,
             audit_gc_watermark,
             session_key,
+            fleet_name,
             journal_gens,
             proxy_recorded,
             dedup,
@@ -4295,6 +4352,15 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 .get(SESSION_KEY_ROW)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
                 .map(|v| v.value().to_owned());
+            // Travels with the snapshot for the same #134/#137 reason. The failure if forgotten
+            // is quieter than most of its siblings but still real: a node that joins by snapshot
+            // would silently forget the fleet's name until the next rename.
+            let fleet_name = read_txn
+                .open_table(SM_FLEET_NAME_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+                .get(FLEET_NAME_ROW)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+                .map(|v| v.value().to_owned());
             // Travels with the snapshot for the #134/#137 reason every table above does, with the
             // #224-specific failure if it is ever forgotten here: a node that joins by snapshot
             // and reads every generation as `0` would resurrect entries its peers have already
@@ -4360,6 +4426,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 audit_checkpoint,
                 audit_gc_watermark,
                 session_key,
+                fleet_name,
                 journal_gens,
                 proxy_recorded,
                 dedup,
@@ -4379,6 +4446,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             audit_checkpoint,
             audit_gc_watermark,
             session_key,
+            fleet_name,
             journal_gens,
             proxy_recorded,
             dedup,
@@ -4493,6 +4561,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut session_key = write_txn
                 .open_table(SM_SESSION_KEY_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut fleet_name = write_txn
+                .open_table(SM_FLEET_NAME_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut journal_gens = write_txn
                 .open_table(SM_JOURNAL_GENS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -4589,6 +4660,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut audit_sink,
                                         &mut audit_checkpoint,
                                         &mut session_key,
+                                        &mut fleet_name,
                                         &mut journal_gens,
                                         &mut proxy_recorded,
                                         journal.as_deref(),
@@ -4608,6 +4680,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut audit_sink,
                                     &mut audit_checkpoint,
                                     &mut session_key,
+                                    &mut fleet_name,
                                     &mut journal_gens,
                                     &mut proxy_recorded,
                                     journal.as_deref(),
@@ -4931,6 +5004,22 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             if let Some(value) = &payload.session_key {
                 session_key_table
                     .insert(SESSION_KEY_ROW, value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
+            // Cleared before it is repopulated, like the sink and the session key above: a
+            // payload carrying no name means the leader's fleet is unnamed, and leaving a stale
+            // local name in place would make this node keep reporting a name the fleet has since
+            // cleared or renamed away from.
+            let mut fleet_name_table = write_txn
+                .open_table(SM_FLEET_NAME_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            fleet_name_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            if let Some(value) = &payload.fleet_name {
+                fleet_name_table
+                    .insert(FLEET_NAME_ROW, value.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -8426,6 +8515,119 @@ mod tests {
         assert!(
             !follower_routes.load().is_empty(),
             "install_snapshot must also drive the attached routes handle"
+        );
+    }
+
+    // -- issue #373: the fleet's operator-set name ----------------------------
+
+    fn set_fleet_name(op_id: u128, name: &str) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::FleetNamePut {
+                tenant: TenantId::new(crate::FLEET_SCOPE),
+                name: name.to_owned(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn an_unset_fleet_name_reads_as_absent() {
+        let (_td, sm) = fresh_sm(None).await;
+        assert_eq!(
+            sm.fleet_name().expect("read fleet name"),
+            None,
+            "a fleet nobody has named reads as absent, not as an empty string and not as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_name_reads_back_what_was_applied() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "rift-prod-eu"))])
+            .await
+            .expect("apply");
+        assert_eq!(
+            sm.fleet_name().expect("read fleet name"),
+            Some("rift-prod-eu".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_fleet_name_write_renames_rather_than_appending() {
+        // Setting the first name and renaming are one op, so the second write must replace the
+        // first outright — a fleet with two names is the state this whole feature exists to
+        // make impossible.
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![
+            entry(1, set_fleet_name(1, "rift-prod-eu")),
+            entry(2, set_fleet_name(2, "rift-prod-us")),
+        ])
+        .await
+        .expect("apply");
+        assert_eq!(
+            sm.fleet_name().expect("read fleet name"),
+            Some("rift-prod-us".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trips_the_fleet_name() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "rift-prod-eu"))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+
+        assert_eq!(
+            follower.fleet_name().expect("read fleet name"),
+            Some("rift-prod-eu".to_owned()),
+            "a node that joins by snapshot must come back knowing which fleet it is in"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_without_a_fleet_name_installs_and_reads_absent() {
+        // The #134/#137 lesson, applied before it can bite again: a snapshot built before this
+        // field existed must still install. Simulated faithfully by stripping the key from a
+        // real snapshot's JSON rather than by trusting `#[serde(default)]` in the abstract.
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "rift-prod-eu"))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&snapshot.into_inner()).expect("snapshot is json");
+        let removed = payload
+            .as_object_mut()
+            .expect("snapshot payload is an object")
+            .remove("fleet_name");
+        assert!(
+            removed.is_some(),
+            "the field must be present in a current snapshot, or this test proves nothing"
+        );
+        let older = Box::new(std::io::Cursor::new(
+            serde_json::to_vec(&payload).expect("re-encode"),
+        ));
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, older)
+            .await
+            .expect("a snapshot predating the fleet name must still install");
+        assert_eq!(
+            follower.fleet_name().expect("read fleet name"),
+            None,
+            "an older snapshot carries no name, which reads as absent — the same as a fleet \
+             nobody has named"
         );
     }
 

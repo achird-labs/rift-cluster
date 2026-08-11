@@ -67,9 +67,19 @@ tags:
     description: RFC-002 §9 audit stream and export sink — no upstream equivalent.
   - name: fleet
     description: >
-      RFC-006 §5.2 read-only admin-port projection of the operator
-      surface (`/_cluster/*` on the cluster port) — no upstream
-      equivalent.
+      Fleet-level operator surface — no upstream equivalent.
+
+
+      Mostly RFC-006 §5.2's **read-only** admin-port projection of
+      `/_cluster/*` on the cluster port (`/_fleet/members`,
+      `/_fleet/health`, `/_fleet/ops/{opId}`). `PUT /admin/fleet/name`
+      (issue #373) is the one write here and is not a projection of
+      anything: the fleet's name has no cluster-port equivalent to project,
+      because it is set through consensus rather than read off a node. It
+      is tagged `fleet` regardless of that difference, so a consumer
+      looking for what the fleet *is* finds naming beside membership rather
+      than filed under tenancy, which administers a different thing
+      entirely.
   - name: session
     description: RFC-006 §5.3 browser session exchange — no upstream equivalent.
   - name: sources
@@ -3262,6 +3272,62 @@ paths:
           $ref: '#/components/responses/Unavailable'
 
   # ---------------------------------------------------------------------
+  # ee: the fleet's operator-set name (issue #373) — Raft-replicated, fleet-
+  # scoped, published on `getFleetMembers`/`/_cluster/members`; no upstream
+  # equivalent
+  # ---------------------------------------------------------------------
+  /admin/fleet/name:
+    put:
+      operationId: putFleetName
+      summary: Set or rename the fleet's operator-set name
+      description: >
+        Terminates. Fleet-scoped (`ClusterAdmin` / FleetAdmin only) — same
+        tier as `putAuditSink`, for the same reason: this is a fleet-wide
+        rename, not a tenant-scoped one. Replicated via a new `ControlOp`
+        rather than a per-node command-line flag, so every node — and every
+        console session, regardless of which node it happens to be talking
+        to — agrees on one name. Setting the first name and renaming are the
+        same write: the new value replaces whatever was there.
+      tags: [fleet]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FleetNameWrite'
+      responses:
+        '200':
+          description: >
+            Name stored; body is empty (`terminate_tenancy` renders no
+            body — only principal creation returns one).
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Caller lacks fleet-scoped access (RFC-002 §8.4 — not a 403).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
+  # ---------------------------------------------------------------------
   # ee: fleet projection (RFC-006 §5.2) — read-only admin-port mirror of
   # /_cluster/* on the cluster port; no upstream equivalent
   # ---------------------------------------------------------------------
@@ -4816,6 +4882,19 @@ components:
                     reason:
                       type: string
 
+    FleetNameWrite:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: >
+            Required — an omitted field is refused, not defaulted to an
+            empty name. Trimmed non-empty, at most 128 characters, and free
+            of control characters; otherwise unconstrained, since this is
+            chrome text a human reads rather than an id anything parses
+            back.
+
     AuditSinkWrite:
       type: object
       required: [uri]
@@ -5123,6 +5202,48 @@ components:
           description: >
             Voter node ids in the currently effective membership. Strings for
             the same reason as `node_id`.
+        fleet_name:
+          type: string
+          nullable: true
+          description: >
+            The fleet's operator-set name (issue #373), or `null` when nobody
+            has named it yet. A label, not an identity — node ids remain what
+            every endpoint on this document addresses; this exists only so a
+            console user, or an operator with several fleets open, can tell
+            them apart at a glance.
+
+
+            Deliberately **not** in `required`, unlike `current_leader` and
+            `last_applied` which share its always-present-but-nullable
+            shape. Those predate every node in any live fleet; this field
+            does not. During a rolling upgrade the node answering this
+            request may be a pre-#373 build that omits the key altogether,
+            and `/_fleet/members` is answered by whichever node the caller
+            reached — so absent is a genuinely reachable state, not a
+            hypothetical one. Requiring it would make the shape an older
+            node really sends unrepresentable in every generated client.
+
+
+            Consumers therefore fold absent into `null`: both mean "no name
+            to show". What neither means is "the name could not be read" —
+            that is `fleet_name_unavailable` below, and keeping the two
+            apart is the whole point of there being two fields.
+        fleet_name_unavailable:
+          type: boolean
+          description: >
+            Whether the answering node could not *read* the name, as distinct
+            from there being none to read. Both arrive as `fleet_name: null`,
+            and without this flag they are the same byte on the wire — so a
+            storage fault on the answering node would render exactly like a
+            fleet nobody has named, which is the wrong-but-quiet failure the
+            error rules exist to prevent.
+
+
+            The read deliberately still answers `200` when this is `true`:
+            everything else in this body comes from in-memory raft metrics and
+            is still trustworthy, and an operator diagnosing that fault wants
+            the membership view rather than a `500`. Absent is equivalent to
+            `false`.
         members:
           type: array
           description: >

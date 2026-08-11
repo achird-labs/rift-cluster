@@ -624,6 +624,17 @@ pub enum ControlOp {
         /// dump and survives JSON without a base64 alphabet decision.
         key: String,
     },
+    /// Set or rename the fleet's operator-facing name (issue #373).
+    ///
+    /// Fleet-scoped and replicated rather than a per-node command-line flag: a flag lets two
+    /// nodes disagree about what the fleet is called, which is exactly the confusion this
+    /// feature exists to remove. One fleet has one name, agreed by consensus like the rest of
+    /// the cluster's config, and every node — and every console session, regardless of which
+    /// node it happens to be talking to — reads the same value back.
+    FleetNamePut {
+        tenant: TenantId,
+        name: String,
+    },
     /// Bump a port's journal clear generation, or one space's within it (Ch.7 §"Clears are
     /// generation bumps — never timestamps", issue #224).
     ///
@@ -850,6 +861,12 @@ pub const MIN_POLL_SECS: u64 = 5;
 /// liability. Both sit under the cluster transport's own cap.
 pub const MAX_SOURCE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 
+/// Longest a fleet name ([`ControlOp::FleetNamePut`]) may be, in `char`s. A cap exists so the
+/// name stays chrome-sized wherever it renders (a top bar, a members-list column); 128
+/// matches the length ceiling this crate already uses for other operator-chosen names
+/// (`is_source_name`), not any technical constraint of the field itself.
+pub const MAX_FLEET_NAME_CHARS: usize = 128;
+
 /// An ordered sequence of stub edits, applied atomically to one imposter's stub
 /// list — the order-aware #316 semantics, mirroring
 /// `ImposterManager::{add_stub, replace_stub_by_id, delete_stub_by_id, move_stub}`.
@@ -972,6 +989,7 @@ impl ControlOp {
             | ControlOp::AuditSinkDelete { tenant }
             | ControlOp::AuditCheckpointPut { tenant, .. }
             | ControlOp::SessionKeyPut { tenant, .. }
+            | ControlOp::FleetNamePut { tenant, .. }
             | ControlOp::JournalClearGen { tenant, .. }
             | ControlOp::ProxyRecorded { tenant, .. }
             | ControlOp::ProxyRecordedClear { tenant, .. } => tenant,
@@ -1030,6 +1048,11 @@ impl ControlOp {
             // how every console session is revoked at once — precisely the kind of act an auditor
             // reading an incident timeline needs to see.
             ControlOp::SessionKeyPut { .. } => "cluster.admin",
+            // Named identically to the session-key and audit-sink arms above: this is the same
+            // "fleet-scoped operator act" category, and a rename is exactly the kind of thing an
+            // incident timeline needs attributed — "which fleet was this?" is unanswerable
+            // afterwards if the rename itself left no row.
+            ControlOp::FleetNamePut { .. } => "cluster.admin",
             // Unlike `AuditCheckpointPut`, this one IS audited (issue #224): taking the clear onto
             // consensus is what makes an honest audit row possible at all — the pre-#224 fan-out
             // had no log entry to attribute one to. Named identically to `authz::Action::SavedRequestsClear`'s
@@ -1078,7 +1101,10 @@ impl ControlOp {
             | ControlOp::AuditCheckpointPut { .. }
             // One key, fleet-wide: it addresses the whole scope, not a named object. The key itself
             // must never reach an audit row.
-            | ControlOp::SessionKeyPut { .. } => AUDIT_RESOURCE_ALL.to_owned(),
+            | ControlOp::SessionKeyPut { .. }
+            // Same reasoning again: one name, fleet-wide, so it addresses the whole scope rather
+            // than a named object.
+            | ControlOp::FleetNamePut { .. } => AUDIT_RESOURCE_ALL.to_owned(),
             // A port-wide clear addresses the port, exactly like `PatchStubs`/`SetEnabled`; a
             // space-scoped one addresses the narrower `port/space` pair so an audit reader can
             // tell the two apart without decoding the outcome text.
@@ -1459,6 +1485,38 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             }
             Ok(())
         }
+        ControlOp::FleetNamePut { tenant, name } => {
+            require_fleet_scope(tenant)?;
+            // Deliberately not `is_source_name`'s `[A-Za-z0-9._-]` charset: that rule guards ids
+            // that appear in paths and redb keys. A fleet name is chrome text a human reads in
+            // the console's top bar — it is never parsed back into an address — so the only
+            // hazards worth guarding against are "renders as nothing" and "corrupts the chrome
+            // that displays it".
+            if name.trim().is_empty() {
+                return Err(
+                    "fleet name must not be empty or whitespace-only: a name a human cannot \
+                     read is the same confusion as no name at all"
+                        .to_owned(),
+                );
+            }
+            // Counted in chars, not bytes: a human-facing length cap should bound how much text
+            // renders, not how many bytes a particular character happens to encode to.
+            let char_count = name.chars().count();
+            if char_count > MAX_FLEET_NAME_CHARS {
+                return Err(format!(
+                    "fleet name is {char_count} characters, over the {MAX_FLEET_NAME_CHARS} \
+                     character cap"
+                ));
+            }
+            if name.chars().any(char::is_control) {
+                return Err(
+                    "fleet name must not contain control characters: one could corrupt a log \
+                     line, a terminal, or the console's own chrome"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
         // Deliberately shallow: only the checks that hold regardless of state. Whether `tenant`
         // exists and whether it owns `port` are apply-time questions (`raft::store::mutate_tables`'
         // `JournalClearGen` arm) — the same split every other op here draws, and the reason is the
@@ -1552,19 +1610,19 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// The audit-export ops address one fleet-wide sink, so the fleet scope is the
-/// only tenant they may carry.
+/// Several ops (the audit sink, the session-signing key, the fleet name) each address one
+/// fleet-wide piece of state, so the fleet scope is the only tenant any of them may carry.
 ///
-/// Refused rather than tolerated: these ops are audited, and `AuditRow::tenant`
-/// means "the tenant the op acted on". Admitting `AuditSinkPut { tenant: "acme" }`
-/// would file a fleet-wide configuration change under one tenant's name, in the
-/// stream this feature exists to produce.
+/// Refused rather than tolerated: these ops are audited, and `AuditRow::tenant` means "the
+/// tenant the op acted on". Admitting `AuditSinkPut { tenant: "acme" }` — or a fleet rename
+/// under the same tenant — would file a fleet-wide configuration change under one tenant's
+/// name, in the stream this feature exists to produce.
 fn require_fleet_scope(tenant: &TenantId) -> Result<(), String> {
     if tenant.as_str() == FLEET_SCOPE {
         Ok(())
     } else {
         Err(format!(
-            "the audit export sink is fleet-wide, so its ops carry the reserved fleet scope \
+            "this op addresses fleet-wide state, so it carries the reserved fleet scope \
              {FLEET_SCOPE:?}, not tenant {:?}",
             tenant.as_str()
         ))
@@ -2171,6 +2229,9 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget<'_>> {
         | ControlOp::AuditCheckpointPut { .. }
         // The session key addresses the fleet, not an imposter record.
         | ControlOp::SessionKeyPut { .. }
+        // The fleet name addresses the fleet, not an imposter record — same reasoning as the
+        // session key immediately above.
+        | ControlOp::FleetNamePut { .. }
         // A clear is a convergence primitive, not a config write conditioned on a stored
         // revision: it commits unconditionally, like `AuditCheckpointPut`'s `max` does, so two
         // concurrent clears compose rather than one losing an optimistic-concurrency race the
@@ -4213,6 +4274,87 @@ mod tests {
             serde_json::to_value(&stubs).expect("serialize"),
             before,
             "partial application would diverge replicas from the stored config"
+        );
+    }
+
+    // -- issue #373: the fleet's operator-set name ----------------------------
+
+    fn fleet_name(name: &str) -> ControlOp {
+        ControlOp::FleetNamePut {
+            tenant: TenantId::new(FLEET_SCOPE),
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_fleet_name() {
+        assert_eq!(validate(&fleet_name("rift-prod-eu")), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_a_fleet_name_with_spaces_and_non_ascii() {
+        // Deliberately permitted: this is chrome text a human reads, not an id that addresses
+        // anything, so the `[A-Za-z0-9._-]` rule that guards path- and redb-key-safe ids
+        // (`is_source_name`) would be borrowed reasoning here.
+        assert_eq!(validate(&fleet_name("Rift Prod (eu-west) ✱")), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_fleet_name() {
+        let err = validate(&fleet_name("")).expect_err("an empty fleet name must be rejected");
+        assert!(err.contains("fleet name"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_a_whitespace_only_fleet_name() {
+        // Distinct from the empty case: a name that renders as nothing is the same operator
+        // mistake, and "the top bar is blank" is exactly the confusion #373 exists to remove.
+        let err = validate(&fleet_name("   \t ")).expect_err("a blank fleet name must be rejected");
+        assert!(err.contains("fleet name"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_an_over_long_fleet_name() {
+        let err = validate(&fleet_name(&"n".repeat(129)))
+            .expect_err("an over-long fleet name must be rejected");
+        assert!(err.contains("128"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_a_fleet_name_at_the_length_cap() {
+        assert_eq!(validate(&fleet_name(&"n".repeat(128))), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_a_fleet_name_with_control_characters() {
+        // The real hazard for a label that is never parsed: a newline or escape sequence that
+        // corrupts a log line, a terminal, or the console's own chrome.
+        for bad in ["prod\nstaging", "prod\u{1b}[31m", "prod\u{0}"] {
+            let err = validate(&fleet_name(bad))
+                .expect_err("a fleet name carrying control characters must be rejected");
+            assert!(err.contains("control"), "{bad:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_tenant_scoped_fleet_name_write() {
+        // One fleet, one name: a tenant admin sending `X-Rift-Tenant: acme` must not be able to
+        // rename the cluster every other tenant is also looking at.
+        let op = ControlOp::FleetNamePut {
+            tenant: TenantId::new("acme"),
+            name: "acme-only".to_owned(),
+        };
+        let err = validate(&op).expect_err("a tenant-scoped fleet rename must be rejected");
+        assert!(err.contains(FLEET_SCOPE), "{err}");
+    }
+
+    #[test]
+    fn fleet_name_put_is_audited_as_cluster_admin() {
+        // A rename is an operator act an incident timeline needs: "which fleet was this?" is
+        // unanswerable afterwards if the rename itself left no row.
+        assert_eq!(
+            fleet_name("rift-prod-eu").audit_action(),
+            Some("cluster.admin")
         );
     }
 }

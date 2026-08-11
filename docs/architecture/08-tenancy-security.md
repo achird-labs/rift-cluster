@@ -776,6 +776,27 @@ requirement; the count is an enhancement available to fleet admins.
 Unlike `/events`, this is **not** a fail-closed placeholder awaiting a capability. A tenant-filtered
 fleet view is not deferred work — there is nothing per-tenant in a ring to filter.
 
+### `PUT /admin/fleet/name` — the first fleet-scoped *write* on the admin port (issue #373)
+
+The section above is about a read-only projection, and stays true: `/_fleet/*` projects
+`/_cluster/*` and mutates nothing. Naming the fleet is the first thing on this port that is
+fleet-scoped and **not** a projection, so it is recorded here rather than left to be inferred from
+the route table.
+
+It is `Action::ClusterAdmin` on `FLEET_SCOPE`, by reason 1 above rather than by analogy: a fleet's
+name is fleet-wide state, and a `TenantAdmin` of `acme` sending `X-Rift-Tenant: acme` must not
+become eligible to rename the cluster every other tenant is also looking at. `control::validate`
+enforces the same thing a second time — `require_fleet_scope` refuses the op outright — so a
+mis-built `ControlOp` fails at admission rather than filing a fleet-wide rename under one tenant's
+name in the audit stream. That belt-and-braces is deliberate: the audit-sink surface shipped
+exactly that bug once (`TenantId::default()` instead of `FLEET_SCOPE`).
+
+Why it is replicated rather than a per-node flag is a control-plane question, not a security one,
+and is recorded on `ControlOp::FleetNamePut` itself. The security-relevant half is that the name is
+**a label, never an identity**: nothing authorizes, addresses, or routes by it, so a fleet renamed
+mid-flight changes what an operator sees and nothing about what anyone may do. Node ids remain what
+every decision in this chapter is made against.
+
 ### The session-signing key is a secret in the replicated log, deliberately
 
 A browser cannot hold the long-lived API key, so `POST /session` exchanges it once for an

@@ -19,6 +19,56 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/*
+ * The fleet's name (#373). Three states, not two — and the third is the one worth testing, because
+ * "could not read the name" and "nobody has named it" both arrive as `fleet_name: null` and would
+ * otherwise render identically. They send an operator to different places: one is a fault on the
+ * answering node, the other is a console task nobody has done yet.
+ */
+describe("the fleet's name", () => {
+  const withMembers = (extra: Record<string, unknown>) => ({
+    ...THREE_NODE,
+    "/_fleet/members": {
+      json: { ...THREE_NODE["/_fleet/members"].json, ...extra },
+    },
+  });
+
+  it("renders the name the fleet was given", async () => {
+    stubFetch(withMembers({ fleet_name: "rift-prod-eu", fleet_name_unavailable: false }));
+    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+
+    expect((await screen.findByTestId("fleet-name")).textContent).toBe("rift-prod-eu");
+  });
+
+  it("says Unnamed when nobody has named it, rather than leaving a gap", async () => {
+    // The state every existing deployment is in the moment it upgrades, so it is the common case,
+    // not an edge one. A blank here reads as "still loading" and invites a refresh that changes
+    // nothing.
+    stubFetch(withMembers({ fleet_name: null, fleet_name_unavailable: false }));
+    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+
+    expect((await screen.findByTestId("fleet-name")).textContent).toBe("Unnamed");
+  });
+
+  it("distinguishes a name it could not read from a fleet with no name", async () => {
+    stubFetch(withMembers({ fleet_name: null, fleet_name_unavailable: true }));
+    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+
+    const name = await screen.findByTestId("fleet-name");
+    expect(name.textContent).toBe("Unavailable");
+    expect(name.textContent).not.toBe("Unnamed");
+  });
+
+  it("treats a node that omits the flag entirely as having nothing to report", async () => {
+    // Field-absent is the pre-#373 wire shape and must not read as "unavailable" — an older node
+    // in a mixed-version fleet has not failed to read anything.
+    stubFetch(withMembers({}));
+    renderInApp(<Fleet />, { whoami: whoamiWith("fleet-admin") });
+
+    expect((await screen.findByTestId("fleet-name")).textContent).toBe("Unnamed");
+  });
+});
+
 describe("cluster screen against a 3-node fleet", () => {
   it("names this node, the leader, the ring epoch and the voters", async () => {
     stubFetch(THREE_NODE);
