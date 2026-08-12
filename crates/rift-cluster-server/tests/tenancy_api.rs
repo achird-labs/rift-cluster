@@ -1964,7 +1964,7 @@ async fn a_non_default_tenants_route_hits_report_not_installed_never_zero() {
         .expect("json");
     assert_eq!(
         default_hits,
-        json!({ "installed": true, "hits": {} }),
+        json!({ "installed": true, "hits": {}, "front_door": "none" }),
         "{default_hits}"
     );
 

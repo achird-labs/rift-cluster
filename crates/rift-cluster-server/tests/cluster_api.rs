@@ -37,6 +37,8 @@ async fn start() -> Fixture {
             slot.clone(),
             readiness.clone(),
             Arc::clone(&route_hits),
+            // This fixture's node binds a front door, so the cluster-port body must say so (#403).
+            true,
         ),
         engine: None,
         audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
@@ -310,7 +312,7 @@ async fn route_hits_reports_this_nodes_own_dispatch_counts() {
     let empty = get(&client, fixture.addr, "/_cluster/route-hits").await;
     assert_eq!(
         empty,
-        serde_json::json!({ "hits": {} }),
+        serde_json::json!({ "hits": {}, "front_door": true }),
         "a node that has dispatched nothing reports an empty map, not an absent key"
     );
 
@@ -321,7 +323,7 @@ async fn route_hits_reports_this_nodes_own_dispatch_counts() {
     let counted = get(&client, fixture.addr, "/_cluster/route-hits").await;
     assert_eq!(
         counted,
-        serde_json::json!({ "hits": { "svc": 2, "other": 1 } }),
+        serde_json::json!({ "hits": { "svc": 2, "other": 1 }, "front_door": true }),
         "raw per-id counts, exactly as this node holds them"
     );
 }

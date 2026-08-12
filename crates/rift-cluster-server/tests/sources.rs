@@ -142,6 +142,8 @@ async fn start() -> Fixture {
                 // This suite is about the source surface; nothing here dispatches through a front
                 // door, so the counter exists only to satisfy the signature.
                 Arc::new(rift_cluster_server::route_hits::RouteHitCounter::default()),
+                // No front-door listener in this fixture either, for the same reason.
+                false,
             ),
             Arc::clone(&puller),
         ),

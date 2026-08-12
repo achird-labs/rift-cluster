@@ -92,6 +92,15 @@ all of it keys on a positive `installed: false`, never on a hits read that merel
 point is the rule, not an implementation detail: rendering "cannot take a request" off the back of a
 read the console could not complete would be a confident claim sourced from an unknown.
 
+**A fleet with no listener at all gets the same treatment, one level down (#403).** `--front-door`
+is optional, so every node in a fleet can be running without one — and then every route reports an
+honest zero, which the Hits column otherwise flags as the "wrong or dead" state. When the server
+answers `front_door: "none"` the screen states that once in a banner and renders those zeros muted
+rather than flagged, because flagging every row at once is the false diagnosis, not a warning. The
+ranks and the evaluation order are untouched: unlike the not-installed case these routes really are
+installed and really would be evaluated — there is simply nothing listening yet. And as above, only
+the server's *proven* `none` counts; `unknown` renders exactly as today.
+
 The editor validates before the write, mirroring `RouteTable::validate` / `Route::validate`:
 
 | Error | Condition |

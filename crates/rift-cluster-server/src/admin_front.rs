@@ -171,6 +171,10 @@ pub struct FrontConfig {
     /// body it already built — a node asking itself over the wire can observe a different moment
     /// than the one it is reporting.
     pub route_hits: Arc<RouteHitCounter>,
+    /// Whether this node binds a front-door listener (issue #403), resolved once in `compose` and
+    /// shared with the cluster port so the two cannot disagree. Counts alone cannot tell "no
+    /// request reached this route" from "nothing in this fleet could have dispatched one".
+    pub front_door_bound: bool,
     /// This node's view of the fleet request journal (issue #223): the merged read, the
     /// `numberOfRequests` decoration, and the transitional `DELETE savedRequests` fan-out all
     /// reach the fleet through it.
@@ -306,6 +310,8 @@ struct FrontState {
     puller: Arc<SourcePuller>,
     /// See [`FrontConfig::route_hits`].
     route_hits: Arc<RouteHitCounter>,
+    /// See [`FrontConfig::front_door_bound`].
+    front_door_bound: bool,
     /// See [`FrontConfig::journal_net`].
     journal_net: Arc<JournalNet>,
     /// See [`FrontConfig::flow_net`].
@@ -342,6 +348,7 @@ pub async fn bind(config: FrontConfig, node: &Arc<RaftNode>) -> std::io::Result<
         readiness: config.readiness,
         puller: config.puller,
         route_hits: config.route_hits,
+        front_door_bound: config.front_door_bound,
         journal_net: config.journal_net,
         flow_net: config.flow_net,
         fleet_journal_port_cap: config.fleet_journal_port_cap,
@@ -1407,7 +1414,7 @@ async fn read_routes(
 /// `GET /front-door/route-hits`: how many requests each of `tenant`'s routes has claimed, summed
 /// across the fleet (issue #368).
 ///
-/// Three answers, kept apart on purpose:
+/// Four answers, kept apart on purpose:
 ///
 /// - `{"installed": true, "hits": {...}}` — one entry per id in this tenant's stored table, `0`
 ///   included. The zero is the point: a route that has never taken a request is wrong or dead.
@@ -1442,9 +1449,25 @@ async fn read_route_hits(state: &Arc<FrontState>, tenant: &TenantId) -> Response
     let ids: Vec<String> = table.routes.into_iter().map(|route| route.id).collect();
 
     let local = state.route_hits.snapshot();
+    let status = node.status();
     let peers = route_hits::peer_hits(&node).await;
     let (hits, partial) = route_hits::merge_route_hits(&ids, &local, &peers);
-    route_hits_response(&RouteHits::Installed(hits), partial)
+    // Folded from the same peer replies the counts came from, so the presence answer and the sums
+    // describe the same moment and the same set of nodes (issue #403).
+    //
+    // `peer_hits` enumerates *voters*, but a learner replicates and serves the data plane in full
+    // and can bind a front door — and past the auto-voter ceiling learners are a permanent steady
+    // state, not a transient. They are therefore counted as members the fan-out never asked, which
+    // blocks a claim of proven absence without pretending they answered. (Their counts are missing
+    // from the sums too; that is the older gap this does not widen — see the follow-up filed with
+    // this change.)
+    let unasked_members = status
+        .learners
+        .iter()
+        .filter(|&&id| id != status.node_id)
+        .count();
+    let front_door = route_hits::merge_front_door(state.front_door_bound, &peers, unasked_members);
+    route_hits_response(&RouteHits::Installed { hits, front_door }, partial)
 }
 
 fn route_hits_response(hits: &RouteHits, partial: bool) -> Response<FrontBody> {
@@ -6818,6 +6841,7 @@ mod tests {
                     rift_cluster_base::seams::SourceRegistry::default(),
                 )),
                 route_hits: Arc::new(RouteHitCounter::default()),
+                front_door_bound: false,
                 journal_net: JournalNet::new(rift_cluster::stores::ClusterJournal::new(1)),
                 flow_net: Arc::clone(&net),
                 fleet_journal_port_cap: rift_cluster::stores::DEFAULT_FLEET_JOURNAL_PORT_CAP,
@@ -7193,7 +7217,10 @@ mod tests {
     /// merge computed right and plumbed wrong — so the plumbing is asserted directly.
     #[test]
     fn a_partial_route_hits_answer_is_stamped_and_a_complete_one_is_not() {
-        let hits = RouteHits::Installed(std::collections::BTreeMap::from([("svc".to_owned(), 3)]));
+        let hits = RouteHits::Installed {
+            hits: std::collections::BTreeMap::from([("svc".to_owned(), 3)]),
+            front_door: route_hits::FrontDoorPresence::Bound,
+        };
 
         let floor = route_hits_response(&hits, true);
         assert_eq!(
@@ -7456,6 +7483,7 @@ mod tests {
                     rift_cluster_base::seams::SourceRegistry::default(),
                 )),
                 route_hits: Arc::new(RouteHitCounter::default()),
+                front_door_bound: false,
                 journal_net: JournalNet::new(Arc::clone(&journal)),
                 // In-memory and never bound to `node`'s ring: nothing in this file's
                 // tests exercises `/admin/tenants`'s flow-entry fan-out, so this only

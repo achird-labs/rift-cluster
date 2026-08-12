@@ -217,6 +217,15 @@ pub struct StatusReport {
     pub last_applied: Option<u64>,
     /// The voter ids in the currently effective membership.
     pub voters: Vec<NodeId>,
+    /// The **learner** ids in the currently effective membership — members that replicate and
+    /// serve the data plane in full but hold no vote.
+    ///
+    /// Reported separately rather than folded into [`voters`](Self::voters) because the two answer
+    /// different questions, and because a fan-out that enumerates only voters is silently
+    /// incomplete on any fleet past the auto-voter ceiling: nodes beyond it stay learners
+    /// indefinitely, still binding listeners and still taking traffic. Anything proving a negative
+    /// about "the fleet" has to know they exist.
+    pub learners: Vec<NodeId>,
 }
 
 /// What a [`RaftNode::leave`] actually did.
@@ -1594,6 +1603,17 @@ impl RaftNode {
             current_leader: metrics.current_leader,
             last_applied: metrics.last_applied.map(|log_id| log_id.index),
             voters: metrics.membership_config.voter_ids().collect(),
+            // `nodes()` is every member; whatever is in it and not a voter is a learner.
+            learners: {
+                let voters: std::collections::BTreeSet<NodeId> =
+                    metrics.membership_config.voter_ids().collect();
+                metrics
+                    .membership_config
+                    .nodes()
+                    .map(|(id, _)| *id)
+                    .filter(|id| !voters.contains(id))
+                    .collect()
+            },
         }
     }
 

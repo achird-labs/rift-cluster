@@ -65,8 +65,24 @@ Design points that carry weight (full spec in #19):
   what an operator needs to see. The counts are per node and in memory, summed
   across the fleet by `GET /front-door/route-hits` and stamped
   `Rift-Cluster-Partial` when a peer could not be reached. The figure that
-  matters most is a zero: a route that has never taken a request is either
-  wrong or dead.
+  matters most is a zero — but a zero only means "wrong or dead" for a route
+  that *could* have taken a request, and three states where it could not are
+  reported rather than collapsed into it: a tenant whose routes are never
+  compiled in (`installed: false`, above), a route switched off, and a fleet
+  where no node binds a listener at all.
+- **Listener presence is published too** (#403): `--front-door` is optional,
+  so a whole fleet can run without one — and then every route reports an
+  honest zero that reads exactly like a misconfigured route. Each node states
+  its own listener on `GET /_cluster/route-hits`, and the admin read folds
+  those into `front_door: bound | none | unknown` on the same body as the
+  counts. `none` is *proven* absence and is the only value that explains the
+  zeros: it is claimable only when every voter answered and every one of them
+  denied binding a listener, which is what makes it mutually exclusive with
+  `Rift-Cluster-Partial` by construction. A peer that could not be asked, or
+  one running a build from before the field existed, yields `unknown` — the
+  counts still stand, but absence is not inferred from silence. The fold is a
+  pure function beside the count merge, because every wire test here runs a
+  solo node and would never execute the peer arms.
 
 ## Imposter sources: mocks come from somewhere
 
