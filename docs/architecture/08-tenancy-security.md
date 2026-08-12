@@ -610,9 +610,24 @@ second would be a claim about traffic where the truth is about installation.
 `routes_installed_for` is the single definition of that rule: `desired_routes`
 filters on it and the hit read reports it, so the table the front door compiles
 and the state the console displays cannot drift apart. When the front door grows
-a tenant dimension, that one function is what changes. The rest of the route
-screen still presents a non-default tenant's stored table as though it were live;
-that gap is tracked separately (issue #400).
+a tenant dimension, that one function is what changes.
+
+The console spends that flag across the whole route screen, not just the count
+column (issue #400). On `installed: false` it states the fact once above the
+table — stored and replicated, editable, but never compiled in — and then stops
+the rows contradicting it: no route is given a rank, and the "why this order"
+column reads `not installed` rather than the tie-break prose, because both are
+claims about a position in a dispatch chain that does not exist for this tenant.
+The rows are listed in stored order there rather than in `effective_order`, for
+the same reason: sorting by a chain that is never evaluated would be presenting a
+computed order as a fact about this table. The route tester still reports which
+route *would* win, since that is a true reading of the rules, but says plainly
+that nothing reaches this tenant's table to be dispatched in the first place.
+The editing controls stay live, deliberately: the stored table is real
+replicated state and writing to it is legitimate, so muting the *chain* must not
+read as a read-only screen. The banner and the muting key on a positive
+`installed: false` only — a flag the console could not read leaves the screen as
+it was, since "unknown" is not a licence to assert "cannot take a request".
 
 Serving every tenant into one engine reopens the door the old guard was built
 to close: an authorized `acme` caller could address `beta`'s port and read it,

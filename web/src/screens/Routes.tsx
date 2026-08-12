@@ -1,3 +1,4 @@
+import type { UseQueryResult } from "@tanstack/react-query";
 import { type FormEvent, type ReactNode, useEffect, useState } from "react";
 
 import { ApiError } from "../api/client.ts";
@@ -16,9 +17,31 @@ import { effectiveOrder, orderReason, validateTable } from "../features/routes/o
 import { probeRoutes } from "../features/routes/probe.ts";
 import { useToast } from "../components/toast.tsx";
 
+/**
+ * Is this tenant's table *known* to be uninstalled?
+ *
+ * The `undefined` case — the read is pending, failed, or came back without the flag — is
+ * deliberately not `true`. Everything this predicate gates is a confident structural claim ("these
+ * routes can never take a request"), and putting that behind a read the console could not complete
+ * would be the same bound-versus-unknown error #369 exists to prevent, one level up. One
+ * definition, used by every call site, so the rule cannot drift between them.
+ */
+function isNotInstalled(hits: RouteHits | undefined): boolean {
+  return hits?.installed === false;
+}
+
 export function RouteTableScreen(): ReactNode {
   const { can } = useSession();
   const table = useRouteTable();
+  /*
+   * Read once here and passed down, rather than read again inside `Editor`. Two observers of one
+   * query key is not one cache read: `Editor` mounts only after the table resolves, and at
+   * `staleTime: 0` the later observer refetches on mount — so the screen issued the cluster-wide
+   * fan-out twice per load. Gated on the table read because the error branch below renders no
+   * table at all, and a fan-out polling behind that screen buys nothing.
+   */
+  const hits = useRouteHits({ enabled: table.isSuccess });
+  const notInstalled = isNotInstalled(hits.data);
   const mayWrite = can("imposter.write");
 
   if (table.isError) {
@@ -35,28 +58,35 @@ export function RouteTableScreen(): ReactNode {
       <header className="screen-head">
         <h1>Front-door routes</h1>
         <p className="scope-label">
-          Listed in the order the front door evaluates them, which is computed from the routes
-          themselves — not the order they were authored in.
+          {notInstalled
+            ? "Listed in stored order. This tenant's table is not evaluated by the front door — see below."
+            : "Listed in the order the front door evaluates them, which is computed from the routes themselves — not the order they were authored in."}
         </p>
       </header>
       {table.isPending ? <p className="muted">Reading…</p> : null}
       {table.isSuccess ? (
         <div className="screen-split">
           <div className="screen-main">
-            <Editor loaded={table.data} mayWrite={mayWrite} />
+            <Editor loaded={table.data} mayWrite={mayWrite} hits={hits} />
             <FrontDoorNotes />
           </div>
-          <RouteTester routes={table.data} />
+          <RouteTester routes={table.data} notInstalled={notInstalled} />
         </div>
       ) : null}
     </section>
   );
 }
 
-function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): ReactNode {
-  // Read here rather than in `RouteTableScreen`: the counts belong to the table this component
-  // renders, and the screen above it does not render a row.
-  const hits = useRouteHits();
+function Editor({
+  loaded,
+  mayWrite,
+  hits,
+}: {
+  loaded: Route[];
+  mayWrite: boolean;
+  hits: UseQueryResult<RouteHits>;
+}): ReactNode {
+  const notInstalled = isNotInstalled(hits.data);
   const [draft, setDraft] = useState<Route[]>(loaded);
   const [adding, setAdding] = useState(false);
   const [base, setBase] = useState<Route[]>(loaded);
@@ -105,8 +135,13 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
    * Disabled routes are not in `effectiveOrder` at all (they are never dispatched), so they are
    * appended after it rather than dropped: an operator still has to be able to see and re-enable
    * them.
+   *
+   * Except when the table is never installed, where `effectiveOrder` is computing a chain that does
+   * not exist — sorting by it would present a fabricated order under a header that says these are
+   * listed as stored. Stored order is the only true ordering available for that tenant, and it is
+   * what the muted rank and "why" columns are consistent with.
    */
-  const rows = [...ordered, ...draft.filter((route) => !route.enabled)];
+  const rows = notInstalled ? draft : [...ordered, ...draft.filter((route) => !route.enabled)];
 
   const save = (): void => {
     if (errors.length > 0) return;
@@ -230,6 +265,34 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
         </p>
       ) : null}
 
+      {/*
+       * `role="status"`, and the accent family rather than warn/crit: nothing here is broken or
+       * needs attention, and a tenant cannot act on it at all. It is a standing structural fact
+       * about where this table lives, so it is stated once above the rows instead of repeated as
+       * an alarm on each of them.
+       */}
+      {notInstalled ? (
+        <div className="banner info" data-testid="routes-not-installed" role="status">
+          <span className="b-glyph" aria-hidden="true">
+            &#x25c8;
+          </span>
+          <div>
+            <strong>These routes are stored, but not compiled into the front door.</strong>
+            <p>
+              The front door is a single shared listener with no tenant discriminator, so only the
+              default tenant&rsquo;s table is installed. This table is replicated and readable —
+              editing it here is real — but no request can ever be dispatched through it.
+            </p>
+            <p>
+              The reasoning is recorded in <Ident>docs/architecture/08-tenancy-security.md</Ident>,
+              under &ldquo;<code>desired_routes</code> is deliberately NOT unioned&rdquo;: an
+              arriving data-plane request carries no tenant identity, so a shared table would let
+              any tenant&rsquo;s catch-all capture front-door traffic fleet-wide.
+            </p>
+          </div>
+        </div>
+      ) : null}
+
       <section className="card">
         <div className="scroll-x">
       {hits.data?.partial ? (
@@ -264,10 +327,21 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
         <tbody>
           {rows.map((route) => (
             <tr key={route.id} data-testid="route-row">
-              {/* A disabled route is excluded from dispatch, so it has no place in the chain. */}
-              <td data-testid="route-rank">
-                <span className={route.enabled ? "order-rank" : "order-rank off"}>
-                  {rank.get(route.id) ?? "—"}
+              {/*
+               * A disabled route is excluded from dispatch, so it has no place in the chain — and
+               * when the whole table is uninstalled there is no chain for any row to have a place
+               * in, so a rank number would be a claim about an order that does not exist.
+               */}
+              <td
+                data-testid="route-rank"
+                title={
+                  notInstalled
+                    ? "Not in any dispatch chain — this tenant's table is never installed."
+                    : undefined
+                }
+              >
+                <span className={route.enabled && !notInstalled ? "order-rank" : "order-rank off"}>
+                  {notInstalled ? "—" : (rank.get(route.id) ?? "—")}
                 </span>
               </td>
               <td data-testid="route-id">
@@ -288,7 +362,9 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
                 hits={hits.data}
                 unavailable={hits.isError}
               />
-              <td className="muted">{route.enabled ? orderReason(route) : "disabled"}</td>
+              <td className="muted" data-testid="route-why">
+                {routeWhy(route, notInstalled)}
+              </td>
               {mayWrite ? (
                 <td>
                   <button
@@ -372,6 +448,19 @@ function Editor({ loaded, mayWrite }: { loaded: Route[]; mayWrite: boolean }): R
       ) : null}
     </>
   );
+}
+
+/**
+ * What the "why this order" column says about one route.
+ *
+ * `orderReason` prose ("wins on priority", "more specific host") describes a place in a live chain,
+ * so on an uninstalled table it is not merely overridden but never computed. Not-installed outranks
+ * "disabled" because it is the stronger fact: switching a route off explains its absence from a
+ * chain that, for this tenant, does not exist either way.
+ */
+function routeWhy(route: Route, notInstalled: boolean): string {
+  if (notInstalled) return "not installed";
+  return route.enabled ? orderReason(route) : "disabled";
 }
 
 function describeMatch(route: Route): string {
@@ -546,7 +635,13 @@ function FrontDoorNotes(): ReactNode {
  * clauses the same way. That is said on the panel rather than left implied — a tester quietly
  * disagreeing with the real dispatcher would be worse than no tester, because it would be trusted.
  */
-function RouteTester({ routes }: { routes: readonly Route[] }): ReactNode {
+function RouteTester({
+  routes,
+  notInstalled,
+}: {
+  routes: readonly Route[];
+  notInstalled: boolean;
+}): ReactNode {
   const [host, setHost] = useState("");
   const [path, setPath] = useState("/");
   const [header, setHeader] = useState("");
@@ -631,9 +726,17 @@ function RouteTester({ routes }: { routes: readonly Route[] }): ReactNode {
             ))}
           </ol>
         )}
-        <p className="hint">
+        {/*
+         * Without this the panel contradicts the banner: it would name a winning route on a table
+         * the screen has just said can never take a request. The verdict stays — it is a true
+         * reading of the rules, and it is what the table would do once installed — but it stops
+         * being presented as something that could happen to this tenant today.
+         */}
+        <p className="hint" data-testid="probe-hint">
           Evaluated by this console against the table above — the front door has no probe endpoint
           to ask, so this is a reading of the same rules rather than its verdict.
+          {notInstalled &&
+            " This tenant's table is never installed, so no request would reach any of these routes in the first place — this is what it would do if it were."}
         </p>
       </section>
     </aside>
@@ -667,7 +770,7 @@ function HitsCell({
       </td>
     );
   }
-  if (!hits.installed) {
+  if (isNotInstalled(hits)) {
     return (
       <td
         className="numeric muted"

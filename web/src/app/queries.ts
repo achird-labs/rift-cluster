@@ -1385,7 +1385,7 @@ export type RouteHits = {
  * fan-out and the table is a local read, so a fan-out that degrades must not take the table's
  * rendering down with it. A failure here leaves the Hits column unknown and the table intact.
  */
-export function useRouteHits(): UseQueryResult<RouteHits> {
+export function useRouteHits(options: { enabled?: boolean } = {}): UseQueryResult<RouteHits> {
   const { tenant } = useSession();
   return useQuery({
     queryKey: key(["front-door-route-hits"], tenant),
@@ -1411,6 +1411,9 @@ export function useRouteHits(): UseQueryResult<RouteHits> {
         partial: read.partial,
       };
     },
+    // The screen this serves has nothing to show when the route table itself failed to read, so
+    // the caller gates it off rather than leaving a cluster-wide fan-out polling behind an error.
+    enabled: options.enabled ?? true,
     ...POLLED,
   });
 }
