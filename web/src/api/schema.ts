@@ -1487,6 +1487,15 @@ export interface components {
             hits: {
                 [key: string]: number;
             } | null;
+            /**
+             * @description Whether any node in the fleet binds a front-door listener. Present only when `installed` is true; `installed: false` already says the routes cannot take a dispatch, so listener presence adds nothing.
+             *
+             *     `bound` — some node binds one. `none` — **proven** absence: every voter answered and every one of them binds none, so no route here can take a request and the zeros above reflect that rather than a routing fault. `unknown` — not established, because a node could not be reached or answered without this field; the counts stand, but absence must not be inferred from them.
+             *
+             *     `none` is only claimable on full coverage, so it never appears together with `Rift-Cluster-Partial`.
+             * @enum {string}
+             */
+            front_door?: "bound" | "none" | "unknown";
         };
         Route: {
             /** @description Unique and stable; how the admin API addresses one route. */

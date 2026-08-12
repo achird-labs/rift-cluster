@@ -622,6 +622,25 @@ pub async fn start_with_runtimes(
     // node exactly as `GET /front-door/routes` does.
     let route_hits = Arc::new(RouteHitCounter::default());
 
+    // Does this node run a front-door listener (issue #403)? Read once, here, and handed to both
+    // consumers — the cluster port's `/_cluster/route-hits` body just below, and the admin front
+    // further down — because two derivations of one fact is exactly the drift `routes_installed_for`
+    // exists to prevent on the tenant question.
+    //
+    // Read from the flag rather than from the bound listener because the listener is bound much
+    // later, in `attach_data_plane`, while the router below is built now. The direction that
+    // matters is safe: a bind failure is fatal (`attach_data_plane` shuts the server down and
+    // returns `Err`), so no node ever answers `false` while serving a bound listener, and a false
+    // claim of *absence* cannot originate here.
+    //
+    // The converse is not an equivalence, and the comment should not pretend otherwise: the
+    // cluster port starts serving before the front door binds, and `graceful_leave` closes the
+    // front door while the cluster port still answers. In both windows this over-claims `Bound`,
+    // which folds to "render exactly as today" rather than to a diagnosis — the safe direction.
+    //
+    // `.is_some()` rather than `.take()`: taking it here would rob the binding code of the address.
+    let front_door_bound = cli.oss.front_door.is_some();
+
     // Imposter sources (issue #134). Built before the node for the same reason
     // the flow net and the pull-on-miss hook are: its routes go into the
     // `NodeConfig.routes` seam that binds the cluster port, whose address the
@@ -664,6 +683,7 @@ pub async fn start_with_runtimes(
                     slot.clone(),
                     Arc::clone(&readiness),
                     Arc::clone(&route_hits),
+                    front_door_bound,
                 ),
                 Arc::clone(&puller),
             )
@@ -788,6 +808,7 @@ pub async fn start_with_runtimes(
         Arc::clone(&manager),
         front_door_routes,
         Arc::clone(&route_hits),
+        front_door_bound,
         Arc::clone(&puller),
         Arc::clone(&journal_net),
         Arc::clone(&flow_net),
@@ -836,6 +857,9 @@ async fn attach_data_plane(
     manager: Arc<ImposterManager>,
     front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
     route_hits: Arc<RouteHitCounter>,
+    // This node's front-door listener state, resolved once by the caller (issue #403) so the
+    // cluster port and the admin front cannot disagree about it.
+    front_door_bound: bool,
     puller: Arc<SourcePuller>,
     journal_net: Arc<JournalNet>,
     flow_net: Arc<FlowNet>,
@@ -995,6 +1019,7 @@ async fn attach_data_plane(
             readiness: Arc::clone(readiness),
             puller: Arc::clone(&puller),
             route_hits: Arc::clone(&route_hits),
+            front_door_bound,
             journal_net: Arc::clone(&journal_net),
             flow_net: Arc::clone(&flow_net),
             fleet_journal_port_cap,

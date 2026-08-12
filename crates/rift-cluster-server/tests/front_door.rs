@@ -10,9 +10,11 @@
 //! against, so "the write took effect" is proven by making a real request
 //! *through the bound front door* and observing which imposter answered it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use rift_cluster::rpc::{AlwaysHealthy, RpcClient, RpcClientConfig, Signer};
 use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose::{self, ComposedServer};
 use serde_json::json;
@@ -680,7 +682,7 @@ async fn front_door_dispatches_are_counted_per_route() {
         .expect("json");
     assert_eq!(
         before,
-        json!({ "installed": true, "hits": { "busy": 0, "idle": 0 } }),
+        json!({ "installed": true, "hits": { "busy": 0, "idle": 0 }, "front_door": "bound" }),
         "an untouched table is all zeros, not an empty map: {before}"
     );
 
@@ -706,7 +708,7 @@ async fn front_door_dispatches_are_counted_per_route() {
             .expect("json");
     assert_eq!(
         after_traffic,
-        json!({ "installed": true, "hits": { "busy": 3, "idle": 0 } }),
+        json!({ "installed": true, "hits": { "busy": 3, "idle": 0 }, "front_door": "bound" }),
         "three claims for `busy`, and `idle` still an explicit zero: {after_traffic}"
     );
 
@@ -726,7 +728,7 @@ async fn front_door_dispatches_are_counted_per_route() {
             .expect("json");
     assert_eq!(
         after_failure,
-        json!({ "installed": true, "hits": { "busy": 3, "idle": 1 } }),
+        json!({ "installed": true, "hits": { "busy": 3, "idle": 1 }, "front_door": "bound" }),
         "a claimed-then-failed request counts: {after_failure}"
     );
 
@@ -765,10 +767,38 @@ async fn a_node_with_no_front_door_reports_zeros_rather_than_failing() {
         .json()
         .await
         .expect("json");
+    // What a PEER would read from this node. The admin assertion below cannot cover it: this is a
+    // solo node, so its own flag is folded in locally and never crosses the cluster port. If
+    // `compose` passed the wrong value to `cluster_api::routes` specifically, a multi-node fleet
+    // would report `bound` over listener-less nodes and nothing else here would notice.
+    let cluster: std::net::SocketAddr = server
+        .cluster_addr()
+        .expect("clustered")
+        .as_str()
+        .parse()
+        .expect("advertise is a literal address in tests");
+    let own: serde_json::Value = serde_json::from_slice(
+        &RpcClient::new(
+            Some(Signer::new(SECRET)),
+            Arc::new(AlwaysHealthy),
+            RpcClientConfig::default(),
+        )
+        .call(cluster, "GET", "/_cluster/route-hits", Vec::new())
+        .await
+        .expect("GET /_cluster/route-hits"),
+    )
+    .expect("json body");
+    assert_eq!(
+        own,
+        json!({ "hits": {}, "front_door": false }),
+        "a node that binds no front door must say so to its peers, not merely to its own admin \
+         read: {own}"
+    );
+
     assert_eq!(
         hits,
-        json!({ "installed": true, "hits": { "svc": 0 } }),
-        "the table is installed fleet-wide even where no listener is bound: {hits}"
+        json!({ "installed": true, "hits": { "svc": 0 }, "front_door": "none" }),
+        "the table is installed fleet-wide even where no listener is bound, and the answer says so rather than leaving the zero to read as a dead route (#403): {hits}"
     );
 
     server.shutdown().await;

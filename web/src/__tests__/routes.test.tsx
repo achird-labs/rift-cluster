@@ -576,6 +576,171 @@ describe("an unreadable installed flag is not a not-installed table (#400)", () 
   });
 });
 
+/**
+ * A fleet where no node was started with `--front-door` reports an honest zero for every route.
+ * The Hits column reads a zero as "took nothing" — the state an operator investigates as a broken
+ * route — when the truth is that nothing could have dispatched at all. Same distinction as
+ * not-installed, one level below the tenant. `scripts/e2e-console.sh` reaches this state in-repo.
+ */
+describe("a fleet with no front-door listener anywhere (#403)", () => {
+  const NO_DOOR = { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "none" };
+
+  it("states that nothing is listening, rather than leaving every zero to be read as a fault", async () => {
+    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NO_DOOR } });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    const banner = await screen.findByTestId("routes-no-front-door");
+    expect(banner.getAttribute("role")).toBe("status");
+    expect(banner.textContent).toMatch(/no node/i);
+    expect(banner.textContent).toMatch(/--front-door/);
+  });
+
+  // Flagging every row at once is the false diagnosis this issue exists to remove.
+  it("stops flagging the zeros it has just explained", async () => {
+    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NO_DOOR } });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
+    );
+    for (const cell of screen.getAllByTestId("route-hits")) {
+      expect(cell.className).not.toContain("warn");
+      expect(cell.className).toContain("muted");
+      expect(cell.getAttribute("title")).toMatch(/no front-door listener is bound anywhere/i);
+    }
+  });
+
+  // The count is a fact about traffic already taken; losing the last listener does not erase it.
+  it("still shows what a route took before the last listener went away", async () => {
+    stubFetch({
+      [ROUTES]: { json: TABLE },
+      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 40, beta: 0 }, front_door: "none" } },
+    });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "40"]),
+    );
+  });
+
+  it("leaves the ranks and the evaluation order alone — these routes are installed", async () => {
+    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: NO_DOOR } });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    expect(screen.queryByTestId("routes-not-installed")).toBeNull();
+    expect(screen.getAllByTestId("route-rank").map((n) => n.textContent)).toEqual(["1", "2"]);
+    expect(screen.getByText(/the order the front door evaluates them/i)).toBeTruthy();
+  });
+});
+
+/**
+ * The mirror of #400's rule, and the reason `front_door` is a tri-state rather than a boolean:
+ * proven absence explains the zeros, unproven absence explains nothing. Diagnosing a listener-less
+ * fleet off an unreachable peer is the same error as diagnosing a dead route off a zero.
+ */
+describe("unproven absence of a listener is not absence (#403)", () => {
+  it("says nothing when the fleet could not establish it", async () => {
+    stubFetch({
+      [ROUTES]: { json: TABLE },
+      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "unknown" } },
+    });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    // Wait for the counts themselves: the hits read is a separate query, and until it settles
+    // every cell is the unavailable dash, which would pass an "is not muted" check for the wrong
+    // reason.
+    await waitFor(() =>
+      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
+    );
+    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
+    // Still flagged, exactly as before this change: the cause is not known.
+    for (const cell of screen.getAllByTestId("route-hits")) {
+      expect(cell.className).toContain("warn");
+    }
+  });
+
+  it("says nothing when a listener is bound somewhere", async () => {
+    stubFetch({
+      [ROUTES]: { json: TABLE },
+      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "bound" } },
+    });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
+    );
+    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
+    for (const cell of screen.getAllByTestId("route-hits")) {
+      expect(cell.className).toContain("warn");
+    }
+  });
+
+  // A node predating #403 answers a valid body with no `front_door`. Failing the read would blank
+  // the whole column mid-upgrade; folding it to `none` would put a diagnosis behind a missing field.
+  it("treats a body with no front_door field as unknown, not as proven absence", async () => {
+    stubFetch({
+      [ROUTES]: { json: TABLE },
+      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 0 } } },
+    });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
+    );
+    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
+  });
+
+  // A correct server never sends both — `none` is unclaimable without full coverage. The console
+  // checks anyway, because the banner asserts something about every node in the fleet and should
+  // not make that claim over an answer that admits a node is missing.
+  it("does not banner on a proven-absence claim that arrives with a partial stamp", async () => {
+    stubFetch({
+      [ROUTES]: { json: TABLE },
+      [ROUTE_HITS]: {
+        json: { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "none" },
+        headers: { "Rift-Cluster-Partial": "true" },
+      },
+    });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("route-hits").map((n) => n.textContent)).toEqual(["0", "0"]),
+    );
+    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
+  });
+
+  it("treats an unrecognized front_door value as unknown", async () => {
+    stubFetch({
+      [ROUTES]: { json: TABLE },
+      [ROUTE_HITS]: { json: { installed: true, hits: { alpha: 0, beta: 0 }, front_door: "maybe" } },
+    });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
+  });
+
+  // The two banners answer different questions and must not both appear. The server omits
+  // `front_door` on a not-installed body, so this is belt-and-braces on the console side.
+  it("shows only the not-installed banner for a tenant that is also on a listener-less fleet", async () => {
+    stubFetch({
+      [ROUTES]: { json: TABLE },
+      [ROUTE_HITS]: { json: { installed: false, hits: null, front_door: "none" } },
+    });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    expect(await screen.findByTestId("routes-not-installed")).toBeTruthy();
+    expect(screen.queryByTestId("routes-no-front-door")).toBeNull();
+  });
+});
+
 describe("a parked table write must not be undone by the next poll (#211)", () => {
   /*
    * The sequence this guards, which is a data-loss path and not merely a display glitch:

@@ -1374,11 +1374,26 @@ export function useRouteTable(): UseQueryResult<Route[]> {
  * compiled into the shared front door, so they cannot take a dispatch and a zero would be a false
  * claim about traffic. `partial` means a node could not be reached, so the counts are floors.
  */
+/**
+ * Whether anything in the fleet binds a front-door listener (#403).
+ *
+ * `none` is *proven* absence — every voter answered and every one binds none — which is why it is
+ * safe to explain the zeros with. `unknown` is the same absence unproven, and must read as today.
+ */
+export type FrontDoorPresence = "bound" | "none" | "unknown";
+
 export type RouteHits = {
   installed: boolean;
   hits: Record<string, number> | null;
   partial: boolean;
+  /** `null` when `installed` is false: the server omits it, because it says nothing there. */
+  frontDoor: FrontDoorPresence | null;
 };
+
+/** Anything the console does not positively recognize is `unknown` — never `none`. */
+function asFrontDoorPresence(raw: string | undefined): FrontDoorPresence {
+  return raw === "bound" || raw === "none" ? raw : "unknown";
+}
 
 /**
  * Deliberately its own query, not folded into {@link useRouteTable}: the counts are a fleet
@@ -1393,6 +1408,7 @@ export function useRouteHits(options: { enabled?: boolean } = {}): UseQueryResul
       const read = await apiGetMerged<{
         installed?: boolean;
         hits?: Record<string, number> | null;
+        front_door?: string;
       }>(API_PATHS.frontDoorRouteHits, { tenant });
       // `installed` is **required** by the contract, so an absent one is a broken read, not a
       // domain value — and defaulting it to `false` would be the worst available guess: the screen
@@ -1409,6 +1425,14 @@ export function useRouteHits(options: { enabled?: boolean } = {}): UseQueryResul
         // id as a dash, because a zero is a claim about traffic.
         hits: read.data.hits ?? null,
         partial: read.partial,
+        // Unlike `installed`, a missing or unrecognized `front_door` is NOT a broken read: a
+        // pre-#403 node answers a perfectly good body without it, and failing the query there
+        // would blank the whole Hits column for the length of every rolling upgrade. It folds to
+        // `unknown`, which is both its true meaning and the safe direction — `unknown` renders
+        // exactly as today, whereas `none` is the state that puts a diagnosis on screen. The
+        // asymmetry with `installed` is the point: defaulting that one asserts something, and
+        // defaulting this one asserts nothing.
+        frontDoor: read.data.installed ? asFrontDoorPresence(read.data.front_door) : null,
       };
     },
     // The screen this serves has nothing to show when the route table itself failed to read, so

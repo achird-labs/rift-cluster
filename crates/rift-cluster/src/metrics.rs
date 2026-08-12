@@ -1009,6 +1009,7 @@ mod tests {
             current_leader: Some(7),
             last_applied: Some(42),
             voters: vec![7, 8, 9],
+            learners: Vec::new(),
         };
         observe_node(&status, &Ring::new([7, 8, 9], 31));
 
@@ -1035,6 +1036,7 @@ mod tests {
             current_leader: Some(7),
             last_applied: Some(42),
             voters: vec![7, 8],
+            learners: Vec::new(),
         };
         observe_node(&status, &Ring::new([7, 8], 12));
         // Summing this label across a fleet is how an operator asks "is there

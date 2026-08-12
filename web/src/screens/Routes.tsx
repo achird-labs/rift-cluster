@@ -30,6 +30,24 @@ function isNotInstalled(hits: RouteHits | undefined): boolean {
   return hits?.installed === false;
 }
 
+/**
+ * Is it *established* that no node in the fleet binds a front-door listener (#403)?
+ *
+ * The sibling of {@link isNotInstalled}, one level down and with the same discipline. Only the
+ * server's proven `none` counts — it is claimable solely on full fleet coverage, so it can never
+ * arrive alongside a partial answer. `unknown` is the same absence unproven and deliberately reads
+ * as today: diagnosing "nothing can dispatch" off an unreachable peer is the identical error to
+ * diagnosing "this route is dead" off a zero, which is the whole reason this issue exists.
+ */
+function hasNoFrontDoorAnywhere(hits: RouteHits | undefined): boolean {
+  // `partial === false` is redundant against a correct server — `none` is unclaimable without full
+  // coverage, so the two can never both be set — and it is here precisely because it is redundant.
+  // The banner asserts something about every node in the fleet; making that claim conditional on
+  // the console's own view of coverage costs one comparison and stops a server-side regression in
+  // the fold from becoming a confident wrong statement on screen.
+  return hits?.installed === true && hits.frontDoor === "none" && !hits.partial;
+}
+
 export function RouteTableScreen(): ReactNode {
   const { can } = useSession();
   const table = useRouteTable();
@@ -87,6 +105,7 @@ function Editor({
   hits: UseQueryResult<RouteHits>;
 }): ReactNode {
   const notInstalled = isNotInstalled(hits.data);
+  const noFrontDoor = hasNoFrontDoorAnywhere(hits.data);
   const [draft, setDraft] = useState<Route[]>(loaded);
   const [adding, setAdding] = useState(false);
   const [base, setBase] = useState<Route[]>(loaded);
@@ -288,6 +307,31 @@ function Editor({
               under &ldquo;<code>desired_routes</code> is deliberately NOT unioned&rdquo;: an
               arriving data-plane request carries no tenant identity, so a shared table would let
               any tenant&rsquo;s catch-all capture front-door traffic fleet-wide.
+            </p>
+          </div>
+        </div>
+      ) : null}
+
+      {/*
+       * The sibling of the not-installed banner, one level down: these routes ARE compiled into
+       * the shared table, but nothing in the fleet is listening on it. Same inert-fact family, and
+       * mutually exclusive with the banner above by construction — that one renders only on
+       * `installed: false`, and the server omits this field entirely there.
+       */}
+      {noFrontDoor ? (
+        <div className="banner info" data-testid="routes-no-front-door" role="status">
+          <span className="b-glyph" aria-hidden="true">
+            &#x25c8;
+          </span>
+          <div>
+            <strong>No node in this fleet binds a front-door listener.</strong>
+            <p>
+              These routes are installed and would be evaluated, but there is nothing listening for
+              a request to evaluate them against — so the counts below are zero because nothing
+              could arrive, not because the routes are wrong.
+            </p>
+            <p>
+              Start a node with <code>--front-door</code> to serve this table.
             </p>
           </div>
         </div>
@@ -744,13 +788,19 @@ function RouteTester({
 }
 
 /**
- * One route's HITS figure, in the four states it can honestly be in.
+ * One route's HITS figure, in the five states it can honestly be in.
  *
- * The zero is the reason this column exists — a route that has never taken a request is either
- * wrong or dead — so it is rendered as a number and flagged, never as an empty cell. The other
- * three states all avoid printing a number the fleet did not actually report: "not installed" for
- * a tenant whose routes are never compiled into the shared front door (they cannot take a
- * dispatch, so a zero would be a claim about traffic), and a dash while the count is unknown.
+ * The zero is the reason this column exists — a route that could have taken a request and did not
+ * is either wrong or dead — so it is rendered as a number and flagged, never as an empty cell. The
+ * other four states exist to keep that flag honest, by never printing a number the fleet did not
+ * report and never flagging a zero the fleet has already explained:
+ *
+ * - "not installed" — this tenant's routes are never compiled into the shared front door, so a
+ *   zero would be a claim about traffic where the truth is about installation;
+ * - a muted zero for a **disabled** route, which is excluded from dispatch;
+ * - a muted zero when **no node in the fleet binds a listener** (#403) — nothing could have
+ *   arrived, and flagging every row at once is a diagnosis rather than a warning;
+ * - a dash while the count is unknown.
  */
 function HitsCell({
   id,
@@ -806,14 +856,30 @@ function HitsCell({
       </td>
     );
   }
+  // The fleet binds no listener anywhere, so this zero is explained for the same reason a disabled
+  // route's is: nothing could have arrived. Flagging it would put a warning on every row at once,
+  // which is the false diagnosis #403 exists to remove — and the banner above already states the
+  // cause once, where it belongs. The count still shows; a route that took 40 before the last
+  // listener went away really did take 40.
+  if (count === 0 && hasNoFrontDoorAnywhere(hits)) {
+    return (
+      <td
+        className="numeric muted"
+        data-testid="route-hits"
+        title="No front-door listener is bound anywhere in the fleet, so no route can take a request."
+      >
+        {count}
+      </td>
+    );
+  }
   return (
     <td
       className={count === 0 ? "numeric warn-text" : "numeric"}
       data-testid="route-hits"
       // A statement of fact, not a diagnosis. "Wrong or dead" is the usual explanation and the
-      // reason this column exists, but it is not the only one — a fleet with no front-door
-      // listener bound anywhere reports honest zeros for routes that are configured correctly —
-      // and the cell should not assert a cause it cannot know.
+      // reason this column exists, but it is not the only one — and where the fleet has told us
+      // the cause (no listener bound anywhere, handled above) the cell says so instead of
+      // asserting a cause it cannot know.
       title={
         count === 0
           ? "No request has reached this route since the fleet started."
