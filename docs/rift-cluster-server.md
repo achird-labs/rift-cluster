@@ -1827,12 +1827,27 @@ refusal is wired now so a dataset can never be pulled out from under a stub.
 ## Clustered flow state (#120)
 
 Under `--cluster`, **every** imposter's flow state (scenarios, `ctx.state`,
-flow-state templating) is served by the clustered store — configured or not,
-because scenario state on a process-local store behind a round-robin LB is
-wrong for every imposter, not just the ones that thought about it. Each flow
-has one owner (rendezvous-hashed over the applied membership); writes are
-serialized through it, and by default reads are answered by it, so a scenario
-behaves correctly however the LB spreads its steps.
+flow-state templating, and the declarative `_rift.stateOps` writes) is served
+by the clustered store — configured or not, because scenario state on a
+process-local store behind a round-robin LB is wrong for every imposter, not
+just the ones that thought about it. Each flow has one owner
+(rendezvous-hashed over the applied membership); writes are serialized through
+it, and by default reads are answered by it, so a scenario behaves correctly
+however the LB spreads its steps.
+
+**Writing state without a script (#290, upstream `_rift.stateOps`).** An `is`
+response's `_rift` block may carry `stateOps` — `set` / `increment` / `delete`
+/ `clearFlow`, run in order after the response is rendered, so a body reading
+`{{ state.hits }}` in the same response shows the value before this request's
+bump. These are data evaluated by the template grammar, **not** a scripting
+surface: a `stateOps` config is admitted with `--allowInjection` off, and
+under `--cluster` the ops go through the same owner-routed, replicated,
+scope-prefixed store as everything else — a counter increments correctly
+behind a round-robin LB with no cluster code on the write path
+(`tests/state_ops_cluster.rs`). `increment` is atomic; a `set` that reads its
+own key is a compare-and-set loop; a `set` value that is a canonical integer
+is stored as a number. See upstream's `docs/features/flow-state.md` for the
+full grammar.
 
 Three per-imposter knobs, under `_rift.flowState` (all validated at admission —
 an unknown value is a `400` naming the key, never a silent default):
