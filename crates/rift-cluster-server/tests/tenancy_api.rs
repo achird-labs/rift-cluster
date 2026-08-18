@@ -903,6 +903,9 @@ async fn quotas_written_through_the_surface_reach_the_record() {
             max_imposters: 3,
             max_stubs_per_imposter: 5,
             max_flow_entries: 9,
+            // The dataset ceilings (issue #285) were not in the body, so they land at their
+            // defaults — the one part of `Quotas` that defaults when absent.
+            ..Quotas::default()
         }
     );
 

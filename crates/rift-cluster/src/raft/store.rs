@@ -57,7 +57,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use std::ops::{Bound, RangeBounds};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -80,10 +80,10 @@ use serde::{Deserialize, Serialize};
 
 use super::TypeConfig;
 use crate::control::{
-    self, AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
-    FLEET_SCOPE, OnDrift, PreconditionTarget, Principal, Quotas, Role, SessionKey, SourceMode,
-    SourceProvenance, SpecFormat, SpecMeta, SpecProvenance, SpecSource, StubEdit, StubEditScript,
-    Tenant, TenantConfigUsage, TenantId, routes_installed_for,
+    self, AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT,
+    DatasetRecord, Digest, FLEET_SCOPE, OnDrift, PreconditionTarget, Principal, Quotas, Role,
+    SessionKey, SourceMode, SourceProvenance, SpecFormat, SpecMeta, SpecProvenance, SpecSource,
+    StubEdit, StubEditScript, Tenant, TenantConfigUsage, TenantId, routes_installed_for,
 };
 use crate::stores::journal::ClusterJournal;
 
@@ -134,6 +134,22 @@ const SM_SPECS_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new
 /// refcount is cheap, and a maintained counter is one more value every writer must keep in step
 /// or the GC silently drifts from the truth the scan always gets right.
 const SM_SPEC_BLOBS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_spec_blobs");
+/// `(tenant, dataset name, version) -> StoredDataset` (JSON): dataset records as durable
+/// control-plane objects (RFC-005 D1, #285). Versioned rather than one row per name, like
+/// `sm_specs` is not: a re-put does not replace a dataset, it adds a new live version and
+/// leaves the old one live (D2 binds a stub to a name, not to one version, and RFC-005 §3.2
+/// requires the old version keep answering lookups until the tenant deletes the name) — so the
+/// version has to be part of the key, or a re-put would have nowhere to put the new row without
+/// overwriting the one it must not touch.
+const SM_DATASETS_TABLE: TableDefinition<(&str, &str, u64), &str> =
+    TableDefinition::new("sm_datasets");
+/// `digest hex -> csv text` (#285): the content-addressed blob store a [`StoredDataset`]'s
+/// `record.digest` points into — the dataset-table counterpart of [`SM_SPEC_BLOBS_TABLE`], and
+/// for the identical reason (see that table's doc): the same bytes are commonly held under more
+/// than one name, version, or tenant, and "referenced" is answered by a scan over `sm_datasets`
+/// rather than a maintained refcount, for the same trade that table's doc explains.
+const SM_DATASET_BLOBS_TABLE: TableDefinition<&str, &str> =
+    TableDefinition::new("sm_dataset_blobs");
 /// `tenant id -> Tenant` (JSON): tenant records, including deleted tombstones
 /// (issue #159, RFC-002 §10 slice T1). See [`Tenant::deleted`]'s doc for why a
 /// delete leaves the row behind instead of removing it.
@@ -320,6 +336,70 @@ fn journal_gen_space_key(space: Option<&str>) -> String {
 /// returning `None` only for `"p"` itself is exactly the case that must decode to `None`.
 fn decode_journal_gen_space_key(key: &str) -> Option<String> {
     key.strip_prefix('s').map(str::to_owned)
+}
+
+/// Materialise a dataset blob's bytes at `<dir>/<digest>.csv` (RFC-005 D1, #285) — the file
+/// [`RedbStateMachine::spool_path`] names for `digest`. Called from three places that must all
+/// converge on the same on-disk truth: a live `DatasetPut` apply, a snapshot install, and
+/// `reconcile_engine`'s repair pass.
+///
+/// Write-then-rename, never a direct write: a reader must never observe a partial file, and a
+/// crash mid-write must never leave a corrupt one under the final name. `rename` within one
+/// directory is atomic on every filesystem this crate targets, so `<digest>.csv` is always
+/// either the complete previous contents or the complete new ones. A file already present at
+/// the final path is left untouched and no temp file is even created — the bytes a digest names
+/// never change (it is the sha256 of them), so a second write under the same digest is
+/// redundant by construction, never a real change.
+fn write_spool(dir: &Path, digest: &str, csv: &str) -> std::io::Result<()> {
+    let final_path = dir.join(format!("{digest}.csv"));
+    if final_path.exists() {
+        return Ok(());
+    }
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The directory itself is private to this node, not merely the files inside it —
+            // set once, when this code creates it, so an operator's own mode on a pre-existing
+            // directory is respected rather than reset on every write.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    // A unique temp name per call: a live apply's put and `reconcile_engine`'s repair can both
+    // materialise the same digest around the same time (a restart racing a fresh put of bytes
+    // this node already lost), and two writers must never share one temp file.
+    static SPOOL_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SPOOL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = dir.join(format!("{digest}.csv.tmp-{}-{seq}", std::process::id()));
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::File::create(&tmp_path)?;
+    {
+        use std::io::Write;
+        file.write_all(csv.as_bytes())?;
+        file.sync_all()?;
+    }
+    // If the rename fails, the temp file is left behind rather than silently deleted — an
+    // operator investigating a spool-directory anomaly should find the evidence, not a clean
+    // directory that lies about what happened.
+    std::fs::rename(&tmp_path, &final_path)?;
+    // The bytes are durable (`sync_all` above); the directory entry that names them is not until
+    // the directory itself is synced. Without this a crash right after the rename can leave a
+    // committed row whose file is gone — the one shape the design says cannot occur (startup
+    // repair would heal it, but "cannot occur" should not lean on the repair).
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 const SM_DEDUP_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_op_dedup");
@@ -574,6 +654,43 @@ pub struct SpecBinding {
     pub drifted: bool,
 }
 
+/// What `sm_datasets` stores per `(tenant, name, version)` (RFC-005 D1, #285).
+///
+/// Carries the declared [`DatasetRecord`] verbatim — `validate` already proved it true of the
+/// blob it names — plus the bookkeeping apply itself owns: `version` mirrors the key's own
+/// third component (kept alongside it so a reader never has to destructure the key to get it),
+/// `deleted` is this version's tombstone bit (RFC-005 §3.2: a delete leaves every version's row
+/// behind, marked, the same reason [`Tenant::deleted`] does), and `revision` is the log index
+/// that last wrote *this* row — put or delete, whichever happened most recently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredDataset {
+    record: DatasetRecord,
+    version: u64,
+    created_at_secs: u64,
+    revision: u64,
+    deleted: bool,
+}
+
+/// One dataset version as reported by the read paths — the shape `GET /datasets` and
+/// `GET /datasets/:name` render (RFC-005 D1, #285).
+///
+/// A crate-owned type rather than the stored record itself, for the same reason [`SpecRecord`]
+/// is: the stored shape is free to gain fields the operator surface should not render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetSummary {
+    pub name: String,
+    pub version: u64,
+    pub digest: String,
+    pub key_columns: Vec<String>,
+    pub delimiter: char,
+    pub columns: Vec<String>,
+    pub rows: u64,
+    pub bytes: u64,
+    pub created_at_secs: u64,
+    pub revision: u64,
+}
+
 /// What `sm_op_dedup` stores per `op_id`. The applying log index lives inside
 /// `response.revision`; a separate copy would be dead data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -626,6 +743,20 @@ struct SnapshotPayload {
     /// alone if a row here were ever missing.
     #[serde(default)]
     spec_blobs: Vec<(String, String)>,
+    /// `(tenant, dataset name, version, stored-dataset JSON)` rows of `sm_datasets` (RFC-005 D1,
+    /// #285). Defaulted for the #134/#137 reason every table above carries it: a snapshot built
+    /// before datasets existed must still install, and the empty vec it decodes to means exactly
+    /// what a pre-#285 fleet's history actually is — no dataset has ever been written.
+    #[serde(default)]
+    datasets: Vec<(String, String, u64, String)>,
+    /// `(digest hex, csv text)` rows of `sm_dataset_blobs` (#285). Travels with `datasets`, and
+    /// for the identical reason `spec_blobs` travels with `specs`: a joining node must hold the
+    /// exact bytes a live dataset's digest names, and installing them here is also what
+    /// materialises every blob's spool file (see `install_snapshot`) — a node that joined by
+    /// snapshot must be able to serve a lookup against this dataset immediately, not after a
+    /// separate catch-up step.
+    #[serde(default)]
+    dataset_blobs: Vec<(String, String)>,
     /// `(tenant id, Tenant JSON)` rows of `sm_tenants` (issue #159). Defaulted
     /// for the same reason `routes`/`sources` are: a pre-#159 snapshot still
     /// installs, carrying no tenants — a table omitted here is a table that
@@ -745,6 +876,8 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_SOURCES_TABLE).map_err(io)?;
         write_txn.open_table(SM_SPECS_TABLE).map_err(io)?;
         write_txn.open_table(SM_SPEC_BLOBS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_DATASETS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_DATASET_BLOBS_TABLE).map_err(io)?;
         write_txn.open_table(SM_TENANTS_TABLE).map_err(io)?;
         write_txn.open_table(SM_PRINCIPALS_TABLE).map_err(io)?;
         write_txn.open_table(SM_BINDINGS_TABLE).map_err(io)?;
@@ -1046,6 +1179,16 @@ enum EngineAction {
         id: String,
         error: String,
     },
+    /// Remove a dataset blob's spool file after the txn that GC'd its `sm_dataset_blobs` row has
+    /// committed (RFC-005 D1, #285). Needs no engine — `drive_one` handles it with only the
+    /// node's own spool directory — and always runs after the row is already gone durably: a
+    /// crash between commit and this removal leaves a harmless orphan file behind (repair only
+    /// ever *adds* a missing file, never removes one, so the orphan simply persists until
+    /// noticed). The alternative ordering — deleting the file before the row commits — could
+    /// delete bytes a concurrent read still names, which is the worse failure of the two.
+    UnspoolDataset {
+        digest: String,
+    },
 }
 
 /// An [`EngineAction`] paired with the principal whose committed op caused it
@@ -1136,6 +1279,12 @@ pub struct RedbStateMachine {
     /// not a tenant's; `docs/rift-cluster-server.md` says so where the flag is
     /// documented.
     audit_retention_secs: u64,
+    /// Where a dataset's csv bytes are materialised on this node's local disk, one file per
+    /// digest (RFC-005 D1, #285) — `None` in storage tests and on an embedder that never wires
+    /// one, exactly like `engine`. Node-local derived state, not replicated: every replica keeps
+    /// its own copy of the file under its own data directory, the same way every replica keeps
+    /// its own `redb` file for the tables the files sit beside.
+    spool_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for RedbStateMachine {
@@ -1144,6 +1293,7 @@ impl std::fmt::Debug for RedbStateMachine {
             .field("engine", &self.engine.is_some())
             .field("routes", &self.routes.is_some())
             .field("journal", &self.journal.get().is_some())
+            .field("spool_dir", &self.spool_dir)
             .finish_non_exhaustive()
     }
 }
@@ -1158,6 +1308,7 @@ impl RedbStateMachine {
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
             journal: OnceLock::new(),
             audit_retention_secs: DEFAULT_AUDIT_RETENTION_SECS,
+            spool_dir: None,
         }
     }
 
@@ -1168,6 +1319,44 @@ impl RedbStateMachine {
     pub fn with_audit_retention_secs(mut self, secs: u64) -> Self {
         self.audit_retention_secs = secs;
         self
+    }
+
+    /// Attach the directory dataset blobs are materialised into (RFC-005 D1, #285). Same
+    /// before-`Raft::new` contract as [`Self::with_engine`] — apply writes a dataset's spool
+    /// file inside the same transaction that commits its row, so every handle must agree on
+    /// where that file goes from the very first entry it applies.
+    #[must_use]
+    pub fn with_spool_dir(mut self, dir: PathBuf) -> Self {
+        self.spool_dir = Some(dir);
+        self
+    }
+
+    /// The path a dataset blob's csv bytes are (or would be) materialised at, or `None` when
+    /// this node has no spool directory attached (RFC-005 D1, #285). Answers regardless of
+    /// whether `digest` names anything this node currently holds — a caller with a
+    /// [`DatasetSummary`] already knows that; this is purely the path function.
+    #[must_use]
+    pub fn spool_path(&self, digest: &str) -> Option<PathBuf> {
+        self.spool_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{digest}.csv")))
+    }
+
+    /// Whether the committed `sm_dataset_blobs` currently holds `digest` — read fresh, for the
+    /// post-commit unspool to decide against (see `EngineAction::UnspoolDataset`).
+    #[allow(clippy::result_large_err)]
+    fn dataset_blob_present(&self, digest: &str) -> StorageResult<bool> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let blobs = read_txn
+            .open_table(SM_DATASET_BLOBS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Ok(blobs
+            .get(digest)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .is_some())
     }
 
     /// Attach the local engine committed ops are applied to. Call before the
@@ -1667,6 +1856,112 @@ impl RedbStateMachine {
             .len()
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
         Ok(usize::try_from(len).unwrap_or(usize::MAX))
+    }
+
+    /// Every live dataset version `tenant` holds, name-ascending then version-ascending
+    /// (RFC-005 D1, #285) — `sm_datasets`' own key order, so this is a single ordered scan
+    /// with no sort step. Like [`Self::specs`], this answers from local applied state with no
+    /// Raft round trip.
+    ///
+    /// A row that will not parse is committed-state corruption, reported as an error rather
+    /// than skipped — the same reason [`Self::specs`] does: a silently shrinking list would
+    /// tell an operator their dataset is gone when it is not.
+    #[allow(clippy::result_large_err)]
+    pub fn datasets(&self, tenant: &str) -> StorageResult<Vec<DatasetSummary>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let datasets = read_txn
+            .open_table(SM_DATASETS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut out = Vec::new();
+        for item in datasets
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (row_tenant, name, version) = key.value();
+            if row_tenant != tenant {
+                continue;
+            }
+            let stored: StoredDataset = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(tenant, name, version, error = %e, "corrupt stored dataset");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            if stored.deleted {
+                continue;
+            }
+            out.push(Self::render_dataset(name, version, &stored));
+        }
+        Ok(out)
+    }
+
+    /// The latest live version of `tenant`'s dataset `name`, or `None` when `tenant` holds no
+    /// live version of it (RFC-005 D1, #285).
+    #[allow(clippy::result_large_err)]
+    pub fn dataset(&self, tenant: &str, name: &str) -> StorageResult<Option<DatasetSummary>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let datasets = read_txn
+            .open_table(SM_DATASETS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut latest: Option<(u64, StoredDataset)> = None;
+        for item in datasets
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (row_tenant, row_name, version) = key.value();
+            if row_tenant != tenant || row_name != name {
+                continue;
+            }
+            let stored: StoredDataset = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(tenant, name, version, error = %e, "corrupt stored dataset");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            if stored.deleted {
+                continue;
+            }
+            if latest.as_ref().is_none_or(|(v, _)| version > *v) {
+                latest = Some((version, stored));
+            }
+        }
+        Ok(latest.map(|(version, stored)| Self::render_dataset(name, version, &stored)))
+    }
+
+    /// How many distinct dataset documents are currently held, fleet-wide (RFC-005 D1, #285) —
+    /// the blob table's row count, the dataset-table counterpart of [`Self::spec_blob_count`].
+    #[allow(clippy::result_large_err)]
+    pub fn dataset_blob_count(&self) -> StorageResult<usize> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let blobs = read_txn
+            .open_table(SM_DATASET_BLOBS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let len = blobs
+            .len()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Ok(usize::try_from(len).unwrap_or(usize::MAX))
+    }
+
+    fn render_dataset(name: &str, version: u64, stored: &StoredDataset) -> DatasetSummary {
+        DatasetSummary {
+            name: name.to_owned(),
+            version,
+            digest: stored.record.digest.as_str().to_owned(),
+            key_columns: stored.record.key_columns.clone(),
+            delimiter: stored.record.delimiter,
+            columns: stored.record.columns.clone(),
+            rows: stored.record.rows,
+            bytes: stored.record.bytes,
+            created_at_secs: stored.created_at_secs,
+            revision: stored.revision,
+        }
     }
 
     /// The tenant that owns `port`'s applied config, or `None` if no tenant
@@ -2482,6 +2777,40 @@ impl RedbStateMachine {
                     decode_journal_gen_space_key(space_key).as_deref(),
                     value.value(),
                 );
+            }
+        }
+
+        // Repair the spool directory (RFC-005 D1, #285): a restart with a missing or wiped
+        // `datasets/` directory must not leave a dataset row pointing at a file this node no
+        // longer has, since a restart replays no `DatasetPut` entries (they are already
+        // reflected in `sm_dataset_blobs`) — nothing else re-materialises the files. A no-op
+        // without a spool dir, like the engine drive above. Only ever *adds* a missing file:
+        // an orphan already on disk is left alone, both because it is harmless and because
+        // this pass has no way to know it is unreferenced without a second full table scan on
+        // every restart.
+        if let Some(dir) = &self.spool_dir {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let blobs = read_txn
+                .open_table(SM_DATASET_BLOBS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            for item in blobs
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let digest = key.value();
+                // Presence, not content: `write_spool` never leaves a partial file under the
+                // final name, so a present file is a complete one unless the disk itself lied —
+                // and re-hashing every blob on every restart to guard against that would make
+                // startup cost proportional to the tenant byte quota. A deliberate trade.
+                if self.spool_path(digest).is_some_and(|p| p.exists()) {
+                    continue;
+                }
+                write_spool(dir, digest, value.value())
+                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
             }
         }
         Ok(())
@@ -3315,6 +3644,174 @@ impl RedbStateMachine {
         Ok(())
     }
 
+    /// Every stored row (live or tombstoned) for `(tenant, name)` in `sm_datasets`,
+    /// version-ascending (RFC-005 D1, #285) — the source both `DatasetPut`'s version numbering
+    /// and `DatasetDelete`'s tombstone sweep scan. A row that will not parse is logged and
+    /// skipped, like [`Self::stored_spec`]: every replica holds the same bad bytes, so skipping
+    /// it deterministically never diverges two replicas' apply of the same committed op.
+    #[allow(clippy::result_large_err)]
+    fn dataset_rows(
+        datasets: &Table<'_, (&'static str, &'static str, u64), &'static str>,
+        tenant: &str,
+        name: &str,
+    ) -> StorageResult<Vec<(u64, StoredDataset)>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let mut rows = Vec::new();
+        for item in datasets.iter().map_err(io)? {
+            let (key, value) = item.map_err(io)?;
+            let (row_tenant, row_name, version) = key.value();
+            if row_tenant != tenant || row_name != name {
+                continue;
+            }
+            match serde_json::from_str::<StoredDataset>(value.value()) {
+                Ok(stored) => rows.push((version, stored)),
+                Err(e) => {
+                    tracing::error!(tenant, name, version, error = %e, "corrupt stored dataset");
+                }
+            }
+        }
+        rows.sort_by_key(|(version, _)| *version);
+        Ok(rows)
+    }
+
+    /// `(distinct live dataset names `tenant` holds, excluding `exclude_name` / sum of bytes
+    /// across every live version of every dataset `tenant` holds, `exclude_name` included)` —
+    /// what `DatasetPut`'s count and total-bytes quotas are checked against (RFC-005 D1, #285).
+    /// One scan for both, like [`Self::quota_refusal_for_config`]'s single scan for imposter
+    /// count. `exclude_name` is excluded only from the name count, never the byte sum: a
+    /// re-versioned name is not a *new* dataset, but its already-live bytes still count toward
+    /// the total the tenant holds.
+    #[allow(clippy::result_large_err)]
+    fn dataset_usage(
+        datasets: &Table<'_, (&'static str, &'static str, u64), &'static str>,
+        tenant: &str,
+        exclude_name: &str,
+    ) -> StorageResult<(u32, u64)> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        let mut total_bytes: u64 = 0;
+        for item in datasets.iter().map_err(io)? {
+            let (key, value) = item.map_err(io)?;
+            let (row_tenant, row_name, _version) = key.value();
+            if row_tenant != tenant {
+                continue;
+            }
+            let stored: StoredDataset = match serde_json::from_str(value.value()) {
+                Ok(stored) => stored,
+                Err(e) => {
+                    tracing::error!(tenant, name = row_name, error = %e, "corrupt stored dataset");
+                    continue;
+                }
+            };
+            if stored.deleted {
+                continue;
+            }
+            if row_name != exclude_name {
+                names.insert(row_name.to_owned());
+            }
+            total_bytes = total_bytes.saturating_add(stored.record.bytes);
+        }
+        Ok((u32::try_from(names.len()).unwrap_or(u32::MAX), total_bytes))
+    }
+
+    /// Whether any *live* `sm_datasets` row, in any tenant, still names `digest` (RFC-005 D1,
+    /// #285) — the dataset blob table's "refcount", by scan, the same trade
+    /// [`Self::spec_digest_referenced`] makes and for the identical reason. Tombstoned rows do
+    /// not count: a deleted version no longer entitles its digest to a file.
+    #[allow(clippy::result_large_err)]
+    fn dataset_digest_referenced(
+        datasets: &Table<'_, (&'static str, &'static str, u64), &'static str>,
+        digest: &str,
+    ) -> StorageResult<bool> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        for item in datasets.iter().map_err(io)? {
+            let (key, value) = item.map_err(io)?;
+            match serde_json::from_str::<StoredDataset>(value.value()) {
+                Ok(stored) if !stored.deleted && stored.record.digest.as_str() == digest => {
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                // A row that will not parse might be a live reference to exactly this digest.
+                // The safe reading for a garbage collector is "still referenced": a leaked
+                // blob costs disk, a reclaimed one under a live row costs the dataset. Loud,
+                // and deterministic — every replica holds the same bytes.
+                Err(e) => {
+                    let (t, name, version) = key.value();
+                    tracing::error!(
+                        tenant = t, name, version, error = %e,
+                        "corrupt stored dataset; treating its digest as still referenced"
+                    );
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Every port of `tenant` whose applied config binds a stub response to dataset `name`
+    /// (RFC-005 §3.3, #285) — what `DatasetDelete` refuses against. The binding lives in a
+    /// response's `_rift.dataset.name` extension (D2 compiles it into the engine's lookup
+    /// wiring; D1 only needs to know a binding exists, never what it does), so this reads the
+    /// stored config as generic JSON rather than through the typed `ImposterConfig` — the same
+    /// reason [`Self::ports_of_spec`] reads `StoredImposter::spec` instead of re-parsing a
+    /// document: the fact this needs is provenance, not behavior.
+    #[allow(clippy::result_large_err)]
+    fn ports_binding_dataset(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+        tenant: &str,
+        name: &str,
+    ) -> StorageResult<Result<Vec<u16>, String>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let mut ports = Vec::new();
+        for item in configs.iter().map_err(io)? {
+            let (key, value) = item.map_err(io)?;
+            let (t, port) = key.value();
+            if t != tenant {
+                continue;
+            }
+            // This is a delete guard, so it fails *closed*: a config row it cannot read might be
+            // the very stub that binds the dataset, and "unreadable" must refuse the delete
+            // rather than let it through — the opposite of `ports_of_spec`, where under-reporting
+            // only loses a provenance fact. Deterministic: every replica holds the same bytes.
+            let stored = match serde_json::from_str::<StoredImposter>(value.value()) {
+                Ok(stored) => stored,
+                Err(e) => {
+                    tracing::error!(tenant, port, error = %e, "corrupt stored imposter; refusing the dataset delete");
+                    return Ok(Err(format!(
+                        "cannot tell whether dataset {name:?} is bound: port {port}'s stored \
+                         imposter is unreadable"
+                    )));
+                }
+            };
+            let config = match serde_json::from_str::<serde_json::Value>(&stored.config_json) {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::error!(tenant, port, error = %e, "corrupt stored config; refusing the dataset delete");
+                    return Ok(Err(format!(
+                        "cannot tell whether dataset {name:?} is bound: port {port}'s stored \
+                         config is unreadable"
+                    )));
+                }
+            };
+            let binds = config["stubs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|stub| stub["responses"].as_array())
+                .flatten()
+                .any(|resp| resp["_rift"]["dataset"]["name"].as_str() == Some(name));
+            if binds {
+                ports.push(port);
+            }
+        }
+        ports.sort_unstable();
+        Ok(Ok(ports))
+    }
+
     /// The stored [`Tenant`] record at `id`, or `None` when there is none.
     ///
     /// A record that will not parse is treated as `None`, like
@@ -3516,6 +4013,8 @@ impl RedbStateMachine {
         sources: &mut Table<'_, (&'static str, &'static str), &'static str>,
         specs: &mut Table<'_, (&'static str, &'static str), &'static str>,
         spec_blobs: &mut Table<'_, &'static str, &'static str>,
+        datasets: &mut Table<'_, (&'static str, &'static str, u64), &'static str>,
+        dataset_blobs: &mut Table<'_, &'static str, &'static str>,
         tenants: &mut Table<'_, &'static str, &'static str>,
         principals: &mut Table<'_, &'static str, &'static str>,
         bindings: &mut Table<'_, (&'static str, &'static str), &'static str>,
@@ -3530,6 +4029,10 @@ impl RedbStateMachine {
         // never wires one, or when a shutdown race has already dropped it (see the `journal`
         // field's doc on `RedbStateMachine`).
         journal: Option<&ClusterJournal>,
+        // Where a `DatasetPut`'s spool file is written, inside this same apply transaction
+        // (RFC-005 D1, #285) — `None` in storage tests and on an embedder that never attached
+        // one, matching every other node-local handle threaded through here.
+        spool_dir: Option<&Path>,
         op: &ControlOp,
         index: u64,
         issued_at_secs: u64,
@@ -4179,6 +4682,38 @@ impl RedbStateMachine {
                 for digest in freed_digests {
                     Self::gc_spec_blob_if_unreferenced(spec_blobs, specs, &digest)?;
                 }
+                // Datasets cascade too (RFC-005 D1, #285), the same shape as specs above: the
+                // tenant's rows go — every version, live or already tombstoned, since a deleted
+                // tenant has no "old version stays visible" a live `DatasetDelete`'s tombstone
+                // exists to protect — and any blob nothing else still references, including a
+                // *different* tenant's dataset that happened to share the same bytes, is
+                // reclaimed. Removal happens after this txn commits (`UnspoolDataset`), so the
+                // digests to free are collected from the live rows before that removal.
+                let mut freed_dataset_digests = Vec::new();
+                for item in datasets.iter().map_err(io)? {
+                    let (key, value) = item.map_err(io)?;
+                    let (t, _name, _version) = key.value();
+                    if t != tenant_str {
+                        continue;
+                    }
+                    if let Ok(stored) = serde_json::from_str::<StoredDataset>(value.value())
+                        && !stored.deleted
+                    {
+                        freed_dataset_digests.push(stored.record.digest.as_str().to_owned());
+                    }
+                }
+                datasets
+                    .retain(|(t, _, _), _| t != tenant_str)
+                    .map_err(io)?;
+                freed_dataset_digests.sort_unstable();
+                freed_dataset_digests.dedup();
+                let mut dataset_actions = Vec::new();
+                for digest in freed_dataset_digests {
+                    if !Self::dataset_digest_referenced(datasets, &digest)? {
+                        dataset_blobs.remove(digest.as_str()).map_err(io)?;
+                        dataset_actions.push(EngineAction::UnspoolDataset { digest });
+                    }
+                }
                 // Bindings cascade too, and this one is a security property
                 // rather than tidiness. A tombstoned id may be recreated (the
                 // tombstone records that it existed, it does not reserve it),
@@ -4193,10 +4728,12 @@ impl RedbStateMachine {
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 tenants.insert(tenant_str, value.as_str()).map_err(io)?;
-                Ok(Ok(vec![
+                let mut actions = vec![
                     Self::sync_action(configs)?,
                     Self::sync_routes_action(routes)?,
-                ]))
+                ];
+                actions.extend(dataset_actions);
+                Ok(Ok(actions))
             }
             ControlOp::PrincipalPut { tenant, principal } => {
                 if let Err(reason) = Self::require_live_tenant(tenants, tenant.as_str())? {
@@ -4698,6 +5235,137 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
+            ControlOp::DatasetPut {
+                tenant,
+                record,
+                csv,
+            } => {
+                let quotas = match Self::quotas_for(tenants, tenant.as_str())? {
+                    Ok(quotas) => quotas,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                if record.bytes > quotas.max_dataset_bytes {
+                    return Ok(Err(format!(
+                        "dataset {:?} is {} bytes; tenant {:?} allows at most {} per dataset",
+                        record.name,
+                        record.bytes,
+                        tenant.as_str(),
+                        quotas.max_dataset_bytes
+                    )));
+                }
+                let (live_names_excluding, live_bytes) =
+                    Self::dataset_usage(datasets, tenant.as_str(), &record.name)?;
+                if live_names_excluding >= quotas.max_datasets {
+                    return Ok(Err(format!(
+                        "tenant {:?} is at its ceiling of {} datasets",
+                        tenant.as_str(),
+                        quotas.max_datasets
+                    )));
+                }
+                let would_hold = live_bytes.saturating_add(record.bytes);
+                if would_hold > quotas.max_dataset_total_bytes {
+                    return Ok(Err(format!(
+                        "tenant {:?} would hold {would_hold} dataset bytes; its ceiling is {}",
+                        tenant.as_str(),
+                        quotas.max_dataset_total_bytes
+                    )));
+                }
+
+                // Version = one past the highest version this name has ever held, tombstones
+                // included: a delete must never free up a version number a stale client
+                // reference could still name.
+                let existing = Self::dataset_rows(datasets, tenant.as_str(), &record.name)?;
+                let version = existing
+                    .iter()
+                    .map(|(v, _)| *v)
+                    .max()
+                    .map_or(1, |max| max + 1);
+
+                // The spool file is written before the row that names it, inside this same
+                // transaction: a reader that observes the committed row must be able to find
+                // the bytes it names immediately, never in a window where the row exists but
+                // the file does not. An I/O failure here is a real storage error (propagated,
+                // like a redb failure) rather than a committed refusal — a refusal here would
+                // let replicas silently diverge on whether the put "worked".
+                if let Some(dir) = spool_dir {
+                    write_spool(dir, record.digest.as_str(), csv)
+                        .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
+                }
+                // Content-addressed: insert the blob only on its first reference, exactly like
+                // `SpecPut` — `validate` already proved `record.digest` is `csv`'s own sha256.
+                if dataset_blobs
+                    .get(record.digest.as_str())
+                    .map_err(io)?
+                    .is_none()
+                {
+                    dataset_blobs
+                        .insert(record.digest.as_str(), csv.as_str())
+                        .map_err(io)?;
+                }
+                let stored = StoredDataset {
+                    record: record.clone(),
+                    version,
+                    created_at_secs: issued_at_secs,
+                    revision: index,
+                    deleted: false,
+                };
+                let value = serde_json::to_string(&stored)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                datasets
+                    .insert(
+                        (tenant.as_str(), record.name.as_str(), version),
+                        value.as_str(),
+                    )
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
+            ControlOp::DatasetDelete { tenant, name } => {
+                let rows = Self::dataset_rows(datasets, tenant.as_str(), name)?;
+                if rows.iter().all(|(_, stored)| stored.deleted) {
+                    return Ok(Err(format!("no dataset {name:?}")));
+                }
+                let bound_ports = match Self::ports_binding_dataset(configs, tenant.as_str(), name)?
+                {
+                    Ok(ports) => ports,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                if !bound_ports.is_empty() {
+                    let ports = bound_ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Ok(Err(format!("dataset {name:?} is bound by port(s) {ports}")));
+                }
+                // Tombstone every live version — a delete addresses the whole name, not one
+                // version, and D2's binding is by name (RFC-005 §3.2).
+                let mut freed_digests = Vec::new();
+                for (version, mut stored) in rows {
+                    if stored.deleted {
+                        continue;
+                    }
+                    freed_digests.push(stored.record.digest.as_str().to_owned());
+                    stored.deleted = true;
+                    stored.revision = index;
+                    let value = serde_json::to_string(&stored)
+                        .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                    datasets
+                        .insert((tenant.as_str(), name.as_str(), version), value.as_str())
+                        .map_err(io)?;
+                }
+                freed_digests.sort_unstable();
+                freed_digests.dedup();
+                let mut actions = Vec::new();
+                for digest in freed_digests {
+                    // Checked *after* every tombstone write above, so this scan sees the
+                    // post-write truth — nothing this delete just tombstoned still counts.
+                    if !Self::dataset_digest_referenced(datasets, &digest)? {
+                        dataset_blobs.remove(digest.as_str()).map_err(io)?;
+                        actions.push(EngineAction::UnspoolDataset { digest });
+                    }
+                }
+                Ok(Ok(actions))
+            }
         }
     }
 
@@ -4801,6 +5469,43 @@ impl RedbStateMachine {
                      (the front door keeps its last-known-good table)"
                 );
             }
+            EngineAction::UnspoolDataset { digest } => {
+                let Some(path) = self.spool_path(&digest) else {
+                    return;
+                };
+                // Re-check the *committed* blob table before touching the file. `apply` runs a
+                // whole batch of entries in one transaction and drives the actions only after it
+                // commits, so a `DatasetDelete` and a `DatasetPut` of the same bytes in one batch
+                // would otherwise queue an unspool that lands after the put re-created the
+                // reference — deleting a live dataset's file with nothing left to repair it. The
+                // table is the truth; the action is only a hint that a removal *may* be due.
+                match self.dataset_blob_present(&digest) {
+                    Ok(false) => {}
+                    Ok(true) => return,
+                    Err(e) => {
+                        tracing::error!(
+                            digest = %digest,
+                            error = %e,
+                            "could not re-check the dataset blob table; keeping the spool file"
+                        );
+                        return;
+                    }
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    // Already gone is success, not failure — the outcome this call wants
+                    // (no file at `path`) already holds.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::error!(
+                            digest = %digest,
+                            path = %path.display(),
+                            error = %e,
+                            "failed to remove an unreferenced dataset spool file"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -4863,6 +5568,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             sources,
             specs,
             spec_blobs,
+            datasets,
+            dataset_blobs,
             tenants,
             principals,
             bindings,
@@ -4954,6 +5661,37 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
                 spec_blobs.push((key.value().to_owned(), value.value().to_owned()));
+            }
+            // Travels with the snapshot for the identical #134/#137 reason `specs`/`spec_blobs`
+            // do (RFC-005 D1, #285): a node joining by snapshot must come back holding the same
+            // datasets and blobs as its peers.
+            let datasets_table = read_txn
+                .open_table(SM_DATASETS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut datasets = Vec::new();
+            for item in datasets_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (tenant, name, version) = key.value();
+                datasets.push((
+                    tenant.to_owned(),
+                    name.to_owned(),
+                    version,
+                    value.value().to_owned(),
+                ));
+            }
+            let dataset_blobs_table = read_txn
+                .open_table(SM_DATASET_BLOBS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut dataset_blobs = Vec::new();
+            for item in dataset_blobs_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                dataset_blobs.push((key.value().to_owned(), value.value().to_owned()));
             }
             let tenants_table = read_txn
                 .open_table(SM_TENANTS_TABLE)
@@ -5108,6 +5846,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 sources,
                 specs,
                 spec_blobs,
+                datasets,
+                dataset_blobs,
                 tenants,
                 principals,
                 bindings,
@@ -5130,6 +5870,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             sources,
             specs,
             spec_blobs,
+            datasets,
+            dataset_blobs,
             tenants,
             principals,
             bindings,
@@ -5234,6 +5976,12 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut spec_blobs = write_txn
                 .open_table(SM_SPEC_BLOBS_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut datasets = write_txn
+                .open_table(SM_DATASETS_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut dataset_blobs = write_txn
+                .open_table(SM_DATASET_BLOBS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut tenants = write_txn
                 .open_table(SM_TENANTS_TABLE)
@@ -5354,6 +6102,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut sources,
                                         &mut specs,
                                         &mut spec_blobs,
+                                        &mut datasets,
+                                        &mut dataset_blobs,
                                         &mut tenants,
                                         &mut principals,
                                         &mut bindings,
@@ -5364,6 +6114,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut journal_gens,
                                         &mut proxy_recorded,
                                         journal.as_deref(),
+                                        self.spool_dir.as_deref(),
                                         &request.op,
                                         log_id.index,
                                         applied.logical_clock_secs,
@@ -5376,6 +6127,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut sources,
                                     &mut specs,
                                     &mut spec_blobs,
+                                    &mut datasets,
+                                    &mut dataset_blobs,
                                     &mut tenants,
                                     &mut principals,
                                     &mut bindings,
@@ -5386,6 +6139,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut journal_gens,
                                     &mut proxy_recorded,
                                     journal.as_deref(),
+                                    self.spool_dir.as_deref(),
                                     &request.op,
                                     log_id.index,
                                     applied.logical_clock_secs,
@@ -5626,6 +6380,34 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
+            // Cleared before repopulating, like `specs` above (RFC-005 D1, #285): a payload
+            // carrying no datasets means the fleet holds none, and leaving this node's stale
+            // rows in place would let a dataset (or a binding to one) the fleet has since
+            // deleted keep answering here.
+            let mut datasets_table = write_txn
+                .open_table(SM_DATASETS_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            datasets_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (tenant, name, version, value) in &payload.datasets {
+                datasets_table
+                    .insert((tenant.as_str(), name.as_str(), *version), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
+            let mut dataset_blobs_table = write_txn
+                .open_table(SM_DATASET_BLOBS_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            dataset_blobs_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (digest, csv) in &payload.dataset_blobs {
+                dataset_blobs_table
+                    .insert(digest.as_str(), csv.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
             let mut tenants_table = write_txn
                 .open_table(SM_TENANTS_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
@@ -5818,6 +6600,20 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             .commit()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
+        // Materialise every dataset blob's spool file (RFC-005 D1, #285), after the durable
+        // table write: a node that joins by snapshot must be able to serve a lookup against a
+        // bound dataset immediately, not after a separate catch-up step, and `write_spool`
+        // already skips a digest whose final file is present — so this is a no-op for every
+        // blob this node already had. A no-op with no `spool_dir` attached, like the engine
+        // drive below.
+        if let Some(dir) = &self.spool_dir {
+            for (digest, csv) in &payload.dataset_blobs {
+                write_spool(dir, digest, csv).map_err(|e| {
+                    StorageError::from(StorageIOError::write_snapshot(Some(meta.signature()), &e))
+                })?;
+            }
+        }
+
         // Pushed into the local journal after the durable write, like the engine/routes
         // convergence just below — and for the identical #134/#137 reason `journal_gens_table`
         // above is cleared-then-repopulated rather than merged: a node joining (or rejoining
@@ -5904,14 +6700,15 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        DEDUP_TTL_SECS, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine, SM_CONFIGS_TABLE,
-        SM_DEDUP_TABLE, SM_TENANTS_TABLE, SourceRecord, SourceRow, SpecRecord, StoredImposter, new,
+        DEDUP_TTL_SECS, DatasetSummary, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine,
+        SM_CONFIGS_TABLE, SM_DEDUP_TABLE, SM_TENANTS_TABLE, SourceRecord, SourceRow, SpecRecord,
+        StoredImposter, new,
     };
     use crate::control::{
         AUDIT_RESOURCE_ALL, AuditRow, AuthSource, ControlOp, ControlOutcome, ControlRequest,
-        ControlResponse, DEFAULT_TENANT, Digest, FLEET_SCOPE, OnDrift, Principal, PrincipalId,
-        Quotas, Role, SourceMode, SpecFormat, SpecMeta, SpecSource, StubEdit, StubEditScript,
-        TenantId,
+        ControlResponse, DEFAULT_TENANT, DatasetRecord, Digest, FLEET_SCOPE, OnDrift, Principal,
+        PrincipalId, Quotas, Role, SourceMode, SpecFormat, SpecMeta, SpecSource, StubEdit,
+        StubEditScript, TenantId,
     };
     use crate::raft::TypeConfig;
     use crate::stores::journal::ClusterJournal;
@@ -8738,6 +9535,7 @@ mod tests {
                     max_imposters: 4,
                     max_stubs_per_imposter: 1,
                     max_flow_entries: 100,
+                    ..Quotas::default()
                 },
                 0,
             ),
@@ -9806,6 +10604,628 @@ mod tests {
                 .is_some(),
             "a blob another tenant still references stays"
         );
+    }
+
+    // -- datasets (#285) --------------------------------------------------------------
+
+    fn dataset_digest(csv: &str) -> Digest {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(csv.as_bytes());
+        Digest::new(format!("{:x}", hasher.finalize()))
+    }
+
+    fn dataset_put_as(op_id: u128, tenant: &str, name: &str, csv: &str) -> ControlRequest {
+        let mut lines = csv.lines();
+        let columns: Vec<String> = lines
+            .next()
+            .unwrap_or_default()
+            .split(',')
+            .map(|c| c.trim().to_owned())
+            .collect();
+        let rows = lines.count() as u64;
+        request(
+            op_id,
+            ControlOp::DatasetPut {
+                tenant: TenantId::new(tenant),
+                record: DatasetRecord {
+                    name: name.to_owned(),
+                    digest: dataset_digest(csv),
+                    key_columns: vec![columns[0].clone()],
+                    delimiter: ',',
+                    columns,
+                    rows,
+                    bytes: csv.len() as u64,
+                },
+                csv: csv.to_owned(),
+            },
+        )
+    }
+
+    fn dataset_put(op_id: u128, name: &str, csv: &str) -> ControlRequest {
+        dataset_put_as(op_id, DEFAULT_TENANT, name, csv)
+    }
+
+    fn dataset_delete_as(op_id: u128, tenant: &str, name: &str) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::DatasetDelete {
+                tenant: TenantId::new(tenant),
+                name: name.to_owned(),
+            },
+        )
+    }
+
+    fn dataset_delete(op_id: u128, name: &str) -> ControlRequest {
+        dataset_delete_as(op_id, DEFAULT_TENANT, name)
+    }
+
+    /// A state machine with a spool directory, the way `RaftNode::start` builds one.
+    async fn fresh_sm_with_spool() -> (TempDir, RedbStateMachine, std::path::PathBuf) {
+        let td = TempDir::new().expect("tempdir");
+        let (_, sm) = new(td.path().join("raft.redb")).await.expect("open store");
+        let spool = td.path().join("datasets");
+        let sm = sm.with_spool_dir(spool.clone());
+        (td, sm, spool)
+    }
+
+    fn spool_file(spool: &std::path::Path, csv: &str) -> std::path::PathBuf {
+        spool.join(format!("{}.csv", dataset_digest(csv).as_str()))
+    }
+
+    fn one_dataset(sm: &RedbStateMachine, name: &str) -> DatasetSummary {
+        sm.dataset(DEFAULT_TENANT, name)
+            .expect("read dataset")
+            .expect("dataset present")
+    }
+
+    const CUSTOMERS: &str = "id,name,tier\n1,ada,gold\n2,bob,silver\n";
+    const ORDERS_CSV: &str = "order,customer\n100,1\n101,2\n102,1\n";
+
+    #[tokio::test]
+    async fn dataset_put_stores_the_record_the_blob_and_the_spool_file() {
+        let (_td, mut sm, spool) = fresh_sm_with_spool().await;
+        let response = apply_one(
+            &mut sm,
+            1,
+            request_at(1, 1_700_000_000, dataset_put_op("customers", CUSTOMERS)),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+
+        let record = one_dataset(&sm, "customers");
+        assert_eq!(record.name, "customers");
+        assert_eq!(record.version, 1, "the first version of a name is 1");
+        assert_eq!(record.digest, dataset_digest(CUSTOMERS).as_str());
+        assert_eq!(record.key_columns, ["id"]);
+        assert_eq!(record.columns, ["id", "name", "tier"]);
+        assert_eq!(record.rows, 2);
+        assert_eq!(record.bytes, CUSTOMERS.len() as u64);
+        assert_eq!(
+            record.created_at_secs, 1_700_000_000,
+            "the replicated clock, never a local one"
+        );
+        assert_eq!(record.revision, 1);
+        assert_eq!(sm.dataset_blob_count().expect("count"), 1);
+        assert_eq!(
+            sm.spool_path(dataset_digest(CUSTOMERS).as_str()),
+            Some(spool_file(&spool, CUSTOMERS))
+        );
+        let on_disk = std::fs::read(spool_file(&spool, CUSTOMERS)).expect("spool file exists");
+        assert_eq!(
+            on_disk,
+            CUSTOMERS.as_bytes(),
+            "byte-identical to the upload"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(spool_file(&spool, CUSTOMERS))
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "spool files are private to the node");
+        }
+        assert!(
+            std::fs::read_dir(&spool).expect("spool dir").all(|e| !e
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")),
+            "no temp file is left behind"
+        );
+        assert!(
+            sm.dataset("other", "customers").expect("read").is_none(),
+            "datasets are tenant-owned"
+        );
+    }
+
+    fn dataset_put_op(name: &str, csv: &str) -> ControlOp {
+        match dataset_put(0, name, csv).op {
+            op @ ControlOp::DatasetPut { .. } => op,
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn re_putting_a_name_appends_a_version_and_keeps_the_old_one_live() {
+        let (_td, mut sm, spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        let v2 = "id,name,tier\n1,ada,platinum\n";
+        apply_one(&mut sm, 2, dataset_put(2, "customers", v2)).await;
+        let latest = one_dataset(&sm, "customers");
+        assert_eq!(latest.version, 2);
+        assert_eq!(latest.digest, dataset_digest(v2).as_str());
+        let all = sm.datasets(DEFAULT_TENANT).expect("list");
+        assert_eq!(
+            all.iter()
+                .map(|d| (d.name.as_str(), d.version))
+                .collect::<Vec<_>>(),
+            [("customers", 1), ("customers", 2)],
+            "every live version is listed, name then version ascending"
+        );
+        assert!(
+            spool_file(&spool, CUSTOMERS).exists(),
+            "v1's file is still referenced"
+        );
+        assert!(spool_file(&spool, v2).exists());
+        assert_eq!(sm.dataset_blob_count().expect("count"), 2);
+    }
+
+    #[tokio::test]
+    async fn identical_bytes_share_one_blob_and_one_spool_file_across_names_and_tenants() {
+        let (_td, mut sm, spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "a", CUSTOMERS)).await;
+        apply_one(&mut sm, 2, dataset_put(2, "b", CUSTOMERS)).await;
+        apply_one(&mut sm, 3, dataset_put_as(3, "acme", "c", CUSTOMERS)).await;
+        assert_eq!(sm.dataset_blob_count().expect("count"), 1);
+        assert_eq!(
+            std::fs::read_dir(&spool).expect("dir").count(),
+            1,
+            "one file for one byte string"
+        );
+
+        apply_one(&mut sm, 4, dataset_delete(4, "a")).await;
+        apply_one(&mut sm, 5, dataset_delete(5, "b")).await;
+        assert!(
+            spool_file(&spool, CUSTOMERS).exists(),
+            "acme still references it"
+        );
+        assert_eq!(sm.dataset_blob_count().expect("count"), 1);
+
+        let response = apply_one(&mut sm, 6, dataset_delete_as(6, "acme", "c")).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert_eq!(sm.dataset_blob_count().expect("count"), 0);
+        assert!(
+            !spool_file(&spool, CUSTOMERS).exists(),
+            "the last live reference takes the file with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn dataset_delete_tombstones_every_live_version_and_a_re_put_continues_the_numbering() {
+        let (_td, mut sm, spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        apply_one(&mut sm, 2, dataset_put(2, "customers", ORDERS_CSV)).await;
+        let response = apply_one(&mut sm, 3, dataset_delete(3, "customers")).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert!(
+            sm.dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_none()
+        );
+        assert!(sm.datasets(DEFAULT_TENANT).expect("list").is_empty());
+        assert!(!spool_file(&spool, CUSTOMERS).exists());
+        assert!(!spool_file(&spool, ORDERS_CSV).exists());
+
+        let response = apply_one(&mut sm, 4, dataset_delete(4, "customers")).await;
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Failed {
+                reason: "no dataset \"customers\"".to_owned()
+            },
+            "deleting what is already gone is a committed refusal"
+        );
+
+        apply_one(&mut sm, 5, dataset_put(5, "customers", CUSTOMERS)).await;
+        assert_eq!(
+            one_dataset(&sm, "customers").version,
+            3,
+            "versions are monotonic per name across a delete: tombstones count"
+        );
+        assert!(spool_file(&spool, CUSTOMERS).exists(), "the file is back");
+    }
+
+    #[tokio::test]
+    async fn dataset_delete_refuses_while_a_stub_binds_it() {
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        // The RFC-005 §3.3 binding block on a stub response. D2 is what makes the engine's
+        // config schema carry `_rift.dataset` — today the vendored `RiftResponseExtension` drops
+        // it on parse, so a `PutImposter` cannot store one yet. The row is injected as D2 will
+        // store it, so the refusal D1 wires is exercised now rather than trusted.
+        let stored = json!({
+            "config_json": json!({
+                "port": 8080,
+                "protocol": "http",
+                "host": "127.0.0.1",
+                "stubs": [{
+                    "id": "lookup",
+                    "responses": [{
+                        "is": { "statusCode": 200, "body": "${row}[name]" },
+                        "_rift": { "dataset": { "name": "customers", "keyColumn": "id", "into": "${row}" } }
+                    }]
+                }]
+            }).to_string(),
+            "enabled": true,
+            "revision": 2,
+        })
+        .to_string();
+        sm.inject_raw_config(DEFAULT_TENANT, 8080, &stored);
+        let response = apply_one(&mut sm, 3, dataset_delete(3, "customers")).await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => assert!(
+                reason.contains("bound") && reason.contains("8080"),
+                "names the binding port: {reason}"
+            ),
+            other => panic!("a bound dataset must not be deleted: {other:?}"),
+        }
+        assert!(
+            sm.dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_some()
+        );
+        // A different tenant's identically-named dataset is not what this stub binds.
+        apply_one(
+            &mut sm,
+            4,
+            dataset_put_as(4, "acme", "customers", ORDERS_CSV),
+        )
+        .await;
+        assert_eq!(
+            apply_one(&mut sm, 5, dataset_delete_as(5, "acme", "customers"))
+                .await
+                .outcome,
+            ControlOutcome::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn dataset_quotas_are_enforced_at_apply_at_their_exact_ceilings() {
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::TenantPut {
+                    tenant: TenantId::new("acme"),
+                    display_name: "Acme".to_owned(),
+                    quotas: Quotas {
+                        max_datasets: 2,
+                        max_dataset_bytes: 40,
+                        max_dataset_total_bytes: 100,
+                        ..Quotas::default()
+                    },
+                    journal_retention_secs: 0,
+                },
+            ),
+        )
+        .await;
+        let small = "id,v\n1,a\n"; // 9 bytes
+        assert_eq!(small.len(), 9);
+        // "id,v\n1," is 7 bytes and the trailing newline 1, so 32 payload bytes make exactly 40.
+        let forty = format!("id,v\n1,{}\n", "a".repeat(32));
+        assert_eq!(forty.len(), 40);
+        let forty_one = format!("id,v\n1,{}\n", "a".repeat(33));
+        assert_eq!(forty_one.len(), 41);
+        let (forty, forty_one) = (forty.as_str(), forty_one.as_str());
+
+        // Per-dataset bytes: at the ceiling is fine, one over is refused, nothing stored.
+        assert_eq!(
+            apply_one(&mut sm, 2, dataset_put_as(2, "acme", "d1", forty))
+                .await
+                .outcome,
+            ControlOutcome::Applied
+        );
+        let response = apply_one(&mut sm, 3, dataset_put_as(3, "acme", "d2", forty_one)).await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => assert!(
+                reason.contains("40") && reason.contains("\"d2\""),
+                "names the ceiling and the dataset: {reason}"
+            ),
+            other => panic!("over the per-dataset ceiling: {other:?}"),
+        }
+        assert!(sm.dataset("acme", "d2").expect("read").is_none());
+        assert_eq!(
+            sm.dataset_blob_count().expect("count"),
+            1,
+            "a refused put stores no blob"
+        );
+
+        // Count: the second distinct name is fine, a third is refused — but a new version of an
+        // existing name is not a new dataset.
+        assert_eq!(
+            apply_one(&mut sm, 4, dataset_put_as(4, "acme", "d2", small))
+                .await
+                .outcome,
+            ControlOutcome::Applied
+        );
+        let response = apply_one(&mut sm, 5, dataset_put_as(5, "acme", "d3", small)).await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("ceiling") && reason.contains("2"),
+                    "{reason}"
+                );
+            }
+            other => panic!("over the dataset-count ceiling: {other:?}"),
+        }
+        assert_eq!(
+            apply_one(&mut sm, 6, dataset_put_as(6, "acme", "d1", "id,v\n1,b\n"))
+                .await
+                .outcome,
+            ControlOutcome::Applied,
+            "re-versioning a name the tenant already holds is not a new dataset"
+        );
+
+        // Total bytes: 40 + 9 + 9 = 58 held (every live version counts). Two 21-byte uploads
+        // land exactly on the ceiling (58 + 21 + 21 = 100); the next byte is refused.
+        let twenty_one = format!("id,v\n1,{}\n", "a".repeat(13));
+        assert_eq!(twenty_one.len(), 21);
+        let twenty_one = twenty_one.as_str();
+        assert_eq!(
+            apply_one(&mut sm, 7, dataset_put_as(7, "acme", "d1", twenty_one))
+                .await
+                .outcome,
+            ControlOutcome::Applied
+        );
+        let twenty_one_b = format!("id,v\n1,{}\n", "b".repeat(13));
+        let twenty_one_b = twenty_one_b.as_str();
+        assert_eq!(
+            apply_one(&mut sm, 8, dataset_put_as(8, "acme", "d2", twenty_one_b))
+                .await
+                .outcome,
+            ControlOutcome::Applied,
+            "exactly at the total ceiling (100) is allowed"
+        );
+        let response = apply_one(&mut sm, 9, dataset_put_as(9, "acme", "d1", small)).await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(reason.contains("100"), "names the total ceiling: {reason}");
+            }
+            other => panic!("over the total-bytes ceiling: {other:?}"),
+        }
+        // Deleting frees the total.
+        apply_one(&mut sm, 10, dataset_delete_as(10, "acme", "d2")).await;
+        assert_eq!(
+            apply_one(&mut sm, 11, dataset_put_as(11, "acme", "d1", small))
+                .await
+                .outcome,
+            ControlOutcome::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn a_default_tenant_gets_the_default_dataset_quotas() {
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        // 8 MiB + 1 byte: over the default per-dataset ceiling for a tenant with no record.
+        let mut csv = String::from("id,v\n");
+        let mut i = 0u64;
+        while csv.len() <= 8 * 1024 * 1024 {
+            csv.push_str(&format!("{i},{}\n", "x".repeat(1000)));
+            i += 1;
+        }
+        let response = apply_one(&mut sm, 1, dataset_put(1, "big", &csv)).await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("8388608"),
+                    "names the default ceiling: {reason}"
+                );
+            }
+            other => panic!("over the default per-dataset ceiling: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trips_datasets_and_materialises_their_spool_files() {
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        apply_one(&mut sm, 2, dataset_put(2, "orders", ORDERS_CSV)).await;
+        apply_one(&mut sm, 3, dataset_delete(3, "orders")).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower, follower_spool) = fresh_sm_with_spool().await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+        let record = follower
+            .dataset(DEFAULT_TENANT, "customers")
+            .expect("read")
+            .expect("dataset travels in the snapshot");
+        assert_eq!(record.digest, dataset_digest(CUSTOMERS).as_str());
+        assert!(
+            follower
+                .dataset(DEFAULT_TENANT, "orders")
+                .expect("read")
+                .is_none(),
+            "a tombstone travels as a tombstone"
+        );
+        assert_eq!(
+            std::fs::read(spool_file(&follower_spool, CUSTOMERS)).expect("materialised on install"),
+            CUSTOMERS.as_bytes(),
+            "a node that joins by snapshot holds the same bytes on disk"
+        );
+        assert!(
+            !spool_file(&follower_spool, ORDERS_CSV).exists(),
+            "no file for a tombstoned digest"
+        );
+        assert_eq!(follower.dataset_blob_count().expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_without_datasets_installs_and_reads_empty() {
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&snapshot.into_inner()).expect("snapshot is json");
+        let object = payload.as_object_mut().expect("object");
+        assert!(object.remove("datasets").is_some());
+        assert!(object.remove("dataset_blobs").is_some());
+        let older = Box::new(std::io::Cursor::new(
+            serde_json::to_vec(&payload).expect("re-encode"),
+        ));
+        let (_td2, mut follower, _) = fresh_sm_with_spool().await;
+        follower
+            .install_snapshot(&meta, older)
+            .await
+            .expect("a pre-#285 snapshot still installs");
+        assert!(follower.datasets(DEFAULT_TENANT).expect("list").is_empty());
+        assert_eq!(follower.dataset_blob_count().expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_missing_spool_file_is_repaired_from_the_state_machine_on_reconcile() {
+        let (_td, mut sm, spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        std::fs::remove_file(spool_file(&spool, CUSTOMERS)).expect("simulate a lost file");
+        std::fs::write(spool.join("orphan.csv"), b"junk")
+            .expect("an orphan the repair must not touch");
+        sm.reconcile_engine().await.expect("reconcile");
+        assert_eq!(
+            std::fs::read(spool_file(&spool, CUSTOMERS)).expect("repaired"),
+            CUSTOMERS.as_bytes()
+        );
+        assert!(spool.join("orphan.csv").exists(), "repair only ever adds");
+    }
+
+    #[tokio::test]
+    async fn tenant_delete_cascades_datasets_and_their_files() {
+        let (_td, mut sm, spool) = fresh_sm_with_spool().await;
+        apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::TenantPut {
+                    tenant: TenantId::new("acme"),
+                    display_name: "Acme".to_owned(),
+                    quotas: Quotas::default(),
+                    journal_retention_secs: 0,
+                },
+            ),
+        )
+        .await;
+        apply_one(
+            &mut sm,
+            2,
+            dataset_put_as(2, "acme", "customers", CUSTOMERS),
+        )
+        .await;
+        apply_one(&mut sm, 3, dataset_put_as(3, "acme", "orders", ORDERS_CSV)).await;
+        apply_one(&mut sm, 4, dataset_put(4, "shared", CUSTOMERS)).await;
+        let response = apply_one(
+            &mut sm,
+            5,
+            request(
+                5,
+                ControlOp::TenantDelete {
+                    tenant: TenantId::new("acme"),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert!(sm.datasets("acme").expect("list").is_empty());
+        assert!(
+            !spool_file(&spool, ORDERS_CSV).exists(),
+            "only acme held these bytes"
+        );
+        assert!(
+            spool_file(&spool, CUSTOMERS).exists(),
+            "default still holds these"
+        );
+        assert_eq!(sm.dataset_blob_count().expect("count"), 1);
+    }
+
+    /// The batch shape `apply` actually runs: several entries in one transaction, actions
+    /// driven after the commit. A delete and a re-put of the same bytes in one batch must not
+    /// leave the live row pointing at a file the deferred unspool removed.
+    #[tokio::test]
+    async fn a_delete_and_re_put_of_the_same_bytes_in_one_batch_keeps_the_spool_file() {
+        let (_td, mut sm, spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        let responses = sm
+            .apply([
+                entry(2, dataset_delete(2, "customers")),
+                entry(3, dataset_put(3, "customers", CUSTOMERS)),
+            ])
+            .await
+            .expect("apply");
+        assert!(
+            responses
+                .iter()
+                .all(|r| r.outcome == ControlOutcome::Applied),
+            "{responses:?}"
+        );
+        assert_eq!(one_dataset(&sm, "customers").version, 2);
+        assert_eq!(sm.dataset_blob_count().expect("count"), 1);
+        assert_eq!(
+            std::fs::read(spool_file(&spool, CUSTOMERS)).expect("the file survives the batch"),
+            CUSTOMERS.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_dataset_whose_spool_file_is_already_gone_still_applies() {
+        let (_td, mut sm, spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        std::fs::remove_file(spool_file(&spool, CUSTOMERS)).expect("simulate a lost file");
+        let response = apply_one(&mut sm, 2, dataset_delete(2, "customers")).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert_eq!(sm.dataset_blob_count().expect("count"), 0);
+    }
+
+    /// The delete guard fails closed: a config row it cannot read might be the binding stub.
+    #[tokio::test]
+    async fn dataset_delete_refuses_when_a_stored_config_is_unreadable() {
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        sm.inject_raw_config(DEFAULT_TENANT, 8080, "{not json");
+        let response = apply_one(&mut sm, 2, dataset_delete(2, "customers")).await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => assert!(
+                reason.contains("cannot tell") && reason.contains("8080"),
+                "{reason}"
+            ),
+            other => panic!("an unreadable config must refuse the delete: {other:?}"),
+        }
+        assert!(
+            sm.dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_spool_dir_the_state_machine_still_applies_datasets() {
+        // An embedder that never attached a spool dir (or a storage-only test) still gets the
+        // replicated tables; only the on-disk materialisation is skipped.
+        let (_td, mut sm) = fresh_sm(None).await;
+        assert_eq!(
+            apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS))
+                .await
+                .outcome,
+            ControlOutcome::Applied
+        );
+        assert_eq!(one_dataset(&sm, "customers").version, 1);
+        assert_eq!(sm.spool_path("abc"), None);
     }
 
     #[tokio::test]

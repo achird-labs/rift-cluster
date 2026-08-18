@@ -133,6 +133,39 @@ pub struct Quotas {
     /// entries are not in the state machine — so this slice stores it and #147
     /// applies it.
     pub max_flow_entries: u64,
+    /// Distinct dataset names a tenant may hold (RFC-005 D1). Enforced at
+    /// apply. `#[serde(default)]`, unlike the three fields above: a `Quotas`
+    /// committed before #285 carries no dataset fields at all, and it must
+    /// keep decoding — at these defaults, not a hard failure.
+    #[serde(default = "default_max_datasets")]
+    pub max_datasets: u32,
+    /// Bytes any one dataset's CSV document may be. Enforced at apply.
+    #[serde(default = "default_max_dataset_bytes")]
+    pub max_dataset_bytes: u64,
+    /// Sum of bytes across every live version of every dataset a tenant
+    /// holds. Enforced at apply.
+    #[serde(default = "default_max_dataset_total_bytes")]
+    pub max_dataset_total_bytes: u64,
+}
+
+/// Default [`Quotas::max_datasets`] — also the value a pre-#285 `Quotas`
+/// decodes to when the field is absent from stored JSON.
+pub const DEFAULT_MAX_DATASETS: u32 = 50;
+/// Default [`Quotas::max_dataset_bytes`] — 8 MiB.
+pub const DEFAULT_MAX_DATASET_BYTES: u64 = 8 * 1024 * 1024;
+/// Default [`Quotas::max_dataset_total_bytes`] — 64 MiB.
+pub const DEFAULT_MAX_DATASET_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+fn default_max_datasets() -> u32 {
+    DEFAULT_MAX_DATASETS
+}
+
+fn default_max_dataset_bytes() -> u64 {
+    DEFAULT_MAX_DATASET_BYTES
+}
+
+fn default_max_dataset_total_bytes() -> u64 {
+    DEFAULT_MAX_DATASET_TOTAL_BYTES
 }
 
 impl Default for Quotas {
@@ -141,6 +174,9 @@ impl Default for Quotas {
             max_imposters: 1_000,
             max_stubs_per_imposter: 1_000,
             max_flow_entries: 100_000,
+            max_datasets: DEFAULT_MAX_DATASETS,
+            max_dataset_bytes: DEFAULT_MAX_DATASET_BYTES,
+            max_dataset_total_bytes: DEFAULT_MAX_DATASET_TOTAL_BYTES,
         }
     }
 }
@@ -781,6 +817,27 @@ pub enum ControlOp {
         tenant: TenantId,
         port: u16,
     },
+    /// Store a dataset document and its content-addressed blob (RFC-005 D1, #285) — the same
+    /// shape as [`ControlOp::SpecPut`], for the same reason: `csv` is a `String` because log
+    /// entries are JSON and the engine's own CSV lookup reads the file as UTF-8 lines, and
+    /// `record` carries metadata [`validate`] has already proven true of `csv`'s exact bytes, so
+    /// apply never re-parses it.
+    ///
+    /// Re-putting an existing `(tenant, record.name)` does not replace it: it adds a new live
+    /// version, numbered one past the highest version that name has ever held (tombstones
+    /// included) — see `raft::store`'s apply arm.
+    DatasetPut {
+        tenant: TenantId,
+        record: DatasetRecord,
+        csv: String,
+    },
+    /// Tombstone every live version of a dataset name (and, if nothing else references its
+    /// digest, its blob). Refused at apply while any stub of the tenant is still bound to it
+    /// (RFC-005 §3.3) — see `raft::store`'s apply arm.
+    DatasetDelete {
+        tenant: TenantId,
+        name: String,
+    },
 }
 
 /// The stub half of a [`ControlOp::ProxyRecorded`]: the generated stub plus everything its
@@ -989,6 +1046,33 @@ pub struct SpecProvenance {
     pub digest: Digest,
 }
 
+/// A dataset's declared, pre-verified metadata (RFC-005 D1, #285) — carried on
+/// [`ControlOp::DatasetPut`] and stamped onto the stored record unchanged.
+///
+/// Every field here is checked by [`validate`] against `csv` itself (the digest is its sha256,
+/// `bytes` is its length, `columns`/`rows` are what the engine's own CSV tokenizer would yield
+/// from it) *before* the op ever reaches the log. That is what lets apply skip re-parsing the
+/// document on every replica: by the time `mutate_tables` sees this record, its fields are
+/// already proven true of the bytes beside them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetRecord {
+    pub name: String,
+    pub digest: Digest,
+    /// Header column(s) a lookup keys on. Non-empty: a dataset with no key column cannot be
+    /// looked up by one, which is the entire reason a dataset is uploaded (D2 binds a stub's
+    /// lookup to exactly one of these).
+    pub key_columns: Vec<String>,
+    pub delimiter: char,
+    /// The header row, cell-for-cell — proven equal to `csv`'s first line by [`validate`].
+    pub columns: Vec<String>,
+    /// Number of data lines (everything after the header).
+    pub rows: u64,
+    /// `csv.len()` in bytes — the blob table's integrity check, same role as
+    /// [`SpecMeta::digest`] plays for a spec document.
+    pub bytes: u64,
+}
+
 /// The shortest poll interval a [`SourceMode::Tracking`] source may declare.
 ///
 /// A floor, not a suggestion: `poll_secs: 0` (or a typo'd `1`) turns the fleet
@@ -1143,7 +1227,9 @@ impl ControlOp {
             | ControlOp::SpecPut { tenant, .. }
             | ControlOp::SpecDelete { tenant, .. }
             | ControlOp::SpecBind { tenant, .. }
-            | ControlOp::SpecUnbind { tenant, .. } => tenant,
+            | ControlOp::SpecUnbind { tenant, .. }
+            | ControlOp::DatasetPut { tenant, .. }
+            | ControlOp::DatasetDelete { tenant, .. } => tenant,
         }
     }
 
@@ -1222,6 +1308,8 @@ impl ControlOp {
             | ControlOp::SpecBind { .. }
             | ControlOp::SpecUnbind { .. } => "spec.write",
             ControlOp::SpecDelete { .. } => "spec.delete",
+            ControlOp::DatasetPut { .. } => "dataset.write",
+            ControlOp::DatasetDelete { .. } => "dataset.delete",
         })
     }
 
@@ -1278,6 +1366,8 @@ impl ControlOp {
             // Unbind names no spec (it may run after the spec itself is
             // gone); the port it cleared is the only thing left to address.
             ControlOp::SpecUnbind { port, .. } => port.to_string(),
+            ControlOp::DatasetPut { record, .. } => record.name.clone(),
+            ControlOp::DatasetDelete { name, .. } => name.clone(),
         }
     }
 }
@@ -1798,6 +1888,19 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             require_spec_id(id)
         }
         ControlOp::SpecUnbind { tenant, port: _ } => require_real_tenant(tenant),
+        ControlOp::DatasetPut {
+            tenant,
+            record,
+            csv,
+        } => {
+            require_real_tenant(tenant)?;
+            require_dataset_name(&record.name)?;
+            validate_dataset_put(record, csv)
+        }
+        ControlOp::DatasetDelete { tenant, name } => {
+            require_real_tenant(tenant)?;
+            require_dataset_name(name)
+        }
     }
 }
 
@@ -2001,6 +2104,159 @@ fn require_source_id(id: &str) -> Result<(), String> {
     } else {
         Err(
             "source id must be a non-empty name of at most 128 characters drawn from \
+             [A-Za-z0-9._-]: it addresses the record and appears in the request path"
+                .to_owned(),
+        )
+    }
+}
+
+/// The document half of [`validate`]'s `DatasetPut` arm (RFC-005 D1, #285): the record must
+/// describe `csv` truthfully, the header must be usable, and every declared key column — plus
+/// column 0, which the engine keys its row map on — must be unique across rows. Runs on every
+/// replica at apply as well as at admission, so it must be deterministic and allocate no more
+/// than a row's worth of borrows per row.
+fn validate_dataset_put(record: &DatasetRecord, csv: &str) -> Result<(), String> {
+    // The digest is the blob table's key and `bytes` is the size integrity check —
+    // both must be true of `csv`'s own bytes, the same rule `SpecPut` enforces for a
+    // spec document, and for the same reason: a record that lies about either could
+    // point the blob table at bytes it never actually holds.
+    if record.bytes != csv.len() as u64 || !digest_matches(record.digest.as_str(), csv.as_bytes()) {
+        return Err(format!(
+            "dataset {:?}: digest/bytes do not match the document",
+            record.name
+        ));
+    }
+
+    // Checked before any cell-splitting below: '\n'/'\r' terminate the lines
+    // `csv.lines()` already split on, so either would make every row an
+    // unsplittable single cell rather than a real delimiter.
+    if matches!(record.delimiter, '\n' | '\r') {
+        return Err(format!(
+            "dataset {:?}: delimiter {:?} cannot split a document — it is a line \
+                 terminator, not a cell separator",
+            record.name, record.delimiter
+        ));
+    }
+
+    // Mirrors the engine's own tokenizer exactly (`CsvData::load`,
+    // vendor/rift/crates/rift-mock-core/src/behaviors/lookup.rs): `.lines()` (so both
+    // `\n` and `\r\n` work), first line is the header, every later line is a row —
+    // each split on `delimiter` and trimmed. Reproduced here so apply never has to
+    // re-parse the document to know it is well-formed.
+    let mut lines = csv.lines();
+    let Some(header_line) = lines.next().filter(|line| !line.trim().is_empty()) else {
+        return Err(format!("dataset {:?} has no header row", record.name));
+    };
+    let header: Vec<&str> = header_line.split(record.delimiter).map(str::trim).collect();
+    for (i, cell) in header.iter().enumerate() {
+        if cell.is_empty() {
+            return Err(format!("header column {i} is empty"));
+        }
+    }
+    {
+        let mut seen = std::collections::HashSet::new();
+        for cell in &header {
+            if !seen.insert(*cell) {
+                return Err(format!("header names {cell:?} twice"));
+            }
+        }
+    }
+    if !record
+        .columns
+        .iter()
+        .map(String::as_str)
+        .eq(header.iter().copied())
+    {
+        return Err(format!(
+            "dataset {:?} declares columns {:?} but the document's header is {:?}",
+            record.name, record.columns, header
+        ));
+    }
+
+    if record.key_columns.is_empty() {
+        return Err(format!(
+            "dataset {:?} must declare at least one key column: a dataset with none \
+                 can never be looked up by one",
+            record.name
+        ));
+    }
+    for c in &record.key_columns {
+        if !header.contains(&c.as_str()) {
+            return Err(format!("key column {c:?} is not in the header row"));
+        }
+    }
+    {
+        let mut seen = std::collections::HashSet::new();
+        for c in &record.key_columns {
+            if !seen.insert(c.as_str()) {
+                return Err(format!("key column {c:?} is declared twice"));
+            }
+        }
+    }
+
+    // Borrowed, not owned: an 8 MiB document of short rows is millions of cells, and
+    // this runs on every replica at apply — one allocation per row is the budget.
+    let rows: Vec<Vec<&str>> = lines
+        .map(|line| line.split(record.delimiter).map(str::trim).collect())
+        .collect();
+    if record.rows != rows.len() as u64 {
+        return Err(format!(
+            "dataset {:?} declares {} rows but the document has {}",
+            record.name,
+            record.rows,
+            rows.len()
+        ));
+    }
+
+    // First colliding pair, in row order (1-based, the way an operator reads a CSV). A row
+    // shorter than the column's index reads as `""` — the engine's own `values.get(idx)`
+    // sees the cell as absent, which is exactly a row that spells it empty.
+    fn first_duplicate<'a>(rows: &[Vec<&'a str>], idx: usize) -> Option<(usize, usize, &'a str)> {
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            let value = row.get(idx).copied().unwrap_or_default();
+            let row_no = i + 1;
+            if let Some(&first) = seen.get(value) {
+                return Some((first, row_no, value));
+            }
+            seen.insert(value, row_no);
+        }
+        None
+    }
+    // Column 0 is checked unconditionally — the engine keys its row map on it and
+    // silently keeps the last duplicate, whether or not it is a declared key column.
+    if let Some((i, j, v)) = first_duplicate(&rows, 0) {
+        return Err(format!(
+            "column 0 ({:?}) is not unique: rows {i} and {j} share value {v:?}",
+            header[0]
+        ));
+    }
+    for c in &record.key_columns {
+        // Membership in `header` was already proven above.
+        let Some(idx) = header.iter().position(|h| *h == c.as_str()) else {
+            continue;
+        };
+        if idx == 0 {
+            continue; // already checked, and with column 0's own message
+        }
+        if let Some((i, j, v)) = first_duplicate(&rows, idx) {
+            return Err(format!(
+                "key column {c:?} is not unique: rows {i} and {j} share value {v:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Same shape rule as [`require_source_id`]/[`require_spec_id`] — reusing [`is_source_name`] —
+/// with its own message so a refusal names what it is actually about (RFC-005 D1, #285).
+fn require_dataset_name(name: &str) -> Result<(), String> {
+    if is_source_name(name) {
+        Ok(())
+    } else {
+        Err(
+            "dataset name must be a non-empty name of at most 128 characters drawn from \
              [A-Za-z0-9._-]: it addresses the record and appears in the request path"
                 .to_owned(),
         )
@@ -2491,7 +2747,11 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget<'_>> {
         // in `rift-cluster-server` mints `expected_revision` only for ops whose
         // `precondition_target` is `Some`, so `SpecBind` never gets one).
         | ControlOp::SpecBind { .. }
-        | ControlOp::SpecUnbind { .. } => None,
+        | ControlOp::SpecUnbind { .. }
+        // A dataset addresses `sm_datasets`, not `sm_configs` — no imposter row for a
+        // precondition to hold against (RFC-005 D1, #285).
+        | ControlOp::DatasetPut { .. }
+        | ControlOp::DatasetDelete { .. } => None,
     }
 }
 
@@ -2851,6 +3111,29 @@ mod tests {
                     port: 4545,
                 },
                 "SpecUnbind",
+            ),
+            (
+                ControlOp::DatasetPut {
+                    tenant: TenantId::new("acme"),
+                    record: DatasetRecord {
+                        name: "customers".to_owned(),
+                        digest: Digest::new("a".repeat(64)),
+                        key_columns: vec!["id".to_owned()],
+                        delimiter: ',',
+                        columns: vec!["id".to_owned()],
+                        rows: 0,
+                        bytes: 3,
+                    },
+                    csv: "id\n".to_owned(),
+                },
+                "DatasetPut",
+            ),
+            (
+                ControlOp::DatasetDelete {
+                    tenant: TenantId::new("acme"),
+                    name: "customers".to_owned(),
+                },
+                "DatasetDelete",
             ),
         ];
         for (op, tag) in cases {
@@ -4019,6 +4302,271 @@ mod tests {
                 .expect_err("a source must name something fetchable");
             assert!(err.contains("uri"), "{err}");
         }
+    }
+
+    // -- dataset ops (#285) ------------------------------------------------------
+
+    fn dataset_digest(csv: &str) -> Digest {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(csv.as_bytes());
+        Digest::new(format!("{:x}", hasher.finalize()))
+    }
+
+    /// A `DatasetPut` whose record describes `csv` truthfully — what an honest
+    /// client (or D3's front) sends. Tests that want a lie mutate the record.
+    fn dataset_put(name: &str, key_columns: &[&str], csv: &str) -> ControlOp {
+        let mut lines = csv.lines();
+        let columns: Vec<String> = lines
+            .next()
+            .unwrap_or_default()
+            .split(',')
+            .map(|c| c.trim().to_owned())
+            .collect();
+        let rows = lines.count() as u64;
+        ControlOp::DatasetPut {
+            tenant: TenantId::new("acme"),
+            record: DatasetRecord {
+                name: name.to_owned(),
+                digest: dataset_digest(csv),
+                key_columns: key_columns.iter().map(|k| (*k).to_owned()).collect(),
+                delimiter: ',',
+                columns,
+                rows,
+                bytes: csv.len() as u64,
+            },
+            csv: csv.to_owned(),
+        }
+    }
+
+    const CUSTOMERS: &str = "id,name,tier\n1,ada,gold\n2,bob,silver\n3,cyd,gold\n";
+
+    #[test]
+    fn dataset_quotas_default_and_older_records_still_decode() {
+        let quotas = Quotas::default();
+        assert_eq!(quotas.max_datasets, 50);
+        assert_eq!(quotas.max_dataset_bytes, 8 * 1024 * 1024);
+        assert_eq!(quotas.max_dataset_total_bytes, 64 * 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_DATASET_BYTES, 8_388_608);
+        // A `Quotas` written before #285 carries only the three original fields; a committed
+        // `TenantPut` and every `sm_tenants` row must keep decoding, at the new defaults.
+        let older: Quotas = serde_json::from_value(json!({
+            "maxImposters": 7,
+            "maxStubsPerImposter": 8,
+            "maxFlowEntries": 9
+        }))
+        .expect("pre-#285 quotas decode");
+        assert_eq!(older.max_imposters, 7);
+        assert_eq!(older.max_datasets, 50);
+        assert_eq!(older.max_dataset_bytes, 8 * 1024 * 1024);
+        assert_eq!(older.max_dataset_total_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            serde_json::to_value(Quotas::default()).expect("serialize")["maxDatasetBytes"],
+            json!(8_388_608)
+        );
+    }
+
+    #[test]
+    fn dataset_record_spellings_are_stable() {
+        let ControlOp::DatasetPut { record, .. } = dataset_put("customers", &["id"], CUSTOMERS)
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            serde_json::to_value(&record).expect("serialize"),
+            json!({
+                "name": "customers",
+                "digest": dataset_digest(CUSTOMERS).as_str(),
+                "keyColumns": ["id"],
+                "delimiter": ",",
+                "columns": ["id", "name", "tier"],
+                "rows": 3,
+                "bytes": CUSTOMERS.len(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_truthful_dataset_put_is_admitted() {
+        assert_eq!(
+            validate(&dataset_put("customers", &["id"], CUSTOMERS)),
+            Ok(())
+        );
+        // Several key columns, CRLF line endings, a header-only file — all fine.
+        assert_eq!(
+            validate(&dataset_put(
+                "k2",
+                &["id", "name"],
+                "id,name\r\n1,a\r\n2,b\r\n"
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            validate(&dataset_put("empty", &["id"], "id,name\n")),
+            Ok(())
+        );
+        // A tab delimiter is a delimiter like any other char.
+        assert_eq!(
+            validate(&ControlOp::DatasetPut {
+                tenant: TenantId::new("acme"),
+                record: DatasetRecord {
+                    name: "tabbed".to_owned(),
+                    digest: dataset_digest("id\tname\n1\tada\n"),
+                    key_columns: vec!["id".to_owned()],
+                    delimiter: '\t',
+                    columns: vec!["id".to_owned(), "name".to_owned()],
+                    rows: 1,
+                    bytes: 14,
+                },
+                csv: "id\tname\n1\tada\n".to_owned(),
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            validate(&ControlOp::DatasetDelete {
+                tenant: TenantId::new("acme"),
+                name: "customers".to_owned(),
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_is_refused_naming_the_rows_and_the_value() {
+        let err = validate(&dataset_put(
+            "dup",
+            &["email"],
+            "id,email\n1,a@x\n2,b@x\n3,a@x\n",
+        ))
+        .expect_err("a duplicate key column value must be refused");
+        assert!(
+            err.contains("\"email\"") && err.contains("rows 1 and 3") && err.contains("\"a@x\""),
+            "names the column, both rows and the value: {err}"
+        );
+        // Column 0 is checked even when it is not a declared key column: the engine keys its
+        // row map on it and silently keeps the last duplicate.
+        let err = validate(&dataset_put("dup0", &["email"], "id,email\n1,a@x\n1,b@x\n"))
+            .expect_err("a duplicate in column 0 is refused");
+        assert!(
+            err.contains("column 0") && err.contains("rows 1 and 2") && err.contains("\"1\""),
+            "{err}"
+        );
+        // A row too short to carry the key column reads as an empty key, exactly as the engine
+        // would see it — two such rows collide.
+        let err = validate(&dataset_put("short", &["email"], "id,email\n1\n2\n"))
+            .expect_err("two rows with no key cell share the empty key");
+        assert!(
+            err.contains("rows 1 and 2") && err.contains("\"\""),
+            "{err}"
+        );
+        // A blank line is a row (`[""]`), exactly as the engine stores it — so two blank lines
+        // collide on column 0, and one blank line collides with a row whose first cell is empty.
+        let err = validate(&dataset_put("blank", &["id"], "id,v\n1,a\n\n\n"))
+            .expect_err("two blank lines are two rows with the same empty key");
+        assert!(
+            err.contains("column 0") && err.contains("rows 2 and 3") && err.contains("\"\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_dataset_whose_shape_is_wrong_is_refused_naming_the_problem() {
+        let err = validate(&dataset_put("nohdr", &["id"], "")).expect_err("no header");
+        assert!(err.contains("header"), "{err}");
+        let err = validate(&dataset_put("nokey", &["missing"], CUSTOMERS))
+            .expect_err("no such key column");
+        assert!(
+            err.contains("\"missing\"") && err.contains("header"),
+            "{err}"
+        );
+        let err =
+            validate(&dataset_put("nokeys", &[], CUSTOMERS)).expect_err("a key column is required");
+        assert!(err.contains("key column"), "{err}");
+        let err = validate(&dataset_put("dupkey", &["id", "id"], CUSTOMERS))
+            .expect_err("duplicate key declaration");
+        assert!(err.contains("\"id\""), "{err}");
+        let err = validate(&dataset_put("duphdr", &["id"], "id,id\n1,2\n"))
+            .expect_err("duplicate header");
+        assert!(err.contains("\"id\"") && err.contains("twice"), "{err}");
+        let err = validate(&dataset_put("emptyhdr", &["id"], "id,,x\n1,2,3\n"))
+            .expect_err("empty header cell");
+        assert!(err.contains("empty"), "{err}");
+        for name in ["", "a/b", "a b", &"x".repeat(129)] {
+            let err = validate(&dataset_put(name, &["id"], CUSTOMERS)).expect_err("bad name");
+            assert!(err.contains("dataset name"), "{name:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_dataset_record_that_lies_about_its_document_is_refused() {
+        let ControlOp::DatasetPut {
+            tenant,
+            record,
+            csv,
+        } = dataset_put("liar", &["id"], CUSTOMERS)
+        else {
+            unreachable!()
+        };
+        let put = |record: DatasetRecord| ControlOp::DatasetPut {
+            tenant: tenant.clone(),
+            record,
+            csv: csv.clone(),
+        };
+        let mut r = record.clone();
+        r.digest = Digest::new("0".repeat(64));
+        assert!(
+            validate(&put(r))
+                .expect_err("wrong digest")
+                .contains("digest")
+        );
+        let mut r = record.clone();
+        r.bytes += 1;
+        assert!(
+            validate(&put(r))
+                .expect_err("wrong bytes")
+                .contains("bytes")
+        );
+        let mut r = record.clone();
+        r.rows = 99;
+        assert!(validate(&put(r)).expect_err("wrong rows").contains("rows"));
+        let mut r = record.clone();
+        r.columns = vec!["id".to_owned()];
+        assert!(
+            validate(&put(r))
+                .expect_err("wrong columns")
+                .contains("columns")
+        );
+        let mut r = record.clone();
+        r.delimiter = '\n';
+        assert!(
+            validate(&put(r))
+                .expect_err("unsplittable delimiter")
+                .contains("delimiter")
+        );
+    }
+
+    #[test]
+    fn dataset_ops_carry_their_audit_names_and_no_precondition() {
+        let put = dataset_put("customers", &["id"], CUSTOMERS);
+        assert_eq!(put.audit_action(), Some("dataset.write"));
+        assert_eq!(put.audit_resource(), "customers");
+        assert_eq!(put.tenant(), &TenantId::new("acme"));
+        assert!(precondition_target(&put).is_none());
+        let delete = ControlOp::DatasetDelete {
+            tenant: TenantId::new("acme"),
+            name: "customers".to_owned(),
+        };
+        assert_eq!(delete.audit_action(), Some("dataset.delete"));
+        assert_eq!(delete.audit_resource(), "customers");
+        assert!(precondition_target(&delete).is_none());
+        assert!(
+            validate(&ControlOp::DatasetDelete {
+                tenant: TenantId::new(FLEET_SCOPE),
+                name: "customers".to_owned(),
+            })
+            .is_err(),
+            "the reserved fleet scope owns no datasets"
+        );
     }
 
     // -- spec ops (#278) ---------------------------------------------------------

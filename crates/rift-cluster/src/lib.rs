@@ -52,7 +52,7 @@ pub use raft::{
 // `raft::store` is `pub(crate)` (not re-exported by `raft`'s own `pub use`, unlike
 // `SourceRecord`/`SourceRow`) — reached directly here rather than widening that module's own
 // visibility just to route two more types through it.
-pub use raft::store::{SpecBinding, SpecRecord};
+pub use raft::store::{DatasetSummary, SpecBinding, SpecRecord};
 pub use rpc::{Authority, AuthorityError, Router, RpcClient, RpcError, RpcServer};
 pub use sources::scheduler::{PollStatus, SourceScheduler};
 pub use sources::{PullError, PullReport, SourcePuller};

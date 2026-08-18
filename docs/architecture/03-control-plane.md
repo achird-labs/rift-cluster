@@ -76,6 +76,13 @@ flowchart TB
   sources' one-fetch rule closes — but they are capped at **4 MiB** by
   `control::validate` before commit and stored content-addressed in
   `sm_spec_blobs`, so identical documents under two ids cost one blob.
+  Datasets (RFC-005 §3.2, #285) follow the same rule with a larger ceiling —
+  a `DatasetPut` carries the CSV, capped by the tenant's `maxDatasetBytes`
+  (default 8 MiB) at apply — and add one derived artefact: apply writes the
+  bytes to `<data-dir>/datasets/<digest>.csv` before inserting the record, so
+  log order alone puts the file on every node before any config that names
+  it. The file is derived state — rebuilt from `sm_dataset_blobs` on restart,
+  never fetched from a peer.
 
 ## Membership lifecycle
 
