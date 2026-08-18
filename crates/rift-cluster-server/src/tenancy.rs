@@ -30,7 +30,7 @@ use rift_cluster::control::{
     AuthSource, FLEET_SCOPE, Principal, PrincipalId, Quotas, Role, Tenant, TenantConfigUsage,
     api_key_principal_id, generate_api_key, hash_api_key,
 };
-use rift_cluster::stores::FlowNet;
+use rift_cluster::stores::{FlowCounts, FlowNet};
 use rift_cluster::{ControlOp, ControlRequest, DEFAULT_AUDIT_BATCH_MAX_ROWS, RaftNode, TenantId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -526,32 +526,44 @@ struct TenantUsageView {
 }
 
 /// Fold one tenant's config usage and the fleet-wide flow-entry counts
-/// (already fetched for the union of every listed tenant's ports) into its
-/// [`TenantUsageView`].
+/// (already fetched for the union of every listed tenant's ports, and per
+/// listed tenant) into its [`TenantUsageView`].
+///
+/// `flowEntries` is the tenant's imposter-scoped flows (charged by port, over
+/// the ports it owns) plus its tenant-scoped flows (charged by tenant, #413).
+/// Fleet-scoped flows are in neither map, by design.
 ///
 /// `configs` has no row for a tenant holding no imposters, so `HashMap::get`
-/// answering `None` there is exactly what makes an empty tenant's `0`/`0`/`0`
-/// fall out of the ordinary path below rather than needing a special case.
+/// answering `None` there is exactly what makes an empty tenant's `0`/`0`
+/// fall out of the ordinary path below rather than needing a special case —
+/// its tenant-scoped flows are still charged, because a flow can outlive the
+/// imposter that wrote it (TTL) and it is still that tenant's state.
 fn usage_view(
     tenant: &TenantId,
     configs: &HashMap<String, TenantConfigUsage>,
-    flow_counts: &HashMap<u16, u64>,
+    flow_counts: &FlowCounts,
 ) -> TenantUsageView {
+    let tenant_scoped = flow_counts
+        .by_tenant
+        .get(tenant.as_str())
+        .copied()
+        .unwrap_or(0);
     let Some(config_usage) = configs.get(tenant.as_str()) else {
         return TenantUsageView {
             imposters: 0,
             stubs_per_imposter: 0,
-            flow_entries: 0,
+            flow_entries: tenant_scoped,
         };
     };
+    let per_port: u64 = config_usage
+        .ports
+        .iter()
+        .filter_map(|port| flow_counts.by_port.get(port))
+        .sum();
     TenantUsageView {
         imposters: config_usage.imposters,
         stubs_per_imposter: config_usage.max_stubs,
-        flow_entries: config_usage
-            .ports
-            .iter()
-            .filter_map(|port| flow_counts.get(port))
-            .sum(),
+        flow_entries: per_port.saturating_add(tenant_scoped),
     }
 }
 
@@ -866,8 +878,10 @@ pub(crate) async fn dispatch(
                 .collect::<BTreeSet<u16>>()
                 .into_iter()
                 .collect();
-            let (flow_counts, fan_out_partial) =
-                flow_net.fleet_entry_counts(&ports, FLOW_USAGE_BUDGET).await;
+            let tenant_ids: Vec<String> = tenants.iter().map(|t| t.id.to_string()).collect();
+            let (flow_counts, fan_out_partial) = flow_net
+                .fleet_usage_counts(&ports, &tenant_ids, FLOW_USAGE_BUDGET)
+                .await;
             // Two independent reasons this response cannot fully vouch for its
             // own usage figures, ORed rather than picked between: the fan-out
             // missing a peer, and a corrupt `sm_configs` row this node's own
@@ -901,8 +915,13 @@ pub(crate) async fn dispatch(
                         .get(tenant.as_str())
                         .map(|usage| usage.ports.clone())
                         .unwrap_or_default();
-                    let (flow_counts, fan_out_partial) =
-                        flow_net.fleet_entry_counts(&ports, FLOW_USAGE_BUDGET).await;
+                    let (flow_counts, fan_out_partial) = flow_net
+                        .fleet_usage_counts(
+                            &ports,
+                            std::slice::from_ref(&tenant.to_string()),
+                            FLOW_USAGE_BUDGET,
+                        )
+                        .await;
                     // Same OR as `TenantList` above: a corrupt config row for
                     // this one tenant is just as much a reason to mark the
                     // read partial as a peer the fan-out could not reach.
@@ -1552,9 +1571,9 @@ mod tests {
                 incomplete: false,
             },
         );
-        let mut flow_counts = HashMap::new();
-        flow_counts.insert(8001, 10);
-        flow_counts.insert(8002, 7);
+        let mut flow_counts = FlowCounts::default();
+        flow_counts.by_port.insert(8001, 10);
+        flow_counts.by_port.insert(8002, 7);
 
         let view = usage_view(&tenant("acme"), &configs, &flow_counts);
 
@@ -1579,11 +1598,13 @@ mod tests {
                 incomplete: false,
             },
         );
-        let mut flow_counts = HashMap::new();
-        flow_counts.insert(8001, 4);
+        let mut flow_counts = FlowCounts::default();
+        flow_counts.by_port.insert(8001, 4);
         // Another tenant's port, present in the fleet-wide map handed to
         // every tenant's fold — must not leak into `acme`'s total.
-        flow_counts.insert(8099, 999_999);
+        flow_counts.by_port.insert(8099, 999_999);
+        // Nor another tenant's tenant-scoped flows (#413).
+        flow_counts.by_tenant.insert("beta".to_owned(), 555);
 
         let view = usage_view(&tenant("acme"), &configs, &flow_counts);
 
@@ -1599,13 +1620,44 @@ mod tests {
     #[test]
     fn usage_view_with_no_config_row_reads_as_all_zeros() {
         let configs = HashMap::new();
-        let mut flow_counts = HashMap::new();
-        flow_counts.insert(8001, 42);
+        let mut flow_counts = FlowCounts::default();
+        flow_counts.by_port.insert(8001, 42);
 
         let view = usage_view(&tenant("acme"), &configs, &flow_counts);
 
         assert_eq!(view.imposters, 0);
         assert_eq!(view.stubs_per_imposter, 0);
         assert_eq!(view.flow_entries, 0);
+    }
+
+    /// Tenant-scoped flows are charged to their tenant on top of the per-port sum (#413) — and
+    /// they are charged even when the tenant currently holds no imposter, because a flow can
+    /// outlive the imposter that wrote it and it is still that tenant's state.
+    #[test]
+    fn usage_view_adds_the_tenants_own_tenant_scoped_flows() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "acme".to_owned(),
+            TenantConfigUsage {
+                imposters: 1,
+                max_stubs: 1,
+                ports: vec![8001],
+                incomplete: false,
+            },
+        );
+        let mut flow_counts = FlowCounts::default();
+        flow_counts.by_port.insert(8001, 4);
+        flow_counts.by_tenant.insert("acme".to_owned(), 6);
+        flow_counts.by_tenant.insert("beta".to_owned(), 100);
+
+        assert_eq!(
+            usage_view(&tenant("acme"), &configs, &flow_counts).flow_entries,
+            10
+        );
+        // No config row for beta, but its tenant-scoped flows are still its usage.
+        assert_eq!(
+            usage_view(&tenant("beta"), &configs, &flow_counts).flow_entries,
+            100
+        );
     }
 }

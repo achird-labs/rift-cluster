@@ -5620,12 +5620,14 @@ components:
             **Fleet-scoped flows are counted against no tenant.** A flow under
             `contextScope: "fleet"` is shared by construction, so charging it to
             every tenant would double-count it and charging it to one would be
-            arbitrary. Only imposter-scoped flows, on ports this tenant owns,
-            are counted here. Tenant-scoped flows (`contextScope: "tenant"`,
-            #288) are attributable — their key names the tenant — but the count
-            fan-out is keyed by port and does not yet include them (issue
-            #413); until it does, a tenant using `tenant` scope reads a floor
-            here.
+            arbitrary. Counted here: imposter-scoped flows, on ports this
+            tenant owns, plus tenant-scoped flows (`contextScope: "tenant"`,
+            #288) charged to this tenant by their key (#413) — the latter even
+            for a tenant that currently holds no imposter, since a flow can
+            outlive the imposter that wrote it and is still that tenant's
+            state. During a rolling upgrade a peer on a build before #413
+            answers only the per-port half, so the tenant-scoped share is a
+            floor until every node is upgraded.
 
 
             ⚠️ **`maxFlowEntries` currently enforces nothing.** Unlike the other

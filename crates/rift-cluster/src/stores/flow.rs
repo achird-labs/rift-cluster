@@ -285,6 +285,13 @@ struct SyncReply {
 #[derive(Debug, Serialize, Deserialize)]
 struct CountsReq {
     ports: Vec<u16>,
+    /// The tenants whose tenant-scoped (`t<tenant>:`, #288) flows the caller
+    /// wants counted (#413). `default` so a peer still on a build before this
+    /// field decodes the request; it then answers with no tenant slots, and the
+    /// tenant half of the fleet-wide sum is a floor for the length of that
+    /// rolling upgrade — the same shape any additive wire field has here.
+    #[serde(default)]
+    tenants: Vec<String>,
     /// The caller's own ring index, checked against the serving node's
     /// (RFC-001 §7.6's fencing token, reused here rather than invented
     /// afresh). A membership change can leave two nodes' rings disagreeing
@@ -302,6 +309,22 @@ struct CountsReply {
     /// reasoning: a JSON object's keys are strings, and a `u16` round-tripping
     /// through one is a decode failure waiting to happen.
     slots: Vec<(u16, u64)>,
+    /// `(tenant, this node's owned live-entry count under `t<tenant>:`)` (#413).
+    /// `default` for the same rolling-upgrade reason as [`CountsReq::tenants`]:
+    /// an older peer's reply has no such field and decodes as "no tenant
+    /// slots".
+    #[serde(default)]
+    tenant_slots: Vec<(String, u64)>,
+}
+
+/// What [`FlowNet::fleet_usage_counts`] answers: live entries charged per port
+/// (imposter-scoped flows, `i<port>:`) and per tenant (tenant-scoped flows,
+/// `t<tenant>:`, #288/#413). Fleet-scoped `f:` flows are in neither — shared by
+/// construction, so charging them anywhere would be arbitrary.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FlowCounts {
+    pub by_port: HashMap<u16, u64>,
+    pub by_tenant: HashMap<String, u64>,
 }
 
 /// `POST /_cluster/flow/spaces` — this node's OWNED spaces under `prefix` (#374): the per-row
@@ -1125,43 +1148,62 @@ impl FlowNet {
             .map_err(|e| anyhow::anyhow!("flow store: {e}"))
     }
 
-    /// This node's OWNED share of `numberOfFlowEntries` for `ports` (#372): the
-    /// live entry count of every imposter-scoped flow this node currently owns.
+    /// This node's OWNED share of `numberOfFlowEntries` (#372): the live entry
+    /// count of every flow this node currently owns, charged per port for the
+    /// imposter-scoped ones (`i<port>:`) whose port is in `ports` and per tenant
+    /// for the tenant-scoped ones (`t<tenant>:`, #288/#413) whose tenant is in
+    /// `tenants` — one pass over the shard for both, because a tenant listing
+    /// asks for both at once and `entries_by_flow` is the whole shard.
     ///
     /// Filtered to the **owner** only, never every holder of a copy: a flow keeps
     /// [`REPLICAS`] copies for durability, so a raw per-node sum (this node's plus
     /// every peer's) would count each entry up to [`REPLICAS`] times. Restricting
-    /// to the owner makes the fleet-wide sum in [`Self::fleet_entry_counts`]
+    /// to the owner makes the fleet-wide sum in [`Self::fleet_usage_counts`]
     /// exactly the union of live entries, with no coordination beyond the ring
     /// every node already agrees on.
     ///
-    /// Fleet-scoped (`f:`) flows never match [`imposter_port`]'s `i{port}:`
-    /// prefix, so they contribute to no port's count — they are shared by
-    /// construction, and charging them to any one imposter would be arbitrary.
-    /// Tenant-scoped (`t<tenant>:`, #288) flows do not match it either: they
-    /// are attributable to their tenant, but not to a port, and this count is
-    /// per port — charging them to their tenant is issue #413.
-    fn owned_port_counts(&self, node: &RaftNode, ring: &Ring, ports: &[u16]) -> HashMap<u16, u64> {
-        let wanted: HashSet<u16> = ports.iter().copied().collect();
-        // Seeded with every requested port at `0`, not only the ones this node
-        // happens to own something for: `fleet_entry_counts` folds a peer's reply
-        // into this map by key, and a port absent here would silently drop that
-        // peer's count instead of adding to zero.
-        let mut totals: HashMap<u16, u64> = ports.iter().map(|&port| (port, 0)).collect();
+    /// Fleet-scoped (`f:`) flows match neither [`imposter_port`] nor [`tenant_of`],
+    /// so they contribute to nothing — they are shared by construction, and
+    /// charging them to any one imposter or tenant would be arbitrary. The
+    /// unresolved placeholders (`i?:`, `t??:`) name nothing to charge either.
+    fn owned_counts(
+        &self,
+        node: &RaftNode,
+        ring: &Ring,
+        ports: &[u16],
+        tenants: &[String],
+    ) -> FlowCounts {
+        let wanted_ports: HashSet<u16> = ports.iter().copied().collect();
+        let wanted_tenants: HashSet<&str> = tenants.iter().map(String::as_str).collect();
+        // Seeded with every requested key at `0`, not only the ones this node
+        // happens to own something for: `fleet_usage_counts` folds a peer's
+        // reply into these maps by key, and a key absent here would silently
+        // drop that peer's count instead of adding to zero.
+        let mut counts = FlowCounts {
+            by_port: ports.iter().map(|&port| (port, 0)).collect(),
+            by_tenant: tenants.iter().map(|t| (t.clone(), 0)).collect(),
+        };
         for (flow_id, count) in self.shard.entries_by_flow() {
-            let Some(port) = imposter_port(&flow_id) else {
-                continue;
+            let charge_port = imposter_port(&flow_id).filter(|port| wanted_ports.contains(port));
+            let charge_tenant = if charge_port.is_none() {
+                tenant_of(&flow_id).filter(|tenant| wanted_tenants.contains(tenant))
+            } else {
+                None
             };
-            if !wanted.contains(&port) {
+            if charge_port.is_none() && charge_tenant.is_none() {
                 continue;
             }
             let owned = OwnedKey::new(KeyClass::FlowKv, &flow_id);
             if ring.owner(owned) != Some(node.id()) {
                 continue;
             }
-            *totals.entry(port).or_insert(0) += count as u64;
+            if let Some(port) = charge_port {
+                *counts.by_port.entry(port).or_insert(0) += count as u64;
+            } else if let Some(tenant) = charge_tenant {
+                *counts.by_tenant.entry(tenant.to_owned()).or_insert(0) += count as u64;
+            }
         }
-        totals
+        counts
     }
 
     /// `numberOfFlowEntries` for a batch of ports (#372): this node's own owned
@@ -1188,23 +1230,40 @@ impl FlowNet {
         ports: &[u16],
         budget: Duration,
     ) -> (HashMap<u16, u64>, bool) {
-        // Nothing to fan out for: a tenant with no imposters has a locally
-        // computable (empty) answer, and asking every peer anyway would stamp
-        // `partial: true` on a `0/0/0` body the instant any one of them
-        // failed to answer in time — for no reason, since there is nothing
-        // for their answers to add.
-        if ports.is_empty() {
-            return (HashMap::new(), false);
+        let (counts, partial) = self.fleet_usage_counts(ports, &[], budget).await;
+        (counts.by_port, partial)
+    }
+
+    /// [`Self::fleet_entry_counts`], plus the tenant-scoped flows of `tenants`
+    /// charged per tenant (#413) — one fan-out for both, because a tenant listing
+    /// needs both and every peer's answer is one shard scan either way. Same
+    /// `partial` contract. A peer still on a build before the tenant half
+    /// answers only the port half; the tenant sum is then a floor for the length
+    /// of that rolling upgrade, which is the shape any additive wire field has.
+    #[must_use]
+    pub async fn fleet_usage_counts(
+        self: &Arc<Self>,
+        ports: &[u16],
+        tenants: &[String],
+        budget: Duration,
+    ) -> (FlowCounts, bool) {
+        // Nothing to fan out for: a tenant with no imposters and no
+        // tenant-scoped flows to ask about has a locally computable (empty)
+        // answer, and asking every peer anyway would stamp `partial: true` on
+        // a `0/0/0` body the instant any one of them failed to answer in time
+        // — for no reason, since there is nothing for their answers to add.
+        if ports.is_empty() && tenants.is_empty() {
+            return (FlowCounts::default(), false);
         }
 
         let (node, ring) = match self.view() {
             Ok(view) => view,
             Err(reason) => {
                 tracing::warn!(error = %reason, "flow entry counts: cluster view unavailable");
-                return (HashMap::new(), true);
+                return (FlowCounts::default(), true);
             }
         };
-        let mut totals = self.owned_port_counts(&node, &ring, ports);
+        let mut totals = self.owned_counts(&node, &ring, ports, tenants);
 
         let peers: Vec<NodeId> = ring
             .members()
@@ -1221,10 +1280,12 @@ impl FlowNet {
         for peer in peers.iter().copied() {
             let node = Arc::clone(&node);
             let req_ports = ports.to_vec();
+            let req_tenants = tenants.to_vec();
             set.spawn(async move {
                 let outcome = async {
                     let body = serde_json::to_vec(&CountsReq {
                         ports: req_ports,
+                        tenants: req_tenants,
                         m_idx: caller_m_idx,
                     })
                     .map_err(|e| e.to_string())?;
@@ -1246,7 +1307,8 @@ impl FlowNet {
                 match joined {
                     Ok((peer, Ok(reply))) => {
                         answered.insert(peer);
-                        merge_peer_counts(&mut totals, &reply.slots);
+                        merge_peer_counts(&mut totals.by_port, &reply.slots);
+                        merge_peer_counts(&mut totals.by_tenant, &reply.tenant_slots);
                     }
                     Ok((peer, Err(e))) => {
                         answered.insert(peer);
@@ -1394,13 +1456,28 @@ impl FlowNet {
 /// `fleet_entry_counts`'s "nothing to fan out for" guard, which means `totals` only ever holds the
 /// caller's requested ports) and is skipped rather than inserted — growing the map to a port
 /// nobody requested would put a key the caller cannot use into the response. `saturating_add`
-/// matches the totals' own construction in `owned_port_counts`.
-fn merge_peer_counts(totals: &mut HashMap<u16, u64>, peer_slots: &[(u16, u64)]) {
-    for &(port, count) in peer_slots {
-        if let Some(total) = totals.get_mut(&port) {
-            *total = total.saturating_add(count);
+/// matches the totals' own construction in `owned_counts`.
+fn merge_peer_counts<K: std::hash::Hash + Eq>(
+    totals: &mut HashMap<K, u64>,
+    peer_slots: &[(K, u64)],
+) {
+    for (key, count) in peer_slots {
+        if let Some(total) = totals.get_mut(key) {
+            *total = total.saturating_add(*count);
         }
     }
+}
+
+/// The tenant a tenant-scoped flow id belongs to (`t<tenant>:` → `<tenant>`,
+/// #288), or `None` for every other namespace and for the unresolved `t??:`
+/// placeholder — which names no real tenant to charge, so its entries are
+/// charged to nobody, exactly like `i?:`'s (#413).
+fn tenant_of(scoped_flow_id: &str) -> Option<&str> {
+    scoped_flow_id
+        .strip_prefix('t')
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(tenant, _)| tenant)
+        .filter(|tenant| !tenant.is_empty() && !tenant.starts_with('?'))
 }
 
 /// The imposter port a scoped flow id belongs to, or `None` for a fleet-scoped
@@ -1595,7 +1672,7 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
                     // count that looks like a real one is worse than the asker
                     // marking this peer's contribution `partial`.
                     let (node, ring) = net.view().map_err(RpcError::Handler)?;
-                    // The caller computed `owned_port_counts` decisions under
+                    // The caller computed `owned_counts` decisions under
                     // its own ring; answering under a *different* one here is
                     // exactly how a flow gets claimed by two nodes (both
                     // think they own it) or by none (both think the other
@@ -1611,14 +1688,27 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
                             ring.m_idx()
                         )));
                     }
-                    let totals = net.owned_port_counts(&node, &ring, &req.ports);
+                    let totals = net.owned_counts(&node, &ring, &req.ports, &req.tenants);
                     let slots = req
                         .ports
                         .iter()
-                        .map(|&port| (port, totals.get(&port).copied().unwrap_or(0)))
+                        .map(|&port| (port, totals.by_port.get(&port).copied().unwrap_or(0)))
                         .collect();
-                    serde_json::to_vec(&CountsReply { slots })
-                        .map_err(|e| RpcError::Handler(e.to_string()))
+                    let tenant_slots = req
+                        .tenants
+                        .iter()
+                        .map(|tenant| {
+                            (
+                                tenant.clone(),
+                                totals.by_tenant.get(tenant).copied().unwrap_or(0),
+                            )
+                        })
+                        .collect();
+                    serde_json::to_vec(&CountsReply {
+                        slots,
+                        tenant_slots,
+                    })
+                    .map_err(|e| RpcError::Handler(e.to_string()))
                 })
             }),
         )
@@ -2006,6 +2096,39 @@ mod tests {
         assert_eq!(imposter_port("i?:cart"), None);
     }
 
+    /// `tenant_of` charges only `t<tenant>:` ids, and never the unresolved placeholder (#413).
+    #[test]
+    fn tenant_of_charges_only_the_tenant_namespace() {
+        assert_eq!(tenant_of("tacme:cart"), Some("acme"));
+        assert_eq!(tenant_of("tdefault:x"), Some("default"));
+        assert_eq!(
+            tenant_of("t??:cart"),
+            None,
+            "the placeholder names no tenant"
+        );
+        assert_eq!(tenant_of("t?:cart"), None);
+        assert_eq!(tenant_of("t:cart"), None, "an empty tenant is not a tenant");
+        assert_eq!(tenant_of("i6400:cart"), None);
+        assert_eq!(tenant_of("f:cart"), None);
+        assert_eq!(tenant_of("tacme"), None, "no `:` — not a scoped id at all");
+    }
+
+    /// The peer fold works for the tenant half exactly as for ports (#413): a mentioned tenant is
+    /// added to, an unmentioned one is left alone, an unrequested one is ignored.
+    #[test]
+    fn a_peers_tenant_counts_fold_like_its_port_counts() {
+        let mut totals: HashMap<String, u64> =
+            HashMap::from([("acme".to_owned(), 5), ("beta".to_owned(), 0)]);
+        merge_peer_counts(
+            &mut totals,
+            &[("acme".to_owned(), 3), ("gamma".to_owned(), 9)],
+        );
+        assert_eq!(
+            totals,
+            HashMap::from([("acme".to_owned(), 8), ("beta".to_owned(), 0)])
+        );
+    }
+
     // -- issue #401: `merge_peer_counts` (the `fleet_entry_counts` peer fold) -
 
     /// A peer answering with real counts is added, per port, to the running totals — the mutation
@@ -2042,7 +2165,7 @@ mod tests {
         assert_eq!(totals, HashMap::from([(8001, 8)]));
     }
 
-    /// The merge saturates rather than overflows, matching `owned_port_counts`'s own arithmetic.
+    /// The merge saturates rather than overflows, matching `owned_counts`'s own arithmetic.
     #[test]
     fn the_merge_saturates_instead_of_overflowing() {
         let mut totals: HashMap<u16, u64> = HashMap::from([(8001, u64::MAX - 1)]);
