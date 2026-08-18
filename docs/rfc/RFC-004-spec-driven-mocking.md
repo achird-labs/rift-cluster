@@ -536,6 +536,20 @@ justifiable to an OSS maintainer. U-14 remains free.
 
 ### U-13 — exchange inspector (`rift-mock-core::extensions`)
 
+> **As shipped (#281).** Filed upstream as achird-labs/rift#966 and landed by
+> rift#967 as `rift_mock_core::extensions::exchange_inspector`, re-exported
+> under `rift_cluster_base::seams`. Two deviations from the sketch below, both
+> in the direction of the code the hooks sit in: `InspectRequest::headers` is
+> `&hyper::HeaderMap` (every value, zero-copy — the same map matching sees)
+> rather than a `HashMap<String, Vec<String>>`, and the response-side hook
+> lives in `handle_imposter_request` — the funnel the serve loop, the
+> `/__rift/` gateway and an in-process dispatch all share — rather than only
+> the decorated serve-loop wrapper, so every path that produces a response is
+> inspected before the decorator. The request-side hook runs after journaling
+> and before matching exactly as below; a request the hook rejects is not
+> offered to the response-side hook. Nothing consumes the seam yet: S6 (#282)
+> installs the enterprise inspector.
+
 ```rust
 /// What the request-side hook sees: the already-collected request, borrowed.
 pub struct InspectRequest<'a> {

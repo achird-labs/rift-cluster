@@ -63,6 +63,18 @@ pub mod seams {
         NoMatchContext, NoMatchDirective, NoMatchInterceptor,
     };
 
+    /// The exchange inspector (U-13, upstream #966; RFC-004 §6): a synchronous
+    /// per-imposter hook pair that sees a request after journaling and before
+    /// matching, and the response before it is written, and may replace either.
+    /// Installed per imposter through `ImposterManager::with_exchange_inspector_provider`,
+    /// the `FlowStoreProvider` shape. What spec enforcement (RFC-004 §3.6, S6)
+    /// and full-fidelity traffic observation hang on; nothing here consumes it
+    /// yet.
+    pub use rift_mock_core::extensions::exchange_inspector::{
+        ExchangeInspector, ExchangeInspectorProvider, InspectRequest, InspectResponse,
+        InspectVerdict,
+    };
+
     /// Incremental config reconciliation: the per-port / per-stub apply path
     /// that replaces reset-the-world reload, plus the change-event hook, the
     /// attribution that rides with it, and the stable stub identity both sides
@@ -295,6 +307,11 @@ mod tests {
         assert_object_safe::<dyn AdminAuthorizer>();
         assert_object_safe::<dyn ResponseDecorator>();
         assert_object_safe::<dyn NoMatchInterceptor>();
+        assert_object_safe::<dyn ExchangeInspector>();
+        assert_object_safe::<dyn ExchangeInspectorProvider>();
+        _named::<InspectRequest<'_>>();
+        _named::<InspectResponse<'_>>();
+        let _ = InspectVerdict::Proceed;
 
         // Built-in implementations the `--cluster`-off path keeps using.
         let _: fn() -> LocalSequencer = LocalSequencer::default;
