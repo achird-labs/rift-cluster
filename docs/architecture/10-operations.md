@@ -23,6 +23,17 @@ rift-cluster-server \
   --cluster-leave-timeout 10s
 ```
 
+One subcommand is not a server at all:
+
+```
+rift-cluster-server mcp --url https://fleet.example:2525 --api-key-file ~/.rift/agent.key
+```
+
+`mcp` runs a Model Context Protocol server over stdio for coding agents. It is a
+**client** of the admin API named by `--url` — it binds no port, joins no ring,
+and holds no state, so it is not a node and does not appear in any topology.
+Full reference in `docs/rift-cluster-server.md`.
+
 Guard rails enforced at startup: `--cluster` with `--runtime per-core` is
 rejected (the sync bridge assumes a work-stealing data plane — D-14);
 `--cluster` with intercept mode is rejected (out of scope); no secret and no

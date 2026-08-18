@@ -19,6 +19,8 @@
 //!   cluster port.
 //! * `tenancy` — RFC-002 §5's `/admin/tenants*` and `/admin/whoami` surface,
 //!   terminated by [`admin_front`].
+//! * [`mcp`] — the `mcp` subcommand: an MCP server over stdio that is a *client*
+//!   of a remote admin front, holding no node state of its own.
 
 pub mod admin_front;
 pub mod authorizer;
@@ -32,6 +34,7 @@ pub mod compose;
 #[cfg(feature = "console")]
 mod console;
 pub mod fleet;
+pub mod mcp;
 pub mod openapi;
 pub mod principal;
 pub mod probes;

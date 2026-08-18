@@ -373,6 +373,40 @@ pinned in the slice-M1 PR). stdio transport only in v1: it is what every
 coding agent launches today, it inherits the parent process's environment for
 credential delivery, and it opens no listening port to threat-model.
 
+> **As shipped (#292, slice MCP-A).** The subcommand, the stdio transport, the
+> credential model and the eight v1 read tools landed as specified. Three
+> statements above were **wrong about the tree at the time of writing**, and were
+> corrected in the implementing PR rather than worked around:
+>
+> 1. **`EeCli` is not "a flat clap parser", and the cited `cli.rs:165-173` no
+>    longer describes it.** `EeCli` `#[command(flatten)]`s the upstream `OssCli`,
+>    which already declares `#[command(subcommand)] pub command: Option<Commands>`
+>    (`vendor/rift/crates/rift-http-proxy/src/server.rs:49`). clap permits one
+>    subcommand slot per command and the derive macro has spent it, so "an
+>    optional subcommand is purely additive" is false — a second
+>    `#[command(subcommand)]` field does not compile. `mcp` is therefore
+>    registered on the **clap builder** (`EeCli::command().subcommand(…)`), which
+>    keeps the change enterprise-local and still puts `mcp` in `--help`. Adding an
+>    `Mcp` variant to upstream's `Commands` was rejected: it would make an
+>    EE-only feature a cross-repo change and place it in the open-source enum.
+>
+> 2. **`requests_query` does not hardcode `"scope": "node"`.** That instruction
+>    was written while #223/#225/#229 were open; all three have since shipped, and
+>    `GET /imposters/{port}/requests` now merges across the fleet *unless* a
+>    `match` predicate is supplied, in which case it proxies to the local engine.
+>    The tool reports `"fleet"` or `"node"` accordingly, plus the
+>    `Rift-Cluster-Partial` marker when a merge was incomplete. The instruction's
+>    intent — never let an agent mistake a node read for a fleet read — is what
+>    survived; a hardcoded `"node"` would now break it in the other direction.
+>
+> 3. **`verify` wraps `POST /imposters/{port}/verify`.** §8.2 below describes it
+>    as "assertions over the same read", which reads as client-side evaluation.
+>    That endpoint exists and its own contract gives the reason to prefer it: an
+>    SDK's `verify(match, times(n))` "defers to the engine's own matcher instead
+>    of shipping the whole journal over the wire and re-evaluating predicates
+>    client-side". Re-implementing matching in the MCP process would ship a second
+>    matcher free to disagree with the engine's.
+
 ### 8.2 Tools
 
 Tool input schemas derive from the §5.1 OpenAPI document — the MCP surface is

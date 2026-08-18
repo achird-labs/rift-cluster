@@ -38,6 +38,18 @@ rift-cluster = { path = "../rift-cluster" }
 rift-cluster-spec = { path = "../rift-cluster-spec" }
 
 clap = { version = "4.5", features = ["derive", "env"] }
+# A real dependency again, for a different reason than last time. #335 promoted
+# `reqwest` here so the try endpoint could dial a loopback imposter; #344 answered
+# the try in-process instead and returned it to dev-only. The `mcp` subcommand
+# (#292) now needs a client in the *shipped* binary — it is nothing but an HTTP
+# client of a remote admin front — so it comes back, `workspace` as before: the
+# workspace pins exactly one `reqwest` configuration, and `rustls-tls` from that
+# pin is what lets the MCP server reach an `https` fleet at all.
+reqwest.workspace = true
+# The MCP server (#292). Pinned in the workspace manifest with `transport-io`
+# (stdio) as the only transport, so this process never opens a listening port.
+rmcp.workspace = true
+schemars.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
@@ -75,18 +87,20 @@ rust-embed = { workspace = true, optional = true }
 [dev-dependencies]
 tokio.workspace = true
 tempfile = "3"
+# The MCP *client* half, so `tests/mcp_session.rs` can drive a real protocol
+# session against the server this crate ships (#292's M1 exit criterion). Dev-only
+# on purpose: the binary enables `server` + stdio alone, so shipping this feature
+# would add a capability the subcommand has no use for.
+rmcp = { workspace = true, features = ["client"] }
 # Enumerates `Terminated`'s variants so the route-parity gate can prove its representative list
 # covers every one (issue #184). Dev-only: the derives are `cfg_attr(test, ...)`, so nothing here
 # reaches the shipped binary.
 strum.workspace = true
-# `reqwest` drives the composed admin API / probe listeners over real HTTP in
-# tests, the way an operator, a load balancer and the upstream integration
-# suites all do. It was a real dependency between #335 and #344, when the try
-# endpoint dialled a loopback imposter as a client; since #344 the try is
-# answered in-process over an in-memory hyper connection, so nothing in the
-# shipped binary needs a client (or `rustls-tls`) any more and it is dev-only
-# again. Still `workspace`, so the tests use the one pinned configuration.
-reqwest.workspace = true
+# `reqwest` also drives the composed admin API / probe listeners over real HTTP
+# in tests, the way an operator, a load balancer and the upstream integration
+# suites all do. It is not named here: #344 made it dev-only when the try
+# endpoint stopped dialling a socket, and #292 made it a real dependency again
+# for the MCP client, so `[dependencies]` above already covers the tests.
 # Reads `rift_cluster_no_principals` straight off the global registry
 # `rift_cluster::metrics` registers into — the same technique that crate's own
 # tests use, and the reason the workspace pins one `prometheus` version.

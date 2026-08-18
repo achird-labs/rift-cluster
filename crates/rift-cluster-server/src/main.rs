@@ -5,18 +5,27 @@
 //! the crypto provider and tracing, resolve the runtime topology, then compose
 //! and serve.
 
-use clap::Parser;
 use rift_cluster_base::rift_http_proxy::{healthcheck, runtime, script_cli};
 use rift_cluster_base::seams::Commands;
 use rift_cluster_server::bootstrap;
 use rift_cluster_server::cli::EeCli;
 use rift_cluster_server::compose;
+use rift_cluster_server::mcp;
 use rift_cluster_server::probes;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
 
 fn main() -> anyhow::Result<()> {
-    let mut cli = EeCli::parse();
+    // `mcp` is resolved here, ahead of everything, for the same reason `script` and
+    // `healthcheck` are short-circuited below: it is a self-contained program that
+    // wants only its own exit code. It is a *client* of a remote admin front — it
+    // binds nothing, writes no PID file, and must not pay for (or perturb) a server
+    // bootstrap. See `mcp`'s module docs for why the subcommand is registered on the
+    // clap builder rather than derived.
+    let mut cli = match mcp::parse() {
+        mcp::Invocation::Mcp(args) => return run_mcp(*args),
+        mcp::Invocation::Server(cli) => *cli,
+    };
 
     // Both of these must run before any bootstrap: they are self-contained
     // programs that want only their own exit code, and neither should pay for
@@ -89,6 +98,40 @@ fn main() -> anyhow::Result<()> {
     );
 
     run(cli)
+}
+
+/// Serve MCP over stdio.
+///
+/// A small current-thread runtime on purpose: this process is an HTTP client
+/// driving one stdio pipe, so a multi-threaded pool would be threads doing
+/// nothing. It also never reaches `runtime::RuntimeTopology` — the per-core
+/// machinery below exists for the data plane, and there is no data plane here.
+fn run_mcp(args: mcp::McpArgs) -> anyhow::Result<()> {
+    // Tracing goes to **stderr**: stdout is the MCP transport, and a single log
+    // line written there corrupts the protocol stream.
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                // Default to `info` rather than the empty filter `from_default_env`
+                // yields when `RUST_LOG` is unset — otherwise the MCP server logs
+                // nothing at all, while the server path below defaults to info.
+                .with_filter(
+                    EnvFilter::builder()
+                        .with_default_directive(
+                            tracing_subscriber::filter::LevelFilter::INFO.into(),
+                        )
+                        .from_env_lossy(),
+                ),
+        )
+        .init();
+
+    rift_cluster_base::rift_http_proxy::install_default_crypto_provider();
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(mcp::run(args))
 }
 
 fn run(cli: EeCli) -> anyhow::Result<()> {
