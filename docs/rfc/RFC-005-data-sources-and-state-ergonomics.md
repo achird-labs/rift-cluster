@@ -189,6 +189,27 @@ refused with a 400 naming the row and value — never accepted-but-broken.
 
 ### 3.2 Distribution — the bytes ride the log
 
+> **As shipped (#285, D1).** `DatasetPut { tenant, record, csv }` /
+> `DatasetDelete { tenant, name }`; `sm_datasets (tenant, name, version)` and
+> `sm_dataset_blobs digest → csv` (referenced-by-scan, like `sm_spec_blobs`);
+> the spool file `<data-dir>/datasets/<digest>.csv` is written before the
+> record row and removed after the transaction that dropped the last live
+> reference commits; `reconcile_engine` repairs a missing file at startup and
+> never deletes. Validation runs in `control::validate` (so on every replica,
+> not only the leader) and mirrors the engine's tokenizer; the quotas
+> `maxDatasets` / `maxDatasetBytes` / `maxDatasetTotalBytes` are enforced at
+> apply like the imposter quotas. "Delete while bound answers 409" is, in D1, a
+> committed `Failed` refusal at apply (the `409` shape arrives with D3's route),
+> and the guard fails closed: an unreadable stored config refuses the delete.
+> `version` and `created_at` are assigned at
+> apply from log order and the replicated clock, not sent by the client, so the
+> op's record is the declared-and-verifiable half of §3.1's struct only.
+> **§11's "openraft/redb are comfortable with quota-ceiling log entries" is
+> answered, and the answer is no** (#411): openraft 0.9 bounds AppendEntries by
+> `heartbeat_interval` (50 ms), so an entry above roughly 512 KiB does not
+> commit today. The 8 MiB restart test ships `#[ignore]`d against #411; the
+> restart/repair proof runs at 128 KiB.
+
 **Decision: dataset bytes are committed through the Raft log and materialized
 to a per-node spool file at apply time.** No blob sidecar, no fetch protocol,
 no gossip.
@@ -648,7 +669,7 @@ Slices sized ~1 PR each; cluster proofs follow the C-numbered `test(cluster)` co
 
 | Slice | Contents | Exit criteria |
 |---|---|---|
-| **D1** `feat(data): dataset artifacts on the control plane` | `ControlOp::DatasetPut/Delete`, SM tables, leader validation (CSV shape, key uniqueness, quotas), spool materialization, refcounted blob GC | `test(cluster)`: a dataset uploaded on node A is byte-identical on every node's spool before the write's 2xx; survives full-cluster restart; delete while bound answers 409 |
+| **D1** `feat(data): dataset artifacts on the control plane` — **shipped (#285)** | `ControlOp::DatasetPut/Delete`, SM tables, leader validation (CSV shape, key uniqueness, quotas), spool materialization, refcounted blob GC | `test(cluster)`: a dataset uploaded on node A is byte-identical on every node's spool before the write's 2xx; survives full-cluster restart; delete while bound answers 409 |
 | **D2** `feat(data): stub binding compiles to the lookup behavior` | `_rift.dataset` block, admission resolution + pinning, apply-time compile-down, determinism validation | Bound stub serves the correct row on every node; same key ⇒ same row across 100 runs; binding an absent dataset/column refused with 400 naming it; literal-`{{ }}`-in-CSV pin (§8.6) |
 | **D3** `feat(data): dataset admin surface + RBAC + audit` | §5 dataset routes, `DatasetPut/Read/Delete` actions, content-read audit exception | Viewer lists but cannot upload; cross-tenant probe 404s; content read appears in the audit stream |
 | **S1** `feat(state): context scoping` | `ContextScope` on the clustered store, `contextScope` knob + validation, `fleet` gated `FleetAdmin` | `test(cluster)`: two imposters, same header value, isolated keys under `--cluster` (the G5 parity proof); `tenant` scope shares within, never across, tenants |

@@ -3000,3 +3000,294 @@ async fn voter_count_sizes_the_journal_shard() {
 
     cluster.shutdown_all().await;
 }
+
+// -- datasets on the control plane (RFC-005 D1, issue #285) --------------------------------------
+
+fn dataset_digest_hex(csv: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(csv.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// A truthful `DatasetPut` for `csv`, keyed on its first column, under the default tenant.
+fn dataset_put(name: &str, csv: &str) -> ControlRequest {
+    let mut lines = csv.lines();
+    let columns: Vec<String> = lines
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .map(|c| c.trim().to_owned())
+        .collect();
+    let rows = lines.count() as u64;
+    ControlRequest {
+        op_id: uuid::Uuid::new_v4(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: rift_cluster::ControlOp::DatasetPut {
+            tenant: rift_cluster::TenantId::default(),
+            record: rift_cluster::control::DatasetRecord {
+                name: name.to_owned(),
+                digest: rift_cluster::control::Digest::new(dataset_digest_hex(csv)),
+                key_columns: vec![columns[0].clone()],
+                delimiter: ',',
+                columns,
+                rows,
+                bytes: csv.len() as u64,
+            },
+            csv: csv.to_owned(),
+        },
+    }
+}
+
+fn spool_file(dir: &Path, csv: &str) -> std::path::PathBuf {
+    dir.join("datasets")
+        .join(format!("{}.csv", dataset_digest_hex(csv)))
+}
+
+/// A CSV of at least `bytes` bytes with a unique first column — the quota-ceiling payload the
+/// RFC §11 check wants openraft/redb exercised at.
+fn big_csv(bytes: usize) -> String {
+    let mut csv = String::from("id,payload\n");
+    let mut i = 0u64;
+    while csv.len() < bytes {
+        csv.push_str(&format!("{i},{}\n", "x".repeat(1_000)));
+        i += 1;
+    }
+    csv
+}
+
+/// Issue #285: the bytes ride the log, so once the leader's write barrier has answered, every
+/// member holds the spool file — byte-identical to the upload — with no fetch and no readiness
+/// handshake. This is the fleet-level "on disk before the 2xx" the front's barrier will surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dataset_upload_is_byte_identical_on_every_node_before_the_write_returns() {
+    let _serial = TEST_LOCK.lock().await;
+    let cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let csv = "id,name,tier\n1,ada,gold\n2,bob,silver\n";
+
+    let leader = cluster.leader().expect("leader");
+    let response = leader
+        .submit(dataset_put("customers", csv))
+        .await
+        .expect("the put commits");
+    assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
+    let unapplied = leader
+        .await_applied(response.revision, CONVERGE_DEADLINE)
+        .await;
+    assert!(
+        unapplied.is_empty(),
+        "the barrier must reach every member: {unapplied:?}"
+    );
+
+    for member in &cluster.members {
+        let path = spool_file(member.dir.path(), csv);
+        let on_disk = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("node {} has no spool file at {path:?}: {e}", member.id));
+        assert_eq!(
+            on_disk,
+            csv.as_bytes(),
+            "node {} holds different bytes",
+            member.id
+        );
+        let node = member.node.as_ref().expect("live");
+        let record = node
+            .dataset(DEFAULT_TENANT, "customers")
+            .expect("read")
+            .expect("every node lists the dataset");
+        assert_eq!(record.version, 1);
+        assert_eq!(record.digest, dataset_digest_hex(csv));
+        assert_eq!(
+            node.spool_path(&record.digest),
+            Some(path),
+            "the node names the file it holds"
+        );
+        let listed = node.datasets(DEFAULT_TENANT).expect("list");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|d| (d.name.as_str(), d.version))
+                .collect::<Vec<_>>(),
+            [("customers", 1)],
+            "node {} lists exactly the one dataset",
+            member.id
+        );
+    }
+
+    let mut cluster = cluster;
+    cluster.shutdown_all().await;
+}
+
+/// Issue #285: an upload commits, converges, and survives every node going down and coming
+/// back. One member also loses its spool directory while down, and gets the file back from its
+/// own state machine on restart — never from a peer. Parameterised on the payload size because of
+/// #411 (see the two callers below).
+async fn dataset_survives_a_full_cluster_restart_and_a_lost_spool(bytes: usize) {
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let csv = big_csv(bytes);
+
+    let leader = cluster.leader().expect("leader");
+    let response = leader
+        .submit(dataset_put("big", &csv))
+        .await
+        .expect("the entry commits");
+    assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
+    let unapplied = leader
+        .await_applied(response.revision, Duration::from_secs(30))
+        .await;
+    assert!(unapplied.is_empty(), "{unapplied:?}");
+    for member in &cluster.members {
+        assert_eq!(
+            std::fs::read(spool_file(member.dir.path(), &csv))
+                .expect("spool file")
+                .len(),
+            csv.len(),
+            "node {} spool",
+            member.id
+        );
+    }
+
+    let ids: Vec<NodeId> = cluster.members.iter().map(|m| m.id).collect();
+    let victim = ids[ids.len() - 1];
+    cluster.shutdown_all().await;
+    // A node that lost its derived state: only the spool directory, never the state machine.
+    std::fs::remove_dir_all(cluster.member(victim).dir.path().join("datasets"))
+        .expect("wipe the victim's spool dir");
+    for id in &ids {
+        cluster.restart(*id).await;
+    }
+    assert!(
+        cluster.wait_for_leader(LEADER_DEADLINE).await.is_some(),
+        "no leader after the cold restart"
+    );
+    // Startup repair runs from `reconcile_engine`, which the composed server calls on start; the
+    // in-process harness has no composition, so call it the way `compose` does.
+    for member in &cluster.members {
+        member
+            .node
+            .as_ref()
+            .expect("live")
+            .reconcile_engine()
+            .await
+            .expect("reconcile");
+    }
+    for member in &cluster.members {
+        let on_disk = std::fs::read(spool_file(member.dir.path(), &csv)).unwrap_or_else(|e| {
+            panic!(
+                "node {} lost its spool file across the restart: {e}",
+                member.id
+            )
+        });
+        assert_eq!(on_disk.len(), csv.len(), "node {}", member.id);
+        assert_eq!(
+            on_disk[..64],
+            csv.as_bytes()[..64],
+            "node {} bytes differ",
+            member.id
+        );
+        let record = member
+            .node
+            .as_ref()
+            .expect("live")
+            .dataset(DEFAULT_TENANT, "big")
+            .expect("read")
+            .expect("the record survived");
+        assert_eq!(record.bytes, csv.len() as u64);
+    }
+    cluster.shutdown_all().await;
+}
+
+/// The restart + lost-spool proof at a size the fleet commits today (128 KiB): well under the
+/// ~50 ms AppendEntries budget openraft grants a single replication round trip (#411).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
+    let _serial = TEST_LOCK.lock().await;
+    dataset_survives_a_full_cluster_restart_and_a_lost_spool(128 * 1024).await;
+}
+
+/// RFC-005 §11's check: an upload at the per-dataset ceiling (8 MiB) is one log entry, and the
+/// fleet must be comfortable with it. **It is not, yet** — openraft 0.9 bounds every AppendEntries
+/// RPC by `heartbeat_interval` (50 ms here), so an entry that cannot replicate and fsync within
+/// one round trip is retried forever and never commits; ≥1 MiB reproducibly fails, ~512 KiB
+/// takes minutes. Ignored, not deleted: it is the acceptance test for issue #411, and it must
+/// pass unchanged (run the ignored tests) before the 8 MiB default ceiling means anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "blocked on #411: an 8 MiB log entry cannot replicate within openraft's 50 ms AppendEntries timeout"]
+async fn an_eight_mebibyte_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
+    let _serial = TEST_LOCK.lock().await;
+    let bytes = 8 * 1024 * 1024 - 1_100;
+    let csv = big_csv(bytes);
+    assert!(
+        csv.len() <= 8 * 1024 * 1024,
+        "at or under the default ceiling: {}",
+        csv.len()
+    );
+    assert!(
+        csv.len() > 8 * 1024 * 1024 - 2_200,
+        "close to the ceiling: {}",
+        csv.len()
+    );
+    dataset_survives_a_full_cluster_restart_and_a_lost_spool(bytes).await;
+}
+
+/// Issue #285: a node that joins after the upload materialises the spool file from what it
+/// receives through the log/snapshot — nothing is fetched from a peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_joining_after_the_upload_materialises_the_spool_file() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(2).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let csv = "id,name\n1,ada\n2,bob\n";
+    let leader = cluster.leader().expect("leader");
+    let response = leader
+        .submit(dataset_put("customers", csv))
+        .await
+        .expect("commits");
+    assert!(
+        leader
+            .await_applied(response.revision, CONVERGE_DEADLINE)
+            .await
+            .is_empty()
+    );
+
+    // A brand-new third member on a fresh directory.
+    let port = reserve_ports(1)[0];
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    let dir = TempDir::new().expect("tempdir");
+    let seed = cluster.leader().expect("leader").advertise();
+    let joiner = spawn(3, addr, dir.path(), cluster.audit_retention_secs).await;
+    joiner.join_via(seed).await.expect("join");
+
+    let deadline = Instant::now() + CONVERGE_DEADLINE;
+    let path = spool_file(dir.path(), csv);
+    loop {
+        if std::fs::read(&path).ok().as_deref() == Some(csv.as_bytes()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the joiner never materialised the spool file at {path:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        joiner
+            .dataset(DEFAULT_TENANT, "customers")
+            .expect("read")
+            .is_some()
+    );
+    joiner.shutdown().await.ok();
+    cluster.shutdown_all().await;
+}

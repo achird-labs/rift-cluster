@@ -559,6 +559,9 @@ replicated apply path:
 | `maxImposters` | Yes. Counts the tenant's existing ports *excluding* the one being written, so replacing an imposter you already own never trips the ceiling |
 | `maxStubsPerImposter` | Yes — on the payload for a create/replace, and on the *result* for a stub edit |
 | `maxFlowEntries` | Stored; enforced by the flow owner |
+| `maxDatasets` (50) | Yes (issue #285). Distinct live dataset *names*; a new version of a name the tenant already holds is not a new dataset |
+| `maxDatasetBytes` (8 MiB) | Yes — on the upload's bytes, at apply |
+| `maxDatasetTotalBytes` (64 MiB) | Yes — the sum of every live dataset version's bytes plus the upload; a delete frees its share |
 | `journalRetentionSecs` | Moved **off** `quotas` onto the tenant record itself (it is a duration policy, not a count). Stored; applied by the request shards in M3 |
 
 > **If you set `quotas.journalRetentionSecs` on an earlier M2 build, re-set it.**
@@ -567,6 +570,11 @@ replicated apply path:
 > (unlimited), silently. Nothing enforces the value yet — M3 (#147) is what will
 > read it — so the practical window to fix this is before that lands, but the
 > value is lost now rather than then.
+
+The three dataset ceilings **default when absent** on the tenant body and in
+stored records — the one exception to the "present-but-partial fails" rule
+above, because tenant records committed before they existed have to keep
+decoding.
 
 A ceiling of `0` is refused at validation rather than stored: it makes the tenant
 permanently unusable, and "unlimited" has its own spelling (a large number). A
@@ -1719,6 +1727,9 @@ it does. `control::validate` refuses a document over **4 MiB** before commit
 cap is the only other bound), and refuses a `SpecPut` whose digest is not the
 sha256 of its document, so a bad client can never corrupt the blob table.
 Snapshots carry both tables; a node that joins by snapshot holds the same bytes.
+The 4 MiB cap is a validation bound, not a replication guarantee: see the
+known limitation under *Datasets on the control plane* (#411) — today an entry
+above roughly 512 KiB does not commit.
 
 ### Provenance, drift, and edit-time warnings
 
@@ -1749,6 +1760,68 @@ Drift classification and the re-import report with `overwrite | skip | fail`
 (S3, #279 — `deploy` refuses a `policy` field rather than ignoring it), any
 traffic-validation mode (S4/S6), and `openapi+https:` / `openapi+git:` source
 kinds (S8).
+
+## Datasets on the control plane (#285)
+
+RFC-005 D1. A **dataset** is a tenant-owned, named, versioned CSV table the
+engine's `lookup` behavior can read rows from. Under `--cluster` a dataset is a
+replicated control-plane object like an imposter or a spec: uploaded once,
+identical bytes on every node, governed by the tenant's quotas.
+
+The load-bearing decision (RFC-005 §3.2): **the bytes ride the log.**
+`ControlOp::DatasetPut { tenant, record, csv }` commits metadata and content
+together; apply on every node writes `<state-dir>/datasets/<digest>.csv`
+(temp file, `0600`, rename) *before* it inserts the record. Log order alone
+therefore guarantees every node holds the bytes on disk before any config that
+references them applies — the sources' one-fetch-then-replicate rule with the
+upload as the one fetch. No blob sidecar, no fetch protocol, no readiness
+handshake; a node never fetches a dataset from a peer.
+
+This slice ships the ops, validation, tables and spool lifecycle, driven through
+the control layer; the admin routes and RBAC actions arrive with D3, the
+`_rift.dataset` stub binding with D2.
+
+### Validation, deterministic and pre-commit
+
+`control::validate` refuses — never accepts-but-breaks — an upload whose record
+does not describe its document (`digest` = sha256 of the exact bytes, `bytes`,
+`columns`, `rows`), a name that is not a slug, a missing or duplicated header
+column, a delimiter that cannot split, a declared key column that is not in the
+header, and — the one that matters most — a **duplicate key**: every declared
+`keyColumns` entry, and column 0 whether declared or not, must be unique across
+rows. The engine keys its row map on column 0 and silently keeps the last
+duplicate, and picks among duplicate key matches in hash order; validation makes
+both unreachable rather than documenting them. The tokenizer is the engine's own
+(`lines()`, split on the delimiter, trim), so "unique" means what the engine will
+actually see. The refusal names the column, both rows and the value:
+`key column "email" is not unique: rows 1 and 3 share value "a@x"`.
+
+### Tables, blobs, versions
+
+`sm_datasets` `(tenant, name, version) → {record, createdAtSecs, revision,
+deleted}` and `sm_dataset_blobs` `digest → csv`. Every upload of a name is a new
+**version** (monotonic per name; a delete tombstones every live version and a
+later upload continues the numbering). Blobs are content-addressed and shared:
+identical bytes under two names or two tenants hold one blob and one spool file,
+and no API reports the dedup. The blob and its file go when the last *live*
+record referencing the digest goes — the file is removed only after the
+transaction that dropped the reference commits. Snapshots carry both tables and
+a node that installs one materialises the files; a node that has lost its
+`datasets/` directory gets every file back from its own state machine at
+startup (`reconcile_engine`), which never deletes anything it finds there.
+
+`DatasetDelete` refuses while any of the tenant's stubs carries a
+`_rift.dataset` block naming the dataset — the binding itself is D2's, the
+refusal is wired now so a dataset can never be pulled out from under a stub.
+
+> **Known limitation (#411).** The quota's 8 MiB default is the RFC's, but the
+> fleet cannot yet commit an entry that large: openraft bounds every
+> AppendEntries round trip by the 50 ms heartbeat, so a single entry that does
+> not replicate and fsync within that window is retried indefinitely and never
+> commits — measured at ≥1 MiB on loopback (~512 KiB takes minutes). Until #411
+> lands, keep datasets (and imported specs) in the low hundreds of KiB. A refused
+> upload of that shape shows up as a `503` with a parked op id, not as a quota
+> refusal.
 
 ## Clustered flow state (#120)
 

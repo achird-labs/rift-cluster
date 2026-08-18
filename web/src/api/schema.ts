@@ -1668,7 +1668,7 @@ export interface components {
              */
             flowEntries: number;
         };
-        /** @description All three fields are required when `quotas` is present. `Quotas` carries no `serde(default)` on the struct or on any field, so a present-but-partial object fails deserialization with `missing field` and answers `400` — only an entirely absent `quotas` is defaulted (`TenantBody.quotas` is `serde(default)`). */
+        /** @description The three original fields are required when `quotas` is present — they carry no `serde(default)`, so a present-but-partial object fails deserialization with `missing field` and answers `400`; only an entirely absent `quotas` is defaulted (`TenantBody.quotas` is `serde(default)`). The three dataset ceilings (RFC-005 §4, issue #285) are the exception: they default when absent, because tenant records committed before they existed must keep decoding. */
         Quotas: {
             /** @default 1000 */
             maxImposters: number;
@@ -1679,6 +1679,23 @@ export interface components {
              * @default 100000
              */
             maxFlowEntries: number;
+            /**
+             * @description Distinct live dataset names the tenant may hold. Enforced at apply (issue #285).
+             * @default 50
+             */
+            maxDatasets: number;
+            /**
+             * Format: int64
+             * @description Largest single dataset version, in bytes (8 MiB). Enforced at apply.
+             * @default 8388608
+             */
+            maxDatasetBytes: number;
+            /**
+             * Format: int64
+             * @description Sum of every live dataset version's bytes the tenant may hold (64 MiB). Enforced at apply.
+             * @default 67108864
+             */
+            maxDatasetTotalBytes: number;
         };
         /**
          * @description A strict superset ladder: viewer subset of operator subset of editor subset of tenant-admin subset of fleet-admin. Only fleet-admin may hold a binding on the fleet scope (*).

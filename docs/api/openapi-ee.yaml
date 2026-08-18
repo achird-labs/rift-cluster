@@ -5582,11 +5582,13 @@ components:
     Quotas:
       type: object
       description: >
-        All three fields are required when `quotas` is present. `Quotas` carries
-        no `serde(default)` on the struct or on any field, so a present-but-partial
-        object fails deserialization with `missing field` and answers `400` — only
-        an entirely absent `quotas` is defaulted (`TenantBody.quotas` is
-        `serde(default)`).
+        The three original fields are required when `quotas` is present — they
+        carry no `serde(default)`, so a present-but-partial object fails
+        deserialization with `missing field` and answers `400`; only an entirely
+        absent `quotas` is defaulted (`TenantBody.quotas` is `serde(default)`).
+        The three dataset ceilings (RFC-005 §4, issue #285) are the exception:
+        they default when absent, because tenant records committed before they
+        existed must keep decoding.
       required: [maxImposters, maxStubsPerImposter, maxFlowEntries]
       properties:
         maxImposters:
@@ -5599,6 +5601,20 @@ components:
           type: integer
           format: int64
           default: 100000
+        maxDatasets:
+          type: integer
+          default: 50
+          description: "Distinct live dataset names the tenant may hold. Enforced at apply (issue #285)."
+        maxDatasetBytes:
+          type: integer
+          format: int64
+          default: 8388608
+          description: Largest single dataset version, in bytes (8 MiB). Enforced at apply.
+        maxDatasetTotalBytes:
+          type: integer
+          format: int64
+          default: 67108864
+          description: Sum of every live dataset version's bytes the tenant may hold (64 MiB). Enforced at apply.
 
     Role:
       type: string

@@ -517,6 +517,12 @@ function TenantEditRow({
         maxImposters: parsed[0],
         maxStubsPerImposter: parsed[1],
         maxFlowEntries: parsed[2],
+        // The dataset ceilings (RFC-005 §4, issue #285) are not edited here yet — D3 brings the
+        // dataset surface and its form. Carried through from the record rather than omitted, so
+        // saving this form never quietly resets a tenant's dataset quotas to the defaults.
+        maxDatasets: tenant.quotas?.maxDatasets ?? 50,
+        maxDatasetBytes: tenant.quotas?.maxDatasetBytes ?? 8_388_608,
+        maxDatasetTotalBytes: tenant.quotas?.maxDatasetTotalBytes ?? 67_108_864,
       },
       journalRetentionSecs: parsed[3],
     });
@@ -593,10 +599,18 @@ function CreateTenantForm({
     onSubmit({
       id,
       displayName,
-      // All three quota fields, always: `Quotas` has no serde default on the struct or any field,
-      // so a present-but-partial object is a `missing field` parse error and a flat 400. These are
-      // the server's own defaults (`Quotas::default`).
-      quotas: { maxImposters: 1000, maxStubsPerImposter: 1000, maxFlowEntries: 100_000 },
+      // Every quota field, always: the three original ones have no serde default on the server,
+      // so a present-but-partial object is a `missing field` parse error and a flat 400; the
+      // dataset ceilings (issue #285) would default, but are spelled out so the payload states
+      // the whole record. These are the server's own defaults (`Quotas::default`).
+      quotas: {
+        maxImposters: 1000,
+        maxStubsPerImposter: 1000,
+        maxFlowEntries: 100_000,
+        maxDatasets: 50,
+        maxDatasetBytes: 8_388_608,
+        maxDatasetTotalBytes: 67_108_864,
+      },
       journalRetentionSecs: 0,
     });
   };

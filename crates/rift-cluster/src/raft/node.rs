@@ -30,7 +30,9 @@ use super::network::{
     JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
 };
 use super::ring::Ring;
-use super::store::{self, RedbStateMachine, SourceRecord, SourceRow, SpecBinding, SpecRecord};
+use super::store::{
+    self, DatasetSummary, RedbStateMachine, SourceRecord, SourceRow, SpecBinding, SpecRecord,
+};
 use super::{NodeId, TypeConfig};
 use crate::control::{
     AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, Principal, Role, SessionKey,
@@ -363,6 +365,9 @@ impl RaftNode {
             None => state_machine,
         };
         let state_machine = state_machine.with_audit_retention_secs(config.audit_retention_secs);
+        // Dataset blobs materialise under the node's own data directory (RFC-005 D1, #285),
+        // beside `RAFT_DB_FILE` — node-local derived state, not itself part of the redb file.
+        let state_machine = state_machine.with_spool_dir(config.data_dir.join("datasets"));
         let sm_reader = state_machine.clone();
 
         let raft_config = Arc::new(Self::raft_config(config.snapshot_log_entries)?);
@@ -1459,6 +1464,38 @@ impl RaftNode {
     pub fn spec_blob_count(&self) -> Result<usize, NodeError> {
         self.sm_reader
             .spec_blob_count()
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Every live dataset version `tenant` holds, name-ascending then version-ascending
+    /// (RFC-005 D1, #285). Like [`Self::specs`], this answers from local applied state and
+    /// needs no leadership.
+    pub fn datasets(&self, tenant: &str) -> Result<Vec<DatasetSummary>, NodeError> {
+        self.sm_reader
+            .datasets(tenant)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The latest live version of `tenant`'s dataset `name`, or `None` when there is none
+    /// (RFC-005 D1, #285).
+    pub fn dataset(&self, tenant: &str, name: &str) -> Result<Option<DatasetSummary>, NodeError> {
+        self.sm_reader
+            .dataset(tenant, name)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The path a dataset blob's csv bytes are (or would be) materialised at, or `None` when
+    /// this node has no spool directory attached (RFC-005 D1, #285). Answers regardless of
+    /// whether `digest` names anything this node currently holds.
+    #[must_use]
+    pub fn spool_path(&self, digest: &str) -> Option<std::path::PathBuf> {
+        self.sm_reader.spool_path(digest)
+    }
+
+    /// How many distinct dataset documents are currently held, fleet-wide (RFC-005 D1, #285).
+    pub fn dataset_blob_count(&self) -> Result<usize, NodeError> {
+        self.sm_reader
+            .dataset_blob_count()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
