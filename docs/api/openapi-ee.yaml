@@ -87,6 +87,11 @@ tags:
       Issue #239's read-only imposter-source inspection — no upstream
       equivalent. Declaring, deleting, and pulling sources stay on the
       cluster port.
+  - name: specs
+    description: >
+      RFC-004 §5 (issue #278): OpenAPI specs as tenant-owned,
+      content-addressed control-plane objects — import, dry-run compile,
+      deploy, delete. No upstream equivalent.
   - name: meta
     description: Identity and contract introspection.
   - name: upstream-core
@@ -3424,6 +3429,381 @@ paths:
   # ---------------------------------------------------------------------
   # ee: identity / contract introspection
   # ---------------------------------------------------------------------
+  # ---------------------------------------------------------------------
+  # ee: specs (RFC-004 §5, issue #278)
+  # ---------------------------------------------------------------------
+  /specs:
+    get:
+      operationId: listSpecs
+      summary: The tenant's imported specs
+      description: >
+        Terminates. Answers from local applied state: id, digest, format,
+        the ports the spec is currently deployed to, and whether any of
+        those ports has been hand-edited since (`drifted`). Never carries
+        the documents themselves — `GET /specs/{specId}` does. Requires
+        `spec.read` (Viewer and up).
+      tags: [specs]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The tenant's specs, id-ascending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [specs]
+                properties:
+                  specs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SpecRecord'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Caller holds no binding in the tenant in view (RFC-002 §8.4 — not a 403).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /specs/{specId}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/SpecId'
+    get:
+      operationId: getSpec
+      summary: One spec — the stored document plus its metadata
+      description: >
+        Terminates. The record `listSpecs` shows, plus `document`: the
+        spec bytes exactly as imported (the digest is sha256 over them).
+        Requires `spec.read` (Viewer and up).
+      tags: [specs]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: The spec.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SpecRecord'
+                  - type: object
+                    required: [document]
+                    properties:
+                      document:
+                        type: string
+                        description: The imported OpenAPI document, verbatim (JSON or YAML text).
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/SpecNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      operationId: putSpec
+      summary: Import (or re-import) an OpenAPI 3.0 spec under this id
+      description: >
+        Terminates. The body is the spec document itself — JSON or YAML,
+        UTF-8, at most 4 MiB. It is **compiled on the accepting node before
+        anything is committed**: a document that does not compile is
+        refused with the compiler's own reason and writes nothing, so the
+        replicated log only ever carries specs every node can compile
+        identically (`rift-cluster-spec` is a pure function of the bytes).
+        Commits a `SpecPut` op carrying the bytes; every node stores them
+        content-addressed by digest, so two specs with identical bytes share
+        one blob. A re-import whose bytes are unchanged answers `200` with
+        `unchanged: true` and **writes no log entry at all** — retries and
+        unchanged polls cost zero log growth. Deploying is a separate step
+        (`deploySpec`); the drift report on re-import arrives with S3
+        (#279). No `If-Match`: a spec record has no imposter revision to
+        condition on. Requires `spec.write` (Editor and up).
+      tags: [specs]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: >
+                An OpenAPI 3.0.x document. Free-form here by nature — its
+                shape is OpenAPI's own, and the compiler is what decides
+                whether it is acceptable.
+          application/yaml:
+            schema:
+              type: string
+              description: An OpenAPI 3.0.x document.
+      responses:
+        '201':
+          description: A spec with this id did not exist; it is now stored on every node.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpecWriteResult'
+        '200':
+          description: >
+            The id already existed. `unchanged: true` means the bytes were
+            identical to what is stored and nothing was written (no cluster
+            headers); `unchanged: false` means a re-import replaced the
+            document.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpecWriteResult'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          description: >
+            The document is not UTF-8 text, does not compile as OpenAPI 3.0.x
+            (unsupported version, external `$ref`, parse error, self-check
+            failure — the compiler's message is carried verbatim), or the id
+            is not a usable path segment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Caller holds no binding in the tenant named by `X-Rift-Tenant` (RFC-002 §8.4 — not a 403).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The document exceeds the 4 MiB pre-commit cap (RFC-004 §4.1) — refused before it is parsed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+    delete:
+      operationId: deleteSpec
+      summary: Delete a spec
+      description: >
+        Terminates. Refuses with `409` while any imposter is still bound to
+        the spec (deployed from it), unless `?force` is given — then every
+        bound port is unbound first (`SpecUnbind`) and the record removed
+        (`SpecDelete`) in one mutation. Unbinding never tears an imposter
+        down: it keeps serving, it just no longer carries provenance. The
+        stored bytes go with the last spec record that references them.
+        Requires `spec.delete` (Editor and up).
+      tags: [specs]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
+        - name: force
+          in: query
+          required: false
+          allowEmptyValue: true
+          description: >
+            Unbind every deployed port first instead of refusing with `409`.
+            A flag: `?force`, `?force=true` and `?force=1` force;
+            `?force=false` / `?force=0` do not.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: The spec is gone on every node.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, digest, unboundPorts]
+                properties:
+                  id:
+                    type: string
+                  digest:
+                    type: string
+                    description: sha256 hex of the document that was stored.
+                  unboundPorts:
+                    type: array
+                    items:
+                      type: integer
+                    description: The ports `?force` unbound, ascending; empty without `?force`.
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/SpecNotFound'
+        '409':
+          description: The spec is still bound to at least one port and `?force` was not given; the message names the ports.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
+  /specs/{specId}/compile:
+    post:
+      operationId: compileSpec
+      summary: Dry run — compile the stored spec and diff it against what is deployed
+      description: >
+        Terminates and **commits nothing**. Compiles the stored document for
+        the requested port (or the spec's single bound port, or an
+        auto-assigned one) and answers with the imposter JSON that
+        `deploySpec` would commit, the operation index, and a stub-id-level
+        diff against the config currently deployed on the target port —
+        `null` when there is no target port. Requires `spec.read` (Viewer
+        and up): a dry run is a read.
+      tags: [specs]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/CsrfHeader'
+        - $ref: '#/components/parameters/SpecId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                port:
+                  type: integer
+                  description: Compile for this port and diff against it. Defaults to the spec's single bound port, if any.
+      responses:
+        '200':
+          description: The compiled imposter and the diff.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpecCompileResult'
+        '400':
+          $ref: '#/components/responses/BadData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/SpecNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /specs/{specId}/deploy:
+    post:
+      operationId: deploySpec
+      summary: Compile the stored spec and deploy it as the imposter on a port
+      description: >
+        Terminates. Compiles the stored document for `port` on the accepting
+        node and commits **two ops under one barrier**: an ordinary
+        `PutImposter` carrying the compiled config — the same code path as
+        `PUT /imposters`, so park/replay, `Idempotency-Key` dedup,
+        `If-Match` against the imposter's revision and the write barrier are
+        all inherited — followed by `SpecBind`, which stamps the imposter's
+        provenance `{specId, digest}` and resets its drift baseline. After
+        the 2xx every ready node serves the compiled mock. Answers `201`
+        when the port had no imposter, `200` when it replaced one. Requires
+        `spec.write` **and** `imposter.write` (Editor and up): holding
+        `spec.write` alone must not be a back door into imposter mutation.
+        The drift `policy` (`overwrite | skip | fail`) arrives with S3
+        (#279); sending one now is refused rather than ignored.
+      tags: [specs]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CsrfHeader'
+        - $ref: '#/components/parameters/SpecId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [port]
+              properties:
+                port:
+                  type: integer
+                  description: The port the compiled imposter serves on. Fleet-unique across tenants.
+      responses:
+        '201':
+          description: Created the imposter on `port`; the response is the stored imposter (as `getImposter` shows it).
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+            Rift-Cluster-Warnings:
+              $ref: '#/components/headers/RiftClusterWarnings'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '200':
+          description: Replaced the imposter that was on `port`.
+          headers:
+            Rift-Cluster-Revision:
+              $ref: '#/components/headers/RiftClusterRevision'
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
+            Rift-Cluster-Warnings:
+              $ref: '#/components/headers/RiftClusterWarnings'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Imposter'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          description: No `port`, a `policy` (S3), or the stored document no longer compiles for this port.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/SpecNotFound'
+        '409':
+          $ref: '#/components/responses/RevisionConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
+
   /admin/whoami:
     get:
       operationId: getWhoAmI
@@ -4112,6 +4492,16 @@ components:
       schema:
         type: string
         example: acme
+    SpecId:
+      name: specId
+      in: path
+      required: true
+      description: >
+        The spec's id, chosen by the importer, unique within its tenant. A
+        non-empty name of at most 128 characters drawn from
+        `[A-Za-z0-9._-]` — matched literally, undecoded.
+      schema:
+        type: string
     Port:
       name: port
       in: path
@@ -4316,6 +4706,27 @@ components:
       schema:
         type: boolean
         enum: [true]
+    RiftSpecWarnings:
+      description: >
+        Edit-time spec validation (RFC-004 §3.2, issue #278). Present on a
+        successful config-mutating write (`PUT`/`POST /imposters/{port}`,
+        stub add/replace) to an imposter that is **bound to a spec**, when a
+        static `is` body of a stub whose id the compiler emitted
+        (`spec:<operationId>:<status>`) violates the response schema that
+        operation declares. Each entry is `<stubId> <json-pointer>: <what>`,
+        `; `-separated, capped at ten (then `; +N more`) and at 2 KiB
+        (then `...`), visible ASCII only. Templated bodies (`{{…}}`),
+        responses with `_behaviors`, and non-`is` responses are skipped —
+        runtime validation is S4/S6's job. **Warn, never refuse**: a
+        deliberately divergent stub is a legitimate fixture. Absent when
+        nothing is bound or nothing violates — so absence means "checked and
+        clean": if the check itself could not run for a bound port (a storage
+        read failed, the bound document no longer compiles) the header says
+        so with a `port <n>: spec validation unavailable (<why>)` entry
+        instead of staying silent.
+      schema:
+        type: string
+        example: 'spec:showPetById:200 /id: expected integer, got string'
 
   responses:
     BadData:
@@ -4361,6 +4772,16 @@ components:
             $ref: '#/components/schemas/Error'
     PayloadTooLarge:
       description: Request body exceeded the configured maximum size.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    SpecNotFound:
+      description: >
+        No such spec in the tenant in view. Byte-identical whether the id
+        never existed, exists in another tenant, or the caller holds no
+        binding here at all (RFC-002 §8.4): the message names only the id
+        the caller typed.
       content:
         application/json:
           schema:
@@ -5530,6 +5951,119 @@ components:
             usually empty. Scoped to the tenant of the request: the scheduler
             polls every tenant's tracking sources, and a source id is unique
             only within its tenant.
+
+    SpecRecord:
+      type: object
+      description: >
+        One imported spec as the fleet has agreed on it — the replicated
+        projection, identical on every converged node.
+      required: [id, format, digest, source, ports, drifted, revision]
+      properties:
+        id:
+          type: string
+          description: The spec's id, unique within its tenant.
+        format:
+          type: string
+          enum: [json, yaml]
+          description: How the document was written, sniffed at import (YAML is a superset, so this is informational).
+        digest:
+          type: string
+          description: sha256 hex over the document bytes exactly as imported — what a re-import compares to decide `unchanged`.
+        source:
+          type: string
+          enum: [inline]
+          description: Where the document came from. `inline` is a `PUT /specs/{specId}` body; source-backed kinds arrive with S8.
+        ports:
+          type: array
+          items:
+            type: integer
+          description: The ports currently deployed from this spec (carrying its provenance), ascending.
+        drifted:
+          type: boolean
+          description: At least one bound port has had a config-mutating write since it was deployed. A redeploy resets it.
+        revision:
+          type: integer
+          format: int64
+          description: The log index that last wrote this record.
+
+    SpecWriteResult:
+      type: object
+      description: What `putSpec` did.
+      required: [id, digest, format, unchanged]
+      properties:
+        id:
+          type: string
+        digest:
+          type: string
+          description: sha256 hex of the document now stored.
+        format:
+          type: string
+          enum: [json, yaml]
+        unchanged:
+          type: boolean
+          description: The bytes matched what was already stored; nothing was written.
+        revision:
+          type: integer
+          format: int64
+          description: On an unchanged re-import, the revision of the record that already held these bytes.
+
+    SpecCompileResult:
+      type: object
+      description: A dry-run compilation.
+      required: [imposter, operations, diff]
+      properties:
+        imposter:
+          $ref: '#/components/schemas/Imposter'
+        operations:
+          type: array
+          description: The compiler's operation index, in emitted order.
+          items:
+            type: object
+            required: [id, method, pathTemplate, stubIds]
+            properties:
+              id:
+                type: string
+                description: The `operationId`, or one synthesized from method and path.
+              method:
+                type: string
+              pathTemplate:
+                type: string
+                example: /pets/{petId}
+              stubIds:
+                type: array
+                items:
+                  type: string
+        diff:
+          nullable: true
+          description: >
+            The compiled stubs against the config deployed on the target
+            port, keyed by stub id — `null` when there is no target port
+            (none requested and none bound). This is a byte-level stub
+            diff; the per-operation drift classification (added / removed /
+            changed / hand-edited / hand-added) is S3 (#279).
+          type: object
+          required: [port, deployed, added, removed, changed]
+          properties:
+            port:
+              type: integer
+            deployed:
+              type: boolean
+              description: Whether an imposter is currently deployed on `port` at all.
+            added:
+              type: array
+              items:
+                type: string
+              description: Compiled stub ids not present in the deployed config.
+            removed:
+              type: array
+              items:
+                type: string
+              description: Deployed stub ids the compiler no longer emits (`spec:`-prefixed ids only — hand-added stubs are never listed).
+            changed:
+              type: array
+              items:
+                type: string
+              description: Stub ids present on both sides whose canonical JSON differs.
 
     WhoAmI:
       type: object

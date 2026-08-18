@@ -74,6 +74,18 @@ pub enum Action {
     TenantManage,
     AuditRead,
     ClusterAdmin,
+    /// List, read, or dry-run compile a spec (RFC-004 §4.3, issue #278) — landed with S2 because a
+    /// terminated route cannot ship without its action.
+    SpecRead,
+    /// Import (`PUT /specs/{id}`) or deploy a spec.
+    ///
+    /// Deploy additionally requires [`Action::ImposterWrite`] on the target port — checked in
+    /// `admin_front::terminate_spec_deploy`, not here, because the port lives in the request body
+    /// rather than the route. `SpecWrite` alone must not become a back door into imposter
+    /// mutation just because every role that holds it today also holds `ImposterWrite`.
+    SpecWrite,
+    /// `DELETE /specs/{id}`.
+    SpecDelete,
 }
 
 impl Action {
@@ -82,7 +94,7 @@ impl Action {
     ///
     /// Kept beside the enum so the two cannot drift: `every_action_is_listed`
     /// fails if a variant is added without extending this.
-    pub const ALL: [Action; 21] = [
+    pub const ALL: [Action; 24] = [
         Action::ImposterRead,
         Action::ImposterWrite,
         Action::ImposterDelete,
@@ -104,6 +116,9 @@ impl Action {
         Action::TenantManage,
         Action::AuditRead,
         Action::ClusterAdmin,
+        Action::SpecRead,
+        Action::SpecWrite,
+        Action::SpecDelete,
     ];
 
     /// A stable string for audit records and logs (#163 consumes these).
@@ -131,6 +146,9 @@ impl Action {
             Action::TenantManage => "tenant.manage",
             Action::AuditRead => "audit.read",
             Action::ClusterAdmin => "cluster.admin",
+            Action::SpecRead => "spec.read",
+            Action::SpecWrite => "spec.write",
+            Action::SpecDelete => "spec.delete",
         }
     }
 }
@@ -174,6 +192,9 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                 // reads only).
                 | Action::SourceRead
                 | Action::StreamSubscribe
+                // Reading a spec (listing, fetching, or dry-run compiling it) is the same power as
+                // reading the imposter it describes — a Viewer may see what a mock was built from.
+                | Action::SpecRead
         ),
         Role::Operator => {
             role_allows(Role::Viewer, action)
@@ -197,6 +218,13 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                         | Action::SpaceStubWrite
                         | Action::ScenarioWrite
                         | Action::VerifyRun
+                        // RFC-004 §4.3 (issue #278): importing or deploying a spec redefines what
+                        // an imposter answers, which is the Operator/Editor line — and `SpecWrite`
+                        // alone must not be a back door into imposter mutation, so `deploy` also
+                        // requires `ImposterWrite` on the target port (checked in the front, not
+                        // here).
+                        | Action::SpecWrite
+                        | Action::SpecDelete
                 )
         }
         Role::TenantAdmin => {
@@ -327,8 +355,9 @@ mod tests {
     fn every_action_is_listed_in_all() {
         assert_eq!(
             Action::ALL.len(),
-            21,
-            "RFC-002 §4.1 defines 21 actions; ALL must carry every one"
+            24,
+            "RFC-002 §4.1 defines 21 actions and RFC-004 §4.3 adds three (issue #278); ALL must \
+             carry every one"
         );
         let unique: std::collections::BTreeSet<_> = Action::ALL.iter().collect();
         assert_eq!(unique.len(), Action::ALL.len(), "ALL contains a duplicate");
@@ -338,6 +367,15 @@ mod tests {
             Action::ALL.len(),
             "two actions share an audit slug — #163 could not tell them apart"
         );
+    }
+
+    /// The spec actions' audit slugs are part of the contract (#278): the audit stream and
+    /// `role {r:?} does not grant {slug}` refusals both name them.
+    #[test]
+    fn spec_action_slugs_are_stable() {
+        assert_eq!(Action::SpecRead.as_str(), "spec.read");
+        assert_eq!(Action::SpecWrite.as_str(), "spec.write");
+        assert_eq!(Action::SpecDelete.as_str(), "spec.delete");
     }
 
     /// The whole of RFC-002 §4.2, asserted cell by cell.
@@ -353,6 +391,7 @@ mod tests {
             Action::ScenarioRead,
             Action::FlowStateRead,
             Action::SourceRead,
+            Action::SpecRead,
             Action::StreamSubscribe,
         ];
         let operator_adds = [
@@ -370,6 +409,12 @@ mod tests {
             Action::SpaceStubWrite,
             Action::ScenarioWrite,
             Action::VerifyRun,
+            // RFC-004 §4.3 (issue #278): importing or deploying a spec redefines what an
+            // imposter answers, which is the Operator/Editor line — and `SpecWrite` alone
+            // must not be a back door into imposter mutation, so `deploy` also requires
+            // `ImposterWrite` on the target port (checked in the front, not here).
+            Action::SpecWrite,
+            Action::SpecDelete,
         ];
         let tenant_admin_adds = [Action::TenantManage, Action::AuditRead];
 

@@ -341,6 +341,12 @@ mod parity {
             Terminated::SourcePull(_) => {
                 RouteKey::new(&Method::POST, "/admin/sources/{sourceId}/pull")
             }
+            Terminated::SpecList => RouteKey::new(&Method::GET, "/specs"),
+            Terminated::SpecRead(_) => RouteKey::new(&Method::GET, "/specs/{specId}"),
+            Terminated::SpecPut(_) => RouteKey::new(&Method::PUT, "/specs/{specId}"),
+            Terminated::SpecDelete { .. } => RouteKey::new(&Method::DELETE, "/specs/{specId}"),
+            Terminated::SpecCompile(_) => RouteKey::new(&Method::POST, "/specs/{specId}/compile"),
+            Terminated::SpecDeploy(_) => RouteKey::new(&Method::POST, "/specs/{specId}/deploy"),
         }
     }
 
@@ -443,6 +449,15 @@ mod parity {
             Terminated::SourcePut,
             Terminated::SourceDelete("payments".to_owned()),
             Terminated::SourcePull("payments".to_owned()),
+            Terminated::SpecList,
+            Terminated::SpecRead("petstore".to_owned()),
+            Terminated::SpecPut("petstore".to_owned()),
+            Terminated::SpecDelete {
+                id: "petstore".to_owned(),
+                force: false,
+            },
+            Terminated::SpecCompile("petstore".to_owned()),
+            Terminated::SpecDeploy("petstore".to_owned()),
         ]
     }
 
@@ -550,6 +565,7 @@ mod parity {
             // all, so a placeholder like "op-1" would probe a different code path than the live route.
             .replace("{opId}", "0189dcf0-0454-4e0b-a10c-8a8f8dccce1f")
             .replace("{key}", "k")
+            .replace("{specId}", "petstore")
     }
 
     /// Does the front terminate this request itself, rather than proxying it?

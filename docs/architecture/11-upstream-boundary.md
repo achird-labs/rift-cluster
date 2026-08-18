@@ -53,7 +53,7 @@ flowchart BT
     EE["rift-cluster-base — the facade<br/>re-exports crates + rift_cluster_base::seams"]
     CL["rift-cluster<br/>Raft, ring, RPC, stores, reconciler"]
     SV["rift-cluster-server (binary)<br/>CLI superset, composition"]
-    SP["rift-cluster-spec<br/>OpenAPI 3.0 → imposter JSON<br/><i>reaches nothing — see below</i>"]
+    SP["rift-cluster-spec<br/>OpenAPI 3.0 → imposter JSON<br/><i>depends on nothing vendored — see below</i>"]
 
     MC --> EE
     HP --> EE
@@ -83,8 +83,13 @@ facade nor anything vendored — not even `rift-types`. The alternative, emittin
 function. Instead it emits the same JSON a client would `PUT`, and `rift-cluster-server`
 admits it through the gate every other write already passes. Type safety stays where it is
 load-bearing — at admission — and the compiler stays a pure function of `(spec bytes,
-options)` that golden files can pin. Read the arrow as *"produces JSON consumed by"*, not as
-a code dependency in the other direction.
+options)` that golden files can pin. The arrow is a real dependency as of issue #278:
+`rift-cluster-server` calls the compiler on the accepting node — at `PUT /specs/{id}`,
+`deploy`, and for edit-time warnings — and parses its output through the same
+`ImposterConfig` gate. **`rift-cluster` does not depend on it, and must not**: the state
+machine stores spec bytes and stamps provenance, but never parses OpenAPI, so apply stays
+free of fallible spec code (RFC-004 §8). The one number both crates need — the 4 MiB
+pre-commit cap — is declared in each and held equal by a tripwire test in the server crate.
 
 **One seam cannot be guarded that way, and gets its own tripwire.**
 `ServerBuilder::manager()` is all-or-nothing: injecting a manager replaces

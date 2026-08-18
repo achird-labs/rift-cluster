@@ -738,6 +738,49 @@ pub enum ControlOp {
         tenant: TenantId,
         port: u16,
     },
+    /// Store a spec document and its content-addressed blob (RFC-004 S2, #278).
+    ///
+    /// `document` is a `String`, not raw bytes: log entries are JSON, the front
+    /// refuses a non-UTF-8 body with 400 before this op is ever minted, and it
+    /// compiles the document before commit — so a stored document is always
+    /// text that at least once compiled. `meta.digest` is the sha256 hex of
+    /// `document`'s exact bytes, checked by [`validate`] so the blob table can
+    /// never be addressed by a digest that does not match what it stores.
+    SpecPut {
+        tenant: TenantId,
+        id: String,
+        meta: SpecMeta,
+        document: String,
+    },
+    /// Remove a spec record (and, if nothing else references its digest, its
+    /// blob). Refused at apply while any imposter of the tenant is still bound
+    /// to it — see `raft::store`'s apply arm for the `?force` unbind-then-delete
+    /// path.
+    SpecDelete {
+        tenant: TenantId,
+        id: String,
+    },
+    /// Record that the imposter at `port` was deployed from spec `id`, at the
+    /// spec's current digest — the provenance and drift baseline a manual edit
+    /// is compared against afterwards.
+    ///
+    /// Always rides behind the `PutImposter` it follows in a deploy, never
+    /// submitted alone: [`precondition_target`] returns `None` for it because
+    /// the precondition that matters is on the imposter write it accompanies,
+    /// checked once, there.
+    SpecBind {
+        tenant: TenantId,
+        id: String,
+        port: u16,
+    },
+    /// Clear a port's spec provenance without touching its config — what
+    /// `DELETE /specs/:id?force` commits for each bound port ahead of the
+    /// `SpecDelete`, so the imposter keeps serving and merely stops naming a
+    /// spec that is about to be gone.
+    SpecUnbind {
+        tenant: TenantId,
+        port: u16,
+    },
 }
 
 /// The stub half of a [`ControlOp::ProxyRecorded`]: the generated stub plus everything its
@@ -887,6 +930,63 @@ pub struct SourceProvenance {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// The largest spec document [`ControlOp::SpecPut`] may carry (RFC-004 S2,
+/// #278), inclusive.
+///
+/// **Must equal `rift_cluster_spec::MAX_SPEC_BYTES`.** This crate deliberately
+/// does not depend on the compiler crate — applying a spec op never runs spec
+/// code, only stores bytes and a digest — so the two constants are declared
+/// independently rather than shared, and a tripwire test in
+/// `rift-cluster-server` (which depends on both) keeps them equal. The front
+/// compiles the document before it ever commits, so by the time this bound is
+/// checked here the document has already been shown to compile at that other
+/// value; the two crates disagreeing about the cap would only matter for a
+/// window between a constant change and the tripwire catching it.
+pub const MAX_SPEC_BYTES: usize = 4 * 1024 * 1024;
+
+/// The wire encoding a stored spec document is in.
+///
+/// Sniffed at the front (a document that parses as JSON is `Json`, else
+/// `Yaml`) — this crate never parses the document itself, so the sniff result
+/// travels in with [`ControlOp::SpecPut`] rather than being recomputed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpecFormat {
+    Json,
+    Yaml,
+}
+
+/// How a stored spec document arrived. Only `Inline` exists yet — a document
+/// PUT directly through the admin API. S8 adds source-backed variants (a spec
+/// pulled the way an imposter source already is); nothing dormant is minted
+/// here ahead of that work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SpecSource {
+    Inline,
+}
+
+/// A stored spec's metadata, carried on [`ControlOp::SpecPut`] and stamped
+/// onto the stored record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecMeta {
+    pub format: SpecFormat,
+    pub digest: Digest,
+    pub source: SpecSource,
+}
+
+/// Which spec (and at what digest) an imposter was deployed from — the
+/// provenance and drift baseline `raft::store`'s `StoredImposter::spec` holds,
+/// beside the config-source provenance [`SourceProvenance`] already carries
+/// for source-pulled imposters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecProvenance {
+    pub spec_id: String,
+    pub digest: Digest,
 }
 
 /// The shortest poll interval a [`SourceMode::Tracking`] source may declare.
@@ -1039,7 +1139,11 @@ impl ControlOp {
             | ControlOp::FleetNamePut { tenant, .. }
             | ControlOp::JournalClearGen { tenant, .. }
             | ControlOp::ProxyRecorded { tenant, .. }
-            | ControlOp::ProxyRecordedClear { tenant, .. } => tenant,
+            | ControlOp::ProxyRecordedClear { tenant, .. }
+            | ControlOp::SpecPut { tenant, .. }
+            | ControlOp::SpecDelete { tenant, .. }
+            | ControlOp::SpecBind { tenant, .. }
+            | ControlOp::SpecUnbind { tenant, .. } => tenant,
         }
     }
 
@@ -1109,6 +1213,15 @@ impl ControlOp {
             // `authz::Action::SavedRequestsClear` as the journal clear above, so it carries
             // the same name in the stream (#226).
             ControlOp::ProxyRecordedClear { .. } => "savedRequests.clear",
+            // Bind and unbind are writes to the imposter's provenance, not a
+            // spec-record edit, but they share the spec-write name: an
+            // auditor reading the stream should see all three "this port's
+            // spec relationship changed" acts under one action, distinguished
+            // by `audit_resource` and the outcome text.
+            ControlOp::SpecPut { .. }
+            | ControlOp::SpecBind { .. }
+            | ControlOp::SpecUnbind { .. } => "spec.write",
+            ControlOp::SpecDelete { .. } => "spec.delete",
         })
     }
 
@@ -1159,6 +1272,12 @@ impl ControlOp {
                 Some(space) => format!("{port}/{space}"),
                 None => port.to_string(),
             },
+            ControlOp::SpecPut { id, .. }
+            | ControlOp::SpecDelete { id, .. }
+            | ControlOp::SpecBind { id, .. } => id.clone(),
+            // Unbind names no spec (it may run after the spec itself is
+            // gone); the port it cleared is the only thing left to address.
+            ControlOp::SpecUnbind { port, .. } => port.to_string(),
         }
     }
 }
@@ -1632,7 +1751,63 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             }
             Ok(())
         }
+        ControlOp::SpecPut {
+            tenant,
+            id,
+            meta,
+            document,
+        } => {
+            require_real_tenant(tenant)?;
+            require_spec_id(id)?;
+            if document.len() > MAX_SPEC_BYTES {
+                return Err(format!(
+                    "spec exceeds {MAX_SPEC_BYTES} bytes: a document this large would make every \
+                     replica's snapshot and every future compile pay for one operator's mistake"
+                ));
+            }
+            // The digest is checked against the document's own bytes, not
+            // merely for hex shape, because it is the blob table's key: a
+            // digest that does not match what it is stored under would let a
+            // later `SpecPut` under the same id silently address someone
+            // else's document, or leave a blob GC can never find its way back
+            // to.
+            let hex = meta.digest.as_str();
+            let is_well_formed_hex = hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'));
+            if !is_well_formed_hex || !digest_matches(hex, document.as_bytes()) {
+                return Err(
+                    "spec digest must be the 64-character lowercase-hex sha256 of the document, \
+                     and does not match the document"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
+        ControlOp::SpecDelete { tenant, id } => {
+            require_real_tenant(tenant)?;
+            require_spec_id(id)
+        }
+        ControlOp::SpecBind {
+            tenant,
+            id,
+            port: _,
+        } => {
+            require_real_tenant(tenant)?;
+            require_spec_id(id)
+        }
+        ControlOp::SpecUnbind { tenant, port: _ } => require_real_tenant(tenant),
     }
+}
+
+/// Whether `hex` (already shown to be 64 lowercase-hex characters) is the
+/// sha256 digest of `bytes`.
+fn digest_matches(hex: &str, bytes: &[u8]) -> bool {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize()) == hex
 }
 
 /// Decode a lowercase-or-uppercase hex string, or `None` if it is not hex.
@@ -1826,6 +2001,21 @@ fn require_source_id(id: &str) -> Result<(), String> {
     } else {
         Err(
             "source id must be a non-empty name of at most 128 characters drawn from \
+             [A-Za-z0-9._-]: it addresses the record and appears in the request path"
+                .to_owned(),
+        )
+    }
+}
+
+/// Same shape rule as [`require_source_id`] — reusing [`is_source_name`], since a
+/// spec id and a source id are both bounded, path-safe, redb-key-safe tokens —
+/// with its own message so a refusal names the record it is actually about.
+fn require_spec_id(id: &str) -> Result<(), String> {
+    if is_source_name(id) {
+        Ok(())
+    } else {
+        Err(
+            "spec id must be a non-empty name of at most 128 characters drawn from \
              [A-Za-z0-9._-]: it addresses the record and appears in the request path"
                 .to_owned(),
         )
@@ -2289,7 +2479,19 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget<'_>> {
         // then-current stubs, which is the property a stored-revision precondition would
         // re-introduce a race against. The clear follows `JournalClearGen`'s reasoning.
         | ControlOp::ProxyRecorded { .. }
-        | ControlOp::ProxyRecordedClear { .. } => None,
+        | ControlOp::ProxyRecordedClear { .. }
+        // A spec record addresses `sm_specs`, not `sm_configs` — no imposter
+        // row for a precondition to hold against.
+        | ControlOp::SpecPut { .. }
+        | ControlOp::SpecDelete { .. }
+        // `SpecBind` rides behind the `PutImposter` it follows in a deploy: the
+        // precondition that matters is checked once, on that imposter write.
+        // Targeting the imposter itself here would mean the bind conditions on
+        // a revision that has already moved by the time it applies (`run_mutation`
+        // in `rift-cluster-server` mints `expected_revision` only for ops whose
+        // `precondition_target` is `Some`, so `SpecBind` never gets one).
+        | ControlOp::SpecBind { .. }
+        | ControlOp::SpecUnbind { .. } => None,
     }
 }
 
@@ -2614,6 +2816,41 @@ mod tests {
                     principal_id: PrincipalId::new("alice"),
                 },
                 "BindingDelete",
+            ),
+            (
+                ControlOp::SpecPut {
+                    tenant: TenantId::new("acme"),
+                    id: "petstore".to_owned(),
+                    meta: SpecMeta {
+                        format: SpecFormat::Json,
+                        digest: Digest::new("a".repeat(64)),
+                        source: SpecSource::Inline,
+                    },
+                    document: "{}".to_owned(),
+                },
+                "SpecPut",
+            ),
+            (
+                ControlOp::SpecDelete {
+                    tenant: TenantId::new("acme"),
+                    id: "petstore".to_owned(),
+                },
+                "SpecDelete",
+            ),
+            (
+                ControlOp::SpecBind {
+                    tenant: TenantId::new("acme"),
+                    id: "petstore".to_owned(),
+                    port: 4545,
+                },
+                "SpecBind",
+            ),
+            (
+                ControlOp::SpecUnbind {
+                    tenant: TenantId::new("acme"),
+                    port: 4545,
+                },
+                "SpecUnbind",
             ),
         ];
         for (op, tag) in cases {
@@ -3781,6 +4018,218 @@ mod tests {
             let err = validate(&source_put("mocks", uri))
                 .expect_err("a source must name something fetchable");
             assert!(err.contains("uri"), "{err}");
+        }
+    }
+
+    // -- spec ops (#278) ---------------------------------------------------------
+
+    fn spec_put(id: &str, document: &str) -> ControlOp {
+        ControlOp::SpecPut {
+            tenant: TenantId::new("acme"),
+            id: id.to_owned(),
+            meta: SpecMeta {
+                format: SpecFormat::Json,
+                digest: spec_digest_of(document),
+                source: SpecSource::Inline,
+            },
+            document: document.to_owned(),
+        }
+    }
+
+    /// sha256 hex of `document`, computed here and not through the code under
+    /// test, so the assertion below is against a value the test states.
+    fn spec_digest_of(document: &str) -> Digest {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(document.as_bytes());
+        Digest::new(format!("{:x}", hasher.finalize()))
+    }
+
+    #[test]
+    fn spec_meta_spellings_are_stable() {
+        assert_eq!(
+            serde_json::to_value(SpecMeta {
+                format: SpecFormat::Yaml,
+                digest: Digest::new("ab"),
+                source: SpecSource::Inline,
+            })
+            .expect("serialize"),
+            json!({"format": "yaml", "digest": "ab", "source": "inline"})
+        );
+        assert_eq!(
+            serde_json::to_value(SpecProvenance {
+                spec_id: "petstore".to_owned(),
+                digest: Digest::new("ab"),
+            })
+            .expect("serialize"),
+            json!({"specId": "petstore", "digest": "ab"})
+        );
+    }
+
+    #[test]
+    fn a_well_formed_spec_put_is_admitted() {
+        assert_eq!(
+            validate(&spec_put("petstore", "{\"openapi\":\"3.0.0\"}")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_spec_over_the_cap_is_refused_pre_commit() {
+        assert_eq!(MAX_SPEC_BYTES, 4 * 1024 * 1024);
+        let document = "x".repeat(MAX_SPEC_BYTES + 1);
+        let err = validate(&spec_put("petstore", &document))
+            .expect_err("an oversize spec must never reach the log");
+        assert!(
+            err.contains(&MAX_SPEC_BYTES.to_string()),
+            "the refusal must name the cap: {err}"
+        );
+        // Exactly at the cap is admitted: the bound is inclusive.
+        let at_cap = "x".repeat(MAX_SPEC_BYTES);
+        assert_eq!(validate(&spec_put("petstore", &at_cap)), Ok(()));
+    }
+
+    #[test]
+    fn a_spec_put_whose_digest_does_not_match_its_document_is_refused() {
+        let ControlOp::SpecPut {
+            tenant,
+            id,
+            mut meta,
+            document,
+        } = spec_put("petstore", "{}")
+        else {
+            unreachable!()
+        };
+        meta.digest = Digest::new("0".repeat(64));
+        let err = validate(&ControlOp::SpecPut {
+            tenant: tenant.clone(),
+            id: id.clone(),
+            meta: meta.clone(),
+            document: document.clone(),
+        })
+        .expect_err("a digest that is not the document's would corrupt the blob table");
+        assert!(err.contains("digest"), "{err}");
+
+        // Not hex, wrong length: the same refusal, before any hashing.
+        meta.digest = Digest::new("not-hex");
+        let err = validate(&ControlOp::SpecPut {
+            tenant,
+            id,
+            meta,
+            document,
+        })
+        .expect_err("a malformed digest is refused");
+        assert!(err.contains("digest"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_an_unusable_spec_id() {
+        for id in ["", " ", "a/b", "a?b", "a b", &"x".repeat(129)] {
+            let err = validate(&spec_put(id, "{}")).expect_err("id must be a usable path segment");
+            assert!(err.contains("spec id"), "id {id:?}: {err}");
+            let err = validate(&ControlOp::SpecDelete {
+                tenant: TenantId::new("acme"),
+                id: id.to_owned(),
+            })
+            .expect_err("delete refuses the same ids");
+            assert!(err.contains("spec id"), "id {id:?}: {err}");
+            let err = validate(&ControlOp::SpecBind {
+                tenant: TenantId::new("acme"),
+                id: id.to_owned(),
+                port: 1,
+            })
+            .expect_err("bind refuses the same ids");
+            assert!(err.contains("spec id"), "id {id:?}: {err}");
+        }
+        for id in ["petstore", "team-a.orders_v2", "A1"] {
+            assert_eq!(validate(&spec_put(id, "{}")), Ok(()), "id {id}");
+        }
+    }
+
+    #[test]
+    fn spec_ops_refuse_the_reserved_fleet_scope() {
+        for op in [
+            ControlOp::SpecPut {
+                tenant: TenantId::new(FLEET_SCOPE),
+                id: "petstore".to_owned(),
+                meta: SpecMeta {
+                    format: SpecFormat::Json,
+                    digest: spec_digest_of("{}"),
+                    source: SpecSource::Inline,
+                },
+                document: "{}".to_owned(),
+            },
+            ControlOp::SpecDelete {
+                tenant: TenantId::new(FLEET_SCOPE),
+                id: "petstore".to_owned(),
+            },
+            ControlOp::SpecBind {
+                tenant: TenantId::new(FLEET_SCOPE),
+                id: "petstore".to_owned(),
+                port: 1,
+            },
+            ControlOp::SpecUnbind {
+                tenant: TenantId::new(FLEET_SCOPE),
+                port: 1,
+            },
+        ] {
+            assert!(
+                validate(&op).is_err(),
+                "{op:?} must not be admitted on the fleet scope"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_ops_carry_their_audit_names() {
+        let put = spec_put("petstore", "{}");
+        assert_eq!(put.audit_action(), Some("spec.write"));
+        assert_eq!(put.audit_resource(), "petstore");
+        assert_eq!(put.tenant(), &TenantId::new("acme"));
+        let bind = ControlOp::SpecBind {
+            tenant: TenantId::new("acme"),
+            id: "petstore".to_owned(),
+            port: 4545,
+        };
+        assert_eq!(bind.audit_action(), Some("spec.write"));
+        assert_eq!(bind.audit_resource(), "petstore");
+        let unbind = ControlOp::SpecUnbind {
+            tenant: TenantId::new("acme"),
+            port: 4545,
+        };
+        assert_eq!(unbind.audit_action(), Some("spec.write"));
+        assert_eq!(unbind.audit_resource(), "4545");
+        let delete = ControlOp::SpecDelete {
+            tenant: TenantId::new("acme"),
+            id: "petstore".to_owned(),
+        };
+        assert_eq!(delete.audit_action(), Some("spec.delete"));
+        assert_eq!(delete.audit_resource(), "petstore");
+    }
+
+    /// `SpecBind` rides behind the `PutImposter` it follows in a deploy; the
+    /// precondition is checked once, on that imposter write. If it targeted the
+    /// imposter itself, the revision the client conditioned on would already
+    /// have moved by the time the bind applied.
+    #[test]
+    fn spec_ops_are_not_precondition_targets() {
+        for op in [
+            spec_put("petstore", "{}"),
+            ControlOp::SpecDelete {
+                tenant: TenantId::new("acme"),
+                id: "petstore".to_owned(),
+            },
+            ControlOp::SpecBind {
+                tenant: TenantId::new("acme"),
+                id: "petstore".to_owned(),
+                port: 1,
+            },
+            ControlOp::SpecUnbind {
+                tenant: TenantId::new("acme"),
+                port: 1,
+            },
+        ] {
+            assert!(precondition_target(&op).is_none(), "{op:?}");
         }
     }
 

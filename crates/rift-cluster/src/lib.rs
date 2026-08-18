@@ -37,8 +37,9 @@ pub use config::{ClusterConfig, ConfigError, RuntimeTopology};
 pub use control::{
     AUDIT_RESOURCE_ALL, AuditRow, AuditSink, ControlOp, ControlOutcome, ControlRequest,
     ControlResponse, DEFAULT_AUDIT_BATCH_MAX_ROWS, DEFAULT_TENANT, Digest, FLEET_SCOPE,
-    MAX_AUDIT_BATCH_MAX_ROWS, MAX_SOURCE_PAYLOAD_BYTES, OnDrift, PreconditionTarget, RecordedStub,
-    RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey, SourceMode, SourceProvenance, StubEdit,
+    MAX_AUDIT_BATCH_MAX_ROWS, MAX_SOURCE_PAYLOAD_BYTES, MAX_SPEC_BYTES, OnDrift,
+    PreconditionTarget, RecordedStub, RecordedStubPlacement, SESSION_KEY_BYTES, SessionKey,
+    SourceMode, SourceProvenance, SpecFormat, SpecMeta, SpecProvenance, SpecSource, StubEdit,
     StubEditScript, TenantId, precondition_target, routes_installed_for,
 };
 pub use decorate::ClusterDecorator;
@@ -48,6 +49,10 @@ pub use raft::{
     NodeIdentity, OwnStatus, OwnedKey, PullOutcome, RaftNode, Ring, SourceRecord, SourceRow,
     StatusReport,
 };
+// `raft::store` is `pub(crate)` (not re-exported by `raft`'s own `pub use`, unlike
+// `SourceRecord`/`SourceRow`) — reached directly here rather than widening that module's own
+// visibility just to route two more types through it.
+pub use raft::store::{SpecBinding, SpecRecord};
 pub use rpc::{Authority, AuthorityError, Router, RpcClient, RpcError, RpcServer};
 pub use sources::scheduler::{PollStatus, SourceScheduler};
 pub use sources::{PullError, PullReport, SourcePuller};

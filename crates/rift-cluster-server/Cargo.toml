@@ -33,6 +33,9 @@ console = ["dep:rust-embed"]
 # core, so this crate carries no direct rift-mock-core / rift-http-proxy dep.
 rift-cluster-base = { path = "../rift-cluster-base" }
 rift-cluster = { path = "../rift-cluster" }
+# The front compiles specs on the accepting node (PUT, deploy, edit-time warnings); the compiler
+# crate depends on nothing vendored so this does not breach the facade rule (11-upstream-boundary.md).
+rift-cluster-spec = { path = "../rift-cluster-spec" }
 
 clap = { version = "4.5", features = ["derive", "env"] }
 # The try endpoint (#335) dials a loopback imposter as a client. Deliberately

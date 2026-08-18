@@ -82,8 +82,8 @@ use super::TypeConfig;
 use crate::control::{
     self, AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, DEFAULT_TENANT, Digest,
     FLEET_SCOPE, OnDrift, PreconditionTarget, Principal, Quotas, Role, SessionKey, SourceMode,
-    SourceProvenance, StubEdit, StubEditScript, Tenant, TenantConfigUsage, TenantId,
-    routes_installed_for,
+    SourceProvenance, SpecFormat, SpecMeta, SpecProvenance, SpecSource, StubEdit, StubEditScript,
+    Tenant, TenantConfigUsage, TenantId, routes_installed_for,
 };
 use crate::stores::journal::ClusterJournal;
 
@@ -118,6 +118,22 @@ const SM_ROUTES_REVISION_TABLE: TableDefinition<&str, u64> =
 /// control-plane objects (issue #134). One row per source, like `sm_routes` —
 /// a delete is a single-key removal rather than a read-modify-write of a set.
 const SM_SOURCES_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_sources");
+/// `(tenant, spec id) -> StoredSpec` (JSON): spec records as durable control-plane objects
+/// (RFC-004 S2, #278). One row per spec, like `sm_sources` — a delete is a single-key removal
+/// rather than a read-modify-write of a set.
+const SM_SPECS_TABLE: TableDefinition<(&str, &str), &str> = TableDefinition::new("sm_specs");
+/// `digest hex -> document text` (#278): the content-addressed blob store a [`StoredSpec`]'s
+/// `meta.digest` points into. Separate from `sm_specs` because the same bytes are commonly held
+/// under more than one spec id (two tenants importing the same upstream OpenAPI document, or one
+/// tenant re-declaring an id it already holds) — storing the document inline per record would
+/// duplicate it once per reference instead of once per distinct byte string.
+///
+/// "Referenced" has no count column: [`RedbStateMachine::ports_of_spec`]-style logic instead
+/// scans `sm_specs` for any row whose digest matches, on every delete/replace — specs are few
+/// (an operator-authored set, not a per-request table), so the scan this trades for a maintained
+/// refcount is cheap, and a maintained counter is one more value every writer must keep in step
+/// or the GC silently drifts from the truth the scan always gets right.
+const SM_SPEC_BLOBS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sm_spec_blobs");
 /// `tenant id -> Tenant` (JSON): tenant records, including deleted tombstones
 /// (issue #159, RFC-002 §10 slice T1). See [`Tenant::deleted`]'s doc for why a
 /// delete leaves the row behind instead of removing it.
@@ -357,6 +373,23 @@ struct StoredImposter {
     /// hand-written imposter, which is exactly what `None` means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<SourceProvenance>,
+    /// Which spec this imposter was deployed from, when one was (RFC-004 S2, #278). Defaulted so
+    /// a record written before specs existed still parses — it is simply not spec-bound, which
+    /// is exactly what `None` means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spec: Option<SpecProvenance>,
+    /// Whether a config-mutating write has touched this imposter since it was last bound (or
+    /// re-bound) to `spec`. Meaningless — and always `false` — when `spec` is `None`: drift is a
+    /// property of the relationship between a stored imposter and the spec it was deployed from,
+    /// not of the imposter alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    drifted: bool,
+}
+
+/// `#[serde(skip_serializing_if)]` predicate for a plain `bool`: omit the field when it is at
+/// its default, the same way `Option::is_none` does for an `Option`.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// What `sm_sources` stores per `(tenant, id)`.
@@ -494,6 +527,53 @@ impl SourceRecord {
     }
 }
 
+/// What `sm_specs` stores per `(tenant, id)` (RFC-004 S2, #278).
+///
+/// Carries no ports: which imposters are bound to this spec is derived, at read time, by
+/// scanning `sm_configs` for a `StoredImposter::spec` naming this id — the same relationship
+/// `sm_sources`' ports take from `sm_configs` provenance rather than storing their own copy, and
+/// for the identical reason: two tables agreeing about one fact is a table that can disagree
+/// with itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredSpec {
+    meta: SpecMeta,
+    revision: u64,
+}
+
+/// One spec as reported by the read paths — the shape `GET /specs` and
+/// `GET /specs/:id` render (RFC-004 S2, #278).
+///
+/// A crate-owned type rather than the stored record itself, for the same reason [`SourceRecord`]
+/// is: the stored shape is free to gain fields the operator surface should not render, and this
+/// crosses the public API boundary where `openraft` types may not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecRecord {
+    pub id: String,
+    pub format: SpecFormat,
+    pub digest: String,
+    pub source: SpecSource,
+    /// Every port, ascending, whose `StoredImposter::spec` names this id.
+    pub ports: Vec<u16>,
+    /// Whether any bound port has drifted from this spec since its last deploy.
+    pub drifted: bool,
+    /// The log index that last wrote this spec record. Unaffected by binding or unbinding a
+    /// port — see [`ControlOp::SpecBind`]'s doc — so it changes only when the document itself
+    /// (or its metadata) is rewritten.
+    pub revision: u64,
+}
+
+/// One port's spec provenance and drift state (RFC-004 S2, #278) — what the front reads before
+/// deciding whether a config write needs edit-time spec warnings. Narrower than [`SpecRecord`]
+/// because a binding answers "what is this port deployed from", not "what does the spec look like".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecBinding {
+    pub spec_id: String,
+    pub digest: String,
+    pub drifted: bool,
+}
+
 /// What `sm_op_dedup` stores per `op_id`. The applying log index lives inside
 /// `response.revision`; a separate copy would be dead data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -534,6 +614,18 @@ struct SnapshotPayload {
     /// none.
     #[serde(default)]
     sources: Vec<(String, String, String)>,
+    /// `(tenant, spec id, stored-spec JSON)` rows of `sm_specs` (RFC-004 S2, #278). Defaulted for
+    /// the #134/#137 reason every table above carries it: a snapshot built before specs existed
+    /// must still install, and the empty vec it decodes to means exactly what a pre-#278 fleet's
+    /// history actually is — no spec has ever been written.
+    #[serde(default)]
+    specs: Vec<(String, String, String)>,
+    /// `(digest hex, document text)` rows of `sm_spec_blobs` (#278). Travels with `specs` rather
+    /// than being reconstructed from them: a joining node must hold the exact bytes a bound
+    /// spec's digest names, and the blob table's key order carries no tenant to derive it from
+    /// alone if a row here were ever missing.
+    #[serde(default)]
+    spec_blobs: Vec<(String, String)>,
     /// `(tenant id, Tenant JSON)` rows of `sm_tenants` (issue #159). Defaulted
     /// for the same reason `routes`/`sources` are: a pre-#159 snapshot still
     /// installs, carrying no tenants — a table omitted here is a table that
@@ -651,6 +743,8 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_ROUTES_TABLE).map_err(io)?;
         write_txn.open_table(SM_ROUTES_REVISION_TABLE).map_err(io)?;
         write_txn.open_table(SM_SOURCES_TABLE).map_err(io)?;
+        write_txn.open_table(SM_SPECS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_SPEC_BLOBS_TABLE).map_err(io)?;
         write_txn.open_table(SM_TENANTS_TABLE).map_err(io)?;
         write_txn.open_table(SM_PRINCIPALS_TABLE).map_err(io)?;
         write_txn.open_table(SM_BINDINGS_TABLE).map_err(io)?;
@@ -1433,6 +1527,148 @@ impl RedbStateMachine {
         Ok(Some(Self::render_source(id, &stored, owned.get(id))))
     }
 
+    /// Every declared spec for `tenant`, id-ascending (RFC-004 S2, #278).
+    ///
+    /// Like [`Self::sources`], this answers from local applied state with no Raft round trip.
+    #[allow(clippy::result_large_err)]
+    pub fn specs(&self, tenant: &str) -> StorageResult<Vec<SpecRecord>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let specs = read_txn
+            .open_table(SM_SPECS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let configs = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let owned = Self::ports_by_spec(&configs, tenant)
+            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+
+        let mut records = Vec::new();
+        for item in specs
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (row_tenant, id) = key.value();
+            if row_tenant != tenant {
+                continue;
+            }
+            // A spec row that will not parse is committed-state corruption. Reported as an
+            // error rather than skipped, for the same reason `sources` reports one loudly: a
+            // silently shrinking list would tell an operator their spec is gone when it is not.
+            let stored: StoredSpec = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(spec_id = %id, error = %e, "corrupt stored spec");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            records.push(Self::render_spec(id, &stored, owned.get(id)));
+        }
+        Ok(records)
+    }
+
+    /// One spec by id, or `None` if `tenant` has no such spec (RFC-004 S2, #278).
+    #[allow(clippy::result_large_err)]
+    pub fn spec(&self, tenant: &str, id: &str) -> StorageResult<Option<SpecRecord>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let specs = read_txn
+            .open_table(SM_SPECS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let Some(guard) = specs
+            .get((tenant, id))
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        else {
+            return Ok(None);
+        };
+        let stored: StoredSpec = serde_json::from_str(guard.value()).map_err(|e| {
+            tracing::error!(spec_id = %id, error = %e, "corrupt stored spec");
+            StorageError::from(StorageIOError::read_state_machine(&e))
+        })?;
+        let configs = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let owned = Self::ports_by_spec(&configs, tenant)
+            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+        Ok(Some(Self::render_spec(id, &stored, owned.get(id))))
+    }
+
+    /// The document stored under `digest`, or `None` if no spec currently holds it (RFC-004 S2,
+    /// #278). Addressed by digest, not by `(tenant, id)`: this is the blob table's own key, and
+    /// the same document answers for every spec that shares its bytes.
+    #[allow(clippy::result_large_err)]
+    pub fn spec_document(&self, digest: &str) -> StorageResult<Option<String>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let blobs = read_txn
+            .open_table(SM_SPEC_BLOBS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Ok(blobs
+            .get(digest)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|g| g.value().to_owned()))
+    }
+
+    /// `tenant`'s port `port`'s spec provenance, or `None` when the port holds no imposter or
+    /// the imposter it holds is not spec-bound (RFC-004 S2, #278).
+    ///
+    /// A stored imposter that will not parse answers `None`, like [`Self::imposter_revision`]
+    /// does for the same corruption: the read itself still succeeds, and this merely reports the
+    /// port as unbound rather than failing the whole read.
+    #[allow(clippy::result_large_err)]
+    pub fn spec_binding(&self, tenant: &str, port: u16) -> StorageResult<Option<SpecBinding>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let configs = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let Some(guard) = configs
+            .get((tenant, port))
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        else {
+            return Ok(None);
+        };
+        let stored: StoredImposter = match serde_json::from_str(guard.value()) {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::error!(
+                    tenant, port, error = %e,
+                    "corrupt stored imposter; read carries no spec binding"
+                );
+                return Ok(None);
+            }
+        };
+        Ok(stored.spec.map(|spec| SpecBinding {
+            spec_id: spec.spec_id,
+            digest: spec.digest.as_str().to_owned(),
+            drifted: stored.drifted,
+        }))
+    }
+
+    /// How many distinct spec documents are currently held, fleet-wide (RFC-004 S2, #278) — the
+    /// blob table's row count, so a caller can assert on GC (a delete or a digest swap freeing
+    /// the last reference) without knowing which digests exist.
+    #[allow(clippy::result_large_err)]
+    pub fn spec_blob_count(&self) -> StorageResult<usize> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let blobs = read_txn
+            .open_table(SM_SPEC_BLOBS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let len = blobs
+            .len()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Ok(usize::try_from(len).unwrap_or(usize::MAX))
+    }
+
     /// The tenant that owns `port`'s applied config, or `None` if no tenant
     /// has one.
     ///
@@ -1829,6 +2065,56 @@ impl RedbStateMachine {
             }
         }
         Ok(owned)
+    }
+
+    /// Spec id -> (the ports bound to it, whether any of those ports has drifted), from
+    /// `sm_configs` provenance — the spec-table counterpart of [`Self::ports_by_source`]. Read
+    /// from an open (possibly mid-transaction) view so both the read paths and apply can use it.
+    fn ports_by_spec(
+        table: &impl ReadableTable<(&'static str, u16), &'static str>,
+        tenant: &str,
+    ) -> Result<BTreeMap<String, (Vec<u16>, bool)>, redb::StorageError> {
+        let mut owned: BTreeMap<String, (Vec<u16>, bool)> = BTreeMap::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            let (row_tenant, port) = key.value();
+            if row_tenant != tenant {
+                continue;
+            }
+            // A record that will not parse binds no spec *as far as provenance goes*, and every
+            // replica holds the same bytes, so skipping it is deterministic. It can only
+            // under-report a binding, never fabricate one — but under-reporting is what lets a
+            // `SpecDelete` past a real binding, so it is logged rather than silently dropped.
+            match serde_json::from_str::<StoredImposter>(value.value()) {
+                Ok(stored) => {
+                    if let Some(spec) = stored.spec {
+                        let entry = owned.entry(spec.spec_id).or_default();
+                        entry.0.push(port);
+                        entry.1 |= stored.drifted;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(tenant, port, error = %e, "corrupt stored imposter; its spec binding is invisible");
+                }
+            }
+        }
+        for entry in owned.values_mut() {
+            entry.0.sort_unstable();
+        }
+        Ok(owned)
+    }
+
+    fn render_spec(id: &str, stored: &StoredSpec, bound: Option<&(Vec<u16>, bool)>) -> SpecRecord {
+        let (ports, drifted) = bound.cloned().unwrap_or_default();
+        SpecRecord {
+            id: id.to_owned(),
+            format: stored.meta.format,
+            digest: stored.meta.digest.as_str().to_owned(),
+            source: stored.meta.source,
+            ports,
+            drifted,
+            revision: stored.revision,
+        }
     }
 
     fn render_source(id: &str, stored: &StoredSource, ports: Option<&Vec<u16>>) -> SourceRecord {
@@ -2837,6 +3123,19 @@ impl RedbStateMachine {
         Ok(Self::stored_imposter(configs, tenant, port)?.and_then(|stored| stored.source))
     }
 
+    /// `(tenant, port)`'s current spec provenance, or `None` when it holds no imposter or the
+    /// imposter is not spec-bound (RFC-004 S2, #278) — the spec-table counterpart of
+    /// [`Self::provenance_of`], read the same way so a config-mutating write can preserve it
+    /// across the rewrite.
+    #[allow(clippy::result_large_err)]
+    fn spec_of(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+        tenant: &str,
+        port: u16,
+    ) -> StorageResult<Option<SpecProvenance>> {
+        Ok(Self::stored_imposter(configs, tenant, port)?.and_then(|stored| stored.spec))
+    }
+
     /// Every port the named source currently owns, ascending.
     #[allow(clippy::result_large_err)]
     fn ports_of_source(
@@ -2917,6 +3216,102 @@ impl RedbStateMachine {
         sources
             .insert((tenant, provenance.id.as_str()), value.as_str())
             .map_err(io)?;
+        Ok(())
+    }
+
+    /// The stored spec at `(tenant, id)`, or `None` when there is none (RFC-004 S2, #278).
+    ///
+    /// A record that will not parse is treated as `None`, like [`Self::stored_source`]: apply
+    /// takes its "unknown spec" path deterministically, since every replica holds the same bad
+    /// bytes.
+    #[allow(clippy::result_large_err)]
+    fn stored_spec(
+        specs: &Table<'_, (&'static str, &'static str), &'static str>,
+        tenant: &str,
+        id: &str,
+    ) -> StorageResult<Option<StoredSpec>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let Some(guard) = specs.get((tenant, id)).map_err(io)? else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<StoredSpec>(guard.value()) {
+            Ok(stored) => Ok(Some(stored)),
+            Err(e) => {
+                tracing::error!(spec_id = %id, error = %e, "corrupt stored spec");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Every port of `tenant` currently bound to spec `id`, ascending (RFC-004 S2, #278) — the
+    /// spec-table counterpart of [`Self::ports_of_source`].
+    #[allow(clippy::result_large_err)]
+    fn ports_of_spec(
+        configs: &Table<'_, (&'static str, u16), &'static str>,
+        tenant: &str,
+        id: &str,
+    ) -> StorageResult<Vec<u16>> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        let mut ports = Vec::new();
+        for item in configs.iter().map_err(io)? {
+            let (key, value) = item.map_err(io)?;
+            let (t, port) = key.value();
+            if t != tenant {
+                continue;
+            }
+            match serde_json::from_str::<StoredImposter>(value.value()) {
+                Ok(stored) if stored.spec.as_ref().is_some_and(|s| s.spec_id == id) => {
+                    ports.push(port);
+                }
+                Ok(_) => {}
+                // Same reasoning as `ports_by_spec`: deterministic to skip, wrong to skip quietly.
+                Err(e) => {
+                    tracing::error!(tenant, port, error = %e, "corrupt stored imposter; its spec binding is invisible");
+                }
+            }
+        }
+        ports.sort_unstable();
+        Ok(ports)
+    }
+
+    /// Whether any `sm_specs` row, in any tenant, still names `digest` (RFC-004 S2, #278) — the
+    /// blob table's "refcount", computed by scan rather than maintained as a counter (see
+    /// [`SM_SPEC_BLOBS_TABLE`]'s doc for why that trade is the right one here).
+    #[allow(clippy::result_large_err)]
+    fn spec_digest_referenced(
+        specs: &Table<'_, (&'static str, &'static str), &'static str>,
+        digest: &str,
+    ) -> StorageResult<bool> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        for item in specs.iter().map_err(io)? {
+            let (_, value) = item.map_err(io)?;
+            if let Ok(stored) = serde_json::from_str::<StoredSpec>(value.value())
+                && stored.meta.digest.as_str() == digest
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Remove `digest`'s blob if [`Self::spec_digest_referenced`] says nothing holds it any
+    /// more. Called after a spec row is deleted or repointed to a different digest — always
+    /// *after* the `sm_specs` write that could have removed the last reference, so the scan
+    /// sees the post-write truth.
+    #[allow(clippy::result_large_err)]
+    fn gc_spec_blob_if_unreferenced(
+        spec_blobs: &mut Table<'_, &'static str, &'static str>,
+        specs: &Table<'_, (&'static str, &'static str), &'static str>,
+        digest: &str,
+    ) -> StorageResult<()> {
+        let io =
+            |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
+        if !Self::spec_digest_referenced(specs, digest)? {
+            spec_blobs.remove(digest).map_err(io)?;
+        }
         Ok(())
     }
 
@@ -3119,6 +3514,8 @@ impl RedbStateMachine {
         routes: &mut Table<'_, (&'static str, &'static str), &'static str>,
         routes_revision: &mut Table<'_, &'static str, u64>,
         sources: &mut Table<'_, (&'static str, &'static str), &'static str>,
+        specs: &mut Table<'_, (&'static str, &'static str), &'static str>,
+        spec_blobs: &mut Table<'_, &'static str, &'static str>,
         tenants: &mut Table<'_, &'static str, &'static str>,
         principals: &mut Table<'_, &'static str, &'static str>,
         bindings: &mut Table<'_, (&'static str, &'static str), &'static str>,
@@ -3179,6 +3576,11 @@ impl RedbStateMachine {
                 // Clearing it instead would orphan the port, and the next
                 // `overwrite` pull would recreate it as a second imposter.
                 let provenance = Self::provenance_of(configs, tenant.as_str(), port)?;
+                // A manual PutImposter against a spec-bound port is drift (RFC-004 S2, #278):
+                // the provenance survives — a redeploy is still tracked to the spec it named —
+                // but the bytes no longer match what that spec last produced.
+                let spec = Self::spec_of(configs, tenant.as_str(), port)?;
+                let drifted = spec.is_some();
                 let config_json = serde_json::to_string(config)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 let stored = StoredImposter {
@@ -3186,6 +3588,8 @@ impl RedbStateMachine {
                     enabled: config.enabled,
                     revision: index,
                     source: provenance.clone(),
+                    spec,
+                    drifted,
                 };
                 let value = serde_json::to_string(&stored)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -3252,6 +3656,11 @@ impl RedbStateMachine {
                 record.config_json = serde_json::to_string(&config)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 record.revision = index;
+                // A stub patch against a spec-bound port is drift (RFC-004 S2, #278), same
+                // reasoning as `PutImposter`'s.
+                if record.spec.is_some() {
+                    record.drifted = true;
+                }
                 let value = serde_json::to_string(&record)
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 configs
@@ -3645,11 +4054,18 @@ impl RedbStateMachine {
                         );
                         Self::mark_drifted(sources, tenant_str, Some(other), index)?;
                     }
+                    // A source-driven replace against a spec-bound port is drift (RFC-004 S2,
+                    // #278), same reasoning as `PutImposter`'s: the provenance survives, the
+                    // bytes no longer match what the spec last produced.
+                    let spec = existing.as_ref().and_then(|e| e.spec.clone());
+                    let drifted = spec.is_some();
                     let stored = StoredImposter {
                         config_json,
                         enabled: config.enabled,
                         revision: index,
                         source: Some(provenance.clone()),
+                        spec,
+                        drifted,
                     };
                     let value = serde_json::to_string(&stored)
                         .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -3743,6 +4159,26 @@ impl RedbStateMachine {
                 configs.retain(|(t, _), _| t != tenant_str).map_err(io)?;
                 routes.retain(|(t, _), _| t != tenant_str).map_err(io)?;
                 sources.retain(|(t, _), _| t != tenant_str).map_err(io)?;
+                // Specs cascade too (RFC-004 S2, #278), the same shape as sources above: the
+                // tenant's records go, and any blob nothing else still references — including a
+                // *different* tenant's spec that happened to share the same bytes — is reclaimed.
+                // Collected before the removal so the digests to check are the ones this tenant
+                // is about to stop referencing, not whatever happens to remain after.
+                let mut freed_digests = Vec::new();
+                for item in specs.iter().map_err(io)? {
+                    let (key, value) = item.map_err(io)?;
+                    let (t, _id) = key.value();
+                    if t != tenant_str {
+                        continue;
+                    }
+                    if let Ok(stored) = serde_json::from_str::<StoredSpec>(value.value()) {
+                        freed_digests.push(stored.meta.digest.as_str().to_owned());
+                    }
+                }
+                specs.retain(|(t, _), _| t != tenant_str).map_err(io)?;
+                for digest in freed_digests {
+                    Self::gc_spec_blob_if_unreferenced(spec_blobs, specs, &digest)?;
+                }
                 // Bindings cascade too, and this one is a security property
                 // rather than tidiness. A tombstoned id may be recreated (the
                 // tombstone records that it existed, it does not reserve it),
@@ -4139,6 +4575,129 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Ok(Ok(Vec::new()))
             }
+            ControlOp::SpecPut {
+                tenant,
+                id,
+                meta,
+                document,
+            } => {
+                // Read before the row is overwritten: this is the digest the record is about to
+                // stop naming, which is exactly what the GC pass below needs to check.
+                let previous = Self::stored_spec(specs, tenant.as_str(), id)?;
+                let stored = StoredSpec {
+                    meta: meta.clone(),
+                    revision: index,
+                };
+                let value = serde_json::to_string(&stored)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                specs
+                    .insert((tenant.as_str(), id.as_str()), value.as_str())
+                    .map_err(io)?;
+                // Content-addressed: insert the blob only on its first reference. Re-putting the
+                // same bytes under the same id, or under a different id or tenant, is then a
+                // no-op here — `validate` already proved `meta.digest` is this document's own
+                // sha256, so a hit means the bytes already stored are these bytes.
+                if spec_blobs.get(meta.digest.as_str()).map_err(io)?.is_none() {
+                    spec_blobs
+                        .insert(meta.digest.as_str(), document.as_str())
+                        .map_err(io)?;
+                }
+                // A digest change may have orphaned the old blob. Checked *after* the row above
+                // is rewritten, so the reference scan sees the post-write truth — this record
+                // now names the new digest, not the old one.
+                if let Some(previous) = previous
+                    && previous.meta.digest.as_str() != meta.digest.as_str()
+                {
+                    Self::gc_spec_blob_if_unreferenced(
+                        spec_blobs,
+                        specs,
+                        previous.meta.digest.as_str(),
+                    )?;
+                }
+                Ok(Ok(Vec::new()))
+            }
+            ControlOp::SpecDelete { tenant, id } => {
+                let Some(stored) = Self::stored_spec(specs, tenant.as_str(), id)? else {
+                    return Ok(Err(format!("no spec {id:?}")));
+                };
+                let bound_ports = Self::ports_of_spec(configs, tenant.as_str(), id)?;
+                if !bound_ports.is_empty() {
+                    let ports = bound_ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Ok(Err(format!(
+                        "spec {id:?} is bound to port(s) {ports}; DELETE with ?force to unbind \
+                         first"
+                    )));
+                }
+                specs.remove((tenant.as_str(), id.as_str())).map_err(io)?;
+                Self::gc_spec_blob_if_unreferenced(spec_blobs, specs, stored.meta.digest.as_str())?;
+                Ok(Ok(Vec::new()))
+            }
+            ControlOp::SpecBind { tenant, id, port } => {
+                // Block-scoped so the read guard's borrow of `configs` ends
+                // before the insert below.
+                let mut record: StoredImposter = {
+                    match configs.get((tenant.as_str(), *port)).map_err(io)? {
+                        None => return Ok(Err(format!("no imposter on port {port}"))),
+                        Some(guard) => match serde_json::from_str(guard.value()) {
+                            Ok(record) => record,
+                            Err(e) => {
+                                tracing::error!(port = *port, error = %e, "corrupt stored record");
+                                return Ok(Err(format!(
+                                    "corrupt stored record for port {port}: {e}"
+                                )));
+                            }
+                        },
+                    }
+                };
+                let Some(spec) = Self::stored_spec(specs, tenant.as_str(), id)? else {
+                    return Ok(Err(format!("no spec {id:?}")));
+                };
+                // The drift baseline: a bind (first deploy, or a redeploy after drift) declares
+                // this the last-known-good state, so whatever drifted before is resolved.
+                record.spec = Some(SpecProvenance {
+                    spec_id: id.clone(),
+                    digest: spec.meta.digest.clone(),
+                });
+                record.drifted = false;
+                record.revision = index;
+                let value = serde_json::to_string(&record)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                configs
+                    .insert((tenant.as_str(), *port), value.as_str())
+                    .map_err(io)?;
+                // Config bytes are unchanged — a bind only stamps provenance — so there is
+                // nothing for the engine to do.
+                Ok(Ok(Vec::new()))
+            }
+            ControlOp::SpecUnbind { tenant, port } => {
+                let mut record: StoredImposter = {
+                    match configs.get((tenant.as_str(), *port)).map_err(io)? {
+                        None => return Ok(Err(format!("no imposter on port {port}"))),
+                        Some(guard) => match serde_json::from_str(guard.value()) {
+                            Ok(record) => record,
+                            Err(e) => {
+                                tracing::error!(port = *port, error = %e, "corrupt stored record");
+                                return Ok(Err(format!(
+                                    "corrupt stored record for port {port}: {e}"
+                                )));
+                            }
+                        },
+                    }
+                };
+                record.spec = None;
+                record.drifted = false;
+                record.revision = index;
+                let value = serde_json::to_string(&record)
+                    .map_err(|e| StorageIOError::write_state_machine(&e))?;
+                configs
+                    .insert((tenant.as_str(), *port), value.as_str())
+                    .map_err(io)?;
+                Ok(Ok(Vec::new()))
+            }
         }
     }
 
@@ -4302,6 +4861,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             routes,
             routes_revisions,
             sources,
+            specs,
+            spec_blobs,
             tenants,
             principals,
             bindings,
@@ -4368,6 +4929,31 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
                 let (tenant, id) = key.value();
                 sources.push((tenant.to_owned(), id.to_owned(), value.value().to_owned()));
+            }
+            // Travels with the snapshot for the #134/#137 reason every table above does: a node
+            // joining by snapshot must come back holding the same specs and blobs as its peers.
+            let specs_table = read_txn
+                .open_table(SM_SPECS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut specs = Vec::new();
+            for item in specs_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let (tenant, id) = key.value();
+                specs.push((tenant.to_owned(), id.to_owned(), value.value().to_owned()));
+            }
+            let spec_blobs_table = read_txn
+                .open_table(SM_SPEC_BLOBS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let mut spec_blobs = Vec::new();
+            for item in spec_blobs_table
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                spec_blobs.push((key.value().to_owned(), value.value().to_owned()));
             }
             let tenants_table = read_txn
                 .open_table(SM_TENANTS_TABLE)
@@ -4520,6 +5106,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
                 routes,
                 routes_revisions,
                 sources,
+                specs,
+                spec_blobs,
                 tenants,
                 principals,
                 bindings,
@@ -4540,6 +5128,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             routes,
             routes_revisions,
             sources,
+            specs,
+            spec_blobs,
             tenants,
             principals,
             bindings,
@@ -4638,6 +5228,12 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut sources = write_txn
                 .open_table(SM_SOURCES_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut specs = write_txn
+                .open_table(SM_SPECS_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut spec_blobs = write_txn
+                .open_table(SM_SPEC_BLOBS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut tenants = write_txn
                 .open_table(SM_TENANTS_TABLE)
@@ -4756,6 +5352,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut routes,
                                         &mut routes_revision,
                                         &mut sources,
+                                        &mut specs,
+                                        &mut spec_blobs,
                                         &mut tenants,
                                         &mut principals,
                                         &mut bindings,
@@ -4776,6 +5374,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut routes,
                                     &mut routes_revision,
                                     &mut sources,
+                                    &mut specs,
+                                    &mut spec_blobs,
                                     &mut tenants,
                                     &mut principals,
                                     &mut bindings,
@@ -4996,6 +5596,33 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             for (tenant, id, value) in &payload.sources {
                 sources_table
                     .insert((tenant.as_str(), id.as_str()), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
+            // Cleared before repopulating, like every table above: a payload carrying no specs
+            // means the fleet holds none, and leaving this node's stale rows in place would let
+            // a spec (or a binding to one) the fleet has since deleted keep answering here.
+            let mut specs_table = write_txn
+                .open_table(SM_SPECS_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            specs_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (tenant, id, value) in &payload.specs {
+                specs_table
+                    .insert((tenant.as_str(), id.as_str()), value.as_str())
+                    .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            }
+
+            let mut spec_blobs_table = write_txn
+                .open_table(SM_SPEC_BLOBS_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            spec_blobs_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            for (digest, document) in &payload.spec_blobs {
+                spec_blobs_table
+                    .insert(digest.as_str(), document.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -5278,12 +5905,13 @@ mod tests {
 
     use super::{
         DEDUP_TTL_SECS, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine, SM_CONFIGS_TABLE,
-        SM_DEDUP_TABLE, SM_TENANTS_TABLE, SourceRecord, SourceRow, StoredImposter, new,
+        SM_DEDUP_TABLE, SM_TENANTS_TABLE, SourceRecord, SourceRow, SpecRecord, StoredImposter, new,
     };
     use crate::control::{
         AUDIT_RESOURCE_ALL, AuditRow, AuthSource, ControlOp, ControlOutcome, ControlRequest,
         ControlResponse, DEFAULT_TENANT, Digest, FLEET_SCOPE, OnDrift, Principal, PrincipalId,
-        Quotas, Role, SourceMode, StubEdit, StubEditScript, TenantId,
+        Quotas, Role, SourceMode, SpecFormat, SpecMeta, SpecSource, StubEdit, StubEditScript,
+        TenantId,
     };
     use crate::raft::TypeConfig;
     use crate::stores::journal::ClusterJournal;
@@ -8669,6 +9297,514 @@ mod tests {
         assert_eq!(
             sm.fleet_name().expect("read fleet name"),
             Some("rift-prod-us".to_owned())
+        );
+    }
+
+    // -- specs (#278) ------------------------------------------------------------------
+
+    /// sha256 hex of `document`, stated by the test rather than computed by
+    /// the code under test.
+    fn spec_digest(document: &str) -> Digest {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(document.as_bytes());
+        Digest::new(format!("{:x}", hasher.finalize()))
+    }
+
+    fn spec_put_as(op_id: u128, tenant: &str, id: &str, document: &str) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::SpecPut {
+                tenant: TenantId::new(tenant),
+                id: id.to_owned(),
+                meta: SpecMeta {
+                    format: SpecFormat::Json,
+                    digest: spec_digest(document),
+                    source: SpecSource::Inline,
+                },
+                document: document.to_owned(),
+            },
+        )
+    }
+
+    fn spec_put(op_id: u128, id: &str, document: &str) -> ControlRequest {
+        spec_put_as(op_id, DEFAULT_TENANT, id, document)
+    }
+
+    fn spec_delete(op_id: u128, id: &str) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::SpecDelete {
+                tenant: TenantId::default(),
+                id: id.to_owned(),
+            },
+        )
+    }
+
+    fn spec_bind(op_id: u128, id: &str, port: u16) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::SpecBind {
+                tenant: TenantId::default(),
+                id: id.to_owned(),
+                port,
+            },
+        )
+    }
+
+    fn spec_unbind(op_id: u128, port: u16) -> ControlRequest {
+        request(
+            op_id,
+            ControlOp::SpecUnbind {
+                tenant: TenantId::default(),
+                port,
+            },
+        )
+    }
+
+    fn one_spec(sm: &RedbStateMachine, id: &str) -> SpecRecord {
+        sm.spec(DEFAULT_TENANT, id)
+            .expect("read spec")
+            .expect("spec present")
+    }
+
+    const PETSTORE: &str =
+        r#"{"openapi":"3.0.0","info":{"title":"pets","version":"1"},"paths":{}}"#;
+    const ORDERS: &str =
+        r#"{"openapi":"3.0.0","info":{"title":"orders","version":"1"},"paths":{}}"#;
+
+    #[tokio::test]
+    async fn spec_put_stores_the_record_and_its_content_addressed_blob() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let response = apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+
+        let record = one_spec(&sm, "petstore");
+        assert_eq!(record.id, "petstore");
+        assert_eq!(record.digest, spec_digest(PETSTORE).as_str());
+        assert_eq!(record.format, SpecFormat::Json);
+        assert_eq!(record.source, SpecSource::Inline);
+        assert!(record.ports.is_empty(), "nothing bound yet");
+        assert!(!record.drifted);
+        assert_eq!(record.revision, 1);
+        assert_eq!(
+            sm.spec_document(spec_digest(PETSTORE).as_str())
+                .expect("read blob")
+                .as_deref(),
+            Some(PETSTORE),
+            "the blob is addressed by digest and holds the exact bytes"
+        );
+        assert_eq!(
+            sm.specs(DEFAULT_TENANT)
+                .expect("list")
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["petstore"]
+        );
+        assert!(
+            sm.spec("other", "petstore").expect("read").is_none(),
+            "specs are tenant-owned: another tenant does not see it"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_specs_sharing_bytes_share_one_blob_that_outlives_either_alone() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, spec_put(1, "a", PETSTORE)).await;
+        apply_one(&mut sm, 2, spec_put_as(2, "acme", "b", PETSTORE)).await;
+        let digest = spec_digest(PETSTORE);
+        assert!(sm.spec_document(digest.as_str()).expect("read").is_some());
+        assert_eq!(
+            sm.spec_blob_count().expect("count"),
+            1,
+            "identical bytes under two ids — even across tenants — are one blob"
+        );
+
+        apply_one(&mut sm, 3, spec_delete(3, "a")).await;
+        assert!(
+            sm.spec_document(digest.as_str()).expect("read").is_some(),
+            "deleting one referencing spec keeps the blob"
+        );
+        assert!(sm.spec(DEFAULT_TENANT, "a").expect("read").is_none());
+        assert!(sm.spec("acme", "b").expect("read").is_some());
+
+        let response = apply_one(
+            &mut sm,
+            4,
+            request(
+                4,
+                ControlOp::SpecDelete {
+                    tenant: TenantId::new("acme"),
+                    id: "b".to_owned(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert!(
+            sm.spec_document(digest.as_str()).expect("read").is_none(),
+            "deleting the last referencing spec removes the blob"
+        );
+        assert_eq!(sm.spec_blob_count().expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn re_putting_a_spec_with_new_bytes_swaps_the_blob_and_bumps_the_revision() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
+        apply_one(&mut sm, 2, spec_put(2, "petstore", ORDERS)).await;
+        let record = one_spec(&sm, "petstore");
+        assert_eq!(record.digest, spec_digest(ORDERS).as_str());
+        assert_eq!(record.revision, 2);
+        assert!(
+            sm.spec_document(spec_digest(PETSTORE).as_str())
+                .expect("read")
+                .is_none(),
+            "the superseded bytes are unreferenced and gone"
+        );
+        assert_eq!(
+            sm.spec_document(spec_digest(ORDERS).as_str())
+                .expect("read")
+                .as_deref(),
+            Some(ORDERS)
+        );
+        assert_eq!(sm.spec_blob_count().expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn spec_delete_of_an_unknown_spec_is_a_committed_refusal() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let response = apply_one(&mut sm, 1, spec_delete(1, "ghost")).await;
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Failed {
+                reason: "no spec \"ghost\"".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_bind_stamps_provenance_and_a_manual_edit_marks_the_port_drifted() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
+        apply_one(
+            &mut sm,
+            2,
+            put(2, 8080, json!([{ "id": "spec:listPets:200" }])),
+        )
+        .await;
+        let response = apply_one(&mut sm, 3, spec_bind(3, "petstore", 8080)).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+
+        let binding = sm
+            .spec_binding(DEFAULT_TENANT, 8080)
+            .expect("read binding")
+            .expect("bound");
+        assert_eq!(binding.spec_id, "petstore");
+        assert_eq!(binding.digest, spec_digest(PETSTORE).as_str());
+        assert!(!binding.drifted);
+        let record = one_spec(&sm, "petstore");
+        assert_eq!(record.ports, [8080]);
+        assert!(!record.drifted);
+        assert_eq!(
+            record.revision, 1,
+            "binding a port does not rewrite the spec record"
+        );
+        assert_eq!(
+            sm.read_config(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .map(|json| json.contains("spec:listPets:200")),
+            Some(true),
+            "the bind leaves the config bytes exactly as they were"
+        );
+
+        // A hand edit of a spec-bound port is drift, on the port and hence on the spec.
+        apply_one(&mut sm, 4, put(4, 8080, json!([{ "id": "edited" }]))).await;
+        let binding = sm
+            .spec_binding(DEFAULT_TENANT, 8080)
+            .expect("read")
+            .expect("still bound after an edit — provenance survives");
+        assert!(binding.drifted, "a manual PutImposter flips drift");
+        assert!(one_spec(&sm, "petstore").drifted);
+
+        // Re-binding (a redeploy) resets the baseline.
+        apply_one(&mut sm, 5, spec_bind(5, "petstore", 8080)).await;
+        assert!(
+            !sm.spec_binding(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .expect("bound")
+                .drifted,
+            "a bind is the drift baseline"
+        );
+
+        // A stub patch is a config mutation too.
+        apply_one(
+            &mut sm,
+            6,
+            request(
+                6,
+                ControlOp::PatchStubs {
+                    tenant: TenantId::default(),
+                    port: 8080,
+                    edit: StubEditScript(vec![StubEdit::Add {
+                        stub: serde_json::from_value(json!({ "id": "added" })).expect("stub"),
+                        index: None,
+                    }]),
+                },
+            ),
+        )
+        .await;
+        assert!(
+            sm.spec_binding(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .expect("bound")
+                .drifted,
+            "PatchStubs flips drift"
+        );
+
+        // Toggling is not a config edit.
+        apply_one(&mut sm, 7, spec_bind(7, "petstore", 8080)).await;
+        apply_one(
+            &mut sm,
+            8,
+            request(
+                8,
+                ControlOp::SetEnabled {
+                    tenant: TenantId::default(),
+                    port: 8080,
+                    enabled: false,
+                },
+            ),
+        )
+        .await;
+        let binding = sm
+            .spec_binding(DEFAULT_TENANT, 8080)
+            .expect("read")
+            .expect("SetEnabled keeps the provenance");
+        assert!(!binding.drifted, "SetEnabled is not drift");
+    }
+
+    #[tokio::test]
+    async fn spec_bind_refuses_an_unknown_imposter_or_spec() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
+        let response = apply_one(&mut sm, 2, spec_bind(2, "petstore", 8080)).await;
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Failed {
+                reason: "no imposter on port 8080".to_owned()
+            }
+        );
+        apply_one(&mut sm, 3, put(3, 8080, json!([]))).await;
+        let response = apply_one(&mut sm, 4, spec_bind(4, "ghost", 8080)).await;
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Failed {
+                reason: "no spec \"ghost\"".to_owned()
+            }
+        );
+        assert!(
+            sm.spec_binding(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .is_none(),
+            "a refused bind stamps nothing"
+        );
+        let response = apply_one(&mut sm, 5, spec_unbind(5, 9090)).await;
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Failed {
+                reason: "no imposter on port 9090".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_delete_refuses_while_bound_and_unbind_clears_the_port() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
+        apply_one(&mut sm, 2, put(2, 8080, json!([]))).await;
+        apply_one(&mut sm, 3, spec_bind(3, "petstore", 8080)).await;
+
+        let response = apply_one(&mut sm, 4, spec_delete(4, "petstore")).await;
+        match response.outcome {
+            ControlOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("bound") && reason.contains("8080"),
+                    "the refusal names the binding: {reason}"
+                );
+            }
+            other => panic!("a bound spec must not be deleted: {other:?}"),
+        }
+        assert!(sm.spec(DEFAULT_TENANT, "petstore").expect("read").is_some());
+
+        let response = apply_one(&mut sm, 5, spec_unbind(5, 8080)).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert!(
+            sm.spec_binding(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .is_none(),
+            "unbind clears the provenance"
+        );
+        assert!(
+            sm.read_config(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .is_some(),
+            "unbind never tears the imposter down"
+        );
+        assert!(one_spec(&sm, "petstore").ports.is_empty());
+
+        let response = apply_one(&mut sm, 6, spec_delete(6, "petstore")).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert!(sm.spec(DEFAULT_TENANT, "petstore").expect("read").is_none());
+        assert!(
+            sm.spec_document(spec_digest(PETSTORE).as_str())
+                .expect("read")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_bound_imposter_takes_its_spec_binding_with_it() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
+        apply_one(&mut sm, 2, put(2, 8080, json!([]))).await;
+        apply_one(&mut sm, 3, spec_bind(3, "petstore", 8080)).await;
+        apply_one(
+            &mut sm,
+            4,
+            request(
+                4,
+                ControlOp::DeleteImposter {
+                    tenant: TenantId::default(),
+                    port: 8080,
+                },
+            ),
+        )
+        .await;
+        assert!(one_spec(&sm, "petstore").ports.is_empty());
+        let response = apply_one(&mut sm, 5, spec_delete(5, "petstore")).await;
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Applied,
+            "nothing binds it any more"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trips_specs_blobs_and_bindings() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
+        apply_one(&mut sm, 2, put(2, 8080, json!([]))).await;
+        apply_one(&mut sm, 3, spec_bind(3, "petstore", 8080)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+
+        let record = follower
+            .spec(DEFAULT_TENANT, "petstore")
+            .expect("read")
+            .expect("spec travels in the snapshot");
+        assert_eq!(record.digest, spec_digest(PETSTORE).as_str());
+        assert_eq!(record.ports, [8080]);
+        assert_eq!(
+            follower
+                .spec_document(spec_digest(PETSTORE).as_str())
+                .expect("read")
+                .as_deref(),
+            Some(PETSTORE),
+            "the blob travels too — a joining node must hold the same bytes"
+        );
+        assert_eq!(
+            follower
+                .spec_binding(DEFAULT_TENANT, 8080)
+                .expect("read")
+                .map(|b| b.spec_id),
+            Some("petstore".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_without_specs_installs_and_reads_empty() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&snapshot.into_inner()).expect("snapshot is json");
+        let object = payload.as_object_mut().expect("object");
+        assert!(
+            object.remove("specs").is_some(),
+            "specs travel in a current snapshot"
+        );
+        assert!(
+            object.remove("spec_blobs").is_some(),
+            "blobs travel in a current snapshot"
+        );
+        let older = Box::new(std::io::Cursor::new(
+            serde_json::to_vec(&payload).expect("re-encode"),
+        ));
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, older)
+            .await
+            .expect("a pre-#278 snapshot still installs");
+        assert!(follower.specs(DEFAULT_TENANT).expect("list").is_empty());
+        assert_eq!(follower.spec_blob_count().expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_delete_cascades_specs_and_gcs_their_blobs() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::TenantPut {
+                    tenant: TenantId::new("acme"),
+                    display_name: "Acme".to_owned(),
+                    quotas: Quotas::default(),
+                    journal_retention_secs: 0,
+                },
+            ),
+        )
+        .await;
+        apply_one(&mut sm, 2, spec_put_as(2, "acme", "petstore", PETSTORE)).await;
+        apply_one(&mut sm, 3, spec_put(3, "shared", PETSTORE)).await;
+        apply_one(&mut sm, 4, spec_put_as(4, "acme", "orders", ORDERS)).await;
+        let response = apply_one(
+            &mut sm,
+            5,
+            request(
+                5,
+                ControlOp::TenantDelete {
+                    tenant: TenantId::new("acme"),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert!(
+            sm.specs("acme").expect("list").is_empty(),
+            "the tenant's specs go with it"
+        );
+        assert!(
+            sm.spec_document(spec_digest(ORDERS).as_str())
+                .expect("read")
+                .is_none(),
+            "a blob only the deleted tenant referenced is gone"
+        );
+        assert!(
+            sm.spec_document(spec_digest(PETSTORE).as_str())
+                .expect("read")
+                .is_some(),
+            "a blob another tenant still references stays"
         );
     }
 
