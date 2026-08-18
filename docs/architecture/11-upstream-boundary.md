@@ -26,7 +26,7 @@ cluster-aware implementations. All eight seams are merged upstream
 | #314 | `RequestJournal` (+ cursor reads #603) | sharded CRDT journal, vector cursors |
 | #315 | `ProxyRecordingStore` (claim/release) | owner claim state machine — also fixed a stuck-pending OSS bug |
 | #316 | `apply_config` + `ImposterEvent` + `stub_key` + `move_stub` | incremental reconcile as the Raft apply step |
-| #317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` | `rift-cluster-server` composes instead of forking `main.rs` |
+| #317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` (+ its per-imposter half `handle_imposter_request`, re-exported for #344) | `rift-cluster-server` composes instead of forking `main.rs`; the admin try answers in-process from the imposter it resolved, never a socket |
 | #318 | `BackendUnavailable` + `annotate()` + `ResponseDecorator` | every `Rift-Cluster-*` header, without core handlers knowing what a cluster is |
 
 The pattern in #318 deserves a sentence: cluster backends *annotate* the

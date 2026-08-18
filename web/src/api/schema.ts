@@ -503,30 +503,39 @@ export interface paths {
          * Send a sample request to this imposter and return what it answered
          * @description Terminates. The console's **Send** button: it lets an operator find out whether a stub matches without leaving the admin origin, which a browser cannot do on its own — the console is served from the admin port, an imposter answers on its own, and a mock sends no CORS headers, so an in-page `fetch` is blocked for essentially every stub.
          *
-         *     This is the one admin route that makes the **server originate outbound HTTP on a caller's behalf**, so its containment is structural rather than configurable:
+         *     The server **opens no socket** to answer it (issue #344): the sample request is dispatched in-process to the imposter this node's engine holds, over an in-memory HTTP/1 connection, so what answers is that imposter by construction — never whatever else happens to hold the port. Its containment is structural rather than configurable:
          *
-         *     * It names a **port, never a URL or host** — the host is hardcoded
-         *       loopback and is not a parameter.
+         *     * It names a **port, never a URL or host** — there is no address in
+         *       the exchange at all.
          *
          *     * The port must be an imposter in the caller's own tenant. An
          *       unknown port and another tenant's port answer the identical
          *       RFC-002 §8.4 `404`, so this cannot be used to map which ports
-         *       exist.
+         *       exist. A port this node's engine does not actually hold (a
+         *       committed config whose bind failed) answers `502`.
          *
-         *     * The scheme comes from the imposter's own configured `protocol`,
-         *       never from the caller. For an `https` imposter the client accepts
-         *       the imposter's self-signed certificate — the connection never
-         *       leaves the box.
+         *     * The imposter's `protocol` plays no part: an `https` imposter is
+         *       answered the same way, without a TLS handshake — the try answers
+         *       "what would this imposter reply", not "does its TLS work". The
+         *       request the imposter records carries a synthetic loopback
+         *       `request_from`.
          *
          *     * **Redirects are never followed.** A `3xx` is returned like any
-         *       other answer, `Location` header and all. Following one is the only
-         *       way this exchange could reach somewhere other than the loopback
-         *       port the rules above pinned it to.
+         *       other answer, `Location` header and all.
+         *
+         *     * A stub that injects a connection-level fault (`fault:
+         *       CONNECTION_RESET_BY_PEER` and its kin, `_rift.fault.tcp`) has no
+         *       response on the wire; the try reports that as a `502` naming the
+         *       fault rather than presenting a fabricated answer. One shape is not
+         *       yet recognised: a v2 script's `reset()` carries no fault marker the
+         *       front can see, so it renders as the engine's carrier — `status:
+         *       502`, empty body, an `x-rift-script` header — until upstream
+         *       exposes that classification (achird-labs/rift#965).
          *
          *
          *     Requires `imposter.try` (Operator and up). A try is not read-only in effect — it advances scenario state, appends to the request log and can trigger proxy recording — which is why it sits with the other Operator "disturb" actions rather than with `imposter.read`. A Viewer diagnosing a stub uses the console's `Copy curl` button instead, which needs no server surface.
          *
-         *     The exchange is bounded: **10 seconds** total (connect and exchange), and at most **1 MiB** of the imposter's response body is read back, after which `truncated` is `true`. This is a diagnosis surface, not a transfer surface.
+         *     The exchange is bounded: **10 seconds** total, and at most **1 MiB** of the imposter's response body is read back, after which `truncated` is `true`. This is a diagnosis surface, not a transfer surface.
          */
         post: operations["tryImposter"];
         delete?: never;
@@ -1549,7 +1558,7 @@ export interface components {
              * @example /orders?status=open
              */
             path: string;
-            /** @description Sent as given, in order, and repeats are preserved — a list rather than a map because a request may legitimately carry the same header name twice and a map would silently drop one. */
+            /** @description Sent as given, in order, and repeats are preserved — a list rather than a map because a request may legitimately carry the same header name twice and a map would silently drop one. The one exception is framing: `Content-Length` and `Transfer-Encoding` are dropped and recomputed from `body` as actually sent, because a caller-supplied length that disagreed with the body would stall the exchange into a `504` that reads as the imposter's fault (issue #344). */
             headers?: components["schemas"]["TryHeader"][];
             /** @description Request body, verbatim. Omit for a bodyless request. */
             body?: string;
@@ -3968,7 +3977,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The exchange completed. **The imposter's own `4xx`/`5xx` arrives here too** — that is a successful try, with the imposter's status in `status`. Only failures of the endpoint itself (the dial, the budget) are non-`200`, so a client never has to guess whether a `502` came from the mock or from the attempt to reach it. */
+            /** @description The exchange completed. **The imposter's own `4xx`/`5xx` arrives here too** — that is a successful try, with the imposter's status in `status`. Only failures of the endpoint itself (the imposter not served by this node, a connection fault the stub injects, the budget) are non-`200`, so a client never has to guess whether a `502` came from the mock or from the attempt to reach it. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3999,7 +4008,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalError"];
-            /** @description The imposter's port could not be reached, **or** this node is not the one serving it on loopback — a committed imposter config does not by itself mean this node bound the port, and a try never dials a socket it cannot attribute to the imposter. Distinct from a `200` carrying the imposter's own `502`: this one means the exchange never happened. */
+            /** @description This node's engine does not hold the imposter (a committed config does not by itself mean this node bound the port — the try answers only from an imposter this node actually serves), the imposter left this node mid-exchange, or its stub injected a connection-level fault (`x-rift-fault`), which on the wire is an aborted connection with no response. Distinct from a `200` carrying the imposter's own `502`: this one means there is no answer to show. */
             502: {
                 headers: {
                     [name: string]: unknown;

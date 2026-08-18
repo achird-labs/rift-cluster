@@ -191,6 +191,12 @@ pub mod seams {
     pub use rift_http_proxy::server::{
         Cli, Commands, RunningServer, ServerBuilder, run_metrics_server,
     };
+    /// The per-imposter half of [`dispatch_to_port`], for a caller that already holds the
+    /// `Arc<Imposter>` and must not re-resolve it (issue #344): the admin front's in-process
+    /// try resolves the imposter once, behind its own gate, and answers from exactly that one —
+    /// a second lookup inside the dispatch could find it gone and answer with the engine's own
+    /// "no imposter on port" 404 as if the imposter had said so.
+    pub use rift_mock_core::imposter::handle_imposter_request;
 
     /// Imposter sources (U-12): the scheme-dispatched provider SPI upstream
     /// ships `file:` and `https:` implementations of, plus the registry an
@@ -334,7 +340,12 @@ mod tests {
         _named::<RunningServer>();
         _named::<Cli>();
         _named::<Commands>();
-        let _ = (annotate, backend_error_response, dispatch_to_port);
+        let _ = (
+            annotate,
+            backend_error_response,
+            dispatch_to_port,
+            handle_imposter_request,
+        );
         let _ = (
             run_metrics_server,
             with_annotation_scope::<std::future::Ready<()>>,

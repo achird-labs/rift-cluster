@@ -55,8 +55,10 @@
 //! has upgraded.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -549,19 +551,22 @@ pub(crate) enum Terminated {
     /// the console.
     ///
     /// Terminates here because there is nothing to proxy to — no upstream route serves this, and
-    /// the imposter is reached as a *client* rather than as an admin API. It is also the one
-    /// endpoint on this front that makes the **server originate outbound HTTP on a caller's
-    /// behalf**, so its containment is structural rather than configurable:
+    /// the imposter is reached as a *client* rather than as an admin API. Since issue #344 the
+    /// exchange never opens a socket: it is dispatched **in-process**, over an in-memory hyper
+    /// connection, straight to this node's own engine — so its containment is structural rather
+    /// than configurable:
     ///
-    /// - the route names a **port, never a URL or host** — the host is hardcoded loopback, so
-    ///   there is no parameter through which a caller could aim it elsewhere;
+    /// - the route names a **port, never a URL or host** — there is no address at all to aim
+    ///   elsewhere, because nothing is addressed;
     /// - the port must be one of the caller's own tenant's imposters, which
     ///   [`addressed_port`] delegates to the ownership gate in [`authorize_action`] — so an
     ///   unknown port and another tenant's port answer the identical RFC-002 §8.4 `404` and this
     ///   cannot be used to map which ports exist;
-    /// - the scheme comes from the imposter's own configured `protocol`, not from the caller;
-    /// - redirects are **never** followed ([`try_client`]), because following one is the only way
-    ///   the exchange could leave the loopback port the two rules above pinned it to.
+    /// - the imposter answering is *this node's own engine's*, resolved by `port` the same way
+    ///   [`RaftNode::is_locally_bound`] resolves it — not whoever else might hold that port's
+    ///   socket, which a loopback dial could not tell apart on BSD;
+    /// - redirects are **never** followed ([`perform_try`]), because following one is the only way
+    ///   the exchange could leave the imposter these rules pinned it to.
     TryImposter(u16),
     /// Whole-table replace of the front door's route table (issue #131).
     /// There is no upstream `/front-door/routes` to proxy to (U-11's admin
@@ -4838,7 +4843,8 @@ fn source_write_error(e: PullError) -> Response<FrontBody> {
     }
 }
 
-/// Total budget for one try exchange (issue #335) — connect, send, and read the response.
+/// Total budget for one try exchange (issue #335) — the in-process handshake, the send, and
+/// reading the response.
 ///
 /// A fixed constant rather than a knob. A stub whose `wait` behaviour deliberately exceeds this is
 /// curl's job: making the budget configurable would turn a diagnosis affordance into a way to pin
@@ -4867,9 +4873,10 @@ struct TryHeader {
 ///
 /// **Carries no host, scheme or port.** That is the containment, not an omission: the only
 /// addressing input is the `{port}` in the route, which [`addressed_port`] has already proven
-/// belongs to the caller's tenant, and the scheme comes from that imposter's own configured
-/// protocol. There is deliberately no field here through which a caller could aim the server
-/// somewhere else.
+/// belongs to the caller's tenant. Since issue #344 the exchange is dispatched in-process, not
+/// dialled, so there is no scheme to choose at all — an `https` imposter is answered identically
+/// to an `http` one, with no TLS handshake. There is deliberately no field here through which a
+/// caller could aim the server somewhere else.
 ///
 /// `deny_unknown_fields` because a misspelt `header`/`headers` would otherwise silently send a
 /// request without them and leave the operator reading a mismatch they did not cause.
@@ -4926,114 +4933,296 @@ fn is_false(value: &bool) -> bool {
 enum TryFailure {
     /// [`TRY_BUDGET`] expired. Renders `504`.
     Timeout,
-    /// The dial or the exchange failed. Renders `502`.
+    /// The in-process exchange failed to complete — including the imposter having left this node
+    /// between the ownership gate and the exchange. Renders `502`.
     Unreachable(String),
     /// The caller's own envelope was unusable — an invalid method token, a path that will not
-    /// form a URL. Renders `400`.
+    /// form a request target, or a header the wire cannot carry. Renders `400`.
     BadRequest(String),
+    /// The stub injected a connection-level TCP fault (issue #344): on the wire the serve loop
+    /// would abort the connection rather than send a response, so there is nothing to present as
+    /// the imposter's answer. The `String` is the fault name exactly as the stub spelled it.
+    /// Renders `502`.
+    Fault(String),
 }
 
-/// The one client every try goes through.
+/// The TCP-fault names/aliases the engine's carrier response names via its `x-rift-fault` header,
+/// when a stub's `_rift.fault.tcp` would have aborted the connection instead of sending a real
+/// response (issue #344).
 ///
-/// Built once and shared, and every containment property this endpoint claims is a property of
-/// *this builder*:
+/// Mirrors `rift_mock_core::imposter::fault_io::TcpFaultKind::parse` — which is `pub(crate)`
+/// upstream, so this header is the only observable of that classification available outside the
+/// crate, and the alias list is duplicated here rather than imported. A name this list has not
+/// caught up with (a future upstream alias) degrades gracefully rather than breaking: the carrier
+/// response then renders as the imposter's own answer, which is still truthful — that response
+/// really did come back from the engine — just less explicit than naming the fault.
 ///
-/// - **`redirect::Policy::none()`** — following a redirect is the only way an exchange pinned to a
-///   loopback port could end up somewhere else, so it is structurally off rather than a
-///   configuration a future change could flip.
-/// - **`danger_accept_invalid_certs(true)`** — scoped to this client and nothing else. An https
-///   imposter serves a self-signed certificate; refusing it would make the endpoint useless for
-///   exactly the https stubs an operator needs to poke, and the connection never leaves the box.
-///   This client is only ever pointed at `127.0.0.1` on a port the caller's tenant owns, so there
-///   is no remote peer whose identity this could be failing to check.
-fn try_client() -> Result<&'static reqwest::Client, &'static str> {
-    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .danger_accept_invalid_certs(true)
-                .build()
-                .map_err(|e| e.to_string())
-        })
-        .as_ref()
-        // Borrowed rather than cloned, matching `openapi::contract`'s own cached-`Result` shape:
-        // the error lives as long as the `OnceLock`, so there is nothing to own.
-        .map_err(String::as_str)
-}
+/// Two known edges of this header-based detection, stated rather than hidden. **A v2 script's
+/// `reset()`** (upstream #357) builds its carrier without the `x-rift-fault` header — only the
+/// `TcpFaultKind` extension, which is not visible from here — so that one shape renders as the
+/// carrier itself: `status: 502`, empty body, `x-rift-script` header. The fix is upstream —
+/// achird-labs/rift#965: either stamp the header on that third carrier, or make the
+/// classification a seam so `RaftNode::dispatch_to_imposter` can turn the extension into the
+/// header itself *before* the response crosses the in-memory connection (extensions do not
+/// survive serialization; only there is it still attached). Until it lands the OpenAPI names the
+/// gap. And the reverse: a stub is free to
+/// set `x-rift-fault: reset` on an ordinary response the wire would send — self-inflicted, and
+/// reported here as the fault it claims to be.
+const TCP_FAULT_NAMES: &[&str] = &[
+    "reset",
+    "CONNECTION_RESET_BY_PEER",
+    "empty",
+    "EMPTY_RESPONSE",
+    "garbage",
+    "random",
+    "RANDOM_DATA_THEN_CLOSE",
+    "malformed",
+    "MALFORMED_RESPONSE_CHUNK",
+];
 
-/// Resolve the URL a try will actually dial, and **prove** it did not leave the imposter.
+/// The in-process try server's service error: "this exchange produced no response" — the
+/// dispatch was already taken, or the imposter left this node ([`perform_try`]'s `gone` path).
 ///
-/// The caller supplies only a path, and [`terminate_try_imposter`] has already refused one that
-/// does not start with `/` — so concatenating cannot introduce an authority, because the authority
-/// in `base` is terminated by that very first slash. That is the argument. This function does not
-/// rest on it.
-///
-/// After parsing, the host and port are compared against `base`'s own, and a mismatch is refused.
-/// The reasoning above is about URL grammar, and URL grammar is exactly the kind of thing that is
-/// *nearly* always what you think it is: `//evil.com/`, a `\` some parsers fold to `/`, a `@` in
-/// the wrong place, or a future refactor to `Url::join` (which resolves `//evil.com/` as
-/// protocol-relative and **would** change the host) each turn a safe argument into an unsafe one
-/// without touching this line. The post-condition costs one comparison and converts "this cannot
-/// happen" into "this is checked".
-fn try_target(base: &str, path: &str) -> Result<reqwest::Url, TryFailure> {
-    let expected = reqwest::Url::parse(base)
-        .map_err(|e| TryFailure::Unreachable(format!("imposter base {base:?} is unusable: {e}")))?;
-    let url = reqwest::Url::parse(&format!("{base}{path}"))
-        .map_err(|e| TryFailure::BadRequest(format!("{path:?} is not a usable path: {e}")))?;
-    if url.host_str() != expected.host_str()
-        || url.port_or_known_default() != expected.port_or_known_default()
-        || url.scheme() != expected.scheme()
-    {
-        return Err(TryFailure::BadRequest(format!(
-            "{path:?} does not stay on the imposter: it resolves to {}, not {}",
-            url.origin().ascii_serialization(),
-            expected.origin().ascii_serialization()
-        )));
+/// A concrete error type, not an inline `Box<dyn Error>`, so the in-process server's `service_fn`
+/// has a fixed `Service::Error` to coerce to `Box<dyn Error + Send + Sync>` at the one boundary
+/// (`hyper::server::conn::http1::Builder::serve_connection`) that needs it — an error boxed
+/// per-call inside the closure instead runs into a `for<'a>` lifetime hyper's bound cannot unify
+/// with a `'static` one.
+#[derive(Debug)]
+struct TryExchangeEnded;
+
+impl std::fmt::Display for TryExchangeEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "try exchange ended without a response")
     }
-    Ok(url)
 }
 
-/// Send `spec` to `base` and read back what came out.
+impl std::error::Error for TryExchangeEnded {}
+
+/// Aborts the task it holds when dropped, unless it was taken first — both halves of a try's
+/// in-memory connection end with the exchange, *whichever way the exchange ends*: a completed
+/// read, a budget expiry, or `perform_try` itself being dropped because the admin caller went away
+/// mid-try (hyper drops the in-flight service future the moment its client disconnects). Without
+/// the guard on the server half, that last case would leave the imposter's dispatch running as a
+/// detached task — one orphan per abandoned try against a slow stub, which an Operator can farm.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Hand the handle back for an explicit abort-and-observe; the guard then does nothing on drop.
+    fn take(mut self) -> tokio::task::JoinHandle<()> {
+        self.0.take().expect("taken at most once")
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+/// Send `spec` to the imposter's own engine and read back what came out — **in-process, over an
+/// in-memory HTTP/1 connection, never a socket** (issue #344).
 ///
-/// Split from [`terminate_try_imposter`] so the exchange's own rules — the budget, the body cap,
-/// lossy decoding, and that a `3xx` comes back rather than being chased — are testable against a
-/// canned server in milliseconds, without standing up a cluster. `budget` and `cap` are parameters
-/// for that reason only; production passes [`TRY_BUDGET`] and [`TRY_MAX_RESPONSE_BYTES`].
-async fn perform_try(
-    client: &reqwest::Client,
-    base: &str,
+/// `dispatch` is the resolved engine call: production passes a closure over
+/// [`RaftNode::dispatch_to_imposter`] (`None` meaning the imposter left this node between the
+/// ownership gate and this exchange); tests pass a canned service instead, so the exchange's own
+/// rules — the budget, the body cap, lossy decoding, that a `3xx` comes back as data rather than
+/// being followed, that a connection fault renders explicitly — are provable in milliseconds
+/// without standing up a cluster.
+///
+/// The mechanism: `dispatch` becomes the sole handler on one end of a [`tokio::io::duplex`],
+/// served as a real HTTP/1 connection (`hyper::server::conn::http1`); the other end is a real
+/// HTTP/1 client (`hyper::client::conn::http1`) this function drives directly. Nothing is
+/// addressed by host or port — the "connection" is two in-memory pipes — so there is no value
+/// through which the exchange could reach anything other than `dispatch`. Real HTTP/1 framing is
+/// preserved end to end, which is worth more than a bare function call would be: it is exactly the
+/// wire format a stub's own predicates and recorded requests are built to see. It also means the
+/// request's framing headers are the transport's, not the caller's (`Content-Length` and
+/// `Transfer-Encoding` in `spec.headers` are dropped and recomputed from the body actually sent).
+///
+/// `budget` and `cap` are parameters only so the tests above can use short ones; production passes
+/// [`TRY_BUDGET`] and [`TRY_MAX_RESPONSE_BYTES`].
+async fn perform_try<D, Fut>(
+    dispatch: D,
+    port: u16,
     spec: &TryRequest,
     budget: Duration,
     cap: usize,
-) -> Result<TryResponse, TryFailure> {
-    let method = reqwest::Method::from_bytes(spec.method.as_bytes()).map_err(|e| {
+) -> Result<TryResponse, TryFailure>
+where
+    D: FnOnce(Request<Incoming>) -> Fut + Send + 'static,
+    Fut: Future<Output = Option<Response<Full<Bytes>>>> + Send + 'static,
+{
+    // Every validation happens before anything is dispatched — the in-process connection below is
+    // never stood up for a request that could not have been sent in the first place.
+    let method = Method::from_bytes(spec.method.as_bytes()).map_err(|e| {
         TryFailure::BadRequest(format!("{:?} is not an HTTP method: {e}", spec.method))
     })?;
-    let url = try_target(base, &spec.path)?;
-    let mut request = client.request(method, url.clone());
-    for header in &spec.headers {
-        request = request.header(&header.name, &header.value);
+
+    // Origin-form only: a `path_and_query` component can never carry an authority, which is the
+    // whole containment argument here — there is no grammar position left for a caller to smuggle
+    // a different host into. The leading `/` is required *here*, not only in the handler, so the
+    // guarantee lives with the function that documents it: `PathAndQuery` would also accept
+    // `*`, `?x` and `#x`, which serialize to request lines the peer rejects — a `502` blaming
+    // the imposter for the caller's envelope.
+    if !spec.path.starts_with('/') {
+        return Err(TryFailure::BadRequest(format!(
+            "{:?} is not a usable path: it must start with '/'",
+            spec.path
+        )));
     }
-    if let Some(body) = &spec.body {
-        // Cloned because `spec` is borrowed: `perform_try` is called once per manual button press,
-        // so one copy of a hand-authored sample body is not worth taking the whole `TryRequest` by
-        // value and making every test site hand over ownership.
-        request = request.body(body.clone());
+    let uri = Uri::builder()
+        .path_and_query(spec.path.as_str())
+        .build()
+        .map_err(|e| {
+            TryFailure::BadRequest(format!("{:?} is not a usable path: {e}", spec.path))
+        })?;
+
+    let mut headers = Vec::with_capacity(spec.headers.len());
+    let mut caller_set_host = false;
+    for header in &spec.headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|e| {
+            TryFailure::BadRequest(format!(
+                "{:?} is not a usable header name: {e}",
+                header.name
+            ))
+        })?;
+        let value = HeaderValue::from_str(&header.value).map_err(|e| {
+            TryFailure::BadRequest(format!(
+                "{:?} is not a usable value for header {:?}: {e}",
+                header.value, header.name
+            ))
+        })?;
+        // Framing belongs to the transport: the body sent is exactly `spec.body`, and hyper
+        // frames it from that. A caller-supplied `Content-Length`/`Transfer-Encoding` would be
+        // honoured over the real length and stall the exchange into a `504` that reads as the
+        // imposter's fault, so both are dropped rather than sent — the same thing a browser or
+        // curl does with a hand-written length that disagrees with the body it sends.
+        if name == hyper::header::CONTENT_LENGTH || name == hyper::header::TRANSFER_ENCODING {
+            continue;
+        }
+        caller_set_host |= name == hyper::header::HOST;
+        headers.push((name, value));
     }
 
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in &headers {
+        builder = builder.header(name, value);
+    }
+    if !caller_set_host {
+        // HTTP/1.1 needs a `Host`; the caller sent none, so the imposter's own loopback name is
+        // supplied — a stub matching on `host` sees what a real loopback dial would have carried.
+        builder = builder.header(hyper::header::HOST, format!("127.0.0.1:{port}"));
+    }
+    let body = spec.body.clone().map(Bytes::from).unwrap_or_default();
+    let request = builder
+        .body(Full::new(body))
+        .map_err(|e| TryFailure::BadRequest(format!("not a usable request: {e}")))?;
+
     let started = std::time::Instant::now();
-    // One budget over the whole exchange — connect, send, *and* the body read below. A
-    // `Client::timeout` would not cover a peer that answers headers promptly and then dribbles the
-    // body, which is exactly the shape a `wait` behaviour produces.
-    let exchange = tokio::time::timeout(budget, async {
-        let response = client
-            .execute(request.build().map_err(|e| {
-                TryFailure::BadRequest(format!("{url:?} is not a usable request: {e}"))
-            })?)
+
+    // The in-memory "connection": no socket, no address, so there is nothing to misroute to.
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    // `dispatch` is `FnOnce`; the service `hyper` drives needs to be callable through `&self`,
+    // so the closure it takes is called at most once — the `Option` is taken on that one call,
+    // and a stray second one (never expected for a single try exchange) answers loudly rather
+    // than silently reusing state that is gone.
+    let dispatch = Arc::new(Mutex::new(Some(dispatch)));
+    let gone = Arc::new(AtomicBool::new(false));
+
+    // The server half is spawned, and its handle is **kept**: the budget below cancels only the
+    // future it wraps, and the dispatch — the imposter's own handler, `wait` behaviour and all —
+    // runs inside this task. Left detached, a stub slower than the budget would outlive the
+    // request that started it, one orphaned task per try, unbounded and unlogged; the admin
+    // front's own accept loop refuses to orphan a task for the same reason. Aborted once the
+    // exchange has ended, whichever way it ended.
+    let server = {
+        let dispatch = Arc::clone(&dispatch);
+        let gone = Arc::clone(&gone);
+        AbortOnDrop::new(tokio::spawn(async move {
+            let service = service_fn(move |req: Request<Incoming>| {
+                let dispatch = Arc::clone(&dispatch);
+                let gone = Arc::clone(&gone);
+                async move {
+                    let taken = dispatch.lock().expect("dispatch lock poisoned").take();
+                    let Some(dispatch) = taken else {
+                        return Err(TryExchangeEnded);
+                    };
+                    match dispatch(req).await {
+                        Some(response) => Ok(response),
+                        // The imposter left this node between the ownership gate and this
+                        // exchange. Answering with an invented status would be worse than no
+                        // answer at all, so the connection is dropped instead — hyper reports
+                        // that to the client as a send error, which `gone` turns into the
+                        // right message rather than a bare transport string.
+                        None => {
+                            gone.store(true, Ordering::SeqCst);
+                            Err(TryExchangeEnded)
+                        }
+                    }
+                }
+            });
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+            {
+                // Routine when the client half is dropped mid-exchange (a budget expiry, the
+                // `gone` path above) — the caller already has the answer that matters — so
+                // debug, exactly as the admin front's own connection loop logs its ends.
+                tracing::debug!(port, error = %e, "try: in-process serve_connection ended with an error");
+            }
+        }))
+    };
+
+    // One budget over the whole exchange — the handshake, the send, *and* the body read below. A
+    // per-call timeout on the client alone would not cover a dispatch that answers headers
+    // promptly and then dribbles the body, which is exactly the shape a `wait` behaviour produces.
+    let exchange = tokio::time::timeout(budget, async move {
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
             .await
             .map_err(|e| TryFailure::Unreachable(e.to_string()))?;
+        // The client connection is driven on its own task so `send_request` below can await the
+        // response; its errors reach this function through `send_request`/`frame` already, so a
+        // failure here is logged at debug rather than lost. Its handle is kept so the exchange
+        // ends both halves the same way.
+        let client_conn = tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!(port, error = %e, "try: in-process client connection ended with an error");
+            }
+        });
+        let _guard = AbortOnDrop::new(client_conn);
+
+        let response = match sender.send_request(request).await {
+            Ok(response) => response,
+            Err(e) => {
+                return Err(if gone.load(Ordering::SeqCst) {
+                    TryFailure::Unreachable(format!(
+                        "imposter {port} is no longer served by this node: it left between the \
+                         gate and the exchange"
+                    ))
+                } else {
+                    TryFailure::Unreachable(e.to_string())
+                });
+            }
+        };
+
+        // The fault carrier is checked before anything else about the response: a fault is not an
+        // answer, whatever its (fabricated) status or body say.
+        if let Some(fault) = response
+            .headers()
+            .get("x-rift-fault")
+            .and_then(|value| value.to_str().ok())
+            .filter(|name| TCP_FAULT_NAMES.contains(name))
+        {
+            return Err(TryFailure::Fault(fault.to_owned()));
+        }
 
         let status = response.status().as_u16();
         let mut headers_lossy = false;
@@ -5053,39 +5242,54 @@ async fn perform_try(
             })
             .collect();
 
-        // Read chunk by chunk and stop at the cap, rather than buffering the whole body and
-        // slicing it: `bytes()` on a multi-gigabyte response would hold all of it in the admin
-        // process before the cap ever applied.
-        let mut response = response;
+        // Frame by frame, stopping at the cap, for the same reason the pre-#344 chunked read did:
+        // buffering the whole body before slicing it would hold a multi-gigabyte response in the
+        // admin process before the cap ever applied.
+        let mut body = response.into_body();
         let mut collected: Vec<u8> = Vec::new();
         let mut truncated = false;
-        loop {
-            match response.chunk().await {
-                Ok(Some(chunk)) => {
-                    let room = cap.saturating_sub(collected.len());
-                    // `>`, not `>=`. A chunk that exactly fills the remaining room dropped
-                    // nothing, so it must not raise `truncated` — a body of exactly `cap` bytes is
-                    // complete, and reporting it as cut would send an operator looking for content
-                    // that was never missing. If more does follow, the next iteration sees
-                    // `room == 0` and flags it then, which is the moment loss actually happens.
-                    if chunk.len() > room {
-                        collected.extend_from_slice(&chunk[..room]);
-                        truncated = true;
-                        break;
-                    }
-                    collected.extend_from_slice(&chunk);
-                }
-                Ok(None) => break,
-                Err(e) => return Err(TryFailure::Unreachable(e.to_string())),
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| TryFailure::Unreachable(e.to_string()))?;
+            let Some(chunk) = frame.data_ref() else {
+                continue; // trailers carry no body bytes
+            };
+            let room = cap.saturating_sub(collected.len());
+            // `>`, not `>=`. A chunk that exactly fills the remaining room dropped nothing, so it
+            // must not raise `truncated` — a body of exactly `cap` bytes is complete, and
+            // reporting it as cut would send an operator looking for content that was never
+            // missing. If more does follow, the next iteration sees `room == 0` and flags it then,
+            // which is the moment loss actually happens.
+            if chunk.len() > room {
+                collected.extend_from_slice(&chunk[..room]);
+                truncated = true;
+                break;
             }
+            collected.extend_from_slice(chunk);
         }
 
-        Ok((status, headers, headers_lossy, collected, truncated))
+        // The imposter's own timing: measured here, before the teardown below, so what the
+        // operator judges a stub by does not carry the abort of the in-memory connection.
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok((status, headers, headers_lossy, collected, truncated, elapsed_ms))
     })
     .await
-    .map_err(|_| TryFailure::Timeout)??;
+    .map_err(|_| TryFailure::Timeout);
 
-    let (status, headers, headers_lossy, collected, truncated) = exchange;
+    // The exchange has ended, one way or another: stop the server half now rather than letting a
+    // slow dispatch run on. Awaiting the aborted handle is what surfaces a panic inside the
+    // dispatch — the imposter's own handler runs there — which would otherwise vanish with the
+    // handle; a cancellation is the expected outcome and says nothing. Bounded, because the
+    // budget above no longer covers this: an abort lands at the task's next yield, and a
+    // dispatch stuck in a non-yielding section must not extend the caller's wait past it.
+    let server = server.take();
+    server.abort();
+    if let Ok(Err(e)) = tokio::time::timeout(Duration::from_millis(50), server).await
+        && e.is_panic()
+    {
+        tracing::error!(port, error = %e, "try: the in-process dispatch panicked");
+    }
+
+    let (status, headers, headers_lossy, collected, truncated, elapsed_ms) = exchange??;
     let body = String::from_utf8_lossy(&collected);
     let body_lossy = matches!(body, std::borrow::Cow::Owned(_));
     Ok(TryResponse {
@@ -5095,53 +5299,8 @@ async fn perform_try(
         body: body.into_owned(),
         body_lossy,
         truncated,
-        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        elapsed_ms,
     })
-}
-
-/// Is this imposter's configured bind host one the try may reach on loopback (issue #335)?
-///
-/// An imposter may be pinned to a single interface (`{"port":4545,"host":"10.0.0.5"}`). Then
-/// `127.0.0.1:4545` is **not** that imposter — it is whatever else happens to be there, or
-/// nothing — so a try must refuse rather than dial.
-///
-/// The configured host is used as a *predicate*, never as the dial target. Reading it as an
-/// address would be strictly worse than the bug it fixes: `host` is caller-writable through
-/// `POST /imposters`, so dialling it would hand an Editor the arbitrary-URL parameter this
-/// endpoint's whole design exists to withhold. Loopback stays hardcoded; this only decides
-/// whether loopback is *right*.
-///
-/// An absent host means the imposter binds all interfaces, which includes loopback.
-fn imposter_is_on_loopback(config: &serde_json::Value) -> bool {
-    match config.get("host").and_then(serde_json::Value::as_str) {
-        None => true,
-        Some(host) => {
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
-        }
-    }
-}
-
-/// Which scheme to dial an imposter on, read from its own stored config (issue #335).
-///
-/// The whole point is that this is derived, never supplied: [`TryRequest`] has no scheme field
-/// and refuses unknown ones, so a caller cannot talk the server into `https`-ing something that
-/// is not, nor into downgrading one that is.
-///
-/// Anything that is not `"https"` is `http`, including a config with no `protocol` at all.
-/// `control::validate` → `validate_replicable_config` (`rift-cluster/src/control.rs`) refuses any
-/// protocol outside `{http, https}` at the raft-apply gate, so this reads an already-validated
-/// value rather than re-validating one — and the fallback is to the *non-privileged* scheme, so a
-/// hypothetical write path that bypassed that gate would fail a handshake rather than silently
-/// present something as secure.
-fn scheme_for_config(config: &serde_json::Value) -> &'static str {
-    if config.get("protocol").and_then(serde_json::Value::as_str) == Some("https") {
-        "https"
-    } else {
-        "http"
-    }
 }
 
 /// `POST /admin/imposters/{port}/try` (issue #335).
@@ -5187,26 +5346,23 @@ async fn terminate_try_imposter(
         );
     }
 
-    // The scheme is the imposter's own, never the caller's. `get_imposter` is also what makes this
-    // safe to read at all: it is keyed by the authorized tenant, so it cannot reach a config the
-    // ownership gate would have refused.
-    let config = match node.get_imposter(tenant.as_str(), port) {
-        Ok(Some(config)) => match serde_json::from_str::<serde_json::Value>(&config) {
-            Ok(config) => config,
-            Err(e) => return internal(&format!("reading imposter {port}'s config: {e}")),
-        },
+    // `get_imposter` is also what makes this safe to read at all: it is keyed by the authorized
+    // tenant, so it cannot reach a config the ownership gate would have refused. The read proves
+    // the record is this tenant's; it does not by itself prove anything about who answers the
+    // port — that is what the gate below is for.
+    match node.get_imposter(tenant.as_str(), port) {
+        Ok(Some(_)) => {}
         // The ownership gate already passed, so the config disappearing between there and here
         // means it was deleted in between. That is a genuine not-found, and it renders through the
         // same §8.4 body every other refusal on this port does.
         Ok(None) => return tenant_boundary_not_found(),
         Err(e) => return internal(&e.to_string()),
-    };
-    let scheme = scheme_for_config(&config);
+    }
 
-    // **The socket check, and it is load-bearing.** Everything above proves the caller's tenant
-    // owns the imposter *record* on this port. It does not prove that this node's engine is what
-    // is listening on `127.0.0.1:{port}` — and those two facts are decoupled on purpose: a
-    // `PutImposter` whose bind fails still commits and still reads back
+    // **The engine-holds-this-port check, and it is load-bearing.** Everything above proves the
+    // caller's tenant owns the imposter *record* on this port. It does not by itself prove that
+    // this node's engine is the one that will answer — and those two facts are decoupled on
+    // purpose: a `PutImposter` whose bind fails still commits and still reads back
     // (`bind_failure_does_not_fail_apply`), because a bind failure must not wedge the replicated
     // log.
     //
@@ -5214,40 +5370,44 @@ async fn terminate_try_imposter(
     // `ImposterWrite` and `ImposterTry`, so they could create an imposter on a port already held
     // by something else on this box — the metrics listener, the probe listener, the cluster RPC
     // port — and then use the try to send a request of their choosing to it and read the reply.
-    // Every containment property this endpoint claims is downstream of "the thing on that socket
-    // is the imposter you own"; this is where that is actually established.
+    // Every containment property this endpoint claims is downstream of "the thing that answers is
+    // the imposter you own"; this is where that is actually established.
     //
     // The positive form (`is_locally_bound`) is required: `bind_failure(..).is_none()` is also
     // true for a port this node serves nothing on, which is precisely the dangerous case.
     //
-    // **Residual, stated rather than hidden.** This proves the engine holds *a* listener for the
-    // port, not that the listener answering `127.0.0.1:{port}` is that one. An imposter binds
-    // `0.0.0.0` by default, and BSD accepts that alongside an existing `127.0.0.1:{port}` socket —
-    // so on macOS a process holding the more specific address still wins the connection while
-    // `is_bound()` reports true. On Linux the colliding bind is refused and this gate catches it.
-    // Closing the BSD case properly means dialling the socket the engine actually owns, which
-    // needs an upstream accessor for an imposter's bound address that `rift-mock-core` does not
-    // expose today (`Imposter` tracks only `serve_handles`). Filed as a follow-up rather than
-    // approximated here — a heuristic that guessed would read as a guarantee.
-    if !node.is_locally_bound(port) || !imposter_is_on_loopback(&config) {
+    // **The residual this used to carry is gone, not hidden.** Before issue #344 this gate proved
+    // only that the engine *held* the port, not that a loopback dial would reach it — an imposter
+    // binds `0.0.0.0` by default, and BSD accepts that alongside a foreign `127.0.0.1:{port}`
+    // socket, so the more-specific socket still won the connection while this check reported true.
+    // Since #344 there is no dial to misroute: the exchange is dispatched in-process, straight to
+    // the `Arc<Imposter>` this same `is_locally_bound` call resolved, over an in-memory connection
+    // that never touches a socket. The BSD wildcard/REUSEPORT case and the `localhost`-vs-`::1`
+    // variants a loopback dial could not tell apart are all closed at once, by construction —
+    // `a_try_answers_from_this_nodes_engine_not_from_whoever_holds_loopback` pins it.
+    if !node.is_locally_bound(port) {
         return typed_error(
             StatusCode::BAD_GATEWAY,
             ErrorKind::BackendUnavailable,
             &format!(
-                "imposter {port} is not bound on this node's loopback interface, so nothing was \
-                 sent: a try only ever reaches an imposter this node is actually serving"
+                "imposter {port} is not bound by this node's engine, so nothing was dispatched: \
+                 a try only ever answers from an imposter this node is actually serving"
             ),
         );
     }
 
-    let client = match try_client() {
-        Ok(client) => client,
-        Err(e) => return internal(&format!("building the try client: {e}")),
+    let dispatch = {
+        let node = Arc::clone(node);
+        move |req: Request<Incoming>| async move {
+            match node.dispatch_to_imposter(port, req) {
+                Some(answer) => Some(answer.await),
+                None => None,
+            }
+        }
     };
-    let base = format!("{scheme}://127.0.0.1:{port}");
 
     render_try_outcome(
-        perform_try(client, &base, &spec, TRY_BUDGET, TRY_MAX_RESPONSE_BYTES).await,
+        perform_try(dispatch, port, &spec, TRY_BUDGET, TRY_MAX_RESPONSE_BYTES).await,
         port,
     )
 }
@@ -5289,6 +5449,15 @@ fn render_try_outcome(outcome: Result<TryResponse, TryFailure>, port: u16) -> Re
         Err(TryFailure::BadRequest(why)) => {
             typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &why)
         }
+        Err(TryFailure::Fault(name)) => typed_error(
+            StatusCode::BAD_GATEWAY,
+            ErrorKind::BackendUnavailable,
+            &format!(
+                "the imposter's stub on port {port} injects a connection fault ({name}): on the \
+                 wire this connection would be aborted with no response, so there is nothing to \
+                 show"
+            ),
+        ),
     }
 }
 
@@ -8297,9 +8466,10 @@ mod tests {
     /// The try surface (issue #335): exactly `POST /admin/imposters/{port}/try`, and nothing
     /// adjacent to it.
     ///
-    /// The negative half carries the weight. This is the one route that makes the server dial
-    /// out, so every shape that is *not* it must fall through to the proxy rather than be
-    /// generously accepted — a classifier that also matched, say, the canonical `/imposters/`
+    /// The negative half carries the weight. This is the one route that dispatches to the
+    /// imposter's own engine in-process, so every shape that is *not* it must fall through to the
+    /// proxy rather than be generously accepted — a classifier that also matched, say, the
+    /// canonical `/imposters/`
     /// prefix or a `GET` would widen a deliberately narrow capability by accident.
     #[test]
     fn classify_terminates_exactly_the_try_surface() {
@@ -9755,48 +9925,97 @@ mod tests {
         }
     }
 
-    /// Issue #335's exchange rules, against a canned server rather than a cluster.
-    ///
-    /// These are the properties that make the endpoint containable — the budget, the body cap,
-    /// and above all that a redirect is *returned* rather than chased — and every one of them is
-    /// a property of `perform_try` alone. Driving them through a real imposter would need a stub
-    /// per case, a `wait` behaviour that made the timeout test take ten real seconds, and no way
-    /// at all to serve deliberately invalid UTF-8.
+    /// Issue #335's exchange rules — and, since issue #344, the property that makes them all
+    /// hold: **the exchange never opens a socket.** `perform_try` is handed a *dispatch* — in
+    /// production, this node's own engine (`RaftNode::dispatch_to_imposter`) — and speaks HTTP/1
+    /// to it over an in-memory connection. So these tests hand it canned in-process services, not
+    /// canned TCP servers: the budget, the body cap, the lossy flags, that a redirect is *returned*
+    /// rather than chased, and that a connection-fault stub is an explicit outcome are all
+    /// properties of `perform_try` alone, provable in milliseconds without a cluster.
     mod try_exchange {
         use super::*;
-        use std::net::SocketAddr;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::pin::Pin;
+        use std::sync::Mutex;
 
-        /// A server that accepts one connection, reads the request head, then writes `response`
-        /// verbatim. Yields the address and what the request looked like on the wire.
-        async fn canned(response: Vec<u8>) -> (SocketAddr, JoinHandle<String>) {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            let handle = tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let mut seen = Vec::new();
-                let mut buf = [0u8; 4096];
-                // Read until the head is complete. A body may follow; the tests that care about
-                // one send it in the same burst, so this sees it too.
-                loop {
-                    let n = socket.read(&mut buf).await.expect("read");
-                    if n == 0 {
-                        break;
-                    }
-                    seen.extend_from_slice(&buf[..n]);
-                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                socket.write_all(&response).await.expect("write");
-                socket.flush().await.expect("flush");
-                String::from_utf8_lossy(&seen).into_owned()
-            });
-            (addr, handle)
+        /// The record a canned service keeps of the one request it served.
+        #[derive(Debug, Clone)]
+        struct Arrived {
+            method: String,
+            /// `Uri::to_string()` — for an origin-form request this is the path and query.
+            target: String,
+            /// `Uri::authority()` — must always be `None`: the caller's path can never carry one.
+            authority: Option<String>,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
         }
 
-        fn head(status: &str, extra: &str, body_len: usize) -> String {
-            format!("HTTP/1.1 {status}\r\nContent-Length: {body_len}\r\n{extra}\r\n")
+        type Answer = Pin<Box<dyn Future<Output = Option<Response<Full<Bytes>>>> + Send>>;
+
+        /// A canned in-process service: records what arrived, then answers `response`. Returns
+        /// the dispatch `perform_try` takes and the shared record.
+        #[allow(clippy::type_complexity)] // the pair is two test-scaffolding handles, not a domain type worth naming.
+        fn canned(
+            response: Response<Full<Bytes>>,
+        ) -> (
+            impl FnOnce(Request<Incoming>) -> Answer + Send + 'static,
+            Arc<Mutex<Option<Arrived>>>,
+        ) {
+            let seen = Arc::new(Mutex::new(None));
+            let record = Arc::clone(&seen);
+            let dispatch = move |req: Request<Incoming>| -> Answer {
+                Box::pin(async move {
+                    let (parts, body) = req.into_parts();
+                    let body = body
+                        .collect()
+                        .await
+                        .expect("the test body reads")
+                        .to_bytes()
+                        .to_vec();
+                    *record.lock().expect("record") = Some(Arrived {
+                        method: parts.method.to_string(),
+                        target: parts.uri.to_string(),
+                        authority: parts.uri.authority().map(ToString::to_string),
+                        headers: parts
+                            .headers
+                            .iter()
+                            .map(|(name, value)| {
+                                (
+                                    name.as_str().to_owned(),
+                                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                )
+                            })
+                            .collect(),
+                        body,
+                    });
+                    Some(response)
+                })
+            };
+            (dispatch, seen)
+        }
+
+        /// A dispatch that must never be reached: an envelope refused up front is refused
+        /// *before* anything is dispatched, and this is what proves it.
+        fn never() -> impl FnOnce(Request<Incoming>) -> Answer + Send + 'static {
+            |_req: Request<Incoming>| -> Answer {
+                Box::pin(async { panic!("the exchange must not reach the imposter") })
+            }
+        }
+
+        fn answer(
+            status: u16,
+            headers: &[(&str, &[u8])],
+            body: impl Into<Bytes>,
+        ) -> Response<Full<Bytes>> {
+            let mut response = Response::builder().status(status);
+            for (name, value) in headers {
+                response = response.header(
+                    HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                    HeaderValue::from_bytes(value).expect("header value"),
+                );
+            }
+            response
+                .body(Full::new(body.into()))
+                .expect("response builds")
         }
 
         fn spec(method: &str, path: &str) -> TryRequest {
@@ -9808,42 +10027,25 @@ mod tests {
             }
         }
 
-        /// **The production client, deliberately** — not a lookalike built here.
-        ///
-        /// The redirect policy is a property of `try_client`'s builder, so a test that
-        /// constructed its own `Policy::none()` client would prove only that *it* does not follow
-        /// redirects, while a change to the real builder sailed through green. Using the shipped
-        /// client is what makes `a_redirect_is_returned_not_followed` a gate on the containment
-        /// rather than on the test's own setup.
-        fn client() -> &'static reqwest::Client {
-            try_client().expect("the try client builds")
-        }
-
+        const PORT: u16 = 4545;
         const CAP: usize = TRY_MAX_RESPONSE_BYTES;
         const BUDGET: Duration = Duration::from_secs(5);
 
         /// The containment property with the most weight behind it: a `3xx` comes back as data.
         ///
-        /// Following it is the *only* way an exchange pinned to a loopback port by the route and
-        /// the ownership gate could end up talking to something else — a mock is free to answer
-        /// `Location: http://169.254.169.254/`, and a client that chased it would have turned a
-        /// "send a request to a mock you can already see" endpoint into a general-purpose SSRF.
+        /// Following it is the *only* way an exchange could end up talking to something other than
+        /// the imposter — a mock is free to answer `Location: http://169.254.169.254/`, and a
+        /// client that chased it would have turned a "send a request to a mock you can already
+        /// see" endpoint into a general-purpose SSRF. In-process there is nothing to chase *with*
+        /// (no client, no socket), and this pins that the `302` is what the caller sees.
         #[tokio::test]
         async fn a_redirect_is_returned_not_followed() {
             let elsewhere = "http://169.254.169.254/latest/meta-data/";
-            let (addr, server) =
-                canned(head("302 Found", &format!("Location: {elsewhere}\r\n"), 0).into_bytes())
-                    .await;
+            let (dispatch, seen) = canned(answer(302, &[("location", elsewhere.as_bytes())], ""));
 
-            let outcome = perform_try(
-                client(),
-                &format!("http://{addr}"),
-                &spec("GET", "/anything"),
-                BUDGET,
-                CAP,
-            )
-            .await
-            .expect("a redirect is an answer, not a failure");
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/anything"), BUDGET, CAP)
+                .await
+                .expect("a redirect is an answer, not a failure");
 
             assert_eq!(outcome.status, 302, "the redirect itself is the result");
             let location = outcome
@@ -9855,9 +10057,11 @@ mod tests {
                 location.value, elsewhere,
                 "the caller sees where it pointed; the server does not go there"
             );
-            // The canned server serves exactly one connection, so a followed redirect would have
-            // had to dial a second host — this is what proves nothing was chased.
-            server.await.expect("the one and only exchange");
+            let seen = seen.lock().expect("record").clone().expect("one exchange");
+            assert_eq!(
+                seen.target, "/anything",
+                "exactly the one request was dispatched"
+            );
         }
 
         /// The imposter's own failure status is a *successful* try. Conflating it with the
@@ -9866,20 +10070,11 @@ mod tests {
         #[tokio::test]
         async fn an_imposter_error_status_is_a_successful_try() {
             let body = "{\"error\":\"deliberate\"}";
-            let (addr, _server) = canned(
-                format!("{}{body}", head("503 Service Unavailable", "", body.len())).into_bytes(),
-            )
-            .await;
+            let (dispatch, _seen) = canned(answer(503, &[], body));
 
-            let outcome = perform_try(
-                client(),
-                &format!("http://{addr}"),
-                &spec("GET", "/boom"),
-                BUDGET,
-                CAP,
-            )
-            .await
-            .expect("the exchange happened, so it succeeded");
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/boom"), BUDGET, CAP)
+                .await
+                .expect("the exchange happened, so it succeeded");
 
             assert_eq!(outcome.status, 503);
             assert_eq!(outcome.body, body);
@@ -9894,18 +10089,11 @@ mod tests {
         async fn an_oversized_response_body_is_truncated_and_flagged() {
             let cap = 1024;
             let body = "x".repeat(cap * 3);
-            let (addr, _server) =
-                canned(format!("{}{body}", head("200 OK", "", body.len())).into_bytes()).await;
+            let (dispatch, _seen) = canned(answer(200, &[], body));
 
-            let outcome = perform_try(
-                client(),
-                &format!("http://{addr}"),
-                &spec("GET", "/big"),
-                BUDGET,
-                cap,
-            )
-            .await
-            .expect("a big body is still an answer");
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/big"), BUDGET, cap)
+                .await
+                .expect("a big body is still an answer");
 
             assert!(outcome.truncated, "the cut must be declared");
             assert_eq!(
@@ -9920,20 +10108,11 @@ mod tests {
         /// would show an operator replacement characters the mock never sent.
         #[tokio::test]
         async fn a_non_utf8_body_is_flagged_lossy() {
-            let invalid = [0xffu8, 0xfe, 0xfd];
-            let mut response = head("200 OK", "", invalid.len()).into_bytes();
-            response.extend_from_slice(&invalid);
-            let (addr, _server) = canned(response).await;
+            let (dispatch, _seen) = canned(answer(200, &[], vec![0xffu8, 0xfe, 0xfd]));
 
-            let outcome = perform_try(
-                client(),
-                &format!("http://{addr}"),
-                &spec("GET", "/binary"),
-                BUDGET,
-                CAP,
-            )
-            .await
-            .expect("non-text is still an answer");
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/binary"), BUDGET, CAP)
+                .await
+                .expect("non-text is still an answer");
 
             assert!(
                 outcome.body_lossy,
@@ -9946,47 +10125,32 @@ mod tests {
         #[tokio::test]
         async fn a_clean_body_is_not_flagged_lossy_or_truncated() {
             let body = "plain text";
-            let (addr, _server) =
-                canned(format!("{}{body}", head("200 OK", "", body.len())).into_bytes()).await;
+            let (dispatch, _seen) = canned(answer(200, &[], body));
 
-            let outcome = perform_try(
-                client(),
-                &format!("http://{addr}"),
-                &spec("GET", "/plain"),
-                BUDGET,
-                CAP,
-            )
-            .await
-            .expect("answered");
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/plain"), BUDGET, CAP)
+                .await
+                .expect("answered");
 
             assert!(!outcome.body_lossy);
             assert!(!outcome.truncated);
             assert_eq!(outcome.body, body);
         }
 
-        /// The budget covers a peer that answers its head promptly and then stalls — which is
-        /// exactly the shape a `wait` behaviour produces, and exactly what a `Client::timeout`
-        /// alone would not bound.
+        /// The budget bounds the whole exchange. In-process the shape a `wait` behaviour produces
+        /// is a dispatch that simply does not come back in time — and that is a timeout (`504`),
+        /// never an unreachable imposter (`502`).
         #[tokio::test]
-        async fn a_stalled_body_still_hits_the_budget() {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            let _server = tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let mut buf = [0u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                // A complete head promising a body, then nothing at all.
-                socket
-                    .write_all(head("200 OK", "", 1024).as_bytes())
-                    .await
-                    .expect("write head");
-                socket.flush().await.expect("flush");
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            });
+        async fn a_slow_stub_hits_the_budget() {
+            let dispatch = |_req: Request<Incoming>| -> Answer {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Some(answer(200, &[], "too late"))
+                })
+            };
 
             let failure = perform_try(
-                client(),
-                &format!("http://{addr}"),
+                dispatch,
+                PORT,
                 &spec("GET", "/slow"),
                 Duration::from_millis(150),
                 CAP,
@@ -10000,40 +10164,95 @@ mod tests {
             );
         }
 
-        /// A port nothing is listening on is the endpoint's own failure, not the imposter's — so
-        /// it must not arrive as a `200` carrying some invented status.
+        /// The budget does not merely stop *waiting* — it stops the dispatch. The server half runs
+        /// the imposter's handler on its own task, and a timeout that only abandoned it would leave
+        /// one orphaned task per slow try, holding the engine, unbounded and unlogged.
         #[tokio::test]
-        async fn an_unreachable_port_is_a_failure_not_a_result() {
-            // Bind and drop: the port is real, freshly unused, and refuses immediately.
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            drop(listener);
+        async fn a_timed_out_dispatch_is_stopped_not_orphaned() {
+            let finished = Arc::new(AtomicBool::new(false));
+            let dispatch = {
+                let finished = Arc::clone(&finished);
+                move |_req: Request<Incoming>| -> Answer {
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        finished.store(true, Ordering::SeqCst);
+                        Some(answer(200, &[], "too late"))
+                    })
+                }
+            };
 
             let failure = perform_try(
-                client(),
-                &format!("http://{addr}"),
-                &spec("GET", "/nobody-home"),
-                BUDGET,
+                dispatch,
+                PORT,
+                &spec("GET", "/slow"),
+                Duration::from_millis(100),
                 CAP,
             )
             .await
-            .expect_err("nothing answered");
+            .expect_err("the budget must expire");
+            assert!(matches!(failure, TryFailure::Timeout), "{failure:?}");
 
+            // Well past the dispatch's own sleep: had it been left running it would have finished.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert!(
+                !finished.load(Ordering::SeqCst),
+                "the dispatch outlived the try that started it"
+            );
+        }
+
+        /// A dispatch that panics — the imposter's own handler runs there — is the endpoint's
+        /// failure, reported and bounded, never a hang: the server half dies, the client half sees
+        /// the connection close, and the try answers `Unreachable`.
+        #[tokio::test]
+        async fn a_panicking_dispatch_is_a_bounded_failure_not_a_hang() {
+            let dispatch = |_req: Request<Incoming>| -> Answer {
+                Box::pin(async { panic!("the imposter's handler blew up") })
+            };
+
+            let failure = tokio::time::timeout(
+                Duration::from_secs(2),
+                perform_try(dispatch, PORT, &spec("GET", "/boom"), BUDGET, CAP),
+            )
+            .await
+            .expect("answers well inside the budget")
+            .expect_err("a panic is not an answer");
             assert!(
                 matches!(failure, TryFailure::Unreachable(_)),
-                "a refused dial is unreachable (→502), not a timeout (→504): {failure:?}"
+                "the exchange ended without a response: {failure:?}"
+            );
+        }
+
+        /// An imposter this node no longer serves — deleted between the gate and the exchange —
+        /// is the endpoint's own failure, not the imposter's: it must not arrive as a `200`
+        /// carrying some invented status, nor as the engine's own "no imposter on port" body
+        /// dressed up as the mock's answer.
+        #[tokio::test]
+        async fn an_imposter_that_left_this_node_is_a_failure_not_a_result() {
+            let dispatch = |_req: Request<Incoming>| -> Answer { Box::pin(async { None }) };
+
+            let failure = perform_try(dispatch, PORT, &spec("GET", "/nobody-home"), BUDGET, CAP)
+                .await
+                .expect_err("nothing answered");
+
+            let TryFailure::Unreachable(why) = &failure else {
+                panic!("a vanished imposter is unreachable (→502), not {failure:?}");
+            };
+            assert!(
+                why.contains("no longer") || why.contains("not served"),
+                "the reason names the imposter leaving, not a transport error: {why}"
             );
         }
 
         /// The method, path, headers and body reach the imposter as the caller wrote them — the
         /// endpoint is a conduit, and a stub that matches on any of them must see the real thing.
+        /// And what arrives is origin-form: a path, never an authority.
         #[tokio::test]
         async fn the_caller_s_own_request_is_what_arrives() {
-            let (addr, server) = canned(head("200 OK", "", 0).into_bytes()).await;
+            let (dispatch, seen) = canned(answer(200, &[], ""));
 
             let outcome = perform_try(
-                client(),
-                &format!("http://{addr}"),
+                dispatch,
+                PORT,
                 &TryRequest {
                     method: "PATCH".to_owned(),
                     path: "/orders/7?status=open".to_owned(),
@@ -10057,52 +10276,186 @@ mod tests {
             .expect("answered");
             assert_eq!(outcome.status, 200);
 
-            let seen = server.await.expect("the server recorded the request");
-            assert!(
-                seen.starts_with("PATCH /orders/7?status=open "),
-                "method and target arrive verbatim, query included: {seen:?}"
+            let seen = seen
+                .lock()
+                .expect("record")
+                .clone()
+                .expect("the service recorded it");
+            assert_eq!(seen.method, "PATCH");
+            assert_eq!(
+                seen.target, "/orders/7?status=open",
+                "target arrives verbatim, query included"
             );
-            assert!(seen.contains("x-trace: abc"), "{seen:?}");
-            assert!(
-                seen.contains("x-trace: def"),
-                "both values of a repeated header survive: {seen:?}"
+            assert_eq!(
+                seen.authority, None,
+                "origin-form: no authority can be expressed"
             );
-            assert!(seen.contains("{\"qty\":2}"), "{seen:?}");
+            let traces: Vec<&str> = seen
+                .headers
+                .iter()
+                .filter(|(name, _)| name == "x-trace")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(
+                traces,
+                ["abc", "def"],
+                "both values of a repeated header survive, in order"
+            );
+            // HTTP/1.1 needs a Host; the caller sent none, so the imposter's own loopback name is
+            // supplied — a stub matching on `host` sees what a real loopback dial would carry.
+            let host = seen
+                .headers
+                .iter()
+                .find(|(name, _)| name == "host")
+                .map(|(_, value)| value.as_str());
+            assert_eq!(host, Some("127.0.0.1:4545"));
+            assert_eq!(seen.body, b"{\"qty\":2}");
         }
 
-        /// An unusable method token is the caller's mistake (`400`), not the imposter's failure
-        /// (`502`) — and it must be caught before anything is dialled.
+        /// A caller who sets `Host` themselves keeps it: a stub that matches on a virtual host
+        /// must be reachable, and the endpoint has no reason to overrule an explicit header.
         #[tokio::test]
-        async fn an_invalid_method_token_is_a_bad_request() {
-            let failure = perform_try(
-                client(),
-                "http://127.0.0.1:1",
-                &spec("GET SPACE", "/x"),
+        async fn a_caller_supplied_host_header_is_kept() {
+            let (dispatch, seen) = canned(answer(200, &[], ""));
+
+            perform_try(
+                dispatch,
+                PORT,
+                &TryRequest {
+                    method: "GET".to_owned(),
+                    path: "/".to_owned(),
+                    headers: vec![TryHeader {
+                        name: "Host".to_owned(),
+                        value: "shop.example".to_owned(),
+                    }],
+                    body: None,
+                },
                 BUDGET,
                 CAP,
             )
             .await
-            .expect_err("not a method");
+            .expect("answered");
+
+            let seen = seen.lock().expect("record").clone().expect("recorded");
+            let hosts: Vec<&str> = seen
+                .headers
+                .iter()
+                .filter(|(name, _)| name == "host")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(hosts, ["shop.example"], "one Host, the caller's");
+        }
+
+        /// Framing is the transport's. A caller-supplied `Content-Length` that disagrees with the
+        /// body would be honoured by hyper over the real length and stall the exchange into a
+        /// `504` that reads as the imposter's fault; so it, and `Transfer-Encoding`, are dropped
+        /// and the body arrives framed from what was actually sent.
+        #[tokio::test]
+        async fn caller_supplied_framing_headers_are_replaced_by_the_real_ones() {
+            let (dispatch, seen) = canned(answer(200, &[], ""));
+
+            perform_try(
+                dispatch,
+                PORT,
+                &TryRequest {
+                    method: "POST".to_owned(),
+                    path: "/orders".to_owned(),
+                    headers: vec![
+                        TryHeader {
+                            name: "Content-Length".to_owned(),
+                            value: "999".to_owned(),
+                        },
+                        TryHeader {
+                            name: "Transfer-Encoding".to_owned(),
+                            value: "chunked".to_owned(),
+                        },
+                    ],
+                    body: Some("ab".to_owned()),
+                },
+                BUDGET,
+                CAP,
+            )
+            .await
+            .expect("answered, not stalled");
+
+            let seen = seen.lock().expect("record").clone().expect("recorded");
+            assert_eq!(seen.body, b"ab", "the body is what was sent");
+            let lengths: Vec<&str> = seen
+                .headers
+                .iter()
+                .filter(|(name, _)| name == "content-length")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(
+                lengths,
+                ["2"],
+                "framed from the real body, not the caller's claim"
+            );
+            assert!(
+                !seen
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == "transfer-encoding"),
+                "no caller-chosen transfer coding: {:?}",
+                seen.headers
+            );
+        }
+
+        /// An unusable method token is the caller's mistake (`400`), not the imposter's failure
+        /// (`502`) — and it must be caught before anything is dispatched.
+        #[tokio::test]
+        async fn an_invalid_method_token_is_a_bad_request() {
+            let failure = perform_try(never(), PORT, &spec("GET SPACE", "/x"), BUDGET, CAP)
+                .await
+                .expect_err("not a method");
 
             assert!(matches!(failure, TryFailure::BadRequest(_)), "{failure:?}");
         }
 
+        /// The same for a header the wire cannot carry: a name with a space, a value with a
+        /// newline. Refused as the caller's own error, before dispatch — never passed to hyper to
+        /// fail as something that reads like the imposter's fault.
+        #[tokio::test]
+        async fn an_unusable_header_is_a_bad_request() {
+            for (name, value) in [("X Bad", "ok"), ("X-Ok", "line\r\nbreak")] {
+                let failure = perform_try(
+                    never(),
+                    PORT,
+                    &TryRequest {
+                        method: "GET".to_owned(),
+                        path: "/".to_owned(),
+                        headers: vec![TryHeader {
+                            name: name.to_owned(),
+                            value: value.to_owned(),
+                        }],
+                        body: None,
+                    },
+                    BUDGET,
+                    CAP,
+                )
+                .await
+                .expect_err("not a header");
+                assert!(
+                    matches!(failure, TryFailure::BadRequest(_)),
+                    "{name:?}: {value:?} → {failure:?}"
+                );
+            }
+        }
+
         /// **No path can steer the exchange off the imposter.**
         ///
-        /// The route pins the host and port, and this is the only other caller-controlled input
-        /// that participates in building the URL — so if anything here could move the origin, the
-        /// whole containment argument collapses and the endpoint becomes a general-purpose SSRF
-        /// with an authorization check in front of it.
+        /// Since #344 there is no URL to assemble and no host to reach — the dispatch *is* the
+        /// imposter — but the path is still the one caller-controlled input that becomes the
+        /// request target, and a target carrying an authority would be exactly what a future
+        /// change back to a client would need. So every hostile spelling must arrive as a bare
+        /// origin-form target with no authority, or be refused; never anything else.
         ///
         /// Each of these is a real technique against naive URL assembly, not a hypothetical:
-        /// `//host` is protocol-relative and is exactly what `Url::join` would resolve away from
-        /// the base; `@` re-reads what precedes it as userinfo when it lands before the first
-        /// slash; `\` is folded to `/` by some parsers; a control character can attempt request
-        /// splitting. Every one must either stay on the loopback origin or be refused — never
-        /// silently retargeted.
-        #[test]
-        fn no_path_can_move_the_exchange_off_the_imposter() {
-            let base = "http://127.0.0.1:4545";
+        /// `//host` is protocol-relative; `@` re-reads what precedes it as userinfo when it lands
+        /// before the first slash; `\` is folded to `/` by some parsers; a control character can
+        /// attempt request splitting.
+        #[tokio::test]
+        async fn no_path_can_move_the_exchange_off_the_imposter() {
             for hostile in [
                 "//evil.com/",
                 "//evil.com:80/x",
@@ -10115,17 +10468,41 @@ mod tests {
                 "/\u{0000}",
                 "/%2f%2fevil.com",
                 "/x\tHTTP/1.1",
+                // Absolute-form and the other `PathAndQuery` starts: a request line the peer
+                // would reject must be the caller's 400, never a 502 blaming the imposter.
+                "http://evil.com/",
+                "*",
+                "?x",
+                "#x",
+                "",
             ] {
-                match try_target(base, hostile) {
-                    Ok(url) => {
+                let (dispatch, seen) = canned(answer(200, &[], ""));
+                match perform_try(dispatch, PORT, &spec("GET", hostile), BUDGET, CAP).await {
+                    Ok(_) => {
+                        let seen = seen.lock().expect("record").clone().expect("dispatched");
                         assert_eq!(
-                            url.origin().ascii_serialization(),
-                            "http://127.0.0.1:4545",
-                            "{hostile:?} was accepted but left the imposter's origin"
+                            seen.authority, None,
+                            "{hostile:?} was accepted but arrived with an authority"
+                        );
+                        assert!(
+                            seen.target.starts_with('/'),
+                            "{hostile:?} arrived as {:?}, not origin-form",
+                            seen.target
+                        );
+                        let hosts: Vec<&str> = seen
+                            .headers
+                            .iter()
+                            .filter(|(name, _)| name == "host")
+                            .map(|(_, value)| value.as_str())
+                            .collect();
+                        assert_eq!(
+                            hosts,
+                            ["127.0.0.1:4545"],
+                            "{hostile:?} must not smuggle a second Host"
                         );
                     }
-                    // Refusing is equally correct — what must not happen is a *different* origin
-                    // being dialled.
+                    // Refusing is equally correct — what must not happen is a *different* target
+                    // being reached, or a transport-shaped failure blaming the imposter.
                     Err(TryFailure::BadRequest(_)) => {}
                     Err(other) => panic!("{hostile:?} failed for the wrong reason: {other:?}"),
                 }
@@ -10134,72 +10511,50 @@ mod tests {
 
         /// The ordinary paths an operator actually sends still work — otherwise the check above
         /// could be satisfied by refusing everything.
-        #[test]
-        fn an_ordinary_path_survives_the_origin_check() {
+        #[tokio::test]
+        async fn an_ordinary_path_survives_the_origin_check() {
             for good in ["/", "/orders", "/orders/7?status=open&q=a+b", "/a%20b"] {
-                let url = try_target("http://127.0.0.1:4545", good)
+                let (dispatch, seen) = canned(answer(200, &[], ""));
+                perform_try(dispatch, PORT, &spec("GET", good), BUDGET, CAP)
+                    .await
                     .unwrap_or_else(|e| panic!("{good:?} must be usable: {e:?}"));
-                assert_eq!(url.origin().ascii_serialization(), "http://127.0.0.1:4545");
+                let seen = seen.lock().expect("record").clone().expect("dispatched");
+                assert_eq!(seen.target, good, "arrives verbatim");
             }
-            // And the https base keeps its scheme rather than being normalised to the http one.
-            let url = try_target("https://127.0.0.1:4545", "/x").expect("https base is usable");
-            assert_eq!(url.scheme(), "https");
         }
 
-        /// The scheme is derived from the imposter's stored config and from nothing else.
-        ///
-        /// `TryRequest` has no scheme field and `deny_unknown_fields`, so this function is the
-        /// only input to the decision — which is what stops a caller downgrading an `https`
-        /// imposter or aiming `https` at a plain one.
-        #[test]
-        fn the_scheme_comes_from_the_imposters_own_protocol() {
-            let config = |raw: &str| serde_json::from_str::<serde_json::Value>(raw).expect("json");
-            assert_eq!(
-                scheme_for_config(&config(r#"{"port":4545,"protocol":"https"}"#)),
-                "https"
-            );
-            assert_eq!(
-                scheme_for_config(&config(r#"{"port":4545,"protocol":"http"}"#)),
-                "http"
-            );
-            // `control::validate` refuses anything outside http/https at write time, so a config
-            // reaching here without a usable protocol is not a case to guess about — it dials
-            // plain, which is what every imposter this fleet can actually hold is.
-            assert_eq!(scheme_for_config(&config(r#"{"port":4545}"#)), "http");
-        }
+        /// A stub that injects a connection-level fault answers, in-process, with the engine's
+        /// carrier response — a `502` that on the wire is never sent, because the serve loop
+        /// aborts the socket instead. Presenting that carrier as "the imposter said 502" would
+        /// be a fabricated answer; the try says what the wire would have done. And the `error`
+        /// fault — a real `5xx` the wire does send — stays a successful try, so the two must not
+        /// be conflated by the header alone.
+        #[tokio::test]
+        async fn a_connection_fault_carrier_is_an_explicit_transport_outcome() {
+            for name in [
+                "CONNECTION_RESET_BY_PEER",
+                "reset",
+                "EMPTY_RESPONSE",
+                "RANDOM_DATA_THEN_CLOSE",
+                "malformed",
+            ] {
+                let (dispatch, _seen) =
+                    canned(answer(502, &[("x-rift-fault", name.as_bytes())], ""));
+                let failure = perform_try(dispatch, PORT, &spec("GET", "/reset"), BUDGET, CAP)
+                    .await
+                    .expect_err("a connection fault is not an answer");
+                let TryFailure::Fault(reported) = &failure else {
+                    panic!("{name}: expected an explicit fault outcome, got {failure:?}");
+                };
+                assert_eq!(reported, name, "the fault is named as the stub spelled it");
+            }
 
-        /// The configured bind host decides **whether loopback is the right target**, and is never
-        /// itself dialled.
-        ///
-        /// The distinction is the whole point: `host` is caller-writable through `POST /imposters`,
-        /// so treating it as an address would hand an Editor exactly the arbitrary-target
-        /// parameter this endpoint withholds. An imposter pinned to a real interface is refused,
-        /// not chased.
-        #[test]
-        fn only_a_loopback_bound_imposter_is_reachable_by_a_try() {
-            let config = |raw: &str| serde_json::from_str::<serde_json::Value>(raw).expect("json");
-            // Absent host = all interfaces, which includes loopback.
-            assert!(imposter_is_on_loopback(&config(r#"{"port":4545}"#)));
-            for ok in [
-                r#"{"host":"127.0.0.1"}"#,
-                r#"{"host":"localhost"}"#,
-                r#"{"host":"::1"}"#,
-                r#"{"host":"0.0.0.0"}"#,
-                r#"{"host":"127.0.0.5"}"#,
-            ] {
-                assert!(imposter_is_on_loopback(&config(ok)), "{ok}");
-            }
-            for refused in [
-                r#"{"host":"10.0.0.5"}"#,
-                r#"{"host":"169.254.169.254"}"#,
-                r#"{"host":"example.com"}"#,
-                r#"{"host":"192.168.1.1"}"#,
-            ] {
-                assert!(
-                    !imposter_is_on_loopback(&config(refused)),
-                    "{refused} must refuse the try rather than have loopback dialled on its behalf"
-                );
-            }
+            let (dispatch, _seen) = canned(answer(500, &[("x-rift-fault", b"error")], "injected"));
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/error"), BUDGET, CAP)
+                .await
+                .expect("an `error` fault is a real response the wire sends");
+            assert_eq!(outcome.status, 500);
+            assert_eq!(outcome.body, "injected");
         }
 
         /// A caller cannot smuggle in addressing of its own. The envelope is closed, so a `host`,
@@ -10292,12 +10647,21 @@ mod tests {
             assert_eq!(
                 render_try_outcome(Err(TryFailure::Unreachable("refused".into())), 4545).status(),
                 StatusCode::BAD_GATEWAY,
-                "a failed dial is 502, never 504"
+                "a failed exchange is 502, never 504"
             );
             assert_eq!(
                 render_try_outcome(Err(TryFailure::BadRequest("nope".into())), 4545).status(),
                 StatusCode::BAD_REQUEST,
                 "the caller's own malformed envelope is 400 — not the imposter's fault"
+            );
+            let fault = render_try_outcome(
+                Err(TryFailure::Fault("CONNECTION_RESET_BY_PEER".into())),
+                4545,
+            );
+            assert_eq!(
+                fault.status(),
+                StatusCode::BAD_GATEWAY,
+                "a connection fault the stub injects is 502: on the wire there is no response"
             );
         }
 
@@ -10310,18 +10674,11 @@ mod tests {
         async fn a_body_exactly_at_the_cap_is_complete_not_truncated() {
             let cap = 512;
             let body = "y".repeat(cap);
-            let (addr, _server) =
-                canned(format!("{}{body}", head("200 OK", "", body.len())).into_bytes()).await;
+            let (dispatch, _seen) = canned(answer(200, &[], body));
 
-            let outcome = perform_try(
-                client(),
-                &format!("http://{addr}"),
-                &spec("GET", "/exact"),
-                BUDGET,
-                cap,
-            )
-            .await
-            .expect("answered");
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/exact"), BUDGET, cap)
+                .await
+                .expect("answered");
 
             assert_eq!(outcome.body.len(), cap);
             assert!(
@@ -10337,26 +10694,19 @@ mod tests {
         /// substitution shows the operator characters the mock never sent.
         #[tokio::test]
         async fn a_non_utf8_header_value_is_flagged_lossy() {
-            let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Sig: ".to_vec();
-            response.extend_from_slice(&[0xff, 0xfe]);
-            response.extend_from_slice(b"\r\n\r\n");
-            let (addr, _server) = canned(response).await;
+            let (dispatch, _seen) = canned(answer(200, &[("x-sig", &[0xff, 0xfe])], ""));
 
-            let outcome = perform_try(
-                client(),
-                &format!("http://{addr}"),
-                &spec("GET", "/hdr"),
-                BUDGET,
-                CAP,
-            )
-            .await
-            .expect("answered");
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/hdr"), BUDGET, CAP)
+                .await
+                .expect("answered");
 
-            assert!(
-                outcome.headers_lossy,
-                "the substitution in X-Sig must be declared: {:?}",
-                outcome.headers
-            );
+            assert!(outcome.headers_lossy, "the substitution must be declared");
+            let sig = outcome
+                .headers
+                .iter()
+                .find(|h| h.name == "x-sig")
+                .expect("the header is reported, not dropped");
+            assert!(sig.value.contains('\u{fffd}'));
             assert!(
                 !outcome.body_lossy,
                 "the body was clean — the two flags must not be conflated"
@@ -10366,52 +10716,13 @@ mod tests {
         /// And clean headers are not flagged, or the flag says nothing.
         #[tokio::test]
         async fn clean_headers_are_not_flagged_lossy() {
-            let (addr, _server) = canned(head("200 OK", "X-Sig: abc\r\n", 0).into_bytes()).await;
+            let (dispatch, _seen) = canned(answer(200, &[("x-sig", b"abc")], ""));
 
-            let outcome = perform_try(
-                client(),
-                &format!("http://{addr}"),
-                &spec("GET", "/hdr"),
-                BUDGET,
-                CAP,
-            )
-            .await
-            .expect("answered");
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/hdr"), BUDGET, CAP)
+                .await
+                .expect("answered");
 
             assert!(!outcome.headers_lossy);
-        }
-
-        /// The `https` scheme reaches a TLS handshake rather than dying in the client builder.
-        ///
-        /// `rift-cluster-server` gets `reqwest` from the workspace pin **for its `rustls-tls`
-        /// feature**; without a TLS backend compiled in, every https try would fail identically
-        /// for a reason that has nothing to do with the imposter. Dialling a dead port and
-        /// requiring the failure to be a *connection* failure is what distinguishes "the feature
-        /// is wired" from "https is silently impossible" — the latter would otherwise only be
-        /// discovered by the first operator with an https stub.
-        #[tokio::test]
-        async fn an_https_try_reaches_the_transport_rather_than_failing_to_build() {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            drop(listener);
-
-            let failure = perform_try(
-                client(),
-                &format!("https://{addr}"),
-                &spec("GET", "/x"),
-                BUDGET,
-                CAP,
-            )
-            .await
-            .expect_err("nothing is listening");
-
-            let TryFailure::Unreachable(why) = &failure else {
-                panic!("an https dial must fail as unreachable, not as {failure:?}");
-            };
-            assert!(
-                !why.contains("TLS backend") && !why.contains("unknown scheme"),
-                "https failed before the transport — the TLS feature is not compiled in: {why}"
-            );
         }
 
         /// The published budget and cap are the ones the handler actually uses. Both are quoted
