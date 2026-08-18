@@ -26,7 +26,17 @@ the store from `ContextScope` (`_rift.flowState.contextScope`) and the port.
 | Scope | Prefix | Meaning |
 |---|---|---|
 | `imposter` (default) | `i<port>:` | Per-imposter namespace — the single-node semantics, restored |
-| `fleet` | `f:` | One namespace fleet-wide — imposters deliberately share contexts |
+| `tenant` (#288) | `t<tenant>:` | One namespace per tenant, across that tenant's imposters — never reachable from another tenant's |
+| `fleet` | `f:` | One namespace fleet-wide — imposters deliberately share contexts across tenants; admission requires `FleetAdmin` |
+
+The tenant arm has one wrinkle the other two do not: the tenant is not in
+`ImposterConfig` (RFC-002 keeps it on the control-plane record, invisible to
+the core schema). The provider therefore resolves it once, at `provide` time,
+from the state machine's owner of the port — ports are fleet-unique across
+tenants, so port → tenant is a function — and a store whose tenant cannot be
+resolved renders `t??:`, its own defensive namespace, never a real tenant's and
+never the fleet's (the same rule the portless `i?:` arm follows; a tenant id
+cannot contain `?`, so the placeholder is unreachable by any admitted tenant).
 
 Two properties make this the right seam:
 
@@ -44,20 +54,31 @@ Two properties make this the right seam:
 no tenant component, and one `FlowNet` shard serves every imposter on a node. So
 two tenants that both opt into `fleet` share one namespace and can read or
 overwrite each other's flow state by naming the same id. That is inherent to what
-`fleet` means today and is gated by nothing — RFC-005 §S1 specifies an
-admission gate on `FleetAdmin`, which has not shipped (issue #288).
+`fleet` means — a fleet-wide namespace by design; tenant isolation is what
+`tenant` scope is for — which is why admitting a config that sets it requires
+`FleetAdmin` (RFC-005 §S1, issue #288): the admin front refuses any other
+principal's client-supplied config carrying the knob with a `400` before
+anything commits, and the source puller refuses a document carrying it once the
+admin plane is enforced (a credential configured or any principal existing) — a
+pull has no principal to hold the role. Under the open
+admin plane (no principal) nothing gates, as nothing else does. The gate is on
+*setting* the scope: a stub edit on an admitted fleet-scoped imposter is not
+gated, and a store built before its config row is visible renders `t??:` only
+until the next op resolves the tenant.
 
 The consequence for admin surfaces is the part worth stating, because it is not
 obvious from the table: **a fleet-scoped imposter's spaces are not enumerable
-per-imposter.** `GET /imposters/{port}/spaces` (issue #374) refuses them with
-`unavailable: "fleet-scope"` rather than scanning `f:`, which would hand one
-tenant another tenant's flow ids, entry counts and owning nodes. Reading a *named*
-space (`GET .../spaces/{flowId}`) is unaffected: it answers about an id the caller
-already holds, whereas a listing is what turns "know the id" into "enumerate
-them", and flow ids routinely come from request headers (`flowIdSource:
-header:X-Session`), so the ids themselves can carry customer identifiers.
-The refusal is not narrowed to non-admins because the `FleetAdmin` gate does not
-exist yet; when #288 lands, it is what the listing should be gated on instead.
+per-imposter, except by a `FleetAdmin`.** `GET /imposters/{port}/spaces` (issue
+#374) refuses them for every other caller with `unavailable: "fleet-scope"` rather
+than scanning `f:`, which would hand one tenant another tenant's flow ids, entry
+counts and owning nodes; a `FleetAdmin` binding — whose whole role is to cross
+every tenant's boundary — is served the real fleet-wide list (#288). Reading a
+*named* space (`GET .../spaces/{flowId}`) is unaffected: it answers about an id
+the caller already holds, whereas a listing is what turns "know the id" into
+"enumerate them", and flow ids routinely come from request headers
+(`flowIdSource: header:X-Session`), so the ids themselves can carry customer
+identifiers. A `tenant`-scoped imposter's listing is served to its tenant: the
+`t<tenant>:` prefix bounds the scan by construction.
 
 It also settles a limitation the durable tier records below: a repair path could
 not previously tell which imposter a `flow_id` belonged to. Now the id says.

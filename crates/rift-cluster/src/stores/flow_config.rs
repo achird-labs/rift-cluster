@@ -48,6 +48,11 @@ pub enum ContextScope {
     /// imposter isolates them without anyone asking.
     #[default]
     Imposter,
+    /// One namespace per tenant, shared across that tenant's imposters: a
+    /// suite spanning two of a tenant's mocks can carry one session between
+    /// them, without crossing into another tenant's contexts (RFC-005 §3.5,
+    /// #288).
+    Tenant,
     /// One namespace for the whole fleet: imposters deliberately share
     /// contexts, so a suite spanning two mocks can carry one session across
     /// both.
@@ -62,10 +67,10 @@ impl ContextScope {
     /// happens to read like `i6400:cart` cannot otherwise be made to collide
     /// with imposter 6400's `cart`.
     #[must_use]
-    pub fn prefix_for(self, port: Option<u16>) -> String {
-        match (self, port) {
-            (Self::Fleet, _) => "f:".to_owned(),
-            (Self::Imposter, Some(port)) => format!("i{port}:"),
+    pub fn prefix_for(self, port: Option<u16>, tenant: Option<&str>) -> String {
+        match (self, port, tenant) {
+            (Self::Fleet, ..) => "f:".to_owned(),
+            (Self::Imposter, Some(port), _) => format!("i{port}:"),
             // Admission refuses a portless config (`validate_replicable_config`),
             // and upstream's manager assigns the port back into the config
             // before the provider ever sees it, so this is doubly unreachable.
@@ -76,13 +81,36 @@ impl ContextScope {
             // here, every portless imposter would quietly share this one
             // namespace — a silent regression of #152, and this is the only
             // thing that would make it greppable.
-            (Self::Imposter, None) => {
+            (Self::Imposter, None, _) => {
                 tracing::error!(
                     "imposter-scoped flow store built without a port; falling back to an isolated \
                      placeholder namespace. Every portless imposter shares it — this should be \
                      unreachable, so it means an admission path stopped requiring a port."
                 );
                 "i?:".to_owned()
+            }
+            (Self::Tenant, _, Some(tenant)) => format!("t{tenant}:"),
+            // Ports are fleet-unique across tenants (RFC-002 §3.2), so port -> tenant is a
+            // function and this should always resolve by the time a tenant-scoped store is
+            // built. The one place it can legitimately fail is a race between the config row
+            // landing and the provider being driven — see `ClusteredFlowStoreProvider::provide`.
+            // The fallback must not be a real tenant's prefix, nor the fleet's: an unresolved
+            // tenant sharing either would be exactly the cross-tenant bleed this scope exists to
+            // prevent. Logged for the same reason as the portless imposter arm above.
+            //
+            // `??`, not a single `?`: a tenant id is `[a-z0-9][a-z0-9-]{0,63}`
+            // (`control::is_tenant_slug`), which forbids `?` entirely, so one `?` would be a
+            // safe placeholder against any *legally admitted* tenant — but this function takes a
+            // bare `&str`, not a `TenantId`, and does not itself re-check the charset. Doubling
+            // the marker keeps the placeholder unreachable even from a caller that skipped
+            // validation and handed this a literal `"?"`.
+            (Self::Tenant, _, None) => {
+                tracing::error!(
+                    "tenant-scoped flow store built without a resolved tenant; falling back to \
+                     an isolated placeholder namespace. This must never fall into a real tenant's \
+                     namespace or the fleet's."
+                );
+                "t??:".to_owned()
             }
         }
     }
@@ -96,8 +124,8 @@ impl ContextScope {
     /// exactly the disagreement that would send an operator to the wrong node,
     /// so there is one function and both call it.
     #[must_use]
-    pub fn scoped_flow_id(self, port: Option<u16>, flow_id: &str) -> String {
-        format!("{}{flow_id}", self.prefix_for(port))
+    pub fn scoped_flow_id(self, port: Option<u16>, tenant: Option<&str>, flow_id: &str) -> String {
+        format!("{}{flow_id}", self.prefix_for(port, tenant))
     }
 }
 
@@ -130,6 +158,18 @@ const KEY_DURABILITY: &str = "durability";
 const KEY_CONTEXT_SCOPE: &str = "contextScope";
 
 impl FlowConfig {
+    /// The [`ContextScope`] a config *declares*, for the two admission gates that
+    /// ask only that (#288): the admin front's `FleetAdmin` gate on client-supplied
+    /// configs and the source puller's refusal of fleet scope. `None` when the
+    /// `flowState` block does not parse at all — not an error to swallow here,
+    /// because [`Self::validate`] refuses exactly those configs on the same
+    /// path before anything commits; a caller that needs the reason calls
+    /// [`Self::from_imposter`].
+    #[must_use]
+    pub fn declared_scope(config: &ImposterConfig) -> Option<ContextScope> {
+        Self::from_imposter(config).ok().map(|parsed| parsed.scope)
+    }
+
     /// Parse an imposter's `flowState` block. Absent block ⇒ all defaults —
     /// under `--cluster` every imposter gets the clustered store, configured or
     /// not, because scenario state on one node behind a round-robin LB is
@@ -176,18 +216,11 @@ impl FlowConfig {
             None => ContextScope::Imposter,
             Some(value) => match value.as_str() {
                 Some("imposter") => ContextScope::Imposter,
+                Some("tenant") => ContextScope::Tenant,
                 Some("fleet") => ContextScope::Fleet,
-                // Reserved, not unknown: the message names the work that
-                // activates it, so a config written for a later build reads as
-                // "not yet" rather than as a typo.
-                Some("tenant") => {
-                    return Err(format!(
-                        "flowState.{KEY_CONTEXT_SCOPE} reserved value \"tenant\": tenant scope arrives with RFC-002 (#17); accepted: \"imposter\", \"fleet\""
-                    ));
-                }
                 _ => {
                     return Err(format!(
-                        "flowState.{KEY_CONTEXT_SCOPE} must be \"imposter\" or \"fleet\", got {value}"
+                        "flowState.{KEY_CONTEXT_SCOPE} must be \"imposter\", \"tenant\" or \"fleet\", got {value}"
                     ));
                 }
             },
@@ -460,17 +493,106 @@ mod tests {
         assert!(err.contains("fleet"), "{err}");
     }
 
-    /// `tenant` is reserved, not unknown: it is the scope RFC-002 activates, so
-    /// the refusal points at that work rather than reading as a typo.
+    /// RFC-005 S1 (#288): `tenant` is a real scope now that RFC-002 shipped, so the reservation
+    /// is lifted — the parser accepts it, and an unknown value's message names all three.
     #[test]
-    fn the_reserved_tenant_scope_is_refused_naming_its_successor() {
-        let err = FlowConfig::validate(&imposter(serde_json::json!({ "contextScope": "tenant" })))
-            .expect_err("tenant scope must refuse");
-        assert!(err.contains("contextScope"), "{err}");
-        assert!(err.contains("tenant"), "{err}");
+    fn the_tenant_scope_is_accepted_and_the_message_names_all_three() {
+        let parsed =
+            FlowConfig::from_imposter(&imposter(serde_json::json!({ "contextScope": "tenant" })))
+                .expect("tenant scope is accepted");
+        assert_eq!(parsed.scope, ContextScope::Tenant);
+        assert_eq!(
+            FlowConfig::validate(&imposter(serde_json::json!({ "contextScope": "tenant" }))),
+            Ok(())
+        );
+        let err = FlowConfig::validate(&imposter(serde_json::json!({ "contextScope": "global" })))
+            .expect_err("unknown scope");
         assert!(
-            err.contains("#17"),
-            "the reserved-op wording names the issue that lifts the reservation: {err}"
+            err.contains("\"imposter\"") && err.contains("\"tenant\"") && err.contains("\"fleet\""),
+            "the refusal lists every accepted value: {err}"
+        );
+        assert!(
+            !err.contains("#17"),
+            "the reservation wording is gone: {err}"
+        );
+    }
+
+    /// The three namespaces are pairwise disjoint by construction, including for a caller-chosen
+    /// flow id shaped like another scope's prefix (RFC-005 §3.5's G5, extended to `tenant`).
+    #[test]
+    fn the_three_scope_prefixes_are_pairwise_disjoint_even_for_prefix_shaped_ids() {
+        assert_eq!(
+            ContextScope::Tenant.prefix_for(Some(6400), Some("acme")),
+            "tacme:"
+        );
+        assert_eq!(
+            ContextScope::Imposter.prefix_for(Some(6400), Some("acme")),
+            "i6400:"
+        );
+        assert_eq!(
+            ContextScope::Fleet.prefix_for(Some(6400), Some("acme")),
+            "f:"
+        );
+        // The tenant id `default` is a tenant like any other here.
+        assert_eq!(
+            ContextScope::Tenant.scoped_flow_id(Some(6400), Some("default"), "cart"),
+            "tdefault:cart"
+        );
+
+        // Adversarial: an id that spells another scope's prefix cannot land in that scope.
+        let tenant_x = ContextScope::Tenant.scoped_flow_id(Some(6400), Some("acme"), "x");
+        let imposter_shaped =
+            ContextScope::Imposter.scoped_flow_id(Some(6400), Some("acme"), "tacme:x");
+        let fleet_shaped = ContextScope::Fleet.scoped_flow_id(Some(6400), Some("acme"), "tacme:x");
+        let tenant_shaped_as_imposter =
+            ContextScope::Tenant.scoped_flow_id(Some(6400), Some("acme"), "i6400:x");
+        assert_eq!(tenant_x, "tacme:x");
+        assert_eq!(imposter_shaped, "i6400:tacme:x");
+        assert_eq!(fleet_shaped, "f:tacme:x");
+        assert_eq!(tenant_shaped_as_imposter, "tacme:i6400:x");
+        let all = [
+            tenant_x,
+            imposter_shaped,
+            fleet_shaped,
+            tenant_shaped_as_imposter,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert!(i == j || a != b, "{a} vs {b}");
+            }
+        }
+        // Two tenants, same id, same port: disjoint.
+        assert_ne!(
+            ContextScope::Tenant.scoped_flow_id(Some(6400), Some("acme"), "x"),
+            ContextScope::Tenant.scoped_flow_id(Some(6400), Some("beta"), "x")
+        );
+        // A tenant id shaped like a port prefix does not collide with the imposter namespace:
+        // `t` vs `i` is the discriminator, the rest of the string never is.
+        assert_ne!(
+            ContextScope::Tenant.scoped_flow_id(Some(1), Some("6400"), "x"),
+            ContextScope::Imposter.scoped_flow_id(Some(6400), None, "x")
+        );
+    }
+
+    /// A tenant-scoped store whose tenant could not be resolved must not fall into any real
+    /// tenant's namespace, nor the fleet's — the same rule the portless imposter arm follows.
+    #[test]
+    fn an_unresolved_tenant_renders_its_own_defensive_prefix() {
+        let unresolved = ContextScope::Tenant.prefix_for(Some(6400), None);
+        assert!(unresolved.starts_with('t'), "{unresolved}");
+        assert_ne!(unresolved, ContextScope::Fleet.prefix_for(Some(6400), None));
+        assert_ne!(
+            unresolved,
+            ContextScope::Imposter.prefix_for(Some(6400), None)
+        );
+        assert_ne!(
+            unresolved,
+            ContextScope::Tenant.prefix_for(Some(6400), Some("acme"))
+        );
+        assert_ne!(
+            unresolved,
+            ContextScope::Tenant.prefix_for(Some(6400), Some("?")),
+            "a tenant literally named `?` is not the unresolved arm — the id charset forbids it, and this pins that they still differ"
         );
     }
 
@@ -479,23 +601,29 @@ mod tests {
     /// namespace, and nothing else pins that.
     #[test]
     fn scope_prefixes_are_distinct_and_the_portless_arm_never_shares() {
-        let fleet = ContextScope::Fleet.prefix_for(Some(6400));
-        let portless = ContextScope::Imposter.prefix_for(None);
+        let fleet = ContextScope::Fleet.prefix_for(Some(6400), None);
+        let portless = ContextScope::Imposter.prefix_for(None, None);
 
-        assert_eq!(ContextScope::Imposter.prefix_for(Some(6400)), "i6400:");
+        assert_eq!(
+            ContextScope::Imposter.prefix_for(Some(6400), None),
+            "i6400:"
+        );
         assert_eq!(fleet, "f:");
         assert_ne!(
             portless, fleet,
             "an imposter that cannot be identified must not fall into the fleet namespace"
         );
-        assert_ne!(portless, ContextScope::Imposter.prefix_for(Some(6400)));
+        assert_ne!(
+            portless,
+            ContextScope::Imposter.prefix_for(Some(6400), None)
+        );
 
         // The port is rendered in decimal and terminated by a `:`, which is not
         // a digit — that is what makes the scheme uniquely decodable, so a flow
         // id can never be chosen to impersonate another imposter's prefix.
-        assert!(ContextScope::Fleet.prefix_for(None).starts_with('f'));
+        assert!(ContextScope::Fleet.prefix_for(None, None).starts_with('f'));
         for port in [1u16, 640, 6400, 65535] {
-            let prefix = ContextScope::Imposter.prefix_for(Some(port));
+            let prefix = ContextScope::Imposter.prefix_for(Some(port), None);
             assert!(prefix.ends_with(':'), "{prefix}");
             assert_eq!(prefix.matches(':').count(), 1, "{prefix}");
         }

@@ -386,6 +386,15 @@ impl From<SourceRegistry> for SourceProviders {
 pub struct SourcePuller {
     registry: SourceProviders,
     node: OnceLock<Weak<RaftNode>>,
+    /// Whether the admin plane is enforced by configuration alone — an admin
+    /// credential (`--api-key`) is set — before the first principal exists
+    /// (#288). The fleet-scope gate below asks "is the admin plane enforced?",
+    /// which is the front's own bypass predicate (`api_key.is_none() && no
+    /// principals`) inverted; the principal half is read live from the node,
+    /// this half the puller cannot see and is told at construction. `false`
+    /// by default, which is what an embedder or a test fixture with no admin
+    /// credential means.
+    admin_credential_configured: bool,
     /// Leader-local poll status from the tracking scheduler (#135), when one is
     /// running. Absent on a node with no scheduler (a test fixture, or an
     /// embedder that wired only explicit pulls) — and, by construction, empty
@@ -412,7 +421,19 @@ impl SourcePuller {
             registry: registry.into(),
             node: OnceLock::new(),
             poll_status: OnceLock::new(),
+            admin_credential_configured: false,
         }
+    }
+
+    /// Tell the puller an admin credential (`--api-key`) is configured, so the
+    /// admin plane counts as enforced even before the first principal exists —
+    /// see [`Self::pull`]'s fleet-scope gate. Composition sets this from the
+    /// same value the front's bypass reads; the two must not disagree, or a
+    /// document could land through a pull what a `PUT` would refuse.
+    #[must_use]
+    pub fn with_admin_credential_configured(mut self, configured: bool) -> Self {
+        self.admin_credential_configured = configured;
+        self
     }
 
     /// Publish the node to the puller. Weak for the same reason `NodeSlot` is:
@@ -605,6 +626,36 @@ impl SourcePuller {
                 changed: Vec::new(),
                 warnings,
             });
+        }
+
+        // Fleet scope needs `FleetAdmin` at admission (RFC-005 §S1, #288), and
+        // nothing about a pull proves that role: the scheduler re-pulls a
+        // tracking source with no principal at all, and a manual pull is
+        // authorized as a plain `ImposterWrite` — the same action an Editor
+        // holds — so the `principal` this call carries is attribution, not a
+        // grant. A source is therefore not a way to admit a fleet-scoped
+        // config: refused here, before the write, exactly where `validate`
+        // refuses everything else admission would. Gated on the same predicate
+        // as the front — the admin plane is enforced (a credential is
+        // configured, or any principal exists); before that there is no
+        // tenant boundary anyone crosses and no role anyone lacks, and the
+        // front's own gate is skipped for the same reason.
+        if let Some(config) = fleet_scoped_config(&fetched.configs) {
+            let enforced = self.admin_credential_configured
+                || node
+                    .has_any_principals()
+                    .map_err(|e| PullError::Internal(e.to_string()))?;
+            if enforced {
+                let port = config
+                    .port
+                    .map_or_else(|| "<no port>".to_owned(), |port| port.to_string());
+                return Err(PullError::BadRequest(format!(
+                    "source {id:?}: the imposter on port {port} sets flowState.contextScope \
+                     \"fleet\", which only a FleetAdmin may admit and a source pull carries no \
+                     principal to hold that role; admit it through PUT /imposters as a FleetAdmin, \
+                     or scope it \"tenant\" in the document"
+                )));
+            }
         }
 
         let version = fetched.meta.version.clone();
@@ -903,6 +954,22 @@ impl SourcePuller {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the source puller was bound to a node twice")]
 pub struct AlreadyBound;
+
+/// The first config in `configs` that declares `contextScope: "fleet"` (#288)
+/// — the one thing the fleet-scope gate above needs to know. Uses the same
+/// reading of the config the admin front's gate does
+/// (`FlowConfig::declared_scope`), so a source cannot land what a `PUT` would
+/// refuse. A `flowState` block that does not parse reads as no scope here and
+/// is refused by `validate` a few lines later, so nothing slips through the
+/// `None`. Returns the config, not its port: a fleet-scoped config with no port
+/// is still fleet-scoped, and must not slip past the gate just because the
+/// portless-config refusal happens to run after it.
+fn fleet_scoped_config(configs: &[ImposterConfig]) -> Option<&ImposterConfig> {
+    configs.iter().find(|config| {
+        crate::stores::flow_config::FlowConfig::declared_scope(config)
+            == Some(crate::stores::flow_config::ContextScope::Fleet)
+    })
+}
 
 /// The ports a pull would create, replace or remove, from the source's current
 /// ownership and the document it just fetched.

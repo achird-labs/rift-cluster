@@ -145,6 +145,17 @@ tenant is the only difference between them. The fleet follows within a replicati
 2xx-return. Read-your-write across the fleet on this path would be a barrier the
 source handler has to take, not one it already has.
 
+**Updated (#288).** A pull is not a way to admit `flowState.contextScope:
+"fleet"`. RFC-005 S1 gates that scope on `FleetAdmin` at admission, and nothing
+about a pull proves the role — the scheduler re-pulls with no principal, and
+the manual verb is a plain `imposter.write` — so `SourcePuller::pull` refuses a
+document whose imposter sets it, before the write, once the admin plane is
+enforced (an admin credential configured or any principal existing — the same
+predicate the front's bypass reads; composition tells the puller the credential
+half). The refusal names the port and the way in (`PUT /imposters` as a
+`FleetAdmin`, or `tenant` scope in the document); configs an earlier pull
+admitted keep serving.
+
 **Verified, not asserted.** Container scenarios C20–C23
 (`tests/cluster-chaos/tests/scenarios.rs`) hold this section to its claims: a
 pull converges fleet-wide and the config server counts **exactly one** request

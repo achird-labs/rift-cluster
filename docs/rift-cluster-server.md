@@ -1183,7 +1183,8 @@ that was a choice. `default` means the compiled-in default — there is no
 fleet-level override for these knobs, so it never means "inherited from
 somewhere you could go and change".
 
-`contextScope` is deliberately absent; it is tracked under #288 (RFC-005 S1).
+`contextScope` is deliberately absent: it is not a knob with a fleet default to
+resolve but a namespace choice, documented in the knob table above.
 Like `owner` on a space read, the decoration is additive and so a body it
 cannot parse passes through unchanged and logged, rather than failing the read
 the way the `numberOfRequests` correction does.
@@ -1840,7 +1841,7 @@ an unknown value is a `400` naming the key, never a silent default):
 |---|---|---|
 | `readConsistency` | `"strong"` (default) \| `"local"` | `strong`: every read is owner-answered — correct under any LB, at most one LAN RPC. `local`: reads stay on this node's replica — fast, at most one replication push behind the owner |
 | `durability` | `"none"` \| `"async"` (default) \| `"sync"` | What a write survives: `sync` fsyncs before the ack (a full-fleet restart loses nothing), `async` is group-fsynced every `--cluster-flow-fsync-interval-ms` (bounded loss), `none` never touches disk |
-| `contextScope` | `"imposter"` (default) \| `"fleet"` | Which imposters share a flow-id namespace. `imposter`: this imposter's flow ids are its own — two imposters resolving the same id (the ordinary result of both using `flowIdSource: "header:X-Session"`) stay isolated, matching single-node behaviour. `fleet`: one namespace across every imposter, so a suite spanning two mocks carries one context through both |
+| `contextScope` | `"imposter"` (default) \| `"tenant"` \| `"fleet"` | Which imposters share a flow-id namespace. `imposter`: this imposter's flow ids are its own — two imposters resolving the same id (the ordinary result of both using `flowIdSource: "header:X-Session"`) stay isolated, matching single-node behaviour. `tenant` (#288): one namespace across the owning tenant's imposters — a suite spanning two of *your* mocks carries one context through both, and no other tenant's imposter can reach it. `fleet`: one namespace across every imposter of every tenant; **admission requires `FleetAdmin`** (#288) — an Editor's write of a fleet-scoped config is refused with a `400` naming the requirement, nothing committed. Fleet-scoped configs admitted before the gate keep serving; re-admitting one (any config write that carries the knob) needs `FleetAdmin` |
 
 ### `contextScope` and the isolation it restores (#152)
 
@@ -1856,9 +1857,31 @@ reads.
 **behaviour change** for a fleet that was relying on the old sharing: set
 `contextScope: "fleet"` on those imposters to keep it, explicitly.
 
-The two namespaces are disjoint by construction — `fleet` carries its own
-prefix rather than using bare ids — so no caller-chosen flow id can be crafted
-to read across the boundary.
+The three namespaces are disjoint by construction — every scope carries its
+own prefix (`i<port>:`, `t<tenant>:`, `f:`) rather than using bare ids — so no
+caller-chosen flow id can be crafted to read across a boundary, not even one
+shaped like another scope's prefix.
+
+**`tenant` (#288)** is the middle ground: one namespace shared by all of a
+tenant's imposters and reachable by no other tenant's. The tenant is not in the
+config (the core schema carries no tenancy — open-core rule); the clustered
+store learns it at provide time from the control-plane record that owns the
+port, so an imposter's scope is fixed by who committed it. **`fleet` is gated:**
+because it crosses every tenant's boundary, admitting a config that sets it
+requires the writing principal to hold `FleetAdmin` — refused otherwise with a
+`400` naming the requirement, before anything commits. Configs admitted before
+the gate keep serving unchanged; the next config write that *carries the knob*
+is what needs the role — a stub edit on a fleet-scoped imposter carries no
+`flowState` and is not gated, whoever makes it. Under the open admin plane (no
+principal configured) nothing gates, exactly as no other authorization does
+there. A **source** is not a way around the gate: a pull carries no principal
+to hold the role (the scheduler has none, and `POST /admin/sources/{id}/pull` is
+an ordinary `ImposterWrite`), so once the admin plane is enforced — an
+`--api-key` is configured or any principal exists, the same predicate the
+front's bypass reads — a pull whose document sets `contextScope: "fleet"` is
+refused before the write with a `400`
+naming the port and the way in (`PUT /imposters` as a `FleetAdmin`, or `tenant`
+scope in the document); configs a source admitted before that keep serving.
 
 **One residual difference from single-node.** The namespace is keyed by the
 imposter's *port*, not by the store instance, so deleting an imposter and

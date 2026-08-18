@@ -360,10 +360,15 @@ fn scoped(&self, flow_id: &str) -> String {
 - **`fleet`** — the pre-RFC behavior, kept for migration, `FleetAdmin`-gated
   at admission because it deliberately crosses the tenant boundary.
 
-> **As shipped (#152) — two deviations from the sketch above.** S1 landed the
-> scope prefix ahead of the M5 milestone, against a tree where RFC-002 has not
-> yet landed. Both deviations exist because there is nothing to implement
-> against yet, not because the design changed:
+> **As shipped (#152, then #288).** S1's core landed ahead of the M5 milestone
+> (#152) with two deviations, both because RFC-002 had not landed yet; **#288
+> closed both**: `tenant` is a real scope rendering `t<tenant>:` (the tenant is
+> resolved at `provide` time from the control-plane owner of the port — never a
+> field in the core config), and `fleet` is `FleetAdmin`-gated at admission on
+> the admin front (a `400` naming the requirement, nothing committed; pre-gate
+> configs keep serving). The `f:` namespace itself stays fleet-wide by design —
+> tenant isolation is what `tenant` scope is for. The original deviations, for
+> the record:
 >
 > - **`tenant` is parsed and refused, not implemented.** There is no source of
 >   truth for a tenant at `provide` time: `ImposterConfig` carries no tenant
