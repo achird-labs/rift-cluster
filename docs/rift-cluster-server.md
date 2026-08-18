@@ -206,6 +206,106 @@ The check is *advisory* — upstream re-reads and re-parses the file before
 signalling, so it defends a truncated or hand-edited file, not a concurrent
 writer. Tracked upstream as rift#822; the guard goes away when that lands.
 
+## The `mcp` subcommand — an MCP server for coding agents
+
+`rift-cluster-server mcp` speaks the Model Context Protocol over **stdio**, so a
+coding agent can read a running fleet's imposters, routes, recorded requests and
+health as tools rather than as curl invocations it has to compose itself.
+
+```sh
+rift-cluster-server mcp \
+  --url https://fleet.example:2525 \
+  --api-key-file ~/.rift/agent.key
+```
+
+It is a **client**, not a node. It holds no cluster state, embeds no engine,
+joins no ring, and binds no port — it makes ordinary authenticated HTTP calls to
+the admin API of whatever `--url` names, and it runs perfectly well on a laptop
+against a remote fleet. Nothing about running it changes the cluster.
+
+### Credentials
+
+`--api-key-file` is the documented way to supply the key, and there is
+deliberately no env-var spelling: environment variables leak into crash dumps,
+`/proc`, and every child process the agent host spawns. The file's contents are
+trimmed, so a key written with `echo` works.
+
+**Bind a dedicated principal, scoped to the tenants the agent should touch.**
+The threat model assumes an agent host will eventually leak whatever it is
+given; the point of a narrow binding is that the loss is one tenant's `Editor`
+rather than the fleet. Never put a `FleetAdmin` key in an agent's environment.
+
+Every call the MCP server makes is attributed in the audit stream to that
+principal, indistinguishable in mechanism from a human's curl — so revoking the
+agent is deleting one binding, and there is no separate agent pathway to audit.
+
+The key is never logged and never appears in a `Debug` rendering. Tool errors
+relay the API's own error body verbatim; those bodies never echo credentials.
+
+### The v1 tool set
+
+All eight are **reads**, annotated `readOnlyHint` so an agent host can say so
+when it asks a human whether to allow a call. Write tools are a later slice.
+
+| Tool | Wraps |
+|---|---|
+| `imposter_list` | `GET /imposters` |
+| `imposter_get` | `GET /imposters/{port}` |
+| `requests_query` | `GET /imposters/{port}/requests` |
+| `routes_get` | `GET /front-door/routes` |
+| `fleet_health` | `GET /_fleet/health` |
+| `whoami` | `GET /admin/whoami` |
+| `verify` | `POST /imposters/{port}/verify` — assertions evaluated by the engine's own matcher, so a verdict here agrees with how stubs actually match. **Node-scoped** — see below |
+| `lint` | in-process `rift-lint` — no network call, no side effects |
+
+### Scope: which nodes an answer covers
+
+Reads that can differ between one node and the fleet carry a `scope` field, and
+it is not decorative:
+
+- **`requests_query` with no `match` → `"scope": "fleet"`.** The read terminates
+  as the merged journal, across every node.
+- **`requests_query` with a `match` → `"scope": "node"`.** Predicates are
+  evaluated by the local engine, which the fleet merge-on-read path never does,
+  so the answer covers only the node that served it.
+- **`verify` → always `"scope": "node"`.** The front proxies it to the local
+  engine and never decorates it with fleet counts. On a multi-node fleet an
+  imposter's requests are spread across nodes, so `verify` with `times(3)` can
+  legitimately count 1 while the fleet total really is 3. Use `requests_query`
+  without a `match` when you need the fleet-wide count.
+
+Reads with no such distinction — `imposter_list`, `imposter_get`, `routes_get`,
+`whoami` — omit `scope` entirely rather than guessing at one.
+
+### The other provenance fields
+
+- **`partial`** — present when a fleet read could not reach every peer, carrying
+  the front's own explanation.
+- **`next_index`** — the opaque cursor to pass back as `since` on the next
+  `requests_query`. Without it there is no way to page a journal larger than one
+  response.
+- **`truncated`** — present when retention dropped entries from this answer, so
+  a short result is not mistaken for a complete one.
+
+All four are absent rather than null when they do not apply. An agent that
+ignores them can conclude "this request never happened" from a one-node answer,
+an incomplete merge, or a truncated page. They are reported precisely so it does
+not have to guess.
+
+### Credentials in `--url`
+
+A `--url` containing `user:password@` is **refused at startup**: URLs are
+rendered into error messages, so userinfo there would print a password into the
+agent's transcript. The credential is the API key, and it lives in the key file.
+
+A plaintext `http://` URL to a non-loopback host logs a warning — the key is
+being sent in the clear, which is the thing `--api-key-file` exists to avoid.
+
+### Logging
+
+Diagnostics go to **stderr**. stdout is the MCP transport, and a single log line
+written there corrupts the protocol stream.
+
 ## Cluster flags
 
 The master switch is `--cluster`; every other `--cluster*` flag is inert without
