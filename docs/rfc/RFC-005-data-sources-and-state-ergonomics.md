@@ -439,6 +439,28 @@ cross-tenant probes answer 404 per RFC-002 §8.4.
 
 ### 3.7 Declarative state operations — upstream seam U-15
 
+> **As shipped (#290).** Filed upstream as achird-labs/rift#969, landed by
+> rift#970 (`rift_mock_core::extensions::state_ops`), pinned here by #290.
+> Three deviations from the sketch below, each decided in the upstream review:
+> (1) a fourth op, **`increment { key, by = 1 }`**, mapped to
+> `FlowStore::increment_by` — the `{{ }}` grammar has no arithmetic, so
+> `set` + `previousValue` cannot count, and `increment` is atomic on both the
+> in-memory and the clustered store, which is what makes the counter exit
+> criterion hold under concurrency; (2) **§10.5 is settled**: a `set` whose
+> value reads its own key (`previousValue`, or `state.<that key>` — decided
+> from the template heads, not a substring) is a bounded compare-and-set loop
+> (64 attempts), a `set` that does not is a plain write, and the in-memory and
+> clustered stores meet the same contract because both override
+> `compare_and_set` atomically; (3) a rendered `set` value that is a canonical
+> integer is stored as a JSON number (so `set hits "0"` seeds a counter that
+> `increment` continues from), anything else as a string. Also stated
+> upstream: `is` responses only; the ops do not run when a fault fired or a
+> `strictBehaviors` failure pre-empted the response; an imposter with
+> `stateOps` and no `_rift.flowState` auto-provisions the in-memory store
+> rather than the no-op store. Errors follow the templating policy exactly as
+> below, and the ops are not gated on `--allowInjection` —
+> `tests/state_ops_cluster.rs` pins both halves of the exit criterion.
+
 The write-side parity gap (G4). The wrong fix is compiling state operations
 into generated scripts: `config_uses_script_surface` would then classify every
 state-writing config as scripted and the admin front would demand
@@ -706,12 +728,12 @@ U-15/U-14 are filed after review, generic wording, #311-#318 precedent.
    strips them on output; should a `FleetAdmin` fleet-scope listing show raw
    prefixed ids for debugging? Leaning yes-behind-a-query-flag; decide in S2
    review.
-5. **`previousValue` under concurrency.** U-15 `Set` with `previousValue` is
-   a read-then-write, not a CAS; two concurrent requests can interleave.
-   `FlowStore::compare_and_set` exists (`flow_state.rs:100-114`) — should
-   `Set`-with-`previousValue` compile to a bounded CAS retry loop? Decide in
-   the U-15 upstream review, where the in-memory store's answer must match
-   the clustered one.
+5. **`previousValue` under concurrency.** ~~U-15 `Set` with `previousValue` is
+   a read-then-write, not a CAS; two concurrent requests can interleave.~~
+   **Settled (rift#970, #290):** a `set` that reads its own key is a bounded
+   compare-and-set loop; counters use the atomic `increment`. Both stores
+   override `compare_and_set` and `increment_by` atomically, so the in-memory
+   and clustered answers match — see §3.7's "As shipped" note.
 
 ## 11. Claims not verified
 
