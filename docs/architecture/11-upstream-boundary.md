@@ -28,6 +28,7 @@ cluster-aware implementations. All eight seams are merged upstream
 | #316 | `apply_config` + `ImposterEvent` + `stub_key` + `move_stub` | incremental reconcile as the Raft apply step |
 | #317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` (+ its per-imposter half `handle_imposter_request`, re-exported for #344) | `rift-cluster-server` composes instead of forking `main.rs`; the admin try answers in-process from the imposter it resolved, never a socket |
 | #318 | `BackendUnavailable` + `annotate()` + `ResponseDecorator` | every `Rift-Cluster-*` header, without core handlers knowing what a cluster is |
+| #966 (U-13) | `ExchangeInspector` / `ExchangeInspectorProvider` (`extensions::exchange_inspector`) | request-side hook after journaling and before matching, response-side hook in the shared funnel before the decorator; synchronous, per imposter, inert by default — what spec enforcement (RFC-004 §3.6) hangs on; re-exported, not yet consumed (S6, #282) |
 
 The pattern in #318 deserves a sentence: cluster backends *annotate* the
 request task-locally ("degraded: kv-adopt", "revision: 421"), and an
@@ -39,7 +40,10 @@ Four further seams are queued, same rules — generic names, `Local`/default-off
 behavior, independently justifiable to an OSS maintainer: U-9 `AdminAuthorizer`
 and U-10 principal-on-events (RFC-002, Chapter 8), U-11 the front-door route
 table and listener (#19, Chapter 13), and U-12 the `ImposterSource` provider
-trait with `file`/`https` built-ins (#20, Chapter 13).
+trait with `file`/`https` built-ins (#20, Chapter 13). U-13, the exchange
+inspector (RFC-004 §6), landed the same way — upstream #966/#967, re-exported
+here by #281 — and is the first seam that can act on an in-flight exchange
+rather than only observe or decorate it.
 
 ## The dependency architecture
 
