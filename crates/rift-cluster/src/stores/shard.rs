@@ -140,10 +140,32 @@ impl Versioned {
 /// been touched minutes apart, and a no-TTL flow (`expires_at == 0`) has no
 /// expiry to sort by at all — ordering by `expires_at` would evict exactly the
 /// permanent flows first.
+///
+/// `touch_seq` breaks the ties `last_touch` cannot (issue #408): it is
+/// millisecond wall-clock, and bursty writes — the ordinary case, not an edge
+/// case — land many flows on one millisecond. Sorting on `last_touch` alone
+/// then left the victim among tied flows to `HashMap` iteration order, which is
+/// randomised per process, so eviction could take the flow a caller was in the
+/// middle of writing and leave it half-evicted. The sequence is bumped on every
+/// touch from one process-wide counter, so among any set of ties the least
+/// recently touched flow is exactly the one with the smallest sequence.
 #[derive(Default)]
 struct FlowMem {
     keys: HashMap<String, Versioned>,
     last_touch: u64,
+    touch_seq: u64,
+}
+
+/// The process-wide touch counter behind `FlowMem::touch_seq`. Process-wide
+/// rather than per shard because only relative order within one shard is ever
+/// compared, and one counter needs no plumbing through recovery or the writer.
+static TOUCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stamp `flow` as touched now: the wall clock for the TTL/LRU policy, and the
+/// sequence for the order among touches the clock cannot separate.
+fn touch(flow: &mut FlowMem) {
+    flow.last_touch = now_millis();
+    flow.touch_seq = TOUCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The `flow_meta` row, so `last_touch` survives a restart and recovery restores
@@ -421,7 +443,7 @@ impl FlowShard {
             let mut guard = self.inner.memory.write();
             let flow = guard.entry(flow_id.to_owned()).or_default();
             flow.keys.insert(key.to_owned(), entry.clone());
-            flow.last_touch = now_millis();
+            touch(flow);
         }
         self.evict_if_needed();
 
@@ -486,7 +508,7 @@ impl FlowShard {
             }
             let flow = guard.entry(flow_id.to_owned()).or_default();
             flow.keys.insert(key.to_owned(), entry.clone());
-            flow.last_touch = now_millis();
+            touch(flow);
 
             if durability == Durability::None {
                 None
@@ -542,7 +564,7 @@ impl FlowShard {
             let mut guard = self.inner.memory.write();
             if let Some(flow) = guard.get_mut(flow_id) {
                 flow.keys.remove(key);
-                flow.last_touch = now_millis();
+                touch(flow);
                 if flow.keys.is_empty() {
                     guard.remove(flow_id);
                 }
@@ -637,12 +659,15 @@ impl FlowShard {
             if over == 0 {
                 return;
             }
-            let mut by_age: Vec<(String, u64)> = guard
+            let mut by_age: Vec<(String, (u64, u64))> = guard
                 .iter()
-                .map(|(id, flow)| (id.clone(), flow.last_touch))
+                .map(|(id, flow)| (id.clone(), (flow.last_touch, flow.touch_seq)))
                 .collect();
             // Oldest touch first — genuine LRU, unaffected by whether a flow has
-            // a TTL at all.
+            // a TTL at all. The sequence breaks the ties the millisecond clock
+            // leaves (issue #408), so the victim is never a flow touched more
+            // recently than a survivor — in particular never the flow whose
+            // second key is about to land.
             by_age.sort_by_key(|(_, touched)| *touched);
 
             by_age
@@ -751,10 +776,15 @@ fn recover(db: &Database, config: &ShardConfig) -> Result<HashMap<String, FlowMe
             } else {
                 flow.last_touch = now;
             }
+            // Load order stands in for the sequence a restart cannot recover:
+            // among flows whose restored `last_touch` ties, the order is at
+            // least deterministic rather than the map's.
+            flow.touch_seq = TOUCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     } else {
         for flow in memory.values_mut() {
             flow.last_touch = now;
+            flow.touch_seq = TOUCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -764,7 +794,7 @@ fn recover(db: &Database, config: &ShardConfig) -> Result<HashMap<String, FlowMe
     while memory.len() > config.max_flows {
         let oldest = memory
             .iter()
-            .min_by_key(|(_, flow)| flow.last_touch)
+            .min_by_key(|(_, flow)| (flow.last_touch, flow.touch_seq))
             .map(|(id, _)| id.clone());
         match oldest {
             Some(id) => {

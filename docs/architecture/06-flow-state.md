@@ -196,7 +196,11 @@ flow_meta: flow_id        → { last_touch }                  // TTL + LRU sweep
 
 `flow_meta` carries `last_touch` and nothing else: TTL and LRU both order by it, and neither needs
 a count. An entry count is therefore not a stored figure — it is the size of the flow's in-memory
-mirror, which is what the per-tenant usage fan-out (#372) reads.
+mirror, which is what the per-tenant usage fan-out (#372) reads. In memory the LRU order is
+`(last_touch, touch_seq)` (#408): `last_touch` is millisecond wall-clock and bursty writes tie
+on it, so a process-wide touch sequence breaks the tie — the victim among tied flows is the least
+recently touched, never a flow a caller is mid-write on. The sequence is not persisted; recovery
+restores `last_touch` and assigns sequence in load order.
 
 Per-imposter durability knob (`_rift.flowState.durability`), mapping 1:1 onto
 `redb`'s per-commit durability levels:
