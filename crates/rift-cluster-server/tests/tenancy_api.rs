@@ -1639,6 +1639,14 @@ fn imposter_config(port: u16) -> ImposterConfig {
     serde_json::from_value(imposter_with_stubs(port, 1)).expect("config parses")
 }
 
+/// Same shape, scoped `tenant` (#288) — the `t<tenant>:` prefix under which its flow entries are
+/// charged to the owning tenant (#413).
+fn tenant_scoped_config(port: u16) -> ImposterConfig {
+    let mut value = imposter_with_stubs(port, 1);
+    value["_rift"] = json!({ "flowState": { "contextScope": "tenant" } });
+    serde_json::from_value(value).expect("config parses")
+}
+
 /// `usage.imposters` on the admin surface counts only the addressed tenant's
 /// own config rows — a second tenant's imposters must be invisible both ways.
 #[tokio::test]
@@ -1834,6 +1842,88 @@ async fn fleet_scoped_flows_are_charged_to_no_tenant() {
         body["usage"]["flowEntries"], 0,
         "globex must not be charged for the fleet-scoped entries either: {globex}"
     );
+
+    server.shutdown().await;
+}
+
+/// Tenant-scoped (`t<tenant>:`, #288) flows are charged to their tenant (#413): attributable by
+/// their key, unlike fleet-scoped ones, and previously uncounted because the fan-out was keyed by
+/// port alone. The provider resolves the tenant from the control-plane owner of the port, so the
+/// imposter must be committed to the tenant first, exactly as `PutImposter` leaves it.
+#[tokio::test]
+async fn tenant_scoped_flows_are_charged_to_their_tenant() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let flow_net = server.flow_net().expect("clustered").clone();
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "usage-tenant-scope";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+    create_tenant(&client, &admin, fleet_key, "globex").await;
+    put_imposter(node, &mut op_id, "acme", 21041, 1).await;
+    put_imposter(node, &mut op_id, "globex", 21042, 1).await;
+
+    // 3 imposter-scoped on acme's port, 5 tenant-scoped under `tacme:` (written through acme's
+    // imposter), 2 tenant-scoped under `tglobex:`.
+    write_flow_entries(&flow_net, &imposter_config(21041), "cart", 3).await;
+    write_flow_entries(&flow_net, &tenant_scoped_config(21041), "session", 5).await;
+    write_flow_entries(&flow_net, &tenant_scoped_config(21042), "session", 2).await;
+
+    let read = |tenant: &'static str| {
+        let client = client.clone();
+        let admin = admin.clone();
+        async move {
+            let seen = Seen::of(
+                client
+                    .get(format!("http://{admin}/admin/tenants/{tenant}"))
+                    .header("authorization", fleet_key)
+                    .send()
+                    .await
+                    .expect("read tenant"),
+            )
+            .await;
+            let body: Value = serde_json::from_str(&seen.body).expect("json");
+            (body["usage"]["flowEntries"].clone(), seen)
+        }
+    };
+    let (acme, seen) = read("acme").await;
+    assert_eq!(
+        acme, 8,
+        "acme: 3 imposter-scoped on its port + 5 tenant-scoped under tacme: {seen}"
+    );
+    let (globex, seen) = read("globex").await;
+    assert_eq!(
+        globex, 2,
+        "globex: only its own 2 tenant-scoped entries — never acme's: {seen}"
+    );
+
+    // The listing charges each tenant the same way.
+    let seen = Seen::of(
+        client
+            .get(format!("http://{admin}/admin/tenants"))
+            .header("authorization", fleet_key)
+            .send()
+            .await
+            .expect("list tenants"),
+    )
+    .await;
+    let body: Value = serde_json::from_str(&seen.body).expect("json");
+    let by_id: std::collections::HashMap<&str, &Value> = body
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|t| (t["id"].as_str().expect("id"), &t["usage"]["flowEntries"]))
+        .collect();
+    assert_eq!(by_id["acme"], &json!(8), "{seen}");
+    assert_eq!(by_id["globex"], &json!(2), "{seen}");
 
     server.shutdown().await;
 }
