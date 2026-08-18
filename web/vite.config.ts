@@ -15,6 +15,9 @@ export const ADMIN_PROXY_PREFIXES = [
   "/imposters",
   "/admin",
   "/front-door",
+  // RFC-004 S2 (issue #278): the spec import/deploy surface, EE-only and root-mounted like the
+  // front door's route table.
+  "/specs",
   "/session",
   "/_fleet",
   "/openapi.json",

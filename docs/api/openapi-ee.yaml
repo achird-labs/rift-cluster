@@ -3762,8 +3762,6 @@ paths:
               $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
-            Rift-Cluster-Warnings:
-              $ref: '#/components/headers/RiftClusterWarnings'
           content:
             application/json:
               schema:
@@ -3775,8 +3773,6 @@ paths:
               $ref: '#/components/headers/RiftClusterRevision'
             Rift-Cluster-Op-Id:
               $ref: '#/components/headers/RiftClusterOpId'
-            Rift-Cluster-Warnings:
-              $ref: '#/components/headers/RiftClusterWarnings'
           content:
             application/json:
               schema:
