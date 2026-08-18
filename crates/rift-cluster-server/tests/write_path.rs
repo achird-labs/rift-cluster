@@ -552,13 +552,14 @@ async fn an_unknown_flow_state_knob_is_refused_before_commit() {
     server.shutdown().await;
 }
 
-/// #152: `contextScope: "tenant"` is a *reserved* value, not an unknown one —
-/// it is the scope RFC-002 will activate, and there is no tenant to scope by
-/// today. Refusing it at admission with wording that names the successor issue
-/// is deterministic feature detection: a config written for a later build fails
-/// loudly here instead of silently landing in the wrong namespace.
+/// RFC-005 S1 (#288): `contextScope: "tenant"` was reserved until RFC-002 shipped; it is a
+/// real scope now, admitted like the other two (this was a 400 naming RFC-002 before). Under the
+/// open-admin-plane bypass the imposter is owned by `default`, so its flows live under
+/// `tdefault:`; that the listing route resolves the applied scope and serves it is the closest
+/// external observation — `GET /imposters/{port}` echoes upstream's allowlisted `flowState`
+/// fields only, never `contextScope` (see `context_scope_is_not_in_the_resolved_block`).
 #[tokio::test]
-async fn the_reserved_tenant_context_scope_is_refused_before_commit() {
+async fn the_tenant_context_scope_is_admitted_now_that_tenancy_exists() {
     let state = TempDir::new().expect("tempdir");
     let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
         .await
@@ -575,32 +576,35 @@ async fn the_reserved_tenant_context_scope_is_refused_before_commit() {
         .send()
         .await
         .expect("post imposter");
-
     let seen = Seen::of(response).await;
-    assert_eq!(seen.status, 400, "{seen}");
-    assert!(
-        seen.body.contains("contextScope"),
-        "the refusal must name the offending key: {seen}"
-    );
-    assert!(
-        seen.body.contains("#17"),
-        "a reserved value must say which work activates it, like the reserved tenancy ops do: {seen}"
-    );
+    assert_eq!(seen.status, 201, "{seen}");
 
     let read = reqwest::get(format!("http://{admin}/imposters/{port}"))
         .await
         .expect("get");
+    assert_eq!(read.status().as_u16(), 200, "an admitted config lands");
+
+    let spaces = reqwest::get(format!("http://{admin}/imposters/{port}/spaces"))
+        .await
+        .expect("get spaces");
     assert_eq!(
-        read.status().as_u16(),
-        404,
-        "a refused config must not land"
+        spaces.status().as_u16(),
+        200,
+        "the listing resolves the scope"
+    );
+    let body: serde_json::Value = spaces.json().await.expect("json");
+    assert!(
+        body.get("unavailable").is_none(),
+        "a tenant-scoped listing is bounded to the tenant, so it is served: {body}"
     );
 
     server.shutdown().await;
 }
 
-/// The accepted values do land — the companion to the refusal above, so a
-/// future tightening of the parser cannot quietly reject `fleet` too.
+/// The accepted values do land. `fleet` is `FleetAdmin`-gated at admission as of #288, but this
+/// harness runs under the open-admin-plane bypass — no principal, so nothing to hold the role and
+/// nothing to gate: the write is admitted exactly as before. The gated path is proven in
+/// `tests/context_scope.rs`.
 #[tokio::test]
 async fn an_explicit_fleet_context_scope_is_admitted() {
     let state = TempDir::new().expect("tempdir");

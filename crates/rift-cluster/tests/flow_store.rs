@@ -188,7 +188,7 @@ fn stored(flow_id: &str) -> String {
 fn stored_on(port: u16, flow_id: &str) -> String {
     format!(
         "{}{flow_id}",
-        rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(port))
+        rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(port), None)
     )
 }
 
@@ -458,6 +458,215 @@ async fn fleet_scope_shares_across_imposters_and_stays_disjoint_from_imposter_sc
     assert_eq!(
         seen, None,
         "a fleet-scoped read must not observe an imposter-scoped write"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// RFC-005 S1 (#288): `contextScope: "tenant"` shares state **within** a tenant's imposters and
+/// never **across** tenants — two tenants, the same caller-chosen flow id, disjoint keys — and it
+/// stays disjoint from the imposter and fleet namespaces even for ids shaped like `t<tenant>:x`.
+///
+/// The tenant is not in the config (open-core rule): the provider learns it from the control
+/// plane, keyed by port — ports are fleet-unique across tenants — so the imposters are committed
+/// through the node first, exactly as `PutImposter` would leave them for the engine to provide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tenant_scope_shares_within_a_tenant_and_never_across() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+    let tenant_scoped = || serde_json::json!({ "contextScope": "tenant" });
+    let commit = |port: u16, tenant: &str| {
+        let leader = &members[0].node;
+        let config = imposter_on(port, tenant_scoped());
+        let tenant = tenant.to_owned();
+        async move {
+            let response = leader
+                .submit(rift_cluster::ControlRequest {
+                    op_id: uuid::Uuid::new_v4(),
+                    principal: None,
+                    issued_at_secs: 0,
+                    expected_revision: None,
+                    op: rift_cluster::ControlOp::PutImposter {
+                        tenant: rift_cluster::TenantId::new(&tenant),
+                        config: Box::new(config),
+                    },
+                })
+                .await
+                .expect("commit");
+            assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
+            response.revision
+        }
+    };
+    let last = {
+        commit(6600, "acme").await;
+        commit(6601, "acme").await;
+        commit(6602, "beta").await;
+        commit(6603, "beta").await
+    };
+    assert!(
+        members[0]
+            .node
+            .await_applied(last, Duration::from_secs(10))
+            .await
+            .is_empty(),
+        "every member must hold the tenant rows before providing"
+    );
+
+    const SHARED: &str = "x-session-abc";
+    let acme_writer = store_on_port(&members[0], 6600, tenant_scoped());
+    let acme_reader = store_on_port(&members[1], 6601, tenant_scoped());
+    let beta_reader = store_on_port(&members[1], 6602, tenant_scoped());
+    let beta_writer = store_on_port(&members[0], 6603, tenant_scoped());
+
+    blocking(move || acme_writer.set(SHARED, "step", serde_json::json!("acme")))
+        .await
+        .expect("acme write");
+    let seen = blocking(move || acme_reader.get(SHARED, "step"))
+        .await
+        .expect("strong read");
+    assert_eq!(
+        seen,
+        Some(serde_json::json!("acme")),
+        "two of acme's imposters must share one tenant context"
+    );
+    let seen = blocking(move || beta_reader.get(SHARED, "step"))
+        .await
+        .expect("strong read");
+    assert_eq!(
+        seen, None,
+        "beta must never observe acme's tenant-scoped state"
+    );
+
+    // The same id written by beta lands in beta's namespace only.
+    blocking(move || beta_writer.set(SHARED, "step", serde_json::json!("beta")))
+        .await
+        .expect("beta write");
+    let acme_probe = store_on_port(&members[1], 6600, tenant_scoped());
+    let seen = blocking(move || acme_probe.get(SHARED, "step"))
+        .await
+        .expect("strong read");
+    assert_eq!(
+        seen,
+        Some(serde_json::json!("acme")),
+        "beta's write must not overwrite acme's"
+    );
+
+    // Disjoint from the other two scopes, including prefix-shaped ids: an imposter-scoped or
+    // fleet-scoped write of `tacme:x-session-abc` is not acme's `x-session-abc`.
+    let imposter_writer = store_on_port(&members[0], 6600, serde_json::json!({}));
+    blocking(move || imposter_writer.set("tacme:x-session-abc", "step", serde_json::json!("imp")))
+        .await
+        .expect("imposter-scoped write");
+    let fleet_writer = store_on_port(
+        &members[0],
+        6601,
+        serde_json::json!({ "contextScope": "fleet" }),
+    );
+    blocking(move || fleet_writer.set("tacme:x-session-abc", "step", serde_json::json!("fleet")))
+        .await
+        .expect("fleet-scoped write");
+    let acme_probe = store_on_port(&members[1], 6601, tenant_scoped());
+    let seen = blocking(move || acme_probe.get(SHARED, "step"))
+        .await
+        .expect("strong read");
+    assert_eq!(
+        seen,
+        Some(serde_json::json!("acme")),
+        "a prefix-shaped id under another scope must not reach the tenant namespace"
+    );
+    // And what the tenant store wrote is stored under `tacme:` — the production rendering, so
+    // the ring, replication and the admin front all agree on the key.
+    let stored =
+        rift_cluster::stores::ContextScope::Tenant.scoped_flow_id(Some(6600), Some("acme"), SHARED);
+    assert_eq!(stored, "tacme:x-session-abc");
+    let held = members
+        .iter()
+        .any(|m| m.shard.get(&stored, "step").is_some());
+    assert!(
+        held,
+        "the tenant-scoped write is stored under the tenant prefix on some member"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// A tenant-scoped store built before its config row is applied — the one legitimate way the
+/// owning tenant can be unresolvable at `provide` — must not fall into any real tenant's
+/// namespace, nor the fleet's: it renders its own defensive `t??:` prefix. And it must not stay
+/// there: the failure is retried per op, so once the row lands the same store writes under the
+/// real tenant. A store that cached the failure would keep every one of this imposter's flows
+/// in the placeholder namespace for its lifetime, with nothing but a provide-time log to say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unresolved_tenant_falls_back_defensively_and_heals_once_the_row_lands() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+    let tenant_scoped = serde_json::json!({ "contextScope": "tenant" });
+    const PORT: u16 = 6700;
+
+    // Nobody has committed a config for PORT: the provider cannot resolve its tenant.
+    let store = store_on_port(&members[0], PORT, tenant_scoped.clone());
+    let early = Arc::clone(&store);
+    blocking(move || early.set("early", "k", serde_json::json!(1)))
+        .await
+        .expect("the store still functions");
+    let placeholder =
+        rift_cluster::stores::ContextScope::Tenant.scoped_flow_id(Some(PORT), None, "early");
+    assert_eq!(placeholder, "t??:early");
+    assert!(
+        members
+            .iter()
+            .any(|m| m.shard.get(&placeholder, "k").is_some()),
+        "an unresolved tenant writes under the defensive placeholder"
+    );
+    for wrong in ["tacme:early", "f:early", "i6700:early"] {
+        assert!(
+            members.iter().all(|m| m.shard.get(wrong, "k").is_none()),
+            "never under a real namespace: {wrong}"
+        );
+    }
+
+    // The row lands; the very same store now resolves and writes under `tacme:`.
+    let response = members[0]
+        .node
+        .submit(rift_cluster::ControlRequest {
+            op_id: uuid::Uuid::new_v4(),
+            principal: None,
+            issued_at_secs: 0,
+            expected_revision: None,
+            op: rift_cluster::ControlOp::PutImposter {
+                tenant: rift_cluster::TenantId::new("acme"),
+                config: Box::new(imposter_on(PORT, tenant_scoped)),
+            },
+        })
+        .await
+        .expect("commit");
+    assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
+    assert!(
+        members[0]
+            .node
+            .await_applied(response.revision, Duration::from_secs(10))
+            .await
+            .is_empty()
+    );
+    let late = Arc::clone(&store);
+    blocking(move || late.set("late", "k", serde_json::json!(2)))
+        .await
+        .expect("write after the row landed");
+    assert!(
+        members
+            .iter()
+            .any(|m| m.shard.get("tacme:late", "k").is_some()),
+        "the same store heals onto the real tenant prefix"
+    );
+    assert!(
+        members
+            .iter()
+            .all(|m| m.shard.get("t??:late", "k").is_none()),
+        "and stops using the placeholder"
     );
 
     for member in &members {
@@ -1542,7 +1751,7 @@ async fn an_unreachable_peer_marks_the_spaces_listing_partial() {
         .net
         .fleet_spaces(
             TEST_PORT,
-            &rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(TEST_PORT)),
+            &rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(TEST_PORT), None),
             Duration::from_millis(500),
         )
         .await;
@@ -1576,7 +1785,7 @@ async fn a_ring_divergence_is_refused_by_the_spaces_wire_route() {
 
     let target = members[1].node.id();
     let current_m_idx = members[0].node.ring().m_idx();
-    let prefix = rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(TEST_PORT));
+    let prefix = rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(TEST_PORT), None);
 
     let stale = serde_json::to_vec(&serde_json::json!({
         "port": TEST_PORT,
@@ -1645,7 +1854,7 @@ async fn two_imposters_sharing_a_flow_id_do_not_list_each_others_spaces() {
         .net
         .fleet_spaces(
             PORT_A,
-            &rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(PORT_A)),
+            &rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(PORT_A), None),
             Duration::from_secs(5),
         )
         .await;
@@ -1653,7 +1862,7 @@ async fn two_imposters_sharing_a_flow_id_do_not_list_each_others_spaces() {
         .net
         .fleet_spaces(
             PORT_B,
-            &rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(PORT_B)),
+            &rift_cluster::stores::ContextScope::Imposter.prefix_for(Some(PORT_B), None),
             Duration::from_secs(5),
         )
         .await;

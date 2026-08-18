@@ -1578,10 +1578,12 @@ paths:
 
         A fleet-scoped imposter (`flowState.contextScope: "fleet"`) shares its flow-id namespace
         with every other fleet-scoped imposter, so its spaces are not necessarily private to the
-        one imposter named in the path. Imposter-scoped spaces (the default) are private to this
-        port. `owner` is reported per space, never once for the whole list, because a flow — not a
-        port — is the only thing the ring assigns an owner to: one imposter's spaces can
-        legitimately have different owners.
+        one imposter named in the path — and its listing is served to a `FleetAdmin` only (see
+        `unavailable`). A tenant-scoped imposter (`"tenant"`, #288) shares its namespace with the
+        owning tenant's other imposters and no one else's, so its listing is served to that
+        tenant. Imposter-scoped spaces (the default) are private to this port. `owner` is reported
+        per space, never once for the whole list, because a flow — not a port — is the only thing
+        the ring assigns an owner to: one imposter's spaces can legitimately have different owners.
       tags: [imposters]
       x-rift-origin: ee
       responses:
@@ -1659,9 +1661,12 @@ paths:
                       is `flowState.contextScope: "fleet"`, whose `f:` key prefix carries no
                       tenant component, so scanning it would either match nothing (wrong prefix)
                       or return another tenant's fleet-scoped flows alongside this one's (right
-                      prefix, no way to filter by tenant). It will not resolve on a retry; the
-                      caller's own single-space read (`GET
-                      /imposters/{port}/spaces/{flowId}`) is unaffected and still answers by id.
+                      prefix, no way to filter by tenant). It is answered to every caller who does
+                      not hold `FleetAdmin` (#288) — a `FleetAdmin` binding, whose role is to cross
+                      every tenant's boundary, is served the real fleet-wide list instead. It will
+                      not resolve on a retry for the same principal; the caller's own single-space
+                      read (`GET /imposters/{port}/spaces/{flowId}`) is unaffected and still
+                      answers by id.
 
 
                       `scope-unresolved` means this imposter's own config could not be read or
@@ -3376,6 +3381,19 @@ paths:
         does, and for the same reason: a pull is what actually produces the
         `PUT /imposters`-equivalent write. No `If-Match` — see
         `putSource`'s description.
+
+
+        A pull is **not** a way to admit `flowState.contextScope: "fleet"`
+        (RFC-005 S1, issue #288): a pull carries no principal to hold
+        `FleetAdmin` — the scheduler has none, and this route needs only
+        `imposter.write` — so once the admin plane is enforced (an `--api-key`
+        is configured or any principal exists — the same predicate the
+        front's bypass reads), a document whose imposter sets it is refused
+        before the write with a `400` naming the port and the way in
+        (`PUT /imposters` as a `FleetAdmin`, or `"tenant"` scope in the
+        document). Nothing is committed; what an earlier pull admitted keeps
+        serving. Under the open admin plane nothing gates, as nothing else
+        does.
       tags: [sources]
       x-rift-origin: ee
       parameters:
@@ -4930,6 +4948,18 @@ components:
             rift-verify reads it there to drive correlated isolation; the
             resolved view with provenance is the sibling `flowStateResolved`
             (issue #370), which is additive precisely so this contract holds.
+
+
+            On write, `contextScope` (`"imposter"` default, `"tenant"`,
+            `"fleet"`) chooses the flow-id namespace; it is never echoed back
+            here. `"fleet"` is admitted only from a `FleetAdmin` (RFC-005 S1,
+            issue #288): any other principal's `POST`/`PUT` carrying it answers
+            `400` — a **role refusal wearing the `BadData` status the issue
+            prescribes**, not a malformed payload; retrying with the same body
+            cannot succeed, escalating the caller can. The whole `PUT /imposters`
+            batch is refused when one config carries it. Not gated: the
+            no-principal open admin plane, and stub edits on an already-admitted
+            fleet-scoped imposter (their bodies carry no `flowState`).
           additionalProperties: true
         flowStateResolved:
           $ref: '#/components/schemas/FlowStateResolved'
@@ -4951,8 +4981,10 @@ components:
         upstream's, inferring provenance for that one from absence.
 
 
-        `contextScope` is deliberately **not** here: it is tracked under #288
-        (RFC-005 S1), and publishing it would claim a knob still being designed.
+        `contextScope` is deliberately **not** here: it is not a knob with a
+        fleet default to resolve but a namespace choice fixed at admission
+        (see the `flowState` docs), and upstream's own `flowState` echo does
+        not carry it either.
       required: [durability, readConsistency, flowIdSource]
       properties:
         durability:
@@ -5571,7 +5603,11 @@ components:
             `contextScope: "fleet"` is shared by construction, so charging it to
             every tenant would double-count it and charging it to one would be
             arbitrary. Only imposter-scoped flows, on ports this tenant owns,
-            are counted here.
+            are counted here. Tenant-scoped flows (`contextScope: "tenant"`,
+            #288) are attributable — their key names the tenant — but the count
+            fan-out is keyed by port and does not yet include them (issue
+            #413); until it does, a tenant using `tenant` scope reads a floor
+            here.
 
 
             ⚠️ **`maxFlowEntries` currently enforces nothing.** Unlike the other

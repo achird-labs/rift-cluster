@@ -655,7 +655,14 @@ pub async fn start_with_runtimes(
                 return Err(e.context("registering the built-in imposter sources"));
             }
         };
-    let puller = Arc::new(SourcePuller::new(source_registry));
+    // The puller's fleet-scope gate (#288) needs the same "is the admin plane enforced" answer the
+    // front's bypass computes; the principal half it reads live, the credential half only this
+    // composition knows. `cli.oss.api_key` is still set here — it is cleared further down, after
+    // the front captured it.
+    let puller = Arc::new(
+        SourcePuller::new(source_registry)
+            .with_admin_credential_configured(cli.oss.api_key.is_some()),
+    );
 
     let slot = NodeSlot::default();
     let node = match RaftNode::start_with_front_door_routes(

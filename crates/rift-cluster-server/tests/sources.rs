@@ -94,6 +94,12 @@ fn imposter(port: u16, name: &str) -> ImposterConfig {
 }
 
 async fn start() -> Fixture {
+    start_with(false).await
+}
+
+/// [`start`], with the puller told whether an admin credential (`--api-key`) is configured — the
+/// half of the front's bypass predicate the puller cannot read itself (#288).
+async fn start_with(admin_credential_configured: bool) -> Fixture {
     let dir = TempDir::new().expect("tempdir");
     let readiness = Arc::new(Readiness::awaiting([GATE_JOINED]));
     let slot = cluster_api::NodeSlot::default();
@@ -126,7 +132,9 @@ async fn start() -> Fixture {
     registry
         .register(source_b as Arc<dyn ImposterSource>)
         .expect("register the second scripted source");
-    let puller = Arc::new(SourcePuller::new(registry));
+    let puller = Arc::new(
+        SourcePuller::new(registry).with_admin_credential_configured(admin_credential_configured),
+    );
 
     let config = NodeConfig {
         node_id: 1,
@@ -1016,4 +1024,183 @@ async fn the_source_surface_requires_the_cluster_credential() {
         .await
         .expect_err("an unauthenticated read must be refused");
     assert_eq!(err.status(), 401, "{err}");
+}
+
+/// Issue #288: a source is not a way to admit `contextScope: "fleet"` once the fleet has
+/// principals. The admin front's `FleetAdmin` gate covers `PUT /imposters`; a pull commits
+/// `SourcePullResult` directly with no principal to hold the role (the scheduler has none, and a
+/// manual pull is authorized as a plain `ImposterWrite`), so the puller refuses it itself —
+/// before the write, nothing committed, the message naming the role and the way in.
+///
+/// Before any principal exists there is no tenant boundary anyone crosses and no role anyone
+/// lacks — the front's own gate is skipped there for the same reason — so the pull is admitted,
+/// and what it admitted keeps serving after the fleet turns enforcement on.
+#[tokio::test]
+async fn a_source_cannot_admit_fleet_scope_once_the_fleet_has_principals() {
+    let fixture = start().await;
+    let client = client();
+    let fleet_scoped = |name: &str| -> ImposterConfig {
+        serde_json::from_value(serde_json::json!({
+            "port": 9301,
+            "protocol": "http",
+            "name": name,
+            "_rift": { "flowState": { "contextScope": "fleet" } },
+        }))
+        .expect("test config parses")
+    };
+    *fixture.source.body.lock().expect("body lock") = vec![fleet_scoped("v1")];
+    call(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources",
+        serde_json::json!({ "id": "mocks", "uri": "scripted://cfg/i.json" }),
+    )
+    .await;
+
+    // No principals yet: admitted, exactly as before the gate.
+    let pulled = call(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources/mocks/pull",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(pulled["changed"], serde_json::json!([9301]), "{pulled}");
+
+    // The first principal closes the open admin plane (RFC-002 §3.4).
+    let principal = rift_cluster::control::Principal {
+        id: rift_cluster::control::api_key_principal_id("sources-fleet-gate-key"),
+        display_name: "editor".to_owned(),
+        auth: rift_cluster::control::AuthSource::ApiKey {
+            hash: rift_cluster::control::hash_api_key("sources-fleet-gate-key"),
+        },
+        disabled: false,
+    };
+    let response = fixture
+        .node
+        .submit(ControlRequest {
+            op_id: uuid::Uuid::new_v4(),
+            principal: None,
+            issued_at_secs: 0,
+            expected_revision: None,
+            op: ControlOp::PrincipalPut {
+                tenant: TenantId::default(),
+                principal,
+            },
+        })
+        .await
+        .expect("principal commits");
+    assert_eq!(response.outcome, ControlOutcome::Applied);
+    let before = fixture.node.status().last_applied.expect("applied index");
+
+    // The document changes but still sets fleet scope: refused before the write.
+    *fixture.source.body.lock().expect("body lock") = vec![fleet_scoped("v2")];
+    *fixture.source.version.lock().expect("version lock") = "v2".to_owned();
+    let err = call_err(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources/mocks/pull",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(err.status(), 400, "{err}");
+    let message = err.to_string();
+    assert!(message.contains("FleetAdmin"), "names the role: {message}");
+    assert!(message.contains("9301"), "names the port: {message}");
+    assert!(
+        message.contains("PUT /imposters"),
+        "names the way in: {message}"
+    );
+    assert_eq!(
+        fixture.node.status().last_applied.expect("applied index"),
+        before,
+        "a refused pull commits nothing"
+    );
+
+    // What was admitted before the gate keeps serving, unchanged.
+    let config = call(
+        &client,
+        fixture.addr,
+        "GET",
+        "/_cluster/config",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        config["provenance"],
+        serde_json::json!([{ "tenant": DEFAULT_TENANT, "port": 9301, "sourceId": "mocks", "version": "v1" }]),
+        "still the pre-gate pull's version: {config}"
+    );
+
+    // The same document under tenant scope is admitted: the gate is about fleet scope only.
+    *fixture.source.body.lock().expect("body lock") = vec![
+        serde_json::from_value(serde_json::json!({
+            "port": 9301,
+            "protocol": "http",
+            "name": "v3",
+            "_rift": { "flowState": { "contextScope": "tenant" } },
+        }))
+        .expect("test config parses"),
+    ];
+    *fixture.source.version.lock().expect("version lock") = "v3".to_owned();
+    let pulled = call(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources/mocks/pull",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(pulled["changed"], serde_json::json!([9301]), "{pulled}");
+}
+
+/// The other half of the enforcement predicate (#288): with an admin credential configured the
+/// admin plane is enforced before any principal exists — the front then treats the legacy key
+/// as a bound principal, not as the bypass — so the puller must refuse fleet scope there too, or
+/// a document would land through a pull what the same operator's `PUT` could be refused.
+#[tokio::test]
+async fn a_source_cannot_admit_fleet_scope_when_an_admin_credential_is_configured() {
+    let fixture = start_with(true).await;
+    let client = client();
+    *fixture.source.body.lock().expect("body lock") = vec![
+        serde_json::from_value(serde_json::json!({
+            "port": 9301,
+            "protocol": "http",
+            "name": "v1",
+            "_rift": { "flowState": { "contextScope": "fleet" } },
+        }))
+        .expect("test config parses"),
+    ];
+    call(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources",
+        serde_json::json!({ "id": "mocks", "uri": "scripted://cfg/i.json" }),
+    )
+    .await;
+    let before = fixture.node.status().last_applied.expect("applied index");
+    let err = call_err(
+        &client,
+        fixture.addr,
+        "POST",
+        "/admin/sources/mocks/pull",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(err.status(), 400, "{err}");
+    assert!(err.to_string().contains("FleetAdmin"), "{err}");
+    assert_eq!(
+        fixture.node.status().last_applied.expect("applied index"),
+        before,
+        "nothing committed"
+    );
+    assert_eq!(
+        fixture.node.configured_ports().expect("ports"),
+        Vec::<(TenantId, u16)>::new(),
+        "the fleet-scoped config never landed"
+    );
 }

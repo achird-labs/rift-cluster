@@ -2401,7 +2401,7 @@ fn imposter_scope(node: &RaftNode, tenant: &TenantId, port: u16) -> Option<Conte
 /// port with several flows therefore has several owners, one per flow.
 ///
 /// The key is **not** the flow id from the URL. It is that id under the imposter's
-/// `flowState.contextScope` — `i{port}:` per imposter (the default), `f:` fleet-wide — which is why
+/// `flowState.contextScope` — `i{port}:` per imposter (the default), `t<tenant>:` per tenant (#288), `f:` fleet-wide — which is why
 /// this reads the imposter's own config to find the scope. Under `Fleet` two imposters' same-named
 /// spaces are one flow with one owner, and hashing the bare id would name the wrong node for every
 /// imposter-scoped flow, which is the default case.
@@ -2416,6 +2416,11 @@ fn imposter_scope(node: &RaftNode, tenant: &TenantId, port: u16) -> Option<Conte
 /// Absence over error, for the reason [`imposter_read_token`] gives — the space read is served by
 /// the engine and must not start failing because an ownership lookup could not run. `None` when the
 /// node handle is gone, no membership is applied, or the config cannot be read or parsed.
+///
+/// The tenant it renders under `Tenant` scope is the *request* tenant, which is safe only
+/// because `imposter_scope` reads `imposter_config(tenant, port)` — it resolves a scope at all
+/// only when the request tenant owns the row, so the tenant that owns the port and the tenant
+/// named here are the same tenant.
 fn space_owner(state: &FrontState, tenant: &TenantId, port: u16, flow_id: &str) -> Option<NodeId> {
     let node = state.node.upgrade()?;
     let ring = node.ring();
@@ -2428,7 +2433,7 @@ fn space_owner(state: &FrontState, tenant: &TenantId, port: u16, flow_id: &str) 
     let scope = imposter_scope(&node, tenant, port).unwrap_or_default();
     ring.owner(OwnedKey::new(
         KeyClass::FlowKv,
-        &scope.scoped_flow_id(Some(port), flow_id),
+        &scope.scoped_flow_id(Some(port), Some(tenant.as_str()), flow_id),
     ))
 }
 
@@ -3038,7 +3043,7 @@ async fn terminate(
         // `ReadSavedRequests`/`ReadFleetRequests` do above — none of the `If-Match`/`_rift.script`/
         // loopback-render machinery below applies to a read.
         Terminated::SpacesList(port) => {
-            return terminate_spaces_list(&state, &node, port, &tenant).await;
+            return terminate_spaces_list(&state, &node, port, &tenant, &bindings).await;
         }
         _ => {}
     }
@@ -3163,6 +3168,8 @@ async fn terminate(
         &body,
         auth.as_deref(),
         host.as_ref(),
+        principal_id.as_deref(),
+        &bindings,
     )
     .await
     {
@@ -3991,6 +3998,61 @@ async fn terminate_space_teardown(
     response
 }
 
+/// Whether `bindings` carries a `FleetAdmin` grant (issue #288) — the one predicate both the fleet
+/// admission gate ([`run_mutation`]) and the fleet-scoped spaces listing ([`terminate_spaces_list`])
+/// ask, so the two cannot answer it differently. Mirrors [`authz::decide`]'s own inline fleet check
+/// (a `FleetAdmin` binding always names [`FLEET_SCOPE`]) without reaching into that module, which
+/// answers a different question — "does this binding set grant `action` in `requested`" — than the
+/// narrower "does it hold FleetAdmin at all" these two callers need.
+fn fleet_admin(bindings: &[(TenantId, Role)]) -> bool {
+    bindings
+        .iter()
+        .any(|(tenant, role)| *role == Role::FleetAdmin && tenant.as_str() == FLEET_SCOPE)
+}
+
+/// The fleet admission gate (RFC-005 §S1, issue #288): a **client-supplied** config that sets
+/// `contextScope: "fleet"` crosses every tenant's boundary — one namespace shared by the whole
+/// fleet — so only a `FleetAdmin` may admit it. Refused with a `400` naming the requirement,
+/// before anything is validated, minted or parked; a batch (`PUT /imposters`) carrying one
+/// fleet-scoped config among several is refused whole.
+///
+/// Called from exactly the places a config comes off the wire — `build_mutation`'s `Create` and
+/// `ReplaceAllImposters` arms and `terminate_spec_deploy` — and deliberately **not** from
+/// `run_mutation`, which also commits `PutImposter` ops that `put_config_mutation` rebuilt from
+/// the *stored* config for an index-addressed stub edit. An Editor replacing a stub on an
+/// imposter a `FleetAdmin` admitted is not admitting the knob (their body carries no `flowState`
+/// at all), so gating that would refuse them for a key they never sent — while the by-id edits
+/// next to it (`PatchStubs`) went through. The gate is about who sets the scope, not who touches
+/// the imposter afterwards.
+///
+/// Skipped under the no-principal bypass: with no principal there is no role to hold, so nothing
+/// is gated — the same open-admin-plane reasoning `authorize_action`'s own bypass arm documents.
+/// A source pull is the other admission path and is gated in `SourcePuller::pull` itself, where
+/// no principal is ever present to hold the role.
+// The Err IS the client response — this module's early-return channel.
+#[allow(clippy::result_large_err)]
+fn refuse_fleet_scope_without_fleet_admin<'a>(
+    configs: impl IntoIterator<Item = &'a ImposterConfig>,
+    principal_id: Option<&str>,
+    bindings: &[(TenantId, Role)],
+) -> Result<(), Response<FrontBody>> {
+    if principal_id.is_none() || fleet_admin(bindings) {
+        return Ok(());
+    }
+    let sets_fleet = configs
+        .into_iter()
+        .any(|config| FlowConfig::declared_scope(config) == Some(ContextScope::Fleet));
+    if sets_fleet {
+        return Err(typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            "flowState.contextScope \"fleet\" requires FleetAdmin: a fleet-scoped context crosses \
+             every tenant's boundary",
+        ));
+    }
+    Ok(())
+}
+
 /// `GET /imposters/{port}/spaces` (issue #374): the fleet-wide list of correlated-isolation spaces
 /// this imposter currently holds live flow-KV entries under.
 ///
@@ -4003,44 +4065,59 @@ async fn terminate_space_teardown(
 /// whole response is built from `FlowNet::fleet_spaces`'s fan-out plus the imposter's resolved
 /// `durability` knob, both read fresh from this node's applied state.
 ///
-/// Two refusals are folded into `partial` rather than into a wrong list, because for an enumeration
-/// the scope is not a detail of the answer — it *is* the query:
+/// A `Tenant`-scoped imposter is served under its own `t<tenant>:` prefix — bounded to the
+/// caller's tenant by construction, so there is nothing to refuse. `Imposter` scope is likewise
+/// always served. Only `Fleet` scope can still be refused, and one resolution failure:
 ///
 /// - **The scope could not be resolved.** Guessing would enumerate the wrong namespace and report
 ///   it as complete (see [`imposter_scope`]).
-/// - **The scope is `Fleet`.** `ContextScope::Fleet` renders the prefix `f:`, which carries **no
-///   tenant component**, and one `FlowNet` shard serves every tenant's imposters on this node. So
-///   a `f:` scan matches every fleet-scoped flow in the cluster, whoever created it, and this route
-///   would hand one tenant another tenant's flow ids, entry counts and owning nodes. #359's
-///   single-space read does not have this problem: it answers about an id the caller already
-///   named, whereas this route is precisely what turns "know the id" into "enumerate them".
-///   Filtering by tenant is not available — the `f:` key records none — so this fails closed and
-///   says why, which is the standing rule for a classifier that cannot establish its boundary.
-///   RFC-005 §S1 specifies `fleet` as `FleetAdmin`-gated; that gate does not exist yet (issue
-///   #288), so the refusal cannot be narrowed to non-admins today either.
+/// - **The scope is `Fleet` and the caller is not `FleetAdmin`.** `ContextScope::Fleet` renders the
+///   prefix `f:`, which carries **no tenant component**, and one `FlowNet` shard serves every
+///   tenant's imposters on this node. So a `f:` scan matches every fleet-scoped flow in the
+///   cluster, whoever created it, and this route would hand one tenant another tenant's flow ids,
+///   entry counts and owning nodes. #359's single-space read does not have this problem: it
+///   answers about an id the caller already named, whereas this route is precisely what turns
+///   "know the id" into "enumerate them". Filtering by tenant is not available — the `f:` key
+///   records none — so this fails closed and says why, which is the standing rule for a
+///   classifier that cannot establish its boundary. RFC-005 §S1's `FleetAdmin` gate (issue #288)
+///   is exactly what narrows this: a `FleetAdmin` binding — whose whole role is to cross every
+///   tenant's boundary — is served the real fleet-wide list instead ([`fleet_admin`]).
+///
+/// Both refusals fold into `partial` rather than into a wrong list, because for an enumeration the
+/// scope is not a detail of the answer — it *is* the query.
 async fn terminate_spaces_list(
     state: &Arc<FrontState>,
     node: &Arc<RaftNode>,
     port: u16,
     tenant: &TenantId,
+    bindings: &[(TenantId, Role)],
 ) -> Response<FrontBody> {
     let scope = imposter_scope(node, tenant, port);
-    let unavailable = match scope {
-        None => Some("scope-unresolved"),
-        Some(ContextScope::Fleet) => Some("fleet-scope"),
-        Some(ContextScope::Imposter) => None,
+    let (prefix, unavailable): (Option<String>, Option<&str>) = match scope {
+        None => (None, Some("scope-unresolved")),
+        Some(ContextScope::Imposter) => (
+            Some(ContextScope::Imposter.prefix_for(Some(port), None)),
+            None,
+        ),
+        Some(ContextScope::Tenant) => (
+            Some(ContextScope::Tenant.prefix_for(Some(port), Some(tenant.as_str()))),
+            None,
+        ),
+        Some(ContextScope::Fleet) if fleet_admin(bindings) => {
+            (Some(ContextScope::Fleet.prefix_for(Some(port), None)), None)
+        }
+        Some(ContextScope::Fleet) => (None, Some("fleet-scope")),
     };
 
     // Nothing is enumerated at all when the scope is unusable — not even under the `Imposter`
     // default. A `f:` imposter scanned as `i{port}:` finds nothing and would look definitively
     // empty; scanning `f:` for real would leak. Refusing is the only answer that is neither.
-    let (rows, partial) = match unavailable {
-        Some(_) => (Vec::new(), true),
-        None => {
-            let prefix = ContextScope::Imposter.prefix_for(Some(port));
+    let (rows, partial) = match &prefix {
+        None => (Vec::new(), true),
+        Some(prefix) => {
             state
                 .flow_net
-                .fleet_spaces(port, &prefix, JOURNAL_PEER_BUDGET)
+                .fleet_spaces(port, prefix, JOURNAL_PEER_BUDGET)
                 .await
         }
     };
@@ -6062,6 +6139,14 @@ async fn terminate_spec_deploy(
             ));
         }
     };
+    // The compiled config is what a client would `PUT /imposters`, so it passes the same fleet
+    // admission gate (#288) — the compiler emits no `flowState` today, but the gate is about
+    // what reaches the log, not about who is expected to write it.
+    if let Err(response) =
+        refuse_fleet_scope_without_fleet_admin([&config], principal_id.as_deref(), bindings)
+    {
+        return response;
+    }
     let existed = match node.get_imposter(tenant.as_str(), port) {
         Ok(existed) => existed.is_some(),
         Err(e) => return internal(&e.to_string()),
@@ -6273,6 +6358,7 @@ fn static_is_bodies(stub: &serde_json::Value) -> Vec<serde_json::Value> {
 /// Translate one terminated route into ops + a render plan. Reads that inform
 /// the mutation (current stubs for index-addressed edits, capture-before-delete
 /// bodies) come from the local applied state / loopback admin.
+#[allow(clippy::too_many_arguments)]
 async fn build_mutation(
     state: &FrontState,
     node: &Arc<RaftNode>,
@@ -6281,10 +6367,15 @@ async fn build_mutation(
     body: &[u8],
     auth: Option<&str>,
     host: Option<&HeaderValue>,
+    // Who is writing, for the fleet admission gate on the two arms that take a config off the
+    // wire (#288) — see `refuse_fleet_scope_without_fleet_admin`.
+    principal_id: Option<&str>,
+    bindings: &[(TenantId, Role)],
 ) -> Result<Mutation, Response<FrontBody>> {
     match kind {
         Terminated::Create => {
             let config: ImposterConfig = parse(body)?;
+            refuse_fleet_scope_without_fleet_admin([&config], principal_id, bindings)?;
             let Some(port) = config.port else {
                 return Err(typed_error(
                     StatusCode::BAD_REQUEST,
@@ -6314,6 +6405,7 @@ async fn build_mutation(
         }
         Terminated::ReplaceAllImposters => {
             let replace: ReplaceAllBody = parse(body)?;
+            refuse_fleet_scope_without_fleet_admin(&replace.imposters, principal_id, bindings)?;
             // Upsert the new set first, then prune the leftovers — never a
             // DeleteAll up front. The ops commit as separate Raft entries, so a
             // mid-sequence loss of quorum tears the sequence; torn this way the
@@ -7389,20 +7481,20 @@ mod tests {
         let ring = rift_cluster::Ring::new([1, 2, 3, 4, 5, 6, 7], 1);
 
         // Same caller-chosen id, two scopes, two different keys — and so, in general, two owners.
-        let imposter_key = ContextScope::Imposter.scoped_flow_id(Some(4545), "cart");
-        let fleet_key = ContextScope::Fleet.scoped_flow_id(Some(4545), "cart");
+        let imposter_key = ContextScope::Imposter.scoped_flow_id(Some(4545), None, "cart");
+        let fleet_key = ContextScope::Fleet.scoped_flow_id(Some(4545), None, "cart");
         assert_eq!(imposter_key, "i4545:cart");
         assert_eq!(fleet_key, "f:cart");
 
         // Two imposters, same flow id, imposter scope: different keys, so isolated (#152).
         assert_ne!(
-            ContextScope::Imposter.scoped_flow_id(Some(4545), "cart"),
-            ContextScope::Imposter.scoped_flow_id(Some(4646), "cart")
+            ContextScope::Imposter.scoped_flow_id(Some(4545), None, "cart"),
+            ContextScope::Imposter.scoped_flow_id(Some(4646), None, "cart")
         );
         // Under fleet scope the port is irrelevant: one flow, one owner, shared by both imposters.
         assert_eq!(
-            ContextScope::Fleet.scoped_flow_id(Some(4545), "cart"),
-            ContextScope::Fleet.scoped_flow_id(Some(4646), "cart")
+            ContextScope::Fleet.scoped_flow_id(Some(4545), None, "cart"),
+            ContextScope::Fleet.scoped_flow_id(Some(4646), None, "cart")
         );
 
         // Hashing the bare id is the bug this test exists for: it is a third key, equal to neither.
@@ -7907,6 +7999,55 @@ mod tests {
         assert_eq!(doc["unavailable"], "fleet-scope", "{body}");
         assert_eq!(doc["spaces"], serde_json::json!([]), "{body}");
         assert_eq!(doc["partial"], true, "{body}");
+    }
+
+    /// RFC-005 S1 (#288): a `tenant`-scoped imposter's listing is bounded by the caller's own
+    /// tenant prefix (`t<tenant>:`), so unlike `fleet` it is served. Bound harness, because the
+    /// point is that a write made through the *provider* — which resolves the owning tenant at
+    /// `provide` time and keys the entry `tdefault:checkout` — is what the *listing* then finds
+    /// under the prefix it derives from the request tenant. If the two ever computed the prefix
+    /// differently (say the provider fell back to its defensive `t??:`), the row would vanish
+    /// from this list without any other error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spaces_list_for_a_tenant_scoped_imposter_is_served_under_the_tenant_prefix() {
+        use rift_cluster_base::seams::FlowStoreProvider as _;
+
+        let (front, node, net, _dir) = test_front_with_bound_flow().await;
+        seed_imposter(&node, 4545, serde_json::json!({ "contextScope": "tenant" })).await;
+
+        let config: ImposterConfig = serde_json::from_value(serde_json::json!({
+            "port": 4545,
+            "protocol": "http",
+            "_rift": { "flowState": { "contextScope": "tenant" } },
+        }))
+        .expect("config parses");
+        let store = rift_cluster::stores::ClusteredFlowStoreProvider::new(Arc::clone(&net))
+            .provide(&config)
+            .expect("the clustered provider always provides");
+        tokio::task::spawn_blocking(move || {
+            store.set("checkout", "step", serde_json::json!("paid"))
+        })
+        .await
+        .expect("blocking op")
+        .expect("write through the owner");
+
+        let (status, body) = read_spaces(&front, 4545).await;
+
+        assert_eq!(status, 200, "body: {body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert!(
+            doc.get("unavailable").is_none(),
+            "a tenant-scoped listing is servable: {body}"
+        );
+        let rows = doc["spaces"].as_array().expect("a spaces array");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the one space written under `tdefault:`: {body}"
+        );
+        assert_eq!(rows[0]["space"], "checkout", "{body}");
+        assert_eq!(rows[0]["entryCount"], 1, "{body}");
+        assert_eq!(doc["partial"], false, "{body}");
     }
 
     /// The ordinary path: a resolvable, imposter-scoped config carries no `unavailable` key at
