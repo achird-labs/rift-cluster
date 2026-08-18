@@ -10,6 +10,7 @@
 //! rather than reaching a half-built node.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::{Request, Response};
 use openraft::error::{ClientWriteError, InitializeError, RaftError};
 use openraft::metrics::WaitError;
 use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
@@ -1279,6 +1283,25 @@ impl RaftNode {
     #[must_use]
     pub fn is_locally_bound(&self, port: u16) -> bool {
         self.sm_reader.is_locally_bound(port)
+    }
+
+    /// Answer `req` as `port`'s imposter would, in-process — the try endpoint's dispatch (issue
+    /// #344). See [`RedbStateMachine::dispatch_to_imposter`]: `None` means this node's engine does
+    /// not hold `port` at all, and must never be answered as if it did; the try must be answered by
+    /// the imposter this node owns, by construction, instead of a loopback dial BSD can route
+    /// elsewhere.
+    ///
+    /// **Tenant-blind, deliberately.** This resolves by port alone and answers whatever imposter is
+    /// there; it is the caller's job to have already proved the port belongs to the acting tenant
+    /// (the admin front's `addressed_port` → `authorize_action` ownership gate does, before
+    /// `terminate_try_imposter` ever reaches this). A new caller that skipped that gate would have
+    /// built a cross-tenant dispatch in one line — do not add one without it.
+    pub fn dispatch_to_imposter(
+        &self,
+        port: u16,
+        req: Request<Incoming>,
+    ) -> Option<impl Future<Output = Response<Full<Bytes>>> + Send + 'static> {
+        self.sm_reader.dispatch_to_imposter(port, req)
     }
 
     /// Every port this node's engine holds, split by bound vs. failed (issue #369, blocker B4). See

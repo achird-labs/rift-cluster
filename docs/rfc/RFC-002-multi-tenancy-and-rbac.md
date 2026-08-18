@@ -199,8 +199,9 @@ A closed enum, one per route class:
 `StreamSubscribe` · `TenantManage` · `AuditRead` · `ClusterAdmin`
 
 `ImposterTry` (issue #335) authorizes `POST /admin/imposters/{port}/try` — the
-console's "send a sample request to this stub" affordance, and the **only**
-action under which the server originates outbound HTTP on a caller's behalf.
+console's "send a sample request to this stub" affordance. As first shipped it
+was the **only** action under which the server originated outbound HTTP on a
+caller's behalf; since issue #344 it originates none — see below.
 
 It sits at `Operator`, with the other reads-that-mutate, rather than with
 `ImposterRead`: a try advances scenario state, appends to the request log and
@@ -212,9 +213,24 @@ the first capability of its kind.
 Because it is the first, its containment is part of the action's definition
 rather than an implementation detail: the route names a **port, never a URL or
 host**; the port must be an imposter in the caller's own tenant *and* one this
-node is actually serving on loopback (a committed config does not prove the
-socket, so ownership alone is not sufficient); the scheme comes from the
-imposter's own `protocol`; and redirects are never followed.
+node's engine actually holds (a committed config does not prove the socket, so
+ownership alone is not sufficient); and redirects are never followed.
+
+**As shipped (#335, then #344).** #335 dialled `127.0.0.1:{port}` behind that
+gate. Issue #344 showed the gate is not sufficient on BSD/macOS: the engine
+binds `0.0.0.0:{port}`, BSD accepts that alongside a foreign `127.0.0.1:{port}`
+socket, and the kernel routes a loopback dial to the more specific one — so a
+tenant could reach the metrics, probe or cluster-RPC listener through a port it
+"owned". Since #344 the try **opens no socket at all**: the sample request is
+dispatched in-process to the very `Arc<Imposter>` `is_locally_bound` consulted
+(upstream's `handle_imposter_request`, the per-imposter half of seam #317's
+`dispatch_to_port`), over an in-memory HTTP/1 connection, so "the
+thing that answers is the imposter this node owns" holds by construction and
+the SSRF surface is gone rather than gated. The scheme is therefore no longer
+part of the exchange (an `https` imposter is answered without a TLS handshake),
+the recorded `request_from` is the gateway's synthetic loopback address, and a
+stub that injects a connection-level fault renders an explicit "no response on
+the wire" outcome rather than a fabricated answer.
 
 `SourceRead` (issue #239) covers the read-only source inspection surface
 (`GET /admin/sources`, `GET /admin/sources/{id}`). It sits with the other

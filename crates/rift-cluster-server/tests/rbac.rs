@@ -759,10 +759,13 @@ async fn a_try_will_not_dial_a_port_this_node_never_bound() {
     //
     // Bound to `0.0.0.0`, deliberately, because that is what the imposter manager itself binds
     // (`config.host.unwrap_or("0.0.0.0")`) and it is the only spelling whose collision is refused
-    // on every platform. A `127.0.0.1` squatter is *not* equivalent: BSD accepts a `0.0.0.0` bind
-    // alongside it, so the imposter would bind successfully, `is_bound()` would be true, and the
-    // more-specific socket would quietly win the loopback connection — a real residual hole, but a
-    // different one, recorded against this issue rather than papered over by a weaker squatter.
+    // on every platform. A `127.0.0.1` squatter is *not* equivalent here: BSD accepts a `0.0.0.0`
+    // bind alongside it, so the imposter would bind successfully and `is_bound()` would be true —
+    // which is exactly the shape `a_try_answers_from_this_nodes_engine_not_from_whoever_holds_loopback`
+    // exists to cover, now that issue #344 closed it (the exchange is dispatched in-process to the
+    // imposter this gate resolved, never dialled, so there is nothing left for a more-specific
+    // socket to win). This test's `0.0.0.0` squatter still stands for the other case, which #344
+    // does not touch: a bind that fails outright, so the port really is unbound.
     let squatter = std::net::TcpListener::bind("0.0.0.0:0").expect("bind the squatter");
     let port = squatter.local_addr().expect("addr").port();
 
@@ -815,6 +818,169 @@ async fn a_try_will_not_dial_a_port_this_node_never_bound() {
     assert!(
         squatter.accept().is_err(),
         "the try connected to a socket this tenant does not actually own"
+    );
+
+    server.shutdown().await;
+}
+
+/// Issue #344, the hole issue #335 left open on BSD/macOS: **the try answers from this node's
+/// engine, never from whoever happens to hold loopback.**
+///
+/// The imposter manager binds `0.0.0.0:{port}`; BSD accepts that alongside a foreign socket on
+/// `127.0.0.1:{port}`, and the kernel routes a loopback dial to the more specific one. So with the
+/// old loopback dial, `is_bound()` was true, the gate passed, and the try reached the squatter.
+/// Since #344 the try is dispatched in-process to the imposter `is_locally_bound` consulted, over
+/// an in-memory connection — there is no dial to misroute.
+///
+/// Platform-honest: on BSD/macOS the imposter binds and the try must answer with **its** stub
+/// while the squatter accepts nothing; on Linux the colliding bind is refused, so the imposter is
+/// not bound and the try is refused with the same `502` `a_try_will_not_dial_...` pins — and the
+/// squatter still accepts nothing. Both branches prove the one thing this test exists for: no
+/// connection ever reaches the socket the tenant does not own. The branch is chosen by asking the
+/// node, not by `cfg!`, so a platform that starts behaving like the other is still tested truly.
+#[tokio::test]
+async fn a_try_answers_from_this_nodes_engine_not_from_whoever_holds_loopback() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    // The more-specific socket: exactly the shape `a_try_will_not_dial_...` records as the
+    // residual it could not close. Held for the whole test; the accept probe at the end is the
+    // real assertion.
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the squatter");
+    let port = squatter.local_addr().expect("addr").port();
+    squatter
+        .set_nonblocking(true)
+        .expect("non-blocking for the accept probe");
+
+    let mut config = minimal_imposter(port);
+    config["stubs"] = json!([{
+        "responses": [{ "is": { "statusCode": 200, "body": "{\"from\":\"imposter\"}" } }]
+    }]);
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: serde_json::from_value(config).expect("config parses"),
+        },
+    )
+    .await;
+    op_id += 1;
+    let operator =
+        seed_bound_principal(node, &mut op_id, "loopback-op", "default", Role::Operator).await;
+
+    let seen = Seen::of(
+        client
+            .post(format!("http://{admin}/admin/imposters/{port}/try"))
+            .header("authorization", &operator)
+            .json(&json!({ "method": "GET", "path": "/anything" }))
+            .send()
+            .await
+            .expect("try the port"),
+    )
+    .await;
+
+    // The real assertion, before anything else touches the port: the try connected to nothing.
+    // Under the old loopback dial this is where BSD/macOS failed — the kernel handed the dial to
+    // the more specific socket, i.e. the squatter.
+    assert!(
+        squatter.accept().is_err(),
+        "the try must never connect to a socket the tenant does not own"
+    );
+
+    if node.is_locally_bound(port) {
+        // BSD/macOS: the wildcard bind coexisted with the squatter, and the try still answered
+        // from the imposter — the engine's stub, not whoever holds 127.0.0.1.
+        assert_eq!(
+            seen.status, 200,
+            "the try answers from the imposter this node serves: {seen}"
+        );
+        assert_eq!(seen.json()["status"], 200, "{seen}");
+        assert_eq!(
+            seen.json()["body"],
+            "{\"from\":\"imposter\"}",
+            "the imposter's own stub answered, not whoever holds 127.0.0.1: {seen}"
+        );
+        // Informational, not asserted: show whether a plain loopback dial reaches the squatter
+        // on this box (the loophole this test closes). BSD routes it to the more specific
+        // socket; a `SO_REUSEPORT` group or a busy box can occasionally hand it elsewhere, which
+        // is exactly why the property under test is "the try dials nothing", not "the dial goes
+        // to the squatter".
+        let probe = std::net::TcpStream::connect(("127.0.0.1", port));
+        let reached_squatter = squatter.accept().is_ok();
+        eprintln!(
+            "loopback probe: connect={} reached_squatter={reached_squatter}",
+            probe.is_ok()
+        );
+    } else {
+        // Linux: the colliding bind was refused, so the record exists and the socket does not —
+        // the `is_locally_bound` gate refuses, exactly as `a_try_will_not_dial_...` pins.
+        assert_eq!(seen.status, 502, "{seen}");
+        assert!(seen.body.contains("not bound"), "{seen}");
+    }
+
+    server.shutdown().await;
+}
+
+/// Issue #344: a stub that injects a connection-level fault has no response on the wire — the
+/// serve loop resets or closes the socket. In-process there is no socket to reset, so the try
+/// says what the wire would have done rather than presenting the engine's carrier `502` as the
+/// imposter's answer.
+#[tokio::test]
+async fn a_connection_fault_stub_is_an_explicit_transport_outcome() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let port = reserve_port();
+    let mut config = minimal_imposter(port);
+    config["stubs"] = json!([{ "responses": [{ "fault": "CONNECTION_RESET_BY_PEER" }] }]);
+    seed(
+        node,
+        op_id,
+        ControlOp::PutImposter {
+            tenant: TenantId::default(),
+            config: serde_json::from_value(config).expect("config parses"),
+        },
+    )
+    .await;
+    op_id += 1;
+    let operator =
+        seed_bound_principal(node, &mut op_id, "fault-op", "default", Role::Operator).await;
+
+    let seen = Seen::of(
+        client
+            .post(format!("http://{admin}/admin/imposters/{port}/try"))
+            .header("authorization", &operator)
+            .json(&json!({ "method": "GET", "path": "/reset" }))
+            .send()
+            .await
+            .expect("try the fault stub"),
+    )
+    .await;
+
+    assert_eq!(
+        seen.status, 502,
+        "a connection fault is the endpoint reporting no response, not a 200: {seen}"
+    );
+    assert!(
+        seen.body.contains("CONNECTION_RESET_BY_PEER"),
+        "the outcome names the fault the stub injects: {seen}"
     );
 
     server.shutdown().await;

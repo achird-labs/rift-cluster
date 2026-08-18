@@ -55,6 +55,7 @@
 //! longer be applied.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::io::Cursor;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -62,6 +63,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::{Request, Response};
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
     BasicNode, Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
@@ -74,7 +78,7 @@ use redb::{
 };
 use rift_cluster_base::seams::{
     ApplyReport, CompiledRoutes, ImposterConfig, ImposterError, ImposterManager, Route, RouteTable,
-    Stub, StubResponse,
+    Stub, StubResponse, handle_imposter_request,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2483,6 +2487,47 @@ impl RedbStateMachine {
             engine
                 .get_imposter(port)
                 .is_ok_and(|imposter| imposter.is_bound())
+        })
+    }
+
+    /// Answer a request as `port`'s imposter would, **in-process** (issue #344).
+    ///
+    /// The try endpoint's whole containment claim is that its answer comes from the imposter this
+    /// node owns — not from whatever happens to hold `127.0.0.1:port`, which on BSD can be a
+    /// different socket than the one [`Self::is_locally_bound`] just proved this engine holds (the
+    /// wildcard/REUSEPORT/`localhost`-vs-`::1` variants a loopback dial cannot tell apart). Routing
+    /// the exchange through this engine instead of a socket closes all of those at once, by
+    /// construction: there is no address to misroute to, because nothing is addressed.
+    ///
+    /// `None` when there is no local engine, or `engine.get_imposter(port)` is `Err` — this node
+    /// does not hold `port` at all, which must never be answered as if it did. `Some` answers from
+    /// the **`Arc<Imposter>` resolved right here**, through [`handle_imposter_request`] — the
+    /// per-imposter half of `dispatch_to_port`, the seam #317 gives the `/__rift/` gateway, with
+    /// the same synthetic loopback `client_addr` the gateway records. Not `dispatch_to_port`
+    /// itself, deliberately: that re-resolves the port inside, and an imposter deleted between
+    /// this lookup and that one would be answered with the engine's own "no imposter on port"
+    /// `404` — a fabricated answer for a vanished imposter, which is exactly what the `None`
+    /// contract above forbids. Holding the `Arc` closes that window: a deleted imposter's last
+    /// exchange still runs against the imposter that was there when the try was admitted.
+    ///
+    /// Returns an owned `'static` future rather than borrowing `&self` across the await, because
+    /// the caller (the admin front's `perform_try`) runs it inside a spawned hyper connection,
+    /// which must be `'static`. The manager itself never leaves `raft/` — only this one resolved
+    /// imposter's exchange does.
+    pub fn dispatch_to_imposter(
+        &self,
+        port: u16,
+        req: Request<Incoming>,
+    ) -> Option<impl Future<Output = Response<Full<Bytes>>> + Send + 'static> {
+        let imposter = self.engine.as_ref()?.get_imposter(port).ok()?;
+        // The same address the gateway stamps on what it forwards: the imposter is being
+        // reached by this process, not by a peer, and the recorded `request_from` says so.
+        let client_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        Some(async move {
+            match handle_imposter_request(req, imposter, client_addr).await {
+                Ok(response) => response,
+                Err(never) => match never {},
+            }
         })
     }
 

@@ -770,6 +770,19 @@ plus application auth; probe endpoints (`/readyz`, `/healthz`) are
 deliberately unauthenticated and stateless-safe, because kubelets and LBs
 don't hold credentials.
 
+**The admin plane originates no outbound HTTP on a caller's behalf.** The one
+route that did — `POST /admin/imposters/{port}/try` (#335), which dialled
+`127.0.0.1:{port}` behind an `is_locally_bound` gate — was found reachable past
+the gate on BSD/macOS (#344: the engine's `0.0.0.0` bind coexists with a
+foreign `127.0.0.1` socket, and the loopback dial lands on the foreign one —
+including, on a `--cluster-insecure` fleet, the cluster RPC listener). Since
+#344 the try is answered **in-process**: the sample request is dispatched to
+the imposter this node's engine holds, over an in-memory HTTP/1 connection,
+with no socket opened. The containment is now structural rather than checked —
+there is no address to get wrong — and the `is_locally_bound` gate remains only
+so a bind-failed imposter is reported as such (`502`, "not bound") instead of
+answered as though it were serving.
+
 ## Console sessions and the fleet projection (issue #185, RFC-006 §5.2–§5.3)
 
 ### `/_fleet/*` is `ClusterAdmin` — RFC-006 §12 Q3, settled
