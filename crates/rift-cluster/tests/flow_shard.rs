@@ -296,6 +296,64 @@ async fn eviction_sheds_whole_flows() {
             "flow-{i} was half-evicted: {keys:?}"
         );
     }
+    // And it is the two most recently written that survived — actual LRU. All ten writes land
+    // inside one millisecond, so `last_touch` ties across every flow; before the touch sequence
+    // (issue #408) the tie went to `HashMap` iteration order, randomised per process, and this
+    // test failed roughly one run in a handful with a flow half-evicted mid-write.
+    for i in 0..3 {
+        assert!(
+            shard.flow(&format!("flow-{i}")).is_empty(),
+            "flow-{i} is older than the survivors and must have been evicted"
+        );
+    }
+    for i in 3..5 {
+        assert_eq!(
+            shard.flow(&format!("flow-{i}")).len(),
+            2,
+            "flow-{i} is among the two most recently touched and must survive whole"
+        );
+    }
+}
+
+/// The tie-break itself, from the other direction (issue #408): a flow that was written first
+/// but *touched* again last is the most recent, and survives eviction even though every touch in
+/// the test shares one millisecond — the sequence, not the clock, decides.
+#[tokio::test]
+async fn a_re_touched_flow_is_the_most_recent_even_when_the_clock_ties() {
+    let shard = FlowShard::in_memory(ShardConfig {
+        max_flows: 3,
+        ..config(50)
+    });
+    // Three flows fill the cap exactly; nothing is evicted yet.
+    for i in 0..3 {
+        shard
+            .set(&format!("flow-{i}"), "a", entry("x"), Durability::None)
+            .await
+            .expect("write");
+    }
+    // flow-0 was the oldest; touching it makes it the newest.
+    shard
+        .set("flow-0", "b", entry("y"), Durability::None)
+        .await
+        .expect("re-touch flow-0");
+    // A fourth flow evicts exactly one: the least recently touched, which is now flow-1.
+    shard
+        .set("flow-3", "a", entry("x"), Durability::None)
+        .await
+        .expect("write flow-3");
+
+    assert_eq!(shard.flow_count(), 3);
+    assert!(
+        shard.flow("flow-1").is_empty(),
+        "flow-1 was the least recently touched"
+    );
+    assert_eq!(
+        shard.flow("flow-0").len(),
+        2,
+        "the re-touched flow-0 survives whole"
+    );
+    assert_eq!(shard.flow("flow-2").len(), 1);
+    assert_eq!(shard.flow("flow-3").len(), 1);
 }
 
 /// Eviction is real LRU: the least-recently-*touched* flow goes first, and a
