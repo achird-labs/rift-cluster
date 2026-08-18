@@ -476,6 +476,15 @@ Ch. 13).
 New actions — added to the closed enum, per its own rule that adding a
 route means adding an action:
 
+> **As shipped (#278).** `SpecRead` / `SpecWrite` / `SpecDelete` landed with
+> **S2**, not S6 as §9 originally planned. That plan predates M2 shipping:
+> the front's `action_for` is matched wildcard-free over the closed `Action`
+> enum, so a terminated `/specs` route cannot compile without its action.
+> The role mapping is exactly the table below (Viewer+ / Editor+ / Editor+),
+> `deploy` additionally requires `ImposterWrite`, and only
+> `ValidationPolicyWrite` remains for the validation slices — it moves to S4
+> with its route.
+
 | Action | Routes | Granted to |
 |---|---|---|
 | `SpecRead` | `GET /specs`, `GET /specs/:id`, `GET /specs/:id/drift` | Viewer + |
@@ -689,7 +698,7 @@ S5 is the upstream PR; S8 gates on #20.
 | Slice | Contents | Exit criteria |
 |---|---|---|
 | **S1** `feat(spec): rift-cluster-spec — OpenAPI 3.0 compiler to imposter JSON` | pure crate; path/method/param compilation, response synthesis, deterministic ids and seeds; golden-file + property tests (regex escaping, ordering, seed stability) | same spec bytes → byte-identical imposter JSON across runs; goldens cover petstore + a template-heavy spec |
-| **S2** `feat(spec): spec records on the control plane + /specs surface` | `SpecPut/SpecDelete/SpecBind` + tables + 4 MiB guard + digest no-op; `/specs` CRUD, `compile`, `deploy` terminated in the front | deploy → imposter serves on every node after 2xx; unchanged re-`PUT` grows the log by zero entries; tag-stability test extended |
+| **S2** `feat(spec): spec records on the control plane + /specs surface` — **shipped (#278)** | `SpecPut/SpecDelete/SpecBind/SpecUnbind` + `sm_specs`/`sm_spec_blobs` + 4 MiB guard + digest no-op; `/specs` CRUD, `compile`, `deploy` terminated in the front; `SpecRead/Write/Delete` actions (see §4.3's as-shipped note); `Rift-Spec-Warnings` on edit-time violations | deploy → imposter serves on every node after 2xx; unchanged re-`PUT` grows the log by zero entries; tag-stability test extended |
 | **S3** `feat(spec): drift diff + re-import policy` | §3.5 classifier, `overwrite\|skip\|fail`, `drifted` flag, `GET /specs/:id/drift` | hand-added stub survives `overwrite`; hand-edited `spec:` stub is reported, not silently clobbered; `fail` refuses with the report |
 | **S4** `feat(spec): soft validation — bus consumer + violations read` | in-process validator, `jsonschema` cache, per-node violations table, merged `validationFailures` read with `since=` cursor, `ValidationPolicySet` (`off`/`soft` only) | an off-contract request on a `soft` imposter yields exactly one violation row, joinable to its journal index; `off` imposters measure zero overhead |
 | **S5** `feat(spec): U-13 exchange inspector — upstream PR + pin bump` | upstream: trait, provider, two hook points, inert default; here: seam re-export in `rift-cluster-base::seams`, `seams_resolve` extended | upstream suites green with no inspector installed; parity gate (#37/#139) unchanged |

@@ -2702,6 +2702,7 @@ dependencies = [
  "reqwest",
  "rift-cluster",
  "rift-cluster-base",
+ "rift-cluster-spec",
  "rust-embed",
  "serde",
  "serde_json",

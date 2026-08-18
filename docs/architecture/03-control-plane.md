@@ -70,6 +70,12 @@ flowchart TB
 - **Snapshots** serialize the `sm_*` tables at 5k entries / 64 MiB and truncate
   the log. Config bodies ride in log entries (small JSON); snapshots are the
   compaction story, replacing v2's content-addressed body fetch entirely.
+  The one deliberately larger payload is an OpenAPI spec (RFC-004 §4.1, #278):
+  its bytes ride a `SpecPut` entry too — every node must hold *identical*
+  bytes, and re-fetching per node is exactly the differing-bytes hazard the
+  sources' one-fetch rule closes — but they are capped at **4 MiB** by
+  `control::validate` before commit and stored content-addressed in
+  `sm_spec_blobs`, so identical documents under two ids cost one blob.
 
 ## Membership lifecycle
 

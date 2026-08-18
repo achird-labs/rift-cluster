@@ -30,7 +30,7 @@ use super::network::{
     JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
 };
 use super::ring::Ring;
-use super::store::{self, RedbStateMachine, SourceRecord, SourceRow};
+use super::store::{self, RedbStateMachine, SourceRecord, SourceRow, SpecBinding, SpecRecord};
 use super::{NodeId, TypeConfig};
 use crate::control::{
     AuditRow, AuditSink, ControlOp, ControlRequest, ControlResponse, Principal, Role, SessionKey,
@@ -1421,6 +1421,44 @@ impl RaftNode {
     pub fn source(&self, tenant: &str, id: &str) -> Result<Option<SourceRecord>, NodeError> {
         self.sm_reader
             .source(tenant, id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// Every declared spec `tenant` has, id-ascending (RFC-004 S2, #278). Like
+    /// [`Self::sources`], this answers from local applied state and needs no leadership.
+    pub fn specs(&self, tenant: &str) -> Result<Vec<SpecRecord>, NodeError> {
+        self.sm_reader
+            .specs(tenant)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// One spec by id, or `None` when `tenant` has no such spec (RFC-004 S2, #278).
+    pub fn spec(&self, tenant: &str, id: &str) -> Result<Option<SpecRecord>, NodeError> {
+        self.sm_reader
+            .spec(tenant, id)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// The document stored under `digest`, or `None` if no spec currently holds it (RFC-004 S2,
+    /// #278).
+    pub fn spec_document(&self, digest: &str) -> Result<Option<String>, NodeError> {
+        self.sm_reader
+            .spec_document(digest)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// `tenant`'s port `port`'s spec provenance, or `None` when the port holds no imposter or
+    /// its imposter is not spec-bound (RFC-004 S2, #278).
+    pub fn spec_binding(&self, tenant: &str, port: u16) -> Result<Option<SpecBinding>, NodeError> {
+        self.sm_reader
+            .spec_binding(tenant, port)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// How many distinct spec documents are currently held, fleet-wide (RFC-004 S2, #278).
+    pub fn spec_blob_count(&self) -> Result<usize, NodeError> {
+        self.sm_reader
+            .spec_blob_count()
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 

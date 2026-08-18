@@ -1668,6 +1668,88 @@ in order, and pulls the imposters array out of each response through the
 pointer. A pointer that matches nothing is an **error**, not an empty list —
 an empty list would silently delete every imposter the source owns.
 
+## Spec-driven mocking: the `/specs` surface (#278)
+
+RFC-004 makes an OpenAPI 3.0 document a first-class **control-plane object**.
+[`rift-cluster-spec`](../crates/rift-cluster-spec) (#277) is the pure compiler —
+`(spec bytes, options) → imposter JSON` — and this surface is its home: where a
+spec is stored, replicated, deployed, and later validated against. Everything
+here is EE-only and terminates in the clustered front; the upstream admin has no
+notion of a spec.
+
+The rule that makes it cluster-correct mirrors sources: **the compiler never
+runs in the apply path.** `PUT /specs/{id}` compiles on the node that accepted
+the request, *before* anything is committed, and refuses a document that does
+not compile with the compiler's own reason. Only bytes every node can compile
+identically ever enter the log; a `deploy` compiles again on the accepting node
+and commits the *result* as an ordinary `PutImposter`. Apply stores and stamps;
+it never parses OpenAPI.
+
+### The endpoints
+
+All under the tenant in view (`X-Rift-Tenant`), all answering the typed error
+envelope, and every write carrying `Rift-Cluster-Revision` / `Rift-Cluster-Op-Id`
+because it *is* an ordinary terminated write — park/replay, `Idempotency-Key`
+dedup and the write barrier are inherited, not rebuilt.
+
+| Route | Action | What it does |
+|---|---|---|
+| `PUT /specs/{id}` | `spec.write` (Editor+) | Import or re-import. Body is the document (JSON or YAML, UTF-8, ≤ 4 MiB). `201` on first import, `200` on re-import; an unchanged re-import answers `200` with `unchanged: true` and **writes no log entry**. |
+| `GET /specs` | `spec.read` (Viewer+) | `{specs: [{id, format, digest, source, ports, drifted, revision}]}` — never the documents. |
+| `GET /specs/{id}` | `spec.read` | The record plus `document`, verbatim as imported. |
+| `DELETE /specs/{id}[?force]` | `spec.delete` (Editor+) | `409` while any port is deployed from it; `?force` (or `?force=true`) unbinds those ports first (they keep serving) and then removes the record; `?force=false` is a declined force. |
+| `POST /specs/{id}/compile` | `spec.read` | Dry run: `{imposter, operations, diff}` for `{port?}` — commits nothing. |
+| `POST /specs/{id}/deploy` | `spec.write` **+ `imposter.write`** | `{port}` → compile → `PutImposter` + `SpecBind` under one barrier. `201` created / `200` replaced; the body is the stored imposter; `If-Match` conditions on the imposter's revision. |
+
+The RBAC actions `spec.read` / `spec.write` / `spec.delete` are RFC-004 §4.3's,
+landed here rather than in S6 because a terminated route cannot ship without its
+action — `action_for` is matched wildcard-free. `deploy` additionally checks
+`imposter.write` on the caller's bindings: holding `spec.write` alone must not
+be a back door into imposter mutation. Cross-tenant probes (`GET /specs/{id}`
+for another tenant's id) answer the same `404` as an id that never existed.
+
+### Content-addressed, capped, replicated
+
+Specs live in two replicated tables: `sm_specs` `(tenant, id) → {format,
+digest, source, revision}` and `sm_spec_blobs` `digest → bytes`. The blob is
+**content-addressed and shared** — two specs with identical bytes, in one tenant
+or across tenants, hold one blob, and it goes when the last record referencing
+it does. `control::validate` refuses a document over **4 MiB** before commit
+(the store has no per-record size guard of its own; the front's 16 MiB body
+cap is the only other bound), and refuses a `SpecPut` whose digest is not the
+sha256 of its document, so a bad client can never corrupt the blob table.
+Snapshots carry both tables; a node that joins by snapshot holds the same bytes.
+
+### Provenance, drift, and edit-time warnings
+
+Deploying stamps the imposter's control-plane record with `{specId, digest}`
+— the same idea sources use, invisible to the core config schema — and sets
+`drifted: false`. Any later config-mutating write to that port (`PUT`/`POST
+/imposters/{port}`, a stub add/replace/delete, a source pull that overwrites
+it) flips `drifted: true`; `GET /specs` reports the flag per spec and the bound
+ports per record. A redeploy resets the baseline. Toggling `enable`/`disable`
+is not drift.
+
+A config-mutating write to a **spec-bound** imposter also gets its static `is`
+bodies checked against the operation's declared response schema (`spec:<op>:
+<status>` stub ids are how the compiler ties a stub to an operation). Violations
+come back in a `Rift-Spec-Warnings` header — `spec:showPetById:200 /id: expected
+integer, got string`, `; `-separated, capped at ten entries and 2 KiB — and the
+write is **never refused**: a deliberately divergent stub is a legitimate
+fixture. Templated bodies, `_behaviors`, and non-`is` responses are skipped;
+runtime validation is S4/S6's job. The check runs after the commit, off the
+request thread; if it cannot run for a bound port (a storage read failed, the
+bound document no longer compiles) the header carries `port <n>: spec validation
+unavailable (<why>)` rather than staying silent, so "no header" always means
+"checked and clean".
+
+### What is not here yet
+
+Drift classification and the re-import report with `overwrite | skip | fail`
+(S3, #279 — `deploy` refuses a `policy` field rather than ignoring it), any
+traffic-validation mode (S4/S6), and `openapi+https:` / `openapi+git:` source
+kinds (S8).
+
 ## Clustered flow state (#120)
 
 Under `--cluster`, **every** imposter's flow state (scenarios, `ctx.state`,

@@ -957,6 +957,100 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/specs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The tenant's imported specs
+         * @description Terminates. Answers from local applied state: id, digest, format, the ports the spec is currently deployed to, and whether any of those ports has been hand-edited since (`drifted`). Never carries the documents themselves — `GET /specs/{specId}` does. Requires `spec.read` (Viewer and up).
+         */
+        get: operations["listSpecs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/specs/{specId}": {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                /** @description The spec's id, chosen by the importer, unique within its tenant. A non-empty name of at most 128 characters drawn from `[A-Za-z0-9._-]` — matched literally, undecoded. */
+                specId: components["parameters"]["SpecId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * One spec — the stored document plus its metadata
+         * @description Terminates. The record `listSpecs` shows, plus `document`: the spec bytes exactly as imported (the digest is sha256 over them). Requires `spec.read` (Viewer and up).
+         */
+        get: operations["getSpec"];
+        /**
+         * Import (or re-import) an OpenAPI 3.0 spec under this id
+         * @description Terminates. The body is the spec document itself — JSON or YAML, UTF-8, at most 4 MiB. It is **compiled on the accepting node before anything is committed**: a document that does not compile is refused with the compiler's own reason and writes nothing, so the replicated log only ever carries specs every node can compile identically (`rift-cluster-spec` is a pure function of the bytes). Commits a `SpecPut` op carrying the bytes; every node stores them content-addressed by digest, so two specs with identical bytes share one blob. A re-import whose bytes are unchanged answers `200` with `unchanged: true` and **writes no log entry at all** — retries and unchanged polls cost zero log growth. Deploying is a separate step (`deploySpec`); the drift report on re-import arrives with S3 (#279). No `If-Match`: a spec record has no imposter revision to condition on. Requires `spec.write` (Editor and up).
+         */
+        put: operations["putSpec"];
+        post?: never;
+        /**
+         * Delete a spec
+         * @description Terminates. Refuses with `409` while any imposter is still bound to the spec (deployed from it), unless `?force` is given — then every bound port is unbound first (`SpecUnbind`) and the record removed (`SpecDelete`) in one mutation. Unbinding never tears an imposter down: it keeps serving, it just no longer carries provenance. The stored bytes go with the last spec record that references them. Requires `spec.delete` (Editor and up).
+         */
+        delete: operations["deleteSpec"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/specs/{specId}/compile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dry run — compile the stored spec and diff it against what is deployed
+         * @description Terminates and **commits nothing**. Compiles the stored document for the requested port (or the spec's single bound port, or an auto-assigned one) and answers with the imposter JSON that `deploySpec` would commit, the operation index, and a stub-id-level diff against the config currently deployed on the target port — `null` when there is no target port. Requires `spec.read` (Viewer and up): a dry run is a read.
+         */
+        post: operations["compileSpec"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/specs/{specId}/deploy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Compile the stored spec and deploy it as the imposter on a port
+         * @description Terminates. Compiles the stored document for `port` on the accepting node and commits **two ops under one barrier**: an ordinary `PutImposter` carrying the compiled config — the same code path as `PUT /imposters`, so park/replay, `Idempotency-Key` dedup, `If-Match` against the imposter's revision and the write barrier are all inherited — followed by `SpecBind`, which stamps the imposter's provenance `{specId, digest}` and resets its drift baseline. After the 2xx every ready node serves the compiled mock. Answers `201` when the port had no imposter, `200` when it replaced one. Requires `spec.write` **and** `imposter.write` (Editor and up): holding `spec.write` alone must not be a back door into imposter mutation. The drift `policy` (`overwrite | skip | fail`) arrives with S3 (#279); sending one now is refused rather than ignored.
+         */
+        post: operations["deploySpec"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/whoami": {
         parameters: {
             query?: never;
@@ -1779,6 +1873,72 @@ export interface components {
                 [key: string]: string;
             };
         };
+        /** @description One imported spec as the fleet has agreed on it — the replicated projection, identical on every converged node. */
+        SpecRecord: {
+            /** @description The spec's id, unique within its tenant. */
+            id: string;
+            /**
+             * @description How the document was written, sniffed at import (YAML is a superset, so this is informational).
+             * @enum {string}
+             */
+            format: "json" | "yaml";
+            /** @description sha256 hex over the document bytes exactly as imported — what a re-import compares to decide `unchanged`. */
+            digest: string;
+            /**
+             * @description Where the document came from. `inline` is a `PUT /specs/{specId}` body; source-backed kinds arrive with S8.
+             * @enum {string}
+             */
+            source: "inline";
+            /** @description The ports currently deployed from this spec (carrying its provenance), ascending. */
+            ports: number[];
+            /** @description At least one bound port has had a config-mutating write since it was deployed. A redeploy resets it. */
+            drifted: boolean;
+            /**
+             * Format: int64
+             * @description The log index that last wrote this record.
+             */
+            revision: number;
+        };
+        /** @description What `putSpec` did. */
+        SpecWriteResult: {
+            id: string;
+            /** @description sha256 hex of the document now stored. */
+            digest: string;
+            /** @enum {string} */
+            format: "json" | "yaml";
+            /** @description The bytes matched what was already stored; nothing was written. */
+            unchanged: boolean;
+            /**
+             * Format: int64
+             * @description On an unchanged re-import, the revision of the record that already held these bytes.
+             */
+            revision?: number;
+        };
+        /** @description A dry-run compilation. */
+        SpecCompileResult: {
+            imposter: components["schemas"]["Imposter"];
+            /** @description The compiler's operation index, in emitted order. */
+            operations: {
+                /** @description The `operationId`, or one synthesized from method and path. */
+                id: string;
+                method: string;
+                /** @example /pets/{petId} */
+                pathTemplate: string;
+                stubIds: string[];
+            }[];
+            /** @description The compiled stubs against the config deployed on the target port, keyed by stub id — `null` when there is no target port (none requested and none bound). This is a byte-level stub diff; the per-operation drift classification (added / removed / changed / hand-edited / hand-added) is S3 (#279). */
+            diff: {
+                port: number;
+                /** @description Whether an imposter is currently deployed on `port` at all. */
+                deployed: boolean;
+                /** @description Compiled stub ids not present in the deployed config. */
+                added: string[];
+                /** @description Deployed stub ids the compiler no longer emits (`spec:`-prefixed ids only — hand-added stubs are never listed). */
+                removed: string[];
+                /** @description Stub ids present on both sides whose canonical JSON differs. */
+                changed: string[];
+            } | null;
+        };
         WhoAmI: {
             /** @description Null under the open-admin-plane bypass (no principals configured, no API key). */
             principalId?: string | null;
@@ -2113,6 +2273,15 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description No such spec in the tenant in view. Byte-identical whether the id never existed, exists in another tenant, or the caller holds no binding here at all (RFC-002 §8.4): the message names only the id the caller typed. */
+        SpecNotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description No quorum to commit this write against, or the node is shutting down. The shutdown case is not specific to writes — it can also be answered by a read, since authentication itself runs behind the same gate (see the top-level description). */
         Unavailable: {
             headers: {
@@ -2156,6 +2325,8 @@ export interface components {
         IdempotencyKey: string;
         /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
         TenantHeader: string;
+        /** @description The spec's id, chosen by the importer, unique within its tenant. A non-empty name of at most 128 characters drawn from `[A-Za-z0-9._-]` — matched literally, undecoded. */
+        SpecId: string;
         /** @description The imposter's port number. */
         Port: number;
         /** @description The tenant record's id. */
@@ -2205,6 +2376,8 @@ export interface components {
          *     There is no `false` form either way, exactly like `x-rift-truncated`, and a Ch.12 strict-mode gate asserts its absence on a fully healthy, unscoped answer.
          */
         RiftClusterPartial: true;
+        /** @description Edit-time spec validation (RFC-004 §3.2, issue #278). Present on a successful config-mutating write (`PUT`/`POST /imposters/{port}`, stub add/replace) to an imposter that is **bound to a spec**, when a static `is` body of a stub whose id the compiler emitted (`spec:<operationId>:<status>`) violates the response schema that operation declares. Each entry is `<stubId> <json-pointer>: <what>`, `; `-separated, capped at ten (then `; +N more`) and at 2 KiB (then `...`), visible ASCII only. Templated bodies (`{{…}}`), responses with `_behaviors`, and non-`is` responses are skipped — runtime validation is S4/S6's job. **Warn, never refuse**: a deliberately divergent stub is a legitimate fixture. Absent when nothing is bound or nothing violates — so absence means "checked and clean": if the check itself could not run for a bound port (a storage read failed, the bound document no longer compiles) the header says so with a `port <n>: spec validation unavailable (<why>)` entry instead of staying silent. */
+        RiftSpecWarnings: string;
     };
     pathItems: never;
 }
@@ -5066,6 +5239,322 @@ export interface operations {
                 };
             };
             503: components["responses"]["Unavailable"];
+        };
+    };
+    listSpecs: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tenant's specs, id-ascending. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        specs: components["schemas"]["SpecRecord"][];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description Caller holds no binding in the tenant in view (RFC-002 §8.4 — not a 403). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getSpec: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                /** @description The spec's id, chosen by the importer, unique within its tenant. A non-empty name of at most 128 characters drawn from `[A-Za-z0-9._-]` — matched literally, undecoded. */
+                specId: components["parameters"]["SpecId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The spec. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpecRecord"] & {
+                        /** @description The imported OpenAPI document, verbatim (JSON or YAML text). */
+                        document: string;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["SpecNotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    putSpec: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path: {
+                /** @description The spec's id, chosen by the importer, unique within its tenant. A non-empty name of at most 128 characters drawn from `[A-Za-z0-9._-]` — matched literally, undecoded. */
+                specId: components["parameters"]["SpecId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+                "application/yaml": string;
+            };
+        };
+        responses: {
+            /** @description The id already existed. `unchanged: true` means the bytes were identical to what is stored and nothing was written (no cluster headers); `unchanged: false` means a re-import replaced the document. */
+            200: {
+                headers: {
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpecWriteResult"];
+                };
+            };
+            /** @description A spec with this id did not exist; it is now stored on every node. */
+            201: {
+                headers: {
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpecWriteResult"];
+                };
+            };
+            202: components["responses"]["AcceptedParked"];
+            /** @description The document is not UTF-8 text, does not compile as OpenAPI 3.0.x (unsupported version, external `$ref`, parse error, self-check failure — the compiler's message is carried verbatim), or the id is not a usable path segment. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Caller holds no binding in the tenant named by `X-Rift-Tenant` (RFC-002 §8.4 — not a 403). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The document exceeds the 4 MiB pre-commit cap (RFC-004 §4.1) — refused before it is parsed. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["Unavailable"];
+            504: components["responses"]["WriteTimeout"];
+        };
+    };
+    deleteSpec: {
+        parameters: {
+            query?: {
+                /** @description Unbind every deployed port first instead of refusing with `409`. A flag: `?force`, `?force=true` and `?force=1` force; `?force=false` / `?force=0` do not. */
+                force?: boolean;
+            };
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path: {
+                /** @description The spec's id, chosen by the importer, unique within its tenant. A non-empty name of at most 128 characters drawn from `[A-Za-z0-9._-]` — matched literally, undecoded. */
+                specId: components["parameters"]["SpecId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The spec is gone on every node. */
+            200: {
+                headers: {
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        id: string;
+                        /** @description sha256 hex of the document that was stored. */
+                        digest: string;
+                        /** @description The ports `?force` unbound, ascending; empty without `?force`. */
+                        unboundPorts: number[];
+                    };
+                };
+            };
+            202: components["responses"]["AcceptedParked"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["SpecNotFound"];
+            /** @description The spec is still bound to at least one port and `?force` was not given; the message names the ports. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["Unavailable"];
+            504: components["responses"]["WriteTimeout"];
+        };
+    };
+    compileSpec: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path: {
+                /** @description The spec's id, chosen by the importer, unique within its tenant. A non-empty name of at most 128 characters drawn from `[A-Za-z0-9._-]` — matched literally, undecoded. */
+                specId: components["parameters"]["SpecId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    /** @description Compile for this port and diff against it. Defaults to the spec's single bound port, if any. */
+                    port?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description The compiled imposter and the diff. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpecCompileResult"];
+                };
+            };
+            400: components["responses"]["BadData"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["SpecNotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deploySpec: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Selects which of the caller's existing tenant bindings this request acts under; it never grants a binding the caller does not already hold. Absent, requests act as the default tenant. Ignored on tenancy routes, where the path segment names the tenant being administered instead. */
+                "X-Rift-Tenant"?: components["parameters"]["TenantHeader"];
+                /** @description Optimistic-concurrency precondition for a single-imposter write: either the exact token from a prior response's Rift-Cluster-Revision header (default:<port>@<revision>) or a bare revision integer. Absent, the write is last-writer-wins. A stale or mismatched value answers 409; sending it on a collection-wide mutation (which has no single record to condition on) answers 400. The route-table form is a separate parameter (IfMatchRouteTable) because its grammar is portless — the two are not interchangeable, and sending one where the other is expected answers 400. */
+                "If-Match"?: components["parameters"]["IfMatch"];
+                /** @description Client-chosen retry key for a mutating request. Mints a deterministic op id (a v5 derivation when the value is not itself a UUID) so a retried request with the same key dedups to the original committed response instead of re-applying. Explicitly refused with 400 on principal creation — not silently ignored: the key and principal id are minted per request before any op id exists, so a replayed request would commit nothing yet still answer 201 with a freshly minted key that was never stored. A client that sent the header believes its retry is safe, so the request is rejected rather than left to go on believing it. A keyed retry against an op that committed a `409` (revision conflict) dedups to that same `409` — the key does not make the conflict retryable. A client that wants to proceed after a `409` must rebase against the current state and retry with a *fresh* Idempotency-Key, not the one that produced the conflict. */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path: {
+                /** @description The spec's id, chosen by the importer, unique within its tenant. A non-empty name of at most 128 characters drawn from `[A-Za-z0-9._-]` — matched literally, undecoded. */
+                specId: components["parameters"]["SpecId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The port the compiled imposter serves on. Fleet-unique across tenants. */
+                    port: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Replaced the imposter that was on `port`. */
+            200: {
+                headers: {
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Imposter"];
+                };
+            };
+            /** @description Created the imposter on `port`; the response is the stored imposter (as `getImposter` shows it). */
+            201: {
+                headers: {
+                    "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
+                    "Rift-Cluster-Op-Id": components["headers"]["RiftClusterOpId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Imposter"];
+                };
+            };
+            202: components["responses"]["AcceptedParked"];
+            /** @description No `port`, a `policy` (S3), or the stored document no longer compiles for this port. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["SpecNotFound"];
+            409: components["responses"]["RevisionConflict"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["Unavailable"];
+            504: components["responses"]["WriteTimeout"];
         };
     };
     getWhoAmI: {
