@@ -2094,6 +2094,10 @@ fn session_logout() -> Response<FrontBody> {
 /// The fleet's session-signing key, minting one first if no console login has ever committed one
 /// (issue #185). The only branch of this front's entire session surface that is a Raft write —
 /// every other login reads the record this one commits.
+// The error channel here *is* a rendered HTTP response, which is how a handler returns a
+// refusal with `?` from anywhere in its body. `Response<FrontBody>` is hyper's type and
+// its size is not ours to shrink; boxing it would only move the unboxing to every caller.
+#[allow(clippy::result_large_err)]
 async fn ensure_session_key(
     state: &FrontState,
     node: &Arc<RaftNode>,
@@ -4204,6 +4208,8 @@ enum Render {
 /// `build_mutation`'s own arms for them explain, can inherit this tail without going through a
 /// `Terminated` classification a second time.
 #[allow(clippy::too_many_arguments)]
+// A rendered refusal in the error channel, as in `ensure_session_key` above.
+#[allow(clippy::result_large_err)]
 async fn run_mutation(
     state: &Arc<FrontState>,
     node: &Arc<RaftNode>,
@@ -6528,6 +6534,8 @@ fn static_is_bodies(stub: &serde_json::Value) -> Vec<serde_json::Value> {
 /// the mutation (current stubs for index-addressed edits, capture-before-delete
 /// bodies) come from the local applied state / loopback admin.
 #[allow(clippy::too_many_arguments)]
+// A rendered refusal in the error channel, as in `ensure_session_key` above.
+#[allow(clippy::result_large_err)]
 async fn build_mutation(
     state: &FrontState,
     node: &Arc<RaftNode>,
@@ -7348,6 +7356,8 @@ fn validate_op_scripts(
 /// the collection-wide `DeleteAllImposters`/`GET /imposters`-shaped capture,
 /// which has no single tenant to name any more precisely than the mutation
 /// itself already was authorized for.
+// A rendered refusal in the error channel, as in `ensure_session_key` above.
+#[allow(clippy::result_large_err)]
 async fn fetch(
     state: &FrontState,
     path: &str,
