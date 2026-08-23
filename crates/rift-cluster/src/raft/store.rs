@@ -857,6 +857,9 @@ struct StoredSnapshot {
 /// is surfaced as openraft's `StorageError` rather than panicking a node at
 /// startup — a control-plane node that cannot open its own log must refuse to
 /// start, not abort.
+// `StorageError` is openraft's, carried here because this is the constructor openraft's
+// storage contract expects. Same reason as the other sites in this file.
+#[allow(clippy::result_large_err)]
 pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbStateMachine)> {
     let db = Database::create(path).map_err(|e| StorageError::from(StorageIOError::write(&e)))?;
     {

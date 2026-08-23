@@ -150,6 +150,9 @@ pub(crate) struct PeerClient {
 }
 
 impl PeerClient {
+    // `RPCError` is openraft's, and every caller hands the result straight back to an
+    // openraft `RaftNetwork` method, so this signature is fixed by that trait.
+    #[allow(clippy::result_large_err)]
     async fn send<Req, Resp, E>(
         &self,
         path: &str,
