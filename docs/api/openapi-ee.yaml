@@ -2652,7 +2652,12 @@ paths:
                       type: integer
                       description: Live stubs binding this dataset. Non-zero blocks a delete.
         '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
     post:
       operationId: uploadDataset
       summary: Upload a new version of a dataset
@@ -2714,7 +2719,12 @@ paths:
             column not in the header, an unsplittable delimiter — or a quota was
             exceeded. The body names which.
         '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
         '413': { description: The CSV exceeded the admin plane's body limit. }
   /admin/tenants/{tenantId}/datasets/{datasetName}:
     parameters:
@@ -2747,7 +2757,12 @@ paths:
                     type: array
                     items: { type: object }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
     delete:
       operationId: deleteDataset
       summary: Delete a dataset
@@ -2763,7 +2778,12 @@ paths:
       responses:
         '204': { description: Deleted. }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
         '409': { description: A live stub still binds this dataset. The body names the port. }
   /admin/tenants/{tenantId}/datasets/{datasetName}/{version}/content:
     parameters:
@@ -2797,7 +2817,12 @@ paths:
             text/csv:
               schema: { type: string }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
   /admin/tenants/{tenantId}/principals:
     parameters:
       - $ref: '#/components/parameters/TenantId'
