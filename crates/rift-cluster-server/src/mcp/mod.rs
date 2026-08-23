@@ -36,8 +36,14 @@ use clap::{Args as _, CommandFactory as _, FromArgMatches as _};
 // `AdminClient`, asserting on `ToolFailure`. `ApiKey`, `Answer`, `ReadScope` and
 // `StartupError` stay module-private — nothing outside `mcp` names them.
 pub use args::McpArgs;
-pub use client::{AdminClient, ToolFailure};
-pub use tools::RiftMcp;
+pub use client::{AdminClient, ToolFailure, WriteOutcome};
+// The write tools' parameter types are named by `tests/mcp_cluster.rs`, which drives the
+// tool methods directly rather than over a protocol session — the only way to replay one
+// tool call under the *same* request id, which is exactly what the dedup criterion asserts.
+pub use tools::{
+    CreateParams, DeleteImposterParams, OpStatusParams, Precondition, RiftMcp, RoutesPutParams,
+    SetEnabledParams, StubAddParams, StubByIdParams, StubReplaceParams,
+};
 
 use crate::cli::EeCli;
 
@@ -115,11 +121,36 @@ pub async fn run(args: McpArgs) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// The tool set is the issue's v1 list, exactly — no more (write tools are #293,
-    /// and shipping one here would hand agents a capability this slice never
-    /// authorized) and no fewer.
+    /// The reads #292 shipped, unchanged by #293.
+    const READ_TOOLS: [&str; 9] = [
+        "fleet_health",
+        "imposter_get",
+        "imposter_list",
+        "lint",
+        "op_status",
+        "requests_query",
+        "routes_get",
+        "verify",
+        "whoami",
+    ];
+
+    /// The writes #293 adds. `op_status` is deliberately NOT here: it polls a parked
+    /// write and mutates nothing, so it belongs with the reads above.
+    const WRITE_TOOLS: [&str; 8] = [
+        "imposter_create",
+        "imposter_delete",
+        "imposter_set_enabled",
+        "route_delete",
+        "routes_put",
+        "stub_add",
+        "stub_delete",
+        "stub_replace",
+    ];
+
+    /// The tool set is exactly the reads (#292) plus the writes (#293) — no more, no
+    /// fewer. An extra tool here is a capability no slice authorized.
     #[test]
-    fn registers_exactly_the_v1_read_tools() {
+    fn registers_exactly_the_read_and_write_tools() {
         let router = RiftMcp::tool_router();
         let mut names: Vec<_> = router
             .list_all()
@@ -128,37 +159,51 @@ mod tests {
             .collect();
         names.sort();
 
-        assert_eq!(
-            names,
-            vec![
-                "fleet_health",
-                "imposter_get",
-                "imposter_list",
-                "lint",
-                "requests_query",
-                "routes_get",
-                "verify",
-                "whoami",
-            ]
-        );
+        let mut expected: Vec<_> = READ_TOOLS
+            .iter()
+            .chain(WRITE_TOOLS.iter())
+            .map(|s| (*s).to_owned())
+            .collect();
+        expected.sort();
+
+        assert_eq!(names, expected);
     }
 
-    /// Every v1 tool is a read. `read_only_hint` is what an agent host shows a user
-    /// when it asks whether to auto-approve a call, so a wrong hint here is a
-    /// consent problem, not a cosmetic one.
+    /// `read_only_hint` must tell the truth in **both** directions.
+    ///
+    /// It is what an agent host shows a user when it asks whether to auto-approve a
+    /// call, so this is a consent property, not a cosmetic one — and #293 is where it
+    /// acquires a second failure mode. A read hinted as a write is merely annoying; a
+    /// **write hinted as a read** is a mutation auto-approved on the strength of a
+    /// promise that it would not mutate anything, which is why the write half asserts
+    /// the hint is absent-or-false rather than just "not required to be true".
     #[test]
-    fn every_v1_tool_is_annotated_read_only() {
+    fn the_read_only_hint_partitions_reads_from_writes() {
         for tool in RiftMcp::tool_router().list_all() {
-            let annotations = tool
+            let name = tool.name.to_string();
+            let read_only = tool
                 .annotations
                 .as_ref()
-                .unwrap_or_else(|| panic!("tool `{}` must carry annotations", tool.name));
-            assert_eq!(
-                annotations.read_only_hint,
-                Some(true),
-                "tool `{}` must be annotated read-only",
-                tool.name
-            );
+                .and_then(|annotations| annotations.read_only_hint);
+
+            if READ_TOOLS.contains(&name.as_str()) {
+                assert_eq!(
+                    read_only,
+                    Some(true),
+                    "read tool `{name}` must be annotated read-only"
+                );
+            } else {
+                assert!(
+                    WRITE_TOOLS.contains(&name.as_str()),
+                    "tool `{name}` is in neither list — classify it before shipping it"
+                );
+                assert_ne!(
+                    read_only,
+                    Some(true),
+                    "write tool `{name}` must NOT be hinted read-only: an agent host would \
+                     auto-approve a mutation on the strength of that hint"
+                );
+            }
         }
     }
 
