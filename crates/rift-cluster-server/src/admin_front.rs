@@ -1444,6 +1444,16 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                         .then(|| space_read_target(&path))
                         .flatten()
                         .map(|(port, flow)| space_owner(&state, &tenant, port, &flow));
+                    // The node, for undoing D2's apply-time dataset compile-down on the way out
+                    // (issue #286). Both the single read and the listing: the engine holds a
+                    // compiled `lookup` whose CSV path is **node-local**, so leaving it in a
+                    // rendered config would make the same imposter read differently depending on
+                    // which node answered — and a `GET`-edit-`PUT` through the console would then
+                    // store that node's path as a hand-written lookup, wrong everywhere else.
+                    let dataset_render_node = (list_read
+                        || (req.method() == Method::GET && is_single_imposter_read(&path)))
+                    .then(|| state.node.upgrade())
+                    .flatten();
                     // The resolved `_rift` knobs (issue #370), read from the applied config before
                     // `proxy` moves `state` for the same reason as everything above. Single-imposter
                     // read only: the listing carries no knobs panel, and resolving them per entry
@@ -1472,6 +1482,9 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
                     }
                     if let Some(knobs) = flow_knobs {
                         response = decorate_flow_state_resolved(response, knobs).await;
+                    }
+                    if let Some(node) = dataset_render_node {
+                        response = strip_compiled_dataset_lookups(response, &node).await;
                     }
                     if let Some(reason) = degraded {
                         set_header(&mut response, HEADER_BIND_FAILURES, &reason);
@@ -2570,6 +2583,66 @@ async fn decorate_space_owner(
                 .unwrap_or_else(|response| response)
         }
     }
+}
+
+/// Remove the compiled dataset `lookup` from a rendered imposter (issue #286).
+///
+/// The engine executes a compiled `_behaviors.lookup` whose CSV path is node-local, so it must not
+/// appear in a rendered config: the same imposter would read differently per node, and an operator
+/// who edited a rendered document and `PUT` it back would store that node's filesystem path as a
+/// hand-written lookup. What is left is the operator's own `_rift.dataset` block, carrying the pin.
+///
+/// Additive-in-reverse, and takes the same failure polarity as [`decorate_flow_state_resolved`]: a
+/// body that will not parse passes through **unchanged and logged**. That is the safe direction
+/// here — the untouched body is the engine's own answer, which is complete and merely more verbose
+/// than intended, where a fabricated one would not be.
+async fn strip_compiled_dataset_lookups(
+    response: Response<FrontBody>,
+    node: &Arc<RaftNode>,
+) -> Response<FrontBody> {
+    let (parts, body) = response.into_parts();
+    if !parts.status.is_success() {
+        return Response::from_parts(parts, body);
+    }
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return internal(&format!(
+                "reading the imposter body to strip compiled dataset lookups: {e}"
+            ));
+        }
+    };
+    let body = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(mut document) => {
+            rift_cluster::datasets::strip_compiled(&mut document, |digest| node.spool_path(digest));
+            match serde_json::to_vec(&document) {
+                Ok(stripped) => Bytes::from(stripped),
+                Err(e) => {
+                    // The original bytes are valid and the status is untouched, so this is a safe
+                    // last resort — but it reverts to the *unstripped* body, which is the leak this
+                    // function exists to prevent. Logged for parity with the parse arm above, so it
+                    // cannot happen invisibly if `document` ever stops being trivially serializable.
+                    tracing::error!(
+                        error = %e,
+                        "the imposter body could not be re-serialized after stripping its \
+                         compiled dataset lookups; serving it unstripped"
+                    );
+                    bytes
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "the imposter body could not be parsed to strip its compiled dataset lookups"
+            );
+            bytes
+        }
+    };
+    let mut response = buffered_response(parts.status, body, json_content_type())
+        .unwrap_or_else(|response| response);
+    carry_over_headers(&mut response, &parts.headers);
+    response
 }
 
 /// Add `_rift.flowStateResolved` to a proxied single-imposter read (issue #370).
@@ -6551,7 +6624,7 @@ async fn build_mutation(
 ) -> Result<Mutation, Response<FrontBody>> {
     match kind {
         Terminated::Create => {
-            let config: ImposterConfig = parse(body)?;
+            let config: ImposterConfig = parse_pinned(body, node, tenant)?;
             refuse_fleet_scope_without_fleet_admin([&config], principal_id, bindings)?;
             let Some(port) = config.port else {
                 return Err(typed_error(
@@ -6581,7 +6654,7 @@ async fn build_mutation(
             })
         }
         Terminated::ReplaceAllImposters => {
-            let replace: ReplaceAllBody = parse(body)?;
+            let replace: ReplaceAllBody = parse_pinned(body, node, tenant)?;
             refuse_fleet_scope_without_fleet_admin(&replace.imposters, principal_id, bindings)?;
             // Upsert the new set first, then prune the leftovers — never a
             // DeleteAll up front. The ops commit as separate Raft entries, so a
@@ -6693,7 +6766,7 @@ async fn build_mutation(
             })
         }
         Terminated::AddStub(port) => {
-            let add: AddStubBody = parse(body)?;
+            let add: AddStubBody = parse_pinned(body, node, tenant)?;
             Ok(Mutation {
                 ops: vec![ControlOp::PatchStubs {
                     tenant: tenant.clone(),
@@ -6711,13 +6784,13 @@ async fn build_mutation(
             })
         }
         Terminated::ReplaceStubs(port) => {
-            let replace: ReplaceStubsBody = parse(body)?;
+            let replace: ReplaceStubsBody = parse_pinned(body, node, tenant)?;
             let mut config = stored_config(node, tenant, port)?;
             config.stubs = replace.stubs;
             Ok(put_config_mutation(tenant, port, config))
         }
         Terminated::ReplaceStubAt(port, index) => {
-            let stub: Stub = parse(body)?;
+            let stub: Stub = parse_pinned(body, node, tenant)?;
             let mut config = stored_config(node, tenant, port)?;
             if index >= config.stubs.len() {
                 return Err(stub_index_missing(index));
@@ -6734,7 +6807,7 @@ async fn build_mutation(
             Ok(put_config_mutation(tenant, port, config))
         }
         Terminated::ReplaceStubById(port, id) => {
-            let stub: Stub = parse(body)?;
+            let stub: Stub = parse_pinned(body, node, tenant)?;
             Ok(Mutation {
                 ops: vec![ControlOp::PatchStubs {
                     tenant: tenant.clone(),
@@ -7428,6 +7501,74 @@ async fn fetch(
 #[allow(clippy::result_large_err)]
 fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response<FrontBody>> {
     serde_json::from_slice(body).map_err(|e| {
+        typed_error(
+            StatusCode::BAD_REQUEST,
+            ErrorKind::BadData,
+            &format!("invalid request JSON: {e}"),
+        )
+    })
+}
+
+/// [`parse`], with every `_rift.dataset` block resolved and pinned first (RFC-005 D2, #286).
+///
+/// Admission happens **here, on the leader, before the op is built**, so the committed entry names
+/// an exact digest rather than "latest" — which is time-dependent and would let two nodes applying
+/// the same entry reach different rows. Every body that can carry a stub response goes through
+/// this, not just a whole `ImposterConfig`.
+///
+/// The state machine is read only when the body actually binds something: this runs on every
+/// config write, and the overwhelming majority carry no dataset block at all.
+#[allow(clippy::result_large_err)]
+fn parse_pinned<T: serde::de::DeserializeOwned>(
+    body: &[u8],
+    node: &Arc<RaftNode>,
+    tenant: &TenantId,
+) -> Result<T, Response<FrontBody>> {
+    let mut document: serde_json::Value = parse(body)?;
+
+    // A failed *read* must not be reported as "no such dataset" — that would refuse a valid
+    // binding with a message naming the wrong cause. The closure can only answer `Option`, so the
+    // error is carried out here and takes precedence over whatever the refusal said.
+    let mut read_failure: Option<String> = None;
+    let mut live: Option<Vec<rift_cluster::DatasetSummary>> = None;
+
+    let pinned = rift_cluster::datasets::pin_bindings(&mut document, |name, version| {
+        if read_failure.is_some() {
+            return None;
+        }
+        let live = match live {
+            Some(ref cached) => cached,
+            None => match node.datasets(tenant.as_str()) {
+                Ok(rows) => live.insert(rows),
+                Err(e) => {
+                    read_failure = Some(e.to_string());
+                    return None;
+                }
+            },
+        };
+        // No version asked for means the latest *live* one — `datasets` already drops
+        // tombstoned rows, so a deleted version cannot be picked here.
+        let found = match version {
+            Some(want) => live.iter().find(|d| d.name == name && d.version == want),
+            None => live
+                .iter()
+                .filter(|d| d.name == name)
+                .max_by_key(|d| d.version),
+        }?;
+        Some(rift_cluster::datasets::ResolvedDataset {
+            version: found.version,
+            digest: found.digest.clone(),
+            delimiter: found.delimiter,
+            key_columns: found.key_columns.clone(),
+        })
+    });
+
+    if let Some(error) = read_failure {
+        return Err(internal(&format!("could not read datasets: {error}")));
+    }
+    pinned.map_err(|e| typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &e))?;
+
+    serde_json::from_value(document).map_err(|e| {
         typed_error(
             StatusCode::BAD_REQUEST,
             ErrorKind::BadData,

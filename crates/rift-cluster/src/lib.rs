@@ -24,6 +24,7 @@ pub mod audit_export;
 pub mod bridge;
 pub mod config;
 pub mod control;
+pub mod datasets;
 pub mod decorate;
 pub mod metrics;
 pub mod pull_on_miss;

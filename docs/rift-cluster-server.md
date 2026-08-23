@@ -2030,6 +2030,55 @@ refusal is wired now so a dataset can never be pulled out from under a stub.
 > upload of that shape shows up as a `503` with a parked op id, not as a quota
 > refusal.
 
+### Binding a stub to a dataset (#286)
+
+RFC-005 D2. A stub response binds a dataset with a `_rift.dataset` block — a `lookup` named by
+*dataset* rather than by file path:
+
+```jsonc
+"_rift": { "dataset": {
+  "name": "customers",
+  "version": 3,                 // optional; default = latest at bind time, then PINNED
+  "key": { "from": { "query": "id" }, "using": { "method": "regex", "selector": ".*" } },
+  "keyColumn": "customer_id",
+  "into": "${row}"
+} }
+```
+
+The engine's `lookup` behavior needs a **filesystem path**, and a path is node-local, so it can
+never travel in a config that replicates. The work is therefore split, and the split is the whole
+determinism argument:
+
+**Admission, on the leader.** The version resolves to a concrete `(version, digest)` and both are
+written back into the block, so what commits names an exact set of bytes rather than a moving
+target. A later upload does **not** move a serving stub — rebinding is an explicit config write.
+Refused here, naming what is wrong: an absent or deleted dataset, and a `keyColumn` the dataset
+does not *declare*. That second refusal matters more than it looks — #285 proves every declared key
+column is unique across rows, so a binding restricted to them matches at most one row; an
+undeclared column carries no such proof and the engine picks among duplicates in hash order.
+
+**Apply, on every node.** The pinned block is rewritten into the engine's own
+`behaviors.lookup` pointing at that node's `<state-dir>/datasets/<digest>.csv`. It keys **only** on
+the committed digest and never re-resolves "latest", which is what makes two nodes applying the
+same entry reach the same rows. The hot path is unmodified upstream code, so the request-time cost
+is zero.
+
+**What `GET` returns.** The block you wrote, carrying the resolved pin — never the compiled
+`lookup`. The compiled form names a node-local path, so rendering it would make the same imposter
+read differently depending on which node answered, and editing that rendered document and `PUT`ing
+it back would store one node's filesystem path as a hand-written lookup. A `lookup` you wrote
+yourself, with an explicit path, is left exactly as written.
+
+**Template tokens in dataset values are inert.** A CSV cell containing `{{ uuid }}` is served
+literally: templating is opt-in per response (`_rift.templated`) and a bound response does not set
+it. This is deliberate — if dataset values were rendered, any uploaded CSV would become a
+template-injection surface.
+
+**Not available through a source pull.** A `_rift.dataset` block is resolved and pinned when it is
+written to the admin API, and a source pull is not an admission — a pulled document carrying one is
+refused, naming the port and dataset.
+
+
 ## Clustered flow state (#120)
 
 Under `--cluster`, **every** imposter's flow state (scenarios, `ctx.state`,
