@@ -1939,6 +1939,91 @@ impl RedbStateMachine {
         Ok(latest.map(|(version, stored)| Self::render_dataset(name, version, &stored)))
     }
 
+    /// The CSV bytes behind `digest`, or `None` when this node holds no such blob.
+    ///
+    /// Answers from the replicated blob table rather than the node-local spool file: the spool is
+    /// a materialisation for the engine to read, and a node that has lost its `datasets/`
+    /// directory still owes an honest answer here (`reconcile_engine` rebuilds the files from
+    /// exactly this table).
+    #[allow(clippy::result_large_err)]
+    pub fn dataset_blob(&self, digest: &str) -> StorageResult<Option<String>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let blobs = read_txn
+            .open_table(SM_DATASET_BLOBS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        Ok(blobs
+            .get(digest)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+            .map(|guard| guard.value().to_owned()))
+    }
+
+    /// How many live stubs bind each of `tenant`'s datasets, by dataset name, plus whether the
+    /// tally is **complete**.
+    ///
+    /// **One** scan of the config table, tallying every name at once. The listing route needs a
+    /// count per dataset, and a scan per dataset would make rendering one page
+    /// O(datasets x configs) — the same reason `desired_configs` builds its whole set from a
+    /// single pass. A name absent from the map has no bindings.
+    ///
+    /// A config that will not parse is skipped and the tally is reported **incomplete**, matching
+    /// how per-tenant usage handles the same corruption (`TenantConfigUsage::incomplete`) rather
+    /// than how `desired_configs` does. The difference is what the number is *for*: the engine's
+    /// desired set drives teardown, so a short one is destructive and must abort; this count is
+    /// advisory. But it must not be quietly short either — it is what tells an operator whether a
+    /// delete will be refused, so under-reporting it would promise a delete that then 409s. The
+    /// caller renders the flag as `Rift-Cluster-Partial`.
+    #[allow(clippy::result_large_err)]
+    pub fn dataset_binding_counts(
+        &self,
+        tenant: &str,
+    ) -> StorageResult<(std::collections::HashMap<String, usize>, bool)> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let configs = read_txn
+            .open_table(SM_CONFIGS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut incomplete = false;
+        for item in configs
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (row_tenant, _) = key.value();
+            if row_tenant != tenant {
+                continue;
+            }
+            // Read as generic JSON, like the delete-while-bound check: a stored config that will
+            // not parse must not make a *binding* invisible, which is what silently skipping it
+            // would do — and this count is what tells an operator a delete will be refused.
+            let stored: StoredImposter = match serde_json::from_str(value.value()) {
+                Ok(stored) => stored,
+                Err(e) => {
+                    tracing::error!(tenant, error = %e, "corrupt stored imposter; binding count incomplete");
+                    incomplete = true;
+                    continue;
+                }
+            };
+            let config: serde_json::Value = match serde_json::from_str(&stored.config_json) {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::error!(tenant, error = %e, "corrupt stored config; binding count incomplete");
+                    incomplete = true;
+                    continue;
+                }
+            };
+            for name in crate::datasets::bound_dataset_names(&config) {
+                *counts.entry(name).or_default() += 1;
+            }
+        }
+        Ok((counts, incomplete))
+    }
+
     /// How many distinct dataset documents are currently held, fleet-wide (RFC-005 D1, #285) —
     /// the blob table's row count, the dataset-table counterpart of [`Self::spec_blob_count`].
     #[allow(clippy::result_large_err)]
@@ -4170,6 +4255,11 @@ impl RedbStateMachine {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
         match op {
+            // Deliberately mutates nothing (RFC-002 §9's audit exception, issue #287). The op
+            // exists so the export is recorded, and the recording happens in the audit arm that
+            // runs for every committed op — not here. An empty arm someone had to write, rather
+            // than an absent branch: the "changes nothing" claim is the whole contract.
+            ControlOp::DatasetContentRead { .. } => Ok(Ok(Vec::new())),
             ControlOp::PutImposter { tenant, config } => {
                 // `validate` guaranteed the port; a missing one here means a
                 // caller skipped validation, and a deterministic refusal is the
@@ -5490,7 +5580,10 @@ impl RedbStateMachine {
                         .map(u16::to_string)
                         .collect::<Vec<_>>()
                         .join(", ");
-                    return Ok(Err(format!("dataset {name:?} is bound by port(s) {ports}")));
+                    // "bound **to** port(s)", matching the spec refusal above word for word: the front maps
+                    // that phrasing to `409`, and two spellings of the same fact would mean two
+                    // status rules that can drift apart (issue #287 renders this one).
+                    return Ok(Err(format!("dataset {name:?} is bound to port(s) {ports}")));
                 }
                 // Tombstone every live version — a delete addresses the whole name, not one
                 // version, and D2's binding is by name (RFC-005 §3.2).
@@ -10998,6 +11091,60 @@ mod tests {
             "versions are monotonic per name across a delete: tombstones count"
         );
         assert!(spool_file(&spool, CUSTOMERS).exists(), "the file is back");
+    }
+
+    /// A binding tally that had to skip a corrupt config says so.
+    ///
+    /// The count is what tells an operator whether a delete will be refused, so a silently short
+    /// one promises a delete that then `409`s. The flag is what the front renders as
+    /// `Rift-Cluster-Partial` — without it, "0 bindings" from a corrupt table is indistinguishable
+    /// from "0 bindings" from an empty one.
+    #[tokio::test]
+    async fn a_binding_tally_that_skipped_a_corrupt_config_reports_itself_incomplete() {
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+
+        let bound = json!({
+            "config_json": json!({
+                "port": 8080,
+                "protocol": "http",
+                "stubs": [{
+                    "id": "b",
+                    "responses": [{
+                        "is": {},
+                        "_rift": { "dataset": {
+                            "name": "customers", "keyColumn": "id", "into": "${row}"
+                        } }
+                    }]
+                }]
+            })
+            .to_string(),
+            "enabled": true,
+            "revision": 2,
+        })
+        .to_string();
+        sm.inject_raw_config(DEFAULT_TENANT, 8080, &bound);
+
+        let (counts, incomplete) = sm
+            .dataset_binding_counts(DEFAULT_TENANT)
+            .expect("counts read");
+        assert_eq!(counts.get("customers"), Some(&1));
+        assert!(!incomplete, "a readable table is a complete tally");
+
+        // Now a row that will not parse at all.
+        sm.inject_raw_config(DEFAULT_TENANT, 8081, "{not json");
+        let (counts, incomplete) = sm
+            .dataset_binding_counts(DEFAULT_TENANT)
+            .expect("counts read");
+        assert_eq!(
+            counts.get("customers"),
+            Some(&1),
+            "the readable bindings are still counted"
+        );
+        assert!(
+            incomplete,
+            "but the tally must admit it is short, or a 0 from corruption reads as a real 0"
+        );
     }
 
     #[tokio::test]

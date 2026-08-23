@@ -113,6 +113,19 @@ pub(crate) enum Route {
     BindingPut(TenantId, PrincipalId),
     /// `DELETE /admin/tenants/:id/bindings/:pid`
     BindingDelete(TenantId, PrincipalId),
+    /// `POST /admin/tenants/:id/datasets` — upload a new version (RFC-005 §5, issue #287).
+    DatasetUpload(TenantId),
+    /// `GET /admin/tenants/:id/datasets`
+    DatasetList(TenantId),
+    /// `GET /admin/tenants/:id/datasets/:name` — version history plus which imposters bind it.
+    DatasetHistory(TenantId, String),
+    /// `GET /admin/tenants/:id/datasets/:name/:ver/content` — the bytes.
+    ///
+    /// The **one** audited read (RFC-002 §9's single named exception): this is a bulk export of
+    /// whatever the operator uploaded, which is routinely PII.
+    DatasetContent(TenantId, String, u64),
+    /// `DELETE /admin/tenants/:id/datasets/:name` — refused while any live stub binds it.
+    DatasetDelete(TenantId, String),
     /// `GET /admin/audit?since=&limit=` (RFC-002 §9, issue #163).
     ///
     /// Carries the parsed query rather than the raw string so `dispatch` never
@@ -174,6 +187,11 @@ impl Route {
             | Route::PrincipalCreate(tenant)
             | Route::PrincipalList(tenant)
             | Route::PrincipalPut(tenant, _)
+            | Route::DatasetUpload(tenant)
+            | Route::DatasetList(tenant)
+            | Route::DatasetHistory(tenant, _)
+            | Route::DatasetContent(tenant, _, _)
+            | Route::DatasetDelete(tenant, _)
             | Route::PrincipalDelete(tenant, _)
             | Route::BindingPut(tenant, _)
             | Route::BindingDelete(tenant, _) => Some(tenant.clone()),
@@ -248,6 +266,14 @@ impl Route {
                     Action::TenantManage
                 }
             }
+            // RFC-005 §5 (issue #287). The content read is a `DatasetRead` like the others —
+            // its exceptional treatment is that it is *audited*, not that it needs a higher
+            // role. A separate action would have implied a role boundary the RFC does not draw.
+            Route::DatasetList(_) | Route::DatasetHistory(_, _) | Route::DatasetContent(_, _, _) => {
+                Action::DatasetRead
+            }
+            Route::DatasetUpload(_) => Action::DatasetWrite,
+            Route::DatasetDelete(_, _) => Action::DatasetDelete,
         }
     }
 }
@@ -324,6 +350,35 @@ pub(crate) fn classify(method: &Method, path: &str, query: Option<&str>) -> Opti
                 Method::DELETE => Some(Route::PrincipalDelete(tenant, pid)),
                 _ => None,
             }
+        }
+        [tenant, "datasets"] if !tenant.is_empty() => {
+            let tenant = TenantId::new(*tenant);
+            match *method {
+                Method::POST => Some(Route::DatasetUpload(tenant)),
+                Method::GET => Some(Route::DatasetList(tenant)),
+                _ => None,
+            }
+        }
+        [tenant, "datasets", name] if !tenant.is_empty() && !name.is_empty() => {
+            let tenant = TenantId::new(*tenant);
+            match *method {
+                Method::GET => Some(Route::DatasetHistory(tenant, (*name).to_owned())),
+                Method::DELETE => Some(Route::DatasetDelete(tenant, (*name).to_owned())),
+                _ => None,
+            }
+        }
+        // The version parses here or the route does not exist. A handler taking a `&str` would
+        // have to invent an answer for `latest` or `-1`; a match that simply fails answers 404,
+        // which is the truth — there is no such version.
+        [tenant, "datasets", name, ver, "content"]
+            if !tenant.is_empty() && !name.is_empty() && *method == Method::GET =>
+        {
+            let version: u64 = ver.parse().ok()?;
+            Some(Route::DatasetContent(
+                TenantId::new(*tenant),
+                (*name).to_owned(),
+                version,
+            ))
         }
         [tenant, "bindings", pid] if !tenant.is_empty() && !pid.is_empty() => {
             let tenant = TenantId::new(*tenant);
@@ -672,7 +727,127 @@ pub(crate) enum Outcome {
         status: StatusCode,
         /// Rendered *after* the op commits and this node has applied it.
         then: Option<Vec<u8>>,
+        /// What `then` is, when it is not JSON. `None` takes the surface's default.
+        ///
+        /// Exists for the one route that answers with something else: a dataset's content is the
+        /// CSV the operator uploaded, and it is uploaded as `text/csv`. Labelling those bytes
+        /// `application/json` would be untrue and would break any client that calls `.json()` on
+        /// a response that succeeded.
+        then_content_type: Option<&'static str>,
     },
+}
+
+/// One row of `GET /admin/tenants/:id/datasets` (RFC-005 §5, issue #287).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetListRow {
+    name: String,
+    /// The highest live version — what an unpinned `_rift.dataset` binding would resolve to.
+    latest_version: u64,
+    rows: u64,
+    bytes: u64,
+    /// How many live stubs bind this dataset. Non-zero means a delete is refused.
+    bindings: usize,
+}
+
+/// `GET /admin/tenants/:id/datasets/:name` — every live version, newest first.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetHistoryBody {
+    name: String,
+    versions: Vec<rift_cluster::DatasetSummary>,
+    /// How many live stubs bind this dataset, across all versions.
+    bindings: usize,
+}
+
+/// What an upload answers with (RFC-005 §5).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetUploaded {
+    name: String,
+    digest: String,
+    rows: u64,
+}
+
+/// The `X-Rift-Dataset-*` headers an upload carries, already parsed.
+///
+/// A newtype rather than three loose strings so a handler cannot pass the delimiter where the
+/// name belongs — they are all strings on the wire.
+pub(crate) struct DatasetUploadMeta {
+    pub name: String,
+    pub key_columns: Vec<String>,
+    pub delimiter: char,
+}
+
+impl DatasetUploadMeta {
+    /// Read the upload's metadata from headers, falling back to the query string.
+    ///
+    /// Headers win: they travel with the `text/csv` body as its description, and a query string
+    /// left over from a copied URL should not quietly override what the client just sent. Both
+    /// forms are accepted because the RFC offers both (§5).
+    pub(crate) fn parse(
+        header: impl Fn(&str) -> Option<String>,
+        query: Option<&str>,
+    ) -> Result<Self, String> {
+        let from_query = |key: &str| -> Option<String> {
+            query?.split('&').find_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                (k == key).then(|| v.replace('+', " "))
+            })
+        };
+        let field = |header_name: &str, query_name: &str| -> Option<String> {
+            header(header_name).or_else(|| from_query(query_name))
+        };
+
+        let name = field("x-rift-dataset-name", "name").ok_or_else(|| {
+            "an upload needs a dataset name (X-Rift-Dataset-Name or ?name=)".to_owned()
+        })?;
+        let key_columns: Vec<String> = field("x-rift-dataset-key-columns", "keyColumns")
+            .ok_or_else(|| {
+                "an upload needs its key columns (X-Rift-Dataset-Key-Columns or ?keyColumns=)"
+                    .to_owned()
+            })?
+            .split(',')
+            .map(|c| c.trim().to_owned())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if key_columns.is_empty() {
+            return Err("keyColumns must name at least one column".to_owned());
+        }
+        // A delimiter is one character. Accepting a longer string and using its first byte would
+        // split on something the caller did not ask for, and #285 keys uniqueness on exactly this
+        // character — so a wrong one silently changes what "unique" proved.
+        let delimiter = match field("x-rift-dataset-delimiter", "delimiter") {
+            None => ',',
+            Some(raw) => {
+                let mut chars = raw.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => c,
+                    _ => {
+                        return Err(format!(
+                            "delimiter must be exactly one character, got {raw:?}"
+                        ));
+                    }
+                }
+            }
+        };
+        Ok(Self {
+            name,
+            key_columns,
+            delimiter,
+        })
+    }
+}
+
+/// The lowercase-hex sha256 of `bytes`.
+///
+/// Must agree byte-for-byte with `control::digest_matches`, which re-proves this digest against
+/// the CSV at apply on every replica — a different spelling here would refuse every upload.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Serialize `value`, or fail loudly.
@@ -691,6 +866,10 @@ fn json(value: &impl Serialize) -> Result<Vec<u8>, String> {
 /// `Err(reason)` is a client-shaped refusal message; the caller renders it as a
 /// `400`. Storage failures are `Err` too and render as `500` — never as an
 /// empty success.
+// Eight, one per thing a tenancy route can need. Bundling them into a context struct would move
+// the same arguments behind one name without removing a single caller obligation, and this has
+// exactly one call site.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch(
     node: &Arc<RaftNode>,
     route: Route,
@@ -704,6 +883,10 @@ pub(crate) async fn dispatch(
     // say) — [`Route::AuditSinkRead`] is the only arm that reads it, and it
     // already treats a follower's own absent status as unremarkable, so a
     // wholly absent exporter is unremarkable too.
+    // The `name` / `keyColumns` / `delimiter` an upload carries beside its CSV body, already
+    // parsed from the query string or the `X-Rift-Dataset-*` headers (issue #287). `None` for
+    // every other route.
+    upload: Option<DatasetUploadMeta>,
     export_status: Option<&ExportStatus>,
     // The flow-state subsystem (issue #372): `Route::TenantList` and
     // `Route::TenantRead` are the only arms that reach it, to fan out
@@ -712,6 +895,197 @@ pub(crate) async fn dispatch(
     flow_net: &Arc<FlowNet>,
 ) -> Result<Outcome, TenancyError> {
     match route {
+        Route::DatasetList(tenant) => {
+            let summaries = node
+                .datasets(tenant.as_str())
+                .map_err(|e| TenancyError::Storage(e.to_string()))?;
+            let (bindings_by_name, incomplete) = node
+                .dataset_binding_counts(tenant.as_str())
+                .map_err(|e| TenancyError::Storage(e.to_string()))?;
+            // One row per *name*, not per version: the listing answers "what tables does this
+            // tenant have", and every version of one name is one table.
+            let mut latest: std::collections::BTreeMap<String, rift_cluster::DatasetSummary> =
+                std::collections::BTreeMap::new();
+            for summary in summaries {
+                latest
+                    .entry(summary.name.clone())
+                    .and_modify(|held| {
+                        if summary.version > held.version {
+                            *held = summary.clone();
+                        }
+                    })
+                    .or_insert(summary);
+            }
+            let rows: Vec<DatasetListRow> = latest
+                .into_values()
+                .map(|summary| DatasetListRow {
+                    bindings: bindings_by_name
+                        .get(&summary.name)
+                        .copied()
+                        .unwrap_or_default(),
+                    name: summary.name,
+                    latest_version: summary.version,
+                    rows: summary.rows,
+                    bytes: summary.bytes,
+                })
+                .collect();
+            Ok(Outcome::Body {
+                status: StatusCode::OK,
+                body: json(&rows).map_err(TenancyError::Storage)?,
+                // A corrupt config makes the binding tally short, and a short tally promises a
+                // delete that will then 409. Say so rather than rendering it as fact.
+                partial: incomplete,
+            })
+        }
+        Route::DatasetHistory(tenant, name) => {
+            let versions: Vec<rift_cluster::DatasetSummary> = node
+                .datasets(tenant.as_str())
+                .map_err(|e| TenancyError::Storage(e.to_string()))?
+                .into_iter()
+                .filter(|summary| summary.name == *name)
+                .collect();
+            // Absent reads exactly like a cross-tenant probe, deliberately (RFC-002 §8.4): a
+            // caller must not be able to tell "no such dataset" from "not yours".
+            if versions.is_empty() {
+                return Err(TenancyError::NotFound);
+            }
+            let (bindings_by_name, incomplete) = node
+                .dataset_binding_counts(tenant.as_str())
+                .map_err(|e| TenancyError::Storage(e.to_string()))?;
+            let mut versions = versions;
+            // Newest first: negating the key rather than a comparator, which clippy prefers and
+            // which cannot get the direction subtly wrong on a later edit.
+            versions.sort_unstable_by_key(|summary| std::cmp::Reverse(summary.version));
+            let body = DatasetHistoryBody {
+                bindings: bindings_by_name.get(&name).copied().unwrap_or_default(),
+                name,
+                versions,
+            };
+            Ok(Outcome::Body {
+                status: StatusCode::OK,
+                body: json(&body).map_err(TenancyError::Storage)?,
+                partial: incomplete,
+            })
+        }
+        Route::DatasetContent(tenant, name, version) => {
+            let summary = node
+                .datasets(tenant.as_str())
+                .map_err(|e| TenancyError::Storage(e.to_string()))?
+                .into_iter()
+                .find(|summary| summary.name == *name && summary.version == version)
+                .ok_or(TenancyError::NotFound)?;
+            // Absent is **not** a 404 here. The summary above already proved the row is live, and
+            // `DatasetPut` writes the blob and the record in one apply transaction — so a missing
+            // blob is this node having lost bytes it still has a record for. Rendering that as
+            // "no such dataset" would tell an operator their data does not exist while the
+            // integrity failure left no trace at all.
+            let csv = node
+                .dataset_blob(&summary.digest)
+                .map_err(|e| TenancyError::Storage(e.to_string()))?
+                .ok_or_else(|| {
+                    tracing::error!(
+                        tenant = tenant.as_str(),
+                        %name,
+                        version,
+                        digest = %summary.digest,
+                        "dataset row is live but its blob is absent on this node"
+                    );
+                    TenancyError::Storage(format!(
+                        "dataset {name:?}@{version} is recorded but its bytes are missing on this \
+                         node"
+                    ))
+                })?;
+            // The audit exception (RFC-002 §9, issue #287). Committed through the ordinary write
+            // path, which means the bytes are served only *after* the record commits — and if it
+            // cannot commit, the caller gets the write path's failure and no bytes at all.
+            // Exporting unrecorded is the outcome this whole op exists to prevent.
+            Ok(Outcome::Commit {
+                op: ControlOp::DatasetContentRead {
+                    tenant,
+                    name,
+                    version,
+                    digest: rift_cluster::control::Digest::new(summary.digest),
+                },
+                status: StatusCode::OK,
+                then: Some(csv.into_bytes()),
+                // The bytes are the CSV that was uploaded, and it was uploaded as `text/csv`.
+                then_content_type: Some("text/csv; charset=utf-8"),
+            })
+        }
+        Route::DatasetUpload(tenant) => {
+            let meta = upload.ok_or_else(|| {
+                TenancyError::BadRequest("an upload needs its dataset metadata".to_owned())
+            })?;
+            let csv = std::str::from_utf8(body).map_err(|e| {
+                TenancyError::BadRequest(format!("the CSV is not valid UTF-8: {e}"))
+            })?;
+
+            // Every field of the record is *derived from the bytes*, never taken from the caller.
+            // `control::validate` re-proves the record against the CSV at apply on every replica,
+            // so a record that described the document wrongly would be refused there — deriving
+            // it here means a caller cannot make that happen by mis-declaring a row count.
+            let mut lines = csv.lines();
+            let header: Vec<String> = lines
+                .next()
+                .ok_or_else(|| TenancyError::BadRequest("the CSV has no header row".to_owned()))?
+                .split(meta.delimiter)
+                .map(|c| c.trim().to_owned())
+                .collect();
+            let rows = lines.count() as u64;
+            let record = rift_cluster::control::DatasetRecord {
+                name: meta.name.clone(),
+                digest: rift_cluster::control::Digest::new(sha256_hex(csv.as_bytes())),
+                key_columns: meta.key_columns,
+                delimiter: meta.delimiter,
+                columns: header,
+                rows,
+                bytes: csv.len() as u64,
+            };
+            // Deliberately **without** the assigned version. It is allocated at apply (monotonic
+            // per name), and this surface renders its body *before* the commit — so the only ways
+            // to report one are to guess `latest + 1`, which two concurrent uploads of the same
+            // name would both get wrong, or to add a post-commit re-read this surface does not
+            // have. A number that is right except under concurrency is worse than an absent one:
+            // it is the pin a caller would then bind against. `GET .../datasets/:name` has it.
+            let uploaded = DatasetUploaded {
+                name: record.name.clone(),
+                digest: record.digest.as_str().to_owned(),
+                rows,
+            };
+            Ok(Outcome::Commit {
+                op: ControlOp::DatasetPut {
+                    tenant,
+                    record,
+                    csv: csv.to_owned(),
+                },
+                status: StatusCode::CREATED,
+                then: Some(json(&uploaded).map_err(TenancyError::Storage)?),
+                then_content_type: None,
+            })
+        }
+        Route::DatasetDelete(tenant, name) => {
+            // Absence is a 404 here for the same reason the history read gives one, and it is
+            // checked before the commit so a delete of nothing does not append an audit row
+            // claiming something was deleted.
+            let exists = node
+                .datasets(tenant.as_str())
+                .map_err(|e| TenancyError::Storage(e.to_string()))?
+                .iter()
+                .any(|summary| summary.name == *name);
+            if !exists {
+                return Err(TenancyError::NotFound);
+            }
+            // The delete-while-bound refusal is #285's, at apply, on every replica — deliberately
+            // not re-checked here. A front-side pre-check would be a second implementation of the
+            // same rule that could disagree with the authoritative one, and it would race: a
+            // binding committed between the check and the apply must still refuse.
+            Ok(Outcome::Commit {
+                op: ControlOp::DatasetDelete { tenant, name },
+                status: StatusCode::NO_CONTENT,
+                then: None,
+                then_content_type: None,
+            })
+        }
         Route::AuditRead { since, limit } => {
             // Who sees what (RFC-002 §9). A `FleetAdmin` sees the fleet; anyone
             // else sees exactly the tenant they were authorized as, and nothing
@@ -806,6 +1180,7 @@ pub(crate) async fn dispatch(
                         .unwrap_or(DEFAULT_AUDIT_BATCH_MAX_ROWS),
                 },
                 status: StatusCode::OK,
+                then_content_type: None,
                 then: None,
             })
         }
@@ -814,6 +1189,7 @@ pub(crate) async fn dispatch(
                 tenant: TenantId::new(FLEET_SCOPE),
             },
             status: StatusCode::NO_CONTENT,
+            then_content_type: None,
             then: None,
         }),
         Route::FleetNamePut => {
@@ -828,6 +1204,7 @@ pub(crate) async fn dispatch(
                     name: parsed.name,
                 },
                 status: StatusCode::OK,
+                then_content_type: None,
                 then: None,
             })
         }
@@ -859,6 +1236,7 @@ pub(crate) async fn dispatch(
         Route::TenantDelete(tenant) => Ok(Outcome::Commit {
             op: ControlOp::TenantDelete { tenant },
             status: StatusCode::NO_CONTENT,
+            then_content_type: None,
             then: None,
         }),
         Route::TenantList => {
@@ -974,6 +1352,7 @@ pub(crate) async fn dispatch(
                 },
                 status: StatusCode::CREATED,
                 then: Some(rendered),
+                then_content_type: None,
             })
         }
         Route::PrincipalList(tenant) => {
@@ -1012,6 +1391,7 @@ pub(crate) async fn dispatch(
                     },
                 },
                 status: StatusCode::OK,
+                then_content_type: None,
                 then: None,
             })
         }
@@ -1021,6 +1401,7 @@ pub(crate) async fn dispatch(
                 principal_id,
             },
             status: StatusCode::NO_CONTENT,
+            then_content_type: None,
             then: None,
         }),
         Route::BindingPut(tenant, principal_id) => {
@@ -1032,6 +1413,7 @@ pub(crate) async fn dispatch(
                     role: parsed.role,
                 },
                 status: StatusCode::OK,
+                then_content_type: None,
                 then: None,
             })
         }
@@ -1041,6 +1423,7 @@ pub(crate) async fn dispatch(
                 principal_id,
             },
             status: StatusCode::NO_CONTENT,
+            then_content_type: None,
             then: None,
         }),
     }
@@ -1059,6 +1442,7 @@ fn tenant_upsert(
             journal_retention_secs: parsed.journal_retention_secs,
         },
         status,
+        then_content_type: None,
         then: None,
     })
 }
@@ -1658,6 +2042,152 @@ mod tests {
         assert_eq!(
             usage_view(&tenant("beta"), &configs, &flow_counts).flow_entries,
             100
+        );
+    }
+
+    /// #287: all five dataset routes classify, and each carries the tenant already parsed.
+    #[test]
+    fn every_dataset_route_classifies_with_its_tenant() {
+        let cases: [(Method, &str, Route); 5] = [
+            (
+                Method::POST,
+                "/admin/tenants/acme/datasets",
+                Route::DatasetUpload(TenantId::new("acme")),
+            ),
+            (
+                Method::GET,
+                "/admin/tenants/acme/datasets",
+                Route::DatasetList(TenantId::new("acme")),
+            ),
+            (
+                Method::GET,
+                "/admin/tenants/acme/datasets/customers",
+                Route::DatasetHistory(TenantId::new("acme"), "customers".to_owned()),
+            ),
+            (
+                Method::GET,
+                "/admin/tenants/acme/datasets/customers/3/content",
+                Route::DatasetContent(TenantId::new("acme"), "customers".to_owned(), 3),
+            ),
+            (
+                Method::DELETE,
+                "/admin/tenants/acme/datasets/customers",
+                Route::DatasetDelete(TenantId::new("acme"), "customers".to_owned()),
+            ),
+        ];
+        for (method, path, expected) in cases {
+            assert_eq!(
+                classify(&method, path, None),
+                Some(expected),
+                "{method} {path}"
+            );
+        }
+    }
+
+    /// Read is a Viewer's action; upload and delete redefine what stubs serve, so they are not.
+    #[test]
+    fn dataset_routes_carry_the_action_their_tier_implies() {
+        let tenant = TenantId::new("acme");
+        let name = || "customers".to_owned();
+        for (route, expected) in [
+            (Route::DatasetList(tenant.clone()), Action::DatasetRead),
+            (
+                Route::DatasetHistory(tenant.clone(), name()),
+                Action::DatasetRead,
+            ),
+            (
+                Route::DatasetContent(tenant.clone(), name(), 1),
+                Action::DatasetRead,
+            ),
+            (Route::DatasetUpload(tenant.clone()), Action::DatasetWrite),
+            (
+                Route::DatasetDelete(tenant.clone(), name()),
+                Action::DatasetDelete,
+            ),
+        ] {
+            assert_eq!(route.action(), expected, "{route:?}");
+        }
+    }
+
+    /// Every dataset route scopes to the tenant in its own path, never the fleet.
+    ///
+    /// A dataset belongs to one tenant; scoping one of these to the fleet would let a
+    /// `FleetAdmin`-shaped check stand in for a tenant-scoped one and read another tenant's rows.
+    #[test]
+    fn every_dataset_route_scopes_to_its_own_tenant() {
+        let tenant = TenantId::new("acme");
+        for route in [
+            Route::DatasetList(tenant.clone()),
+            Route::DatasetHistory(tenant.clone(), "c".to_owned()),
+            Route::DatasetContent(tenant.clone(), "c".to_owned(), 1),
+            Route::DatasetUpload(tenant.clone()),
+            Route::DatasetDelete(tenant.clone(), "c".to_owned()),
+        ] {
+            assert_eq!(
+                route.scope().as_ref().map(TenantId::as_str),
+                Some("acme"),
+                "{route:?}"
+            );
+        }
+    }
+
+    /// E13 — a version that is not a number does not match, so it 404s instead of reaching a
+    /// handler that would have to decide what to do with it.
+    #[test]
+    fn a_non_numeric_dataset_version_does_not_classify() {
+        assert_eq!(
+            classify(
+                &Method::GET,
+                "/admin/tenants/acme/datasets/customers/latest/content",
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            classify(
+                &Method::GET,
+                "/admin/tenants/acme/datasets/customers/-1/content",
+                None
+            ),
+            None
+        );
+    }
+
+    /// E14 — `%2f` in a name stays one segment, exactly as it does for a principal id.
+    ///
+    /// The matcher deliberately does not percent-decode. If it did, `customers%2f3%2fcontent`
+    /// would arrive here as four segments and could be read as a *content* route for a dataset
+    /// the caller never named.
+    #[test]
+    fn a_percent_encoded_slash_cannot_smuggle_a_dataset_path_segment() {
+        assert_eq!(
+            classify(
+                &Method::GET,
+                "/admin/tenants/acme/datasets/customers%2f3%2fcontent",
+                None
+            ),
+            Some(Route::DatasetHistory(
+                TenantId::new("acme"),
+                "customers%2f3%2fcontent".to_owned()
+            )),
+            "the escape must stay inside the name, not become a route"
+        );
+    }
+
+    /// A method the route does not define is not silently mapped onto one that exists.
+    #[test]
+    fn an_undefined_method_on_a_dataset_path_does_not_classify() {
+        assert_eq!(
+            classify(&Method::DELETE, "/admin/tenants/acme/datasets", None),
+            None
+        );
+        assert_eq!(
+            classify(
+                &Method::POST,
+                "/admin/tenants/acme/datasets/customers/1/content",
+                None
+            ),
+            None
         );
     }
 }
