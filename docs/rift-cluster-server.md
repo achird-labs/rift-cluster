@@ -242,21 +242,127 @@ agent is deleting one binding, and there is no separate agent pathway to audit.
 The key is never logged and never appears in a `Debug` rendering. Tool errors
 relay the API's own error body verbatim; those bodies never echo credentials.
 
-### The v1 tool set
+### The read tools
 
-All eight are **reads**, annotated `readOnlyHint` so an agent host can say so
-when it asks a human whether to allow a call. Write tools are a later slice.
+Annotated `readOnlyHint` so an agent host can say so when it asks a human whether
+to allow a call.
 
 | Tool | Wraps |
 |---|---|
 | `imposter_list` | `GET /imposters` |
-| `imposter_get` | `GET /imposters/{port}` |
+| `imposter_get` | `GET /imposters/{port}` — also reports `current_revision` |
 | `requests_query` | `GET /imposters/{port}/requests` |
 | `routes_get` | `GET /front-door/routes` |
 | `fleet_health` | `GET /_fleet/health` |
 | `whoami` | `GET /admin/whoami` |
+| `op_status` | `GET /_fleet/ops/{opId}` — poll a parked write, see below |
 | `verify` | `POST /imposters/{port}/verify` — assertions evaluated by the engine's own matcher, so a verdict here agrees with how stubs actually match. **Node-scoped** — see below |
 | `lint` | in-process `rift-lint` — no network call, no side effects |
+
+### The write tools
+
+These mutate replicated config and are **not** annotated `readOnlyHint`, so an
+agent host that auto-approves reads still asks about them.
+
+| Tool | Wraps |
+|---|---|
+| `imposter_create` | `POST /imposters` — `port` is a required parameter; the front allocates nothing |
+| `imposter_delete` | `DELETE /imposters/{port}` |
+| `imposter_set_enabled` | `POST /imposters/{port}/enable` \| `/disable` |
+| `stub_add` | `POST /imposters/{port}/stubs` |
+| `stub_replace` | `PUT /imposters/{port}/stubs/by-id/{id}` |
+| `stub_delete` | `DELETE /imposters/{port}/stubs/by-id/{id}` |
+| `routes_put` | `PUT /front-door/routes` — set-replace, not a merge |
+| `route_delete` | `DELETE /front-door/routes/{id}` |
+
+**Stub edits are by id, never by index.** The front also serves index-addressed
+stub routes, and this surface deliberately does not project them: an index edit
+is a read-modify-write of the whole imposter on the answering node, so two agents
+editing different stubs concurrently silently clobber one another. The console
+refuses the same window for the same reason. Read ids from `imposter_get`.
+
+### What a write answers
+
+Every write answers one of three shapes, and an agent has to tell them apart —
+two of the three are not failures.
+
+**Applied.** The write committed. `current_revision` is what to condition the
+next write on; `data` is the front's own post-commit render of the record.
+
+```jsonc
+{ "data": { "port": 4545, … }, "current_revision": 8, "op_id": "0189dcf0-…" }
+```
+
+**Conflict.** Refused because the record moved on since `expected_revision`.
+
+```jsonc
+{ "conflict": true, "current_revision": 5, "message": "revision conflict: expected revision 3, …" }
+```
+
+Re-read, rebase your change onto `current_revision`, and retry. Note that
+`current_revision` comes from a fresh read of the record, so it reports where the
+record is *now* — which is the value to retry against. It is omitted when the
+record does not exist, and never guessed.
+
+Retry with a **new tool call**, not by repeating the refused one: a keyed retry
+of a `409` dedups to that same `409` by design (see *Idempotency*).
+
+**Parked.** The write is durable but not yet applied — the fleet accepted it and
+will replay it. This is what a leaderless window looks like from a tool, and it
+is not a failure: the write is not lost and must not be re-sent.
+
+```jsonc
+{ "parked": true, "op_id": "0189dcf0-…" }
+```
+
+Poll `op_status` with that `op_id` until `state` is `applied` or `failed`. It reads
+`pending` while the write is still parked — those three are the only values, and
+`parked` is not one of them.
+
+A park that arrives without an op id — no `Rift-Cluster-Op-Id` header and no `opId`
+in the body — is reported as an **error**, not as an applied write. The fleet has
+almost certainly queued the write, so the safe move is to check the parked intents
+rather than re-send it. This does not happen against the front, which always stamps
+the header; it happens when something in between drops it.
+
+**Applied, with a warning.** A write can commit fleet-wide and still not be realized
+everywhere: a write barrier that timed out on named peers, or an engine on the
+answering node that refused the op (a port already bound). The commit is real, so the
+answer is `Applied` — but it carries `warnings`, verbatim from
+`Rift-Cluster-Warnings`, as `unapplied=<node,…>` and/or `local-engine=<failure>`.
+An `imposter_create` that reports `local-engine=address in use` committed the
+document and did **not** get a listener; the port will refuse connections. Absent
+`warnings` means fully applied.
+
+**Committed, but not readable here.** The front answers a failed post-commit re-read
+with *that* read's status rather than dressing it in a success code, so a write can
+answer `404` having already committed. This is reported as an error naming the
+committed revision, and it is the one case where you must **not** retry: the change is
+in the log, and a retry under a fresh tool-call id would apply it twice. Re-read the
+record instead.
+
+### Idempotency
+
+Every write carries an `Idempotency-Key` derived from the MCP tool-call id, so
+**retrying a call that timed out dedups instead of applying twice**. The key is
+namespaced per server process as well as per call id — two agents' first calls
+both being "request 1" must not dedup into each other.
+
+The practical rule: retrying the *same* tool call is safe; making the *same
+change* under a new tool call is a second write.
+
+### Conditional writes
+
+Every mutating tool takes an optional `expected_revision`, sent as `If-Match`.
+Omit it and the write is last-writer-wins, which is the front's own default —
+nothing is made conditional behind your back. Supply it and a stale value is
+refused with the conflict shape above instead of overwriting another writer.
+
+`imposter_create` has no `expected_revision`: `POST /imposters` is not
+port-addressed, and the front refuses a precondition on it.
+
+The route table's revision is **per tenant, not per route** — a `routes_put` or
+a `route_delete` invalidates any outstanding precondition on that table.
 
 ### Scope: which nodes an answer covers
 
