@@ -2773,12 +2773,16 @@ impl RedbStateMachine {
             let configs = read_txn
                 .open_table(SM_CONFIGS_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let config_action = match Self::desired_configs(&configs)
-                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
-            {
-                Ok(desired) => EngineAction::Sync(desired),
-                Err((port, error)) => EngineAction::RefuseSync { port, error },
-            };
+            let sm_datasets = read_txn
+                .open_table(SM_DATASETS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let config_action =
+                match Self::desired_configs(&configs, &sm_datasets, self.spool_dir.as_deref())
+                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+                {
+                    Ok(desired) => EngineAction::Sync(desired),
+                    Err((port, error)) => EngineAction::RefuseSync { port, error },
+                };
             let routes = read_txn
                 .open_table(SM_ROUTES_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -2790,6 +2794,45 @@ impl RedbStateMachine {
             };
             (config_action, routes_action)
         };
+        // Repaired **before** the engine drive below, not after: a D2 dataset binding compiles
+        // to a `lookup` naming a spool file, and the engine loading one that is not there yet
+        // does not fail loudly — upstream's `CsvCache` warns and substitutes nothing, so the
+        // response is served with its `${row}` tokens intact under a 200. `install_snapshot`
+        // orders these the same way, and for the same reason.
+        // Repair the spool directory (RFC-005 D1, #285): a restart with a missing or wiped
+        // `datasets/` directory must not leave a dataset row pointing at a file this node no
+        // longer has, since a restart replays no `DatasetPut` entries (they are already
+        // reflected in `sm_dataset_blobs`) — nothing else re-materialises the files. A no-op
+        // without a spool dir, like the engine drive above. Only ever *adds* a missing file:
+        // an orphan already on disk is left alone, both because it is harmless and because
+        // this pass has no way to know it is unreferenced without a second full table scan on
+        // every restart.
+        if let Some(dir) = &self.spool_dir {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let blobs = read_txn
+                .open_table(SM_DATASET_BLOBS_TABLE)
+                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+            for item in blobs
+                .iter()
+                .map_err(|e| StorageIOError::read_state_machine(&e))?
+            {
+                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+                let digest = key.value();
+                // Presence, not content: `write_spool` never leaves a partial file under the
+                // final name, so a present file is a complete one unless the disk itself lied —
+                // and re-hashing every blob on every restart to guard against that would make
+                // startup cost proportional to the tenant byte quota. A deliberate trade.
+                if self.spool_path(digest).is_some_and(|p| p.exists()) {
+                    continue;
+                }
+                write_spool(dir, digest, value.value())
+                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+            }
+        }
+
         // Unattributed: this materializes a whole table on restart, not one
         // caller's write, so there is no principal to name.
         self.drive_engine(vec![
@@ -2828,39 +2871,6 @@ impl RedbStateMachine {
             }
         }
 
-        // Repair the spool directory (RFC-005 D1, #285): a restart with a missing or wiped
-        // `datasets/` directory must not leave a dataset row pointing at a file this node no
-        // longer has, since a restart replays no `DatasetPut` entries (they are already
-        // reflected in `sm_dataset_blobs`) — nothing else re-materialises the files. A no-op
-        // without a spool dir, like the engine drive above. Only ever *adds* a missing file:
-        // an orphan already on disk is left alone, both because it is harmless and because
-        // this pass has no way to know it is unreferenced without a second full table scan on
-        // every restart.
-        if let Some(dir) = &self.spool_dir {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            let blobs = read_txn
-                .open_table(SM_DATASET_BLOBS_TABLE)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            for item in blobs
-                .iter()
-                .map_err(|e| StorageIOError::read_state_machine(&e))?
-            {
-                let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                let digest = key.value();
-                // Presence, not content: `write_spool` never leaves a partial file under the
-                // final name, so a present file is a complete one unless the disk itself lied —
-                // and re-hashing every blob on every restart to guard against that would make
-                // startup cost proportional to the tenant byte quota. A deliberate trade.
-                if self.spool_path(digest).is_some_and(|p| p.exists()) {
-                    continue;
-                }
-                write_spool(dir, digest, value.value())
-                    .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
-            }
-        }
         Ok(())
     }
 
@@ -3279,23 +3289,54 @@ impl RedbStateMachine {
     /// failure instead — the engine keeps serving its last-known state. This
     /// still holds with the union: a broken record in *any* tenant aborts the
     /// whole sync, exactly as it did when only the default tenant was read.
+    ///
+    /// This is also where a `_rift.dataset` binding becomes something the engine can execute
+    /// (RFC-005 D2, #286): the stored config keeps the operator's declarative block, and the
+    /// engine-facing copy gains the compiled `lookup` pointing at this node's spool file. It
+    /// happens here and nowhere else — the other stored-config readers either edit and write back
+    /// (and so must keep the declarative form) or only count usage.
     fn desired_configs(
         table: &impl ReadableTable<(&'static str, u16), &'static str>,
+        datasets: &impl ReadableTable<(&'static str, &'static str, u64), &'static str>,
+        spool_dir: Option<&Path>,
     ) -> Result<Result<Vec<ImposterConfig>, (u16, String)>, redb::StorageError> {
         let mut desired = Vec::new();
         for item in table.iter()? {
             let (key, value) = item?;
-            let (_tenant, port) = key.value();
+            let (tenant, port) = key.value();
             let stored = match serde_json::from_str::<StoredImposter>(value.value()) {
                 Ok(stored) => stored,
                 Err(e) => {
                     return Ok(Err((port, format!("stored record will not parse: {e}"))));
                 }
             };
+            // Compiled as JSON, before the parse: upstream precomputes `_behaviors` once at
+            // construction (#479), so a lookup added to an already-parsed config would change the
+            // field and not what the engine runs.
+            let mut config_json =
+                match serde_json::from_str::<serde_json::Value>(&stored.config_json) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return Ok(Err((port, format!("stored config will not parse: {e}"))));
+                    }
+                };
+            if let Err(e) = crate::datasets::compile_bindings(
+                &mut config_json,
+                |name, version| Self::resolve_dataset(datasets, tenant, name, version),
+                spool_dir,
+            ) {
+                // Refused rather than dropped, for the same reason an unparseable record is: a
+                // binding that silently fails to compile serves the response with its `${row}`
+                // tokens unsubstituted, under a 200.
+                return Ok(Err((
+                    port,
+                    format!("dataset binding will not compile: {e}"),
+                )));
+            }
             // Disabled configs stay in the desired set: upstream keeps a
             // paused imposter bound (serving 503) — dropping it here would
             // read as "delete it" to apply_config (#817).
-            match serde_json::from_str::<ImposterConfig>(&stored.config_json) {
+            match serde_json::from_value::<ImposterConfig>(config_json) {
                 Ok(config) => desired.push(config),
                 Err(e) => {
                     return Ok(Err((port, format!("stored config will not parse: {e}"))));
@@ -3305,18 +3346,59 @@ impl RedbStateMachine {
         Ok(Ok(desired))
     }
 
+    /// One dataset version as [`crate::datasets::compile_bindings`] needs it (RFC-005 D2, #286).
+    ///
+    /// `Ok(None)` means the row is genuinely absent or tombstoned — a binding to either is
+    /// refused, never quietly compiled against whatever version happens to be live now.
+    ///
+    /// A storage failure or a row that will not parse is an `Err`, **not** an `Ok(None)**, for the
+    /// same reason [`Self::datasets`] refuses rather than skipping one: folding corruption into
+    /// "absent" tells an operator their dataset is gone when it is not. Here it would do that on
+    /// every node at once, for a dataset they can still list — and the real cause, a corrupt row,
+    /// would appear in no log at all.
+    fn resolve_dataset(
+        datasets: &impl ReadableTable<(&'static str, &'static str, u64), &'static str>,
+        tenant: &str,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<crate::datasets::ResolvedDataset>, String> {
+        let Some(guard) = datasets
+            .get((tenant, name, version))
+            .map_err(|e| format!("reading dataset \"{name}\" version {version}: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let stored: StoredDataset = serde_json::from_str(guard.value()).map_err(|e| {
+            tracing::error!(tenant, name, version, error = %e, "corrupt stored dataset");
+            format!("stored dataset \"{name}\" version {version} will not parse: {e}")
+        })?;
+        if stored.deleted {
+            return Ok(None);
+        }
+        Ok(Some(crate::datasets::ResolvedDataset {
+            version: stored.version,
+            digest: stored.record.digest.to_string(),
+            delimiter: stored.record.delimiter,
+            key_columns: stored.record.key_columns,
+        }))
+    }
+
     /// Build the engine action for a config op: a full sync when every stored
     /// record parses, a recorded refusal when one does not.
     #[allow(clippy::result_large_err)]
     fn sync_action(
         configs: &Table<'_, (&'static str, u16), &'static str>,
+        datasets: &Table<'_, (&'static str, &'static str, u64), &'static str>,
+        spool_dir: Option<&Path>,
     ) -> StorageResult<EngineAction> {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
-        Ok(match Self::desired_configs(configs).map_err(io)? {
-            Ok(desired) => EngineAction::Sync(desired),
-            Err((port, error)) => EngineAction::RefuseSync { port, error },
-        })
+        Ok(
+            match Self::desired_configs(configs, datasets, spool_dir).map_err(io)? {
+                Ok(desired) => EngineAction::Sync(desired),
+                Err((port, error)) => EngineAction::RefuseSync { port, error },
+            },
+        )
     }
 
     /// The desired route table as of now, read from an open (possibly
@@ -4157,7 +4239,7 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Self::mark_drifted(sources, tenant.as_str(), provenance.as_ref(), index)?;
                 crate::metrics::config_applied(port, index);
-                Ok(Ok(vec![Self::sync_action(configs)?]))
+                Ok(Ok(vec![Self::sync_action(configs, datasets, spool_dir)?]))
             }
             ControlOp::PatchStubs { tenant, port, edit } => {
                 // Block-scoped so the read guard's borrow of `configs` ends
@@ -4237,7 +4319,7 @@ impl RedbStateMachine {
                     .map_err(io)?;
                 Self::mark_drifted(sources, tenant.as_str(), provenance.as_ref(), index)?;
                 crate::metrics::config_removed(*port);
-                Ok(Ok(vec![Self::sync_action(configs)?]))
+                Ok(Ok(vec![Self::sync_action(configs, datasets, spool_dir)?]))
             }
             ControlOp::DeleteAll { tenant } => {
                 let tenant = tenant.as_str();
@@ -4279,7 +4361,7 @@ impl RedbStateMachine {
                 for port in removed {
                     crate::metrics::config_removed(port);
                 }
-                Ok(Ok(vec![Self::sync_action(configs)?]))
+                Ok(Ok(vec![Self::sync_action(configs, datasets, spool_dir)?]))
             }
             ControlOp::SetEnabled {
                 tenant,
@@ -4500,6 +4582,29 @@ impl RedbStateMachine {
                     if Self::port_claimed_by_another_tenant(configs, tenant_str, port)? {
                         return Ok(Err(format!("port {port} is already bound in this fleet")));
                     }
+                    // A `_rift.dataset` binding is pinned at *admission* (RFC-005 D2, #286), and a
+                    // source pull is not an admission — nothing here resolves a version to a
+                    // digest. An unpinned block that reached storage would be refused at apply,
+                    // and that refusal aborts the whole engine sync, so a document fetched from a
+                    // remote endpoint could freeze this node's entire config plane. Refused here
+                    // instead, scoped to the pull that carried it.
+                    let rendered = match serde_json::to_value(config) {
+                        Ok(rendered) => rendered,
+                        Err(e) => {
+                            return Ok(Err(format!(
+                                "pull result for port {port} could not be inspected: {e}"
+                            )));
+                        }
+                    };
+                    let bound = crate::datasets::bound_dataset_names(&rendered);
+                    if !bound.is_empty() {
+                        return Ok(Err(format!(
+                            "port {port} binds dataset(s) {}: a `_rift.dataset` block is resolved \
+                             and pinned when it is written to the admin API, so a source pull \
+                             cannot carry one",
+                            bound.join(", ")
+                        )));
+                    }
                 }
 
                 let provenance = SourceProvenance {
@@ -4650,7 +4755,7 @@ impl RedbStateMachine {
                     .insert((tenant_str, id.as_str()), value.as_str())
                     .map_err(io)?;
 
-                Ok(Ok(vec![Self::sync_action(configs)?]))
+                Ok(Ok(vec![Self::sync_action(configs, datasets, spool_dir)?]))
             }
             ControlOp::TenantPut {
                 tenant,
@@ -4777,7 +4882,7 @@ impl RedbStateMachine {
                     .map_err(|e| StorageIOError::write_state_machine(&e))?;
                 tenants.insert(tenant_str, value.as_str()).map_err(io)?;
                 let mut actions = vec![
-                    Self::sync_action(configs)?,
+                    Self::sync_action(configs, datasets, spool_dir)?,
                     Self::sync_routes_action(routes)?,
                 ];
                 actions.extend(dataset_actions);
@@ -5147,7 +5252,9 @@ impl RedbStateMachine {
                     // The merge target was a user-authored stub with no id: nothing addresses
                     // it in a patch script, so fall back to the full-sync drive — rare, and
                     // always correct.
-                    PlacedRecording::MergedAnonymous => Self::sync_action(configs)?,
+                    PlacedRecording::MergedAnonymous => {
+                        Self::sync_action(configs, datasets, spool_dir)?
+                    }
                 };
                 Ok(Ok(vec![action]))
             }
@@ -6348,13 +6455,6 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     .insert((tenant.as_str(), *port), value.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
-            let config_action = match Self::desired_configs(&configs_table)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?
-            {
-                Ok(desired) => EngineAction::Sync(desired),
-                Err((port, error)) => EngineAction::RefuseSync { port, error },
-            };
-
             let mut routes_table = write_txn
                 .open_table(SM_ROUTES_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
@@ -6443,6 +6543,21 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     .insert((tenant.as_str(), name.as_str(), *version), value.as_str())
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
+
+            // Computed *after* `datasets_table` is repopulated, not alongside the configs above:
+            // compiling a `_rift.dataset` binding reads this table, and against the emptied one it
+            // would refuse every bound imposter on the node — turning a snapshot install into a
+            // fleet-wide outage for exactly the configs the snapshot was carrying.
+            let config_action = match Self::desired_configs(
+                &configs_table,
+                &datasets_table,
+                self.spool_dir.as_deref(),
+            )
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?
+            {
+                Ok(desired) => EngineAction::Sync(desired),
+                Err((port, error)) => EngineAction::RefuseSync { port, error },
+            };
 
             let mut dataset_blobs_table = write_txn
                 .open_table(SM_DATASET_BLOBS_TABLE)
