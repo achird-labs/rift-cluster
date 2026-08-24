@@ -2614,6 +2614,215 @@ paths:
         '504':
           $ref: '#/components/responses/WriteTimeout'
 
+  /admin/tenants/{tenantId}/datasets:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      operationId: listDatasets
+      summary: List this tenant's datasets
+      description: >
+        One row per dataset *name* — every version of a name is one table — carrying
+        the latest live version and how many live stubs bind it. A non-zero
+        `bindings` count means a delete will be refused with `409`.
+
+        Not audited. Only the content read is (see that route): keeping the
+        deviation from RFC-002 §9 narrow is what keeps it defensible.
+
+        `Rift-Cluster-Partial: true` means a stored config would not parse, so the
+        binding tally is short — the count is advisory, but a short one would
+        promise a delete that then `409`s, so it is reported rather than hidden.
+      tags: [datasets]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: The tenant's datasets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [name, latestVersion, rows, bytes, bindings]
+                  properties:
+                    name: { type: string }
+                    latestVersion: { type: integer, format: int64 }
+                    rows: { type: integer, format: int64 }
+                    bytes: { type: integer, format: int64 }
+                    bindings:
+                      type: integer
+                      description: Live stubs binding this dataset. Non-zero blocks a delete.
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
+    post:
+      operationId: uploadDataset
+      summary: Upload a new version of a dataset
+      description: >
+        The body is the CSV itself (`text/csv`). Its name, key columns and
+        delimiter travel beside it, as `X-Rift-Dataset-*` headers or as query
+        parameters; headers win when both are present.
+
+        Every version of a name is a new version — an upload never mutates a
+        serving stub, because a `_rift.dataset` binding pins the version it
+        resolved (RFC-005 §3.3, issue #286).
+
+        The response deliberately omits the assigned version: it is allocated at
+        apply, and reporting one here would mean guessing `latest + 1`, which two
+        concurrent uploads of the same name would both get wrong. `GET
+        /admin/tenants/{tenantId}/datasets/{datasetName}` has it.
+
+        Bounded by the admin plane's 16 MiB body limit before any quota check runs.
+      tags: [datasets]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+        - in: header
+          name: X-Rift-Dataset-Name
+          schema: { type: string }
+          description: The dataset's name. Or `?name=`.
+        - in: header
+          name: X-Rift-Dataset-Key-Columns
+          schema: { type: string }
+          description: >
+            Comma-separated columns a lookup may key on. Or `?keyColumns=`. Each
+            must be unique across rows — validated before the upload commits.
+        - in: header
+          name: X-Rift-Dataset-Delimiter
+          schema: { type: string, maxLength: 1, default: ',' }
+          description: Exactly one character. Or `?delimiter=`.
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            schema: { type: string }
+      responses:
+        '201':
+          description: Committed; the bytes are on every node.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [name, digest, rows]
+                properties:
+                  name: { type: string }
+                  digest:
+                    type: string
+                    description: sha256 of the exact bytes uploaded.
+                  rows: { type: integer, format: int64 }
+        '400':
+          description: >
+            The record did not describe the document — a duplicate key, a key
+            column not in the header, an unsplittable delimiter — or a quota was
+            exceeded. The body names which.
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
+        '413': { description: The CSV exceeded the admin plane's body limit. }
+  /admin/tenants/{tenantId}/datasets/{datasetName}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/DatasetName'
+    get:
+      operationId: readDatasetHistory
+      summary: One dataset's version history
+      description: >
+        Every live version, newest first, plus how many live stubs bind the
+        dataset. Not audited.
+
+        A dataset this tenant does not have answers `404` — byte-identical to a
+        cross-tenant probe, so a caller cannot tell "no such dataset" from "not
+        yours" (RFC-002 §8.4).
+      tags: [datasets]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: The dataset's versions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [name, versions, bindings]
+                properties:
+                  name: { type: string }
+                  bindings: { type: integer }
+                  versions:
+                    type: array
+                    items: { type: object }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
+    delete:
+      operationId: deleteDataset
+      summary: Delete a dataset
+      description: >
+        Tombstones every live version of the name. **Refused with `409` while any
+        live stub binds it** — a mock never breaks because its data was removed
+        underneath it. That rule is enforced at apply on every replica, not at the
+        front, so a binding committed concurrently with this call still refuses it.
+      tags: [datasets]
+      x-rift-origin: ee
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '204': { description: Deleted. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
+        '409': { description: A live stub still binds this dataset. The body names the port. }
+  /admin/tenants/{tenantId}/datasets/{datasetName}/{version}/content:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/DatasetName'
+      - in: path
+        name: version
+        required: true
+        schema: { type: integer, format: int64 }
+        description: A concrete version. A non-numeric value is `404`, never coerced.
+    get:
+      operationId: readDatasetContent
+      summary: Download a dataset version's bytes
+      description: >
+        **The one audited read.** RFC-002 §9 says reads are not audited; this is
+        its single named exception, because these bytes are a bulk export of
+        whatever the operator uploaded and are routinely PII. The audit record
+        carries the dataset name, the version and the digest, so "who exported
+        which bytes" is a log query (§8.3). Listings and version history are *not*
+        audited — the exception is deliberately this route alone.
+
+        The record commits before the bytes are served, and a read whose record
+        cannot commit is refused rather than served: exporting unrecorded is the
+        outcome this exception exists to prevent.
+      tags: [datasets]
+      x-rift-origin: ee
+      responses:
+        '200':
+          description: The CSV, exactly as uploaded.
+          content:
+            text/csv:
+              schema: { type: string }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: >
+            No such dataset, or the caller is not bound to the tenant named — the
+            two are deliberately indistinguishable (RFC-002 §8.4), body included,
+            so this cannot be used to discover whether a dataset exists in another
+            tenant.
   /admin/tenants/{tenantId}/principals:
     parameters:
       - $ref: '#/components/parameters/TenantId'
@@ -4543,6 +4752,16 @@ components:
       in: path
       required: true
       description: The tenant record's id.
+      schema:
+        type: string
+    DatasetName:
+      name: datasetName
+      in: path
+      required: true
+      description: >
+        The dataset's name, unique per tenant. Not percent-decoded by the router,
+        so an escaped separator stays part of the name rather than becoming a path
+        segment.
       schema:
         type: string
     PrincipalId:

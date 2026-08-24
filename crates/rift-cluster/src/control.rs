@@ -838,6 +838,24 @@ pub enum ControlOp {
         tenant: TenantId,
         name: String,
     },
+    /// A dataset's bytes were exported (RFC-002 §9's single named exception, issue #287).
+    ///
+    /// **Changes nothing.** It exists only so the export leaves a trace, and it is an op rather
+    /// than a local log line because audit rows are written inside apply, keyed by log index, and
+    /// replicate with everything else. A record written outside Raft would make "who exported
+    /// these bytes" depend on which node happened to answer.
+    ///
+    /// Carries the resolved `digest`, not just the name: a name can be re-versioned, and the
+    /// question the record has to answer is *which bytes left*, not which label they had.
+    ///
+    /// The read commits before the bytes are served, and a commit that fails refuses the read —
+    /// exporting unrecorded is the one outcome this op exists to prevent.
+    DatasetContentRead {
+        tenant: TenantId,
+        name: String,
+        version: u64,
+        digest: Digest,
+    },
 }
 
 /// The stub half of a [`ControlOp::ProxyRecorded`]: the generated stub plus everything its
@@ -1229,7 +1247,8 @@ impl ControlOp {
             | ControlOp::SpecBind { tenant, .. }
             | ControlOp::SpecUnbind { tenant, .. }
             | ControlOp::DatasetPut { tenant, .. }
-            | ControlOp::DatasetDelete { tenant, .. } => tenant,
+            | ControlOp::DatasetDelete { tenant, .. }
+            | ControlOp::DatasetContentRead { tenant, .. } => tenant,
         }
     }
 
@@ -1310,6 +1329,11 @@ impl ControlOp {
             ControlOp::SpecDelete { .. } => "spec.delete",
             ControlOp::DatasetPut { .. } => "dataset.write",
             ControlOp::DatasetDelete { .. } => "dataset.delete",
+            // The exception RFC-002 §9 names: reads are not audited, except this one. A dataset's
+            // content is a bulk export of whatever the operator uploaded, routinely PII, so it
+            // leaves a trace. Listings and version history do not — keeping the deviation narrow
+            // is what keeps it defensible.
+            ControlOp::DatasetContentRead { .. } => "dataset.read",
         })
     }
 
@@ -1368,6 +1392,14 @@ impl ControlOp {
             ControlOp::SpecUnbind { port, .. } => port.to_string(),
             ControlOp::DatasetPut { record, .. } => record.name.clone(),
             ControlOp::DatasetDelete { name, .. } => name.clone(),
+            // Not just the name: the row must name the exact bytes, because a name outlives the
+            // version it pointed at.
+            ControlOp::DatasetContentRead {
+                name,
+                version,
+                digest,
+                ..
+            } => format!("{name}@{version} ({digest})"),
         }
     }
 }
@@ -1457,6 +1489,10 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             require_real_tenant(tenant)
         }
         ControlOp::DeleteAll { tenant } => require_real_tenant(tenant),
+        // Nothing else to check: this op carries no state to be wrong about — it records that
+        // bytes were exported. Whether those bytes *exist* is per-node state, which is the
+        // front's business before it ever submits, not `validate`'s (see this function's doc).
+        ControlOp::DatasetContentRead { tenant, .. } => require_real_tenant(tenant),
         ControlOp::SetEnabled { tenant, .. } => require_real_tenant(tenant),
         ControlOp::PutRoutes { tenant, table } => {
             require_real_tenant(tenant)?;
@@ -2751,7 +2787,8 @@ pub fn precondition_target(op: &ControlOp) -> Option<PreconditionTarget<'_>> {
         // A dataset addresses `sm_datasets`, not `sm_configs` — no imposter row for a
         // precondition to hold against (RFC-005 D1, #285).
         | ControlOp::DatasetPut { .. }
-        | ControlOp::DatasetDelete { .. } => None,
+        | ControlOp::DatasetDelete { .. }
+        | ControlOp::DatasetContentRead { .. } => None,
     }
 }
 

@@ -2079,6 +2079,61 @@ written to the admin API, and a source pull is not an admission — a pulled doc
 refused, naming the port and dataset.
 
 
+### The dataset admin surface (#287)
+
+RFC-005 D3. Five routes, all EE-terminated — there is no upstream endpoint to proxy to:
+
+```text
+POST   /admin/tenants/:id/datasets                    upload a new version
+GET    /admin/tenants/:id/datasets                    list, with a bindings count per dataset
+GET    /admin/tenants/:id/datasets/:name              version history + bindings
+GET    /admin/tenants/:id/datasets/:name/:ver/content the bytes — AUDITED
+DELETE /admin/tenants/:id/datasets/:name              409 while bound
+```
+
+An upload sends the CSV as the body (`text/csv`); its name, key columns and delimiter travel as
+`X-Rift-Dataset-*` headers or query parameters, headers winning. Every field of the stored record
+is derived from the bytes — digest, row count, columns — never taken from the caller, because the
+state machine re-proves the record against the document on every replica anyway.
+
+The response deliberately omits the assigned version. It is allocated at apply, and reporting one
+would mean guessing `latest + 1`, which two concurrent uploads of the same name would both get
+wrong. A number that is right except under concurrency is worse than an absent one, because it is
+exactly the pin a caller would then bind against. The history route has it.
+
+**Roles.** `dataset.read` is a Viewer's; `dataset.write` and `dataset.delete` are an Editor's — a
+new table of rows redefines what every bound stub answers, which is the same line `spec.write` sits
+on. A dataset in another tenant answers **404**, never 403, and the body is byte-identical to a
+dataset that does not exist: a distinguishable refusal would confirm the dataset is there.
+
+### The one audited read
+
+Reads are not audited (RFC-002 §9). `GET …/content` is the single exception, because it is a bulk
+export of whatever the operator uploaded and is routinely PII. The record carries the dataset name,
+the version and the **digest**, so "who exported which bytes" is a log query — a name outlives the
+version it pointed at, so the name alone would not answer it.
+
+Listings and version history are **not** audited. Keeping the exception to exactly one route is
+what keeps it defensible, and it is asserted in both directions.
+
+Three consequences worth knowing:
+
+- **A content read commits a Raft entry.** Audit rows are written inside apply and replicate with
+  everything else, so a trace that must survive a node dying has to be committed, not logged
+  locally. That is a write on the read path — deliberate, and the reason it is confined to this one
+  route.
+- **It fails closed.** The record commits *before* the bytes are served, and a read whose record
+  cannot commit is refused rather than served. Exporting unrecorded is the outcome the exception
+  exists to prevent.
+- **`Idempotency-Key` does not deduplicate it.** Every export is its own event and leaves its own
+  record. A deduplicated second read would return the bytes and record nothing, which is the same
+  failure wearing a retry's clothes.
+
+A dataset whose record is live but whose bytes are missing on the answering node is a `500`, not a
+`404`: the row proves the dataset exists, so absence of the blob is this node's integrity failure,
+not the operator's mistake.
+
+
 ## Clustered flow state (#120)
 
 Under `--cluster`, **every** imposter's flow state (scenarios, `ctx.state`,

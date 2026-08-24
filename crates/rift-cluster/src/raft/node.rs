@@ -1515,6 +1515,24 @@ impl RaftNode {
         self.sm_reader.spool_path(digest)
     }
 
+    /// The CSV bytes behind `digest` (RFC-005 §5, #287), or `None` when this node holds none.
+    pub fn dataset_blob(&self, digest: &str) -> Result<Option<String>, NodeError> {
+        self.sm_reader
+            .dataset_blob(digest)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
+    /// How many live stubs bind each of `tenant`'s datasets, and whether the tally is complete
+    /// (RFC-005 §5, #287). One config-table scan for all names.
+    pub fn dataset_binding_counts(
+        &self,
+        tenant: &str,
+    ) -> Result<(std::collections::HashMap<String, usize>, bool), NodeError> {
+        self.sm_reader
+            .dataset_binding_counts(tenant)
+            .map_err(|e| NodeError::Storage(e.to_string()))
+    }
+
     /// How many distinct dataset documents are currently held, fleet-wide (RFC-005 D1, #285).
     pub fn dataset_blob_count(&self) -> Result<usize, NodeError> {
         self.sm_reader

@@ -719,6 +719,96 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/tenants/{tenantId}/datasets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant record's id. */
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List this tenant's datasets
+         * @description One row per dataset *name* — every version of a name is one table — carrying the latest live version and how many live stubs bind it. A non-zero `bindings` count means a delete will be refused with `409`.
+         *     Not audited. Only the content read is (see that route): keeping the deviation from RFC-002 §9 narrow is what keeps it defensible.
+         *     `Rift-Cluster-Partial: true` means a stored config would not parse, so the binding tally is short — the count is advisory, but a short one would promise a delete that then `409`s, so it is reported rather than hidden.
+         */
+        get: operations["listDatasets"];
+        put?: never;
+        /**
+         * Upload a new version of a dataset
+         * @description The body is the CSV itself (`text/csv`). Its name, key columns and delimiter travel beside it, as `X-Rift-Dataset-*` headers or as query parameters; headers win when both are present.
+         *     Every version of a name is a new version — an upload never mutates a serving stub, because a `_rift.dataset` binding pins the version it resolved (RFC-005 §3.3, issue #286).
+         *     The response deliberately omits the assigned version: it is allocated at apply, and reporting one here would mean guessing `latest + 1`, which two concurrent uploads of the same name would both get wrong. `GET /admin/tenants/{tenantId}/datasets/{datasetName}` has it.
+         *     Bounded by the admin plane's 16 MiB body limit before any quota check runs.
+         */
+        post: operations["uploadDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/tenants/{tenantId}/datasets/{datasetName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant record's id. */
+                tenantId: components["parameters"]["TenantId"];
+                /** @description The dataset's name, unique per tenant. Not percent-decoded by the router, so an escaped separator stays part of the name rather than becoming a path segment. */
+                datasetName: components["parameters"]["DatasetName"];
+            };
+            cookie?: never;
+        };
+        /**
+         * One dataset's version history
+         * @description Every live version, newest first, plus how many live stubs bind the dataset. Not audited.
+         *     A dataset this tenant does not have answers `404` — byte-identical to a cross-tenant probe, so a caller cannot tell "no such dataset" from "not yours" (RFC-002 §8.4).
+         */
+        get: operations["readDatasetHistory"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a dataset
+         * @description Tombstones every live version of the name. **Refused with `409` while any live stub binds it** — a mock never breaks because its data was removed underneath it. That rule is enforced at apply on every replica, not at the front, so a binding committed concurrently with this call still refuses it.
+         */
+        delete: operations["deleteDataset"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/tenants/{tenantId}/datasets/{datasetName}/{version}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant record's id. */
+                tenantId: components["parameters"]["TenantId"];
+                /** @description The dataset's name, unique per tenant. Not percent-decoded by the router, so an escaped separator stays part of the name rather than becoming a path segment. */
+                datasetName: components["parameters"]["DatasetName"];
+                /** @description A concrete version. A non-numeric value is `404`, never coerced. */
+                version: number;
+            };
+            cookie?: never;
+        };
+        /**
+         * Download a dataset version's bytes
+         * @description **The one audited read.** RFC-002 §9 says reads are not audited; this is its single named exception, because these bytes are a bulk export of whatever the operator uploaded and are routinely PII. The audit record carries the dataset name, the version and the digest, so "who exported which bytes" is a log query (§8.3). Listings and version history are *not* audited — the exception is deliberately this route alone.
+         *     The record commits before the bytes are served, and a read whose record cannot commit is refused rather than served: exporting unrecorded is the outcome this exception exists to prevent.
+         */
+        get: operations["readDatasetContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/tenants/{tenantId}/principals": {
         parameters: {
             query?: never;
@@ -2361,6 +2451,8 @@ export interface components {
         Port: number;
         /** @description The tenant record's id. */
         TenantId: string;
+        /** @description The dataset's name, unique per tenant. Not percent-decoded by the router, so an escaped separator stays part of the name rather than becoming a path segment. */
+        DatasetName: string;
         /** @description A principal's id (derived from its credential, e.g. key:<sha256-prefix>). */
         PrincipalId: string;
         /** @description A correlated-isolation space's flow id. */
@@ -4585,6 +4677,224 @@ export interface operations {
             500: components["responses"]["InternalError"];
             503: components["responses"]["Unavailable"];
             504: components["responses"]["WriteTimeout"];
+        };
+    };
+    listDatasets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant record's id. */
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tenant's datasets. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name: string;
+                        /** Format: int64 */
+                        latestVersion: number;
+                        /** Format: int64 */
+                        rows: number;
+                        /** Format: int64 */
+                        bytes: number;
+                        /** @description Live stubs binding this dataset. Non-zero blocks a delete. */
+                        bindings: number;
+                    }[];
+                };
+            };
+            403: components["responses"]["Forbidden"];
+            /** @description No such dataset, or the caller is not bound to the tenant named — the two are deliberately indistinguishable (RFC-002 §8.4), body included, so this cannot be used to discover whether a dataset exists in another tenant. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    uploadDataset: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+                /** @description The dataset's name. Or `?name=`. */
+                "X-Rift-Dataset-Name"?: string;
+                /** @description Comma-separated columns a lookup may key on. Or `?keyColumns=`. Each must be unique across rows — validated before the upload commits. */
+                "X-Rift-Dataset-Key-Columns"?: string;
+                /** @description Exactly one character. Or `?delimiter=`. */
+                "X-Rift-Dataset-Delimiter"?: string;
+            };
+            path: {
+                /** @description The tenant record's id. */
+                tenantId: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "text/csv": string;
+            };
+        };
+        responses: {
+            /** @description Committed; the bytes are on every node. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name: string;
+                        /** @description sha256 of the exact bytes uploaded. */
+                        digest: string;
+                        /** Format: int64 */
+                        rows: number;
+                    };
+                };
+            };
+            /** @description The record did not describe the document — a duplicate key, a key column not in the header, an unsplittable delimiter — or a quota was exceeded. The body names which. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            /** @description No such dataset, or the caller is not bound to the tenant named — the two are deliberately indistinguishable (RFC-002 §8.4), body included, so this cannot be used to discover whether a dataset exists in another tenant. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The CSV exceeded the admin plane's body limit. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    readDatasetHistory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant record's id. */
+                tenantId: components["parameters"]["TenantId"];
+                /** @description The dataset's name, unique per tenant. Not percent-decoded by the router, so an escaped separator stays part of the name rather than becoming a path segment. */
+                datasetName: components["parameters"]["DatasetName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The dataset's versions. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name: string;
+                        bindings: number;
+                        versions: Record<string, never>[];
+                    };
+                };
+            };
+            403: components["responses"]["Forbidden"];
+            /** @description No such dataset, or the caller is not bound to the tenant named — the two are deliberately indistinguishable (RFC-002 §8.4), body included, so this cannot be used to discover whether a dataset exists in another tenant. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    deleteDataset: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description RFC-006 §5.3/§9.2 CSRF defense: a cookie-authenticated state-changing request (anything that would mutate state, sent with the `rift_session` cookie rather than an `Authorization` bearer) that omits this header is refused with `403`, checked before authorization runs. Send any non-empty value — `SameSite=Strict` already stops the cookie riding cross-site, so this header exists only to defeat the narrower case (a same-site-adjacent or misconfigured-CORS request) by requiring a custom header cross-origin HTML cannot attach without a preflight. Bearer-authenticated requests are exempt: a bearer cannot be attached to a request by a victim's browser in the first place, which is the entire attack this header defends against — so requiring it there would add friction without closing a real hole. */
+                "X-Rift-CSRF"?: components["parameters"]["CsrfHeader"];
+            };
+            path: {
+                /** @description The tenant record's id. */
+                tenantId: components["parameters"]["TenantId"];
+                /** @description The dataset's name, unique per tenant. Not percent-decoded by the router, so an escaped separator stays part of the name rather than becoming a path segment. */
+                datasetName: components["parameters"]["DatasetName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            403: components["responses"]["Forbidden"];
+            /** @description No such dataset, or the caller is not bound to the tenant named — the two are deliberately indistinguishable (RFC-002 §8.4), body included, so this cannot be used to discover whether a dataset exists in another tenant. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A live stub still binds this dataset. The body names the port. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    readDatasetContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant record's id. */
+                tenantId: components["parameters"]["TenantId"];
+                /** @description The dataset's name, unique per tenant. Not percent-decoded by the router, so an escaped separator stays part of the name rather than becoming a path segment. */
+                datasetName: components["parameters"]["DatasetName"];
+                /** @description A concrete version. A non-numeric value is `404`, never coerced. */
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The CSV, exactly as uploaded. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/csv": string;
+                };
+            };
+            403: components["responses"]["Forbidden"];
+            /** @description No such dataset, or the caller is not bound to the tenant named — the two are deliberately indistinguishable (RFC-002 §8.4), body included, so this cannot be used to discover whether a dataset exists in another tenant. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listPrincipals: {

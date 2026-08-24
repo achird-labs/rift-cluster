@@ -5600,6 +5600,40 @@ async fn terminate_tenancy(
         );
     }
 
+    // An audited export must never be deduplicated (issue #287). `base_op_id` derives the op id
+    // from `Idempotency-Key`, and a replayed op id short-circuits in the state machine *above* the
+    // audit write — so a second keyed request would serve the bytes again and record nothing.
+    // Dedup keys on the op id alone, never on the op's content, so the replay need not even name
+    // the same dataset: one recorded read would buy `DEDUP_TTL_SECS` (24h) of unrecorded exports
+    // of everything the caller can reach.
+    //
+    // A fresh id per request instead of refusing the header: a read has no state to make
+    // idempotent, so there is no retry semantics worth preserving, and each export genuinely is a
+    // separate event that has to leave its own trace. Recording twice is harmless; recording once
+    // for two exports is the failure this op exists to prevent.
+    let is_audited_export = matches!(route, tenancy::Route::DatasetContent(..));
+
+    // Parsed here, where both the headers and the query are in hand — `classify` sees only the
+    // path and query, and `dispatch` sees neither.
+    let upload = if matches!(route, tenancy::Route::DatasetUpload(_)) {
+        match tenancy::DatasetUploadMeta::parse(
+            |name| {
+                req.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            },
+            req.uri().query(),
+        ) {
+            Ok(meta) => Some(meta),
+            Err(reason) => {
+                return typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, &reason);
+            }
+        }
+    } else {
+        None
+    };
+
     let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
         .collect()
         .await
@@ -5620,6 +5654,7 @@ async fn terminate_tenancy(
         &body,
         authorized_tenant,
         bindings,
+        upload,
         state.export_status.as_deref(),
         &state.flow_net,
     )
@@ -5636,7 +5671,7 @@ async fn terminate_tenancy(
         Err(tenancy::TenancyError::Storage(reason)) => return internal(&reason),
     };
 
-    let (op, status, rendered) = match outcome {
+    let (op, status, rendered, rendered_content_type) = match outcome {
         tenancy::Outcome::Body {
             status,
             body,
@@ -5649,7 +5684,12 @@ async fn terminate_tenancy(
             }
             return response;
         }
-        tenancy::Outcome::Commit { op, status, then } => (op, status, then),
+        tenancy::Outcome::Commit {
+            op,
+            status,
+            then,
+            then_content_type,
+        } => (op, status, then, then_content_type),
     };
 
     // The same order every write on this front follows (R4): validate, park
@@ -5658,7 +5698,11 @@ async fn terminate_tenancy(
     if let Err(reason) = control::validate(&op) {
         return refusal_response(&reason);
     }
-    let op_id = base_op_id(idempotency.as_deref());
+    let op_id = if is_audited_export {
+        uuid::Uuid::new_v4()
+    } else {
+        base_op_id(idempotency.as_deref())
+    };
     let request = tenancy::mint_request(op, principal_id, op_id);
     if let Err(e) = node.park_intent(&request) {
         return typed_error(
@@ -5739,6 +5783,8 @@ async fn terminate_tenancy(
     // fail on a response that succeeded.
     let content_type = if body.is_empty() {
         None
+    } else if let Some(declared) = rendered_content_type {
+        HeaderValue::from_static(declared).into()
     } else {
         json_content_type()
     };
@@ -7607,10 +7653,24 @@ fn refusal_response(reason: &str) -> Response<FrontBody> {
         || reason.starts_with("no spec ")
     {
         typed_error(StatusCode::NOT_FOUND, ErrorKind::NoSuchResource, reason)
+    } else if reason.contains("cannot tell whether dataset") {
+        // `ports_binding_dataset` fails closed when a stored config will not parse (RFC-005 §5).
+        // That is this node's storage being corrupt, not the caller's request being wrong, and
+        // `400 bad data` would send an operator to inspect a payload that is fine.
+        typed_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorKind::InternalError,
+            reason,
+        )
     } else if reason.contains("is bound to port(s)") {
         // The state machine's own `SpecDelete` refusal (issue #278) — the front pre-checks the
         // same condition and answers `409`, so a delete that loses the race against a deploy
         // must render the same status, not a `400` that names the identical fact differently.
+        //
+        // `DatasetDelete` (RFC-005 §5, issue #287) refuses in the same words deliberately, so
+        // this one rule covers both. It has no front-side pre-check at all — the binding can be
+        // committed concurrently with the delete, so only the apply-time refusal is authoritative
+        // and this is the only place its status is decided.
         typed_error(StatusCode::CONFLICT, ErrorKind::ResourceConflict, reason)
     } else {
         typed_error(StatusCode::BAD_REQUEST, ErrorKind::BadData, reason)

@@ -86,6 +86,13 @@ pub enum Action {
     SpecWrite,
     /// `DELETE /specs/{id}`.
     SpecDelete,
+    /// Read a dataset's listing, its version history, or its bytes (RFC-005 §5, #287).
+    DatasetRead,
+    /// Upload a new version of a dataset. Editor-tier: a new table of rows redefines what every
+    /// stub bound to that dataset answers.
+    DatasetWrite,
+    /// Delete a dataset. Editor-tier for the same reason, and refused outright while bound.
+    DatasetDelete,
 }
 
 impl Action {
@@ -94,7 +101,7 @@ impl Action {
     ///
     /// Kept beside the enum so the two cannot drift: `every_action_is_listed`
     /// fails if a variant is added without extending this.
-    pub const ALL: [Action; 24] = [
+    pub const ALL: [Action; 27] = [
         Action::ImposterRead,
         Action::ImposterWrite,
         Action::ImposterDelete,
@@ -119,6 +126,9 @@ impl Action {
         Action::SpecRead,
         Action::SpecWrite,
         Action::SpecDelete,
+        Action::DatasetRead,
+        Action::DatasetWrite,
+        Action::DatasetDelete,
     ];
 
     /// A stable string for audit records and logs (#163 consumes these).
@@ -149,6 +159,15 @@ impl Action {
             Action::SpecRead => "spec.read",
             Action::SpecWrite => "spec.write",
             Action::SpecDelete => "spec.delete",
+            // `write`, not `put`, and not by accident: an action's RBAC string and its audit
+            // string are one namespace, and #285 already ships
+            // `ControlOp::DatasetPut.audit_action() == "dataset.write"`. Issue #287's prose asks
+            // for `"dataset.put"`, which would make this the only action in the system that
+            // disagrees with its own audit string — on the resource whose whole point here is
+            // that access to it be answerable as a log query.
+            Action::DatasetRead => "dataset.read",
+            Action::DatasetWrite => "dataset.write",
+            Action::DatasetDelete => "dataset.delete",
         }
     }
 }
@@ -195,6 +214,11 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                 // Reading a spec (listing, fetching, or dry-run compiling it) is the same power as
                 // reading the imposter it describes — a Viewer may see what a mock was built from.
                 | Action::SpecRead
+                // RFC-005 §5 (issue #287): a dataset is the table of rows a bound stub serves, so
+                // reading one is the same power as reading the stub it feeds. Note this covers the
+                // *content* read too — which is a bulk export, and is why that one read is the
+                // single named exception to reads-are-not-audited (RFC-002 §9).
+                | Action::DatasetRead
         ),
         Role::Operator => {
             role_allows(Role::Viewer, action)
@@ -225,6 +249,12 @@ pub fn role_allows(role: Role, action: Action) -> bool {
                         // here).
                         | Action::SpecWrite
                         | Action::SpecDelete
+                        // RFC-005 §5 (issue #287): a dataset is the table of rows a bound stub
+                        // serves, so replacing or removing one redefines what that stub answers —
+                        // the same Operator/Editor line `SpecWrite` sits on. Reading one is a
+                        // Viewer's business.
+                        | Action::DatasetWrite
+                        | Action::DatasetDelete
                 )
         }
         Role::TenantAdmin => {
@@ -355,9 +385,9 @@ mod tests {
     fn every_action_is_listed_in_all() {
         assert_eq!(
             Action::ALL.len(),
-            24,
-            "RFC-002 §4.1 defines 21 actions and RFC-004 §4.3 adds three (issue #278); ALL must \
-             carry every one"
+            27,
+            "RFC-002 §4.1 defines 21 actions, RFC-004 §4.3 adds three (issue #278) and RFC-005 §5 \
+             adds three more (issue #287); ALL must carry every one"
         );
         let unique: std::collections::BTreeSet<_> = Action::ALL.iter().collect();
         assert_eq!(unique.len(), Action::ALL.len(), "ALL contains a duplicate");
@@ -392,6 +422,7 @@ mod tests {
             Action::FlowStateRead,
             Action::SourceRead,
             Action::SpecRead,
+            Action::DatasetRead,
             Action::StreamSubscribe,
         ];
         let operator_adds = [
@@ -415,6 +446,8 @@ mod tests {
             // `ImposterWrite` on the target port (checked in the front, not here).
             Action::SpecWrite,
             Action::SpecDelete,
+            Action::DatasetWrite,
+            Action::DatasetDelete,
         ];
         let tenant_admin_adds = [Action::TenantManage, Action::AuditRead];
 
@@ -670,5 +703,76 @@ mod tests {
         // In its own tenant it still behaves as the role says, which is the
         // conservative reading: the row is malformed, not a reason to panic.
         assert!(decide(&bogus, Action::ImposterWrite, &tenant("acme")).is_allowed());
+    }
+
+    /// The three dataset actions sit on the read/disturb/redefine ladder where #287 puts them.
+    ///
+    /// Asserted per-role rather than through the big matrix so the *reason* survives: a dataset is
+    /// a table of rows that stubs serve, so reading one is a Viewer's business, and replacing or
+    /// removing one redefines what every bound stub answers — an Editor's.
+    #[test]
+    fn a_viewer_reads_datasets_but_only_an_editor_redefines_them() {
+        assert!(role_allows(Role::Viewer, Action::DatasetRead));
+        assert!(!role_allows(Role::Viewer, Action::DatasetWrite));
+        assert!(!role_allows(Role::Viewer, Action::DatasetDelete));
+
+        for action in [
+            Action::DatasetRead,
+            Action::DatasetWrite,
+            Action::DatasetDelete,
+        ] {
+            assert!(role_allows(Role::Editor, action), "{action:?}");
+        }
+    }
+
+    /// An action's RBAC string and its audit string are **one namespace**, and the verb is `write`.
+    ///
+    /// Every other resource holds this: `Action::SpecWrite` is `"spec.write"` and
+    /// `ControlOp::SpecPut`/`SpecBind`/`SpecUnbind` all audit as `"spec.write"`. #285 already ships
+    /// `ControlOp::DatasetPut.audit_action() == "dataset.write"`, so an `Action` spelled
+    /// `"dataset.put"` — as issue #287's prose asks for — would be the only action in the system
+    /// that disagrees with its own audit string, for the very resource whose point is that access
+    /// to it be answerable as a log query.
+    #[test]
+    fn dataset_action_strings_match_the_audit_namespace() {
+        assert_eq!(Action::DatasetRead.as_str(), "dataset.read");
+        assert_eq!(Action::DatasetWrite.as_str(), "dataset.write");
+        assert_eq!(Action::DatasetDelete.as_str(), "dataset.delete");
+
+        assert_eq!(
+            Action::DatasetWrite.as_str(),
+            rift_cluster::ControlOp::DatasetPut {
+                tenant: rift_cluster::TenantId::default(),
+                record: dataset_record(),
+                csv: "id\n1\n".to_owned(),
+            }
+            .audit_action()
+            .expect("a dataset write is audited"),
+            "the RBAC action and the audit action for the same operation must be the same string"
+        );
+    }
+
+    fn dataset_record() -> rift_cluster::control::DatasetRecord {
+        rift_cluster::control::DatasetRecord {
+            name: "customers".to_owned(),
+            digest: rift_cluster::control::Digest::new("0".repeat(64)),
+            key_columns: vec!["id".to_owned()],
+            delimiter: ',',
+            columns: vec!["id".to_owned()],
+            rows: 1,
+            bytes: 5,
+        }
+    }
+
+    /// All three join `Action::ALL`, which is what makes the role matrix exhaustive.
+    #[test]
+    fn every_dataset_action_is_in_action_all() {
+        for action in [
+            Action::DatasetRead,
+            Action::DatasetWrite,
+            Action::DatasetDelete,
+        ] {
+            assert!(Action::ALL.contains(&action), "{action:?} missing from ALL");
+        }
     }
 }
