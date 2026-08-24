@@ -3496,6 +3496,33 @@ mod tests {
         );
     }
 
+    /// #411 pins the timers the single-flight fix deliberately did NOT change.
+    ///
+    /// The rejected fix for #411 was to raise `heartbeat_interval` so a big
+    /// entry fits one round trip. That would have forced `election_timeout_min`
+    /// above it and stretched elections (and the isolated-owner window, which is
+    /// `3 x election_max`) by an order of magnitude — trading failover latency
+    /// for upload size, against ADR-001's "~1-3 s" elections. The fix went into
+    /// the network adapter instead, so these three numbers must stay put; if a
+    /// later change moves them, that trade is being made silently.
+    #[test]
+    fn raft_config_pins_the_replication_timers() {
+        let config = RaftNode::raft_config(None).expect("default config validates");
+        assert_eq!(
+            config.heartbeat_interval, 50,
+            "heartbeat_interval is openraft's AppendEntries RPC ceiling; #411 is fixed in the \
+             network adapter precisely so this does not have to move"
+        );
+        assert_eq!(
+            config.election_timeout_min, 150,
+            "election_timeout_min must stay 3x the heartbeat"
+        );
+        assert_eq!(
+            config.election_timeout_max, 300,
+            "election_timeout_max must stay 6x the heartbeat; the isolated-owner window is 3x it"
+        );
+    }
+
     /// Issue #183 AC1: with no knob set, the openraft config is byte-identical to what it was
     /// before the knob existed.
     ///

@@ -205,10 +205,19 @@ refused with a 400 naming the row and value — never accepted-but-broken.
 > apply from log order and the replicated clock, not sent by the client, so the
 > op's record is the declared-and-verifiable half of §3.1's struct only.
 > **§11's "openraft/redb are comfortable with quota-ceiling log entries" is
-> answered, and the answer is no** (#411): openraft 0.9 bounds AppendEntries by
-> `heartbeat_interval` (50 ms), so an entry above roughly 512 KiB does not
-> commit today. The 8 MiB restart test ships `#[ignore]`d against #411; the
-> restart/repair proof runs at 128 KiB.
+> answered, and the answer is now yes** (#411). It was no: openraft 0.9 bounds
+> each AppendEntries RPC by `heartbeat_interval` (50 ms) and drops the future
+> when that fires, so an entry above roughly 512 KiB restarted from byte 0
+> forever and never committed. The fix single-flights the transfer in the
+> network adapter — it outlives the RPC deadline and a re-send attaches to it
+> instead of restarting it — so a quota-ceiling entry commits in
+> `O(size / link speed)` with the timers untouched. A 4 MiB entry commits on a
+> 3-node fleet in CI; 8 MiB commits in ~9.4 s on an unloaded host.
+> **One caveat remains, and it is not about the transfer:** on a
+> CPU-constrained host a large entry can still trip #430, where an empty log read
+> panics openraft's replication worker and the leader loses its streams. The
+> 8 MiB restart test stays `#[ignore]`d against that issue, not against #411.
+> See `docs/architecture/09-durability-failure.md`.
 
 **Decision: dataset bytes are committed through the Raft log and materialized
 to a per-node spool file at apply time.** No blob sidecar, no fetch protocol,
