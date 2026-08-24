@@ -102,6 +102,8 @@ async fn spawn_with_snapshot_policy(
 /// A running in-process cluster.
 struct TestCluster {
     members: Vec<Member>,
+    /// Retained so `restart` brings a node back with the same snapshot policy.
+    snapshot_log_entries: Option<u64>,
     /// Retained so `restart` brings a node back with the same retention it was
     /// started with. A node that silently reverted to the 30-day default on
     /// restart would look like a GC bug rather than a harness bug.
@@ -118,6 +120,20 @@ impl TestCluster {
     /// [`Self::start`] with an explicit audit retention window, for the tests
     /// that need GC to actually run within a test's lifetime.
     async fn start_with_audit_retention(n: usize, audit_retention_secs: u64) -> Self {
+        Self::start_full(n, audit_retention_secs, None).await
+    }
+
+    /// [`Self::start`] with every node snapshotting every `entries` log entries and purging to
+    /// the tip, so a member that falls behind must be caught up by `install_snapshot`.
+    async fn start_with_snapshots(n: usize, entries: u64) -> Self {
+        Self::start_full(n, rift_cluster::DEFAULT_AUDIT_RETENTION_SECS, Some(entries)).await
+    }
+
+    async fn start_full(
+        n: usize,
+        audit_retention_secs: u64,
+        snapshot_log_entries: Option<u64>,
+    ) -> Self {
         assert!(n >= 1, "a cluster needs at least one node");
         let mut members: Vec<Member> = reserve_ports(n)
             .into_iter()
@@ -130,11 +146,12 @@ impl TestCluster {
             })
             .collect();
 
-        let n1 = spawn(
+        let n1 = spawn_with_snapshot_policy(
             members[0].id,
             members[0].addr,
             members[0].dir.path(),
             audit_retention_secs,
+            snapshot_log_entries,
         )
         .await;
         n1.cluster_init().await.expect("bootstrap node 1");
@@ -142,11 +159,12 @@ impl TestCluster {
 
         let seed = Authority::from(members[0].addr);
         for member in members.iter_mut().skip(1) {
-            let node = spawn(
+            let node = spawn_with_snapshot_policy(
                 member.id,
                 member.addr,
                 member.dir.path(),
                 audit_retention_secs,
+                snapshot_log_entries,
             )
             .await;
             node.join_via(&seed)
@@ -157,6 +175,7 @@ impl TestCluster {
 
         let cluster = Self {
             members,
+            snapshot_log_entries,
             audit_retention_secs,
         };
         let all: BTreeSet<NodeId> = cluster.members.iter().map(|m| m.id).collect();
@@ -305,7 +324,14 @@ impl TestCluster {
         // Ensure the previous instance is gone before rebinding the port.
         self.kill(id).await;
         let dir = self.member(id).dir.path().to_path_buf();
-        let node = spawn(mid, addr, &dir, self.audit_retention_secs).await;
+        let node = spawn_with_snapshot_policy(
+            mid,
+            addr,
+            &dir,
+            self.audit_retention_secs,
+            self.snapshot_log_entries,
+        )
+        .await;
         self.member_mut(id).node = Some(node);
     }
 
@@ -3286,6 +3312,117 @@ async fn a_leadership_change_under_load_never_panics_a_replication_worker() {
     );
 }
 
+/// #431's acceptance test: a voter that restarts *behind a purged log* is caught up by snapshot,
+/// and its term never runs ahead of the leader's while that happens.
+///
+/// Nodes 1+2 keep committing while the victim is down; every node snapshots every 2 entries and
+/// purges to the tip, so by the time the victim returns the entries it needs no longer exist
+/// anywhere. Before the fix this livelocked — the victim's term climbed 3 → 66 over 58 s while
+/// the leader sat at term 1 — for reasons that only showed under instrumentation: the leader's
+/// own health tracker refused to heartbeat the restarted peer for its cooldown, the voter timed
+/// out and campaigned, and a leader never adopts a term from a candidate it rejects. The term
+/// assertion is the one that pins the mechanism; convergence alone would pass by accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_voter_behind_a_purged_log_catches_up_by_snapshot() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start_with_snapshots(3, 2).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let victim: NodeId = if leader_id == 3 { 2 } else { 3 };
+
+    let csv = big_csv(512 * 1024);
+    let r = cluster
+        .leader()
+        .expect("leader")
+        .submit(dataset_put("d0", &csv))
+        .await
+        .expect("d0");
+    assert_eq!(r.outcome, rift_cluster::ControlOutcome::Applied);
+    cluster.kill(victim).await;
+
+    for i in 1..=8 {
+        let r = cluster
+            .leader()
+            .expect("leader")
+            .submit(dataset_put(&format!("d{i}"), &csv))
+            .await
+            .expect("commit while the victim is down");
+        assert_eq!(r.outcome, rift_cluster::ControlOutcome::Applied);
+    }
+
+    cluster.restart(victim).await;
+    let start = std::time::Instant::now();
+    let mut converged = None;
+    while start.elapsed() < Duration::from_secs(60) {
+        let leader = cluster.leader();
+        let v = cluster.member(victim).node.as_ref().expect("live");
+        if let Some(l) = leader {
+            assert!(
+                v.raft_term() <= l.raft_term(),
+                "the restarted voter's term ({}) ran ahead of the leader's ({}): it campaigned",
+                v.raft_term(),
+                l.raft_term()
+            );
+        }
+        let target = leader.and_then(|l| l.status().last_applied);
+        let mine = v.status().last_applied;
+        if target.is_some() && mine >= target {
+            converged = Some(start.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let st = cluster.member(victim).node.as_ref().expect("live").status();
+    cluster.shutdown_all().await;
+    assert!(
+        converged.is_some(),
+        "the restarted voter must be caught up by snapshot; stuck at {:?}",
+        st.last_applied
+    );
+}
+
+/// #431's restart grace: a member of a multi-voter cluster that comes back and hears no leader
+/// holds off campaigning for `RESTART_ELECTION_GRACE`, then campaigns normally — so a restart
+/// never bumps the term of a healthy fleet, and a genuinely leaderless one is still recovered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarting_member_holds_elections_until_it_hears_a_leader_or_the_grace_expires() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    // No leader can exist: two of three voters are gone. Node 3 is still a
+    // plain running voter while they go down and campaigns freely — that is
+    // normal and not what this test is about. The grace governs the process
+    // that comes back, so the baseline is its term immediately after restart.
+    cluster.kill(1).await;
+    cluster.kill(2).await;
+    cluster.restart(3).await;
+    let term_before = cluster.member(3).node.as_ref().expect("live").raft_term();
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let during_grace = cluster.member(3).node.as_ref().expect("live").raft_term();
+    assert_eq!(
+        during_grace, term_before,
+        "a restarting member must not campaign inside the grace even with no leader audible"
+    );
+
+    tokio::time::sleep(
+        rift_cluster::RaftNode::RESTART_ELECTION_GRACE + Duration::from_millis(1500),
+    )
+    .await;
+    let after_grace = cluster.member(3).node.as_ref().expect("live").raft_term();
+    cluster.shutdown_all().await;
+    assert!(
+        after_grace > term_before,
+        "once the grace expires a leaderless member must campaign (term {after_grace} vs {term_before})"
+    );
+}
+
 /// #411's other shipped ceiling: a spec document at the RFC-004 S2 maximum (4 MiB, #278) is one
 /// log entry and must commit on a real 3-node cluster.
 ///
@@ -3747,5 +3884,66 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
         leaders_seen,
         BTreeSet::from([1]),
         "leadership must not move while a joiner installs its snapshot"
+    );
+}
+
+/// The chaos suite's C5 first roll, in-process: the departing leader stays
+/// alive after `leave` returns — the container's drain window — and the
+/// survivors must elect a successor promptly *during* that window, because
+/// C5's first post-leave write is asserted with no retry.
+///
+/// This caught the liveness ticker speaking past step-down: openraft keeps an
+/// ex-leader's idle replication clients, the ticker filled the drain's silence
+/// with the old (still highest) vote, every survivor's leader lease stayed
+/// fresh, and no election happened while the process lived. The ticker now
+/// falls silent when the node stops leading; this pins the handover itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn survivors_elect_while_the_departed_leader_still_runs() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    // Leave WITHOUT shutting the process down: this is the drain window.
+    cluster
+        .member(leader)
+        .node
+        .as_ref()
+        .expect("running")
+        .leave(Duration::from_secs(5))
+        .await
+        .expect("the leader must be able to leave gracefully");
+
+    let t0 = tokio::time::Instant::now();
+    let survivors: Vec<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != leader)
+        .collect();
+    let handover = loop {
+        let elected = survivors.iter().any(|&id| {
+            let s = cluster.member(id).node.as_ref().expect("running").status();
+            s.current_leader.is_some() && s.current_leader != Some(leader)
+        });
+        if elected {
+            break t0.elapsed();
+        }
+        if t0.elapsed() > Duration::from_secs(8) {
+            cluster.shutdown_all().await;
+            panic!(
+                "survivors never elected while the departed leader's process was \
+                 still alive — the C5 graceful-leave handover is broken"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    eprintln!("handover took {handover:?}");
+    cluster.shutdown_all().await;
+    assert!(
+        handover < Duration::from_millis(2000),
+        "handover took {handover:?}; the first post-leave write races this"
     );
 }

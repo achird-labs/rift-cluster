@@ -114,16 +114,39 @@ pub(crate) struct LeaveRequest {
 /// before the `Raft` exists; the node sets it once, after construction.
 pub(crate) type RaftSlot = Arc<OnceCell<Raft<TypeConfig>>>;
 
+/// How a [`PeerClient`] ticker asks "does this node lead *right now*?".
+///
+/// A live observation, not a cached mark: the production probe reads the
+/// node's metrics watch at the moment of the decision (`state == Leader`), so
+/// there is no updater task whose scheduling lag could leave a stale `true`
+/// behind after a step-down — under load, exactly when it would matter.
+/// During a snapshot-starvation window the reading may be stale in the other
+/// direction, and that is correct: a starved core cannot have stepped down,
+/// because it is the starved thing.
+pub(crate) type LeadingProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// The sending side: builds a per-target client over one pooled [`RpcClient`].
 #[derive(Clone)]
 pub(crate) struct RpcNetwork {
     client: RpcClient,
     resolver: Arc<dyn PeerResolver>,
+    /// Whether the node this factory belongs to leads at the moment asked.
+    /// Every [`PeerClient`] ticker consults it before probing; see the field
+    /// on [`PeerClient`] for why.
+    leading: LeadingProbe,
 }
 
 impl RpcNetwork {
-    pub(crate) fn new(client: RpcClient, resolver: Arc<dyn PeerResolver>) -> Self {
-        Self { client, resolver }
+    pub(crate) fn new(
+        client: RpcClient,
+        resolver: Arc<dyn PeerResolver>,
+        leading: LeadingProbe,
+    ) -> Self {
+        Self {
+            client,
+            resolver,
+            leading,
+        }
     }
 }
 
@@ -131,14 +154,19 @@ impl RaftNetworkFactory<TypeConfig> for RpcNetwork {
     type Network = PeerClient;
 
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
-        PeerClient {
+        let mut peer = PeerClient {
             client: self.client.clone(),
             target,
             addr: node.addr.clone(),
             resolver: Arc::clone(&self.resolver),
             inflight: None,
             probe_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
+            liveness: Arc::new(std::sync::Mutex::new(PeerLiveness::default())),
+            leading: Arc::clone(&self.leading),
+            ticker: None,
+        };
+        peer.ticker = Some(peer.spawn_liveness_ticker());
+        peer
     }
 }
 
@@ -165,7 +193,42 @@ pub(crate) struct PeerClient {
     /// kill the very transfer it exists to protect. One probe at a time keeps
     /// failures accruing at the probe's timeout rate, like any other call.
     probe_inflight: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the liveness ticker: the leader's last-seen vote and when
+    /// openraft last sent this peer anything. See [`PeerClient::spawn_liveness_ticker`].
+    liveness: Arc<std::sync::Mutex<PeerLiveness>>,
+    /// Whether this node currently leads. A probe asserts "your leader is
+    /// alive", which is only true while we lead. openraft does not drop an
+    /// ex-leader's idle replication clients promptly, so without this gate a
+    /// gracefully departed (or deposed) leader's tickers keep speaking its
+    /// old — still highest — vote, every follower's leader lease stays fresh,
+    /// and the election the fleet needs is postponed for as long as the
+    /// process lives. That is exactly the C5 rolling-restart outage: the
+    /// handover is supposed to complete during the drain, and the drain is
+    /// precisely when openraft is silent and the ticker would speak.
+    leading: LeadingProbe,
+    ticker: Option<tokio::task::JoinHandle<()>>,
 }
+
+#[derive(Default)]
+struct PeerLiveness {
+    vote: Option<Vote<NodeId>>,
+    last_sent: Option<std::time::Instant>,
+}
+
+impl Drop for PeerClient {
+    fn drop(&mut self) {
+        // openraft drops the client when it stops replicating to this peer
+        // (leader change, membership change); the ticker must not outlive it.
+        if let Some(ticker) = self.ticker.take() {
+            ticker.abort();
+        }
+    }
+}
+
+/// How long a follower may go without hearing from this leader before the
+/// ticker speaks for openraft — the same cadence as `heartbeat_interval`, so a
+/// follower sees no difference between openraft's heartbeat and the ticker's.
+const LIVENESS_TICK: Duration = Duration::from_millis(50);
 
 /// What an in-flight AppendEntries transfer resolves to.
 type AppendOutcome =
@@ -330,79 +393,89 @@ impl PeerClient {
         })
     }
 
-    /// Ping the follower so its election timer resets while a large transfer is
-    /// still crossing the link.
-    ///
-    /// openraft does **not** send empty heartbeats to a peer that has entries
-    /// pending: `send_log_entries` builds its range from `matching`, so a
-    /// heartbeat tick for a follower missing a big entry re-sends *that entry*
-    /// rather than an empty probe. Measured over a whole 3-node run replicating
-    /// an 8 MiB dataset: 114 AppendEntries calls, **zero** with an empty range.
-    ///
-    /// The consequence is not about the transfer at all. The follower hears
-    /// nothing for the seconds the body takes to arrive, its election timeout
-    /// (150-300 ms) fires, and the term churn that follows is what kept the
-    /// entry from committing even after the transfer itself was made to survive
-    /// openraft's 50 ms RPC deadline. Fixing the transfer alone took the fleet
-    /// from "1 MiB never commits" to "6 MiB commits, 8 MiB still loses the
-    /// leader".
-    ///
-    /// So the adapter sends the probe openraft would otherwise have sent: an
-    /// empty AppendEntries on the in-flight transfer's own base. That is exactly
-    /// a Raft heartbeat — same vote, a `prev_log_id` the follower already has,
-    /// no entries — so it is idempotent and cannot move `matching`. openraft
-    /// re-drives this path about every 50 ms while the transfer runs, which is
-    /// precisely the heartbeat cadence the timers expect.
-    ///
-    /// Fire-and-forget: its reply carries nothing the awaited transfer will not
-    /// deliver, and a failed ping is not itself news. It gets its own connection
-    /// rather than queueing behind the in-flight body, because the pool hands
-    /// out a new one when the existing connection is checked out.
-    fn send_transfer_keepalive(&self, rpc: &AppendEntriesRequest<TypeConfig>) {
-        let probe = AppendEntriesRequest::<TypeConfig> {
-            vote: rpc.vote,
-            prev_log_id: rpc.prev_log_id,
-            entries: Vec::new(),
-            leader_commit: rpc.leader_commit,
-        };
-        let Ok(body) = serde_json::to_vec(&probe) else {
-            // An empty AppendEntries that will not serialize is a defect in
-            // openraft's own types, not a peer problem; the transfer's result is
-            // still authoritative, so there is nothing useful to report here.
-            return;
-        };
-
-        // At most one probe in flight per peer — see `probe_inflight`.
-        use std::sync::atomic::Ordering;
-        if self
-            .probe_inflight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
+    /// Record that openraft just sent this peer an RPC carrying `vote`, so the
+    /// liveness ticker stays quiet while openraft is doing the talking.
+    fn note_sent(&self, vote: Vote<NodeId>) {
+        if let Ok(mut l) = self.liveness.lock() {
+            l.vote = Some(vote);
+            l.last_sent = Some(std::time::Instant::now());
         }
+    }
 
+    /// A per-peer heartbeat that fills every silent window openraft opens.
+    ///
+    /// A follower's election timer is refreshed only by an AppendEntries that
+    /// reaches its engine. openraft 0.9 sends a follower nothing else while a
+    /// large entry is in flight (a heartbeat tick to a lagging follower re-sends
+    /// the entry — measured: 114 calls in a 3-node 8 MiB run, none empty), and
+    /// nothing at all from the moment it decides to snapshot, through fetching
+    /// and parsing the snapshot, through every chunk. Any such window longer
+    /// than `election_timeout_min` makes a voter campaign, and once its term
+    /// has moved the leader — which rejects a candidate without adopting its
+    /// term — never reconciles with it (#431).
+    ///
+    /// The ticker sends an empty AppendEntries on the leader's last-seen vote
+    /// whenever openraft has sent this peer nothing within one heartbeat
+    /// interval, and is idle otherwise. `prev_log_id: None` with no entries is
+    /// exactly what openraft itself sends a fresh target: the vote check runs
+    /// before the log check on the receiver, so the probe refreshes the timer
+    /// and can truncate nothing. It goes through [`RpcClient::probe`], not
+    /// `call_once`, because the health tracker would otherwise refuse it for
+    /// the whole cooldown after the peer's restart — the exact window it exists
+    /// to cover. It dies with the `PeerClient`.
+    fn spawn_liveness_ticker(&self) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let resolver = Arc::clone(&self.resolver);
         let target = self.target;
         let addr = self.addr.clone();
-        let deadline = self.client.request_timeout();
         let gate = Arc::clone(&self.probe_inflight);
-
+        let liveness = Arc::clone(&self.liveness);
+        let leading = Arc::clone(&self.leading);
+        let deadline = self.client.request_timeout();
         tokio::spawn(async move {
-            if let Ok(addrs) = resolve_peer(&resolver, target, &addr).await {
-                for peer in &addrs {
-                    if client
-                        .call_once(*peer, "POST", RAFT_APPEND_PATH, body.clone(), deadline)
-                        .await
-                        .is_ok()
-                    {
-                        break;
+            use std::sync::atomic::Ordering;
+            loop {
+                tokio::time::sleep(LIVENESS_TICK).await;
+                // A node that stopped leading must fall silent: its silence is
+                // what lets the survivors' leases lapse and a successor win.
+                if !leading() {
+                    continue;
+                }
+                let due = liveness.lock().ok().and_then(|l| {
+                    let quiet = l.last_sent.is_none_or(|t| t.elapsed() >= LIVENESS_TICK);
+                    if quiet { l.vote } else { None }
+                });
+                let Some(vote) = due else { continue };
+                // One probe in flight per peer, shared with the transfer path's
+                // gate: without it the ticker would pile up probes behind a slow
+                // link instead of pacing them.
+                if gate
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                let probe = AppendEntriesRequest::<TypeConfig> {
+                    vote,
+                    prev_log_id: None,
+                    entries: Vec::new(),
+                    leader_commit: None,
+                };
+                let resolved = resolve_peer(&resolver, target, &addr).await;
+                if let (Ok(body), Ok(addrs)) = (serde_json::to_vec(&probe), resolved) {
+                    for peer in &addrs {
+                        if client
+                            .probe(*peer, "POST", RAFT_APPEND_PATH, body.clone(), deadline)
+                            .await
+                            .is_ok()
+                        {
+                            break;
+                        }
                     }
                 }
+                gate.store(false, Ordering::Release);
             }
-            gate.store(false, Ordering::Release);
-        });
+        })
     }
 
     /// Serialize `rpc` once and start its transfer on a detached task, returning
@@ -573,6 +646,13 @@ async fn resolve_peer(
 }
 
 impl RaftNetwork<TypeConfig> for PeerClient {
+    /// Retry an unreachable peer every 50 ms rather than openraft's default
+    /// 500 ms. A restarting voter's election timeout is 150–300 ms, so the
+    /// default lets it campaign before the leader ever tries it again (#431).
+    fn backoff(&self) -> openraft::network::Backoff {
+        openraft::network::Backoff::new(std::iter::repeat(Duration::from_millis(50)))
+    }
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
@@ -585,8 +665,9 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         // during a big transfer: openraft only produces an empty range for a
         // follower that is already caught up. One whose `matching` is behind
         // gets the missing entry instead, so while a large entry is pending
-        // this branch is never taken — which is what `send_transfer_keepalive`
+        // this branch is never taken — which is what the liveness ticker
         // exists to compensate for.
+        self.note_sent(rpc.vote);
         if rpc.entries.is_empty() {
             return self.send(RAFT_APPEND_PATH, &rpc, Delivery::Retried).await;
         }
@@ -605,11 +686,7 @@ impl RaftNetwork<TypeConfig> for PeerClient {
                 && slot.prev_log_id == rpc.prev_log_id
                 && slot.last_log_id <= last_log_id
         });
-        if attaches {
-            // The transfer is still crossing the link, and openraft will not
-            // ping this follower while it is — see `send_transfer_keepalive`.
-            self.send_transfer_keepalive(&rpc);
-        } else {
+        if !attaches {
             // Dropping the handle detaches the old task; it runs to its deadline
             // and its result is discarded. The follower rejects a stale-vote
             // request on its own, so an abandoned transfer is harmless.
@@ -663,6 +740,7 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
     > {
+        self.note_sent(rpc.vote);
         self.send(RAFT_SNAPSHOT_PATH, &rpc, Delivery::BulkSingleAttempt)
             .await
     }
@@ -1498,7 +1576,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver);
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
         let mut peer = network
             .new_client(2, &BasicNode::new("dual-stack-peer:4790".to_owned()))
             .await;
@@ -1591,7 +1669,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver);
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
         let mut peer = network
             .new_client(2, &BasicNode::new("all-dead:4790".to_owned()))
             .await;
@@ -1656,7 +1734,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver);
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
 
         // Driven through one `PeerClient` from `new_client`, which is the whole
         // point: calling the free `resolve_peer` twice would pass even if
@@ -1756,7 +1834,7 @@ mod tests {
     /// replying while the client is still writing would answer a request the
     /// responder had not actually received, which is the very thing these tests
     /// are counting.
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Option<bool> {
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Option<Option<bool>> {
         use tokio::io::AsyncReadExt;
 
         let mut buf = Vec::new();
@@ -1791,14 +1869,26 @@ mod tests {
         // claim is about the BODY, and the adapter also sends empty keepalive
         // probes while a transfer runs — counting both together would let a
         // re-sent 8 MiB body hide behind a legitimate probe.
-        let carried_entries = serde_json::from_slice::<serde_json::Value>(&buf[head_end..])
-            .ok()
+        let body = serde_json::from_slice::<serde_json::Value>(&buf[head_end..]).ok();
+        let carried_entries = body
+            .as_ref()
             .and_then(|v| {
                 v.get("entries")
                     .and_then(|e| e.as_array().map(|a| !a.is_empty()))
             })
             .unwrap_or(false);
-        Some(carried_entries)
+        if carried_entries {
+            return Some(Some(true));
+        }
+        // No entries: a probe has no `prev_log_id` (what openraft sends a fresh
+        // target, and what the liveness ticker sends); an ordinary heartbeat
+        // carries one and is counted as neither, so a test can assert the ticker
+        // stayed silent while openraft was heartbeating.
+        let is_probe = body
+            .as_ref()
+            .and_then(|v| v.get("prev_log_id"))
+            .is_none_or(|p| p.is_null());
+        Some(if is_probe { Some(false) } else { None })
     }
 
     /// A responder for `RAFT_APPEND_PATH` that answers `reply` after `delay`,
@@ -1832,8 +1922,9 @@ mod tests {
                 tokio::spawn(async move {
                     match read_http_request(&mut socket).await {
                         None => return,
-                        Some(true) => body_counter.fetch_add(1, Ordering::SeqCst),
-                        Some(false) => probe_counter.fetch_add(1, Ordering::SeqCst),
+                        Some(Some(true)) => body_counter.fetch_add(1, Ordering::SeqCst),
+                        Some(Some(false)) => probe_counter.fetch_add(1, Ordering::SeqCst),
+                        Some(None) => 0,
                     };
                     tokio::time::sleep(delay).await;
 
@@ -1866,8 +1957,22 @@ mod tests {
     }
 
     /// Build a `PeerClient` aimed at `addr` with no retries, so a test observes
-    /// exactly the adapter's own behaviour.
+    /// exactly the adapter's own behaviour. The node is treated as leading, so
+    /// the liveness ticker is armed.
     async fn peer_client_for(addr: SocketAddr) -> PeerClient {
+        peer_client_with_leading(addr, Arc::new(std::sync::atomic::AtomicBool::new(true))).await
+    }
+
+    /// [`peer_client_for`], with the caller holding the `leading` flag. The
+    /// flag is wrapped into the production [`LeadingProbe`] shape, so the
+    /// ticker reads it at the moment of each decision exactly as it would
+    /// read the metrics watch.
+    async fn peer_client_with_leading(
+        addr: SocketAddr,
+        leading: Arc<std::sync::atomic::AtomicBool>,
+    ) -> PeerClient {
+        let leading: LeadingProbe =
+            Arc::new(move || leading.load(std::sync::atomic::Ordering::Acquire));
         use crate::rpc::{AlwaysHealthy, RpcClientConfig};
         use openraft::network::RaftNetworkFactory;
 
@@ -1885,7 +1990,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver);
+        let mut network = RpcNetwork::new(client, resolver, leading);
         network
             .new_client(2, &BasicNode::new(addr.to_string()))
             .await
@@ -2239,5 +2344,127 @@ mod tests {
             }
             other => panic!("a follower 413 must map to PayloadTooLarge, got {other:?}"),
         }
+    }
+
+    // ---- #431: the per-peer liveness ticker ---------------------------------
+
+    /// The ticker must be silent while openraft is heartbeating — otherwise it
+    /// doubles every follower's inbound traffic for nothing.
+    #[tokio::test]
+    async fn the_liveness_ticker_is_silent_while_openraft_heartbeats() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, _bodies, probes, _guard) =
+            spawn_append_responder(Duration::from_millis(0), AppendReply::Success).await;
+        let mut peer = peer_client_for(addr).await;
+
+        // Ordinary heartbeats every 25 ms: entry-less, but with a prev_log_id,
+        // so the responder counts them as neither body nor probe.
+        for _ in 0..12 {
+            let mut hb = append_req(1, Some(3), 3);
+            hb.entries.clear();
+            let _ = peer
+                .append_entries(hb, RPCOption::new(Duration::from_millis(500)))
+                .await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "openraft was heartbeating the whole time; the ticker must not have spoken"
+        );
+    }
+
+    /// Once openraft goes quiet, the ticker speaks within a couple of ticks.
+    #[tokio::test]
+    async fn the_liveness_ticker_speaks_when_openraft_goes_quiet() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, _bodies, probes, _guard) =
+            spawn_append_responder(Duration::from_millis(0), AppendReply::Success).await;
+        let mut peer = peer_client_for(addr).await;
+
+        let mut hb = append_req(1, Some(3), 3);
+        hb.entries.clear();
+        let _ = peer
+            .append_entries(hb, RPCOption::new(Duration::from_millis(500)))
+            .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            probes.load(Ordering::SeqCst) >= 1,
+            "250 ms of silence from openraft must produce at least one probe"
+        );
+    }
+
+    /// The ticker must fall silent the moment this node stops leading: openraft
+    /// does not drop an ex-leader's idle replication clients promptly, and its
+    /// old vote is still the highest — so a probe from it reads as a live
+    /// leader and keeps every follower's leader lease fresh, postponing the
+    /// election a graceful leave depends on (the C5 rolling-restart outage).
+    #[tokio::test]
+    async fn the_liveness_ticker_falls_silent_when_this_node_stops_leading() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, _bodies, probes, _guard) =
+            spawn_append_responder(Duration::from_millis(0), AppendReply::Success).await;
+        let leading = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut peer = peer_client_with_leading(addr, Arc::clone(&leading)).await;
+
+        // Note a vote and let openraft go quiet: the armed ticker speaks.
+        let mut hb = append_req(1, Some(3), 3);
+        hb.entries.clear();
+        let _ = peer
+            .append_entries(hb, RPCOption::new(Duration::from_millis(500)))
+            .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            probes.load(Ordering::SeqCst) >= 1,
+            "while leading, silence must produce probes"
+        );
+
+        // Step down. Give any in-flight tick a moment to drain, then require
+        // silence: the vote is still noted and openraft is still quiet — only
+        // the leadership flag has changed.
+        leading.store(false, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_step_down = probes.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            after_step_down,
+            "a node that stopped leading must not probe: its silence is what \
+             lets the survivors' leases lapse and a successor win"
+        );
+    }
+
+    /// The ticker must die with the client: openraft drops a `PeerClient` when it
+    /// stops replicating to that peer, and a probe from a dead leader would be a
+    /// stale-vote message the follower has to reject.
+    #[tokio::test]
+    async fn the_liveness_ticker_dies_with_the_client() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, _bodies, probes, _guard) =
+            spawn_append_responder(Duration::from_millis(0), AppendReply::Success).await;
+        let mut peer = peer_client_for(addr).await;
+        let mut hb = append_req(1, Some(3), 3);
+        hb.entries.clear();
+        let _ = peer
+            .append_entries(hb, RPCOption::new(Duration::from_millis(500)))
+            .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(peer);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_drop = probes.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            after_drop,
+            "no probe may be sent after the client is dropped"
+        );
     }
 }

@@ -390,6 +390,37 @@ impl RpcClient {
         }
     }
 
+    /// A liveness probe: one attempt, bounded by `deadline`, that **ignores** the
+    /// peer's health mark and clears it on success.
+    ///
+    /// [`TrackedPeerHealth`] fast-fails calls to a peer that recently failed,
+    /// which is right for ordinary traffic and self-defeating for the one call
+    /// whose purpose is to discover that the peer is back. Measured (#431): the
+    /// leader's first ~20 heartbeats to a restarted voter all failed on the
+    /// leader with `peer … is not healthy`, and by the time the cooldown let
+    /// one through the voter had campaigned — its term had moved and it
+    /// rejected everything the leader sent from then on. A probe therefore
+    /// skips the gate; a probe failure is not charged either, because the
+    /// tracker already knows.
+    pub async fn probe(
+        &self,
+        peer: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<Vec<u8>, RpcError> {
+        match tokio::time::timeout(deadline, self.attempt(peer, method, path, body, deadline)).await
+        {
+            Ok(Ok(response)) => {
+                self.health.record_success(peer);
+                Ok(response)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => Err(RpcError::Timeout),
+        }
+    }
+
     /// Call `method path` on `peer` exactly once, bounded by `deadline`.
     ///
     /// [`Self::call`] is wrong for a Raft replication transfer twice over:
@@ -963,6 +994,59 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    /// #431: a liveness probe must reach a peer the tracker has written off, and
+    /// its success must clear the mark — otherwise the tracker suppresses the one
+    /// call that could tell it the peer is back.
+    #[tokio::test]
+    async fn probe_reaches_a_peer_the_tracker_marks_unhealthy_and_clears_the_mark() {
+        let (addr, _guard) = spawn_slow_responder(Duration::from_millis(0)).await;
+        let health = Arc::new(TrackedPeerHealth::with_params(1, Duration::from_secs(60)));
+        health.record_failure(addr);
+        let client = RpcClient::new(
+            None,
+            health.clone(),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(200),
+                request_timeout: Duration::from_millis(500),
+                max_retries: 0,
+            },
+        );
+
+        let gated = client
+            .call(addr, "POST", "/internal/v1/raft/append", b"{}".to_vec())
+            .await;
+        assert!(
+            matches!(gated, Err(RpcError::Transport(ref m)) if m.contains("not healthy")),
+            "an ordinary call to a tripped peer must still fast-fail, got {gated:?}"
+        );
+
+        let probed = client
+            .probe(
+                addr,
+                "POST",
+                "/internal/v1/raft/append",
+                b"{}".to_vec(),
+                Duration::from_millis(500),
+            )
+            .await;
+        assert!(
+            probed.is_ok(),
+            "the probe must bypass the health gate: {probed:?}"
+        );
+        assert!(
+            health.is_healthy(addr),
+            "a successful probe must clear the mark"
+        );
+
+        let after = client
+            .call(addr, "POST", "/internal/v1/raft/append", b"{}".to_vec())
+            .await;
+        assert!(
+            after.is_ok(),
+            "ordinary calls must work again once the probe cleared it"
+        );
     }
 
     /// #411's *second* ceiling: the transfer deadline must **replace** the

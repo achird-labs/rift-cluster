@@ -346,6 +346,67 @@ impl RaftNode {
             .map_err(|e| NodeError::Init(e.to_string()))
     }
 
+    /// Restart grace (#431): a node that already belongs to a multi-voter cluster
+    /// must not campaign the instant it comes back.
+    ///
+    /// The leader's reconnect is not immediate, and a voter that bumps its term
+    /// before hearing the leader is rejected by the lease on every peer while
+    /// the leader keeps its own term — a standoff that outlasts any snapshot
+    /// install (measured: term 3 → 66 over 58 s with the leader flat at 1).
+    /// Elections are held until a leader is heard or
+    /// [`Self::RESTART_ELECTION_GRACE`] passes. A fresh node has no state and is
+    /// unaffected; a single-voter fleet must elect itself and is exempt.
+    async fn hold_elections_until_leader_heard(raft: &Raft<TypeConfig>) -> Result<(), NodeError> {
+        let has_state = raft
+            .is_initialized()
+            .await
+            .map_err(|e| NodeError::Runtime(e.to_string()))?;
+        if !has_state {
+            return Ok(());
+        }
+        // Hold first, decide second — and only on evidence that arrives after
+        // the hold begins. Right after `Raft::new` the metrics still carry the
+        // *persisted* state: `current_leader` names whoever led before the
+        // crash, which is memory, not an audible leader — releasing on it is
+        // what let a restarted voter campaign immediately. What cannot come
+        // from memory: the vote moving, or an entry reaching the log or state
+        // machine. Neither happens without a live leader or candidate on the
+        // wire, so those are the release triggers. A single-voter fleet is
+        // exempt outright — it must elect itself.
+        raft.runtime_config().elect(false);
+        let raft = raft.clone();
+        tokio::spawn(async move {
+            let mut metrics = raft.metrics();
+            let (init_vote, init_log, init_applied) = {
+                let m = metrics.borrow();
+                if m.membership_config.membership().voter_ids().count() == 1 {
+                    raft.runtime_config().elect(true);
+                    return;
+                }
+                (m.vote, m.last_log_index, m.last_applied)
+            };
+            let heard = async {
+                loop {
+                    if metrics.changed().await.is_err() {
+                        return;
+                    }
+                    let m = metrics.borrow();
+                    let voters = m.membership_config.membership().voter_ids().count();
+                    if voters == 1
+                        || m.vote != init_vote
+                        || m.last_log_index > init_log
+                        || m.last_applied > init_applied
+                    {
+                        return;
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(Self::RESTART_ELECTION_GRACE, heard).await;
+            raft.runtime_config().elect(true);
+        });
+        Ok(())
+    }
+
     /// Open storage, bind the cluster server, and start the Raft runtime. This
     /// does not form or join a cluster; call [`RaftNode::cluster_init`] to
     /// bootstrap a new one or [`RaftNode::join_via`] to attach to an existing one.
@@ -442,7 +503,29 @@ impl RaftNode {
             RpcClientConfig::default(),
         );
         let resolver: Arc<dyn PeerResolver> = Arc::new(DnsResolver);
-        let network = RpcNetwork::new(client.clone(), Arc::clone(&resolver));
+        // The liveness tickers consult this before probing: a probe asserts
+        // "your leader is alive", which is only true while we lead — a
+        // departed or deposed leader's tickers would otherwise keep every
+        // follower's leader lease fresh and postpone the very election the
+        // fleet needs (the C5 graceful-leave handover). A live read of the
+        // metrics watch at the moment of the decision, not a flag maintained
+        // by a task whose scheduling lag could leave a stale `true` behind —
+        // under load, exactly when it would matter. Before the slot is filled
+        // (this node's own `Raft::new` below), nothing leads.
+        // Held as a `Weak`: the probe travels into the network factory, which
+        // the `Raft` owns — a strong slot here would close the cycle
+        // Raft → factory → probe → slot → Raft and keep the storage alive
+        // after a drop without shutdown.
+        let leading: super::network::LeadingProbe = {
+            let slot = Arc::downgrade(&slot);
+            Arc::new(move || {
+                slot.upgrade()
+                    .as_deref()
+                    .and_then(OnceCell::get)
+                    .is_some_and(|raft| raft.metrics().borrow().state == ServerState::Leader)
+            })
+        };
+        let network = RpcNetwork::new(client.clone(), Arc::clone(&resolver), leading);
 
         let raft = Raft::new(
             config.node_id,
@@ -455,6 +538,7 @@ impl RaftNode {
         .map_err(|e| NodeError::Runtime(e.to_string()))?;
         slot.set(raft.clone())
             .map_err(|_| NodeError::Runtime("raft slot already set".to_owned()))?;
+        Self::hold_elections_until_leader_heard(&raft).await?;
 
         let server_task = tokio::spawn(server.serve());
 
@@ -989,6 +1073,13 @@ impl RaftNode {
     /// cluster unavailable. Bounded so a flapping election cannot park a client
     /// indefinitely (issue #9: "3 bounded retries").
     pub const FORWARD_ATTEMPTS: usize = 3;
+
+    /// How long a restarting member waits to hear a leader before it may
+    /// campaign. Generously above the leader's 50 ms reconnect retry, so the
+    /// common case — the leader is fine, this node was just down — never
+    /// bumps the term; a genuinely dead leader still gets replaced, just not by
+    /// a node that has been up for 200 ms.
+    pub const RESTART_ELECTION_GRACE: Duration = Duration::from_secs(3);
 
     /// Wait for **this node's own** state machine to apply `revision`, up to
     /// `timeout`. Returns whether it landed.
@@ -1731,6 +1822,13 @@ impl RaftNode {
 
     /// A snapshot of the node's current status, from Raft metrics.
     #[must_use]
+    /// This node's current Raft term. Test-facing: the #431 probe asserts a
+    /// restarted voter's term never runs ahead of the leader's.
+    #[doc(hidden)]
+    pub fn raft_term(&self) -> u64 {
+        self.raft.metrics().borrow().current_term
+    }
+
     pub fn status(&self) -> StatusReport {
         let receiver = self.raft.metrics();
         let metrics = receiver.borrow();

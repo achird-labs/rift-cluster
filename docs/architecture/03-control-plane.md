@@ -141,6 +141,25 @@ learner catching up from a snapshot; and if *every* disk is empty, there is no
 group to re-form and nothing serves until an operator re-initializes — loud
 refusal, exactly as R3 demands (Chapter 9 has the full restart matrix).
 
+**A single member restarting is the case that needs care, not the full
+fleet.** A voter that comes back must hear the leader within its election
+timeout (150–300 ms) or it campaigns — and once its term has moved, the leader
+(which rejects a candidate without adopting its term) never reconciles with it.
+Two things on the leader and one on the returning node keep that from
+happening (#431): the leader retries an unreachable peer every 50 ms and runs a
+per-peer *liveness ticker* — an empty AppendEntries on its current vote whenever
+openraft has sent that peer nothing for a heartbeat interval, which is the whole
+of a snapshot install and the whole of a large entry's transfer — sent through a
+probe that bypasses the peer-health tracker, because the tracker would otherwise
+refuse to talk to a just-restarted peer for its cooldown. The ticker speaks only
+while its node actually leads: a probe asserts "your leader is alive", and a
+leader that has gracefully left (or been deposed) must fall *silent* — its
+silence is what lets the survivors' leader leases lapse so a successor can win
+during the drain, which is the handover a rolling restart depends on. On the returning node,
+a member with persisted state holds elections for a 3 s *restart grace* until it
+hears a leader; a fresh node and a single-voter fleet are unaffected, and a
+genuinely dead leader is still replaced once the grace expires.
+
 ## What the control plane costs
 
 Symmetry demands the bill. A minority partition **cannot write config** — the
