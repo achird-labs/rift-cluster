@@ -111,11 +111,18 @@ jobs:
 
           This issue is reused for every consecutive failure; it closes itself on the next green run."
 
-          # `--search` is fuzzy, so the exact-title match is done in jq — via
+          # Find by LABEL, not by `--search`. GitHub's issue search parses `(`
+          # and `)` as boolean grouping, so `ci(sync-upstream): ... in:title`
+          # matches nothing at all — not even the four issues that carry that
+          # title verbatim. This step therefore never found its own prior issue
+          # and filed a fresh duplicate on every failure (#409, #421, #422), and
+          # the green-run cleanup below never closed any of them. The label list
+          # goes through the plain issues API, which has no query parser and no
+          # search-index lag; the exact-title match is still done in jq — via
           # $ENV, because jq does not see shell variables. Matching loosely would
           # let an unrelated issue absorb the report and hide it again.
           # shellcheck disable=SC2016  # $ENV.TITLE is jq's, and must not be expanded by the shell
-          existing="$(gh issue list --state all --limit 20 --search "$TITLE in:title" \
+          existing="$(gh issue list --state all --limit 100 --label upstream-sync \
             --json number,title \
             --jq 'map(select(.title == $ENV.TITLE)) | first | .number // empty' || true)"
 
@@ -134,10 +141,22 @@ jobs:
           TITLE: "ci(sync-upstream): the scheduled vendor bump is failing"
         run: |
           set -euo pipefail
+          # Label-based for the same reason as the report step above. Closes
+          # EVERY open match, not just the first: while the search was broken a
+          # backlog of duplicates accumulated, and a cleanup that closes one per
+          # green run would take as many green days to drain as there were red
+          # ones. Closing all of them makes the next green run self-healing.
           # shellcheck disable=SC2016  # $ENV.TITLE is jq's, and must not be expanded by the shell
-          open="$(gh issue list --state open --limit 20 --search "$TITLE in:title" \
+          # `|| true` for the same reason the report step has it: a hiccup in the
+          # cleanup must not turn a green sync red, which would then file a
+          # failure issue about a run that did its job.
+          open="$(gh issue list --state open --limit 100 --label upstream-sync \
             --json number,title \
-            --jq 'map(select(.title == $ENV.TITLE)) | first | .number // empty' || true)"
-          if [ -n "$open" ]; then
-            gh issue close "$open" --comment "Green again: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          fi
+            --jq 'map(select(.title == $ENV.TITLE)) | .[].number' || true)"
+          # One number per line, read line-wise rather than relying on unquoted
+          # word splitting — that behaviour differs between shells and this must
+          # not depend on which one runs it.
+          while read -r n; do
+            [ -n "$n" ] || continue
+            gh issue close "$n" --comment "Green again: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          done <<< "$open"
