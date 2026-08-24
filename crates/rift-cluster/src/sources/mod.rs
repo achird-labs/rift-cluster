@@ -1235,7 +1235,7 @@ async fn create_source(puller: &SourcePuller, body: &[u8]) -> Result<Vec<u8>, Rp
 }
 
 async fn read_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, RpcError> {
-    let id = path_id(suffix)?;
+    let id = path_id("GET", suffix)?;
     let node = puller.node().map_err(pull_error)?;
     let record = node
         .source(DEFAULT_TENANT, id)
@@ -1256,7 +1256,7 @@ async fn read_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, Rpc
 }
 
 async fn delete_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, RpcError> {
-    let id = path_id(suffix)?;
+    let id = path_id("DELETE", suffix)?;
     // Same delegation as `create_source`, over `SourcePuller::delete`.
     let (revision, _op_id) = puller
         .delete(TenantId::default(), id, None)
@@ -1287,10 +1287,13 @@ async fn pull_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, Rpc
 
 /// The id segment of a `/admin/sources/<id>` suffix, rejecting anything with a
 /// further path element — `/admin/sources/a/b` names no source.
-fn path_id(suffix: &str) -> Result<&str, RpcError> {
+///
+/// `method` is the HTTP verb of the caller so a malformed suffix is reported as
+/// an unknown route for that verb (not hard-coded GET).
+fn path_id<'a>(method: &str, suffix: &'a str) -> Result<&'a str, RpcError> {
     let id = suffix.split('?').next().unwrap_or_default();
     if id.is_empty() || id.contains('/') {
-        return Err(unknown_route("GET", suffix));
+        return Err(unknown_route(method, suffix));
     }
     Ok(id)
 }
