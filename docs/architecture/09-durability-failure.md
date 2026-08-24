@@ -94,14 +94,21 @@ so a 512 KiB entry took 23–548 s and anything ≥ 1 MiB never committed at all
 the effective ceiling was "whatever replicates in one heartbeat", far below both
 documented quotas.
 
-**Known limit, tracked as #430.** The transfer is fixed, but a large entry can
-still cost the leader its replication streams on a CPU-constrained host: openraft
-may ask the log store for an index it has counted but `append` has not yet made
-readable, and it panics on the empty answer rather than tolerating it. The window
-grows with entry size, so it is reachable now that large entries replicate at
-all. Measured: a 4 MiB entry is unaffected in CI; 8 MiB is fine on an unloaded
-host and fails under saturation. Until #430 lands, treat multi-MiB entries as
-sound but not yet proven at the 8 MiB quota on small hosts.
+**The silent window.** A follower's election timer is refreshed only by an
+AppendEntries that reaches its engine. openraft 0.9 sends a follower nothing
+else while a large entry is in flight (a heartbeat tick to a lagging follower
+re-sends the entry) and nothing at all during a snapshot install. Any such
+window longer than `election_timeout_min` (150 ms) makes a **voter** campaign,
+and once its term has moved the leader — which rejects a candidate without
+adopting its term — never reconciles with it. Large payloads make that window
+routine; CPU pressure widens it. That churn is the real mechanism behind the
+issues this chapter used to list separately: a leader that loses its term keeps
+its replication cores alive for a moment, and a stale core reading a range the
+new leader's conflict has truncated was what openraft 0.9.24 panicked on
+(#430 — an empty read is tolerated from 0.9.25, #435). Closing the window
+itself is #431: a per-peer liveness heartbeat that bypasses the health tracker,
+a 50 ms reconnect backoff, and a restart grace for a node that already belongs
+to a cluster. The measured story is in the RCA report linked from those issues.
 
 ## Scenario walkthroughs
 

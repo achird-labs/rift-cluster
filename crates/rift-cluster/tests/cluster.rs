@@ -3211,6 +3211,81 @@ async fn dataset_survives_a_full_cluster_restart_and_a_lost_spool(bytes: usize) 
     cluster.shutdown_all().await;
 }
 
+/// #430: a leader that loses its term while an 8 MiB entry is in flight keeps its replication
+/// cores alive for a moment; the new leader's conflict truncates the old leader's uncommitted
+/// index, and a stale core then reads a now-empty range. openraft 0.9.24 `unwrap()`ed that and
+/// took the worker down; 0.9.25 treats the empty read as a heartbeat.
+///
+/// The condition that produces it is CPU starvation (the 2-vCPU CI runner; here, one spinning
+/// thread per core but one), which makes followers time out and churn leadership. Whether the
+/// *write* survives that churn is #431's silent-window fix and is not asserted here. What this
+/// pins is narrower and must hold regardless: **no replication worker panics**, ever, on the
+/// empty read. A panic hook counts them because a panic inside a tokio task does not fail the
+/// test on its own — it is exactly the kind of failure that hides in a log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leadership_change_under_load_never_panics_a_replication_worker() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let _serial = TEST_LOCK.lock().await;
+
+    let replication_panics = Arc::new(AtomicUsize::new(0));
+    let counter = replication_panics.clone();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let from_replication = info
+            .location()
+            .is_some_and(|l| l.file().contains("openraft") && l.file().contains("replication"));
+        if from_replication {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+
+    // Starve the runtime the way the CI runner does. `available_parallelism` minus one spinner
+    // leaves the tokio workers fighting for what is left, which is the condition under which
+    // followers time out mid-transfer.
+    let stop = Arc::new(AtomicBool::new(false));
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let spinners: Vec<_> = (0..cores.saturating_sub(1).max(1))
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || while !stop.load(Ordering::Relaxed) {})
+        })
+        .collect();
+
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let csv = big_csv(8 * 1024 * 1024 - 1_100);
+    // The outcome of the write is deliberately not asserted: under this load it may park or
+    // fail with "not the leader" until #431 lands. The panic count is the claim.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(30),
+        cluster
+            .leader()
+            .expect("leader")
+            .submit(dataset_put("big", &csv)),
+    )
+    .await;
+    // Let any stale core that is mid-read finish its read and (on 0.9.24) panic.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    cluster.shutdown_all().await;
+
+    stop.store(true, Ordering::Relaxed);
+    for s in spinners {
+        let _ = s.join();
+    }
+    std::panic::set_hook(previous);
+
+    assert_eq!(
+        replication_panics.load(Ordering::SeqCst),
+        0,
+        "a replication worker panicked on an empty log read; openraft must treat it as a heartbeat"
+    );
+}
+
 /// #411's other shipped ceiling: a spec document at the RFC-004 S2 maximum (4 MiB, #278) is one
 /// log entry and must commit on a real 3-node cluster.
 ///
