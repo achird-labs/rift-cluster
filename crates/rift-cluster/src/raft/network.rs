@@ -17,15 +17,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::error::{
-    ChangeMembershipError, ClientWriteError, InProgress, NetworkError, RPCError, RaftError,
-    Unreachable,
+    ChangeMembershipError, ClientWriteError, InProgress, NetworkError, PayloadTooLarge, RPCError,
+    RaftError, Unreachable,
 };
 use openraft::network::RPCOption;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, ClientWriteResponse, InstallSnapshotRequest,
     InstallSnapshotResponse, VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, ChangeMembers, Raft, RaftNetwork, RaftNetworkFactory};
+use openraft::{BasicNode, ChangeMembers, LogId, Raft, RaftNetwork, RaftNetworkFactory, Vote};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OnceCell};
@@ -136,6 +136,8 @@ impl RaftNetworkFactory<TypeConfig> for RpcNetwork {
             target,
             addr: node.addr.clone(),
             resolver: Arc::clone(&self.resolver),
+            inflight: None,
+            probe_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -147,6 +149,73 @@ pub(crate) struct PeerClient {
     target: NodeId,
     addr: String,
     resolver: Arc<dyn PeerResolver>,
+    /// The one outstanding AppendEntries transfer, if any — see
+    /// [`InflightAppend`]. `RaftNetwork` takes `&mut self` and openraft drives
+    /// one `PeerClient` per replication stream sequentially, so this needs no
+    /// lock.
+    inflight: Option<InflightAppend>,
+    /// Whether a keepalive probe is already in flight to this peer.
+    ///
+    /// openraft re-drives the attach path about every 50 ms, so without this the
+    /// adapter would spawn ~20 probes a second. That is not merely wasteful:
+    /// each one runs through `call_once`, which feeds `TrackedPeerHealth`, and
+    /// three consecutive failures mark the peer unhealthy for a cooldown — after
+    /// which the *transfer's* own `call_once` fast-fails with "peer is not
+    /// healthy". A slow-but-alive follower could therefore have the keepalive
+    /// kill the very transfer it exists to protect. One probe at a time keeps
+    /// failures accruing at the probe's timeout rate, like any other call.
+    probe_inflight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What an in-flight AppendEntries transfer resolves to.
+type AppendOutcome =
+    Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>;
+
+/// Floor on the link speed a replication transfer is granted before it is
+/// declared failed: 8 MiB at 1 MiB/s is 8 s on top of the ordinary request
+/// timeout, which puts a dataset at its 8 MiB quota ceiling at the admin front's
+/// own 10 s write deadline. A link slower than this parks the intent for replay
+/// rather than holding the transfer open indefinitely; op-id dedup then makes
+/// the eventual commit happen exactly once.
+const MIN_REPLICATION_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+/// How long a transfer of `body_len` bytes is given, from the client's ordinary
+/// per-attempt timeout plus an allowance at [`MIN_REPLICATION_BYTES_PER_SEC`].
+fn replication_deadline(request_timeout: Duration, body_len: usize) -> Duration {
+    // Milliseconds rather than whole seconds so a few-hundred-KiB entry gets a
+    // proportional allowance instead of being truncated to zero.
+    let allowance = (body_len as u64).saturating_mul(1_000) / MIN_REPLICATION_BYTES_PER_SEC;
+    request_timeout + Duration::from_millis(allowance)
+}
+
+/// One outstanding AppendEntries transfer, kept so that an identical re-send
+/// attaches to it instead of restarting the body from byte 0.
+///
+/// This is the whole of the #411 fix. openraft wraps every AppendEntries call in
+/// `timeout(heartbeat_interval)` — 50 ms — and *drops* the future when it fires,
+/// which cancels the HTTP request and discards whatever had already reached the
+/// follower. It then re-issues the same range on the next tick, so an entry only
+/// ever commits if one attempt happens to complete transfer *and* the follower's
+/// fsync inside a single heartbeat. A 512 KiB entry took 23-548 s; 1 MiB and up
+/// never committed at all, which capped the fleet far below the 4 MiB spec and
+/// 8 MiB dataset quotas that are already accepted at the front door.
+struct InflightAppend {
+    /// The transfer's identity: a re-send matches only if it is based on the
+    /// same term and the same predecessor entry.
+    vote: Vote<NodeId>,
+    prev_log_id: Option<LogId<NodeId>>,
+    /// Last entry the in-flight body carries. A re-send asking for *more* gets
+    /// this back as `PartialSuccess`; one asking for less does not match at all.
+    last_log_id: Option<LogId<NodeId>>,
+    /// Polled by `&mut`, never awaited by value. openraft drops the waiter at
+    /// its 50 ms deadline, and a `JoinHandle` keeps the task's output in the
+    /// task cell until it is actually joined — so a cancelled poll loses
+    /// nothing. (A `oneshot::Receiver` would not do: polling it *takes* the
+    /// value, so a drop in the window between delivery and return would lose
+    /// the result and silently forget the transfer.) Dropping the handle
+    /// detaches the task rather than aborting it, which is what makes
+    /// discarding a stale slot safe.
+    handle: tokio::task::JoinHandle<AppendOutcome>,
 }
 
 impl PeerClient {
@@ -204,6 +273,189 @@ impl PeerClient {
             )))),
         })
     }
+
+    /// Ping the follower so its election timer resets while a large transfer is
+    /// still crossing the link.
+    ///
+    /// openraft does **not** send empty heartbeats to a peer that has entries
+    /// pending: `send_log_entries` builds its range from `matching`, so a
+    /// heartbeat tick for a follower missing a big entry re-sends *that entry*
+    /// rather than an empty probe. Measured over a whole 3-node run replicating
+    /// an 8 MiB dataset: 114 AppendEntries calls, **zero** with an empty range.
+    ///
+    /// The consequence is not about the transfer at all. The follower hears
+    /// nothing for the seconds the body takes to arrive, its election timeout
+    /// (150-300 ms) fires, and the term churn that follows is what kept the
+    /// entry from committing even after the transfer itself was made to survive
+    /// openraft's 50 ms RPC deadline. Fixing the transfer alone took the fleet
+    /// from "1 MiB never commits" to "6 MiB commits, 8 MiB still loses the
+    /// leader".
+    ///
+    /// So the adapter sends the probe openraft would otherwise have sent: an
+    /// empty AppendEntries on the in-flight transfer's own base. That is exactly
+    /// a Raft heartbeat — same vote, a `prev_log_id` the follower already has,
+    /// no entries — so it is idempotent and cannot move `matching`. openraft
+    /// re-drives this path about every 50 ms while the transfer runs, which is
+    /// precisely the heartbeat cadence the timers expect.
+    ///
+    /// Fire-and-forget: its reply carries nothing the awaited transfer will not
+    /// deliver, and a failed ping is not itself news. It gets its own connection
+    /// rather than queueing behind the in-flight body, because the pool hands
+    /// out a new one when the existing connection is checked out.
+    fn send_transfer_keepalive(&self, rpc: &AppendEntriesRequest<TypeConfig>) {
+        let probe = AppendEntriesRequest::<TypeConfig> {
+            vote: rpc.vote,
+            prev_log_id: rpc.prev_log_id,
+            entries: Vec::new(),
+            leader_commit: rpc.leader_commit,
+        };
+        let Ok(body) = serde_json::to_vec(&probe) else {
+            // An empty AppendEntries that will not serialize is a defect in
+            // openraft's own types, not a peer problem; the transfer's result is
+            // still authoritative, so there is nothing useful to report here.
+            return;
+        };
+
+        // At most one probe in flight per peer — see `probe_inflight`.
+        use std::sync::atomic::Ordering;
+        if self
+            .probe_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let client = self.client.clone();
+        let resolver = Arc::clone(&self.resolver);
+        let target = self.target;
+        let addr = self.addr.clone();
+        let deadline = self.client.request_timeout();
+        let gate = Arc::clone(&self.probe_inflight);
+
+        tokio::spawn(async move {
+            if let Ok(addrs) = resolve_peer(&resolver, target, &addr).await {
+                for peer in &addrs {
+                    if client
+                        .call_once(*peer, "POST", RAFT_APPEND_PATH, body.clone(), deadline)
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+            gate.store(false, Ordering::Release);
+        });
+    }
+
+    /// Serialize `rpc` once and start its transfer on a detached task, returning
+    /// the slot that later re-sends attach to.
+    ///
+    /// The body is built here rather than in the task so an attaching re-send
+    /// costs no JSON work at all, and so a serialization failure is reported to
+    /// the caller that caused it.
+    #[allow(clippy::result_large_err)]
+    fn spawn_append(
+        &self,
+        rpc: &AppendEntriesRequest<TypeConfig>,
+        last_log_id: Option<LogId<NodeId>>,
+    ) -> Result<InflightAppend, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        let body = serde_json::to_vec(rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let deadline = replication_deadline(self.client.request_timeout(), body.len());
+        let entries = rpc.entries.len() as u64;
+
+        let client = self.client.clone();
+        let resolver = Arc::clone(&self.resolver);
+        let target = self.target;
+        let addr = self.addr.clone();
+
+        let handle = tokio::spawn(async move {
+            send_append(&client, &resolver, target, &addr, body, deadline, entries).await
+        });
+
+        Ok(InflightAppend {
+            vote: rpc.vote,
+            prev_log_id: rpc.prev_log_id,
+            last_log_id,
+            handle,
+        })
+    }
+}
+
+/// Carry one AppendEntries body to `target`, trying each resolved address.
+///
+/// A free function rather than a method because it runs on a detached task that
+/// must outlive the `PeerClient` borrow — that outliving is the entire point of
+/// the single-flight slot.
+// Same reason as `PeerClient::send`: the `Err` variant is openraft's `RPCError`
+// and this result is handed straight back to a `RaftNetwork` method, so the
+// size is fixed by that trait rather than ours to shrink.
+#[allow(clippy::result_large_err)]
+async fn send_append(
+    client: &RpcClient,
+    resolver: &Arc<dyn PeerResolver>,
+    target: NodeId,
+    addr: &str,
+    body: Vec<u8>,
+    deadline: Duration,
+    entries: u64,
+) -> AppendOutcome {
+    let addrs = resolve_peer(resolver, target, addr)
+        .await
+        .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+
+    // `call_once`, not `call`: openraft is already the retry loop, so retrying
+    // here would re-send the whole body — the very cost this fix exists to stop
+    // paying.
+    let mut last: Option<RpcError> = None;
+    for peer in &addrs {
+        match client
+            .call_once(*peer, "POST", RAFT_APPEND_PATH, body.clone(), deadline)
+            .await
+        {
+            Ok(response) => {
+                return serde_json::from_slice(&response)
+                    .map_err(|e| RPCError::Network(NetworkError::new(&e)));
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+
+    let context = format!("{addr} ({} address(es) tried)", addrs.len());
+    Err(match last {
+        Some(e) => map_append_err(&e, &context, entries),
+        None => RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+            "{context}: no addresses to try"
+        )))),
+    })
+}
+
+/// AppendEntries-specific error mapping: a follower's 413 is an *answer*, not
+/// silence, and must not be reported as unreachability.
+///
+/// [`map_rpc_err`] sends `BodyTooLarge` to `Unreachable`, which makes openraft
+/// back off and then re-send the identical oversized batch — forever, since
+/// backing off never makes the batch smaller. `PayloadTooLarge` instead makes it
+/// halve the batch and retry at once, which is the only response that can make
+/// progress. A lagging follower catching up across several 4-8 MiB entries hits
+/// this the moment `max_payload_entries` batches them past the transport's cap;
+/// it never fired before the quota-sized entries of #278/#285 existed. Only
+/// AppendEntries can act on the hint, so `vote` and `install_snapshot` keep the
+/// original mapping.
+fn map_append_err(
+    e: &RpcError,
+    context: &str,
+    entries: u64,
+) -> RPCError<NodeId, BasicNode, RaftError<NodeId>> {
+    if matches!(e, RpcError::BodyTooLarge { .. }) {
+        // openraft debug-asserts a positive hint. A single entry that is itself
+        // over the cap cannot be halved further and will fail the same way next
+        // time, which is the honest outcome — the alternative is claiming a
+        // smaller batch exists when it does not.
+        return RPCError::PayloadTooLarge(PayloadTooLarge::new_entries_hint((entries / 2).max(1)));
+    }
+    map_rpc_err(e, context)
 }
 
 /// Resolve `authority` through `resolver`, fresh for this one call. The
@@ -270,7 +522,73 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.send(RAFT_APPEND_PATH, &rpc).await
+        // An entry-less probe is sent inline, exactly as before, and never
+        // queues behind a transfer.
+        //
+        // Note this branch alone does NOT keep the leader's heartbeats flowing
+        // during a big transfer: openraft only produces an empty range for a
+        // follower that is already caught up. One whose `matching` is behind
+        // gets the missing entry instead, so while a large entry is pending
+        // this branch is never taken — which is what `send_transfer_keepalive`
+        // exists to compensate for.
+        if rpc.entries.is_empty() {
+            return self.send(RAFT_APPEND_PATH, &rpc).await;
+        }
+
+        let last_log_id = rpc.entries.last().map(|entry| entry.log_id);
+
+        // Attach only to a transfer based identically and carrying no more than
+        // this request wants:
+        //   - a different `vote` belongs to another term;
+        //   - a different `prev_log_id` is based on a prefix this caller has not
+        //     asked to build on;
+        //   - a *longer* in-flight range (openraft rewound after a conflict)
+        //     would report the follower as holding entries never sent to it.
+        let attaches = self.inflight.as_ref().is_some_and(|slot| {
+            slot.vote == rpc.vote
+                && slot.prev_log_id == rpc.prev_log_id
+                && slot.last_log_id <= last_log_id
+        });
+        if attaches {
+            // The transfer is still crossing the link, and openraft will not
+            // ping this follower while it is — see `send_transfer_keepalive`.
+            self.send_transfer_keepalive(&rpc);
+        } else {
+            // Dropping the handle detaches the old task; it runs to its deadline
+            // and its result is discarded. The follower rejects a stale-vote
+            // request on its own, so an abandoned transfer is harmless.
+            self.inflight = None;
+            self.inflight = Some(self.spawn_append(&rpc, last_log_id)?);
+        }
+
+        let (outcome, sent_through) = {
+            let Some(slot) = self.inflight.as_mut() else {
+                // Unreachable: the branch above installs a slot whenever there
+                // was none. Reported rather than panicked so a future refactor
+                // that breaks the invariant degrades to a retry, not a crash.
+                return Err(RPCError::Unreachable(Unreachable::new(
+                    &std::io::Error::other("no in-flight append transfer to await"),
+                )));
+            };
+            let sent_through = slot.last_log_id;
+            // `&mut handle`: if openraft's deadline drops us here, the slot —
+            // and the running transfer — survive for the next re-send.
+            ((&mut slot.handle).await, sent_through)
+        };
+        self.inflight = None;
+
+        match outcome {
+            // The transfer carried only a prefix of what this caller wants, so
+            // report the prefix: openraft advances `matching` and sends the
+            // remainder as its own request.
+            Ok(Ok(AppendEntriesResponse::Success)) if sent_through < last_log_id => {
+                Ok(AppendEntriesResponse::PartialSuccess(sent_through))
+            }
+            Ok(result) => result,
+            Err(join) => Err(RPCError::Unreachable(Unreachable::new(
+                &std::io::Error::other(format!("append transfer task failed: {join}")),
+            ))),
+        }
     }
 
     async fn vote(
@@ -1344,5 +1662,525 @@ mod tests {
             "localhost:4790".to_socket_addrs().expect("resolve").count(),
             "the resolver must return every address the OS gave, not the first"
         );
+    }
+
+    // ---- #411: single-flight AppendEntries transfers -------------------------
+    //
+    // openraft wraps every AppendEntries call in `timeout(heartbeat_interval)` —
+    // 50 ms here — and drops the future when it fires, so a body that cannot
+    // cross the link and fsync inside one heartbeat is restarted from byte 0
+    // forever and the entry never commits. These tests pin the fix: the transfer
+    // outlives the deadline, and an identical re-send *attaches* to it.
+    //
+    // Every one of them asserts on the responder's REQUEST COUNT, not just on
+    // the reply. A test that only checked the reply would pass against an
+    // implementation that faithfully re-sent the whole body every 50 ms, which
+    // is precisely the bug.
+
+    /// What an append responder answers once it has consumed a whole request.
+    #[derive(Clone, Copy)]
+    enum AppendReply {
+        Success,
+        /// The receiving transport's 413 — body over `DEFAULT_MAX_BODY_BYTES`.
+        BodyTooLarge,
+        /// A handler-side 500.
+        ServerError,
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    /// Read one HTTP request off `socket`, draining its whole body.
+    ///
+    /// The body must be consumed even though the responder ignores its content:
+    /// replying while the client is still writing would answer a request the
+    /// responder had not actually received, which is the very thing these tests
+    /// are counting.
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Option<bool> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        let head_end = loop {
+            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = socket.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        let len: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+
+        while buf.len() < head_end + len {
+            let n = socket.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+
+        // Report whether this request actually carried entries. The single-flight
+        // claim is about the BODY, and the adapter also sends empty keepalive
+        // probes while a transfer runs — counting both together would let a
+        // re-sent 8 MiB body hide behind a legitimate probe.
+        let carried_entries = serde_json::from_slice::<serde_json::Value>(&buf[head_end..])
+            .ok()
+            .and_then(|v| {
+                v.get("entries")
+                    .and_then(|e| e.as_array().map(|a| !a.is_empty()))
+            })
+            .unwrap_or(false);
+        Some(carried_entries)
+    }
+
+    /// A responder for `RAFT_APPEND_PATH` that answers `reply` after `delay`,
+    /// counting every request that actually reached it.
+    async fn spawn_append_responder(
+        delay: Duration,
+        reply: AppendReply,
+    ) -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind append responder");
+        let addr = listener.local_addr().expect("responder addr");
+        let bodies = Arc::new(AtomicUsize::new(0));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (body_counter, probe_counter) = (bodies.clone(), probes.clone());
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let (body_counter, probe_counter) = (body_counter.clone(), probe_counter.clone());
+                tokio::spawn(async move {
+                    match read_http_request(&mut socket).await {
+                        None => return,
+                        Some(true) => body_counter.fetch_add(1, Ordering::SeqCst),
+                        Some(false) => probe_counter.fetch_add(1, Ordering::SeqCst),
+                    };
+                    tokio::time::sleep(delay).await;
+
+                    let (status, body) = match reply {
+                        AppendReply::Success => (
+                            "200 OK",
+                            serde_json::to_vec(&AppendEntriesResponse::<NodeId>::Success)
+                                .expect("encode append reply"),
+                        ),
+                        AppendReply::BodyTooLarge => (
+                            "413 Payload Too Large",
+                            br#"{"message":"request body exceeds 32 bytes"}"#.to_vec(),
+                        ),
+                        AppendReply::ServerError => (
+                            "500 Internal Server Error",
+                            br#"{"message":"responder refused"}"#.to_vec(),
+                        ),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        (addr, bodies, probes, handle)
+    }
+
+    /// Build a `PeerClient` aimed at `addr` with no retries, so a test observes
+    /// exactly the adapter's own behaviour.
+    async fn peer_client_for(addr: SocketAddr) -> PeerClient {
+        use crate::rpc::{AlwaysHealthy, RpcClientConfig};
+        use openraft::network::RaftNetworkFactory;
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver: Arc<dyn PeerResolver> = Arc::new(ListResolver {
+            addrs: vec![addr],
+            calls,
+        });
+        let client = RpcClient::new(
+            None,
+            Arc::new(AlwaysHealthy),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(200),
+                request_timeout: Duration::from_millis(500),
+                max_retries: 0,
+            },
+        );
+        let mut network = RpcNetwork::new(client, resolver);
+        network
+            .new_client(2, &BasicNode::new(addr.to_string()))
+            .await
+    }
+
+    fn append_req(term: u64, prev: Option<u64>, last: u64) -> AppendEntriesRequest<TypeConfig> {
+        use openraft::EntryPayload;
+        use openraft::Vote;
+        use openraft::entry::Entry;
+
+        let first = prev.map_or(1, |p| p + 1);
+        let entries = (first..=last)
+            .map(|i| Entry {
+                log_id: log_id(i),
+                payload: EntryPayload::<TypeConfig>::Blank,
+            })
+            .collect();
+        AppendEntriesRequest {
+            vote: Vote::new_committed(term, 1),
+            prev_log_id: prev.map(log_id),
+            entries,
+            leader_commit: prev.map(log_id),
+        }
+    }
+
+    /// THE gate for #411: a transfer that outlives openraft's 50 ms deadline is
+    /// not restarted — the identical re-send attaches to it and gets its answer.
+    ///
+    /// Pre-fix this test fails on the request count: the second call re-sends
+    /// the whole body, so the responder sees two.
+    #[tokio::test]
+    async fn an_identical_resend_attaches_to_the_inflight_transfer() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        // Answers well after openraft's per-call deadline, so the first waiter
+        // is guaranteed to be dropped while the transfer is still running.
+        let (addr, seen, probes, _guard) =
+            spawn_append_responder(Duration::from_millis(300), AppendReply::Success).await;
+        let mut peer = peer_client_for(addr).await;
+
+        let first = tokio::time::timeout(
+            Duration::from_millis(50),
+            peer.append_entries(
+                append_req(1, None, 3),
+                RPCOption::new(Duration::from_millis(50)),
+            ),
+        )
+        .await;
+        assert!(
+            first.is_err(),
+            "the 50 ms deadline must fire while the transfer is still in flight"
+        );
+
+        let second = peer
+            .append_entries(
+                append_req(1, None, 3),
+                RPCOption::new(Duration::from_millis(50)),
+            )
+            .await;
+        assert!(
+            matches!(second, Ok(AppendEntriesResponse::Success)),
+            "the re-send must attach to the in-flight transfer and return its success, got {second:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the BODY must have been sent exactly ONCE; more means the transfer was restarted"
+        );
+        assert!(
+            probes.load(Ordering::SeqCst) >= 1,
+            "attaching must also ping the follower so its election timer resets \
+             while the transfer is still crossing the link"
+        );
+    }
+
+    /// A re-send that extends the range reports the in-flight prefix as
+    /// `PartialSuccess`, so openraft sends only the remainder.
+    #[tokio::test]
+    async fn a_longer_resend_returns_partial_success_for_the_inflight_prefix() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, seen, _probes, _guard) =
+            spawn_append_responder(Duration::from_millis(300), AppendReply::Success).await;
+        let mut peer = peer_client_for(addr).await;
+
+        let first = tokio::time::timeout(
+            Duration::from_millis(50),
+            peer.append_entries(
+                append_req(1, None, 3),
+                RPCOption::new(Duration::from_millis(50)),
+            ),
+        )
+        .await;
+        assert!(first.is_err(), "first call must time out");
+
+        // Same vote and prev_log_id, but openraft now wants through index 6.
+        let second = peer
+            .append_entries(
+                append_req(1, None, 6),
+                RPCOption::new(Duration::from_millis(50)),
+            )
+            .await;
+        assert_eq!(
+            second.ok(),
+            Some(AppendEntriesResponse::PartialSuccess(Some(log_id(3)))),
+            "the in-flight transfer only carried through index 3, so that is the matching id"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "attaching must not re-send the body"
+        );
+    }
+
+    /// A different `prev_log_id` is a different transfer — it must not be
+    /// answered by the in-flight one, which is based on a prefix the follower
+    /// may never have accepted.
+    #[tokio::test]
+    async fn a_resend_with_a_different_prev_log_id_starts_a_fresh_transfer() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, seen, _probes, _guard) =
+            spawn_append_responder(Duration::from_millis(150), AppendReply::Success).await;
+        let mut peer = peer_client_for(addr).await;
+
+        let first = tokio::time::timeout(
+            Duration::from_millis(50),
+            peer.append_entries(
+                append_req(1, None, 3),
+                RPCOption::new(Duration::from_millis(50)),
+            ),
+        )
+        .await;
+        assert!(first.is_err(), "first call must time out");
+
+        let second = peer
+            .append_entries(
+                append_req(1, Some(7), 9),
+                RPCOption::new(Duration::from_millis(2000)),
+            )
+            .await;
+        assert!(
+            matches!(second, Ok(AppendEntriesResponse::Success)),
+            "a differently-based request must be sent on its own, got {second:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "a different prev_log_id must NOT be served by the in-flight transfer"
+        );
+    }
+
+    /// A vote change means a new leader term; the in-flight transfer belongs to
+    /// the old one and cannot answer for it.
+    #[tokio::test]
+    async fn a_resend_under_a_different_vote_starts_a_fresh_transfer() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, seen, _probes, _guard) =
+            spawn_append_responder(Duration::from_millis(150), AppendReply::Success).await;
+        let mut peer = peer_client_for(addr).await;
+
+        let first = tokio::time::timeout(
+            Duration::from_millis(50),
+            peer.append_entries(
+                append_req(1, None, 3),
+                RPCOption::new(Duration::from_millis(50)),
+            ),
+        )
+        .await;
+        assert!(first.is_err(), "first call must time out");
+
+        let second = peer
+            .append_entries(
+                append_req(2, None, 3),
+                RPCOption::new(Duration::from_millis(2000)),
+            )
+            .await;
+        assert!(
+            matches!(second, Ok(AppendEntriesResponse::Success)),
+            "a new term must get its own transfer, got {second:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "a different vote must NOT be served by the in-flight transfer"
+        );
+    }
+
+    /// openraft rewinds the range after a conflict. The in-flight transfer
+    /// carries MORE than the caller now wants, so reporting it as matching
+    /// would claim the follower holds entries it was never sent.
+    #[tokio::test]
+    async fn a_shrunk_range_starts_a_fresh_transfer() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, seen, _probes, _guard) =
+            spawn_append_responder(Duration::from_millis(150), AppendReply::Success).await;
+        let mut peer = peer_client_for(addr).await;
+
+        let first = tokio::time::timeout(
+            Duration::from_millis(50),
+            peer.append_entries(
+                append_req(1, None, 6),
+                RPCOption::new(Duration::from_millis(50)),
+            ),
+        )
+        .await;
+        assert!(first.is_err(), "first call must time out");
+
+        let second = peer
+            .append_entries(
+                append_req(1, None, 3),
+                RPCOption::new(Duration::from_millis(2000)),
+            )
+            .await;
+        assert!(
+            matches!(second, Ok(AppendEntriesResponse::Success)),
+            "a rewound range must be sent on its own, got {second:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "a shrunk range must NOT be answered by the longer in-flight transfer"
+        );
+    }
+
+    /// Heartbeats share the replication stream. If one queued behind an 8 MiB
+    /// transfer the leader would look dead for the whole upload and the cluster
+    /// would elect around it — trading the bug for a worse one.
+    #[tokio::test]
+    async fn a_heartbeat_is_not_queued_behind_an_inflight_transfer() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, seen, probes, _guard) =
+            spawn_append_responder(Duration::from_millis(400), AppendReply::Success).await;
+        let mut peer = peer_client_for(addr).await;
+
+        let first = tokio::time::timeout(
+            Duration::from_millis(50),
+            peer.append_entries(
+                append_req(1, None, 3),
+                RPCOption::new(Duration::from_millis(50)),
+            ),
+        )
+        .await;
+        assert!(first.is_err(), "first call must time out");
+
+        // An empty-entries probe: it must reach the peer on its own connection
+        // rather than waiting for the 400 ms transfer to finish.
+        let mut heartbeat = append_req(1, None, 3);
+        heartbeat.entries.clear();
+        let beat = peer
+            .append_entries(heartbeat, RPCOption::new(Duration::from_millis(2000)))
+            .await;
+
+        assert!(
+            matches!(beat, Ok(AppendEntriesResponse::Success)),
+            "a heartbeat must be answered while a transfer is in flight, got {beat:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the heartbeat carries no entries, so the body must still have been sent once"
+        );
+        assert!(
+            probes.load(Ordering::SeqCst) >= 1,
+            "the heartbeat must reach the peer as its own entry-less request, \
+             never coalesced into the transfer"
+        );
+    }
+
+    /// A failed transfer must surface and clear the slot, so the next attempt is
+    /// a real retry rather than a replay of the same cached failure.
+    #[tokio::test]
+    async fn a_transfer_error_surfaces_and_clears_the_slot() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, seen, _probes, _guard) =
+            spawn_append_responder(Duration::from_millis(0), AppendReply::ServerError).await;
+        let mut peer = peer_client_for(addr).await;
+
+        let first = peer
+            .append_entries(
+                append_req(1, None, 3),
+                RPCOption::new(Duration::from_millis(2000)),
+            )
+            .await;
+        assert!(
+            first.is_err(),
+            "a 500 must surface as an error, got {first:?}"
+        );
+
+        let second = peer
+            .append_entries(
+                append_req(1, None, 3),
+                RPCOption::new(Duration::from_millis(2000)),
+            )
+            .await;
+        assert!(
+            second.is_err(),
+            "the retry must also fail against a still-broken peer"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "a cleared slot means the retry is a real request, not a cached failure"
+        );
+    }
+
+    /// A follower's 413 is an *answer*, not silence. Mapping it to `Unreachable`
+    /// makes openraft back off and re-send the identical oversized batch
+    /// forever; `PayloadTooLarge` makes it halve the batch and retry at once.
+    #[tokio::test]
+    async fn a_follower_413_maps_to_payload_too_large_with_a_halved_hint() {
+        use openraft::network::{RPCOption, RaftNetwork};
+
+        let (addr, _seen, _probes, _guard) =
+            spawn_append_responder(Duration::from_millis(0), AppendReply::BodyTooLarge).await;
+        let mut peer = peer_client_for(addr).await;
+
+        // Eight entries in the batch, so the hint must be four.
+        let err = peer
+            .append_entries(
+                append_req(1, None, 8),
+                RPCOption::new(Duration::from_millis(2000)),
+            )
+            .await
+            .expect_err("a 413 must be an error");
+
+        match err {
+            RPCError::PayloadTooLarge(too_large) => {
+                assert_eq!(
+                    too_large.entries_hint(),
+                    4,
+                    "eight entries must be halved to four so openraft retries smaller"
+                );
+                // `RPCTypes` is private in openraft 0.9, so the action is
+                // asserted through the rendered form rather than the enum.
+                assert!(
+                    too_large.to_string().contains("AppendEntries"),
+                    "the hint must be about the AppendEntries payload, got {too_large}"
+                );
+            }
+            other => panic!("a follower 413 must map to PayloadTooLarge, got {other:?}"),
+        }
     }
 }

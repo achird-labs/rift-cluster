@@ -303,6 +303,16 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
+    /// The per-attempt deadline this client applies by default.
+    ///
+    /// Exposed so a caller that needs a *size-aware* deadline can build one on
+    /// top of it rather than re-deriving the base from a constant — Raft
+    /// replication does exactly that for large log entries (#411).
+    #[must_use]
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.config.request_timeout
+    }
+
     /// Build a client. `signer` is `None` only for an explicitly insecure
     /// cluster (see [`crate::config`]).
     #[must_use]
@@ -343,7 +353,15 @@ impl RpcClient {
 
         let mut attempt = 0;
         loop {
-            let result = self.attempt(peer, method, path, body.clone()).await;
+            let result = self
+                .attempt(
+                    peer,
+                    method,
+                    path,
+                    body.clone(),
+                    self.config.request_timeout,
+                )
+                .await;
             match result {
                 Ok(response) => {
                     self.health.record_success(peer);
@@ -372,12 +390,74 @@ impl RpcClient {
         }
     }
 
+    /// Call `method path` on `peer` exactly once, bounded by `deadline`.
+    ///
+    /// [`Self::call`] is wrong for a Raft replication transfer twice over:
+    /// openraft is already the retry loop, so a second attempt here re-sends the
+    /// whole body (8 MiB, for a dataset at its quota), and the fixed
+    /// `request_timeout` is far too short for an entry that size once the
+    /// transfer is allowed to outlive openraft's 50 ms RPC deadline (#411).
+    ///
+    /// Health accounting is identical to `call`'s: only liveness failures count
+    /// against the peer, because a `Handler` refusal proves it answered.
+    pub async fn call_once(
+        &self,
+        peer: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<Vec<u8>, RpcError> {
+        if !self.health.is_healthy(peer) {
+            let err = RpcError::Transport(format!("peer {peer} is not healthy"));
+            metrics::rpc_failure(err.reason());
+            return Err(err);
+        }
+
+        // `deadline` twice, deliberately: `attempt` applies it to the request
+        // itself, and the outer bound also covers collecting the response body,
+        // which `attempt` does not time out. Passing it inward is the load-
+        // bearing half — an outer-only bound leaves `request_timeout` binding.
+        match tokio::time::timeout(deadline, self.attempt(peer, method, path, body, deadline)).await
+        {
+            Ok(Ok(response)) => {
+                self.health.record_success(peer);
+                Ok(response)
+            }
+            Ok(Err(e)) => {
+                if e.is_liveness_failure() {
+                    self.health.record_failure(peer);
+                }
+                metrics::rpc_failure(e.reason());
+                Err(e)
+            }
+            Err(_elapsed) => {
+                // The caller's deadline, not `request_timeout`. A transfer that
+                // cannot cross the link in the budget it was given is a liveness
+                // failure like any other timeout.
+                self.health.record_failure(peer);
+                metrics::rpc_failure(RpcError::Timeout.reason());
+                Err(RpcError::Timeout)
+            }
+        }
+    }
+
+    /// One request/response exchange, bounded by `deadline`.
+    ///
+    /// The deadline is a parameter rather than always `config.request_timeout`
+    /// because a Raft replication transfer needs a size-aware one (#411).
+    /// Wrapping this call from outside would not work: the inner bound is what
+    /// actually cancels the HTTP request, so a nested-but-larger outer deadline
+    /// leaves the shorter one binding — which is the second ceiling behind the
+    /// heartbeat one, and it silently caps transfers at whatever fits in
+    /// `request_timeout`.
     async fn attempt(
         &self,
         peer: SocketAddr,
         method: &str,
         path: &str,
         body: Vec<u8>,
+        deadline: Duration,
     ) -> Result<Vec<u8>, RpcError> {
         let uri = format!("http://{peer}{path}");
         let mut builder = Request::builder()
@@ -401,11 +481,10 @@ impl RpcClient {
             .body(Full::new(Bytes::from(body)))
             .map_err(|e| RpcError::Transport(e.to_string()))?;
 
-        let response =
-            tokio::time::timeout(self.config.request_timeout, self.http.request(request))
-                .await
-                .map_err(|_| RpcError::Timeout)?
-                .map_err(|e| RpcError::Transport(e.to_string()))?;
+        let response = tokio::time::timeout(deadline, self.http.request(request))
+            .await
+            .map_err(|_| RpcError::Timeout)?
+            .map_err(|e| RpcError::Transport(e.to_string()))?;
 
         let status = response.status();
         let bytes = response
@@ -830,6 +909,177 @@ mod tests {
                 method: "POST".into(),
                 path: "/internal/v1/echo".into()
             }
+        );
+    }
+
+    /// A responder that answers `200 {}` after `delay`.
+    async fn spawn_slow_responder(delay: Duration) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow responder");
+        let addr = listener.local_addr().expect("responder addr");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 8192];
+                    let _ = socket.read(&mut buf).await;
+                    tokio::time::sleep(delay).await;
+                    let body = b"{}";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        (addr, handle)
+    }
+
+    /// #411's *second* ceiling: the transfer deadline must **replace** the
+    /// per-attempt `request_timeout`, not nest outside it.
+    ///
+    /// This is the case the sibling test below cannot see, because there the
+    /// deadline is the shorter of the two and binds either way. Wrapping
+    /// `attempt` in a larger timeout leaves the smaller inner bound governing,
+    /// so transfers silently cap at whatever fits in `request_timeout` — which
+    /// is exactly what shipped in the first cut of this fix: on a 3-node
+    /// cluster a 4 MiB dataset committed in 1.1 s while 8 MiB never committed
+    /// at all, because a 2 s inner bound cut every attempt that ran longer.
+    #[tokio::test]
+    async fn call_once_deadline_outlives_a_shorter_request_timeout() {
+        // Answers later than `request_timeout` but well inside the deadline.
+        let (addr, _guard) = spawn_slow_responder(Duration::from_millis(600)).await;
+
+        let client = RpcClient::new(
+            None,
+            Arc::new(AlwaysHealthy),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(200),
+                // Deliberately shorter than the answer takes: if this still
+                // binds, a large replication transfer can never complete.
+                request_timeout: Duration::from_millis(200),
+                max_retries: 0,
+            },
+        );
+
+        let result = client
+            .call_once(
+                addr,
+                "POST",
+                "/internal/v1/raft/append",
+                b"body".to_vec(),
+                Duration::from_secs(5),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "the caller's 5 s deadline must govern, not the 200 ms request_timeout: {result:?}"
+        );
+    }
+
+    /// `call` must keep its configured per-attempt timeout — threading a
+    /// deadline through `attempt` for #411 must not change the ordinary path.
+    #[tokio::test]
+    async fn call_still_honours_the_configured_request_timeout() {
+        let (addr, _guard) = spawn_slow_responder(Duration::from_millis(800)).await;
+
+        let client = RpcClient::new(
+            None,
+            Arc::new(AlwaysHealthy),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(200),
+                request_timeout: Duration::from_millis(150),
+                max_retries: 0,
+            },
+        );
+
+        let result = client
+            .call(addr, "POST", "/internal/v1/ping", b"body".to_vec())
+            .await;
+
+        assert!(
+            matches!(result, Err(RpcError::Timeout)),
+            "an ordinary call must still be cut at its configured 150 ms, got {result:?}"
+        );
+    }
+
+    /// #411: a replication transfer needs exactly ONE attempt, bounded by a
+    /// deadline the caller picks from the body size.
+    ///
+    /// `call` is wrong for it twice over: openraft is already the retry loop, so
+    /// a second attempt re-sends the whole 8 MiB body, and its fixed 2 s
+    /// `request_timeout` is far too short for a large entry once the transfer is
+    /// allowed to outlive openraft's 50 ms RPC deadline.
+    #[tokio::test]
+    async fn call_once_honours_its_deadline_and_does_not_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Accepts, then answers nothing — the deadline is the only way out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        let _guard = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Hold it open rather than dropping it: a closed connection
+                // would surface as a transport error and never exercise the
+                // deadline this test exists to pin.
+                held.push(socket);
+            }
+        });
+
+        let client = RpcClient::new(
+            None,
+            Arc::new(AlwaysHealthy),
+            RpcClientConfig {
+                connect_timeout: Duration::from_millis(200),
+                // Deliberately huge and deliberately retrying: if either of
+                // these bounds the call, the caller's deadline is being ignored.
+                request_timeout: Duration::from_secs(30),
+                max_retries: 3,
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let result = client
+            .call_once(
+                addr,
+                "POST",
+                "/internal/v1/raft/append",
+                b"body".to_vec(),
+                Duration::from_millis(150),
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(RpcError::Timeout)),
+            "the caller's deadline must surface as Timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the 150 ms deadline must bound the call, not the 30 s request_timeout (took {elapsed:?})"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "call_once must make exactly ONE attempt even with max_retries=3"
         );
     }
 }
