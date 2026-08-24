@@ -1334,8 +1334,13 @@ async fn attempt_rejoin(node: &RaftNode, targets: &[String]) {
         };
         for addr in resolved {
             match node.join_via(&Authority::from(addr)).await {
-                Ok(()) => {
-                    tracing::info!(%addr, "rejoined through a peer after the fallback window");
+                Ok(outcome) => {
+                    tracing::info!(
+                        %addr,
+                        role = ?outcome.role,
+                        catching_up = outcome.catching_up,
+                        "rejoined through a peer after the fallback window"
+                    );
                     return;
                 }
                 Err(e) => last_failure = Some(format!("{addr}: {e}")),
@@ -1711,8 +1716,17 @@ async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
             };
             for addr in resolved {
                 match node.join_via(&Authority::from(addr)).await {
-                    Ok(()) => {
-                        tracing::info!(%addr, "joined the cluster through seed");
+                    // Admitted-but-catching-up is success (#433): this node is
+                    // a member, and promotion is the leader's job. Startup
+                    // proceeds; blocking here is exactly the defect two-phase
+                    // admission removed.
+                    Ok(outcome) => {
+                        tracing::info!(
+                            %addr,
+                            role = ?outcome.role,
+                            catching_up = outcome.catching_up,
+                            "joined the cluster through seed"
+                        );
                         clear_departed_marker(&state_dir);
                         return Ok(());
                     }

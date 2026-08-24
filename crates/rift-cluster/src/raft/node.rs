@@ -30,8 +30,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::network::{
-    self, CLUSTER_APPLIED_PATH, CLUSTER_JOIN_PATH, CLUSTER_LEAVE_PATH, CLUSTER_WRITE_PATH,
-    JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
+    self, AdmittedRole, CLUSTER_APPLIED_PATH, CLUSTER_JOIN_PATH, CLUSTER_LEAVE_PATH,
+    CLUSTER_WRITE_PATH, JoinAccepted, JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
 };
 use super::ring::Ring;
 use super::store::{
@@ -259,6 +259,33 @@ pub enum LeaveOutcome {
     Retained,
 }
 
+/// The outcome of a successful [`RaftNode::join_via`] (#433): this node **is
+/// a member** — that is what "successful" means, and it is all that startup
+/// needs. What it is a member *as*, and whether it is still catching up, are
+/// carried for logging and for the operator; neither is a reason to fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinOutcome {
+    /// What the leader admitted this node as.
+    pub role: JoinedAs,
+    /// The leader's estimate at admission time. `true` means the leader's
+    /// promotion sweep will make this node a voter once it is current;
+    /// nothing on this node needs to wait for that.
+    pub catching_up: bool,
+}
+
+/// What a join made this node, as reported by the leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinedAs {
+    /// Admitted as a learner; promotion is the leader's job (#433).
+    Learner,
+    /// A voter — promoted at admission, or already one (a restart).
+    Voter,
+    /// An older leader that predates #433 answered: it admitted this node the
+    /// blocking way, so it is a member and current — it just cannot say which
+    /// role in its reply.
+    Unknown,
+}
+
 /// The control-plane Raft node.
 pub struct RaftNode {
     id: NodeId,
@@ -290,6 +317,8 @@ pub struct RaftNode {
     // it evicts for a peer take the same lock — the voter floor and the
     // auto-voter ceiling are only exact if every path holds it (#55, #69).
     membership_gate: network::MembershipGate,
+    /// The auto-voter ceiling both admission phases enforce (#433).
+    auto_voter_ceiling: network::AutoVoterCeiling,
     // Signals that parked intents deserve a drain attempt now, rather than at
     // the composition's next periodic sweep (#83). Lives here because this node
     // owns the parked-intent ledger (`park_intent`/`parked_intents`/
@@ -356,6 +385,52 @@ impl RaftNode {
     /// Elections are held until a leader is heard or
     /// [`Self::RESTART_ELECTION_GRACE`] passes. A fresh node has no state and is
     /// unaffected; a single-voter fleet must elect itself and is exempt.
+    /// Cadence of the leader's learner-promotion sweep (#433, phase 2). One
+    /// second: an order of magnitude above the replication timers, so the
+    /// sweep never competes with catch-up itself, while a caught-up learner
+    /// still becomes a voter well inside any operator's patience.
+    pub const LEARNER_PROMOTION_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// Phase 2 of two-phase admission (#433): every node runs the sweep on a
+    /// fixed cadence; only the leader's ever acts (elsewhere every peer reads
+    /// as catching up and the scan falls through, after one cheap metrics
+    /// read). Holds the Raft only weakly — a strong handle here would keep
+    /// the storage alive after a drop without shutdown, the same cycle the
+    /// leading probe had to avoid (#431).
+    fn spawn_promotion_loop(
+        slot: &RaftSlot,
+        gate: &network::MembershipGate,
+        ceiling: &network::AutoVoterCeiling,
+    ) {
+        let slot = Arc::downgrade(slot);
+        let gate = Arc::clone(gate);
+        let ceiling = Arc::clone(ceiling);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Self::LEARNER_PROMOTION_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(slot) = slot.upgrade() else { return };
+                let Some(raft) = slot.get() else { continue };
+                if raft.metrics().borrow().state != ServerState::Leader {
+                    continue;
+                }
+                // A promotion racing a deposition surfaces ForwardToLeader or
+                // a handler error; the next tick sees the truth. Background
+                // sweep: nothing to propagate to, so the failure is a trace.
+                if let Err(e) = network::promote_ready_learners(
+                    raft,
+                    &gate,
+                    ceiling.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .await
+                {
+                    tracing::debug!(error = %e, "promotion sweep skipped this tick");
+                }
+            }
+        });
+    }
+
     async fn hold_elections_until_leader_heard(raft: &Raft<TypeConfig>) -> Result<(), NodeError> {
         let has_state = raft
             .is_initialized()
@@ -465,10 +540,15 @@ impl RaftNode {
         // Control-plane routes register last so a caller's route table can never
         // shadow the Raft endpoints the cluster itself depends on.
         let membership_gate: network::MembershipGate = Arc::new(tokio::sync::Mutex::new(()));
+        // One ceiling for both admission phases (#433); see `AutoVoterCeiling`.
+        let auto_voter_ceiling: network::AutoVoterCeiling = Arc::new(
+            std::sync::atomic::AtomicUsize::new(network::MAX_AUTO_VOTERS),
+        );
         let router = network::control_routes(
             config.routes.clone(),
             slot.clone(),
             Arc::clone(&membership_gate),
+            Arc::clone(&auto_voter_ceiling),
         );
 
         let (signer, verifier) = match &config.secret {
@@ -539,6 +619,7 @@ impl RaftNode {
         slot.set(raft.clone())
             .map_err(|_| NodeError::Runtime("raft slot already set".to_owned()))?;
         Self::hold_elections_until_leader_heard(&raft).await?;
+        Self::spawn_promotion_loop(&slot, &membership_gate, &auto_voter_ceiling);
 
         let server_task = tokio::spawn(server.serve());
 
@@ -553,6 +634,7 @@ impl RaftNode {
             shutdown_invoked: AtomicBool::new(false),
             last_leave_error: Mutex::new(None),
             membership_gate,
+            auto_voter_ceiling,
             replay_wake: Arc::new(tokio::sync::Notify::new()),
         })
     }
@@ -561,6 +643,17 @@ impl RaftNode {
     #[must_use]
     pub fn id(&self) -> NodeId {
         self.id
+    }
+
+    /// Lower (or raise) the auto-voter ceiling this node enforces in **both**
+    /// admission phases — the join handler's in-call promotion and the
+    /// promotion sweep. Test-only: it exists so a ceiling test can provoke the
+    /// #55 race on a three-node cluster instead of an eleven-node one, with
+    /// the sweep bound by the same number.
+    #[doc(hidden)]
+    pub fn set_auto_voter_ceiling(&self, ceiling: usize) {
+        self.auto_voter_ceiling
+            .store(ceiling, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The authority peers dial this node on.
@@ -638,7 +731,7 @@ impl RaftNode {
     /// Seeding at a follower is not an exotic case: `--cluster-seeds` pointing at
     /// one stable member is the obvious thing for an operator to configure, and
     /// before this the joiner retried that member until its deadline expired.
-    pub async fn join_via(&self, seed: &Authority) -> Result<(), NodeError> {
+    pub async fn join_via(&self, seed: &Authority) -> Result<JoinOutcome, NodeError> {
         let request = JoinRequest {
             node_id: self.id,
             advertise: self.advertise.to_string(),
@@ -646,15 +739,36 @@ impl RaftNode {
         let body =
             serde_json::to_vec(&request).map_err(|e| NodeError::Membership(e.to_string()))?;
 
-        chase_join(seed.as_str(), Self::FORWARD_ATTEMPTS, |target| {
+        let accepted: JoinAccepted = chase_join(seed.as_str(), Self::FORWARD_ATTEMPTS, |target| {
             let body = body.clone();
             async move {
-                self.call_any_typed(&target, "POST", CLUSTER_JOIN_PATH, body)
-                    .await
-                    .map(|_| ())
+                let reply = self
+                    .call_any_typed(&target, "POST", CLUSTER_JOIN_PATH, body)
+                    .await?;
+                serde_json::from_slice(&reply)
+                    .map_err(|e| RpcError::Handler(format!("decode join reply: {e}")))
             }
         })
-        .await
+        .await?;
+
+        if !accepted.admitted {
+            // No current leader sends this, but the field exists on the wire
+            // and a refusal misread as an admission would let a non-member
+            // start serving.
+            return Err(NodeError::Membership(format!(
+                "seed {seed} answered the join without admitting this node"
+            )));
+        }
+        Ok(JoinOutcome {
+            role: match accepted.role {
+                Some(AdmittedRole::Voter) => JoinedAs::Voter,
+                Some(AdmittedRole::Learner) => JoinedAs::Learner,
+                // An older leader's bare `Ok`: its admission included the full
+                // blocking catch-up, so "member, current" is what it meant.
+                None => JoinedAs::Unknown,
+            },
+            catching_up: accepted.catching_up,
+        })
     }
 
     /// Best-effort, deadline-bounded departure from the cluster (issue #6).
@@ -2020,10 +2134,10 @@ fn map_write_err(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> N
 /// the transport is the closure's business, the give-up rule is this function's.
 /// A leadership that keeps moving must cost a bounded number of round trips,
 /// never a ping-pong between two nodes each naming the other.
-async fn chase_join<F, Fut>(seed: &str, max_attempts: usize, mut send: F) -> Result<(), NodeError>
+async fn chase_join<T, F, Fut>(seed: &str, max_attempts: usize, mut send: F) -> Result<T, NodeError>
 where
     F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<(), RpcError>>,
+    Fut: Future<Output = Result<T, RpcError>>,
 {
     let mut target = seed.to_owned();
     for attempt in 0..max_attempts {
@@ -2034,8 +2148,9 @@ where
         if attempt > 0 {
             crate::metrics::join_forwarded();
         }
-        let Err(error) = send(target.clone()).await else {
-            return Ok(());
+        let error = match send(target.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
         };
         // Only a named leader is worth another hop. A hintless refusal means an
         // election is unsettled, and there is nowhere better to ask — the
@@ -2676,6 +2791,13 @@ mod tests {
         let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
         n2.join_via(n1.advertise()).await.expect("n2 join");
         n3.join_via(n1.advertise()).await.expect("n3 join");
+        // The premise — two voters survive the leader — must be established,
+        // not assumed: a joiner still a learner at the kill cannot elect.
+        assert_eq!(
+            wait_voters(&n1, &BTreeSet::from([1, 2, 3])).await,
+            BTreeSet::from([1, 2, 3]),
+            "three voters must form before the leader is killed"
+        );
 
         // Kill the leader; the remaining two must elect a new one.
         n1.shutdown().await.expect("shutdown n1");
@@ -2729,6 +2851,9 @@ mod tests {
         r2.expect("n2 join must not lose the admission race");
         r3.expect("n3 join must not lose the admission race");
 
+        // Formation is bounded, not instantaneous (#433): a joiner that
+        // missed the in-call currency window is promoted by the sweep.
+        wait_voters(&n1, &BTreeSet::from([1, 2, 3])).await;
         let voters = n1.status().voters;
         assert!(
             voters.contains(&2) && voters.contains(&3),
@@ -2761,6 +2886,7 @@ mod tests {
         n2.join_via(n1.advertise())
             .await
             .expect("n2 join via leader");
+        wait_voters(&n1, &BTreeSet::from([1, 2])).await;
 
         // Asserted, not assumed: if leadership happened to move to n2 the join
         // below would succeed locally and prove nothing at all.
@@ -2830,7 +2956,7 @@ mod tests {
 
         let seen = RefCell::new(Vec::new());
         // Every hop redirects, and the two addresses point at each other.
-        let err = chase_join("a:1", RaftNode::FORWARD_ATTEMPTS, |target| {
+        let err = chase_join::<(), _, _>("a:1", RaftNode::FORWARD_ATTEMPTS, |target| {
             seen.borrow_mut().push(target.clone());
             async move {
                 Err(RpcError::NotLeader {
@@ -2908,6 +3034,7 @@ mod tests {
             r2.unwrap_or_else(|e| panic!("round {round}: n2 join lost the admission race: {e}"));
             r3.unwrap_or_else(|e| panic!("round {round}: n3 join lost the admission race: {e}"));
 
+            wait_voters(&n1, &BTreeSet::from([1, 2, 3])).await;
             let voters = n1.status().voters;
             assert!(
                 voters.contains(&2) && voters.contains(&3),
@@ -2926,24 +3053,26 @@ mod tests {
     /// both promote. Repeated like the #38 gate: one pass can get lucky.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_admissions_never_exceed_the_ceiling() {
-        use crate::raft::network;
-
-        for round in 0..4 {
+        for round in 0..3 {
             let (d1, d2, d3) = (
                 TempDir::new().unwrap(),
                 TempDir::new().unwrap(),
                 TempDir::new().unwrap(),
             );
             let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+            // The ceiling is a node property read by both admission phases
+            // (#433), so it is set on the node and the joins go through the
+            // real handler: driving `admit` directly with a private ceiling
+            // would leave the node's own promotion sweep bound by a different
+            // number, and the sweep would then "exceed" a ceiling it was
+            // never given.
+            n1.set_auto_voter_ceiling(2);
             n1.cluster_init().await.expect("init n1");
             let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
             let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
 
-            let gate = tokio::sync::Mutex::new(());
-            let (r2, r3) = tokio::join!(
-                network::admit(&n1.raft, &gate, 2, n2.advertise().to_string(), 2),
-                network::admit(&n1.raft, &gate, 3, n3.advertise().to_string(), 2),
-            );
+            let seed = n1.advertise();
+            let (r2, r3) = tokio::join!(n2.join_via(seed), n3.join_via(seed));
             r2.unwrap_or_else(|e| {
                 panic!("round {round}: losing the promotion race must not fail the join: {e}")
             });
@@ -2951,11 +3080,26 @@ mod tests {
                 panic!("round {round}: losing the promotion race must not fail the join: {e}")
             });
 
+            // Watched across several promotion-sweep ticks, not sampled once:
+            // the invariant is that the committed voter set *never* exceeds
+            // the ceiling — in-call promotion and the sweep together — and
+            // that it reaches it.
+            let watch_until =
+                tokio::time::Instant::now() + RaftNode::LEARNER_PROMOTION_INTERVAL * 3;
+            let mut reached = false;
+            while tokio::time::Instant::now() < watch_until {
+                let voters = n1.status().voters;
+                assert!(
+                    voters.len() <= 2,
+                    "round {round}: auto-promotion exceeded the ceiling: {voters:?}"
+                );
+                reached |= voters.len() == 2;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             let voters = n1.status().voters;
-            assert_eq!(
-                voters.len(),
-                2,
-                "round {round}: auto-promotion exceeded the ceiling: {voters:?}"
+            assert!(
+                reached && voters.len() == 2,
+                "round {round}: the ceiling must be reached and held, got {voters:?}"
             );
             assert!(
                 voters.contains(&1),
@@ -3107,6 +3251,7 @@ mod tests {
         n2.join_via(&bound)
             .await
             .expect("join through the bound address");
+        wait_voters(&n1, &BTreeSet::from([1, 2])).await;
         (n1, n2, (d1, d2))
     }
 

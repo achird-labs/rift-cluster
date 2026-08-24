@@ -121,6 +121,14 @@ Key rules, each carrying weight:
   citizens (they bind imposters, own flow-state keys, serve traffic) with no
   election weight. Consensus latency stays flat as the fleet grows to the
   16-node ceiling.
+- **Admission is two-phase** (#433, the etcd learner pattern): the join RPC
+  commits the membership entry — the fast, consensus-bound fact — and returns
+  `admitted` with the role and a `catching_up` estimate. Catch-up belongs to
+  replication, and the **leader's** promotion sweep (1 s cadence) makes a
+  caught-up learner a voter under the same admission gate and ceiling. A
+  joiner never waits out its own catch-up inside an RPC deadline, and the
+  diagram above is literally what the code does: `Learner → CatchingUp →
+  Voter`, each transition a committed entry the joiner does not drive.
 - **Readiness is a gate, not a vibe**: `/readyz` goes 200 only when the node's
   applied index has caught up to the leader's commit index observed at join
   *and* its imposters are bound-or-reported. An LB never routes to a node
