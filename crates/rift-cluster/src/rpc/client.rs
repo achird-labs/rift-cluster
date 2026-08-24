@@ -425,21 +425,43 @@ impl RpcClient {
                 Ok(response)
             }
             Ok(Err(e)) => {
-                if e.is_liveness_failure() {
-                    self.health.record_failure(peer);
-                }
-                metrics::rpc_failure(e.reason());
+                self.charge_single_attempt(peer, &e);
                 Err(e)
             }
             Err(_elapsed) => {
-                // The caller's deadline, not `request_timeout`. A transfer that
-                // cannot cross the link in the budget it was given is a liveness
-                // failure like any other timeout.
-                self.health.record_failure(peer);
-                metrics::rpc_failure(RpcError::Timeout.reason());
+                self.charge_single_attempt(peer, &RpcError::Timeout);
                 Err(RpcError::Timeout)
             }
         }
+    }
+
+    /// Charge a failed single-attempt call to `peer`'s health — except a deadline expiry.
+    ///
+    /// A caller-supplied deadline running out says the payload did not cross the link in the
+    /// budget *this caller* chose. That is a statement about the transfer, not about whether the
+    /// peer is reachable, which is what [`PeerHealth`] tracks. Charging it makes the tracker
+    /// defeat itself: three slow transfers trip the threshold, [`Self::call`]'s
+    /// `is_healthy` gate then fast-fails **every** RPC to that peer for the cooldown — heartbeats
+    /// included — and the node stops talking to a peer that was only ever on a slow link.
+    ///
+    /// Measured, not hypothetical: while diagnosing #431 the leader's first ~20 heartbeats to a
+    /// restarted node failed with "peer … is not healthy", its own liveness tracker having
+    /// suppressed the liveness check.
+    ///
+    /// Liveness is still observed, and far more often, by the small RPCs going through
+    /// [`Self::call`] — this only declines to add a signal that can be a false positive.
+    /// Connect and transport failures are charged as before: those *are* about the peer.
+    ///
+    /// **Not for [`Self::call`], and do not unify the two.** The exemption is specific to a
+    /// single attempt on a deadline the *caller* chose for a payload it chose. On the ordinary
+    /// retried path the timeout is the configured `request_timeout`, nobody picked it per-call,
+    /// and its expiry after the full retry budget is exactly the signal that marks a dead peer —
+    /// routing `call` through here would silently disable the health tracker.
+    fn charge_single_attempt(&self, peer: SocketAddr, err: &RpcError) {
+        if err.is_liveness_failure() && !matches!(err, RpcError::Timeout) {
+            self.health.record_failure(peer);
+        }
+        metrics::rpc_failure(err.reason());
     }
 
     /// One request/response exchange, bounded by `deadline`.
@@ -1009,6 +1031,126 @@ mod tests {
         assert!(
             matches!(result, Err(RpcError::Timeout)),
             "an ordinary call must still be cut at its configured 150 ms, got {result:?}"
+        );
+    }
+
+    /// A listener that accepts and then answers `status` after `delay`.
+    ///
+    /// Hand-rolled rather than an `RpcServer` because these tests turn on *when* the peer answers
+    /// and on it answering at all — the point is what the client records, not what it parses.
+    async fn responder(delay: Duration, status: u16) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("bound address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut scratch = vec![0u8; 16 * 1024];
+                    let _ = socket.read(&mut scratch).await;
+                    tokio::time::sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 {status} STATUS\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A deadline expiring must NOT mark the peer unhealthy.
+    ///
+    /// The regression this guards is self-defeating rather than merely wasteful: the health gate
+    /// covers `call` too, so a peer cooled down by slow transfers stops receiving heartbeats —
+    /// which is how a node on a slow link becomes a node nobody can reach (#431).
+    #[tokio::test]
+    async fn call_once_deadline_expiry_is_not_charged_to_peer_health() {
+        // Threshold 1: if the timeout were charged at all, the peer trips immediately.
+        let health = Arc::new(TrackedPeerHealth::with_params(1, Duration::from_secs(30)));
+        let addr = responder(Duration::from_secs(30), 200).await;
+        let client = RpcClient::new(
+            None,
+            Arc::clone(&health) as Arc<dyn PeerHealth>,
+            RpcClientConfig::default(),
+        );
+
+        let err = client
+            .call_once(
+                addr,
+                "POST",
+                "/internal/v1/echo",
+                vec![],
+                Duration::from_millis(150),
+            )
+            .await
+            .expect_err("the deadline expires");
+
+        assert_eq!(err, RpcError::Timeout);
+        assert!(
+            health.is_healthy(addr),
+            "a transfer that outran its own deadline says nothing about reachability"
+        );
+    }
+
+    /// The other half of the same rule: a peer that *answers* — even to refuse — is alive.
+    #[tokio::test]
+    async fn call_once_does_not_charge_a_handler_refusal_to_peer_health() {
+        let health = Arc::new(TrackedPeerHealth::with_params(1, Duration::from_secs(30)));
+        let addr = responder(Duration::ZERO, 500).await;
+        let client = RpcClient::new(
+            None,
+            Arc::clone(&health) as Arc<dyn PeerHealth>,
+            RpcClientConfig::default(),
+        );
+
+        let err = client
+            .call_once(
+                addr,
+                "POST",
+                "/internal/v1/echo",
+                vec![],
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a 500 is a refusal");
+
+        assert!(matches!(err, RpcError::Handler(_)), "{err:?}");
+        assert!(
+            health.is_healthy(addr),
+            "a peer that replied is reachable, whatever it replied"
+        );
+    }
+
+    /// A long deadline must not become a long hang against a peer already known to be gone.
+    #[tokio::test]
+    async fn call_once_fast_fails_an_unhealthy_peer() {
+        let client = RpcClient::new(None, Arc::new(NeverHealthy), RpcClientConfig::default());
+        // TEST-NET-3: guaranteed unroutable, so anything but a fast-fail parks for the deadline.
+        let peer: SocketAddr = "203.0.113.1:4790".parse().expect("valid test address");
+
+        let started = std::time::Instant::now();
+        let err = client
+            .call_once(
+                peer,
+                "POST",
+                "/internal/v1/ping",
+                vec![],
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("an unhealthy peer is refused up front");
+
+        assert!(matches!(err, RpcError::Transport(_)), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "did not fast-fail: {:?}",
+            started.elapsed()
         );
     }
 
