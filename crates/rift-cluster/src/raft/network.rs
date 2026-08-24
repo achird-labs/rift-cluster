@@ -901,8 +901,13 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot, gate: MembershipGat
                 Box::pin(async move {
                     let raft = raft_of(&slot)?;
                     let req = decode::<JoinRequest>(&body)?;
-                    admit(raft, &gate, req.node_id, req.advertise, MAX_AUTO_VOTERS).await?;
-                    encode(&JoinAccepted { admitted: true })
+                    let admission =
+                        admit(raft, &gate, req.node_id, req.advertise, MAX_AUTO_VOTERS).await?;
+                    encode(&JoinAccepted {
+                        admitted: true,
+                        role: Some(admission.role),
+                        catching_up: admission.catching_up,
+                    })
                 })
             }),
         )
@@ -929,9 +934,38 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot, gate: MembershipGat
 }
 
 /// Reply to a successful [`JoinRequest`].
+///
+/// `role` and `catching_up` arrived with two-phase admission (#433). Both
+/// default, so a reply from an older leader — the bare `{"admitted":true}` —
+/// still decodes: `role: None` (unknown) and `catching_up: false`, which is
+/// the only thing an old leader's `Ok` could mean (its admission included the
+/// full blocking catch-up). An older joiner reading a new leader's reply
+/// ignores the extra fields. A mixed-version fleet joins either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct JoinAccepted {
-    admitted: bool,
+pub(crate) struct JoinAccepted {
+    pub(crate) admitted: bool,
+    #[serde(default)]
+    pub(crate) role: Option<AdmittedRole>,
+    #[serde(default)]
+    pub(crate) catching_up: bool,
+}
+
+/// What the joiner is a member *as*, after phase-1 admission (#433).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AdmittedRole {
+    Learner,
+    Voter,
+}
+
+/// Phase-1 admission outcome (#433): the membership entry is committed and
+/// the node **is a member** — that is the fast, consensus-bound fact `admit`
+/// reports. Whether the member is *current* is a slow, replication-bound fact;
+/// `catching_up` carries the leader's estimate of it, and the leader's
+/// promotion sweep ([`promote_ready_learners`]) acts on it later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Admission {
+    pub(crate) role: AdmittedRole,
+    pub(crate) catching_up: bool,
 }
 
 /// Reply to a [`LeaveRequest`] the leader accepted for consideration.
@@ -985,9 +1019,13 @@ pub(crate) async fn local_write(
     }
 }
 
-/// Admit `id`@`advertise` to the cluster: add it as a learner, wait for it to
-/// catch up, then promote it to voter if the cluster is still under the
-/// ceiling — at the ceiling the joiner is admitted as a learner only (#55).
+/// Admit `id`@`advertise` to the cluster — **phase 1 of two-phase admission**
+/// (#433, the etcd learner pattern): commit the membership entry that makes
+/// the node a learner, and return. Catch-up is not waited for; it is a
+/// replication-bound fact the reply reports as `catching_up` and the leader's
+/// [`promote_ready_learners`] sweep acts on later. A joiner that is already
+/// current is still promoted here, under the same gate and ceiling as before,
+/// so a small fleet forms voters in one call exactly as it always did.
 /// Must run on the leader — on any other node openraft returns a
 /// `ForwardToLeader` error, surfaced here as a typed [`RpcError::NotLeader`]
 /// carrying the leader's address so the caller can re-issue there (#391).
@@ -1000,7 +1038,7 @@ pub(crate) async fn admit(
     id: NodeId,
     advertise: String,
     max_voters: usize,
-) -> Result<(), RpcError> {
+) -> Result<Admission, RpcError> {
     // Validated here as well as at the joiner's CLI, because this is the path
     // that actually writes an address into the replicated log: whatever arrives
     // on the wire becomes a durable membership entry, and one that can never
@@ -1011,10 +1049,17 @@ pub(crate) async fn admit(
 
     // Concurrent joins are the normal case (a StatefulSet rollout seeds every
     // pod off the same node), so failures name the candidate they belong to.
-    // The learner add — the slow, replication-bound phase — deliberately stays
-    // outside the gate so concurrent joins still parallelize catch-up.
+    //
+    // `blocking = false` is the load-bearing word of #433: with `true`,
+    // admission *included* the joiner's full catch-up, which for a multi-MiB
+    // snapshot cannot fit `ADMIT_COMMIT_TIMEOUT` by construction — and a
+    // catch-up longer than the seed deadline failed startup for a node Raft
+    // already listed as a member. Non-blocking, this waits (inside
+    // `membership_change`) only for the membership *entry* to commit: the
+    // fast, consensus-bound half of the job. The slow half belongs to
+    // replication and to [`promote_ready_learners`].
     membership_change(raft, &format!("admit {id}: add learner"), || {
-        raft.add_learner(id, BasicNode::new(advertise.to_string()), true)
+        raft.add_learner(id, BasicNode::new(advertise.to_string()), false)
     })
     .await?;
 
@@ -1030,19 +1075,53 @@ pub(crate) async fn admit(
     // so by the time a guard drops, the next holder's committed read includes
     // all prior auto-promotions. Without it, N concurrent admissions each read
     // a pre-promotion count and all pass the `< max_voters` check.
+    // Give the joiner one short window to become current before deciding its
+    // role. A fresh or small fleet's joiner is current within milliseconds,
+    // and the admit-promotes-in-one-call contract is worth keeping for it —
+    // every caller from a three-node bootstrap to the failover tests relies
+    // on a returned join meaning a formed voter. The window is a fraction of
+    // the joiner's RPC budget, so the case #433 exists for — a multi-MiB
+    // snapshot catch-up — still returns fast, as a learner with
+    // `catching_up: true`, and the promotion sweep takes it from there. An
+    // already-current voter (a restart) skips the wait entirely.
+    if !committed_voters(raft, id).await?.contains(&id) {
+        let currency_deadline = tokio::time::Instant::now() + ADMIT_CURRENCY_WAIT;
+        while is_catching_up(raft, id) && tokio::time::Instant::now() < currency_deadline {
+            tokio::time::sleep(ADMIT_CURRENCY_POLL).await;
+        }
+    }
+
     let _serialized = gate.lock().await;
     let voters = committed_voters(raft, id).await?;
-    if should_promote(&voters, id, max_voters) {
+    let catching_up = is_catching_up(raft, id);
+    if should_promote(&voters, id, max_voters) && !catching_up {
         membership_change(raft, &format!("admit {id}: promote to voter"), || {
             raft.change_membership(ChangeMembers::AddVoterIds(BTreeSet::from([id])), false)
         })
         .await?;
-    } else if voters.contains(&id) {
-        // A retried join from a node that is already a voter: nothing to do,
-        // but leave a trace so the three-way outcome is always greppable.
+        return Ok(Admission {
+            role: AdmittedRole::Voter,
+            catching_up: false,
+        });
+    }
+    if voters.contains(&id) {
+        // A retried join from a node that is already a voter (a restart):
+        // nothing to do, but leave a trace so the three-way outcome is always
+        // greppable.
         tracing::debug!(
             node_id = id,
+            catching_up,
             "join for an existing voter; membership unchanged"
+        );
+        return Ok(Admission {
+            role: AdmittedRole::Voter,
+            catching_up,
+        });
+    }
+    if should_promote(&voters, id, max_voters) {
+        tracing::info!(
+            node_id = id,
+            "admitted as learner, still catching up; the promotion sweep takes it from here"
         );
     } else {
         tracing::info!(
@@ -1051,6 +1130,99 @@ pub(crate) async fn admit(
             max_voters,
             "auto-voter ceiling reached; admitted as learner only"
         );
+    }
+    Ok(Admission {
+        role: AdmittedRole::Learner,
+        catching_up,
+    })
+}
+
+/// Whether `id`'s replication trails this leader by more than
+/// [`REPLICATION_LAG_THRESHOLD`] entries — or has no replication stream data
+/// yet at all, which a just-added learner does not and must read as "not
+/// caught up". Leader-only: on a non-leader `replication` is `None` and every
+/// peer reads as catching up, which is the safe direction for both callers.
+fn is_catching_up(raft: &Raft<TypeConfig>, id: NodeId) -> bool {
+    let metrics = raft.metrics();
+    let m = metrics.borrow();
+    let Some(last) = m.last_log_index else {
+        return true;
+    };
+    let matching = m
+        .replication
+        .as_ref()
+        .and_then(|r| r.get(&id).copied().flatten());
+    match matching {
+        Some(log_id) => last.saturating_sub(log_id.index) > REPLICATION_LAG_THRESHOLD,
+        None => true,
+    }
+}
+
+/// How long `admit` waits for a fresh learner to become current before
+/// answering with `catching_up: true` — the fast path's budget, not a
+/// correctness bound. Well inside `ADMIT_COMMIT_TIMEOUT` and the joiner's own
+/// RPC budget, both of which bounded the whole handler before #433.
+const ADMIT_CURRENCY_WAIT: Duration = Duration::from_millis(500);
+
+/// The poll cadence inside [`ADMIT_CURRENCY_WAIT`]'s window.
+const ADMIT_CURRENCY_POLL: Duration = Duration::from_millis(20);
+
+/// A learner within this many entries of the leader's log converges within
+/// one replication round, so promoting it cannot stall the membership change;
+/// farther behind, promotion waits for [`promote_ready_learners`] to observe
+/// it caught up. Entries, not bytes: openraft replicates in entry batches and
+/// its own catch-up accounting is entry-indexed.
+const REPLICATION_LAG_THRESHOLD: u64 = 16;
+
+/// **Phase 2 of two-phase admission** (#433): promote every caught-up learner
+/// in the committed membership, under the admission gate and beneath the
+/// auto-voter ceiling — the same gate and the same `should_promote` as
+/// admission itself, so the ceiling stays exact under concurrency (#55).
+///
+/// Driven by the leader's promotion loop on a fixed cadence; call it anywhere
+/// else and it is a cheap no-op (a non-leader sees every peer as catching up,
+/// and a promotion racing a leadership change surfaces `ForwardToLeader`,
+/// which the loop tolerates by trying again next tick). Idempotent: a voter
+/// is not a learner, so a promoted node drops out of the scan.
+pub(crate) async fn promote_ready_learners(
+    raft: &Raft<TypeConfig>,
+    gate: &Mutex<()>,
+    max_voters: usize,
+) -> Result<(), RpcError> {
+    let members: Vec<NodeId> = raft
+        .with_raft_state(|state| {
+            state
+                .membership_state
+                .committed()
+                .nodes()
+                .map(|(id, _)| *id)
+                .collect()
+        })
+        .await
+        .map_err(|e| RpcError::Handler(e.to_string()))?;
+
+    for id in members {
+        // Re-read the voter set per candidate: each promotion changes it, and
+        // the ceiling must be enforced against what has actually committed.
+        let voters = committed_voters(raft, id).await?;
+        if voters.contains(&id) || !should_promote(&voters, id, max_voters) {
+            continue;
+        }
+        if is_catching_up(raft, id) {
+            continue;
+        }
+        let _serialized = gate.lock().await;
+        // The gate was taken after the scan read; re-check under it so a
+        // concurrent admission's promotion is seen (#55's exactness argument).
+        let voters = committed_voters(raft, id).await?;
+        if !should_promote(&voters, id, max_voters) {
+            continue;
+        }
+        membership_change(raft, &format!("promote learner {id}"), || {
+            raft.change_membership(ChangeMembers::AddVoterIds(BTreeSet::from([id])), false)
+        })
+        .await?;
+        tracing::info!(node_id = id, "caught-up learner promoted to voter");
     }
     Ok(())
 }
@@ -1382,6 +1554,36 @@ mod tests {
             );
         }
     }
+    /// A pre-#433 leader answers the bare `{"admitted":true}`. It must decode
+    /// as "member, role unknown, not catching up" — the only thing that
+    /// leader's blocking admission could have meant — so a mixed-version
+    /// fleet still joins.
+    #[test]
+    fn an_old_leaders_bare_join_reply_still_decodes() {
+        let accepted: JoinAccepted =
+            serde_json::from_slice(br#"{"admitted":true}"#).expect("old wire shape decodes");
+        assert!(accepted.admitted);
+        assert_eq!(accepted.role, None);
+        assert!(!accepted.catching_up);
+    }
+
+    /// The other direction of the same skew: an old joiner must be able to
+    /// ignore the two fields a new leader adds. serde ignores unknown fields
+    /// by default, so this pins that no `deny_unknown_fields` sneaks onto the
+    /// old shape's stand-in.
+    #[test]
+    fn a_new_leaders_join_reply_carries_role_and_catch_up() {
+        let encoded = serde_json::to_vec(&JoinAccepted {
+            admitted: true,
+            role: Some(AdmittedRole::Learner),
+            catching_up: true,
+        })
+        .expect("encode");
+        let accepted: JoinAccepted = serde_json::from_slice(&encoded).expect("round trip");
+        assert_eq!(accepted.role, Some(AdmittedRole::Learner));
+        assert!(accepted.catching_up);
+    }
+
     #[test]
     fn should_promote_gates_on_ceiling_and_membership() {
         let voters: BTreeSet<NodeId> = BTreeSet::from([1, 2]);

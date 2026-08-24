@@ -20,7 +20,9 @@ pub mod ring;
 pub(crate) mod store;
 
 pub use identity::NodeIdentity;
-pub use node::{LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport};
+pub use node::{
+    JoinOutcome, JoinedAs, LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport,
+};
 pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
 pub use store::{DEFAULT_AUDIT_RETENTION_SECS, PullOutcome, SourceRecord, SourceRow};
 

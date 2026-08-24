@@ -3947,3 +3947,115 @@ async fn survivors_elect_while_the_departed_leader_still_runs() {
         "handover took {handover:?}; the first post-leave write races this"
     );
 }
+
+/// #433's acceptance: a fresh node whose catch-up is a multi-MiB snapshot
+/// joins a fleet with a purged log, and **startup succeeds immediately** —
+/// admission commits the membership entry and returns, with catch-up left to
+/// replication and promotion left to the leader's sweep.
+///
+/// Three claims in one scenario, each pinned separately:
+/// 1. `join_via` returns `Ok` on the *first* call, fast — under the old
+///    one-phase admission this call rode the full snapshot catch-up inside a
+///    1.5 s wait and failed by construction (the seed loop then retried into
+///    its 30 s deadline).
+/// 2. The joiner needs no further part in its own promotion: after the one
+///    join call it is never spoken for again (C5's criterion — the seed
+///    connection is gone), yet the leader's sweep promotes it to voter once
+///    caught up.
+/// 3. The end state is a four-voter fleet with the joiner converged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_behind_a_purged_log_starts_as_learner_and_the_leader_promotes_it() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start_with_snapshots(3, 2).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    // Put enough on the log — snapshotting every 2 entries, purging to the
+    // tip — that a fresh joiner can only be caught up by a multi-MiB
+    // snapshot, never by log replay.
+    let csv = big_csv(512 * 1024);
+    for i in 0..8 {
+        let r = cluster
+            .leader()
+            .expect("leader")
+            .submit(dataset_put(&format!("j{i}"), &csv))
+            .await
+            .expect("dataset commits");
+        assert_eq!(r.outcome, rift_cluster::ControlOutcome::Applied);
+    }
+
+    // A fourth node, exactly as `start_full` would build it.
+    let port = reserve_ports(1)[0];
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    let dir = TempDir::new().expect("tempdir");
+    let joiner = spawn_with_snapshot_policy(
+        4,
+        addr,
+        dir.path(),
+        cluster.audit_retention_secs,
+        cluster.snapshot_log_entries,
+    )
+    .await;
+
+    let seed = Authority::from(cluster.member(1).addr);
+    let asked = tokio::time::Instant::now();
+    let outcome = joiner
+        .join_via(&seed)
+        .await
+        .expect("the first join call must succeed: admission no longer includes catch-up");
+    let admission_took = asked.elapsed();
+    assert!(
+        admission_took < Duration::from_secs(5),
+        "admission took {admission_took:?}; it must commit a membership entry, \
+         not wait out a snapshot catch-up"
+    );
+
+    // Track the joiner in the harness so shutdown covers it. From here on,
+    // nothing calls anything on its behalf: promotion is the leader's job.
+    cluster.members.push(Member {
+        id: 4,
+        addr,
+        dir,
+        node: Some(joiner),
+    });
+
+    let everyone: BTreeSet<NodeId> = BTreeSet::from([1, 2, 3, 4]);
+    assert!(
+        cluster
+            .wait_voters(&everyone, Duration::from_secs(60))
+            .await,
+        "the leader's promotion sweep must make the caught-up joiner a voter \
+         without the joiner asking again (admitted as {:?}, catching_up: {})",
+        outcome.role,
+        outcome.catching_up
+    );
+
+    // And the member the fleet gained is a real one: it converges on the data.
+    let target = cluster
+        .leader()
+        .expect("leader")
+        .status()
+        .last_applied
+        .expect("leader applied something");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let mine = cluster
+            .member(4)
+            .node
+            .as_ref()
+            .expect("live")
+            .status()
+            .last_applied;
+        if mine >= Some(target) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            cluster.shutdown_all().await;
+            panic!("the promoted joiner never converged (at {mine:?}, leader at {target})");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    cluster.shutdown_all().await;
+}

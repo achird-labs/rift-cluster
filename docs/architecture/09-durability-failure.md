@@ -166,11 +166,12 @@ misses its deadline abandons the entire transfer back to offset 0, so the bounds
 are deliberately generous rather than tight (#428). Two apply, and the smaller
 governs — the RPC's own size-aware deadline (~6 s for a 1 MiB chunk: a flat
 budget plus a 1 MiB/s floor on the link) inside openraft's per-chunk
-`install_snapshot_timeout` of 10 s. A join whose first attempt returns a
-membership timeout while that install runs is expected and not an error: the
-membership entry has committed, the seed loop retries, and a later attempt
-returns once the joiner has applied it — though a catch-up that outlasts the
-seed loop's own deadline currently fails startup outright (#433).
+`install_snapshot_timeout` of 10 s. The join itself never rides that install:
+admission is two-phase (#433) — the join RPC returns once the membership
+entry commits, the node starts up as a learner, and the leader promotes it to
+voter when its replication is current. However long the catch-up above takes,
+it delays *promotion*, never startup; a refused, unreachable, or mis-secreted
+join still fails the deployment exactly as before.
 
 **Catch-up has a size ceiling below the documented quotas, and it is not the one
 above.** A fleet holding a few MiB of state catches a node up in seconds

@@ -30,8 +30,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::network::{
-    self, CLUSTER_APPLIED_PATH, CLUSTER_JOIN_PATH, CLUSTER_LEAVE_PATH, CLUSTER_WRITE_PATH,
-    JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
+    self, AdmittedRole, CLUSTER_APPLIED_PATH, CLUSTER_JOIN_PATH, CLUSTER_LEAVE_PATH,
+    CLUSTER_WRITE_PATH, JoinAccepted, JoinRequest, LeaveRequest, RaftSlot, RpcNetwork, WriteReply,
 };
 use super::ring::Ring;
 use super::store::{
@@ -259,6 +259,33 @@ pub enum LeaveOutcome {
     Retained,
 }
 
+/// The outcome of a successful [`RaftNode::join_via`] (#433): this node **is
+/// a member** — that is what "successful" means, and it is all that startup
+/// needs. What it is a member *as*, and whether it is still catching up, are
+/// carried for logging and for the operator; neither is a reason to fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinOutcome {
+    /// What the leader admitted this node as.
+    pub role: JoinedAs,
+    /// The leader's estimate at admission time. `true` means the leader's
+    /// promotion sweep will make this node a voter once it is current;
+    /// nothing on this node needs to wait for that.
+    pub catching_up: bool,
+}
+
+/// What a join made this node, as reported by the leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinedAs {
+    /// Admitted as a learner; promotion is the leader's job (#433).
+    Learner,
+    /// A voter — promoted at admission, or already one (a restart).
+    Voter,
+    /// An older leader that predates #433 answered: it admitted this node the
+    /// blocking way, so it is a member and current — it just cannot say which
+    /// role in its reply.
+    Unknown,
+}
+
 /// The control-plane Raft node.
 pub struct RaftNode {
     id: NodeId,
@@ -356,6 +383,43 @@ impl RaftNode {
     /// Elections are held until a leader is heard or
     /// [`Self::RESTART_ELECTION_GRACE`] passes. A fresh node has no state and is
     /// unaffected; a single-voter fleet must elect itself and is exempt.
+    /// Cadence of the leader's learner-promotion sweep (#433, phase 2). One
+    /// second: an order of magnitude above the replication timers, so the
+    /// sweep never competes with catch-up itself, while a caught-up learner
+    /// still becomes a voter well inside any operator's patience.
+    pub const LEARNER_PROMOTION_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// Phase 2 of two-phase admission (#433): every node runs the sweep on a
+    /// fixed cadence; only the leader's ever acts (elsewhere every peer reads
+    /// as catching up and the scan falls through, after one cheap metrics
+    /// read). Holds the Raft only weakly — a strong handle here would keep
+    /// the storage alive after a drop without shutdown, the same cycle the
+    /// leading probe had to avoid (#431).
+    fn spawn_promotion_loop(slot: &RaftSlot, gate: &network::MembershipGate) {
+        let slot = Arc::downgrade(slot);
+        let gate = Arc::clone(gate);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Self::LEARNER_PROMOTION_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(slot) = slot.upgrade() else { return };
+                let Some(raft) = slot.get() else { continue };
+                if raft.metrics().borrow().state != ServerState::Leader {
+                    continue;
+                }
+                // A promotion racing a deposition surfaces ForwardToLeader or
+                // a handler error; the next tick sees the truth. Background
+                // sweep: nothing to propagate to, so the failure is a trace.
+                if let Err(e) =
+                    network::promote_ready_learners(raft, &gate, network::MAX_AUTO_VOTERS).await
+                {
+                    tracing::debug!(error = %e, "promotion sweep skipped this tick");
+                }
+            }
+        });
+    }
+
     async fn hold_elections_until_leader_heard(raft: &Raft<TypeConfig>) -> Result<(), NodeError> {
         let has_state = raft
             .is_initialized()
@@ -539,6 +603,7 @@ impl RaftNode {
         slot.set(raft.clone())
             .map_err(|_| NodeError::Runtime("raft slot already set".to_owned()))?;
         Self::hold_elections_until_leader_heard(&raft).await?;
+        Self::spawn_promotion_loop(&slot, &membership_gate);
 
         let server_task = tokio::spawn(server.serve());
 
@@ -638,7 +703,7 @@ impl RaftNode {
     /// Seeding at a follower is not an exotic case: `--cluster-seeds` pointing at
     /// one stable member is the obvious thing for an operator to configure, and
     /// before this the joiner retried that member until its deadline expired.
-    pub async fn join_via(&self, seed: &Authority) -> Result<(), NodeError> {
+    pub async fn join_via(&self, seed: &Authority) -> Result<JoinOutcome, NodeError> {
         let request = JoinRequest {
             node_id: self.id,
             advertise: self.advertise.to_string(),
@@ -646,15 +711,36 @@ impl RaftNode {
         let body =
             serde_json::to_vec(&request).map_err(|e| NodeError::Membership(e.to_string()))?;
 
-        chase_join(seed.as_str(), Self::FORWARD_ATTEMPTS, |target| {
+        let accepted: JoinAccepted = chase_join(seed.as_str(), Self::FORWARD_ATTEMPTS, |target| {
             let body = body.clone();
             async move {
-                self.call_any_typed(&target, "POST", CLUSTER_JOIN_PATH, body)
-                    .await
-                    .map(|_| ())
+                let reply = self
+                    .call_any_typed(&target, "POST", CLUSTER_JOIN_PATH, body)
+                    .await?;
+                serde_json::from_slice(&reply)
+                    .map_err(|e| RpcError::Handler(format!("decode join reply: {e}")))
             }
         })
-        .await
+        .await?;
+
+        if !accepted.admitted {
+            // No current leader sends this, but the field exists on the wire
+            // and a refusal misread as an admission would let a non-member
+            // start serving.
+            return Err(NodeError::Membership(format!(
+                "seed {seed} answered the join without admitting this node"
+            )));
+        }
+        Ok(JoinOutcome {
+            role: match accepted.role {
+                Some(AdmittedRole::Voter) => JoinedAs::Voter,
+                Some(AdmittedRole::Learner) => JoinedAs::Learner,
+                // An older leader's bare `Ok`: its admission included the full
+                // blocking catch-up, so "member, current" is what it meant.
+                None => JoinedAs::Unknown,
+            },
+            catching_up: accepted.catching_up,
+        })
     }
 
     /// Best-effort, deadline-bounded departure from the cluster (issue #6).
@@ -2020,10 +2106,10 @@ fn map_write_err(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> N
 /// the transport is the closure's business, the give-up rule is this function's.
 /// A leadership that keeps moving must cost a bounded number of round trips,
 /// never a ping-pong between two nodes each naming the other.
-async fn chase_join<F, Fut>(seed: &str, max_attempts: usize, mut send: F) -> Result<(), NodeError>
+async fn chase_join<T, F, Fut>(seed: &str, max_attempts: usize, mut send: F) -> Result<T, NodeError>
 where
     F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<(), RpcError>>,
+    Fut: Future<Output = Result<T, RpcError>>,
 {
     let mut target = seed.to_owned();
     for attempt in 0..max_attempts {
@@ -2034,8 +2120,9 @@ where
         if attempt > 0 {
             crate::metrics::join_forwarded();
         }
-        let Err(error) = send(target.clone()).await else {
-            return Ok(());
+        let error = match send(target.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
         };
         // Only a named leader is worth another hop. A hintless refusal means an
         // election is unsettled, and there is nowhere better to ask — the
@@ -2830,7 +2917,7 @@ mod tests {
 
         let seen = RefCell::new(Vec::new());
         // Every hop redirects, and the two addresses point at each other.
-        let err = chase_join("a:1", RaftNode::FORWARD_ATTEMPTS, |target| {
+        let err = chase_join::<(), _, _>("a:1", RaftNode::FORWARD_ATTEMPTS, |target| {
             seen.borrow_mut().push(target.clone());
             async move {
                 Err(RpcError::NotLeader {
