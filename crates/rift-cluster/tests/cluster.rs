@@ -65,6 +65,19 @@ async fn spawn(
     dir: &Path,
     audit_retention_secs: u64,
 ) -> Arc<RaftNode> {
+    // Most of these tests drive `build_snapshot`/`install_snapshot` directly, so they need no help
+    // provoking one. The exception is #428's catch-up test, which needs a real snapshot to cross
+    // the wire and so passes the knob explicitly.
+    spawn_with_snapshot_policy(id, addr, dir, audit_retention_secs, None).await
+}
+
+async fn spawn_with_snapshot_policy(
+    id: NodeId,
+    addr: SocketAddr,
+    dir: &Path,
+    audit_retention_secs: u64,
+    snapshot_log_entries: Option<u64>,
+) -> Arc<RaftNode> {
     let config = NodeConfig {
         node_id: id,
         bind: addr,
@@ -74,9 +87,7 @@ async fn spawn(
         routes: Router::new(),
         engine: None,
         audit_retention_secs,
-        // These in-process tests drive `build_snapshot`/`install_snapshot` directly, so they need
-        // no help provoking one; the knob exists for the container tier, which cannot (issue #183).
-        snapshot_log_entries: None,
+        snapshot_log_entries,
     };
     // No retry-on-lock-contention: `RaftNode::shutdown` now waits for the Raft
     // core to release its storage handles before returning (#41), so a restart on
@@ -3049,13 +3060,7 @@ fn spool_file(dir: &Path, csv: &str) -> std::path::PathBuf {
 /// A CSV of at least `bytes` bytes with a unique first column — the quota-ceiling payload the
 /// RFC §11 check wants openraft/redb exercised at.
 fn big_csv(bytes: usize) -> String {
-    let mut csv = String::from("id,payload\n");
-    let mut i = 0u64;
-    while csv.len() < bytes {
-        csv.push_str(&format!("{i},{}\n", "x".repeat(1_000)));
-        i += 1;
-    }
-    csv
+    tagged_csv(bytes, "")
 }
 
 /// Issue #285: the bytes ride the log, so once the leader's write barrier has answered, every
@@ -3290,4 +3295,273 @@ async fn a_node_joining_after_the_upload_materialises_the_spool_file() {
     );
     joiner.shutdown().await.ok();
     cluster.shutdown_all().await;
+}
+
+/// A CSV of at least `bytes` bytes whose content is unique to `tag`.
+///
+/// Distinct content per dataset is the point: a dataset's blob is addressed by digest, so
+/// uploading the same bytes under N names stores one blob and the snapshot stays small.
+fn tagged_csv(bytes: usize, tag: &str) -> String {
+    let mut csv = String::from("id,payload\n");
+    let mut i = 0u64;
+    while csv.len() < bytes {
+        csv.push_str(&format!("{i},{tag}{}\n", "x".repeat(1_000)));
+        i += 1;
+    }
+    csv
+}
+
+/// Issue #428: a fleet that has snapshotted and purged catches a fresh node up **over the wire**,
+/// and keeps committing while it does.
+///
+/// Every byte of a dataset rides the state machine, so a fleet at RFC-005's quotas has a snapshot
+/// measured in MiB. openraft bounds each snapshot *chunk* by `install_snapshot_timeout` and
+/// abandons the whole transfer — back to offset 0 — when one misses, so at its defaults (3 MiB
+/// chunks, 200 ms) the transfer could never finish: chunks ride the JSON cluster port at ~4× their
+/// raw size, which is ~900 ms for a default chunk on loopback alone.
+///
+/// The write probe in the middle is the sharp end of this. Once the joiner is in the membership
+/// the fleet is in a joint configuration whose second half needs its ack, so a node that can never
+/// install its snapshot does not merely fail to catch up — it takes the leader's ability to commit
+/// anything with it. Measured before the fix on this exact shape: the joiner never converged in
+/// 60 s and the next `DatasetPut` never returned.
+///
+/// `snapshot_log_entries: Some(2)` (with the `max_in_snapshot_log_to_keep: 0` it implies) is what
+/// makes the catch-up a *snapshot* rather than log replication: by the time the joiner arrives the
+/// log it would need has been purged, so `install_snapshot` is openraft's only route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
+    /// ~4 MiB of state — well under RFC-005's 8 MiB per-dataset and 64 MiB per-tenant ceilings,
+    /// and already 20× what a default chunk could carry in its 200 ms budget.
+    const DATASETS: usize = 8;
+    const PER_DATASET_BYTES: usize = 512 * 1024;
+    const CONVERGE_BY: Duration = Duration::from_secs(30);
+    /// How long a write submitted mid-install may take to commit. Generous: it covers the whole
+    /// snapshot transfer, because it cannot commit until the joiner acknowledges.
+    const WRITE_STALL_BOUND: Duration = Duration::from_secs(45);
+    /// `rift-cluster-server`'s `REJOIN_ATTEMPT_INTERVAL`, which is what a real fleet does.
+    const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
+
+    let _serial = TEST_LOCK.lock().await;
+    let ports = reserve_ports(2);
+    let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().expect("addr");
+    let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().expect("addr");
+    let dir1 = TempDir::new().expect("tempdir");
+    let dir2 = TempDir::new().expect("tempdir");
+    let retention = rift_cluster::DEFAULT_AUDIT_RETENTION_SECS;
+
+    let leader = spawn_with_snapshot_policy(1, addr1, dir1.path(), retention, Some(2)).await;
+    leader.cluster_init().await.expect("bootstrap node 1");
+    let deadline = Instant::now() + LEADER_DEADLINE;
+    while !leader.status().is_leader {
+        assert!(Instant::now() < deadline, "node 1 never became leader");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut last_revision = 0;
+    let mut last_csv = String::new();
+    for i in 0..DATASETS {
+        let csv = tagged_csv(PER_DATASET_BYTES, &format!("d{i}-"));
+        let response = leader
+            .submit(dataset_put(&format!("d{i}"), &csv))
+            .await
+            .unwrap_or_else(|e| panic!("dataset d{i} commits: {e}"));
+        last_revision = response.revision;
+        last_csv = csv;
+    }
+    assert!(
+        leader
+            .await_applied(last_revision, CONVERGE_DEADLINE)
+            .await
+            .is_empty()
+    );
+
+    // Let the snapshot policy run before the joiner arrives, so the log it would otherwise be
+    // caught up from has been purged and `install_snapshot` is openraft's only route. There is no
+    // public signal for "snapshot built and log purged", so this is a settle rather than a poll —
+    // the entry count is what makes it certain, the same argument the chaos tier's snapshot
+    // overlay relies on.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let joiner = spawn_with_snapshot_policy(2, addr2, dir2.path(), retention, Some(2)).await;
+    let seed = Authority::from(addr1);
+    // The first attempt is *expected* to fail: `admit` waits `ADMIT_COMMIT_TIMEOUT` (1.5 s) for the
+    // membership entry to apply, which a multi-MiB snapshot install legitimately outlasts. That
+    // bound is the joiner's own RPC budget and is deliberately unchanged — the real seed loop
+    // (`rift-cluster-server`'s `SEED_JOIN_DEADLINE`/`REJOIN_ATTEMPT_INTERVAL`) retries, so this
+    // test does too.
+    let mut joined = joiner.join_via(&seed).await.is_ok();
+
+    // The membership change commits regardless of that timeout, so the leader now owes the joiner
+    // acks. Wait for that to be visible before probing, or the probe proves nothing.
+    let deadline = Instant::now() + CONVERGE_DEADLINE;
+    while !leader.status().voters.contains(&2) {
+        assert!(
+            Instant::now() < deadline,
+            "the joiner never reached the leader's membership, so the write probe below would be \
+             vacuous"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Submitted *while* the install is streaming, and deliberately not awaited here.
+    //
+    // It cannot commit yet and that is Raft, not a defect: the fleet is in the joint configuration
+    // {1},{1,2}, and a majority of a two-member set is two, so nothing commits until the joiner
+    // acknowledges. What this probe pins down is that the stall is **bounded by the install** — a
+    // fleet whose snapshot can never land does not merely fail to grow, it stops accepting writes
+    // for good. Before the fix this write never returned at all.
+    let probe_leader = Arc::clone(&leader);
+    let probe = tokio::spawn(async move {
+        tokio::time::timeout(
+            WRITE_STALL_BOUND,
+            probe_leader.submit(dataset_put("during-join", "id,v\n1,a\n")),
+        )
+        .await
+    });
+
+    let last_name = format!("d{}", DATASETS - 1);
+    let deadline = Instant::now() + CONVERGE_BY;
+    let mut last_attempt = Instant::now();
+    let mut converged = false;
+    while Instant::now() < deadline {
+        if joiner
+            .dataset(DEFAULT_TENANT, &last_name)
+            .expect("read")
+            .is_some()
+        {
+            converged = true;
+            break;
+        }
+        // Re-join at the real seed loop's cadence. Retrying as fast as this loop polls would be a
+        // different test entirely: every attempt takes the leader's admission gate and proposes
+        // membership entries, so a tight retry contends with the very install it is waiting for.
+        if !joined && last_attempt.elapsed() >= REJOIN_INTERVAL {
+            last_attempt = Instant::now();
+            joined = joiner.join_via(&seed).await.is_ok();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let joiner_status = joiner.status();
+    let leader_status = leader.status();
+    assert!(
+        converged,
+        "the joiner was never caught up by snapshot within {CONVERGE_BY:?}: joiner          {joiner_status:?}, leader {leader_status:?}"
+    );
+
+    let probe = probe
+        .await
+        .expect("the probe task ran")
+        .expect("a write submitted during the install must commit once the joiner catches up")
+        .expect("the probe write commits");
+    assert_eq!(probe.outcome, rift_cluster::ControlOutcome::Applied);
+
+    // Installing a snapshot must also materialise the blobs' spool files, or the joiner holds a
+    // dataset record it cannot serve a lookup from.
+    let spool = spool_file(dir2.path(), &last_csv);
+    let on_disk = std::fs::read(&spool)
+        .unwrap_or_else(|e| panic!("the joiner never materialised {spool:?}: {e}"));
+    assert_eq!(on_disk.len(), last_csv.len());
+
+    joiner.shutdown().await.ok();
+    leader.shutdown().await.ok();
+}
+
+/// Issue #428, the fan-out half: catch-up in a fleet that already holds a quorum without the
+/// joiner, so the install cannot be masked by the joiner's ack being required anyway.
+///
+/// In the test above the fleet goes from one voter to two, which makes every commit wait on the
+/// joiner; here nodes 1 and 2 commit without node 3, so a disrupted install shows up as a stalled
+/// or restarted transfer rather than as a wedged fleet.
+///
+/// **What `leaders_seen` does and does not prove.** It pins that leadership stays put across a
+/// multi-MiB install, which is worth having. It is *not* evidence that chunk size keeps a
+/// follower's election timer quiet — a follower receiving a snapshot gets no lease refresh at all
+/// (`Raft::install_snapshot` only reaches the engine on the final chunk, and openraft sends no
+/// AppendEntries to a peer while its snapshot streams). A *fresh* joiner cannot campaign for an
+/// unrelated reason: it has applied nothing, so its own effective membership does not list it as a
+/// voter, and `handle_tick_election` returns early for a non-voter. The case where a node is
+/// already a voter and *can* campaign mid-install is a real hole, and such a node does not catch
+/// up at all today — measured, and filed as #431.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() {
+    const CONVERGE_BY: Duration = Duration::from_secs(30);
+    const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
+
+    let _serial = TEST_LOCK.lock().await;
+    let ports = reserve_ports(3);
+    let addrs: Vec<SocketAddr> = ports
+        .iter()
+        .map(|p| format!("127.0.0.1:{p}").parse().expect("addr"))
+        .collect();
+    let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().expect("tempdir")).collect();
+    let retention = rift_cluster::DEFAULT_AUDIT_RETENTION_SECS;
+
+    let n1 = spawn_with_snapshot_policy(1, addrs[0], dirs[0].path(), retention, Some(2)).await;
+    n1.cluster_init().await.expect("bootstrap node 1");
+    let deadline = Instant::now() + LEADER_DEADLINE;
+    while !n1.status().is_leader {
+        assert!(Instant::now() < deadline, "node 1 never became leader");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let seed = Authority::from(addrs[0]);
+    // Node 2 joins while there is nothing to catch up on, so the two-voter quorum below is formed
+    // without exercising the path under test.
+    let n2 = spawn_with_snapshot_policy(2, addrs[1], dirs[1].path(), retention, Some(2)).await;
+    n2.join_via(&seed)
+        .await
+        .expect("node 2 joins an empty fleet");
+
+    let mut last_revision = 0;
+    for i in 0..8 {
+        let csv = tagged_csv(512 * 1024, &format!("m{i}-"));
+        last_revision = n1
+            .submit(dataset_put(&format!("m{i}"), &csv))
+            .await
+            .unwrap_or_else(|e| panic!("dataset m{i} commits: {e}"))
+            .revision;
+    }
+    assert!(
+        n1.await_applied(last_revision, CONVERGE_DEADLINE)
+            .await
+            .is_empty()
+    );
+    // See the sibling test: no public signal for "snapshot built and purged", so this is a settle.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let n3 = spawn_with_snapshot_policy(3, addrs[2], dirs[2].path(), retention, Some(2)).await;
+    let mut joined = n3.join_via(&seed).await.is_ok();
+    let mut last_attempt = Instant::now();
+    let deadline = Instant::now() + CONVERGE_BY;
+    let mut converged = false;
+    let mut leaders_seen = BTreeSet::new();
+    while Instant::now() < deadline {
+        if let Some(leader) = n1.status().current_leader {
+            leaders_seen.insert(leader);
+        }
+        if n3.dataset(DEFAULT_TENANT, "m7").expect("read").is_some() {
+            converged = true;
+            break;
+        }
+        if !joined && last_attempt.elapsed() >= REJOIN_INTERVAL {
+            last_attempt = Instant::now();
+            joined = n3.join_via(&seed).await.is_ok();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let n3_status = n3.status();
+    n3.shutdown().await.ok();
+    n2.shutdown().await.ok();
+    n1.shutdown().await.ok();
+
+    assert!(
+        converged,
+        "the joiner never caught up within {CONVERGE_BY:?}: {n3_status:?}"
+    );
+    assert_eq!(
+        leaders_seen,
+        BTreeSet::from([1]),
+        "leadership must not move while a joiner installs its snapshot"
+    );
 }

@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::error::{
     ChangeMembershipError, ClientWriteError, InProgress, NetworkError, RPCError, RaftError,
@@ -82,6 +82,12 @@ pub(crate) const MIN_VOTERS: usize = 2;
 /// their own budgets transitively; that only re-triggers the same cheap,
 /// idempotent retry, and a leader too wedged to commit promptly cannot admit
 /// anyone anyway.
+///
+/// A joiner that must be caught up by a multi-MiB `install_snapshot` routinely outlasts this on
+/// its **first** attempt (#428) — the membership entry commits, but applying it waits on the
+/// snapshot. That is expected, not a failure to fix here: the caller retries (`SEED_JOIN_DEADLINE`
+/// and `REJOIN_ATTEMPT_INTERVAL` in `rift-cluster-server`'s compose), and a later attempt returns
+/// promptly once the install completes.
 const ADMIT_COMMIT_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// How many times a membership change re-submits after losing the slot to a
@@ -140,6 +146,27 @@ impl RaftNetworkFactory<TypeConfig> for RpcNetwork {
     }
 }
 
+/// How one Raft RPC is delivered.
+///
+/// Only `install_snapshot` is bulk today. `append_entries` can carry a payload just as large — a
+/// `DatasetPut` entry is the whole CSV — but it stays on the retried path here because its
+/// transfer problem is a different one with a different fix (#411 makes concurrent attempts share
+/// a single in-flight transfer rather than restarting it); routing it through this arm as well
+/// would collide with that work rather than complement it.
+#[derive(Clone, Copy, Debug)]
+enum Delivery {
+    /// A small, latency-bound RPC. [`RpcClient`]'s own retries and flat `request_timeout` apply.
+    Retried,
+    /// A bulk transfer: exactly one attempt, on a deadline scaled to the body size.
+    ///
+    /// openraft is already the retry loop for these and keeps the transfer's own progress (its
+    /// snapshot chunk loop holds the offset), so a retry underneath it re-sends the whole body
+    /// and races the caller's next attempt. Worse, the flat `request_timeout` is sized for a
+    /// control RPC: a multi-MiB chunk cut off by it can never complete however often it is
+    /// retried, which is #428 one layer below openraft's own per-chunk deadline.
+    BulkSingleAttempt,
+}
+
 /// A network client aimed at one peer. Cheap to build; the underlying connection
 /// pool is shared across every peer via the cloned [`RpcClient`].
 pub(crate) struct PeerClient {
@@ -157,6 +184,7 @@ impl PeerClient {
         &self,
         path: &str,
         req: &Req,
+        delivery: Delivery,
     ) -> Result<Resp, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>
     where
         Req: Serialize,
@@ -181,9 +209,45 @@ impl PeerClient {
         // and the live one is reached without any pinning state of our own.
         // Each cooldown expiry lets it be tried once more — which is the point,
         // since an address that comes back must be usable again.
+        // A bulk transfer's deadline is a budget for this whole send, not for each address in
+        // turn. openraft wraps the entire `install_snapshot` call in its own `install_snapshot_
+        // timeout` and abandons the transfer when that fires, so a per-address deadline would let
+        // a peer advertising N addresses spend N × the budget and blow openraft's bound whenever
+        // the first address is reachable-but-hung — restarting the snapshot from offset 0, which
+        // is the very failure #428 exists to remove. Spending one budget in order keeps the total
+        // bounded however many addresses the resolver returns; a persistently dead one then stops
+        // consuming it at all, because `RpcClient` fast-fails an address its health tracker has
+        // already given up on.
+        let budget = match delivery {
+            Delivery::Retried => None,
+            Delivery::BulkSingleAttempt => Some(self.client.replication_deadline(body.len())),
+        };
+        let started = Instant::now();
+
+        // The body is handed to the last address rather than cloned for it: for a snapshot chunk
+        // that is multiple MiB, and the single-address case — every literal advertise address, so
+        // nearly all of them — then copies nothing at all.
+        let mut body = body;
+        let last_index = addrs.len().saturating_sub(1);
         let mut last: Option<RpcError> = None;
-        for peer in &addrs {
-            match self.client.call(*peer, "POST", path, body.clone()).await {
+        for (index, peer) in addrs.iter().enumerate() {
+            let payload = if index == last_index {
+                std::mem::take(&mut body)
+            } else {
+                body.clone()
+            };
+            let attempt = match budget {
+                None => self.client.call(*peer, "POST", path, payload).await,
+                Some(budget) => {
+                    let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+                        break;
+                    };
+                    self.client
+                        .call_once(*peer, "POST", path, payload, remaining)
+                        .await
+                }
+            };
+            match attempt {
                 Ok(response) => {
                     return serde_json::from_slice(&response)
                         .map_err(|e| RPCError::Network(NetworkError::new(&e)));
@@ -270,7 +334,7 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.send(RAFT_APPEND_PATH, &rpc).await
+        self.send(RAFT_APPEND_PATH, &rpc, Delivery::Retried).await
     }
 
     async fn vote(
@@ -278,7 +342,7 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.send(RAFT_VOTE_PATH, &rpc).await
+        self.send(RAFT_VOTE_PATH, &rpc, Delivery::Retried).await
     }
 
     async fn install_snapshot(
@@ -289,7 +353,8 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
     > {
-        self.send(RAFT_SNAPSHOT_PATH, &rpc).await
+        self.send(RAFT_SNAPSHOT_PATH, &rpc, Delivery::BulkSingleAttempt)
+            .await
     }
 }
 

@@ -109,6 +109,38 @@ majority of voters** is the honest limit of a self-contained cluster: configs
 survive only as `--datadir` exports/backups (Chapter 10's backup runbook);
 this is stated rather than hedged.
 
+That catch-up moves the *whole* state machine, datasets and spec documents
+included, so it is measured in MiB rather than KiB — and it costs roughly 4× its
+size on the wire, because snapshot chunks ride the JSON cluster port as byte
+arrays. The transfer is bounded **per chunk**, not per snapshot: a chunk that
+misses its deadline abandons the entire transfer back to offset 0, so the bounds
+are deliberately generous rather than tight (#428). Two apply, and the smaller
+governs — the RPC's own size-aware deadline (~6 s for a 1 MiB chunk: a flat
+budget plus a 1 MiB/s floor on the link) inside openraft's per-chunk
+`install_snapshot_timeout` of 10 s. A join whose first attempt returns a
+membership timeout while that install runs is expected and not an error: the
+membership entry has committed, the seed loop retries, and a later attempt
+returns once the joiner has applied it — though a catch-up that outlasts the
+seed loop's own deadline currently fails startup outright (#433).
+
+**Catch-up has a size ceiling below the documented quotas, and it is not the one
+above.** A fleet holding a few MiB of state catches a node up in seconds
+(measured: ~4 MiB in 8 s on loopback). A fleet at RFC-005's 64 MiB per-tenant
+dataset ceiling does **not** catch a node up at all — the joiner applies nothing
+even given minutes, though the same 64 MiB writes normally. So the quotas in
+RFC-005 §4 currently describe more state than a node can be brought up to hold,
+and an operator near them should expect a replacement node to fail to converge
+rather than to converge slowly. The per-chunk deadline above is not the cause;
+the remaining bottleneck is #432.
+
+A related gap, and the one more likely to be met in practice: the scenario above
+is a node that comes back **empty**, which is the case that works. A node that
+returns still holding its old state, having been down long enough for the fleet
+to snapshot and purge past it, does *not* catch up at all today (#431) — it
+rejoins, finds the leader, and stays at the index it left off. Until that is
+fixed, replacing such a node with a fresh one converges where restarting it does
+not.
+
 **Slow node (GC-pause-class stall, not dead).** The three protections:
 fast-fail RPC health stops per-request timeout burn; the bounded bridge sheds
 stateful ops so stateless traffic never queues behind a black hole (chaos C13
