@@ -503,7 +503,29 @@ impl RaftNode {
             RpcClientConfig::default(),
         );
         let resolver: Arc<dyn PeerResolver> = Arc::new(DnsResolver);
-        let network = RpcNetwork::new(client.clone(), Arc::clone(&resolver));
+        // The liveness tickers consult this before probing: a probe asserts
+        // "your leader is alive", which is only true while we lead — a
+        // departed or deposed leader's tickers would otherwise keep every
+        // follower's leader lease fresh and postpone the very election the
+        // fleet needs (the C5 graceful-leave handover). A live read of the
+        // metrics watch at the moment of the decision, not a flag maintained
+        // by a task whose scheduling lag could leave a stale `true` behind —
+        // under load, exactly when it would matter. Before the slot is filled
+        // (this node's own `Raft::new` below), nothing leads.
+        // Held as a `Weak`: the probe travels into the network factory, which
+        // the `Raft` owns — a strong slot here would close the cycle
+        // Raft → factory → probe → slot → Raft and keep the storage alive
+        // after a drop without shutdown.
+        let leading: super::network::LeadingProbe = {
+            let slot = Arc::downgrade(&slot);
+            Arc::new(move || {
+                slot.upgrade()
+                    .as_deref()
+                    .and_then(OnceCell::get)
+                    .is_some_and(|raft| raft.metrics().borrow().state == ServerState::Leader)
+            })
+        };
+        let network = RpcNetwork::new(client.clone(), Arc::clone(&resolver), leading);
 
         let raft = Raft::new(
             config.node_id,

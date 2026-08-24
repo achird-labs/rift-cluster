@@ -114,16 +114,39 @@ pub(crate) struct LeaveRequest {
 /// before the `Raft` exists; the node sets it once, after construction.
 pub(crate) type RaftSlot = Arc<OnceCell<Raft<TypeConfig>>>;
 
+/// How a [`PeerClient`] ticker asks "does this node lead *right now*?".
+///
+/// A live observation, not a cached mark: the production probe reads the
+/// node's metrics watch at the moment of the decision (`state == Leader`), so
+/// there is no updater task whose scheduling lag could leave a stale `true`
+/// behind after a step-down — under load, exactly when it would matter.
+/// During a snapshot-starvation window the reading may be stale in the other
+/// direction, and that is correct: a starved core cannot have stepped down,
+/// because it is the starved thing.
+pub(crate) type LeadingProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// The sending side: builds a per-target client over one pooled [`RpcClient`].
 #[derive(Clone)]
 pub(crate) struct RpcNetwork {
     client: RpcClient,
     resolver: Arc<dyn PeerResolver>,
+    /// Whether the node this factory belongs to leads at the moment asked.
+    /// Every [`PeerClient`] ticker consults it before probing; see the field
+    /// on [`PeerClient`] for why.
+    leading: LeadingProbe,
 }
 
 impl RpcNetwork {
-    pub(crate) fn new(client: RpcClient, resolver: Arc<dyn PeerResolver>) -> Self {
-        Self { client, resolver }
+    pub(crate) fn new(
+        client: RpcClient,
+        resolver: Arc<dyn PeerResolver>,
+        leading: LeadingProbe,
+    ) -> Self {
+        Self {
+            client,
+            resolver,
+            leading,
+        }
     }
 }
 
@@ -139,6 +162,7 @@ impl RaftNetworkFactory<TypeConfig> for RpcNetwork {
             inflight: None,
             probe_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             liveness: Arc::new(std::sync::Mutex::new(PeerLiveness::default())),
+            leading: Arc::clone(&self.leading),
             ticker: None,
         };
         peer.ticker = Some(peer.spawn_liveness_ticker());
@@ -172,6 +196,16 @@ pub(crate) struct PeerClient {
     /// Shared with the liveness ticker: the leader's last-seen vote and when
     /// openraft last sent this peer anything. See [`PeerClient::spawn_liveness_ticker`].
     liveness: Arc<std::sync::Mutex<PeerLiveness>>,
+    /// Whether this node currently leads. A probe asserts "your leader is
+    /// alive", which is only true while we lead. openraft does not drop an
+    /// ex-leader's idle replication clients promptly, so without this gate a
+    /// gracefully departed (or deposed) leader's tickers keep speaking its
+    /// old — still highest — vote, every follower's leader lease stays fresh,
+    /// and the election the fleet needs is postponed for as long as the
+    /// process lives. That is exactly the C5 rolling-restart outage: the
+    /// handover is supposed to complete during the drain, and the drain is
+    /// precisely when openraft is silent and the ticker would speak.
+    leading: LeadingProbe,
     ticker: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -396,11 +430,17 @@ impl PeerClient {
         let addr = self.addr.clone();
         let gate = Arc::clone(&self.probe_inflight);
         let liveness = Arc::clone(&self.liveness);
+        let leading = Arc::clone(&self.leading);
         let deadline = self.client.request_timeout();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering;
             loop {
                 tokio::time::sleep(LIVENESS_TICK).await;
+                // A node that stopped leading must fall silent: its silence is
+                // what lets the survivors' leases lapse and a successor win.
+                if !leading() {
+                    continue;
+                }
                 let due = liveness.lock().ok().and_then(|l| {
                     let quiet = l.last_sent.is_none_or(|t| t.elapsed() >= LIVENESS_TICK);
                     if quiet { l.vote } else { None }
@@ -1536,7 +1576,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver);
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
         let mut peer = network
             .new_client(2, &BasicNode::new("dual-stack-peer:4790".to_owned()))
             .await;
@@ -1629,7 +1669,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver);
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
         let mut peer = network
             .new_client(2, &BasicNode::new("all-dead:4790".to_owned()))
             .await;
@@ -1694,7 +1734,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver);
+        let mut network = RpcNetwork::new(client, resolver, Arc::new(|| true));
 
         // Driven through one `PeerClient` from `new_client`, which is the whole
         // point: calling the free `resolve_peer` twice would pass even if
@@ -1917,8 +1957,22 @@ mod tests {
     }
 
     /// Build a `PeerClient` aimed at `addr` with no retries, so a test observes
-    /// exactly the adapter's own behaviour.
+    /// exactly the adapter's own behaviour. The node is treated as leading, so
+    /// the liveness ticker is armed.
     async fn peer_client_for(addr: SocketAddr) -> PeerClient {
+        peer_client_with_leading(addr, Arc::new(std::sync::atomic::AtomicBool::new(true))).await
+    }
+
+    /// [`peer_client_for`], with the caller holding the `leading` flag. The
+    /// flag is wrapped into the production [`LeadingProbe`] shape, so the
+    /// ticker reads it at the moment of each decision exactly as it would
+    /// read the metrics watch.
+    async fn peer_client_with_leading(
+        addr: SocketAddr,
+        leading: Arc<std::sync::atomic::AtomicBool>,
+    ) -> PeerClient {
+        let leading: LeadingProbe =
+            Arc::new(move || leading.load(std::sync::atomic::Ordering::Acquire));
         use crate::rpc::{AlwaysHealthy, RpcClientConfig};
         use openraft::network::RaftNetworkFactory;
 
@@ -1936,7 +1990,7 @@ mod tests {
                 max_retries: 0,
             },
         );
-        let mut network = RpcNetwork::new(client, resolver);
+        let mut network = RpcNetwork::new(client, resolver, leading);
         network
             .new_client(2, &BasicNode::new(addr.to_string()))
             .await
@@ -2341,6 +2395,48 @@ mod tests {
         assert!(
             probes.load(Ordering::SeqCst) >= 1,
             "250 ms of silence from openraft must produce at least one probe"
+        );
+    }
+
+    /// The ticker must fall silent the moment this node stops leading: openraft
+    /// does not drop an ex-leader's idle replication clients promptly, and its
+    /// old vote is still the highest — so a probe from it reads as a live
+    /// leader and keeps every follower's leader lease fresh, postponing the
+    /// election a graceful leave depends on (the C5 rolling-restart outage).
+    #[tokio::test]
+    async fn the_liveness_ticker_falls_silent_when_this_node_stops_leading() {
+        use openraft::network::{RPCOption, RaftNetwork};
+        use std::sync::atomic::Ordering;
+
+        let (addr, _bodies, probes, _guard) =
+            spawn_append_responder(Duration::from_millis(0), AppendReply::Success).await;
+        let leading = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut peer = peer_client_with_leading(addr, Arc::clone(&leading)).await;
+
+        // Note a vote and let openraft go quiet: the armed ticker speaks.
+        let mut hb = append_req(1, Some(3), 3);
+        hb.entries.clear();
+        let _ = peer
+            .append_entries(hb, RPCOption::new(Duration::from_millis(500)))
+            .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            probes.load(Ordering::SeqCst) >= 1,
+            "while leading, silence must produce probes"
+        );
+
+        // Step down. Give any in-flight tick a moment to drain, then require
+        // silence: the vote is still noted and openraft is still quiet — only
+        // the leadership flag has changed.
+        leading.store(false, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_step_down = probes.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            after_step_down,
+            "a node that stopped leading must not probe: its silence is what \
+             lets the survivors' leases lapse and a successor win"
         );
     }
 

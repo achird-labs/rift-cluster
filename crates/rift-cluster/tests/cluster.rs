@@ -3886,3 +3886,64 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
         "leadership must not move while a joiner installs its snapshot"
     );
 }
+
+/// The chaos suite's C5 first roll, in-process: the departing leader stays
+/// alive after `leave` returns — the container's drain window — and the
+/// survivors must elect a successor promptly *during* that window, because
+/// C5's first post-leave write is asserted with no retry.
+///
+/// This caught the liveness ticker speaking past step-down: openraft keeps an
+/// ex-leader's idle replication clients, the ticker filled the drain's silence
+/// with the old (still highest) vote, every survivor's leader lease stayed
+/// fresh, and no election happened while the process lived. The ticker now
+/// falls silent when the node stops leading; this pins the handover itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn survivors_elect_while_the_departed_leader_still_runs() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    // Leave WITHOUT shutting the process down: this is the drain window.
+    cluster
+        .member(leader)
+        .node
+        .as_ref()
+        .expect("running")
+        .leave(Duration::from_secs(5))
+        .await
+        .expect("the leader must be able to leave gracefully");
+
+    let t0 = tokio::time::Instant::now();
+    let survivors: Vec<NodeId> = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .filter(|&id| id != leader)
+        .collect();
+    let handover = loop {
+        let elected = survivors.iter().any(|&id| {
+            let s = cluster.member(id).node.as_ref().expect("running").status();
+            s.current_leader.is_some() && s.current_leader != Some(leader)
+        });
+        if elected {
+            break t0.elapsed();
+        }
+        if t0.elapsed() > Duration::from_secs(8) {
+            cluster.shutdown_all().await;
+            panic!(
+                "survivors never elected while the departed leader's process was \
+                 still alive — the C5 graceful-leave handover is broken"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    eprintln!("handover took {handover:?}");
+    cluster.shutdown_all().await;
+    assert!(
+        handover < Duration::from_millis(2000),
+        "handover took {handover:?}; the first post-leave write races this"
+    );
+}

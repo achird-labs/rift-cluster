@@ -151,7 +151,11 @@ per-peer *liveness ticker* — an empty AppendEntries on its current vote whenev
 openraft has sent that peer nothing for a heartbeat interval, which is the whole
 of a snapshot install and the whole of a large entry's transfer — sent through a
 probe that bypasses the peer-health tracker, because the tracker would otherwise
-refuse to talk to a just-restarted peer for its cooldown. On the returning node,
+refuse to talk to a just-restarted peer for its cooldown. The ticker speaks only
+while its node actually leads: a probe asserts "your leader is alive", and a
+leader that has gracefully left (or been deposed) must fall *silent* — its
+silence is what lets the survivors' leader leases lapse so a successor can win
+during the drain, which is the handover a rolling restart depends on. On the returning node,
 a member with persisted state holds elections for a 3 s *restart grace* until it
 hears a leader; a fresh node and a single-voter fleet are unaffected, and a
 genuinely dead leader is still replaced once the grace expires.
