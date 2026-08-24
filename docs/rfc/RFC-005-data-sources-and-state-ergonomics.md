@@ -211,8 +211,13 @@ refused with a 400 naming the row and value — never accepted-but-broken.
 > forever and never committed. The fix single-flights the transfer in the
 > network adapter — it outlives the RPC deadline and a re-send attaches to it
 > instead of restarting it — so a quota-ceiling entry commits in
-> `O(size / link speed)` with the timers untouched. The 8 MiB restart test runs
-> unignored; see `docs/architecture/09-durability-failure.md`.
+> `O(size / link speed)` with the timers untouched. A 4 MiB entry commits on a
+> 3-node fleet in CI; 8 MiB commits in ~9.4 s on an unloaded host.
+> **One caveat remains, and it is not about the transfer:** on a
+> CPU-constrained host a large entry can still trip #430, where an empty log read
+> panics openraft's replication worker and the leader loses its streams. The
+> 8 MiB restart test stays `#[ignore]`d against that issue, not against #411.
+> See `docs/architecture/09-durability-failure.md`.
 
 **Decision: dataset bytes are committed through the Raft log and materialized
 to a per-node spool file at apply time.** No blob sidecar, no fetch protocol,

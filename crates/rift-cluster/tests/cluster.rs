@@ -3308,14 +3308,27 @@ async fn a_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
 /// RFC-005 §11's check: an upload at the per-dataset ceiling (8 MiB) is one log entry, and the
 /// fleet must be comfortable with it.
 ///
-/// It was not, until #411. openraft 0.9 bounds every AppendEntries RPC by `heartbeat_interval`
-/// (50 ms here) and drops the future when that fires, so an entry that could not transfer and
-/// fsync inside one round trip restarted from byte 0 forever: ≥1 MiB never committed and
-/// ~512 KiB took 23-548 s. The fix single-flights the transfer in the network adapter, so it
-/// outlives the RPC deadline and a re-send attaches to it — the timers are untouched.
+/// #411's half of this is done: openraft 0.9 bounds every AppendEntries RPC by
+/// `heartbeat_interval` (50 ms here) and drops the future when that fires, so an entry that could
+/// not transfer and fsync inside one round trip restarted from byte 0 forever — ≥1 MiB never
+/// committed and ~512 KiB took 23-548 s. The transfer is now single-flighted in the network
+/// adapter, so it outlives the RPC deadline and a re-send attaches to it rather than restarting
+/// it, with the timers untouched. Unloaded, this test passes in ~9.4 s.
 ///
-/// This is the acceptance test for that fix, which is why it runs unignored now.
+/// It stays ignored for a *different* and pre-existing reason (#430). `try_get_log_entries` can
+/// be asked for a range whose entries openraft has counted but `append` has not yet made
+/// readable; it answers with an empty vec, and openraft 0.9.24 does
+/// `logs.first().….unwrap()` on that (`replication/mod.rs:399`), panicking the replication
+/// workers and costing the leader its leadership. The window scales with entry size, so #411 is
+/// what makes it reachable — but it reproduces identically on a tree with #411's changes
+/// reverted, and it is a storage/openraft interaction rather than anything about the transfer.
+/// On a CPU-constrained runner it fires reliably.
+///
+/// Un-ignore this when #430 is fixed; it is that issue's acceptance test now. The 4 MiB
+/// `SpecPut` case below is #411's own CI-green proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "blocked on #430: an empty log read panics openraft's replication worker under load; \
+            #411's transfer fix is what makes an entry this large reach that window"]
 async fn an_eight_mebibyte_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
     let _serial = TEST_LOCK.lock().await;
     let bytes = 8 * 1024 * 1024 - 1_100;

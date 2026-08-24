@@ -94,6 +94,15 @@ so a 512 KiB entry took 23–548 s and anything ≥ 1 MiB never committed at all
 the effective ceiling was "whatever replicates in one heartbeat", far below both
 documented quotas.
 
+**Known limit, tracked as #430.** The transfer is fixed, but a large entry can
+still cost the leader its replication streams on a CPU-constrained host: openraft
+may ask the log store for an index it has counted but `append` has not yet made
+readable, and it panics on the empty answer rather than tolerating it. The window
+grows with entry size, so it is reachable now that large entries replicate at
+all. Measured: a 4 MiB entry is unaffected in CI; 8 MiB is fine on an unloaded
+host and fails under saturation. Until #430 lands, treat multi-MiB entries as
+sound but not yet proven at the 8 MiB quota on small hosts.
+
 ## Scenario walkthroughs
 
 **One voter crashes (the common case).** Raft elects within ~1–3 s if it was
