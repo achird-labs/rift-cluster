@@ -3630,20 +3630,24 @@ fn tagged_csv(bytes: usize, tag: &str) -> String {
     csv
 }
 
-/// Issue #428: a fleet that has snapshotted and purged catches a fresh node up **over the wire**,
-/// and keeps committing while it does.
+/// Issue #428: a fleet that has snapshotted and purged catches a fresh node up **over the wire**.
 ///
 /// Every byte of a dataset rides the state machine, so a fleet at RFC-005's quotas has a snapshot
 /// measured in MiB. openraft bounds each snapshot *chunk* by `install_snapshot_timeout` and
 /// abandons the whole transfer — back to offset 0 — when one misses, so at its defaults (3 MiB
 /// chunks, 200 ms) the transfer could never finish: chunks ride the JSON cluster port at ~4× their
-/// raw size, which is ~900 ms for a default chunk on loopback alone.
+/// raw size, which is ~900 ms for a default chunk on loopback alone. Measured before the fix on
+/// this exact shape: the joiner never converged in 60 s.
 ///
-/// The write probe in the middle is the sharp end of this. Once the joiner is in the membership
-/// the fleet is in a joint configuration whose second half needs its ack, so a node that can never
-/// install its snapshot does not merely fail to catch up — it takes the leader's ability to commit
-/// anything with it. Measured before the fix on this exact shape: the joiner never converged in
-/// 60 s and the next `DatasetPut` never returned.
+/// This test once carried a second claim — a write submitted mid-install commits once the joiner
+/// catches up — because admission promoted the joiner to voter at once, the fleet entered the
+/// joint configuration `{1},{1,2}`, and a snapshot that never landed took the leader's ability to
+/// commit anything with it. Two-phase admission (#433) removed that failure mode by construction:
+/// a joiner is promoted in-call only if it is current within `ADMIT_CURRENCY_WAIT`, which a
+/// multi-MiB install never is, so it is a **learner for the whole install** and its ack is required
+/// for nothing. The probe became a write that could not fail, so it is gone; what replaced it is
+/// the two observations that make the new shape checkable — no voterhood during the install,
+/// voterhood after it.
 ///
 /// `snapshot_log_entries: Some(2)` (with the `max_in_snapshot_log_to_keep: 0` it implies) is what
 /// makes the catch-up a *snapshot* rather than log replication: by the time the joiner arrives the
@@ -3655,11 +3659,6 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     const DATASETS: usize = 8;
     const PER_DATASET_BYTES: usize = 512 * 1024;
     const CONVERGE_BY: Duration = Duration::from_secs(30);
-    /// How long a write submitted mid-install may take to commit. Generous: it covers the whole
-    /// snapshot transfer, because it cannot commit until the joiner acknowledges.
-    const WRITE_STALL_BOUND: Duration = Duration::from_secs(45);
-    /// `rift-cluster-server`'s `REJOIN_ATTEMPT_INTERVAL`, which is what a real fleet does.
-    const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
 
     let _serial = TEST_LOCK.lock().await;
     let ports = reserve_ports(2);
@@ -3704,44 +3703,31 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
 
     let joiner = spawn_with_snapshot_policy(2, addr2, dir2.path(), retention, Some(2)).await;
     let seed = Authority::from(addr1);
-    // The first attempt is *expected* to fail: `admit` waits `ADMIT_COMMIT_TIMEOUT` (1.5 s) for the
-    // membership entry to apply, which a multi-MiB snapshot install legitimately outlasts. That
-    // bound is the joiner's own RPC budget and is deliberately unchanged — the real seed loop
-    // (`rift-cluster-server`'s `SEED_JOIN_DEADLINE`/`REJOIN_ATTEMPT_INTERVAL`) retries, so this
-    // test does too.
-    let mut joined = joiner.join_via(&seed).await.is_ok();
-
-    // The membership change commits regardless of that timeout, so the leader now owes the joiner
-    // acks. Wait for that to be visible before probing, or the probe proves nothing.
-    let deadline = Instant::now() + CONVERGE_DEADLINE;
-    while !leader.status().voters.contains(&2) {
-        assert!(
-            Instant::now() < deadline,
-            "the joiner never reached the leader's membership, so the write probe below would be \
-             vacuous"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // Submitted *while* the install is streaming, and deliberately not awaited here.
-    //
-    // It cannot commit yet and that is Raft, not a defect: the fleet is in the joint configuration
-    // {1},{1,2}, and a majority of a two-member set is two, so nothing commits until the joiner
-    // acknowledges. What this probe pins down is that the stall is **bounded by the install** — a
-    // fleet whose snapshot can never land does not merely fail to grow, it stops accepting writes
-    // for good. Before the fix this write never returned at all.
-    let probe_leader = Arc::clone(&leader);
-    let probe = tokio::spawn(async move {
-        tokio::time::timeout(
-            WRITE_STALL_BOUND,
-            probe_leader.submit(dataset_put("during-join", "id,v\n1,a\n")),
-        )
+    // Admission commits the membership entry and returns (#433); the install it used to have to
+    // outlast is no longer on this call's path, so the first attempt succeeds.
+    joiner
+        .join_via(&seed)
         .await
-    });
+        .expect("admission returns once the membership entry commits, ahead of the install");
+
+    // The joiner is a member now — and, for the whole install, a learner. A multi-MiB snapshot
+    // cannot be current inside the admission's currency window, so no joint configuration exists
+    // yet and the leader owes this node nothing. That is what makes a never-landing snapshot
+    // unable to wedge the fleet, and it is checkable: no voterhood before catch-up.
+    //
+    // This rests on the *fixture*, not only on the code: it holds while the install outlasts
+    // `ADMIT_CURRENCY_WAIT` (500 ms). At ~4 MiB the install takes seconds, an order of magnitude
+    // of margin — but shrink `DATASETS`/`PER_DATASET_BYTES` for speed and this fails with the
+    // joiner correctly promoted in-call, which is not two-phase admission breaking.
+    assert!(
+        !leader.status().voters.contains(&2),
+        "a joiner that must install a multi-MiB snapshot is admitted as a learner, not a voter \
+         (requires the install to outlast the 500 ms admission currency window; if the fixture \
+         was shrunk, in-call promotion is the correct outcome and this test needs a bigger one)"
+    );
 
     let last_name = format!("d{}", DATASETS - 1);
     let deadline = Instant::now() + CONVERGE_BY;
-    let mut last_attempt = Instant::now();
     let mut converged = false;
     while Instant::now() < deadline {
         if joiner
@@ -3752,13 +3738,6 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
             converged = true;
             break;
         }
-        // Re-join at the real seed loop's cadence. Retrying as fast as this loop polls would be a
-        // different test entirely: every attempt takes the leader's admission gate and proposes
-        // membership entries, so a tight retry contends with the very install it is waiting for.
-        if !joined && last_attempt.elapsed() >= REJOIN_INTERVAL {
-            last_attempt = Instant::now();
-            joined = joiner.join_via(&seed).await.is_ok();
-        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let joiner_status = joiner.status();
@@ -3768,12 +3747,17 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
         "the joiner was never caught up by snapshot within {CONVERGE_BY:?}: joiner          {joiner_status:?}, leader {leader_status:?}"
     );
 
-    let probe = probe
-        .await
-        .expect("the probe task ran")
-        .expect("a write submitted during the install must commit once the joiner catches up")
-        .expect("the probe write commits");
-    assert_eq!(probe.outcome, rift_cluster::ControlOutcome::Applied);
+    // The other half of the new shape: once current, the leader's promotion sweep makes the
+    // joiner a voter with no further part played by the joiner itself.
+    let deadline = Instant::now() + CONVERGE_DEADLINE;
+    while !leader.status().voters.contains(&2) {
+        assert!(
+            Instant::now() < deadline,
+            "a caught-up learner must be promoted to voter by the leader's sweep: leader {:?}",
+            leader.status()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Installing a snapshot must also materialise the blobs' spool files, or the joiner holds a
     // dataset record it cannot serve a lookup from.
@@ -3789,9 +3773,9 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
 /// Issue #428, the fan-out half: catch-up in a fleet that already holds a quorum without the
 /// joiner, so the install cannot be masked by the joiner's ack being required anyway.
 ///
-/// In the test above the fleet goes from one voter to two, which makes every commit wait on the
-/// joiner; here nodes 1 and 2 commit without node 3, so a disrupted install shows up as a stalled
-/// or restarted transfer rather than as a wedged fleet.
+/// In the test above the joiner is a learner for its whole install (#433), so no commit ever waits
+/// on it; here nodes 1 and 2 hold a quorum without node 3 regardless of its role, so a disrupted
+/// install can only show up as a stalled or restarted transfer, never as a wedged fleet.
 ///
 /// **What `leaders_seen` does and does not prove.** It pins that leadership stays put across a
 /// multi-MiB install, which is worth having. It is *not* evidence that chunk size keeps a
