@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::error::{
     ChangeMembershipError, ClientWriteError, InProgress, NetworkError, PayloadTooLarge, RPCError,
@@ -188,6 +188,25 @@ fn replication_deadline(request_timeout: Duration, body_len: usize) -> Duration 
     request_timeout + Duration::from_millis(allowance)
 }
 
+/// How one Raft RPC that goes through [`PeerClient::send`] is delivered.
+///
+/// Only `install_snapshot` is bulk. `append_entries` carries payloads just as large — a
+/// `DatasetPut` entry is the whole CSV — but it does not come through `send` at all: #411 gives it
+/// its own single-flight path so that concurrent attempts share one in-flight transfer instead of
+/// restarting it. `vote` is small and keeps the client's ordinary retry budget.
+#[derive(Clone, Copy, Debug)]
+enum Delivery {
+    /// A small, latency-bound RPC. [`RpcClient`]'s own retries and flat `request_timeout` apply.
+    Retried,
+    /// A bulk transfer: exactly one attempt, on a deadline scaled to the body size.
+    ///
+    /// openraft is already the retry loop for these and keeps the transfer's own progress (its
+    /// snapshot chunk loop holds the offset), so a retry underneath it re-sends the whole body and
+    /// races the caller's next attempt. The flat `request_timeout` is sized for a control RPC: a
+    /// multi-MiB chunk cut off by it can never complete however often it is retried (#428).
+    BulkSingleAttempt,
+}
+
 /// One outstanding AppendEntries transfer, kept so that an identical re-send
 /// attaches to it instead of restarting the body from byte 0.
 ///
@@ -226,6 +245,7 @@ impl PeerClient {
         &self,
         path: &str,
         req: &Req,
+        delivery: Delivery,
     ) -> Result<Resp, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>
     where
         Req: Serialize,
@@ -250,9 +270,45 @@ impl PeerClient {
         // and the live one is reached without any pinning state of our own.
         // Each cooldown expiry lets it be tried once more — which is the point,
         // since an address that comes back must be usable again.
+        // A bulk transfer's deadline is a budget for this whole send, not for each address in
+        // turn. openraft wraps the entire `install_snapshot` call in its own
+        // `install_snapshot_timeout` and abandons the transfer when that fires, so a per-address
+        // deadline would let a peer advertising N addresses spend N x the budget and blow
+        // openraft's bound whenever the first address is reachable-but-hung — restarting the
+        // snapshot from offset 0, which is the very failure #428 exists to remove.
+        let budget = match delivery {
+            Delivery::Retried => None,
+            Delivery::BulkSingleAttempt => Some(replication_deadline(
+                self.client.request_timeout(),
+                body.len(),
+            )),
+        };
+        let started = Instant::now();
+
+        // The body is handed to the last address rather than cloned for it: for a snapshot chunk
+        // that is multiple MiB, and the single-address case — every literal advertise address, so
+        // nearly all of them — then copies nothing at all.
+        let mut body = body;
+        let last_index = addrs.len().saturating_sub(1);
         let mut last: Option<RpcError> = None;
-        for peer in &addrs {
-            match self.client.call(*peer, "POST", path, body.clone()).await {
+        for (index, peer) in addrs.iter().enumerate() {
+            let payload = if index == last_index {
+                std::mem::take(&mut body)
+            } else {
+                body.clone()
+            };
+            let attempt = match budget {
+                None => self.client.call(*peer, "POST", path, payload).await,
+                Some(budget) => {
+                    let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+                        break;
+                    };
+                    self.client
+                        .call_once(*peer, "POST", path, payload, remaining)
+                        .await
+                }
+            };
+            match attempt {
                 Ok(response) => {
                     return serde_json::from_slice(&response)
                         .map_err(|e| RPCError::Network(NetworkError::new(&e)));
@@ -532,7 +588,7 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         // this branch is never taken — which is what `send_transfer_keepalive`
         // exists to compensate for.
         if rpc.entries.is_empty() {
-            return self.send(RAFT_APPEND_PATH, &rpc).await;
+            return self.send(RAFT_APPEND_PATH, &rpc, Delivery::Retried).await;
         }
 
         let last_log_id = rpc.entries.last().map(|entry| entry.log_id);
@@ -596,7 +652,7 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.send(RAFT_VOTE_PATH, &rpc).await
+        self.send(RAFT_VOTE_PATH, &rpc, Delivery::Retried).await
     }
 
     async fn install_snapshot(
@@ -607,7 +663,8 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
     > {
-        self.send(RAFT_SNAPSHOT_PATH, &rpc).await
+        self.send(RAFT_SNAPSHOT_PATH, &rpc, Delivery::BulkSingleAttempt)
+            .await
     }
 }
 

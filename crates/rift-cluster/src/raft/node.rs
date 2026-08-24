@@ -311,6 +311,27 @@ impl RaftNode {
             election_timeout_min: 150,
             election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
             heartbeat_interval: 50,
+            // Snapshot transport (#428). openraft bounds each *chunk* by `install_snapshot_timeout`
+            // and abandons the whole transfer — back to offset 0 — when one misses, so this is a
+            // deadline that must never be tight. Its defaults (3 MiB chunks, 200 ms) cannot be met
+            // even on loopback: chunks ride the JSON cluster port as `Vec<u8>`, measured at 4.0× on
+            // the wire (`JSON_WIRE_EXPANSION`), so a default chunk is ~12 MiB of JSON and ~900 ms.
+            // A fleet holding a few MiB of datasets could therefore never catch up a joining node.
+            //
+            // 1 MiB keeps a chunk's wire form (~4 MiB) far under the cluster port's 32 MiB body
+            // cap. Unlike `heartbeat_interval`, neither knob is coupled to the election timers —
+            // raising them costs nothing in failover latency.
+            //
+            // Note what the chunk size does *not* buy: a follower receiving a snapshot gets no
+            // leader-lease refresh from it. `Raft::install_snapshot` only reaches the engine on
+            // the final chunk (`install_full_snapshot`); intermediate chunks merely read the vote
+            // and buffer, and openraft sends no AppendEntries to a peer while its snapshot streams
+            // (`replication/mod.rs`: "can not send other data while sending snapshot"). So a peer
+            // that is already a voter hears nothing for the whole install and can time out and
+            // campaign — a hole this issue does not close, and one that a longer
+            // `install_snapshot_timeout` widens rather than narrows.
+            install_snapshot_timeout: 10_000,
+            snapshot_max_chunk_size: 1024 * 1024,
             ..Default::default()
         };
         if let Some(entries) = snapshot_log_entries {
@@ -3522,6 +3543,52 @@ mod tests {
             ours.max_in_snapshot_log_to_keep, defaults.max_in_snapshot_log_to_keep,
             "the default must not change log purging"
         );
+    }
+
+    /// How much larger a Raft RPC gets on the wire than the bytes it carries.
+    ///
+    /// Every Raft RPC is `serde_json`, and a `Vec<u8>` payload — a snapshot chunk — serialises as
+    /// an array of decimal integers, measured at 4.0x for the byte distribution a snapshot
+    /// actually contains. Named rather than inlined so this number and the sizing comment in
+    /// `raft_config` cannot drift apart: if the snapshot wire format ever stops being JSON,
+    /// exactly one number changes.
+    const JSON_WIRE_EXPANSION: u64 = 4;
+
+    /// Issue #428: the snapshot *transport* knobs are deliberately ours, unlike the snapshot
+    /// *policy* the test above pins to openraft's defaults.
+    ///
+    /// openraft aborts a whole snapshot transfer and restarts it from offset 0 when any single
+    /// chunk misses `install_snapshot_timeout`, and chunks ride the JSON cluster port as
+    /// `Vec<u8>` — measured at 4.0× on the wire, ~300 ms per MiB on loopback. At openraft's own
+    /// defaults (3 MiB chunks, 200 ms) a chunk cannot finish even on loopback, so a fleet holding
+    /// a few MiB of datasets could never catch up a joining node at all.
+    ///
+    /// The second half of this test is the "and nothing else moved" claim: raising a snapshot
+    /// deadline must not become a failover change, which is exactly what raising
+    /// `heartbeat_interval` (issue #411's fork) would have been.
+    #[test]
+    fn raft_config_pins_the_snapshot_transport_knobs() {
+        let ours = RaftNode::raft_config(None).expect("default config validates");
+
+        assert_eq!(
+            ours.install_snapshot_timeout, 10_000,
+            "a chunk that misses this restarts the entire snapshot, so it is deliberately generous"
+        );
+        assert_eq!(ours.snapshot_max_chunk_size, 1024 * 1024);
+        // A chunk's *wire* form is what has to fit the cluster port: ~4× the raw bytes, plus the
+        // request envelope (vote, meta, offset).
+        assert!(
+            ours.snapshot_max_chunk_size * JSON_WIRE_EXPANSION + 64 * 1024
+                < crate::rpc::DEFAULT_MAX_BODY_BYTES,
+            "a JSON-expanded chunk must stay under the cluster port's body cap"
+        );
+
+        assert_eq!(
+            ours.heartbeat_interval, 50,
+            "#428 must not move the replication timers"
+        );
+        assert_eq!(ours.election_timeout_min, 150);
+        assert_eq!(ours.election_timeout_max, ELECTION_TIMEOUT_MAX_MS);
     }
 
     /// A shipped fleet maintains its own log without being asked (#365).
