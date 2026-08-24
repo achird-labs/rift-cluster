@@ -644,6 +644,37 @@ fn a_scheme_already_unavailable_may_not_then_be_served() {
     );
 }
 
+/// `path_id` used to hard-code `"GET"` in its unknown-route error, so a
+/// malformed `POST /admin/sources/a/b` was reported as an unknown GET. The
+/// caller now supplies the real method (#382).
+#[test]
+fn path_id_unknown_route_reports_the_callers_method() {
+    let err = super::path_id("POST", "a/b").expect_err("extra path segment is unknown");
+    assert_eq!(
+        err,
+        crate::rpc::RpcError::UnknownRoute {
+            method: "POST".into(),
+            path: "/admin/sources/a/b".into(),
+        },
+        "malformed suffix under POST must name POST, not a hard-coded GET"
+    );
+
+    let err = super::path_id("DELETE", "").expect_err("empty id is unknown");
+    assert_eq!(
+        err,
+        crate::rpc::RpcError::UnknownRoute {
+            method: "DELETE".into(),
+            path: "/admin/sources/".into(),
+        }
+    );
+
+    assert_eq!(super::path_id("GET", "src-1").expect("valid id"), "src-1");
+    assert_eq!(
+        super::path_id("GET", "src-1?x=1").expect("query is stripped"),
+        "src-1"
+    );
+}
+
 /// Claims a fixed scheme list and nothing else — enough to drive the
 /// registration guards without standing up a real provider.
 #[derive(Debug)]
