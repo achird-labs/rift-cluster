@@ -60,6 +60,48 @@ Defaults shown; `local` overrides exist per feature and stamp
 | Journal / count read | all peers | merge of reachable shards + `Rift-Cluster-Partial: true` | Partial-and-says-so beats blocked |
 | Journal read **from a crash-restarted writer** | all peers | merge, still `Rift-Cluster-Partial: true` while peers cache entries of its own lost shard (#349) | The entries are gone for good, not late — a knowingly short answer must say so |
 | Admin config read | — (local applied state) | served, possibly behind; revision comparable | Staleness is measurable, not hidden |
+| Admin write **carrying a large payload** (spec ≤ 4 MiB, dataset ≤ 8 MiB) | Raft quorum | commits in `O(size / link speed)`; below ~1 MiB/s the intent parks and replays | The bytes ride the log — a big entry is slow, not impossible (#411) |
+
+## The replication ceiling
+
+Two shipped quotas put real bytes in a single log entry: a spec document up to
+4 MiB (RFC-004 S2) and a dataset up to a tenant-configurable 8 MiB (RFC-005 §4).
+The fleet carries them as **one entry each** — atomically, or not at all.
+
+What bounds an entry's size is the transport's own body cap (32 MiB), which sits
+above every quota. What bounds its *latency* is the link:
+
+- A large entry commits in **`O(size / link speed)`**, not in one heartbeat.
+  openraft grants each AppendEntries RPC only `heartbeat_interval` (50 ms), so
+  the transfer deliberately **outlives** that deadline — it runs on its own task
+  in the network adapter, and openraft's re-send attaches to the transfer in
+  flight instead of restarting it from byte 0.
+- **Heartbeats and failover are unaffected.** A heartbeat carries no entries and
+  is sent inline, never queued behind a transfer, so the leader keeps its term
+  for the whole upload. The election timers are untouched (50 / 150–300 ms), and
+  ADR-001's "~1–3 s elections" still holds.
+- An entry that cannot cross the link at **≥ 1 MiB/s** exceeds its transfer
+  deadline. The op then takes the ordinary parked-intent path — `503`, op-id,
+  durably parked, auto-replayed — and op-id dedup makes the eventual commit
+  happen exactly once.
+- A follower that refuses an over-cap batch answers `413`. The leader halves the
+  batch and retries immediately rather than treating the peer as unreachable, so
+  a lagging follower catching up across several large entries makes progress
+  instead of backing off forever.
+
+Before #411 none of this was true: every attempt was cut at 50 ms and restarted,
+so a 512 KiB entry took 23–548 s and anything ≥ 1 MiB never committed at all —
+the effective ceiling was "whatever replicates in one heartbeat", far below both
+documented quotas.
+
+**Known limit, tracked as #430.** The transfer is fixed, but a large entry can
+still cost the leader its replication streams on a CPU-constrained host: openraft
+may ask the log store for an index it has counted but `append` has not yet made
+readable, and it panics on the empty answer rather than tolerating it. The window
+grows with entry size, so it is reachable now that large entries replicate at
+all. Measured: a 4 MiB entry is unaffected in CI; 8 MiB is fine on an unloaded
+host and fails under saturation. Until #430 lands, treat multi-MiB entries as
+sound but not yet proven at the 8 MiB quota on small hosts.
 
 ## Scenario walkthroughs
 

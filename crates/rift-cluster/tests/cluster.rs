@@ -3206,8 +3206,99 @@ async fn dataset_survives_a_full_cluster_restart_and_a_lost_spool(bytes: usize) 
     cluster.shutdown_all().await;
 }
 
-/// The restart + lost-spool proof at a size the fleet commits today (128 KiB): well under the
-/// ~50 ms AppendEntries budget openraft grants a single replication round trip (#411).
+/// #411's other shipped ceiling: a spec document at the RFC-004 S2 maximum (4 MiB, #278) is one
+/// log entry and must commit on a real 3-node cluster.
+///
+/// The dataset case below proves the 8 MiB path; this proves the other quota the front already
+/// accepts. Both were validated, accepted, and then unable to commit — openraft dropped every
+/// AppendEntries attempt at the 50 ms `heartbeat_interval` and restarted the body, so the fleet's
+/// true ceiling was "whatever replicates in one heartbeat" (a few hundred KiB on loopback)
+/// rather than either documented quota.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_four_mebibyte_spec_document_commits_on_a_three_node_cluster() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    // At the ceiling, not merely near it: `MAX_SPEC_BYTES` is inclusive, and the point is that
+    // the largest document the front accepts is the largest the log can carry.
+    let document = big_spec_document(rift_cluster::control::MAX_SPEC_BYTES);
+    assert_eq!(
+        document.len(),
+        rift_cluster::control::MAX_SPEC_BYTES,
+        "the document must sit exactly on the documented ceiling"
+    );
+
+    let leader = cluster.leader().expect("leader");
+    let response = leader
+        .submit(spec_put("big-spec", &document))
+        .await
+        .expect("a 4 MiB spec entry commits");
+    assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
+    let unapplied = leader
+        .await_applied(response.revision, Duration::from_secs(30))
+        .await;
+    assert!(unapplied.is_empty(), "{unapplied:?}");
+
+    // Every member, not just the leader: the whole claim is that the bytes rode the log.
+    for member in &cluster.members {
+        let record = member
+            .node
+            .as_ref()
+            .expect("live")
+            .spec(DEFAULT_TENANT, "big-spec")
+            .expect("read")
+            .expect("the spec record replicated");
+        assert_eq!(
+            record.digest,
+            dataset_digest_hex(&document),
+            "node {} must hold the document's own digest",
+            member.id
+        );
+    }
+    cluster.shutdown_all().await;
+}
+
+/// A spec document of exactly `bytes` bytes. Content is irrelevant to this crate — it stores
+/// bytes and a digest and never parses the document — so this pads to an exact length rather
+/// than pretending to be a valid OpenAPI file.
+fn big_spec_document(bytes: usize) -> String {
+    let head = "openapi: 3.0.0\ninfo:\n  title: big\n  version: 1.0.0\npaths: {}\n# ";
+    let mut doc = String::with_capacity(bytes);
+    doc.push_str(head);
+    while doc.len() < bytes {
+        doc.push('x');
+    }
+    doc.truncate(bytes);
+    doc
+}
+
+/// A truthful `SpecPut` for `document` under the default tenant.
+fn spec_put(id: &str, document: &str) -> ControlRequest {
+    ControlRequest {
+        op_id: uuid::Uuid::new_v4(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: rift_cluster::ControlOp::SpecPut {
+            tenant: rift_cluster::TenantId::default(),
+            id: id.to_owned(),
+            meta: rift_cluster::control::SpecMeta {
+                format: rift_cluster::control::SpecFormat::Yaml,
+                digest: rift_cluster::control::Digest::new(dataset_digest_hex(document)),
+                source: rift_cluster::control::SpecSource::Inline,
+            },
+            document: document.to_owned(),
+        },
+    }
+}
+
+/// The restart + lost-spool proof at a small size (128 KiB), kept as the fast sibling of the
+/// 8 MiB case below — the two differ only in payload, so a failure in one and not the other
+/// points straight at size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
     let _serial = TEST_LOCK.lock().await;
@@ -3215,13 +3306,29 @@ async fn a_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
 }
 
 /// RFC-005 §11's check: an upload at the per-dataset ceiling (8 MiB) is one log entry, and the
-/// fleet must be comfortable with it. **It is not, yet** — openraft 0.9 bounds every AppendEntries
-/// RPC by `heartbeat_interval` (50 ms here), so an entry that cannot replicate and fsync within
-/// one round trip is retried forever and never commits; ≥1 MiB reproducibly fails, ~512 KiB
-/// takes minutes. Ignored, not deleted: it is the acceptance test for issue #411, and it must
-/// pass unchanged (run the ignored tests) before the 8 MiB default ceiling means anything.
+/// fleet must be comfortable with it.
+///
+/// #411's half of this is done: openraft 0.9 bounds every AppendEntries RPC by
+/// `heartbeat_interval` (50 ms here) and drops the future when that fires, so an entry that could
+/// not transfer and fsync inside one round trip restarted from byte 0 forever — ≥1 MiB never
+/// committed and ~512 KiB took 23-548 s. The transfer is now single-flighted in the network
+/// adapter, so it outlives the RPC deadline and a re-send attaches to it rather than restarting
+/// it, with the timers untouched. Unloaded, this test passes in ~9.4 s.
+///
+/// It stays ignored for a *different* and pre-existing reason (#430). `try_get_log_entries` can
+/// be asked for a range whose entries openraft has counted but `append` has not yet made
+/// readable; it answers with an empty vec, and openraft 0.9.24 does
+/// `logs.first().….unwrap()` on that (`replication/mod.rs:399`), panicking the replication
+/// workers and costing the leader its leadership. The window scales with entry size, so #411 is
+/// what makes it reachable — but it reproduces identically on a tree with #411's changes
+/// reverted, and it is a storage/openraft interaction rather than anything about the transfer.
+/// On a CPU-constrained runner it fires reliably.
+///
+/// Un-ignore this when #430 is fixed; it is that issue's acceptance test now. The 4 MiB
+/// `SpecPut` case below is #411's own CI-green proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked on #411: an 8 MiB log entry cannot replicate within openraft's 50 ms AppendEntries timeout"]
+#[ignore = "blocked on #430: an empty log read panics openraft's replication worker under load; \
+            #411's transfer fix is what makes an entry this large reach that window"]
 async fn an_eight_mebibyte_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
     let _serial = TEST_LOCK.lock().await;
     let bytes = 8 * 1024 * 1024 - 1_100;
