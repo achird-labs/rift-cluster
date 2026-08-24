@@ -795,14 +795,28 @@ where
 /// leader's gate is the cluster-wide serialization point for its term.
 pub(crate) type MembershipGate = Arc<Mutex<()>>;
 
+/// The auto-voter ceiling a node enforces — one value, read by **both** phases
+/// of admission (#433): the join handler's in-call promotion and the leader's
+/// promotion sweep. Shared rather than a constant so the two can never
+/// disagree, and so a test can lower it on one node and have the sweep honor
+/// the same bound. Defaults to [`MAX_AUTO_VOTERS`].
+pub(crate) type AutoVoterCeiling = Arc<std::sync::atomic::AtomicUsize>;
+
 /// Register the control-plane receiving endpoints (Raft RPCs + seed join) onto
 /// `router`, all reading the node through `slot`.
 ///
 /// `gate` is supplied by the caller rather than created here because the node
 /// itself also evicts locally — when the departing node *is* the leader — and
 /// that path has to share this serialization to keep the floor exact.
+/// `ceiling` likewise: both admission phases must read the one value.
 #[must_use]
-pub(crate) fn control_routes(router: Router, slot: RaftSlot, gate: MembershipGate) -> Router {
+pub(crate) fn control_routes(
+    router: Router,
+    slot: RaftSlot,
+    gate: MembershipGate,
+    ceiling: AutoVoterCeiling,
+) -> Router {
+    let admission_ceiling = ceiling;
     let append = slot.clone();
     let vote = slot.clone();
     let snapshot = slot.clone();
@@ -898,11 +912,18 @@ pub(crate) fn control_routes(router: Router, slot: RaftSlot, gate: MembershipGat
             Arc::new(move |body: Vec<u8>| -> HandlerFuture {
                 let slot = join.clone();
                 let gate = Arc::clone(&admission_gate);
+                let ceiling = Arc::clone(&admission_ceiling);
                 Box::pin(async move {
                     let raft = raft_of(&slot)?;
                     let req = decode::<JoinRequest>(&body)?;
-                    let admission =
-                        admit(raft, &gate, req.node_id, req.advertise, MAX_AUTO_VOTERS).await?;
+                    let admission = admit(
+                        raft,
+                        &gate,
+                        req.node_id,
+                        req.advertise,
+                        ceiling.load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                    .await?;
                     encode(&JoinAccepted {
                         admitted: true,
                         role: Some(admission.role),
