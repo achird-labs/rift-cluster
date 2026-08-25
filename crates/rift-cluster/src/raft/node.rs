@@ -295,6 +295,53 @@ pub enum JoinedAs {
     Unknown,
 }
 
+/// What one [`RaftNode::fan_out_blob`] achieved (#438).
+///
+/// Carries the evidence rather than a verdict alone: `quorum` is what the write
+/// path branches on, but a fan-out that silently sent nothing and one that moved
+/// 8 MiB are indistinguishable from the verdict, and only `bytes_sent` tells
+/// them apart.
+#[derive(Debug, Clone)]
+pub struct FanOutOutcome {
+    /// Members that hold the digest, including this node.
+    pub acks: BTreeSet<NodeId>,
+    /// Peers whose build cannot serve blobs at all. Held separately because
+    /// they are *ambiguous*, not negative: they never answered the question.
+    pub skewed: BTreeSet<NodeId>,
+    /// Bytes this fan-out put on the wire, summed across peers. Zero is
+    /// legitimate — every peer may already have held the digest.
+    pub bytes_sent: u64,
+    /// Whether a majority of **both** the committed and the effective
+    /// configuration acked (joint consensus).
+    pub quorum: bool,
+    /// Whether the two configurations differed, i.e. a membership change was in
+    /// flight and the second majority did real work.
+    pub joint: bool,
+}
+
+/// Put `payload` to one peer, trying each address its authority resolved to.
+///
+/// Mirrors `call_any_typed`'s sweep rule: only a *liveness* failure is worth
+/// trying the next address for. A peer that answers — even to refuse — has
+/// answered, and re-asking a second address would overwrite that answer with a
+/// later address's transport error.
+async fn send_blob_to_peer(
+    transfer: &crate::blobs::client::BlobTransfer,
+    addrs: &[SocketAddr],
+    digest: &crate::blobs::BlobDigest,
+    payload: &[u8],
+) -> Result<crate::blobs::client::PutOutcome, RpcError> {
+    let mut last = RpcError::Transport("no address answered".to_owned());
+    for addr in addrs {
+        match transfer.put(*addr, digest, payload).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(e @ (RpcError::Timeout | RpcError::Transport(_) | RpcError::Shed)) => last = e,
+            Err(answered) => return Err(answered),
+        }
+    }
+    Err(last)
+}
+
 /// The control-plane Raft node.
 pub struct RaftNode {
     id: NodeId,
@@ -757,6 +804,141 @@ impl RaftNode {
     #[must_use]
     pub fn blobs(&self) -> &Arc<crate::blobs::BlobStore> {
         &self.blobs
+    }
+
+    /// Store `bytes` locally under `digest`, then fan it out to every other
+    /// member and report which of them hold it (#438).
+    ///
+    /// The blob is **pinned** for the whole call: between storing it and the op
+    /// that references it committing, nothing in the state machine points at it,
+    /// so the reaper is the only thing that could take it (see
+    /// [`crate::blobs::BlobStore::pin`]).
+    ///
+    /// Peers are dialled concurrently — a 64 MiB blob is 17 chunked round trips
+    /// *per member*, and serialising those would multiply the write's latency by
+    /// the fleet size.
+    ///
+    /// This node counts toward the acks because it has just stored the blob.
+    /// When it is a *learner* rather than a voter that ack is silently ignored,
+    /// because [`QuorumTargets::satisfied_by`] intersects the acks with each
+    /// configuration before counting — a non-voter holding the blob is not
+    /// evidence about that configuration's durability.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Runtime`] if the blob cannot be stored locally or the
+    /// membership cannot be read. A peer that refuses, times out, or is
+    /// unreachable is **not** an error — it is an absent ack, and the caller
+    /// decides what to do about the shortfall via
+    /// [`FanOutOutcome::quorum`].
+    pub async fn fan_out_blob<'a>(
+        &'a self,
+        digest: &crate::blobs::BlobDigest,
+        bytes: &[u8],
+    ) -> Result<(FanOutOutcome, crate::blobs::BlobPin<'a>), NodeError> {
+        // Pinned *before* the bytes land, so there is no instant at which the
+        // blob exists unprotected. Handed back to the caller rather than
+        // released here: the window this guards runs from "a quorum holds it"
+        // to "the op that references it commits", and the submit is the
+        // caller's. Releasing on return would leave the blob unpinned *and*
+        // unreferenced for exactly the stretch the pin exists to cover —
+        // survivable in this issue only because the op still carries its bytes,
+        // and not survivable at #439.
+        let pin = self.blobs.pin(digest);
+
+        let store = Arc::clone(&self.blobs);
+        let digest_owned = digest.clone();
+        let payload: Arc<[u8]> = Arc::from(bytes);
+        let local = Arc::clone(&payload);
+        // The store is synchronous, plain file I/O; holding a runtime worker
+        // for a multi-MiB write is the stall #444 is open against elsewhere.
+        tokio::task::spawn_blocking(move || store.store_whole(&digest_owned, &local))
+            .await
+            .map_err(|e| NodeError::Runtime(format!("blob store task: {e}")))?
+            .map_err(|e| NodeError::Runtime(format!("storing blob locally: {e}")))?;
+
+        let targets = network::joint_voters(&self.raft)
+            .await
+            .map_err(|e| NodeError::Runtime(e.to_string()))?;
+
+        // Resolve before spawning: `resolve` borrows `self`, and the transfer
+        // tasks must own everything they touch.
+        let mut peers: Vec<(NodeId, Vec<SocketAddr>)> = Vec::new();
+        for id in targets.members() {
+            if id == self.id {
+                continue;
+            }
+            let Some(authority) = self.member_authority(id) else {
+                continue;
+            };
+            match self.resolve(&authority).await {
+                Ok(addrs) if !addrs.is_empty() => peers.push((id, addrs)),
+                Ok(_) => {
+                    tracing::warn!(node_id = id, %authority, "blob fan-out: authority resolved to no address")
+                }
+                Err(e) => {
+                    tracing::warn!(node_id = id, %authority, error = %e, "blob fan-out: could not resolve peer")
+                }
+            }
+        }
+
+        // One shared client: it is pooled internally, so every peer's transfer
+        // reuses the same connections and signer rather than standing up its own.
+        let client = Arc::new(self.client.clone());
+        let mut tasks = tokio::task::JoinSet::new();
+        for (id, addrs) in peers {
+            let transfer = crate::blobs::client::BlobTransfer::new(Arc::clone(&client));
+            let digest = digest.clone();
+            let payload = Arc::clone(&payload);
+            tasks.spawn(async move {
+                (
+                    id,
+                    send_blob_to_peer(&transfer, &addrs, &digest, &payload).await,
+                )
+            });
+        }
+
+        let mut acks: BTreeSet<NodeId> = BTreeSet::from([self.id]);
+        let mut skewed: BTreeSet<NodeId> = BTreeSet::new();
+        let mut bytes_sent = 0_u64;
+        while let Some(joined) = tasks.join_next().await {
+            let (id, result) = match joined {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(error = %e, "blob fan-out task panicked");
+                    continue;
+                }
+            };
+            match result {
+                Ok(outcome) => {
+                    bytes_sent += outcome.bytes_sent;
+                    acks.insert(id);
+                }
+                // A build without the blob route cannot answer the question
+                // being asked. It is neither "has it" nor "lacks it", and
+                // folding it into either would let a version-skewed fleet
+                // report a durability it never had — so it counts as nothing
+                // and is surfaced separately.
+                Err(e @ (RpcError::UnknownRoute { .. } | RpcError::VersionSkew { .. })) => {
+                    tracing::warn!(node_id = id, error = %e, "blob fan-out: peer cannot serve blobs; not counted toward quorum");
+                    skewed.insert(id);
+                }
+                Err(e) => {
+                    tracing::warn!(node_id = id, error = %e, "blob fan-out: peer did not take the blob");
+                }
+            }
+        }
+
+        Ok((
+            FanOutOutcome {
+                quorum: targets.satisfied_by(&acks),
+                joint: targets.is_joint(),
+                acks,
+                skewed,
+                bytes_sent,
+            },
+            pin,
+        ))
     }
 
     /// Whether this node's log already carries a cluster membership — i.e. it

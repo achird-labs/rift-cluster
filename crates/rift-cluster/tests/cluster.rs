@@ -3569,6 +3569,260 @@ async fn an_eight_mebibyte_dataset_survives_a_full_cluster_restart_and_a_lost_sp
     dataset_survives_a_full_cluster_restart_and_a_lost_spool(bytes).await;
 }
 
+// ---- #438: quorum blob fan-out before propose ---------------------------
+
+/// Acceptance 1. The accepting node stores the blob and every other member ends
+/// up holding it, so a commit implies the blob is quorum-durable and the origin
+/// dying afterwards does not matter.
+///
+/// Asserted on `bytes_sent` rather than on the return being `Ok`: a fan-out that
+/// silently sent nothing and one that moved the whole payload are
+/// indistinguishable from a status, and only the byte count separates them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_fanned_out_before_propose_reaches_every_member() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    let csv = "id,name\n1,ada\n2,bob\n";
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    let leader = cluster.leader().expect("leader");
+
+    let (outcome, _pin) = leader
+        .fan_out_blob(&digest, csv.as_bytes())
+        .await
+        .expect("fan-out");
+
+    assert!(
+        outcome.quorum,
+        "3 live voters must be a joint-consensus quorum"
+    );
+    assert!(!outcome.joint, "no membership change is in flight");
+    assert_eq!(
+        outcome.acks.len(),
+        3,
+        "every member acked: {:?}",
+        outcome.acks
+    );
+    assert!(outcome.skewed.is_empty());
+    assert!(
+        outcome.bytes_sent > 0,
+        "the fan-out must actually put bytes on the wire, not merely return Ok"
+    );
+
+    for node in cluster.live() {
+        assert!(
+            node.blobs().stat(&digest).expect("stat").have,
+            "node {} does not hold the fanned-out blob",
+            node.id()
+        );
+    }
+
+    // Released here as the real write path releases it: once the op that
+    // references the blob has committed.
+    drop(_pin);
+    cluster.shutdown_all().await;
+}
+
+/// Acceptance 2. With only one reachable peer there is no majority of either
+/// configuration, so the fan-out reports no quorum and the write path parks
+/// rather than committing an op whose blob is on one node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fan_out_without_a_reachable_quorum_reports_no_quorum() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    let leader_id = cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    // Kill both peers, leaving the accepting node alone in a 3-voter config.
+    for id in [1, 2, 3] {
+        if id != leader_id {
+            cluster.kill(id).await;
+        }
+    }
+
+    let csv = "id,name\n1,ada\n";
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    let leader = cluster
+        .member(leader_id)
+        .node
+        .as_ref()
+        .expect("leader node");
+
+    let (outcome, _pin) = leader
+        .fan_out_blob(&digest, csv.as_bytes())
+        .await
+        .expect("fan-out completes even when peers are unreachable");
+
+    assert!(
+        !outcome.quorum,
+        "1 of 3 voters is not a majority; acks were {:?}",
+        outcome.acks
+    );
+    assert_eq!(
+        outcome.acks,
+        BTreeSet::from([leader_id]),
+        "only the accepting node holds it"
+    );
+    // The blob is still stored locally — the shortfall is about durability, not
+    // about the write having been lost. That is what makes the parked intent
+    // replayable rather than a dead end.
+    assert!(leader.blobs().stat(&digest).expect("stat").have);
+
+    drop(_pin);
+    cluster.shutdown_all().await;
+}
+
+/// The replay path's precondition: re-running a fan-out after a shortfall must
+/// be idempotent, or the 503-and-replay contract would re-send the whole payload
+/// on every attempt. `BlobTransfer::put` probes `stat` first, so a peer that
+/// already holds the digest costs one round trip and no bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn re_running_a_fan_out_sends_no_bytes_to_a_peer_that_already_has_it() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    let csv = "id,name\n1,ada\n2,bob\n3,cleo\n";
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    let leader = cluster.leader().expect("leader");
+
+    let (first, first_pin) = leader
+        .fan_out_blob(&digest, csv.as_bytes())
+        .await
+        .expect("first fan-out");
+    assert!(first.bytes_sent > 0);
+    // Release it, so the second call exercises a fresh pin rather than
+    // inheriting this one's protection.
+    drop(first_pin);
+
+    let (second, _pin) = leader
+        .fan_out_blob(&digest, csv.as_bytes())
+        .await
+        .expect("second fan-out");
+
+    assert!(second.quorum, "the peers still hold it");
+    assert_eq!(
+        second.bytes_sent, 0,
+        "a replayed fan-out must re-send nothing"
+    );
+
+    drop(_pin);
+    cluster.shutdown_all().await;
+}
+
+/// The pin a fan-out returns must outlive the fan-out itself, because the window
+/// it guards runs from "a quorum holds it" to "the op that references it
+/// commits" — and the submit happens after the fan-out returns. A pin released
+/// on return would leave the blob unpinned *and* unreferenced for exactly that
+/// stretch.
+///
+/// Regression test for a real defect in this change's first draft, which dropped
+/// the guard inside `fan_out_blob`. It survived the other tests because the
+/// grace window is measured from the blob's mtime and a freshly-written blob is
+/// young — so the bug was invisible until the blob was older than the grace,
+/// which is precisely the replayed-intent case this issue's 503 contract
+/// creates. Asserting on GC directly is what makes it visible now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pin_a_fan_out_returns_protects_the_blob_until_it_is_dropped() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    let csv = "id,name\n1,ada\n2,bob\n3,cleo\n4,dai\n";
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    let leader = cluster.leader().expect("leader");
+
+    let (outcome, pin) = leader
+        .fan_out_blob(&digest, csv.as_bytes())
+        .await
+        .expect("fan-out");
+    assert!(outcome.quorum);
+
+    // Nothing references the digest yet — no op has been proposed — and `now` is
+    // far past any grace, so the pin is the only thing that can save it.
+    let unreferenced = std::collections::HashSet::new();
+    let far_future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs()
+        + 10_000_000;
+
+    let removed = leader
+        .blobs()
+        .gc(&unreferenced, far_future, 3600)
+        .expect("gc");
+    assert_eq!(removed, 0, "the returned pin must still be protecting it");
+    assert!(leader.blobs().stat(&digest).expect("stat").have);
+
+    drop(pin);
+    let removed = leader
+        .blobs()
+        .gc(&unreferenced, far_future, 3600)
+        .expect("gc");
+    assert_eq!(
+        removed, 1,
+        "released, it is collectable like any other blob"
+    );
+
+    cluster.shutdown_all().await;
+}
+
+/// Acceptance 3. An 8 MiB dataset — the documented per-dataset ceiling — fans
+/// out to a 3-node cluster on loopback, and the elapsed time is recorded.
+///
+/// Read the number off CI, not off a developer machine: the transfer is 4 MiB-
+/// chunked, so this is round-trip-bound rather than bandwidth-bound, and a
+/// 2-vCPU runner is the honest measurement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_eight_mebibyte_blob_fans_out_to_three_nodes() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    let csv = big_csv(8 * 1024 * 1024 - 1_100);
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    let leader = cluster.leader().expect("leader");
+
+    let started = Instant::now();
+    let (outcome, _pin) = leader
+        .fan_out_blob(&digest, csv.as_bytes())
+        .await
+        .expect("fan-out");
+    let elapsed = started.elapsed();
+
+    assert!(outcome.quorum);
+    assert_eq!(outcome.acks.len(), 3);
+    // Two peers, each receiving the whole payload.
+    assert_eq!(outcome.bytes_sent, 2 * csv.len() as u64);
+    for node in cluster.live() {
+        assert!(node.blobs().stat(&digest).expect("stat").have);
+    }
+
+    println!(
+        "#438 acceptance 3: {} bytes fanned out to 3 nodes in {elapsed:?} ({} bytes on the wire)",
+        csv.len(),
+        outcome.bytes_sent
+    );
+
+    drop(_pin);
+    cluster.shutdown_all().await;
+}
+
 /// Issue #285: a node that joins after the upload materialises the spool file from what it
 /// receives through the log/snapshot — nothing is fetched from a peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
