@@ -1642,7 +1642,10 @@ mod tests {
         let targets = QuorumTargets::new(ids(&[1, 2, 3]), ids(&[1, 2, 3]));
 
         assert!(!targets.is_joint());
-        assert!(!targets.satisfied_by(&ids(&[1])), "1 of 3 is not a majority");
+        assert!(
+            !targets.satisfied_by(&ids(&[1])),
+            "1 of 3 is not a majority"
+        );
         assert!(targets.satisfied_by(&ids(&[1, 2])), "2 of 3 is");
         assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
     }
@@ -1729,7 +1732,10 @@ mod tests {
         // hides: `held * 2 > len` gives 3, while `>=` would wrongly accept 2.
         let targets = QuorumTargets::new(ids(&[1, 2, 3, 4]), ids(&[1, 2, 3, 4]));
 
-        assert!(!targets.satisfied_by(&ids(&[1, 2])), "2 of 4 is a tie, not a majority");
+        assert!(
+            !targets.satisfied_by(&ids(&[1, 2])),
+            "2 of 4 is a tie, not a majority"
+        );
         assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
     }
 

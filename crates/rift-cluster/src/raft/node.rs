@@ -873,8 +873,12 @@ impl RaftNode {
             };
             match self.resolve(&authority).await {
                 Ok(addrs) if !addrs.is_empty() => peers.push((id, addrs)),
-                Ok(_) => tracing::warn!(node_id = id, %authority, "blob fan-out: authority resolved to no address"),
-                Err(e) => tracing::warn!(node_id = id, %authority, error = %e, "blob fan-out: could not resolve peer"),
+                Ok(_) => {
+                    tracing::warn!(node_id = id, %authority, "blob fan-out: authority resolved to no address")
+                }
+                Err(e) => {
+                    tracing::warn!(node_id = id, %authority, error = %e, "blob fan-out: could not resolve peer")
+                }
             }
         }
 
@@ -887,7 +891,10 @@ impl RaftNode {
             let digest = digest.clone();
             let payload = Arc::clone(&payload);
             tasks.spawn(async move {
-                (id, send_blob_to_peer(&transfer, &addrs, &digest, &payload).await)
+                (
+                    id,
+                    send_blob_to_peer(&transfer, &addrs, &digest, &payload).await,
+                )
             });
         }
 

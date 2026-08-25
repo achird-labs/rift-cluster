@@ -3596,9 +3596,17 @@ async fn a_blob_fanned_out_before_propose_reaches_every_member() {
         .await
         .expect("fan-out");
 
-    assert!(outcome.quorum, "3 live voters must be a joint-consensus quorum");
+    assert!(
+        outcome.quorum,
+        "3 live voters must be a joint-consensus quorum"
+    );
     assert!(!outcome.joint, "no membership change is in flight");
-    assert_eq!(outcome.acks.len(), 3, "every member acked: {:?}", outcome.acks);
+    assert_eq!(
+        outcome.acks.len(),
+        3,
+        "every member acked: {:?}",
+        outcome.acks
+    );
     assert!(outcome.skewed.is_empty());
     assert!(
         outcome.bytes_sent > 0,
@@ -3640,7 +3648,11 @@ async fn a_fan_out_without_a_reachable_quorum_reports_no_quorum() {
 
     let csv = "id,name\n1,ada\n";
     let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
-    let leader = cluster.member(leader_id).node.as_ref().expect("leader node");
+    let leader = cluster
+        .member(leader_id)
+        .node
+        .as_ref()
+        .expect("leader node");
 
     let (outcome, _pin) = leader
         .fan_out_blob(&digest, csv.as_bytes())
@@ -3759,7 +3771,10 @@ async fn the_pin_a_fan_out_returns_protects_the_blob_until_it_is_dropped() {
         .blobs()
         .gc(&unreferenced, far_future, 3600)
         .expect("gc");
-    assert_eq!(removed, 1, "released, it is collectable like any other blob");
+    assert_eq!(
+        removed, 1,
+        "released, it is collectable like any other blob"
+    );
 
     cluster.shutdown_all().await;
 }

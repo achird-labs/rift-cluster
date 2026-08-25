@@ -2203,9 +2203,7 @@ async fn ensure_session_key(
 /// re-proves the record against its bytes on every replica anyway.
 fn op_blob(op: &ControlOp) -> Option<(&str, &[u8])> {
     match op {
-        ControlOp::DatasetPut { record, csv, .. } => {
-            Some((record.digest.as_str(), csv.as_bytes()))
-        }
+        ControlOp::DatasetPut { record, csv, .. } => Some((record.digest.as_str(), csv.as_bytes())),
         ControlOp::SpecPut { meta, document, .. } => {
             Some((meta.digest.as_str(), document.as_bytes()))
         }
