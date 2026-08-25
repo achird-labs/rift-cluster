@@ -134,6 +134,10 @@ const LADDER_BASE_PORT: u16 = 6200;
 ///
 /// If `node.rs`'s timeouts or C6's toxics change, re-derive from the new
 /// arithmetic; do not nudge it upward to silence a failure.
+///
+/// D-42: C6 bounds an election *rate*, never a count, and the election timers
+/// it is derived from are fixed in `raft/node.rs` rather than exposed as a
+/// `NodeConfig` knob — widening them so a count bound holds was the rejected fix.
 const C6_MAX_LEADER_TRANSITIONS: usize = 4;
 
 /// Observed leadership transitions in a sequence of distinct leader samples.
@@ -149,6 +153,11 @@ fn leader_transitions(samples: &[usize]) -> usize {
 ///
 /// Runs in ordinary CI: C6 itself needs a container runtime, so without this
 /// the bound's arithmetic would only ever be exercised by the nightly tier.
+///
+/// Pins D-42: the bound is a rate over the ~5 s gauge resolution — a fleet
+/// showing 0–4 transitions in the 60 s window (near-threshold elections under
+/// the toxics) passes, one showing a new leader in nearly every sample fails,
+/// and a count-of-zero assertion would reject the correct fleet.
 #[test]
 fn c6_bound_admits_near_threshold_but_rejects_flapping() {
     // The sequence C6 actually failed on in PR #92 (run 29973215820, attempt 1),

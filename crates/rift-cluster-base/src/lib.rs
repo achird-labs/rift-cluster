@@ -28,6 +28,13 @@ pub use rift_types;
 pub mod seams {
     /// Flow / scenario state: keyed KV with compare-and-set, plus the provider
     /// hook that lets an embedder supply the store per imposter.
+    ///
+    /// U-1's compare-and-set is implemented by upstream's own
+    /// `rift-store-redis::RedisFlowStore` as well as by the cluster's stores:
+    /// by decision D-6 the existing Redis backend, CAS included, stays upstream
+    /// and nothing Redis-shaped is withheld on this side of the facade. The
+    /// cluster's implementations of these traits are its own (redb-backed,
+    /// D-16) — none of them is Redis.
     pub use rift_mock_core::extensions::flow_state::{
         CasOutcome, FlowStore, FlowStoreProvider, NoOpFlowStore,
     };
@@ -79,10 +86,11 @@ pub mod seams {
         InspectVerdict,
     };
 
-    /// Incremental config reconciliation: the per-port / per-stub apply path
-    /// that replaces reset-the-world reload, plus the change-event hook, the
-    /// attribution that rides with it, and the stable stub identity both sides
-    /// key on.
+    /// Incremental config reconciliation (U-6): the per-port / per-stub apply
+    /// path that replaces reset-the-world reload, plus the change-event hook,
+    /// the attribution that rides with it, and the stable stub identity both
+    /// sides key on. This is the whole-config level of D-5's order-aware
+    /// reconcile — the diff runs upstream, keyed by `stub_key`.
     ///
     /// [`EventContext`] is U-10 (upstream #855): it answers *who* caused a
     /// change, which is what turns an event stream into an audit trail. It is
@@ -203,6 +211,12 @@ pub mod seams {
     /// Server composition: the bootstrap builder, the metrics listener, and the
     /// single-port gateway dispatch a cluster binary composes rather than
     /// forking.
+    ///
+    /// The plain gateway listener — the `/__rift/:port` promotion of rift#212 —
+    /// is upstream by decision D-11 (U-7). Only what needs cluster state stays
+    /// on this side: the replicated front-door route table (U-11's admin CRUD
+    /// lives in the admin front), the admin front's in-process dispatch
+    /// (#344, [`handle_imposter_request`]) and the `Rift-Cluster-*` decoration.
     pub use rift_http_proxy::gateway::dispatch_to_port;
     pub use rift_http_proxy::server::{
         Cli, Commands, RunningServer, ServerBuilder, run_metrics_server,
@@ -297,6 +311,11 @@ mod tests {
     /// or visibility change breaks this test rather than surfacing later as a
     /// confusing error inside `rift-cluster`. When upstream does move a seam,
     /// fix the re-export in `seams` — do not delete the line here.
+    ///
+    /// Pins D-11: `dispatch_to_port` and `ServerBuilder` resolve from upstream,
+    /// so the plain gateway listener is an upstream seam, not a cluster fork.
+    /// Pins D-6: U-1's `FlowStore::compare_and_set` / `CasOutcome` resolve from
+    /// upstream too — the CAS was not withheld from the open-source store.
     #[test]
     fn seams_resolve() {
         use crate::seams::*;

@@ -139,9 +139,9 @@ impl PeerHealth for TrackedPeerHealth {
 /// Injectable so tests can substitute a mock without doing real DNS.
 ///
 /// **Every** address is returned, in the resolver's own order, and callers try
-/// them in turn (#79). Returning only the first made a dual-stack name whose
-/// leading address nobody listens on permanently unreachable, even with a live
-/// address sitting second in the same answer.
+/// them in turn (#79, decision D-28). Returning only the first made a dual-stack
+/// name whose leading address nobody listens on permanently unreachable, even
+/// with a live address sitting second in the same answer.
 ///
 /// An implementation must never answer `Ok` with an empty vec: no addresses is
 /// a resolution failure, and returning it as success would hand callers a list
@@ -163,7 +163,8 @@ impl PeerResolver for DnsResolver {
         // this host's actual connectivity; re-sorting it here — "prefer IPv4",
         // say — would pick a guaranteed-unreachable address on an IPv6-only
         // host whose name still carries a stale A record. That is this bug
-        // mirrored, not fixed.
+        // mirrored, not fixed. A prefer-IPv4 knob was rejected for exactly this
+        // reason: decision D-28.
         let addrs: Vec<SocketAddr> = authority.to_socket_addrs()?.collect();
         if addrs.is_empty() {
             return Err(std::io::Error::other(format!(
@@ -393,6 +394,10 @@ impl RpcClient {
     /// A liveness probe: one attempt, bounded by `deadline`, that **ignores** the
     /// peer's health mark and clears it on success.
     ///
+    /// Decision D-22: every liveness mechanism — the per-peer ticker, a
+    /// keepalive during a transfer — goes through this and never through
+    /// [`Self::call`] or [`Self::call_once`], both of which sit behind the gate.
+    ///
     /// [`TrackedPeerHealth`] fast-fails calls to a peer that recently failed,
     /// which is right for ordinary traffic and self-defeating for the one call
     /// whose purpose is to discover that the peer is back. Measured (#431): the
@@ -477,7 +482,8 @@ impl RpcClient {
     ///
     /// Measured, not hypothetical: while diagnosing #431 the leader's first ~20 heartbeats to a
     /// restarted node failed with "peer … is not healthy", its own liveness tracker having
-    /// suppressed the liveness check.
+    /// suppressed the liveness check. D-22 records the rule: a caller's own deadline expiring is
+    /// not evidence the peer is down (#442).
     ///
     /// Liveness is still observed, and far more often, by the small RPCs going through
     /// [`Self::call`] — this only declines to add a signal that can be a false positive.
@@ -1009,6 +1015,9 @@ mod tests {
     /// #431: a liveness probe must reach a peer the tracker has written off, and
     /// its success must clear the mark — otherwise the tracker suppresses the one
     /// call that could tell it the peer is back.
+    ///
+    /// Pins D-22: `probe` bypasses `is_healthy` and clears the mark on success,
+    /// while an ordinary `call` to the same tripped peer still fast-fails.
     #[tokio::test]
     async fn probe_reaches_a_peer_the_tracker_marks_unhealthy_and_clears_the_mark() {
         let (addr, _guard) = spawn_slow_responder(Duration::from_millis(0)).await;
@@ -1163,6 +1172,9 @@ mod tests {
     /// The regression this guards is self-defeating rather than merely wasteful: the health gate
     /// covers `call` too, so a peer cooled down by slow transfers stops receiving heartbeats —
     /// which is how a node on a slow link becomes a node nobody can reach (#431).
+    ///
+    /// Pins D-22: a caller's own deadline expiring is not evidence the peer is down (#442) — the
+    /// tracker is never charged for it.
     #[tokio::test]
     async fn call_once_deadline_expiry_is_not_charged_to_peer_health() {
         // Threshold 1: if the timeout were charged at all, the peer trips immediately.

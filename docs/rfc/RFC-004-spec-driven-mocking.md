@@ -296,6 +296,11 @@ else in this RFC blocks on it: `PUT /specs/:id` with an inline document
 (§5) delivers the full import/drift/validation set with no source
 machinery at all.
 
+> **Status (2026-08-25).** U-12 has since merged upstream — `ImposterSource`
+> lives at `rift-http-proxy/src/sources.rs` in the `v0.17.0` pin, and Chapter 11
+> lists it as merged. The `openapi+https` / `openapi+git` schemes above are still
+> unbuilt; `PUT /specs/:id` remains the shipped import path.
+
 ### 3.5 Drift and diff on re-import
 
 Re-import (a new `PUT /specs/:id`, or a source pull with a changed digest)

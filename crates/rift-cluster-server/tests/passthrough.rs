@@ -58,6 +58,8 @@ async fn a_non_cluster_server_serves_the_admin_api_and_its_imposters() {
     server.shutdown().await;
 }
 
+/// Pins D-33: without `--cluster` the binary binds nothing the open-source one does not — no
+/// probe listener, no cluster port.
 #[tokio::test]
 async fn a_non_cluster_server_adds_no_cluster_surface() {
     let server = compose::start(cli(&[]))
@@ -74,6 +76,43 @@ async fn a_non_cluster_server_adds_no_cluster_surface() {
         server.cluster_addr().is_none(),
         "the cluster port must not appear without --cluster"
     );
+
+    server.shutdown().await;
+}
+
+/// Pins D-33: an unclustered node answers `/console` with the OSS engine's 404, whatever features
+/// it was built with — there is no admin front to reach the console module through, so the
+/// response carries none of that module's signature (its `Content-Security-Policy`) and no
+/// `Rift-Cluster-*` header. This is the half `tests/console_off.rs` cannot see: that file runs
+/// clustered and proves the feature gate, this proves the `--cluster` gate.
+#[tokio::test]
+async fn a_non_cluster_server_does_not_serve_the_console() {
+    let server = compose::start(cli(&[]))
+        .await
+        .expect("non-cluster server starts");
+    let admin = format!("http://{}", server.admin_addr());
+
+    for path in ["/console", "/console/", "/console/assets/index.js"] {
+        let response = reqwest::get(format!("{admin}{path}"))
+            .await
+            .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+        assert_eq!(
+            response.status().as_u16(),
+            404,
+            "GET {path} must 404 without --cluster, as the OSS binary does"
+        );
+        assert!(
+            response.headers().get("content-security-policy").is_none(),
+            "GET {path}: console code answered on an unclustered node"
+        );
+        assert!(
+            !response
+                .headers()
+                .keys()
+                .any(|name| name.as_str().starts_with("rift-cluster-")),
+            "GET {path}: a Rift-Cluster-* header on an unclustered node"
+        );
+    }
 
     server.shutdown().await;
 }

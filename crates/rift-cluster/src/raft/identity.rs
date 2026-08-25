@@ -1,11 +1,12 @@
 //! Node identity: a `u64` Raft node id, minted once and persisted in the state
 //! directory so a restart rejoins as the *same* node rather than a new one.
 //!
-//! Per ADR-001 the id replaces the v2 `name@addr#incarnation` scheme. On a
-//! `--cluster-init` the bootstrapping node mints its own id (it is the founding
-//! voter); a node that later *joins* an existing cluster is instead assigned a
-//! leader-minted id — that path lands with the join lifecycle and reuses the
-//! same persisted-file contract enforced here.
+//! Per ADR-001 the id replaces the v2 `name@addr#incarnation` scheme. Every
+//! node mints its own id at first start — founder and joiner alike — from
+//! `--cluster-node-name` when set (so a redeployed pod with the same name and a
+//! wiped state dir returns as the same node) and from the clock otherwise; the
+//! join request carries it to the leader as-is. Once persisted it is
+//! authoritative for every later start.
 
 use std::path::{Path, PathBuf};
 

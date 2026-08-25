@@ -102,7 +102,9 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    /// Apply every startup guard. Order is deliberate: the cheapest and most
+    /// Apply every startup guard. `--cluster` with `--runtime per-core` or the
+    /// intercept listener is refused here, before anything binds (D-14).
+    /// Order is deliberate: the cheapest and most
     /// commonly wrong settings report first, so an operator fixing a fresh
     /// deployment sees one clear problem at a time.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -160,6 +162,9 @@ mod tests {
         assert!(!valid().is_insecure());
     }
 
+    /// Pins D-14: `--cluster` + `--runtime per-core` is refused at startup — a
+    /// per-core worker has one thread to park, so an owner outage would stall
+    /// every connection pinned to it.
     #[test]
     fn guard_rejects_per_core_runtime() {
         let config = ClusterConfig {
@@ -196,6 +201,8 @@ mod tests {
         assert!(acknowledged.is_insecure());
     }
 
+    /// Pins D-14: `--cluster` + the intercept listener is refused at startup —
+    /// intercept state is per-node and unreplicated.
     #[test]
     fn guard_rejects_intercept_mode() {
         let config = ClusterConfig {

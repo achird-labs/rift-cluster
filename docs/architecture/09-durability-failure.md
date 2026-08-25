@@ -16,7 +16,8 @@ What state lives where, and what it survives:
 | State | Store | Node crash | Full-cluster restart | Notes |
 |---|---|---|---|---|
 | Membership, node ids | Raft log/vote (`redb`, fsync) | ✅ | ✅ | Group re-forms from disk |
-| Raft snapshot payload | file at `<data-dir>/snapshot/<id>` (temp → fsync → rename → dir fsync); `redb` holds only `{meta, file}` | ✅ | ✅ | Derived state — a missing payload is rebuilt, not mourned (#436) |
+| Raft snapshot payload | file at `<cluster-state-dir>/snapshot/<id>` (temp → fsync → rename → dir fsync); `redb` holds only `{meta, file}` | ✅ | ✅ | Derived state — a missing payload is rebuilt, not mourned (#436) |
+| `departed` marker | file in the state dir, fsync'd before the drain | ✅ | ✅ | Steers the next start between *resume*, *rejoin* and *bootstrap* (D-26) |
 | Imposter configs + `enabled` + revisions | Raft state machine | ✅ | ✅ | Committed = fsync'd on majority |
 | Tenants, principals, bindings | Raft state machine | ✅ | ✅ | Authz survives anything the configs survive |
 | Admin intents + op-dedup | Raft SM + accepting node's `pending_intents` | ✅ | ✅ | R4: parked before forwarded |
@@ -152,7 +153,8 @@ mid-flight resumes against identical mocks with identical scenario states (at
 `sync`/`async`), which is precisely the "always-on shared environment" promise.
 
 **Disk loss on one node.** The node restarts empty → it is a *new* node
-(identity lived on that disk): joins as learner, snapshots the state machine,
+(identity lived on that disk — unless `--cluster-node-name` is set, which
+re-derives the same id): joins as learner, snapshots the state machine,
 re-syncs flow replicas. The old id is removed by runbook. No data loss —
 everything it held exists on ≥ 2 other disks. **Correlated disk loss on a
 majority of voters** is the honest limit of a self-contained cluster: configs
@@ -225,13 +227,15 @@ and an operator near them should expect a replacement node to fail to converge
 rather than to converge slowly. The per-chunk deadline above is not the cause;
 the remaining bottleneck is #432.
 
-A related gap, and the one more likely to be met in practice: the scenario above
-is a node that comes back **empty**, which is the case that works. A node that
-returns still holding its old state, having been down long enough for the fleet
-to snapshot and purge past it, does *not* catch up at all today (#431) — it
-rejoins, finds the leader, and stays at the index it left off. Until that is
-fixed, replacing such a node with a fresh one converges where restarting it does
-not.
+A related case, and the one more likely to be met in practice: the scenario
+above is a node that comes back **empty**. A node that returns still holding its
+old state, having been down long enough for the fleet to snapshot and purge past
+it, is caught up by snapshot too — but only since #431. Before it the leader's
+own peer-health tracker refused to heartbeat the restarted voter for its
+cooldown, the voter campaigned, its term ran away, and it stayed at the index it
+left off forever. The liveness probes of D-22 close that window;
+`a_restarted_voter_behind_a_purged_log_catches_up_by_snapshot` pins it, term
+assertion included.
 
 **Slow node (GC-pause-class stall, not dead).** The three protections:
 fast-fail RPC health stops per-request timeout burn; the bounded bridge sheds

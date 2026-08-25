@@ -543,8 +543,8 @@ pub enum ControlOp {
         poll_secs: Option<u64>,
     },
     /// Forget a source. Its imposters stay bound and lose their provenance —
-    /// see `mutate_tables`' arm for why deleting them would be the wrong
-    /// default.
+    /// orphaned, never cascaded (D-29); see `mutate_tables`' arm for why
+    /// deleting them would be the wrong default.
     SourceDelete {
         tenant: TenantId,
         id: String,
@@ -735,12 +735,14 @@ pub enum ControlOp {
     ///
     /// `space: None` clears the whole port; `Some(flow)` clears only that space's entries and
     /// leaves the port generation — and therefore every sibling space — untouched.
+    ///
+    /// D-38: a clear is a generation bump committed on the log, never a timestamped deletion.
     JournalClearGen {
         tenant: TenantId,
         port: u16,
         space: Option<String>,
     },
-    /// One `proxyOnce`/`proxyAlways` recording, as consensus fact (#226, Ch.7 §proxyOnce).
+    /// One `proxyOnce`/`proxyAlways` recording, as consensus fact (#226, Ch.7 §proxyOnce, D-40).
     ///
     /// Carries **both** the replayable response and — when predicate generation built one —
     /// the recorded stub, in a single op. Deliberately not two ops riding one front-door
@@ -1119,6 +1121,13 @@ pub const MAX_FLEET_NAME_CHARS: usize = 128;
 /// An ordered sequence of stub edits, applied atomically to one imposter's stub
 /// list — the order-aware #316 semantics, mirroring
 /// `ImposterManager::{add_stub, replace_stub_by_id, delete_stub_by_id, move_stub}`.
+///
+/// This is the by-id/positional level of D-5's two-level reconcile: an explicit
+/// script carries a reorder as a `Move`, never as delete+add, so the moved slot
+/// keeps its runtime state. The whole-config level (a `PutImposter`) is diffed
+/// upstream by `apply_config` (U-6) on stable stub keys, where a pure reorder
+/// costs nothing — D-5 is why order matters (it is match priority) and why a
+/// set-diff was rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StubEditScript(pub Vec<StubEdit>);
@@ -1287,6 +1296,10 @@ impl ControlOp {
             // than inventing a second name for the same thing.
             ControlOp::PutRoutes { .. } => "imposter.write",
             ControlOp::DeleteRoute { .. } => "imposter.write",
+            // Sources are authorized under the existing config actions — there
+            // is deliberately no `SourceWrite` action (D-29): the audit stream
+            // already emits these names for the ops, and a new one would let
+            // the gate and the audit disagree.
             ControlOp::SourcePut { .. } | ControlOp::SourcePullResult { .. } => "imposter.write",
             ControlOp::SourceDelete { .. } => "imposter.delete",
             ControlOp::TenantPut { .. }
@@ -5304,6 +5317,9 @@ mod tests {
         }
     }
 
+    /// Pins D-5: a reorder is carried as a `Move` step that relocates the stub
+    /// in place — not as a delete+add pair, which would reset the moved slot's
+    /// runtime state cluster-wide.
     #[test]
     fn move_reorders_and_bounds_checks() {
         let mut stubs = vec![stub(Some("a")), stub(Some("b")), stub(Some("c"))];

@@ -97,7 +97,8 @@ const JITTER_FRACTION: f64 = 0.10;
 /// Leader-local, non-replicated poll state: what the last attempt did, for the
 /// sources this node is currently polling.
 ///
-/// Deliberately not in the state machine. A poll failure is a property of one
+/// Deliberately not in the state machine (D-31: `PollStatus` is node-local,
+/// `SourceRecord` is the fleet-replicated half). A poll failure is a property of one
 /// node's view of an external host at one moment — replicating it would mean a
 /// log entry per failure, which is the log-growth problem the digest short
 /// circuit exists to prevent.

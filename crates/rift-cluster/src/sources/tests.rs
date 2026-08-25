@@ -566,6 +566,8 @@ fn a_scheme_may_not_be_explained_twice() {
     );
 }
 
+/// Pins D-34: a `git+` declaration on a git-less node is refused at source
+/// creation with a capability error naming the scheme, not at the first poll.
 #[test]
 fn a_puller_refuses_an_unavailable_scheme_through_the_same_funnel() {
     // Both declaration paths and `pull` route through `scheme_refusal`; this is
@@ -609,6 +611,8 @@ fn the_probe_calls_a_non_executable_file_unusable_not_absent() {
     );
 }
 
+/// Pins D-34: a missing `git` binary is the one probe outcome that reads as
+/// "capability absent in this image" — the arm that boots with `git+` disabled.
 #[test]
 fn the_probe_calls_a_missing_binary_absent() {
     let err = super::git::GitSource::probe_program("rift-no-such-binary-anywhere")

@@ -330,6 +330,8 @@ async fn the_role_action_matrix_holds_through_terminated_and_proxied_routes() {
 /// `tenant_boundary_not_found` helper, so this test is also what would fail
 /// if that sharing were ever broken — e.g. by a hand-rolled duplicate 404 at
 /// one of the two call sites drifting from the other.
+///
+/// Pins D-45: a cross-tenant probe and a probe of nothing render one byte-identical 404.
 #[tokio::test]
 async fn cross_tenant_probes_are_indistinguishable_from_probes_of_nothing() {
     let _guard = METRICS_LOCK.lock().await;
@@ -1372,6 +1374,8 @@ async fn no_principals_gauge_flips_when_a_principal_is_seeded() {
 /// A fleet with no `--api-key` and no principal keeps today's behavior — the
 /// pre-#161 open admin plane — so an upgrade never starts denying a fleet
 /// that never set up authorization.
+///
+/// Pins D-44 (the open half): neither key nor principal means open, not 401.
 #[tokio::test]
 async fn an_unconfigured_fleet_stays_open_admin_by_default() {
     let _guard = METRICS_LOCK.lock().await;
@@ -1393,6 +1397,53 @@ async fn an_unconfigured_fleet_stays_open_admin_by_default() {
     assert_eq!(
         seen.status, 201,
         "no principals and no --api-key must mean open, not 401: {seen}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Pins D-44 (the closing half): the first committed principal closes the open admin plane. The
+/// same unauthenticated write that was `201` a moment ago is `401` once one principal exists — no
+/// `--api-key`, no restart, no flag, and nothing cached between the two requests.
+#[tokio::test]
+async fn the_first_principal_closes_the_open_admin_plane() {
+    let _guard = METRICS_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let node = server.node().expect("clustered");
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(reserve_port()))
+        .send()
+        .await
+        .expect("unauthenticated write before any principal exists");
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 201, "the plane must start open: {seen}");
+
+    seed(node, 1, tenant_put("acme", "Acme Corp")).await;
+    seed(
+        node,
+        2,
+        principal_put("acme", principal_with_key("first", "first-key")),
+    )
+    .await;
+
+    let response = client
+        .post(format!("http://{admin}/imposters"))
+        .json(&minimal_imposter(reserve_port()))
+        .send()
+        .await
+        .expect("unauthenticated write after the first principal");
+    let seen = Seen::of(response).await;
+    assert_eq!(
+        seen.status, 401,
+        "one committed principal must close the open admin plane: {seen}"
     );
 
     server.shutdown().await;

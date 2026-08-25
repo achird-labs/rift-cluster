@@ -60,6 +60,11 @@ async fn wait_ready(server: &ComposedServer) {
 }
 
 /// AC: feature off ⇒ zero new code reachable on the request path.
+///
+/// Pins D-33 (the feature-off half): the default build carries no console code at all, so even a
+/// *clustered* node answers `/console` with upstream's own 404 and none of the console module's
+/// headers — the drop-in-for-OSS invariant does not depend on `--cluster` being off. The
+/// unclustered half is `tests/passthrough.rs::a_non_cluster_server_does_not_serve_the_console`.
 #[tokio::test]
 async fn console_is_not_served_when_the_feature_is_off() {
     let state = TempDir::new().expect("tempdir");

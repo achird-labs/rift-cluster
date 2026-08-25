@@ -5,6 +5,10 @@
 # iteration, and iteration does not fit in a PR's latency budget -- so it lives
 # here, one job per scenario so the nightly's wall clock is the slowest single
 # scenario rather than the sum of all of them.
+#
+# D-41: this soak is where flakes surface — 60–100 iterations per scenario under a 2 h cap,
+# not the flat 100× RFC-001 §12 sketched (C6's 60 s toxic window alone would be ~3.6 h) —
+# while the required `cluster-smoke` check runs each scenario once per PR.
 
 name: nightly-chaos
 

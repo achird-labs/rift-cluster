@@ -202,6 +202,9 @@ async fn start() -> Fixture {
 
 const VIEWER_KEY: &str = "sources-front-viewer-key";
 
+/// Pins D-31: the replicated `SourceRecord` half of the response never carries
+/// `lastPollError`; poll status is reported only under `nodeLocal`, stamped
+/// with the node that observed it.
 #[tokio::test]
 async fn a_viewer_reads_sources_with_fleet_and_node_facts_apart() {
     let fixture = start().await;

@@ -416,6 +416,12 @@ and per-platform binary tarballs with a `SHA256SUMS` on the GitHub Release. Both
 carry the web console. See `docs/rift-cluster-server.md` → *Installing from a
 release* for the download-and-verify steps.
 
+The chart and the image are the portable artifacts every reference deployment
+consumes (D-35), and the non-goals are deliberate: no Terraform / CloudFormation /
+Bicep modules, no OS package-manager packages, no auto-update. Chapters 14 and 15
+compose those two with each platform's own primitives; anything beyond that is the
+operator's composition, not a shipped artifact.
+
 The publish lane rides the same verification that already proved the artifact —
 nothing is pushed on a build that failed `check-console-embed.sh` — and the
 published image is smoke-tested after the push: pulled back by tag and asked for

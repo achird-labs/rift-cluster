@@ -188,7 +188,7 @@ mobile layout.
 The Aug-2026 mockup (`RiftCluster Console.dc.html`) draws an **`OWNER`** column on the imposter
 table, a **`FLOW OWNER`** row in the imposter detail rail, and a **`THIS PORT ON THE RING`** panel.
 The console shipped all three in #358. They encode an ownership that does not exist, and they have
-been **removed** rather than filled in.
+been **removed** rather than filled in. Registered as **D-20** in `docs/decisions/DECISIONS.md`.
 
 What is actually true:
 
@@ -215,7 +215,8 @@ place that says so.
 ## The mockup's `Membership` panel is wrong — do not rebuild it
 
 The fleet screen's **`Membership`** panel, with its **Add learner** and **Remove voter** actions, has
-been **removed** rather than implemented. It was not a missing endpoint. It is not coming.
+been **removed** rather than implemented. It was not a missing endpoint. It is not coming. Registered
+as **D-21** in `docs/decisions/DECISIONS.md`.
 
 **Membership changes only ever happen through a node's own lifecycle**: a node is started and
 attempts to join, or a node leaves. The console is deliberately neither an admission nor an eviction
@@ -246,7 +247,8 @@ show membership, because observing it and changing it are different powers.
 
 Same ruling, same reason. **Trigger snapshot** and **Compact log** have been **removed** rather than
 implemented. Snapshotting and log compaction are the cluster's own business, and an operator button
-for them is not an operator's to press — not even a fleet admin's.
+for them is not an operator's to press — not even a fleet admin's. Registered as **D-24** in
+`docs/decisions/DECISIONS.md`.
 
 Unlike the Membership panel, this one was not merely unwise: it was **redundant**. The fleet already
 does both, unprompted. `RaftNode::raft_config` (`crates/rift-cluster/src/raft/node.rs`) builds

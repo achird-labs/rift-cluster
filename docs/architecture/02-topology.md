@@ -35,14 +35,18 @@ front-end port, isolation scales with header cardinality:
 target port is carried *in the request* and dispatched in-process against the
 imposter map — the pattern of the upstream `/__rift/:port/<path>` admin gateway
 (#212), promoted to a first-class data-plane listener by the embeddable-server
-seam (#317, `gateway::dispatch_to_port`). Three addressing schemes, in order of
-transparency:
+seam (#317, `gateway::dispatch_to_port`). Three addressing schemes were designed,
+in order of transparency — but **only the path prefix is built**: upstream's
+`gateway.rs` parses `/__rift/:port/<path>`, and the front door (Chapter 13) uses
+that same form as its no-route fallback. The header and subdomain forms are
+options, not features; the plain listener is upstream by decision D-11, so they
+would land there first.
 
-| Scheme | Example | Caveat |
-|---|---|---|
-| Header | `X-Rift-Port: 8080` | none — predicates see the true request |
-| Subdomain | `p-8080.mocks.example.com` | needs wildcard DNS/TLS |
-| Path prefix | `/__rift/8080/orders` | prefix must be stripped cleanly or path predicates and recordings see the wrong path |
+| Scheme | Example | Status | Caveat |
+|---|---|---|---|
+| Header | `X-Rift-Port: 8080` | designed, not built | none — predicates see the true request |
+| Subdomain | `p-8080.mocks.example.com` | designed, not built | needs wildcard DNS/TLS |
+| Path prefix | `/__rift/8080/orders` | built (`gateway::dispatch_gateway_path`) | the prefix is stripped before dispatch, so predicates and recordings see `/orders` |
 
 On Kubernetes, gateway-fronted mode is effectively mandatory — Service ports
 are static, so runtime-minted imposter ports cannot be exposed any other way

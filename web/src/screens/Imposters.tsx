@@ -626,7 +626,7 @@ export function Imposters(): ReactNode {
                       {/* The design draws an `Owner` column here. There is no such thing: an
                           imposter has no owner. Imposters, stubs and config are replicated to
                           every node, so every node serves them — only a *flow* is owned, and a
-                          port has as many owners as it has flows (#359). The column is gone
+                          port has as many owners as it has flows (#359, D-20). The column is gone
                           rather than pending, because a column that can never be filled is a
                           promise, not a roadmap. `Provenance` is a real join this screen already
                           computes for its filter, so it renders. */}

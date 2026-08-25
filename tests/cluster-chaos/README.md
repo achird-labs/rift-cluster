@@ -679,11 +679,12 @@ that deliberately lags a follower past `RIFT_CLUSTER_SNAPSHOT_LOG_ENTRIES` and
 restarts it, forcing a real `install_snapshot`, and the original full-fleet
 restart, kept because it separately guards "clearing `sm_audit` whenever the
 store is opened" — a different bug on the ordinary cold-start path that the
-snapshot phase does not touch. Both mutant stories, and what the container
-tier can and cannot observe about `install_snapshot` actually running (there
-is no metric for it, and this file's own house rule — assertions read the
-admin API and Prometheus metrics, never log output — rules out a log line),
-are recorded in the scenario's own doc comment rather than repeated here.
+snapshot phase does not touch. Both mutant stories, and how the container
+tier observes `install_snapshot` actually running (from
+`rift_cluster_snapshots_installed_total` — this file's own house rule, that
+assertions read the admin API and Prometheus metrics and never log output,
+rules out a log line), are recorded in the scenario's own doc comment rather
+than repeated here.
 
 **`GET /admin/whoami` is not a revocation probe, and neither is it a binding
 probe.** It classifies no action (§4.3's `None` case), so it answers `200` to

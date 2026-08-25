@@ -18,8 +18,8 @@ settle delays before a new owner may serve, per-key ownership generations,
 version-vector merges on heal. Every piece existed to manage disagreement
 about membership.
 
-Putting membership *itself* into a Raft log removes the disagreement instead of
-managing it. The roster is now a value in a linearizable state machine: at any
+Putting membership *itself* into a Raft log (D-15) removes the disagreement
+instead of managing it. The roster is now a value in a linearizable state machine: at any
 log index, every node that has applied that index computes byte-identical
 membership, and therefore byte-identical ownership for every key. The settle
 delay, the generations, the epoch-mismatch retry ladders — deleted, not
@@ -69,8 +69,11 @@ flowchart TB
   its applied index — the config exists; that node reports the bind failure as
   status (Chapter 2), preserving "one node's local problem never stalls the
   fleet's log."
-- **Snapshots** serialize the `sm_*` tables at 5k entries / 64 MiB and truncate
-  the log. The payload is a file at `<cluster-state-dir>/snapshot/<snapshot_id>`,
+- **Snapshots** serialize the `sm_*` tables on openraft's default policy —
+  every 5 000 log entries since the last snapshot (`snapshot_log_entries` lowers
+  it for tests only) — and purge the log behind them. Both happen on their own:
+  no admin route or console panel triggers a snapshot or a compaction (D-24).
+  The payload is a file at `<cluster-state-dir>/snapshot/<snapshot_id>`,
   written temp-file → fsync → rename → fsync-dir before the redb row naming it
   commits, so the row never points at a payload that is not already durable
   (#436; Chapter 9). Config bodies ride in log entries (small JSON); snapshots are the
@@ -94,16 +97,18 @@ flowchart TB
   resumable, verified against the digest before an atomic rename makes them
   visible, and reclaimed by a grace-windowed sweep over what the applied state
   still references. The store itself **replicates nothing** — it has no mechanism
-  of its own for putting a blob on another node, so as of #437 two nodes holding
-  different blob sets is expected rather than divergence, and nothing routes
-  through it at all.
+  of its own for putting a blob on another node, so two nodes holding different
+  blob sets is expected rather than divergence. What routes through it today is
+  the pre-propose fan-out (#438): the accepting node stores the blob and puts it
+  on a joint-consensus quorum (D-19) before the referencing op is submitted.
 
   That is not in tension with **ADR-001 D-18** ("every member holds every live
   blob"): D-18 describes where the epic lands, and the completeness it asserts is
-  established by #438 fanning a blob to a quorum *before* the op is proposed and
-  #439 fetching on apply — by the write path, never by the store. Until those
-  land, D-18 is a statement of intent about this subsystem rather than a property
-  it has. #441 revises the surrounding text once the bytes actually leave the log,
+  established by #438 fanning a blob to a quorum *before* the op is proposed
+  (landed) and #439 fetching on apply (open) — by the write path, never by the
+  store. Until #439 lands, D-18 holds for a quorum rather than for every member:
+  a node the fan-out did not reach still gets the bytes from the log entry, not
+  from this store. #441 revises the surrounding text once the bytes actually leave the log,
   at which point this section's "its bytes ride a `SpecPut` entry" stops being
   true.
 
@@ -124,8 +129,9 @@ stateDiagram-v2
 
     note right of Discovering
         Bootstrap is explicit: exactly one node,
-        once, runs --cluster-init to create the
-        group. A node with peers configured
+        once, starts with --cluster-allow-solo and
+        no --cluster-seeds to create the group.
+        A node with peers configured
         NEVER forms its own group — this closes
         the split-brain-on-blip and all-empty
         cold-start hazards by construction.
@@ -134,16 +140,27 @@ stateDiagram-v2
 
 Key rules, each carrying weight:
 
-- **Node identity** is a `u64` minted by the leader at first join and persisted
-  in the state dir. A pod rescheduled with its volume keeps its identity; one
-  rescheduled without it joins as a new node (and the old id is removed via
+- **Node identity** is a `u64` the node mints for itself at first start —
+  derived from `--cluster-node-name` when set, otherwise from the clock — and
+  persists in the state dir. A pod rescheduled with its volume keeps its
+  identity; one rescheduled without it returns as the same node if it carries
+  the same name, and joins as a new node otherwise (the old id is removed via
   runbook). This replaces the v2 incarnation scheme outright.
+- **Membership changes only by a node joining or leaving** (D-21). Admission is
+  initiated by the joining node over the signed cluster port; no admin route or
+  console action adds or removes a learner or a voter — membership is the
+  trust boundary, and what can enter the fleet is bounded by what an operator
+  chose to *start*.
 - **Seeds are re-resolved through DNS on every attempt** — pod IPs churn, and a
-  cached-IP join loop after a full restart would brick the fleet.
+  cached-IP join loop after a full restart would brick the fleet. Every address
+  a name resolves to is dialled, in the resolver's own order; there is no
+  prefer-IPv4 knob (D-28).
 - **Voter cap at 9**: beyond that, nodes join as learners — full data-plane
   citizens (they bind imposters, own flow-state keys, serve traffic) with no
   election weight. Consensus latency stays flat as the fleet grows to the
-  16-node ceiling.
+  16-node ceiling. The cap is a *soft* ceiling on what the fleet does by
+  itself, and a promotion only ever adds voter ids — it can never silently
+  evict one (D-27).
 - **Admission is two-phase** (#433, the etcd learner pattern): the join RPC
   commits the membership entry — the fast, consensus-bound fact — and returns
   `admitted` with the role and a `catching_up` estimate. Catch-up belongs to
@@ -156,9 +173,18 @@ Key rules, each carrying weight:
   applied index has caught up to the leader's commit index observed at join
   *and* its imposters are bound-or-reported. An LB never routes to a node
   serving yesterday's config (Chapter 10).
-- **Graceful leave** (SIGTERM): demote to learner, hand off owned flow state
-  (Chapter 6), then leave the membership — a rolling restart never triggers an
-  election or an ownership *guess*; every transition is a committed entry.
+- **Graceful leave** (SIGTERM): drain readiness, leave the membership, and let
+  ownership of its flow state move with the committed entry (Chapter 6 — there is
+  no pre-leave handoff; every write was already pushed to the successors) — a
+  rolling restart never triggers an election or an ownership *guess*; every
+  transition is a committed entry.
+  The leader refuses a departure that would leave fewer than two voters
+  (D-25): the refused node exits crash-equivalent and resumes on its next
+  start, so a whole-fleet teardown cannot walk the membership down to a single
+  volume. A node that really departed writes a `departed` marker beside its
+  state, which — with the presence of a Raft vote and the reachability of its
+  seeds — decides *resume*, *rejoin* or *bootstrap* on the next start; the
+  state directory is never wiped to force a clean join (D-26).
 
 ## Cold start — the payoff
 
@@ -181,7 +207,7 @@ happening (#431): the leader retries an unreachable peer every 50 ms and runs a
 per-peer *liveness ticker* — an empty AppendEntries on its current vote whenever
 openraft has sent that peer nothing for a heartbeat interval, which is the whole
 of a snapshot install and the whole of a large entry's transfer — sent through a
-probe that bypasses the peer-health tracker, because the tracker would otherwise
+probe that bypasses the peer-health tracker (D-22), because the tracker would otherwise
 refuse to talk to a just-restarted peer for its cooldown. The ticker speaks only
 while its node actually leads: a probe asserts "your leader is alive", and a
 leader that has gracefully left (or been deposed) must fall *silent* — its

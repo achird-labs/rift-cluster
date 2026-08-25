@@ -1731,7 +1731,8 @@ fn authorize_action(
             // reaches here; a cross-tenant port collision is refused by the state machine's own
             // `port_claimed_by_another_tenant` check, which is where fleet-uniqueness is enforced.
             //
-            // The refusal is §8.4's indistinguishable 404, identical to `NotBoundToTenant` below.
+            // The refusal is §8.4's indistinguishable 404, identical to `NotBoundToTenant` below
+            // (D-45: "owned by someone else" and "owned by nobody" are one answer).
             //
             // This applies to `default` symmetrically. Before this change `default` saw everything
             // because everything *was* default's; now a `default` Editor no longer sees `acme`'s
@@ -1759,7 +1760,7 @@ fn authorize_action(
         // are already resolved) — `authenticate` is what actually produces a
         // `401` from a bad or absent credential.
         Decision::Deny(Denial::Unauthenticated) => Err(unauthorized()),
-        // RFC-002 §8.4: must render byte-identical to the tenant-serving
+        // RFC-002 §8.4 / D-45: must render byte-identical to the tenant-serving
         // guard above — see `tenant_boundary_not_found`'s doc for why, and
         // for what this 404 actually is (not a stand-in for any specific
         // route's genuine not-found).
@@ -2054,7 +2055,7 @@ async fn session_login(state: &Arc<FrontState>, req: Request<Incoming>) -> Respo
     //
     // Refused explicitly rather than papered over, and refused *here* rather than by letting the
     // cookie fail later, because a `200` for a credential exchange that cannot produce a usable
-    // credential is the silent-fallback shape this codebase treats as a defect.
+    // credential is the silent-fallback shape this codebase treats as a defect (D-46).
     if principal::is_legacy_identity(resolved.principal_id.as_str()) {
         return typed_error(
             StatusCode::BAD_REQUEST,
@@ -2197,6 +2198,9 @@ async fn ensure_session_key(
 
 /// The blob an op carries, if it carries one (#438).
 ///
+/// Both ops still carry their bytes on the log until D-23 (#439) lands; this
+/// is the copy the fan-out sideloads to a quorum ahead of propose.
+///
 /// Only two ops do. Both already hold a digest that was derived from these
 /// exact bytes at mint time, so this re-uses it rather than re-hashing: a
 /// digest computed twice is two chances to disagree, and `control::validate`
@@ -2212,7 +2216,7 @@ fn op_blob(op: &ControlOp) -> Option<(&str, &[u8])> {
 }
 
 /// Store this op's blob locally and fan it out to a joint-consensus quorum
-/// before it is proposed (#438).
+/// before it is proposed (#438; D-18, D-19).
 ///
 /// Runs **after** the intent is parked and **before** submit, which is what
 /// makes a shortfall recoverable rather than lost: the parked intent replays and
@@ -2220,7 +2224,9 @@ fn op_blob(op: &ControlOp) -> Option<(&str, &[u8])> {
 /// what the peer already staged and sends only the remainder.
 ///
 /// `Ok` when the op carries no blob, or when a majority of both the committed
-/// and the effective configuration holds it. `Err` carries an operator-facing
+/// and the effective configuration holds it — the joint rule D-19 fixes, read in
+/// one `with_raft_state` closure by `network::joint_voters` and decided by
+/// `QuorumTargets::satisfied_by`. `Err` carries an operator-facing
 /// reason for the refusal — the caller must then leave the intent **parked** and
 /// ask for a replay.
 ///
@@ -3461,6 +3467,9 @@ fn fleet_ports(
 }
 
 /// The `coverage` block every fleet journal answer carries — the stated cap (issue #362, AC3).
+///
+/// D-32: `coverage: {covered, total, omitted, capped}` is on every fleet read and re-announced
+/// on the stream whenever the covered set moves, so a capped view is never mistaken for the whole.
 ///
 /// `omitted` names the ports rather than counting them: "3 imposters were left out" tells an
 /// operator their view is short, while naming them tells them whose traffic they are not seeing.
@@ -4782,7 +4791,7 @@ fn spec_warnings_header(violations: &[String]) -> Option<String> {
 
 /// `GET /admin/sources` / `GET /admin/sources/{id}` (issue #239).
 ///
-/// The response deliberately keeps two kinds of fact in two shapes:
+/// The response deliberately keeps two kinds of fact in two shapes (D-31):
 ///
 /// - **`sources` / `source`** is the replicated projection, verbatim. Every
 ///   converged node answers it byte-identically, and `RedbStateMachine::

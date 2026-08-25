@@ -1,10 +1,12 @@
-//! The clustered `proxyOnce` recording store (#226, Ch.7 §proxyOnce): exactly-once
+//! The clustered `proxyOnce` recording store (#226, Ch.7 §proxyOnce, D-40): exactly-once
 //! recording fleet-wide, through upstream's `ProxyRecordingStore` seam (U-16, rift#911).
+//! Cluster-native, not Redis-first: D-12's Redis-backed-first ordering was amended once this
+//! shipped on consensus (see D-12's amendment); no Redis proxyOnce backend exists.
 //!
 //! Shape, mirroring the flow store's discipline:
 //!
 //! - **Ownership.** Each `(port, signature)` has one owner on the HRW ring
-//!   (`KeyClass::Proxy`). Claims are owner-local memory — *Pending dies with the owner*, so
+//!   (`KeyClass::Proxy`, D-20). Claims are owner-local memory — *Pending dies with the owner*, so
 //!   the duplicate-upstream bound is 1 + ownership changes in flight (Ch.6/Ch.7). A
 //!   partitioned owner refuses claims (`is_isolated`, fail closed); membership fencing and
 //!   `NotOwner` redirects copy `FlowNet::owner_write`.
@@ -95,6 +97,8 @@ const OWNER_REDIRECT_ATTEMPTS: usize = 2;
 /// re-claimable. Generously above any upstream call the engine would wait for, so an honest
 /// slow winner is not expired mid-flight; a crashed winner's claim frees itself after this.
 /// Tests shrink it through [`ProxyBindConfig`].
+///
+/// D-40: fixed, not derived from an upstream timeout — the recording seam (U-16) carries none.
 const DEFAULT_CLAIM_TTL: Duration = Duration::from_secs(60);
 
 /// The production rendering of a claim's HRW key. Public so tests predicting an owner from

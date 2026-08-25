@@ -10,21 +10,29 @@ on-prem environments, usually without a dedicated platform team.
 ```
 rift-cluster-server \
   --cluster                          # master switch; everything below inert without it
-  --cluster-init                     # FIRST node of a NEW cluster, exactly once
+  --cluster-allow-solo               # FIRST node of a NEW cluster: found it when no seeds are
+                                      # given (a seedless node without it refuses to start)
   --cluster-bind 10.0.0.5:4790       # required: Raft + owner RPC (TCP, one port)
   --cluster-advertise <host:port>    # NAT/container address peers should dial; a hostname
                                       # is re-resolved on every send, IPv6 literals bracketed
-  --cluster-seeds rift-0.rift-hs:4790,rift-1.rift-hs:4790   # DNS re-resolved per attempt
+  --cluster-seeds rift-0.rift-peers:4790,rift-1.rift-peers:4790   # DNS re-resolved per attempt
   --cluster-secret-file /secrets/cluster.key                # required (or --cluster-insecure)
-  --cluster-state-dir /var/lib/rift  # redb: raft log/vote/snapshot + flow shard
-  --cluster-features config-sync,flow-state   # per-phase enablement / rollback lever
+  --cluster-state-dir /var/lib/rift  # redb: identity, raft log/vote/snapshot + flow shard;
+                                      # default <datadir>/_cluster
   --cluster-write-barrier ready-nodes|none    # Ch.4; default ready-nodes
-  --cluster-leave-timeout 10s
+  --cluster-leave-timeout 10         # seconds (default 10); orchestrator grace ≥ 2× this
+  --cluster-probe-bind 0.0.0.0:2526  # unauthenticated /readyz + /healthz (default shown)
 ```
+
+Every flag has an `RIFT_CLUSTER_*` environment form (`crates/rift-cluster-server/src/cli.rs`
+is the source of truth; `docs/rift-cluster-server.md` the full reference).
 
 There is no `--cluster-degraded-mode` flag: what a node does when a flow's owner is unreachable
 is a per-imposter `readConsistency` setting (D-10, Chapter 9's degradation table), not a
 fleet-wide switch — the flag sketched in earlier drafts was superseded rather than built (#378).
+Nor is there a `--cluster-features` flag: config sync and flow state are always on under
+`--cluster` (#120 — a per-feature opt-out would reintroduce the per-imposter split-brain the
+clustered flow store exists to remove).
 
 One subcommand is not a server at all:
 
@@ -40,8 +48,10 @@ Full reference in `docs/rift-cluster-server.md`.
 Guard rails enforced at startup: `--cluster` with `--runtime per-core` is
 rejected (the sync bridge assumes a work-stealing data plane — D-14);
 `--cluster` with intercept mode is rejected (out of scope); no secret and no
-explicit `--cluster-insecure` is a refusal to start; `--cluster-init` refuses
-to run if a group already exists in the state dir or is reachable via seeds.
+explicit `--cluster-insecure` is a refusal to start; a node with no seeds and
+no `--cluster-allow-solo` refuses to start rather than founding a second
+cluster beside the real one, and a node that already holds state decides
+between *join*, *rejoin* and *bootstrap* by D-26's table — never by wiping it.
 
 ## Kubernetes deployment
 
@@ -53,11 +63,11 @@ flowchart TB
     ING[Ingress / LB] --> SVC["Service (data: gateway port,<br/>admin port, metrics port)"]
     SVC --> P0 & P1 & P2
     subgraph STS["StatefulSet rift (podManagementPolicy: Parallel)"]
-        P0["rift-0 (+ --cluster-init, first boot only)"]
+        P0["rift-0 (ordinal 0: RIFT_CLUSTER_ALLOW_SOLO, seeds unset)"]
         P1[rift-1]
         P2[rift-2]
     end
-    HS["headless Service rift-hs<br/>publishNotReadyAddresses: true"] -.- P0 & P1 & P2
+    HS["headless Service rift-peers<br/>publishNotReadyAddresses: true"] -.- P0 & P1 & P2
     P0 --- V0[(PVC)]
     P1 --- V1[(PVC)]
     P2 --- V2[(PVC)]
@@ -91,8 +101,8 @@ flowchart TB
 | `GET /_cluster/members` | roster: id, address, voter/learner, Ready, applied index; plus this node's own `bound_ports` / `bind_failures` (Chapter 2 divergence) |
 | `GET /_cluster/config` | per port: revision @ every node, `converged: bool` — the CI wait target |
 | `GET /_cluster/imposters` | per-(port, node) bind status (Chapter 2 divergence) |
-| `GET /_cluster/ring?key=…` | computed owner + m_idx — "who owns this flow right now" |
-| `GET /_cluster/kv/:flow_id` | owner value vs local replica — the *why is my scenario stuck* endpoint |
+| `GET /_cluster/ring?key=…` | computed owner + m_idx — "who owns this flow right now". *Designed (RFC-001 §10, phase 2); not served by this build* |
+| `GET /_cluster/kv/:flow_id` | owner value vs local replica — the *why is my scenario stuck* endpoint. *Designed (RFC-001 §10, phase 2); not served by this build* |
 | `GET /_cluster/ops/:op_id` | intent state: pending / applied / failed (Chapter 4) |
 | `GET /_cluster/health` | rolled-up diagnostics |
 | `GET /_cluster/route-hits` | this node's per-route dispatch counts, in memory since process start — the node-local input the admin port's `GET /front-door/route-hits` sums across the fleet |
@@ -116,9 +126,10 @@ first group, and `scripts/check-observability-families.sh` enforces that.
 `rift_cluster_source_scheduler_corrupt_rows`.
 
 *Registered, but not alerted on:* `rift_cluster_flow_wal_lag_ops` (async
-durability backlog). It is on the dashboards and is a legitimate paging
-signal; nobody has yet chosen a threshold that is meaningful across
-deployments, and an alert with an arbitrary one trains people to ignore it.
+durability backlog). It is a legitimate paging signal, but it appears in
+neither the alert pack nor the shipped dashboards yet: nobody has chosen a
+threshold that is meaningful across deployments, and an alert with an
+arbitrary one trains people to ignore it.
 
 *Aspirational — designed, not registered, deliberately absent from the pack:*
 `rift_cluster_raft_leader_changes_total` (flapping = network trouble),
@@ -130,19 +141,27 @@ shedding). Leader flapping is the sharpest of these and has no substitute today;
 
 ## Runbooks (sketches; full versions ship with the harness)
 
-- **Scale up**: start pod with seeds → auto learner → voter if < 9. Nothing
-  else.
+The `cluster …` subcommands sketched below are **not built**: the binary has
+no membership or recovery subcommand today (membership changes only through a
+node joining or leaving — D-25, D-26; the cluster maintains its own log and
+snapshots — D-24). They are kept as the design of what a crash-retire and a
+majority-loss recovery would have to look like.
+
+- **Scale up**: start pod with seeds → auto learner → voter if < 9
+  (`MAX_AUTO_VOTERS`, D-27). Nothing else.
 - **Scale down / retire**: SIGTERM, wait for exit (graceful leave does the
-  rest). Crash-retire: `rift-cluster-server cluster remove-node <id>` against any
-  live node.
+  rest; the leader refuses a leave that would drop the voter set below two —
+  D-25). Crash-retire: `rift-cluster-server cluster remove-node <id>` against
+  any live node *(sketch — not built)*.
 - **Restore quorum after majority loss**: last-resort
   `cluster force-recover --from-state-dir` on the best surviving node (log
   end inspected via `cluster inspect`), then rejoin others empty. Documented
-  as data-loss-possible, operator-confirmed, twice.
+  as data-loss-possible, operator-confirmed, twice *(sketch — not built)*.
 - **Backup**: configs are exportable at any moment via `GET /imposters`
   (Mountebank-compatible JSON) or the core `--datadir` write-through; the
   state dir itself is snapshot-friendly (redb single file, crash-consistent).
-- **Stuck scenario triage**: `/_cluster/ring?key=flow` → `/_cluster/kv/:flow`
+- **Stuck scenario triage** (once `/_cluster/ring` and `/_cluster/kv` ship —
+  see the endpoint table): `/_cluster/ring?key=flow` → `/_cluster/kv/:flow`
   → compare owner vs replica `(m_idx, v)` → the answer is one of: owner
   isolated (heartbeat metric), adoption reset (degraded counter), or the test
   actually didn't send the transition. Three checks, no log spelunking.

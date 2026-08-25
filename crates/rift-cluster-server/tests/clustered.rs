@@ -409,6 +409,9 @@ async fn probes_answer_while_the_node_is_still_joining() {
 /// above the floor and lands, the second would drop the fleet to a single voter
 /// and is refused. Two nodes could only ever show the refusal, and would leave
 /// the wiring that performs a real departure untested.
+///
+/// Pins D-25 end to end: SIGTERM leaves the membership until the voter floor of
+/// two would be breached, and then the leader keeps the departing node.
 #[tokio::test]
 async fn graceful_leave_removes_this_node_until_the_voter_floor_stops_it() {
     let founder_state = TempDir::new().expect("tempdir");
@@ -501,6 +504,10 @@ async fn graceful_leave_removes_this_node_until_the_voter_floor_stops_it() {
 ///
 /// It also pins the marker's on-disk name, which
 /// `a_departed_node_without_seeds_fails_startup_with_guidance` relies on.
+///
+/// Pins D-26 (the *rejoin* row): a `departed` marker beside retained state
+/// sends the node through its seeds without wiping the directory, and the
+/// marker is cleared once it is a member again.
 #[tokio::test]
 async fn departed_node_with_retained_state_dir_rejoins_on_restart() {
     let founder_state = TempDir::new().expect("tempdir");
@@ -638,6 +645,10 @@ async fn cold_start_resumes_from_durable_state_without_seed_joining() {
 /// directory that has been hand-edited or half-restored — the marker's name is
 /// pinned by `departed_node_with_retained_state_dir_rejoins_on_restart`, which
 /// produces a real one.
+///
+/// Pins D-26 (no state wiping): a departed node with nowhere to rejoin refuses
+/// to start and names the directory, rather than founding a fresh group over
+/// its old log or deleting it.
 #[tokio::test]
 async fn a_node_marked_departed_with_nowhere_to_rejoin_fails_startup_with_guidance() {
     let state = TempDir::new().expect("tempdir");
@@ -719,6 +730,9 @@ async fn a_solo_node_survives_a_graceful_leave_and_restarts() {
 /// membership survives the teardown whole. The three-node shape, where one node
 /// really departs and the other two are floor-refused, needs real processes and
 /// lives in the container tier as `whole_fleet_sigterm_then_cold_start_converges`.
+///
+/// Pins D-25 and D-26 together: floor-refused nodes write no marker, so the
+/// *resume* row of the table brings the whole fleet back from its own logs.
 #[tokio::test]
 async fn a_graceful_stop_of_the_whole_fleet_can_cold_start_again() {
     let founder_state = TempDir::new().expect("tempdir");
@@ -808,6 +822,9 @@ async fn a_graceful_stop_of_the_whole_fleet_can_cold_start_again() {
 /// remembers. Without that it restarts into a permanent refusal — which is what
 /// the container tier caught, and what this test guards in-process, since the
 /// container tier does not run on every change.
+///
+/// Pins D-26: with no seeds, the rejoin row falls back to the peers the
+/// retained log names — the log is evidence, never something to discard.
 #[tokio::test]
 async fn a_departed_founder_rejoins_through_the_peers_its_log_remembers() {
     let founder_state = TempDir::new().expect("tempdir");

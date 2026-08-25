@@ -650,6 +650,9 @@ async fn test_graceful_leave() {
 /// plane on a single authoritative volume, and a cold start that has to wait
 /// for *that* node before anything else can join. The floor stops the walk at
 /// two; the refused node exits crash-equivalent and resumes on its next start.
+///
+/// Pins D-25: the leader refuses a graceful leave that would drop the voter set
+/// below two — the first departure from three lands, the second is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_leave_holds_the_voter_floor() {
     let _serial = TEST_LOCK.lock().await;
@@ -732,6 +735,10 @@ async fn test_leave_holds_the_voter_floor() {
 /// same serialization the auto-promote ceiling uses (#55). Without it both
 /// departures read a pre-removal voter count, both pass the check, and the
 /// fleet walks to one anyway.
+///
+/// Pins D-25: the floor holds under concurrent departures because it is
+/// enforced by the leader under one gate — no orchestrator signal tells the
+/// fleet that a teardown is under way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_leaves_never_walk_below_the_floor() {
     let _serial = TEST_LOCK.lock().await;
@@ -795,6 +802,9 @@ async fn test_concurrent_leaves_never_walk_below_the_floor() {
 /// member, and then refuse its own next start — the shape of the defect found
 /// in #72. Every other floor test refuses a follower, so without this one the
 /// local branch is never exercised.
+///
+/// Pins D-25 and D-26: a two-voter fleet sheds nobody, and the refused leader
+/// reports `Retained` rather than a departure the marker would record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_two_node_leave_is_refused_by_the_floor() {
     let _serial = TEST_LOCK.lock().await;
@@ -3322,6 +3332,9 @@ async fn a_leadership_change_under_load_never_panics_a_replication_worker() {
 /// own health tracker refused to heartbeat the restarted peer for its cooldown, the voter timed
 /// out and campaigned, and a leader never adopts a term from a candidate it rejects. The term
 /// assertion is the one that pins the mechanism; convergence alone would pass by accident.
+///
+/// Pins D-22: the leader's liveness probes reach a restarted voter *through* the health gate,
+/// so its term never runs ahead while it is caught up by snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_voter_behind_a_purged_log_catches_up_by_snapshot() {
     let _serial = TEST_LOCK.lock().await;
@@ -3571,6 +3584,10 @@ async fn an_eight_mebibyte_dataset_survives_a_full_cluster_restart_and_a_lost_sp
 
 // ---- #438: quorum blob fan-out before propose ---------------------------
 
+/// Pins D-18: completeness is established by the write path — the fan-out puts
+/// the blob on every member *before* the referencing op is proposed, so a commit
+/// implies quorum-durability and the origin dying after it leaves holders behind.
+///
 /// Acceptance 1. The accepting node stores the blob and every other member ends
 /// up holding it, so a commit implies the blob is quorum-durable and the origin
 /// dying afterwards does not matter.
@@ -3627,6 +3644,9 @@ async fn a_blob_fanned_out_before_propose_reaches_every_member() {
     cluster.shutdown_all().await;
 }
 
+/// Pins D-19: with 1 of 3 voters holding the blob there is no majority of either
+/// configuration, so the fan-out reports no quorum and the write parks.
+///
 /// Acceptance 2. With only one reachable peer there is no majority of either
 /// configuration, so the fan-out reports no quorum and the write path parks
 /// rather than committing an op whose blob is on one node.
@@ -4044,8 +4064,8 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
 /// AppendEntries to a peer while its snapshot streams). A *fresh* joiner cannot campaign for an
 /// unrelated reason: it has applied nothing, so its own effective membership does not list it as a
 /// voter, and `handle_tick_election` returns early for a non-voter. The case where a node is
-/// already a voter and *can* campaign mid-install is a real hole, and such a node does not catch
-/// up at all today — measured, and filed as #431.
+/// already a voter and *can* campaign mid-install was a real hole — measured, filed as #431 and
+/// closed by it; `a_restarted_voter_behind_a_purged_log_catches_up_by_snapshot` pins the fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() {
     const CONVERGE_BY: Duration = Duration::from_secs(30);

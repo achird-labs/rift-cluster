@@ -101,12 +101,14 @@ fast by choice.
 
 ## What the node does when the owner is gone
 
-The read path never hangs and never guesses (defaults; per-feature `local`
-overrides exist and stamp `Rift-Cluster-Degraded` when used — full table in
-Chapter 9):
+The read path never hangs and never guesses (defaults; the per-imposter
+`readConsistency: "local"` override is a contract the imposter opted into, not a
+degradation, and stamps no header — the flow store is reached through
+`spawn_blocking`, which the response-annotation scope does not cross; full
+table in Chapter 9):
 
 - **Fast-fail**: if the owner is already marked unhealthy by local RPC health
-  tracking, the op resolves immediately — no burning the 2.5 s timeout per
+  tracking, the op resolves immediately — no burning the 2 s timeout per
   request.
 - **Reject-by-default**: a scenario-gated request whose owner is unreachable
   answers `503` with the standard error envelope — loudly wrong-side-up rather
@@ -114,8 +116,8 @@ Chapter 9):
 - **The bridge protects the stateless zone**: owner RPCs issued from sync
   engine code park on a bounded bridge (semaphore `max(2, workers/2)`); when an
   owner black-holes, excess stateful ops shed immediately and *stateless*
-  traffic keeps flowing at full speed (chaos scenario C13 pins p99 < 5 ms
-  through an owner loss).
+  traffic keeps flowing at full speed (chaos scenario C13 — Chapter 12, not yet
+  built — specifies p99 < 5 ms through an owner loss).
 
 ## Admin reads
 
@@ -123,6 +125,7 @@ Chapter 9):
 node serves them, consistent at its applied revision, comparable fleet-wide via
 the revision header and `/_cluster/config`. Verification reads
 (`savedRequests`, counts) are the cluster-merged reads of Chapter 7. Cluster
-introspection (`/_cluster/members`, `/ring`, `/kv/:flow`) exists precisely so
-that "why did this request match that stub on that node" is always answerable
-from the outside.
+introspection (`/_cluster/members`, `/_cluster/config`, and
+`GET /imposters/{port}/spaces/{flowId}`, which names the flow's owning node)
+exists precisely so that "why did this request match that stub on that node" is
+always answerable from the outside.

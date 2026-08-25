@@ -96,7 +96,7 @@ on membership change, O(N) fine at our scale.
 ### D-4 — Config bodies via content-addressed RPC fetch, not gossip
 - **Status:** amended
 - **Decided:** 2026-07-01 · RFC-001 v2
-- **Code:** crates/rift-cluster/src/blobs/mod.rs
+- **Code:** crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/blobs/mod.rs
 
 Gossiping full configs blows the SWIM payload budget and re-floods every round; digests converge
 fast and bodies transfer once per node.
@@ -106,17 +106,25 @@ JSON entries. The content-addressed principle survives for *blobs* (datasets, sp
 D-23.
 
 ### D-5 — Two-level, order-aware reconcile (LCS edit script) on top of by-id/positional stub CRUD
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-07-01 · RFC-001 v2
-- **Code:** crates/rift-cluster/src/control.rs
+- **Code:** crates/rift-cluster/src/control.rs, vendor/rift/crates/rift-mock-core/src/imposter/reconcile.rs
 
 Whole-imposter replace per change resets runtime state cluster-wide; set-diff (v2 draft 1) missed
 reorders and reordered keyless edits — order is match priority, so the edit script must be
 order-aware.
 
+**Amendment (2026-08-25, verification pass):** the mechanism is not an LCS. Level 1 is the
+explicit `StubEditScript` (`Add`/`ReplaceById`/`DeleteById`/`Move`), applied all-or-nothing by
+`apply_edit` and the `PatchStubs` arm. Level 2 is upstream's `reconcile_stub_states` (U-6): stubs
+are matched by `stub_key` (explicit id, else an occurrence-counted content hash), surviving keys
+keep their slot state, a pure reorder costs nothing, and a change touching more than half the
+stubs falls back to a wholesale replace. Order-awareness holds; "LCS" does not.
+
 ### D-6 — Redis impls of the new traits are cluster; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-07-01 · RFC-001 v2
+- **Code:** crates/rift-cluster-base/src/lib.rs
 
 **Accepted erosion:** OSS + shared Redis can DIY multi-instance scenario/flow-KV correctness.
 **The moat is not "coordination"** — any Redis impl of these small traits is
@@ -127,6 +135,11 @@ cluster-merged verification, and fleet operations.
 more upstream suspicion than shipping it; pretending trait-impl code is the moat mis-prices the
 product.
 
+**Amendment (2026-08-25, verification pass):** the first clause is moot — no Redis implementation
+of any seam was built on the cluster side (durability is redb, D-16; the Redis-strict path is
+D-12, demand-gated, #466). What stands is the second clause: U-1's CAS ships in upstream's
+`rift-store-redis::RedisFlowStore`, and the facade withholds nothing Redis-shaped.
+
 ### D-7 — Manager-scoped store via provider resolves the construction-time caveat
 - **Status:** active
 - **Decided:** 2026-07-01 · RFC-001 v2
@@ -136,12 +149,16 @@ Per-imposter stores kept for OSS compat; a provider returning a shared store is 
 flexible.
 
 ### D-8 — Sequence cursors reset on ownership change
-- **Status:** active
+- **Status:** pending
 - **Decided:** 2026-07-01 · RFC-001 v2
-- **Code:** crates/rift-cluster-server/src/compose.rs
+- **Implemented by:** #466 (open) — RFC-001 Phase 4
 
 Replicating cursors puts a network write on the hottest stateful path; a documented reset matches
 test-run-scoped data.
+
+**Not built (verified 2026-08-25):** no clustered sequencer exists. `compose.rs` never installs
+one, so cluster nodes run upstream's `LocalSequencer` with node-local cursors — the D-10
+"sequencing = local" default. There is no ownership to reset on until Phase 4 ships.
 
 ### D-9 — Sync traits + cluster-side bridge runtime (std mpsc park, sized semaphore)
 - **Status:** active
@@ -163,19 +180,28 @@ cyclic responses during a blip is worse than a possible duplicate index, and it'
 ### D-11 — Plain gateway listener upstreams with U-7 (promotion of rift #212); only cluster-aware dispatch stays cluster
 - **Status:** active
 - **Decided:** 2026-07-01 · RFC-001 v2
+- **Code:** crates/rift-cluster-base/src/lib.rs
 
 Keeping a generic single-node convenience cluster-only has bad optics, zero moat (community can
 promote #212 trivially), and weakens U-7's story.
 
 ### D-12 — Strict sequencing/proxyOnce ship Redis-backed first; gossip-native single-writer versions are demand-gated
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-07-01 · RFC-001 v2
-- **Code:** crates/rift-cluster-server/src/compose.rs
+- **Amends:** RFC-001 §7.5.3
+- **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster-server/src/compose.rs
 
 Gossip-exact semantics are the hardest engineering in the RFC aimed at the least-demanded
 guarantee; the trait seams make the backend invisible to callers; teams that need this already
 operate Redis. The zero-dependency premise stays intact for Phases 1–3 (membership, config-sync,
 scenario state, verification).
+
+**Amendment (2026-08-25, verification pass):** proxyOnce did **not** ship Redis-first. #226 built
+the zero-dependency form directly — owner-local `Pending` claims on the HRW ring
+(`KeyClass::Proxy`) and one consensus `ProxyRecorded` op (D-40). No Redis proxyOnce backend
+exists or is planned, and `backend: "redis"` is deliberately not honoured under `--cluster`
+(`tests/manager_parity.rs`). The Redis-first ordering now applies to **strict sequencing only**,
+which is unbuilt and demand-gated (D-8).
 
 **Scope note (ADR-001, D-18):** D-12 is the pattern "zero-dependency by default, external system
 by choice" for *flow state*. It is **not** a precedent for tiering the blob corpus to an object
@@ -237,7 +263,7 @@ carried and read the whole payload on every send. The decision stands for the lo
 the snapshot's metadata; only where the payload bytes are written changed.
 
 ### D-17 — Flow state stays off consensus
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-07-21 · ADR-001
 - **Code:** crates/rift-cluster/src/stores/flow.rs, crates/rift-cluster/src/raft/ring.rs
 
@@ -247,12 +273,18 @@ on ownership move) and D-12 (Redis-strict path) both still stand. The residual w
 partitioned node that has not applied the entry deposing it) is closed by the isolated-owner rule:
 no leader heartbeat within `3 × election_timeout` ⇒ reject owner-side stateful ops.
 
+**Amendment (2026-08-25, verification pass):** the isolated-owner rule is enforced for proxyOnce
+claims (`stores/proxy.rs` checks `RaftNode::is_isolated`) but **not** for flow-KV owner
+operations — `FlowNet::owner_write` / `blocking_read` never consult it, so the residual
+split-brain window this entry says is closed is open for flow state. Tracked as a defect
+(#465); the decision stands, the code is behind it.
+
 ### D-18 — Every member holds every live blob
 - **Status:** active
 - **Decided:** 2026-08-24 · ADR-001 · #432, rift-cluster#458
 - **Amends:** RFC-005 §3.2
-- **Implemented by:** #437, #438, #439 (open), #440 (open), #441 (open — the RFC/chapter revision)
-- **Code:** crates/rift-cluster/src/blobs/mod.rs
+- **Implemented by:** #437, #438 (merged), #439 (open), #440 (open), #441 (open — the RFC/chapter revision)
+- **Code:** crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster-server/src/admin_front.rs
 
 The content-addressed blob store (#437) is quorum-complete on each node; an object store (#448)
 is an opt-in cache/backup tier that is never consulted on the serving path and never a condition
@@ -262,7 +294,10 @@ The store itself replicates nothing — two nodes holding different blob sets is
 divergence. Completeness is established by the **write path** (#438): the accepting node stores
 the blob, fans it out to the members, and proposes the referencing op only once a quorum
 acknowledges the digest, so a commit implies quorum-durability — the guarantee the log itself
-provided while the bytes were still on it.
+provided while the bytes were still on it. **Until D-23 (#439) lands** the guarantee at commit is
+quorum-completeness, not every-member completeness — a member the fan-out did not reach still
+receives the bytes from the log entry, so nothing is lost, but "every member holds every live
+blob" is the target state, not yet the invariant.
 
 *Rejected:* object-store tiering of the corpus (evict cold datasets locally, fetch from a bucket
 on demand). A bucket outage, credential rotation or lifecycle deletion becomes a request-path
@@ -274,7 +309,7 @@ replicated; a corpus that outgrows a voter's disk is a redesign with numbers, no
 - **Status:** active
 - **Decided:** 2026-08-24 · ADR-001 · #438
 - **Implemented by:** #438
-- **Code:** crates/rift-cluster-server/src/admin_front.rs
+- **Code:** crates/rift-cluster/src/raft/network.rs, crates/rift-cluster-server/src/admin_front.rs
 
 A majority of *both* the committed and the effective voter configuration, read in a single
 `with_raft_state` closure so the pair cannot be assembled from two membership epochs. Neither
@@ -288,9 +323,9 @@ outside a configuration does not count toward that configuration, and a member w
 serve blobs counts toward neither.
 
 ### D-20 — Only a flow has an owner; imposters, stubs and config own nothing
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-08-09 · #359 (corrected), `docs/design/console/README.md`
-- **Code:** crates/rift-cluster/src/raft/ring.rs, crates/rift-cluster/src/stores/flow_config.rs
+- **Code:** crates/rift-cluster/src/raft/ring.rs, crates/rift-cluster/src/stores/flow_config.rs, crates/rift-cluster/src/stores/proxy.rs
 
 Imposters, stubs and config go through Raft (D-15): a write propagates from the leader to every
 node, every node serves any imposter. There is no "port owner" and no `OWNER` column for an
@@ -303,6 +338,11 @@ write answers `NotOwner{owner}`.
 flow with one owner. Any code deriving an owner from the bare id names the wrong node.
 `KeyClass::Config` is vestigial (the gossip-era config owner) and must never be renumbered — tags
 are hash inputs, so moving one silently reassigns live flows.
+
+**Amendment (2026-08-25, verification pass):** "only a flow has an owner" is precise for *config*
+vs *state*, but there are two owned key classes, not one: flow state (`KeyClass::FlowKv`) and
+proxyOnce claims (`KeyClass::Proxy`, key `(port, signature)`, D-40). Read the title as "only
+*state* has an owner; replicated config never does".
 
 *Why it is registered:* #358 shipped an `OWNER` column on the imposter table and #359 asked to
 fill it in; both were built on the wrong premise. An issue whose facts all check out can still be
@@ -364,7 +404,8 @@ reversal; #441 revises the prose.
 - **Decided:** 2026-08-10 · #365 (rejected by design)
 - **Code:** crates/rift-cluster/src/raft/store.rs
 
-Snapshots are taken at the configured log/size thresholds and the log is purged behind them; no
+Snapshots are taken at openraft's log-entry threshold (`LogsSinceLast`, default 5 000 — there is
+no size threshold) and the log is purged behind them; no
 admin route or console panel triggers either. openraft *does* expose `trigger().snapshot()` and
 `purge_log` — recorded here so nobody re-derives "it is possible" into "it is wanted". Reading
 the durability and write-path settings back (#394) is a separate, accepted request.
@@ -380,7 +421,7 @@ rejected as orchestrator-specific — so the residual raciness of a fast roll is
 than papered over with a signal only one platform can send.
 
 ### D-26 — The `departed` marker and the join-or-bootstrap table; no state wiping
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-08 · #72
 - **Code:** crates/rift-cluster-server/src/compose.rs, crates/rift-cluster/src/raft/node.rs
 
@@ -389,6 +430,12 @@ the presence of a Raft vote, and the reachability of seeds decide between *join*
 *bootstrap* by a fixed table (operator guide, "departed marker"). Wiping state to force a clean
 join was rejected: it turns an operator mistake into data loss and hides the case the table is
 there to make explicit.
+
+**Amendment (2026-08-25, verification pass):** the node id is minted by the node itself at first
+start — from `--cluster-node-name` when set, otherwise from the clock — never by the leader; the
+join request carries it. A redeployed pod with the same name and a wiped state dir therefore
+returns as the *same* node, which is the one case where "no state wiping" and "a new node"
+coincide.
 
 ### D-27 — `MAX_AUTO_VOTERS` is a soft ceiling; promotion only ever adds voter ids
 - **Status:** active
@@ -434,7 +481,7 @@ node can never be mistaken for a member of the fleet it was copied from.
 ### D-31 — `PollStatus` is node-local; `SourceRecord` is fleet-replicated
 - **Status:** active
 - **Decided:** 2026-08 · #233, #239
-- **Code:** crates/rift-cluster/src/sources/scheduler.rs, crates/rift-cluster-server/src/admin_front.rs
+- **Code:** crates/rift-cluster/src/sources/scheduler.rs, crates/rift-cluster/src/sources/mod.rs, crates/rift-cluster-server/src/admin_front.rs
 
 What a source *is* (URL, credentials ref, interval) is a Raft value; when *this node* last polled
 it and what it saw is not. A response that flattens the two into one shape would present a
@@ -453,7 +500,7 @@ was rejected — clocks are not ordered across nodes (Ch.7) — and a fourth, hy
 rejected *visibly* here so it is not rediscovered.
 
 ### D-33 — An unclustered node is indistinguishable from the open-source binary
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-08 · #297
 - **Code:** crates/rift-cluster-server/src/console.rs
 
@@ -461,6 +508,11 @@ Without `--cluster`, `rift-cluster-server` serves exactly what `rift` serves: `/
 404, no `Rift-Cluster-*` headers, no fleet routes. It is a design invariant, not observed
 behaviour — the binary must be a drop-in for the OSS one so a single-node deployment gains
 nothing and risks nothing by using it.
+
+**Amendment (2026-08-25, verification pass):** the invariant has two independent halves. Without
+`--cluster` there is no console regardless of build; and a build without the `console` feature
+serves no console even when clustered. `tests/passthrough.rs` pins the first, `tests/console_off.rs`
+the second — same decision, two gates.
 
 ### D-34 — `git+` sources are a detected capability in the `-static` image
 - **Status:** active
@@ -472,7 +524,7 @@ loudly at source creation with a capability error rather than at the first poll;
 is probed, not assumed from the build.
 
 ### D-35 — Portable release artifacts are the Helm chart and the GHCR image
-- **Status:** active
+- **Status:** amended
 - **Decided:** 2026-08 · #264 (epic)
 - **Code:** deploy/helm, .github/workflows/release.yml
 
@@ -480,11 +532,150 @@ Non-goals, stated so they are not re-proposed: no Terraform / CloudFormation / B
 OS package-manager packages, no auto-update. Chapter 14/15 reference deployments consume the chart
 and the image; anything else is the operator's composition.
 
+**Amendment (2026-08-25, verification pass):** per-platform binary tarballs + `SHA256SUMS` on the
+GitHub Release (`release.yml` jobs `binaries`/`release`) also ship, as the no-container path. They
+are not a third deployment shape: the chart and the image remain the only artifacts the reference
+deployments consume.
+
 ### D-36 — Flow-eviction ties are broken by a monotone touch sequence
 - **Status:** active
 - **Decided:** 2026-08-18 · #408
 - **Code:** crates/rift-cluster/src/stores/shard.rs
 
 LRU eviction keyed on a millisecond timestamp alone evicts the wrong flow when several are touched
-within the same millisecond; a per-shard monotone sequence stamped on every touch breaks the tie
-so LRU holds at any rate.
+within the same millisecond; a process-wide monotone sequence (`static TOUCH_SEQ`) stamped on
+every touch breaks the tie so LRU holds at any rate.
+
+### D-37 — The journal is per-writer shards, merged on read
+- **Status:** active
+- **Decided:** 2026-08 · #223, #224 (RFC-001 §7.5.1 as built)
+- **Code:** crates/rift-cluster/src/stores/journal.rs, crates/rift-cluster/src/stores/journal_net.rs
+
+Every node appends only to its own `(port, node_id)` shard; a read k-way-merges the shards by
+recorded timestamp with `(node_id, seq)` breaking ties. Caps are writer-local with an
+`evicted_below_seq` watermark; an unreachable peer yields `Rift-Cluster-Partial`, never a stall.
+
+*Rejected:* owner-routed or consensus-carried journaling — a mock request must never wait on
+another node to be recorded.
+
+### D-38 — Clears are generation bumps, never timestamps
+- **Status:** active
+- **Decided:** 2026-08 · #223 (RFC-001 §7.5.2 as built)
+- **Amends:** RFC-001 §7.5.2
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/stores/journal.rs
+
+A monotone per-port (and per-`(port, space)`) clear generation rides the Raft log as
+`ControlOp::JournalClearGen`; entries and counter slots carry their writer's generation, and the
+merge drops anything from an older one. RFC-001 §7.5.2's "gossip carries clear generations" and
+its `teardown_space` markers were never built — the generation is a committed value.
+
+*Rejected:* timestamped deletion (clocks are not ordered across nodes); `retain` predicates stay
+best-effort per shard.
+
+### D-39 — The journal cursor is a vector, opaque by contract
+- **Status:** active
+- **Decided:** 2026-08 · #225, #348 (RFC-001 §7.5.1 as built)
+- **Amends:** RFC-001 §7.5.1
+- **Code:** crates/rift-cluster/src/stores/journal.rs, crates/rift-cluster/src/stores/journal_net.rs
+
+`since` is `v1 {gen, pos: node_id → seq}`, base64url-JSON; per-shard filtering, monotone advance,
+dead shards frozen rather than rewound; a bare `u64` is read as `{this_node: seq}` for the upgrade
+window. `x-rift-truncated` replaces the RFC's `Rift-Cluster-Cursor-Lapsed`; `Cursor-Reset` is
+carried but not acted on. The fleet-wide form is `port → JournalCursor` with its own scope tag
+(D-32 builds on it).
+
+*Rejected:* a scalar cursor — it cannot name a position across writers.
+
+### D-40 — proxyOnce is Pending/Recorded with one committed op and a fixed claim TTL
+- **Status:** active
+- **Decided:** 2026-08 · #226 (RFC-001 §7.5.3 as built)
+- **Amends:** RFC-001 §7.5.3
+- **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster/src/control.rs
+
+A `Pending` claim is owner-local (`KeyClass::Proxy`, HRW over `(port, signature)`) and dies with
+its owner; `Recorded` and its replayable stub are one `ControlOp::ProxyRecorded`, so there is no
+crash window between the recording and the config write. The claim TTL is a fixed 60 s — U-16
+carries no timeout context, so "2× the upstream timeout" was not derivable. A partitioned owner
+refuses claims. No Redis-backed proxyOnce was built or is planned (see D-12's amendment).
+
+*Rejected:* two ops (`PatchStubs` then a marker) — a crash between them duplicates the recording;
+an op-id derived from `(port, signature)` — dedup comes from the owner-validated claim token plus
+the committed row instead.
+
+### D-41 — `cluster-smoke` runs every scenario once as a required check; flake detection is the nightly soak
+- **Status:** active
+- **Decided:** 2026-07 · #104, #11
+- **Amends:** RFC-001 §12
+- **Code:** .github/workflows/ci.yml, .github/workflows/nightly-chaos.yml
+
+PR-time `cluster-smoke` runs each container chaos scenario once and is a required status check;
+`nightly-chaos.yml` iterates 60–100× per scenario under a 2 h cap and is where flakes surface.
+
+*Rejected:* RFC-001 §12's three iterations per PR (~25 → 70+ min per cluster-touching PR for
+little the soak does not catch) and a flat 100× nightly (C6's 60 s toxic window alone is ~3.6 h).
+
+### D-42 — C6 bounds an election *rate*; election timers are not an operator knob
+- **Status:** active
+- **Decided:** 2026-07 · #94
+- **Code:** tests/cluster-chaos/tests/scenarios.rs, crates/rift-cluster/src/raft/node.rs
+
+C6's injected jitter overlaps the 150–300 ms election timeout by design, so occasional elections
+are in spec; the scenario bounds leadership transitions by `C6_MAX_LEADER_TRANSITIONS` (derived
+from the ~5 s gauge resolution), never by a fixed count.
+
+*Rejected:* widening the election timeout so a count bound holds — the timers stay fixed in
+`raft/node.rs`; making them a `NodeConfig` knob needs its own design pass and has no operator
+requirement behind it.
+
+### D-43 — `--cluster-snapshot-log-entries` is a hidden testability knob, not operator tuning
+- **Status:** active
+- **Decided:** 2026-08 · #183
+- **Code:** crates/rift-cluster-server/src/cli.rs, crates/rift-cluster/src/raft/node.rs
+
+Sets `snapshot_policy = LogsSinceLast(N)` and `max_in_snapshot_log_to_keep = 0` together so the
+container tier can force a real `install_snapshot`; `hide = true`, unset by every shipped
+configuration, and present only in `snapshot-install.overlay.yml`.
+
+*Rejected:* documenting it for operators (trades log retention for nothing — no tuning
+requirement exists) and putting it in the shared `chaos.overlay.yml` (it changed every catch-up
+path and broke C4/C6/C7).
+
+### D-44 — The first principal closes the open admin plane
+- **Status:** active
+- **Decided:** T2 (#161) · RFC-002 §3.4
+- **Code:** crates/rift-cluster-server/src/principal.rs
+
+A fleet with neither `--api-key` nor any stored principal keeps the pre-tenancy open admin plane,
+so an upgrade denies nobody. The moment the first principal is committed — or a key is
+configured — every request must authenticate; there is no grace window and no per-node flag to
+reopen it (`should_bypass` is `api_key.is_none() && !has_any_principals()`).
+`rift_cluster_no_principals` reports the open state for audit. Bootstrap therefore goes through
+`MB_APIKEY` (legacy key = `tenant-admin@default` + `fleet-admin@*`), then minted principals.
+
+*Rejected:* requiring a key whenever `--cluster` is set — breaks every existing keyless fleet on
+upgrade.
+
+### D-45 — Cross-tenant and unowned-port probes answer one indistinguishable 404
+- **Status:** active
+- **Decided:** T2 (#161) · RFC-002 §8.4 · narrowed by #182
+- **Code:** crates/rift-cluster-server/src/admin_front.rs
+
+A tenant the principal is not bound to, a port owned by another tenant, and a port owned by
+nobody all answer the same terse `404`; `403` is reserved for "bound here, role insufficient".
+The gate refuses unowned ports too, because upstream's descriptive 404 names the port and would
+otherwise let a tenant map which ports other tenants hold.
+
+*Rejected:* letting unowned ports fall through to upstream's 404.
+
+### D-46 — The legacy `--api-key` cannot hold a console session
+- **Status:** active
+- **Decided:** C2 (#185)
+- **Code:** crates/rift-cluster-server/src/admin_front.rs
+
+`POST /session` with the legacy key answers `400`, never a cookie: the synthetic
+`legacy:api-key` identity has no principal row, so a session minted for it could never resolve
+back to a principal — a `200` there is the silent-fallback shape. Operators mint a real principal
+and log in with its key; the legacy key is a curl/bootstrap credential only.
+
+*Rejected:* minting the cookie and letting later requests fail `401` — indistinguishable from a
+rotated key or a skewed clock.

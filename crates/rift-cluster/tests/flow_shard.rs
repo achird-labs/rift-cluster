@@ -318,6 +318,9 @@ async fn eviction_sheds_whole_flows() {
 /// The tie-break itself, from the other direction (issue #408): a flow that was written first
 /// but *touched* again last is the most recent, and survives eviction even though every touch in
 /// the test shares one millisecond — the sequence, not the clock, decides.
+///
+/// Pins D-36: flows touched within one millisecond evict in touch order — the
+/// monotone touch sequence, not the wall clock, breaks the tie.
 #[tokio::test]
 async fn a_re_touched_flow_is_the_most_recent_even_when_the_clock_ties() {
     let shard = FlowShard::in_memory(ShardConfig {
@@ -363,6 +366,9 @@ async fn a_re_touched_flow_is_the_most_recent_even_when_the_clock_ties() {
 /// policy evicted no-TTL flows (`expires_at == 0`) first, because 0 sorts
 /// smallest. Here `keep` has no TTL and is touched last; it must survive while
 /// the older flows are shed.
+///
+/// Pins D-36: eviction order is `(last_touch, touch_seq)` — LRU by touch,
+/// never by expiry.
 #[tokio::test]
 async fn eviction_is_lru_not_by_expiry() {
     let shard = FlowShard::in_memory(ShardConfig {

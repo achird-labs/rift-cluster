@@ -171,14 +171,14 @@ fencing):
 
 | State | On ownership change | Rationale |
 |---|---|---|
-| Scenario FSM / flow KV | **Adopt** highest `(m_idx, v, origin)` from replicas/disk | ≤ 1 replication round staleness; adopt-found-nothing ⇒ FSM restarts, response stamped `Rift-Cluster-Degraded: kv-adopt`, counted — bounded and visible, never silent |
-| Sequence cursors | **Reset** | Deliberate (D-8): replicating every advance puts a network write on the hottest stateful path for test-run-scoped data. A mid-test membership change may restart sequences; documented |
+| Scenario FSM / flow KV | **Adopt** highest `(m_idx, v, origin)` from replicas/disk | ≤ 1 replication round staleness; adopt-found-nothing ⇒ FSM restarts, counted (`rift_cluster_flow_adoptions_total{outcome="empty"}`) — no response header, because the store is reached through `spawn_blocking`, which the annotation scope does not cross; bounded and visible, never silent |
+| Sequence cursors | **Reset** | Deliberate (D-8): replicating every advance puts a network write on the hottest stateful path for test-run-scoped data. A mid-test membership change may restart sequences; documented. *Not yet built:* no clustered sequencer exists — cursors are node-local (`LocalSequencer`) today, so there is nothing to hand off |
 | proxyOnce | `Recorded` adopts (replicated); `Pending` dies with the owner → re-claim | Duplicate-upstream bound: 1 + ownership changes in flight (Chapter 7) |
 | Journal / counters | No owner — nothing to hand off | CRDT merge-on-read (Chapter 7) |
 
-Graceful leave tightens the loop: the leaver pushes final values to successors
-*before* the membership entry commits, so planned restarts hand off with zero
-staleness (Chapter 3's lifecycle).
+Graceful leave adds no separate flush: every accepted write was already pushed
+to the successors when it was applied, so a planned restart hands off with at
+most the in-flight pushes outstanding (Chapter 3's lifecycle).
 
 ## The durable tier
 
@@ -218,9 +218,10 @@ adoption pulls from recovered disk state exactly as it would from live memory
 — restart is just a very long partition, handled by machinery that already
 exists.
 
-Bounds that keep the tier honest: per-flow TTL (default 1 h), 100k entries per
-node with whole-flow LRU shedding (never single keys — a half-evicted scenario
-would be torn state), both counted in metrics.
+Bounds that keep the tier honest: per-entry TTL (default 5 min — upstream's
+`ttlSeconds: 300`), 100k flows per node with whole-flow LRU shedding (never
+single keys — a half-evicted scenario would be torn state), both counted in
+metrics.
 
 ### Reading the knobs back (#370)
 
@@ -245,8 +246,10 @@ keeps that redaction intact. `contextScope` is not included; it arrives with
 ## The strict escape hatch
 
 For customers whose requirements exceed AP-with-bounded-windows — strict
-sequencing, exactly-once proxy recording, zero adoption staleness — the same
-seams accept **Redis-backed implementations** (cluster, Phases 4–5): the
-external store becomes the single writer and the windows above collapse to
-Redis's own guarantees. Zero-dependency by default, external store by choice;
-the trait boundary makes the swap invisible to imposter configs.
+sequencing, zero adoption staleness — the same seams accept **Redis-backed
+implementations** (cluster, Phases 4–5; D-12, none built yet): the external
+store becomes the single writer and the windows above collapse to Redis's own
+guarantees. Exactly-once proxy recording no longer needs this hatch: it shipped
+cluster-native on consensus (Chapter 7, #226). Zero-dependency by default,
+external store by choice; the trait boundary makes the swap invisible to
+imposter configs.

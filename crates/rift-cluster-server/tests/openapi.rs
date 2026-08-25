@@ -187,9 +187,71 @@ async fn every_direct_route_is_actually_served() {
     server.shutdown().await;
 }
 
+/// Pins D-21: the contract publishes no operation that adds or removes a cluster member. The only
+/// path naming membership is the read-only `GET /_fleet/members` projection, and nothing names a
+/// learner or a voter — membership changes only by a node joining or leaving.
+///
+/// Pins D-24: no published path triggers a snapshot, a log compaction or a purge. The cluster
+/// maintains itself; the admin API offers no lever for it.
+///
+/// Asserted against the *served* document rather than the YAML on disk: `src/openapi.rs`'s parity
+/// tests force every route in `HANDLE_DIRECT_ROUTES` into the contract, so a route added there
+/// surfaces here even if the YAML was edited to match.
+#[tokio::test]
+async fn the_contract_offers_no_membership_or_snapshot_operation() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr().to_string();
+
+    let response = reqwest::get(format!("http://{admin}/openapi.json"))
+        .await
+        .expect("openapi.json");
+    let seen = Seen::of(response).await;
+    assert_eq!(seen.status, 200, "{seen}");
+    let doc = seen.json();
+    let paths = doc
+        .get("paths")
+        .and_then(serde_json::Value::as_object)
+        .expect("paths object");
+
+    const HTTP_METHODS: [&str; 7] = ["get", "put", "post", "delete", "options", "head", "patch"];
+    for (path, item) in paths {
+        let lower = path.to_ascii_lowercase();
+        for forbidden in ["snapshot", "compact", "purge", "learner", "voter"] {
+            assert!(
+                !lower.contains(forbidden),
+                "{path} is published: the admin API must not offer a {forbidden} operation"
+            );
+        }
+        if lower.contains("member") {
+            let methods: Vec<&str> = item
+                .as_object()
+                .map(|ops| {
+                    ops.keys()
+                        .map(String::as_str)
+                        .filter(|k| HTTP_METHODS.contains(k))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                methods,
+                ["get"],
+                "{path} must stay a read-only projection of membership, got {methods:?}"
+            );
+        }
+    }
+
+    server.shutdown().await;
+}
+
 /// The contract maps every tenancy and audit route, so it is authenticated — the same posture as
 /// `/admin/whoami`. Without a configured key the node is in bootstrap bypass and answers anyone,
 /// which is why this test configures one: otherwise it would assert nothing.
+///
+/// Pins D-44 (the key half): a configured `--api-key` alone closes the open admin plane.
 #[tokio::test]
 async fn openapi_json_requires_authentication_once_a_key_is_configured() {
     let state = TempDir::new().expect("tempdir");

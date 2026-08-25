@@ -6,6 +6,12 @@
 //! `/console` proxies upstream and 404s exactly as it did before C3. `tests/console_off.rs` asserts
 //! the observable half of that on every ordinary CI run.
 //!
+//! The second gate is `--cluster` itself (D-33): this module is reachable only through the
+//! clustered admin front's `handle`, and `compose::start` builds no front without `--cluster`, so an
+//! unclustered node answers `/console` with the OSS engine's own 404 whatever features it was built
+//! with. That is the invariant, not a side effect — an unclustered `rift-cluster-server` must be
+//! indistinguishable from the open-source binary, and `tests/passthrough.rs` pins it.
+//!
 //! The assets come from `web/dist/`, built by `pnpm build` in the release lane. `rust-embed` fails
 //! the **compile** when that folder is missing, which is the point: a release cannot silently ship
 //! consoleless (RFC-006 §7). An *empty* `web/dist` would satisfy the macro, so

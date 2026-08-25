@@ -264,6 +264,8 @@ describe("RBAC-correct visibility", () => {
 const DERIVED_COLUMNS = ["Provenance"] as const;
 
 describe("every rendered cell comes from the declared column table", () => {
+  // Pins D-20: an imposter has no owner, so no `Owner` column may render — a column that is not
+  // in the declared table (and `Owner` is not) fails this exact assertion.
   it("renders exactly the declared columns, in order, and no others", async () => {
     // The compile-time half of RFC-006 §11 lives in `contract.ts` (`keyof` the schema type with its
     // index signature stripped). It is bypassable: a screen can cast and hand-write a `<td>` for a

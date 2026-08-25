@@ -28,10 +28,12 @@
 //! * `sm_applied`    — `() -> AppliedState` (JSON): last-applied log id + membership.
 //!
 //! Log and vote writes commit with `Durability::Immediate` per the ADR (log and vote
-//! must fsync before ack). Snapshot and state-machine writes use the default
-//! (`None`) durability — the snapshot table is a redundant persisted copy for
-//! [`RaftStateMachine::get_current_snapshot`], not the durability boundary; the log
-//! is.
+//! must fsync before ack) — decision D-16, which puts the log, the vote and the
+//! snapshot's *metadata* in redb; its amendment (#436) moved the snapshot *payload*
+//! to a plain file beside it, see [`RedbStateMachine::snapshot_dir`]. Snapshot and
+//! state-machine writes use the default (`None`) durability — the snapshot table is
+//! a redundant persisted copy for [`RaftStateMachine::get_current_snapshot`], not
+//! the durability boundary; the log is.
 //!
 //! # Apply semantics (issue #9)
 //!
@@ -1137,6 +1139,8 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         Ok(())
     }
 
+    // Called by openraft alone, behind the snapshot policy `raft/node.rs` configures — never by
+    // an admin route (decision D-24).
     async fn purge(&mut self, log_id: LogId<u64>) -> StorageResult<()> {
         let write_txn = self
             .db
@@ -1277,11 +1281,7 @@ pub struct RedbStateMachine {
     /// as `engine`: replay during join must drive it too, not just live
     /// commits.
     routes: Option<Arc<ArcSwap<CompiledRoutes>>>,
-    /// Last engine side-effect failure per port, cleared when a later drive
-    /// succeeds for that port. Key 0 is the set-level slot (an `apply_config`
-    /// refusal that names no single port). This is node status, not replicated
-    /// state — every replica has its own bind outcomes.
-    /// Where snapshot payload files live: `<redb's parent>/snapshot/` (#436).
+    /// Where snapshot payload files live: `<redb's parent>/snapshot/` (#436, the D-16 amendment).
     ///
     /// Not an `Option` and not a builder, unlike `spool_dir`: a snapshot has nowhere else it could
     /// go, so "no directory" is not a representable state. Derived from the path `new` already
@@ -1300,6 +1300,10 @@ pub struct RedbStateMachine {
     /// `Arc` because clones share the directory: `get_snapshot_builder` hands openraft a
     /// `self.clone()`.
     snapshot_guard: Arc<Mutex<()>>,
+    /// Last engine side-effect failure per port, cleared when a later drive
+    /// succeeds for that port. Key 0 is the set-level slot (an `apply_config`
+    /// refusal that names no single port). This is node status, not replicated
+    /// state — every replica has its own bind outcomes.
     apply_failures: Arc<Mutex<BTreeMap<u16, String>>>,
     /// This node's local request journal, late-bound (issue #224): `apply` pushes a committed
     /// clear generation into it via [`ClusterJournal::set_clear_gen`], and `install_snapshot`
@@ -4878,8 +4882,9 @@ impl RedbStateMachine {
                 // Idempotent when absent, like `DeleteImposter`.
                 sources.remove((tenant.as_str(), id.as_str())).map_err(io)?;
                 // The imposters stay bound — "stop tracking this URI" is not
-                // "tear down live traffic" — but nothing may still point at a
-                // source that no longer exists, so their provenance is cleared.
+                // "tear down live traffic" (D-29: orphan, never cascade) — but
+                // nothing may still point at a source that no longer exists,
+                // so their provenance is cleared.
                 let orphaned = Self::ports_of_source(configs, tenant.as_str(), id)?;
                 for port in orphaned {
                     let Some(mut record) = Self::stored_imposter(configs, tenant.as_str(), port)?
@@ -5679,8 +5684,11 @@ impl RedbStateMachine {
                 specs
                     .insert((tenant.as_str(), id.as_str()), value.as_str())
                     .map_err(io)?;
-                // Content-addressed: insert the blob only on its first reference. Re-putting the
-                // same bytes under the same id, or under a different id or tenant, is then a
+                // Bytes still ride the log here until D-23 (#439) lands: `document` is the
+                // in-log copy, and the blob store already holds the same bytes from the
+                // pre-propose fan-out (#438).
+                // Content-addressed (D-4): insert the blob only on its first reference. Re-putting
+                // the same bytes under the same id, or under a different id or tenant, is then a
                 // no-op here — `validate` already proved `meta.digest` is this document's own
                 // sha256, so a hit means the bytes already stored are these bytes.
                 if spec_blobs.get(meta.digest.as_str()).map_err(io)?.is_none() {
@@ -5840,8 +5848,11 @@ impl RedbStateMachine {
                     write_spool(dir, record.digest.as_str(), csv)
                         .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
                 }
-                // Content-addressed: insert the blob only on its first reference, exactly like
-                // `SpecPut` — `validate` already proved `record.digest` is `csv`'s own sha256.
+                // Bytes still ride the log here until D-23 (#439) lands: `csv` is the in-log
+                // copy, and the blob store already holds the same bytes from the pre-propose
+                // fan-out (#438).
+                // Content-addressed (D-4): insert the blob only on its first reference, exactly
+                // like `SpecPut` — `validate` already proved `record.digest` is `csv`'s own sha256.
                 if dataset_blobs
                     .get(record.digest.as_str())
                     .map_err(io)?
@@ -5957,6 +5968,9 @@ impl RedbStateMachine {
     async fn drive_one(&self, action: EngineAction) {
         match action {
             EngineAction::Sync(desired) => {
+                // The whole-config level of D-5: upstream's `apply_config` (U-6)
+                // diffs on stable stub keys, so a replicated write never resets
+                // an untouched imposter's runtime state.
                 let Some(engine) = &self.engine else { return };
                 let desired_ports: std::collections::BTreeSet<u16> =
                     desired.iter().filter_map(|c| c.port).collect();
@@ -8276,6 +8290,10 @@ mod tests {
     /// traffic is not what "stop tracking this URI" means — but clears their
     /// provenance, so nothing is left pointing at a source that no longer
     /// exists.
+    ///
+    /// Pins D-29: deleting a source orphans its imposters — the config survives
+    /// the delete and only its provenance is cleared; a cascade would have
+    /// removed it.
     #[tokio::test]
     async fn deleting_a_source_orphans_its_imposters_rather_than_deleting_them() {
         let (_td, mut sm) = fresh_sm(None).await;
@@ -8634,6 +8652,10 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// Pins D-5: a committed `Move` reorders both the stored config and the
+    /// live engine's stub list in place — the reconcile is order-aware, so a
+    /// reorder replicates as a move rather than as a delete+add that would
+    /// reset the slot.
     #[tokio::test]
     async fn patch_reorders_stubs_in_engine_and_stored_config() {
         let engine = Arc::new(ImposterManager::new());
@@ -11074,6 +11096,9 @@ mod tests {
         );
     }
 
+    /// Pins D-4: a blob's identity is its content digest — two spec ids with
+    /// identical bytes share one `sm_spec_blobs` row, which lives until the last
+    /// reference goes.
     #[tokio::test]
     async fn two_specs_sharing_bytes_share_one_blob_that_outlives_either_alone() {
         let (_td, mut sm) = fresh_sm(None).await;
@@ -11641,6 +11666,8 @@ mod tests {
         assert_eq!(sm.dataset_blob_count().expect("count"), 2);
     }
 
+    /// Pins D-4: content-addressed identity — identical bytes under different
+    /// names and tenants share one blob row and one spool file.
     #[tokio::test]
     async fn identical_bytes_share_one_blob_and_one_spool_file_across_names_and_tenants() {
         let (_td, mut sm, spool) = fresh_sm_with_spool().await;
@@ -12156,6 +12183,9 @@ mod tests {
     /// The row assertion is the load-bearing half: before #436 the row *was* the payload,
     /// re-encoded as a JSON integer array (~3.7x). A row that stays small is the only direct
     /// evidence the bytes moved rather than being copied.
+    ///
+    /// Pins D-16 (amendment): redb keeps the snapshot's metadata and the file name only; the
+    /// payload bytes live in a file beside it.
     #[tokio::test]
     async fn the_stored_snapshot_is_a_file_beside_redb_not_a_row() {
         let (td, mut sm) = fresh_sm(None).await;

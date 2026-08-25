@@ -3,7 +3,8 @@
 //! Recorded requests are the one piece of cluster state that never conflicts: entries
 //! from different nodes interleave rather than disagree. That buys a design with no
 //! owners, no consensus and no coordination on the write side — every node appends to
-//! **its own shard** and reads merge (issue #223).
+//! **its own shard** and reads merge (issue #223, D-37). Clears are generation bumps
+//! carried on the Raft log (D-38), never timestamped deletions.
 //!
 //! What lives here is only the local half: the shard, its writer-local caps, and the
 //! read surface a peer merge consumes. There is no RPC and no peer pull, and journal
@@ -209,6 +210,8 @@ pub struct ShardRead {
 /// would silently skip every entry recorded since the token went stale. Both are
 /// wrong-but-quiet, so [`Self::decode`] and [`Self::decode_or_legacy`] refuse instead of
 /// guessing — see [`CursorError`].
+///
+/// D-39: the cursor is a vector over writer shards, opaque by contract — this type is it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalCursor {
     /// The port's clear generation (issue #224) at the moment this cursor was issued — not at
@@ -1778,6 +1781,7 @@ mod tests {
         );
     }
 
+    /// Pins D-39: the token is opaque base64url a client round-trips and never parses.
     #[test]
     fn a_token_is_opaque_and_url_safe() {
         // Opaque is a contract, not an aesthetic: clients must not parse it, and it travels in a
@@ -1812,6 +1816,7 @@ mod tests {
         );
     }
 
+    /// Pins D-39: an unreadable token is a typed error, never a defaulted position.
     #[test]
     fn a_malformed_token_is_rejected_rather_than_defaulted() {
         // Defaulting a bad cursor to "start from 0" would silently replay the whole journal;
@@ -1829,6 +1834,7 @@ mod tests {
         }
     }
 
+    /// Pins D-39: a bare `u64` is read as `{this_node: seq}` for the upgrade window.
     #[test]
     fn a_legacy_scalar_cursor_is_read_as_this_nodes_position() {
         // Any bare u64 a client holds predates the merged read (which has issued no cursor at
@@ -2072,6 +2078,8 @@ mod tests {
         }
     }
 
+    /// Pins D-37: every entry carries the `(node_id, seq, clear_gen)` key its writer stamped —
+    /// what lets shards be unioned and deduplicated on read with no write-side coordination.
     #[test]
     fn every_entry_carries_the_merge_key() {
         let j = bound(3, 7);
@@ -2104,6 +2112,8 @@ mod tests {
     // local half — that a bump changes what subsequent appends are stamped with, and that it
     // touches nothing else.
 
+    /// Pins D-38: a clear is a generation bump — every append after it carries the new
+    /// generation, and the merge drops the old one; no timestamp is consulted.
     #[test]
     fn a_port_generation_bump_stamps_every_subsequent_append() {
         let j = bound(3, 7);
@@ -2156,6 +2166,8 @@ mod tests {
         );
     }
 
+    /// Pins D-38 and D-39: a clear never rewinds `seq` or the watermark, which is what lets a
+    /// cursor minted before the clear keep walking without replay.
     #[test]
     fn a_generation_bump_never_moves_seq_or_the_eviction_watermark() {
         // Cursor validity across clears (#225 depends on this). A clear deletes nothing
