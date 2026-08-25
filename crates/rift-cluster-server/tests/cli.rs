@@ -120,6 +120,8 @@ fn cluster_without_a_secret_is_refused() {
     );
 }
 
+/// Pins D-14: the CLI's own resolve refuses `--cluster --runtime per-core`
+/// with `PerCoreUnsupported` before the server composes.
 #[test]
 fn cluster_with_per_core_runtime_is_refused() {
     let cli = parse(&[
@@ -138,6 +140,8 @@ fn cluster_with_per_core_runtime_is_refused() {
     );
 }
 
+/// Pins D-14: `--cluster --intercept-port` is refused with
+/// `InterceptUnsupported` at startup.
 #[test]
 fn cluster_with_intercept_is_refused() {
     let cli = parse(&[

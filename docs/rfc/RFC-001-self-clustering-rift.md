@@ -987,6 +987,8 @@ binds can fail on some nodes (port taken by an unrelated process). Built (#143):
 
 #### 7.5.1 Recorded-request journal
 
+> **Amended by D-37 and D-39** (as built, #223/#225/#348): per-writer shards merged on read stand; the cursor shipped as base64url-JSON `{v1, gen, pos: node_id → seq}` (not CBOR), lapses surface as `x-rift-truncated: true` (not `Cursor-Lapsed`), `Cursor-Reset` is carried but not acted on, the age cap defaults to 600 s, and `read_since` is not a seam — U-13 is the exchange inspector. The register entries are normative for the built shape.
+
 - Per port, a **grow-only log sharded by writer**: each node appends locally to its own
   shard, entries keyed `(node_id, seq, clear_gen)` with `seq` a per-node monotone counter.
   Merge = union of shards (idempotent under redelivery); read = k-way merge by recorded
@@ -1082,6 +1084,8 @@ entries on a later poll rather than never.
 
 #### 7.5.2 Clears are generation bumps (clock-free)
 
+> **Amended by D-38** (as built, #223): the generation rides the Raft log as `ControlOp::JournalClearGen`, not gossip; the per-`(port, flow)` TTL and the `teardown_space` `(g, v, deleted)` markers were never built.
+
 `DELETE .../savedRequests`, count resets, and `teardown_space` do **not** delete replicated
 data by timestamp (wall clocks skew). Instead:
 
@@ -1106,6 +1110,8 @@ data by timestamp (wall clocks skew). Instead:
   (same 24 h GC + all-live-ack rule as config tombstones).
 
 #### 7.5.3 proxyOnce: Pending/Recorded state machine (replaces v1's G-set)
+
+> **Amended by D-40** (as built, #226): one committed `ProxyRecorded` op carries the recording and its stub (no `PatchStubs` + marker); the claim TTL is a fixed 60 s, not 2× the upstream timeout; the op-id is not derived from `(port, signature)` — dedup comes from the owner-validated claim token plus the committed row. Redis-backed proxyOnce was never built (D-12 amendment).
 
 A pure monotone claim set cannot support claim *release* (failed upstream call) — a
 released claim would resurrect on any merge, and an unreleased failed claim would wedge
@@ -1585,6 +1591,8 @@ therefore strictly more informative than the 0/1 gauge it replaces.
 health checks in L4 mode (§6.1).
 
 ## 12. Verification & chaos plan
+
+> **Amended by D-41** (as built, #104/#11): the PR-time budget is one run per scenario as a required `cluster-smoke` check, with a 60–100× nightly soak — not three iterations per PR.
 
 Harness: `rift-cluster` repo, **two tiers** (#11). *In-process* (`crates/rift-cluster`
 tests) drives real `RaftNode`s over localhost TCP — fast, deterministic, runs in PR CI.

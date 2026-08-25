@@ -31,14 +31,14 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 | U-6 | rift#316 | `apply_config` + `ImposterEvent` + `stub_key` + `move_stub` | incremental reconcile as the Raft apply step (D-5) | merged |
 | U-7 | rift#317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` (+ `handle_imposter_request`, re-exported for #344) | `rift-cluster-server` composes instead of forking `main` (D-11) | merged |
 | U-8 | rift#318 | `BackendUnavailable` + `annotate()` + `ResponseDecorator` | every `Rift-Cluster-*` header, without core handlers knowing what a cluster is | merged |
-| U-9 | — | `AdminAuthorizer` | RFC-002 enforcement point (Chapter 8) | merged |
-| U-10 | — | principal-on-events | audit attribution (RFC-002, Chapter 8) | merged |
-| U-11 | — | front-door route table + listener | single-port content routing (#19, Chapter 13) | merged |
-| U-12 | — | `ImposterSource` provider trait, `file`/`https` built-ins | imposter sources (#20, Chapter 13) | merged |
+| U-9 | rift#854 (+ `authz::classify`, rift#889) | `AdminAuthorizer` / `AuthzRequest` / `AuthzDecision` | RFC-002 enforcement point (Chapter 8) | merged |
+| U-10 | rift#855 | `EventContext` on `ImposterEventListener` (principal-on-events) | audit attribution (RFC-002, Chapter 8) | merged |
+| U-11 | — | `front_door::{RouteTable, bind_front_door, RouteObserver}` (route table + listener) | single-port content routing (#19, Chapter 13); the admin CRUD is a replicated control-plane object here (#131) | merged |
+| U-12 | — | `ImposterSource` provider trait, `SourceRegistry`, `parse_remote_document`; `FileSource`/`HttpSource` built-ins | imposter sources (#20, Chapter 13) | merged |
 | U-13 | rift#966/#967 | `ExchangeInspector` / `ExchangeInspectorProvider` (`extensions::exchange_inspector`) | request-side hook after journaling and before matching; response-side hook in the shared funnel — spec traffic validation (RFC-004 §6); re-exported by #281 | merged |
 | U-14 | — | `extensions::template_fn` — template-function registration | template read parity for datasets (RFC-005 §3.8, §6.2) | **queued** (#291) |
 | U-15 | — | `extensions::state_ops` — declarative state operations | `_rift.stateOps` (RFC-005 §3.7, §6.1); landed by #418 | merged |
-| U-16 | rift#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once | clustered `proxyOnce` (#226, Chapter 7) | merged |
+| U-16 | rift#910/#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once (`StubPublication`, `publishes_stubs()`) | clustered `proxyOnce` (#226, Chapter 7) | merged |
 
 The pattern in U-8 deserves a sentence: cluster backends *annotate* the
 request task-locally ("degraded: kv-adopt", "revision: 421"), and a
@@ -57,6 +57,7 @@ flowchart BT
         MC[rift-mock-core]
         HP[rift-http-proxy]
         TY[rift-types]
+        LI[rift-lint]
     end
     EE["rift-cluster-base — the facade<br/>re-exports crates + rift_cluster_base::seams"]
     CL["rift-cluster<br/>Raft, ring, RPC, stores, reconciler"]
@@ -66,6 +67,7 @@ flowchart BT
     MC --> EE
     HP --> EE
     TY --> EE
+    LI --> EE
     EE --> CL
     EE --> SV
     CL --> SV
@@ -133,9 +135,11 @@ where code *belongs*, not about what is withheld.
 
 Everything in `rift-cluster` and `rift-cluster-server`: the Raft control plane and
 its storage, the ownership ring and fencing, HMAC RPC, the flow-state durable
-tier, the sharded journal and vector cursors, the proxyOnce owner machine, the
-Redis-strict backends, tenancy/RBAC/audit, `/_cluster/*`, the chaos harness
-and k8s manifests.
+tier, the sharded journal and vector cursors, the proxyOnce owner machine,
+tenancy/RBAC/audit, `/_cluster/*`, the chaos harness and k8s manifests. The
+Redis-strict backends of D-12 are demand-gated and none is built: the cluster
+crates contain no Redis implementation of any seam — the durable tier is redb
+(D-16), and the only Redis `FlowStore` anywhere is upstream's own (D-6).
 
 The commercial moat, assessed honestly (decision D-6): it is **not** the trait
 implementations — any competent team can implement `FlowStore` over a shared

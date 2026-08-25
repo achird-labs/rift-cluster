@@ -817,6 +817,8 @@ async fn fleet_members_carries_the_fleet_name() {
 /// authenticates never — so the exchange is refused outright instead. Regression test for a defect
 /// review caught: without this, a fleet mid-migration off `--api-key` would see "login worked, then
 /// everything is 401" with nothing in the logs to explain it.
+///
+/// Pins D-46: `POST /session` with the legacy `--api-key` is `400`, never a cookie.
 #[tokio::test]
 async fn the_legacy_api_key_cannot_mint_a_session() {
     let state = TempDir::new().expect("tempdir");

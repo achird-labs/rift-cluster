@@ -34,7 +34,7 @@ export const ISSUE_URL = (issue: number): string =>
 
 /*
  * `flowOwner(key)` used to live here, and both its callers asserted something untrue: that a port
- * has a flow owner. It does not — imposters, stubs and config are replicated to every node and are
+ * has a flow owner. It does not (D-20) — imposters, stubs and config are replicated to every node and are
  * owned by none of them; only a *flow* is owned, keyed by an opaque flow id under its
  * `ContextScope` prefix, so a port has as many owners as it has flows.
  *
@@ -94,8 +94,8 @@ export function requestOutcome(_index: number): Pending<RequestOutcome> {
  * The write barrier, its timeout, the flow fsync policy and the admin-write mode are all command
  * line flags on the node and none is read back by any endpoint.
  *
- * Split out of the snapshot issue (#365) when that was closed as rejected-by-design: triggering a
- * snapshot or a compaction from here is not something the console should be able to do at all,
+ * Split out of the snapshot issue (#365) when that was closed as rejected-by-design (D-24): triggering
+ * a snapshot or a compaction from here is not something the console should be able to do at all,
  * whereas *reading back* what a node is configured to do changes nothing and is a real gap.
  *
  * @see https://github.com/achird-labs/rift-cluster/issues/394

@@ -1,6 +1,14 @@
 //! The Raft control-plane node: an [`openraft::Raft`] wired to the redb-backed
-//! storage and the #8 cluster transport, with `--cluster-init` bootstrap, a
-//! seed-join path, and a [`StatusReport`] read from Raft's own metrics.
+//! storage and the #8 cluster transport, with a solo bootstrap
+//! (`cluster_init`), a seed-join path, and a [`StatusReport`] read from Raft's
+//! own metrics.
+//!
+//! This is decision D-15 (ADR-001): membership, imposter configs, the `enabled`
+//! bit, tenancy/RBAC records and admin intents share one embedded Raft log, so
+//! at any log index every node computes byte-identical membership and
+//! therefore byte-identical ownership ([`Ring`]). Flow state stays off it
+//! (D-17). Membership changes enter that log only through [`RaftNode::join_via`]
+//! and [`RaftNode::leave`] (D-21).
 //!
 //! Startup has a deliberate ordering. The cluster server must bind before the
 //! node knows the address it advertises, but the server's request handlers need
@@ -398,9 +406,16 @@ impl RaftNode {
     /// `raft_config_default_leaves_the_snapshot_knobs_untouched`. `snapshot_log_entries` is
     /// [`NodeConfig::snapshot_log_entries`] — `None` must leave openraft's own defaults in place,
     /// which is the property that test pins.
+    ///
+    /// The snapshot policy set here is the *only* thing that ever takes a snapshot or purges the
+    /// log (decision D-24): no admin route or console panel calls `trigger().snapshot()` or
+    /// `purge_log`; the cluster maintains itself.
     fn raft_config(snapshot_log_entries: Option<u64>) -> Result<Config, NodeError> {
         let mut config = Config {
             cluster_name: "rift-control-plane".to_owned(),
+            // Fixed here, not a `NodeConfig` knob (D-42): C6's leadership-transition bound is
+            // derived from these numbers, and widening them so a count bound could hold was
+            // the rejected alternative. #411 pins them below.
             election_timeout_min: 150,
             election_timeout_max: ELECTION_TIMEOUT_MAX_MS,
             heartbeat_interval: 50,
@@ -427,6 +442,8 @@ impl RaftNode {
             snapshot_max_chunk_size: 1024 * 1024,
             ..Default::default()
         };
+        // D-43: the hidden testability knob. Both settings move together, or the wire path
+        // stays unexercised; `None` — every shipped configuration — leaves openraft's defaults.
         if let Some(entries) = snapshot_log_entries {
             config.snapshot_policy = SnapshotPolicy::LogsSinceLast(entries);
             // Purge as soon as a snapshot covers the entries. Without this the snapshot exists but
@@ -2730,6 +2747,8 @@ mod tests {
         node.shutdown().await.expect("shutdown");
     }
 
+    /// Pins D-16: the Raft log lives in redb with `Durability::Immediate`, so a
+    /// committed config is still applied after the node reopens its store.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_survives_restart() {
         let dir = TempDir::new().expect("tempdir");
@@ -2855,6 +2874,9 @@ mod tests {
         node.shutdown().await.expect("shutdown");
     }
 
+    /// Pins D-15: membership is a Raft-log value — a node admitted through a
+    /// seed join is a voter on every member's view, and a config committed on
+    /// the leader is applied byte-identically on the joiners.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_node_cluster_via_seed_join_replicates() {
         let (d1, d2, d3) = (
@@ -2905,6 +2927,9 @@ mod tests {
     /// there is nothing to hand this node's votes to and it stays a full member.
     /// Reporting that as a departure is what would let a caller record "this
     /// node left" about a node that did not — and then refuse its next start.
+    ///
+    /// Pins D-26: only a real departure may be recorded — `Retained` is the
+    /// outcome the `departed` marker must never be written for.
     #[tokio::test]
     async fn a_sole_voter_declines_to_leave_rather_than_reporting_a_departure() {
         let dir = TempDir::new().unwrap();
@@ -3332,6 +3357,10 @@ mod tests {
     /// must never exceed the ceiling, and the loser must still join as a
     /// learner. Pre-fix, both admissions read the same pre-promotion count and
     /// both promote. Repeated like the #38 gate: one pass can get lucky.
+    ///
+    /// Pins D-27: the auto-voter ceiling is exact for what the fleet does on
+    /// its own — the committed voter set never exceeds it, and the node that
+    /// loses the race is still admitted as a learner.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_admissions_never_exceed_the_ceiling() {
         for round in 0..3 {
@@ -3880,6 +3909,9 @@ mod tests {
     /// #55 gate: a joiner admitted at the ceiling is a functioning replica —
     /// the admission succeeds, the voter set is unchanged, and replicated
     /// config still reaches it.
+    ///
+    /// Pins D-27: beyond `MAX_AUTO_VOTERS` a node stays a learner, and a
+    /// promotion never evicts an existing voter to make room.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn admission_at_ceiling_still_admits_learner() {
         use crate::raft::network;
@@ -4054,6 +4086,9 @@ mod tests {
     /// meaning across an openraft bump: if a future version changes either default, this still says
     /// "we did not override it", which is the actual claim. A shipped fleet only ever takes this
     /// path — `snapshot_log_entries` is set by nothing but the chaos overlay.
+    ///
+    /// Pins D-43: the knob is unset by every shipped configuration, so the default must be
+    /// byte-identical to openraft's own snapshot policy and purge threshold.
     #[test]
     fn raft_config_default_leaves_the_snapshot_knobs_untouched() {
         let defaults = Config::default();
@@ -4127,6 +4162,9 @@ mod tests {
     /// `raft_config_default_leaves_the_snapshot_knobs_untouched`, which pins "we do not override
     /// openraft" and would keep passing if a future openraft shipped `Never` as *its* default.
     /// This pins the property an operator actually depends on.
+    ///
+    /// Pins D-24: the shipped default is an automatic snapshot policy with a finite purge
+    /// horizon — the cluster maintains its own log without an admin action.
     #[test]
     fn a_shipped_fleet_snapshots_and_purges_without_being_asked() {
         let ours = RaftNode::raft_config(None).expect("default config validates");
@@ -4150,6 +4188,9 @@ mod tests {
     /// …and the knob sets **both** halves. Setting only the policy is the trap issue #183 exists to
     /// remove: snapshots would be built but no follower would ever need one over the wire, because
     /// the log it is missing would still be there to replicate.
+    ///
+    /// Pins D-43: `Some(n)` sets `LogsSinceLast(n)` **and** `max_in_snapshot_log_to_keep = 0`
+    /// together — either alone leaves `install_snapshot` unreachable in the chaos tier.
     #[test]
     fn the_snapshot_knob_sets_the_policy_and_purges_immediately() {
         let ours = RaftNode::raft_config(Some(10)).expect("config validates");

@@ -56,6 +56,9 @@ pub(crate) const CLUSTER_APPLIED_PATH: &str = "/internal/v1/applied";
 /// The maximum voter count the cluster auto-promotes a joining learner up to.
 /// Beyond this a larger quorum costs more than it buys, so extra members stay
 /// learners until an operator changes membership explicitly.
+///
+/// A *soft* ceiling (decision D-27): it bounds what the fleet does on its own,
+/// and an operator-driven `change_membership` may race it by design.
 pub(crate) const MAX_AUTO_VOTERS: usize = 9;
 
 /// The fewest voters a graceful departure may leave behind.
@@ -71,6 +74,11 @@ pub(crate) const MAX_AUTO_VOTERS: usize = 9;
 /// Raft's joint consensus keeps each individual membership change safe on its
 /// own, and openraft's refusal to commit an empty voter set is the hard
 /// backstop underneath.
+///
+/// The floor is decision D-25. It is enforced by the leader alone: the fleet is
+/// never told whether a departure is a rolling restart or a teardown (an
+/// orchestrator signal was rejected as platform-specific), so the residual
+/// raciness of a fast roll is accepted rather than papered over.
 pub(crate) const MIN_VOTERS: usize = 2;
 
 /// How long a membership change waits for an entry to commit. Kept under
@@ -426,7 +434,7 @@ impl PeerClient {
     /// and can truncate nothing. It goes through [`RpcClient::probe`], not
     /// `call_once`, because the health tracker would otherwise refuse it for
     /// the whole cooldown after the peer's restart — the exact window it exists
-    /// to cover. It dies with the `PeerClient`.
+    /// to cover (decision D-22). It dies with the `PeerClient`.
     fn spawn_liveness_ticker(&self) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let resolver = Arc::clone(&self.resolver);
@@ -599,7 +607,7 @@ fn map_append_err(
 /// hostname advertise address (issue #68) is resolved identically whether the
 /// caller is Raft replication, a seed join, or a leader-hint chase.
 /// Returns every address the authority names, in resolver order; callers dial
-/// them in turn until one answers (#79).
+/// them in turn until one answers (#79, decision D-28).
 pub(crate) async fn resolve_authority(
     resolver: &Arc<dyn PeerResolver>,
     authority: &str,
@@ -1057,6 +1065,10 @@ pub(crate) async fn local_write(
 ///
 /// The handler passes [`MAX_AUTO_VOTERS`]; tests pass a small ceiling to
 /// provoke the race without an 11-node cluster.
+///
+/// This is the only way a member enters the fleet (decision D-21): admission is
+/// initiated by the joining node over the signed cluster port, and no admin
+/// route or console action adds a learner or a voter.
 pub(crate) async fn admit(
     raft: &Raft<TypeConfig>,
     gate: &Mutex<()>,
@@ -1089,11 +1101,11 @@ pub(crate) async fn admit(
     .await?;
 
     // Promote incrementally with `AddVoterIds`, never by replacing the whole
-    // voter set: building a `ReplaceAllVoters` set from any local view would
-    // let two concurrent joins each overwrite the other's just-added voter —
-    // demoting a live member with no error. `AddVoterIds` only ever adds, so
-    // the ceiling read below is a soft gate on *whether* to auto-promote,
-    // never the source of the new membership.
+    // voter set (decision D-27): building a `ReplaceAllVoters` set from any
+    // local view would let two concurrent joins each overwrite the other's
+    // just-added voter — demoting a live member with no error. `AddVoterIds`
+    // only ever adds, so the ceiling read below is a soft gate on *whether* to
+    // auto-promote, never the source of the new membership.
     //
     // The gate makes the ceiling exact rather than best-effort (#55): every
     // promotion ends with a wait for its entry to apply (applied ⇒ committed),
@@ -1272,7 +1284,7 @@ async fn committed_voters(
 }
 
 /// The two voter sets a blob fan-out must satisfy a majority of *both* of
-/// (#438): the committed configuration and the effective one.
+/// (#438, D-19): the committed configuration and the effective one.
 ///
 /// Neither alone is sound, which is why this is a pair rather than a choice:
 ///
@@ -1345,7 +1357,7 @@ fn majority_of(config: &BTreeSet<NodeId>, acks: &BTreeSet<NodeId>) -> bool {
     held * 2 > config.len()
 }
 
-/// Read both voter sets in **one** `with_raft_state` closure (#438).
+/// Read both voter sets in **one** `with_raft_state` closure (#438, D-19).
 ///
 /// One read, not two: separate reads can observe different membership epochs,
 /// and a "joint" pair assembled from two epochs describes a configuration that
@@ -1432,8 +1444,8 @@ async fn remove_member(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), R
 /// the leader.
 ///
 /// **`Ok` does not mean the node was removed.** The voter floor
-/// ([`MIN_VOTERS`], [`held_by_floor`]) refuses a departure that would leave the
-/// cluster with too few voters, and that refusal is a successful outcome —
+/// ([`MIN_VOTERS`], [`held_by_floor`]; decision D-25) refuses a departure that
+/// would leave the cluster with too few voters, and that refusal is a successful outcome —
 /// [`EvictOutcome::HeldByFloor`] — not an error. Callers that record a
 /// departure must match on the outcome, never on `Ok` alone: treating a refusal
 /// as a departure persists "this node left" about a node that is still a
@@ -1650,6 +1662,9 @@ mod tests {
         assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
     }
 
+    /// Pins D-19: the fan-out quorum is a majority of BOTH the committed and the
+    /// effective voter configuration — growing 3→5, the committed majority of 2 is
+    /// not enough, because the blob would sit on 2 of the 5 nodes now in force.
     #[test]
     fn growing_three_to_five_is_not_satisfied_by_the_committed_majority_alone() {
         // The case that makes committed-only unsound, and the concrete reason
@@ -1666,6 +1681,8 @@ mod tests {
         assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
     }
 
+    /// Pins D-19: the effective majority alone is not enough either — shrinking
+    /// 5→3, {1,2} is a majority of the effective set but not of the committed one.
     #[test]
     fn shrinking_five_to_three_is_not_satisfied_by_the_effective_majority_alone() {
         // The mirror case, which is what makes effective-only unsound: the
@@ -1681,6 +1698,9 @@ mod tests {
         assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
     }
 
+    /// Pins D-19: an ack from a node outside a configuration does not count toward
+    /// that configuration's majority — a learner holding the blob is not evidence
+    /// of the voters' durability.
     #[test]
     fn an_ack_from_outside_the_configuration_does_not_count() {
         // Edge 2: the accepting node adds itself to the acks unconditionally
@@ -1814,6 +1834,9 @@ mod tests {
         assert!(accepted.catching_up);
     }
 
+    /// Pins D-27: the ceiling is a soft gate on *whether* to auto-promote — at or
+    /// over it no promotion happens, an existing voter is never re-promoted, and
+    /// an over-grown voter set is never shrunk to fit.
     #[test]
     fn should_promote_gates_on_ceiling_and_membership() {
         let voters: BTreeSet<NodeId> = BTreeSet::from([1, 2]);
@@ -1841,6 +1864,10 @@ mod tests {
     /// get it wrong are both silent: counting learners strands every
     /// ceiling-capped node, and an off-by-one at the boundary either lets the
     /// fleet walk to one voter or freezes a healthy three-node membership.
+    ///
+    /// Pins D-25: the floor is two voters — a voter's departure from a
+    /// two-voter set is refused, from three it is allowed, and a learner is
+    /// never held.
     #[test]
     fn held_by_floor_refuses_only_a_voter_that_would_breach_the_floor() {
         let three: BTreeSet<NodeId> = BTreeSet::from([1, 2, 3]);
@@ -1979,6 +2006,9 @@ mod tests {
     /// address nobody listens on made every send fail forever, even though a
     /// reachable address sat second in the very same answer. Committing to
     /// `.next()` is what did it.
+    ///
+    /// Pins D-28: every resolved address is dialled, in the resolver's order,
+    /// until one answers — none is skipped or preferred by family.
     #[tokio::test]
     async fn a_send_tries_every_resolved_address() {
         use crate::rpc::{AlwaysHealthy, RpcClientConfig};
@@ -2141,6 +2171,8 @@ mod tests {
     /// #6 gate: the resolver must be consulted on every send, not resolved
     /// once and cached — a cached resolution would keep dialing a pod's old IP
     /// after a rollout moved it.
+    ///
+    /// Pins D-28: a peer's hostname is re-resolved on every send.
     #[tokio::test]
     async fn resolver_is_consulted_per_send() {
         use crate::rpc::{AlwaysHealthy, RpcClientConfig};
@@ -2809,6 +2841,10 @@ mod tests {
     }
 
     /// Once openraft goes quiet, the ticker speaks within a couple of ticks.
+    ///
+    /// Pins D-22: the silent window openraft opens is filled by a liveness
+    /// probe, so a follower's election timer is refreshed while a transfer or
+    /// snapshot is in flight.
     #[tokio::test]
     async fn the_liveness_ticker_speaks_when_openraft_goes_quiet() {
         use openraft::network::{RPCOption, RaftNetwork};

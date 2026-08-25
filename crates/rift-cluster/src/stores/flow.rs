@@ -9,8 +9,12 @@
 //! step 2 lands on a node that never saw step 1. Ownership fixes that: every
 //! flow has one owner (HRW over the applied membership, [`KeyClass::FlowKv`]),
 //! every write is serialized through it, and — by default — every read is
-//! answered by it. Correct under any LB, one LAN RPC worst-case, opt-out per
-//! imposter via `readConsistency: "local"`.
+//! answered by it. Flow state never rides the Raft log — ownership is derived
+//! from committed membership, the state itself is owner-held, successor-
+//! replicated and WAL-backed (D-17). Correct under any LB — the receiving node
+//! is *not* assumed to be the owner; LB affinity is stickiness only (D-13) —
+//! one LAN RPC worst-case, opt-out per imposter via `readConsistency: "local"`
+//! (D-10: owner-authoritative by default, replica reads by explicit choice).
 //!
 //! # Structure
 //!
@@ -385,8 +389,9 @@ pub struct FlowNet {
     /// keeps the node alive past shutdown — `RaftNode::Drop` releases the redb
     /// lock and the cluster port.
     node: OnceLock<Weak<RaftNode>>,
-    /// Sync→async for the store face. Created at bind time so an unclustered
-    /// process never pays for the bridge runtime.
+    /// Sync→async for the store face (D-9: upstream's `FlowStore` stays
+    /// synchronous; the cluster side parks the caller on a bridge). Created at
+    /// bind time so an unclustered process never pays for the bridge runtime.
     bridge: OnceLock<Bridge>,
     /// Serializes owner-side read-modify-write. Per node, not per flow: a
     /// coarser lock than strictly needed, chosen for v1 because flow-write
@@ -1966,6 +1971,12 @@ impl rift_cluster_base::seams::FlowStore for ClusteredFlowStore {
 /// node gets the clustered store, configured or not — scenario state behind a
 /// round-robin LB is wrong on a process-local store for *every* imposter, not
 /// just the ones that thought about it.
+///
+/// This is D-7: upstream keeps its per-imposter store instances, and the
+/// manager-scoped provider hands each of them a thin face over the one shared
+/// [`FlowNet`] — which is what lets the store outlive the "constructed before
+/// the node exists" ordering (see *Late binding* above) without changing the
+/// upstream seam.
 pub struct ClusteredFlowStoreProvider {
     net: Arc<FlowNet>,
 }

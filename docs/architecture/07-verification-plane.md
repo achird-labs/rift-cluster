@@ -43,7 +43,7 @@ arrived" from "0 requests visible right now" (silently conflating those two is
 how verification tools lie).
 
 **Caps stay writer-local and honest.** Each shard caps at
-`max(500, 10_000 / N)` entries per port plus an age cap, evicting oldest
+`max(500, 10_000 / N)` entries per port plus an age cap (default 10 min), evicting oldest
 and advancing an `evicted_below_seq` watermark that readers respect — so every
 node converges on the same visible set even after eviction. `N` is the voter
 count of the **applied membership**, not the currently-reachable node count:
@@ -251,12 +251,15 @@ its own version namespace and a scope tag, so a per-imposter token presented her
 misread as a position. The pre-#223 bare scalar is refused here too: it names a
 position in no port in particular.
 
-**The cap is the honest part.** A tenant can own more imposters than one answer
-can carry, so coverage ranks ports by their most recent recorded entry and keeps
-`--cluster-fleet-journal-port-cap` of them (default 100). What it leaves out it
-*names*: `coverage.omitted` carries the ports, and the stream re-announces the
-block whenever the covered set moves. This replaces a client-side cap of 25 that
-was applied quietly. A port that leaves coverage loses its cursor row, which is
+**The cap is the honest part (D-32).** A tenant can own more imposters than one
+answer can carry, so coverage ranks ports by their most recent recorded entry and
+keeps `--cluster-fleet-journal-port-cap` of them (default 100). What it leaves
+out it *names*: every response carries `coverage: {covered, total, omitted,
+capped}`, with `omitted` listing the ports themselves, and the stream re-announces
+the block whenever the covered set moves. This replaces a client-side cap of 25
+that was applied quietly; a `(timestamp, tiebreak)` watermark was rejected in its
+place because clocks are not ordered across nodes (above). A port that leaves
+coverage loses its cursor row, which is
 what keeps the token bounded; re-entry is a join, and the two read modes want
 opposite things from one — a stream adopts the port's current position and
 replays nothing (a connect never replays), while a read serves the history and

@@ -130,6 +130,10 @@ pub struct ClusterArgs {
     /// fleet that sets it is trading away log retention for nothing.
     ///
     /// Unset (the default) leaves openraft's defaults exactly as they were.
+    ///
+    /// D-43: a testability knob, hidden on purpose; the shared `chaos.overlay.yml` was the
+    /// rejected home for it (it changed every catch-up path and broke C4/C6/C7), so it lives only
+    /// in `snapshot-install.overlay.yml`.
     #[arg(
         long,
         value_name = "N",

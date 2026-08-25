@@ -428,6 +428,9 @@ fn paths(seen: &Seen) -> BTreeSet<String> {
 /// They no longer double as the positive control for `x-rift-next-index`. Issue #225 made the
 /// merged read itself carry a cursor, so its presence is now asserted where it belongs — on the
 /// merged read — rather than inferred from a proxied sibling.
+///
+/// Pins D-37 and D-38: three writer shards merge to one identical set on every node, and a
+/// clear (a committed generation bump) removes them everywhere without resurrection.
 #[tokio::test]
 async fn every_node_answers_one_identical_merged_set_and_a_clear_does_not_resurrect() {
     let states = [
@@ -616,6 +619,9 @@ async fn driven_and_warmed(fleet: &Fleet) -> BTreeSet<String> {
 /// This is also the positive control for `Rift-Cluster-Partial` that the
 /// whole-fleet test above cannot provide: asserting a header is *absent* proves
 /// nothing unless something else proves it can be present at all.
+///
+/// Pins D-37: an unreachable peer never stalls the merged read — its shard is served from
+/// cache and the answer is stamped `Rift-Cluster-Partial`.
 #[tokio::test]
 async fn a_dead_but_still_rostered_peer_is_served_from_cache_and_stamped_partial() {
     let states = [
@@ -1220,6 +1226,9 @@ fn read_paths(body: &serde_json::Value) -> BTreeSet<String> {
 /// Traffic is driven at both imposters through *different* nodes' front doors, so a correct answer
 /// requires the walk to cross both the port dimension and the node dimension at once — which is
 /// exactly the pair of loops the unit tests cannot exercise.
+///
+/// Pins D-32: a live fleet read carries the `coverage` block end to end — `covered` names both
+/// imposters, `omitted` is empty and `capped` is false below the cap.
 #[tokio::test]
 async fn the_fleet_read_merges_every_imposter_the_tenant_owns() {
     let states = [

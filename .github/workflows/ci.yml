@@ -62,6 +62,9 @@ jobs:
       # The other half of the script needs a published image and so can only run
       # in the release lane; this half needs no daemon at all, which is what lets
       # it run on every PR and keep `cluster.yml` from rotting between releases.
+      # D-35's enforcement point on the PR path: the quick start must consume the published
+      # GHCR image — `cluster.yml` carries no `build:` key and pins the workspace version — so a
+      # user with only Docker gets the shipped artifact, never a checkout.
       - name: Pull-not-build manifest and quick starts
         run: deploy/compose/verify-pulled.sh --check
 
@@ -139,6 +142,10 @@ jobs:
   #
   # Only on changes that could plausibly break a cluster — the whole tier costs
   # several minutes, and running it on a README edit trains people to ignore it.
+  #
+  # D-41: every scenario runs ONCE here, and this job is a required status check. Flake
+  # detection is the nightly soak's job (`nightly-chaos.yml`, 60–100× per scenario), not a
+  # 3× PR run — the deviation from RFC-001 §12 is deliberate and recorded there.
   cluster-smoke:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'

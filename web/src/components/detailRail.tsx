@@ -65,7 +65,7 @@ function WritePath({ revision }: { revision: string | null }): ReactNode {
  *
  * The ring's epoch, the one real fact here, is on the fleet screen where it describes the fleet
  * rather than this imposter. Per-flow ownership belongs on the flow-state surface, where the flows
- * are actually enumerated — see #359.
+ * are actually enumerated — see #359 and D-20.
  */
 
 /**

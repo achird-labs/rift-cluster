@@ -221,7 +221,7 @@ This is not a defect in U-10. A task-local is the right mechanism for the
 in-process path it was designed for, and no upstream seam could have carried a
 principal across a Raft log it knows nothing about. The clustered answer is the
 one the log format already anticipates: `ControlRequest.principal`
-(`crates/rift-cluster/src/control.rs:61`) is in the envelope today and `None` at
+(`crates/rift-cluster/src/control.rs`) is in the envelope today and `None` at
 every construction site. #161 populates it from `AuthzDecision::Allow`, and #163
 reads it at apply time. `EventContext` remains the attribution path for the
 embedded/single-node case.
@@ -265,8 +265,9 @@ retained, queryable audit table. One stream, not a bolted-on second system.
 
 ### What T2 ships — enforcement, and its two deliberate over-restrictions
 
-Slice T2 (issue #161) turns the model into a boundary. The closed 19-action set
-and the `Role → Action` table live in `rift-cluster-server`'s `authz` module as a
+Slice T2 (issue #161) turns the model into a boundary. The closed action set (19
+actions at T2; later RFCs have widened it — `authz::Action` is the list) and the
+`Role → Action` table live in `rift-cluster-server`'s `authz` module as a
 **pure** evaluator — no I/O, no HTTP — so the whole matrix is unit-testable
 without a cluster. Bindings are read fresh from the local state machine on every
 request; there is **no authorization cache**, ever (§8.5), because a per-node TTL
@@ -294,8 +295,9 @@ without a redesign:
    no tenant to filter on. Serving it at `StreamSubscribe` (a *Viewer* grant)
    would hand a viewer of one tenant every other tenant's recorded request
    bodies, which is worse than the 403-vs-404 oracle this slice closes. Only a
-   fleet admin — entitled to all of it anyway — may subscribe until #163 adds
-   filtering, at which point the route returns to `StreamSubscribe`.
+   fleet admin — entitled to all of it anyway — may subscribe until server-side
+   filtering lands (#163 shipped the audit stream without it), at which point the
+   route returns to `StreamSubscribe`.
 2. **Resource operations are servable only for the `default` tenant.** T1 made
    the state machine *store* by tenant but not *serve* by tenant:
    `desired_configs` and `desired_routes` still skip everything that is not
@@ -857,7 +859,7 @@ both refuse to do. The distinction is what the secret means *outside* the fleet:
 
 It therefore sits inside the same trust boundary as the state directory, which already holds every
 principal's argon2 record and all committed config. Deriving it from the cluster secret instead was
-considered and rejected: that secret is optional (`--cluster-unauthenticated`), so an unauthenticated
+considered and rejected: that secret is optional (`--cluster-insecure`), so an unauthenticated
 fleet would have nothing to derive from.
 
 **Rotation is the containment, and it is structural.** Every token carries the key record's

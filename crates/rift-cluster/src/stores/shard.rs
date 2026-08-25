@@ -141,7 +141,7 @@ impl Versioned {
 /// expiry to sort by at all — ordering by `expires_at` would evict exactly the
 /// permanent flows first.
 ///
-/// `touch_seq` breaks the ties `last_touch` cannot (issue #408): it is
+/// `touch_seq` breaks the ties `last_touch` cannot (D-36, issue #408): it is
 /// millisecond wall-clock, and bursty writes — the ordinary case, not an edge
 /// case — land many flows on one millisecond. Sorting on `last_touch` alone
 /// then left the victim among tied flows to `HashMap` iteration order, which is
@@ -665,7 +665,7 @@ impl FlowShard {
                 .collect();
             // Oldest touch first — genuine LRU, unaffected by whether a flow has
             // a TTL at all. The sequence breaks the ties the millisecond clock
-            // leaves (issue #408), so the victim is never a flow touched more
+            // leaves (D-36, issue #408), so the victim is never a flow touched more
             // recently than a survivor — in particular never the flow whose
             // second key is about to land.
             by_age.sort_by_key(|(_, touched)| *touched);

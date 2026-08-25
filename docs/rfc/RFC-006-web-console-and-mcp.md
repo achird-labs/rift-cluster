@@ -51,8 +51,8 @@ Checked at `5b98fef`, not assumed:
   single-node, and invisible to a browser.
 - **The admin API is browser-hostile as authenticated today.** The front holds
   one optional static bearer (`FrontConfig::api_key: Option<String>`,
-  `admin_front.rs:99-101`) checked by whole-header constant-time comparison
-  (`authorize`, `admin_front.rs:453-465`). A browser would have to keep that
+  `admin_front.rs`) checked by whole-header constant-time comparison
+  (`authorize_action`, `admin_front.rs`). A browser would have to keep that
   key in JS-reachable storage to send it — an XSS away from leaking the fleet
   credential. §5.3 designs around this.
 - **The fleet view is on the wrong port for a browser.** `/_cluster/members`,
@@ -64,20 +64,20 @@ Checked at `5b98fef`, not assumed:
 - **The building blocks for a stub editor already exist and are proven.**
   `rift-lint` is a pure library — `lint_json`, `lint_value`
   (`vendor/rift/crates/rift-lint/src/lib.rs:128,153`), `validate_stub`
-  (`src/validator.rs:538`) — and the TUI already validates editor buffers
+  (`src/validator.rs:563`) — and the TUI already validates editor buffers
   with exactly those calls (`rift-tui/src/validation.rs:6,12-30`). The console
   reuses the same library, not a reimplementation.
 - **Realtime push exists upstream.** `GET /events` and
   `GET /imposters/{port}/savedRequests/stream` are SSE
   (`vendor/rift/crates/rift-http-proxy/src/admin_api/handlers/events.rs:1-52`),
   and the front proxies streaming bodies without buffering
-  (`admin_front.rs:490-493` — "buffering here would break the admin SSE
+  (`admin_front.rs` — "buffering here would break the admin SSE
   streams"). The console does not need a new push channel; it needs to decide
   how much of this one to use in v1 (§6).
 - **The agent story is zero.** Nothing in the workspace speaks MCP. Meanwhile
   the write path an agent would want — idempotency keys, `If-Match`
   preconditions, park-then-replay durability, `202 + opId` async mode — is
-  already built (`admin_front.rs:24-48,553-569,707-765`). The MCP server is
+  already built (`admin_front.rs`). The MCP server is
   cheap because it is a thin client of that.
 
 ## 3. Design
@@ -107,11 +107,11 @@ adds no header logic of its own beyond sending the selection.
 
 | Screen | Backend | Availability |
 |---|---|---|
-| **Imposters** — list, per-imposter detail, enable/disable; filter/sort/bulk (#252) | `GET/POST/DELETE /imposters*` (terminated routes — `classify()` at `admin_front.rs:435`, the `Terminated` enum at `:351`; reads proxied to the engine). Filtering and sorting are **client-side** over the list already fetched — no query parameter is added, because `GET /imposters` returns the tenant's whole set and a server-side filter would give "what is in this list" a second source of truth. Bulk actions are **N calls, not a batch endpoint**: one request per imposter, reported per item (see below) | v1, bulk #252 |
-| **Stub editor** — form ⟷ raw JSON, monaco, lint-on-save | stub CRUD incl. by-id routes (`admin_front.rs:378-395`); lint via `rift-lint` in-browser (§4.1) | v1 |
+| **Imposters** — list, per-imposter detail, enable/disable; filter/sort/bulk (#252) | `GET/POST/DELETE /imposters*` (terminated routes — `classify()` and the `Terminated` enum in `admin_front.rs`; reads proxied to the engine). Filtering and sorting are **client-side** over the list already fetched — no query parameter is added, because `GET /imposters` returns the tenant's whole set and a server-side filter would give "what is in this list" a second source of truth. Bulk actions are **N calls, not a batch endpoint**: one request per imposter, reported per item (see below) | v1, bulk #252 |
+| **Stub editor** — form ⟷ raw JSON, monaco, lint-on-save | stub CRUD incl. by-id routes (`admin_front.rs`); lint via `rift-lint` in-browser (§4.1) | v1 |
 | **Request log** — recorded requests, match diagnostics | v1 read `GET /imposters/:port/requests` per node and labelled it **per-node view**. #147 H landed the promised convergence: the same route now answers the fleet's **merged** journal (doc-07), paged with the server's opaque `?since=` vector cursor, and the per-node label is deleted — a label renders only for an incomplete merge (`Rift-Cluster-Partial`). Same screen, no redesign, exactly as promised | v1 → merged (#147 H) |
 | **Cluster** — members, leader, ring epoch, readiness, pending ops | §5.2's admin-port fleet reads (projection of `cluster_api.rs:63-191`) | v1 |
-| **Front-door routes** — table editor | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` (`admin_front.rs:348-360,405,419-438`) | v1 |
+| **Front-door routes** — table editor | `GET/PUT /front-door/routes`, `DELETE /front-door/routes/:id` (`admin_front.rs`) | v1 |
 | **Tenants / principals / roles / tokens / audit** | RFC-002 §5 admin surface + `GET /admin/audit` | with RFC-002 T3/T4 |
 | **Scenarios & state** — scenario states per space, a space's scoped stubs, flow-state entries; set/reset/tear down/clear | `GET/POST/PUT /imposters/:port/scenarios*`, `GET/DELETE /imposters/:port/spaces/:flowId(/stubs)`, `GET/PUT/DELETE /admin/imposters/:port/flow-state/:flowId(/:key)` — all upstream routes that already ship and are contracted in `openapi-ee.yaml` | v1 (#232) |
 | **Sources** — declared sources, their drift policy, the ports they own, and drift state; declare, edit, delete and refresh-now | Reads: `GET /admin/sources` / `GET /admin/sources/{id}` (#239/#240), gated by `source.read` (Viewer+). Writes (#253): `POST /admin/sources`, `DELETE /admin/sources/{id}`, `POST /admin/sources/{id}/pull` — the verbs the cluster port already served, promoted to the RBAC'd front and tenant-resolved. Authorized as `imposter.write` / `imposter.delete`, matching the names the audit stream already emits for these ops rather than minting a `SourceWrite` the audit and the gate would disagree about | v1 (#233), writes #253 |
@@ -126,8 +126,8 @@ imposter, stub CRUD by index, enable/disable, clear requests, export) is the
 minimum viable verb set a UI needs, and its editor-validates-before-submit
 loop (`validation.rs`) is the loop the console reproduces. Where the TUI
 edits stubs **by index**, the console prefers the **by-id** routes the front
-added (`admin_front.rs:383-387`) — index edits are the documented lost-update
-window (`admin_front.rs:27-44`), and a UI holding stale state open for minutes
+added (`admin_front.rs`) — index edits are the documented lost-update
+window (`admin_front.rs`), and a UI holding stale state open for minutes
 is the worst possible client for them.
 
 ### 4.1 Editor validation
@@ -138,7 +138,7 @@ with a banner, never silently dropped — the config the user saves is the
 config they wrote). On save: `rift-lint` runs **in the browser**, compiled to
 `wasm32-unknown-unknown`. This adds no API surface and works offline; the
 server's own validation (`validate_stub`/`validate_stubs`, already enforced on
-terminated writes — `admin_front.rs:66-70`) remains the authority, so a wasm
+terminated writes — `admin_front.rs`) remains the authority, so a wasm
 gap is a cosmetic gap, not a correctness one. `rift-lint`'s JS-syntax check is
 already feature-gated with a no-op fallback (`validator.rs:53,86`), which is
 the wasm-unfriendly part pre-neutralized — but the full dependency tree
@@ -193,7 +193,7 @@ is not offered the filter at all rather than shown one that would answer
 The EE admin API gets a **committed, hand-authored** OpenAPI 3.1 document at
 `docs/api/openapi-ee.yaml`, served by the binary at `GET /openapi.json`.
 Hand-authored because the front's router is hand-rolled hyper
-(`classify()`, `crates/rift-cluster-server/src/admin_front.rs:435`), not a framework with derive-based
+(`classify()`, `crates/rift-cluster-server/src/admin_front.rs`), not a framework with derive-based
 schema extraction — annotation tooling (utoipa et al.) assumes axum/actix
 shapes we do not have. The schema is kept honest mechanically, not by
 discipline: a golden test enumerates `classify()`'s route table plus the §5.2
@@ -203,7 +203,7 @@ Every operation carries `x-rift-origin: ee | upstream` — the schema documents
 the *whole* surface a client sees through the front (terminated + proxied),
 and the marker records which side owns each contract. It also documents the
 cluster headers (`Rift-Cluster-Revision`, op id, warnings —
-`admin_front.rs:64,895-920`) and the `If-Match` / `Idempotency-Key` request
+`admin_front.rs`) and the `If-Match` / `Idempotency-Key` request
 semantics, which until now live only in code comments.
 
 The console's TypeScript client is **generated** from this schema
@@ -280,7 +280,7 @@ gap-repair protocol, and degrades to nothing when the tab sleeps.
 
 **v2 uses the SSE that already exists, for invalidation only.** The console
 subscribes to `GET /events` (proxied through the front unbuffered,
-`admin_front.rs:490-493`) and maps event kinds to query-cache invalidations —
+`admin_front.rs`) and maps event kinds to query-cache invalidations —
 an imposter-lifecycle event invalidates the imposter list; a recorded-request
 event invalidates that port's log query. Events trigger refetch; they never
 *carry* the data, so a `lagged` drop (the stream's documented backpressure
@@ -339,7 +339,7 @@ dependency. It was not done in C3 because the two checks above already cover the
 lane that ships, and a build script is a permanent cost on every build in the
 tree for a case only the release lane meets.
 
-Serving: the front's `handle()` (`crates/rift-cluster-server/src/admin_front.rs:525`) gains a
+Serving: the front's `handle()` (`crates/rift-cluster-server/src/admin_front.rs`) gains a
 `GET /console` / `GET /console/*` arm ahead of `classify()` — static assets
 with content-type by extension, SPA-fallback to `index.html` for pathless
 routes, `Cache-Control: max-age=31536000, immutable` for hashed assets and
@@ -415,11 +415,11 @@ the admin API re-projected, not re-specified. v1 set:
 | Tool | Wraps | Notes |
 |---|---|---|
 | `imposter_list` / `imposter_get` | `GET /imposters[/:port]` | |
-| `imposter_create` / `imposter_delete` | `POST/DELETE /imposters[/:port]` | explicit port required, as the front already enforces (`admin_front.rs:938-944`) |
+| `imposter_create` / `imposter_delete` | `POST/DELETE /imposters[/:port]` | explicit port required, as the front already enforces (`admin_front.rs`) |
 | `imposter_set_enabled` | `POST /imposters/:port/{enable,disable}` | |
 | `stub_add` / `stub_replace` / `stub_delete` | by-id stub routes | by-id only — agents must not inherit the index-edit lost-update window (§4) |
 | `routes_get` / `routes_put` / `route_delete` | `/front-door/routes*` | |
-| `requests_query` | `GET /imposters/:port/requests` (+ doc-07 params when it ships) | v1 answer carries `"scope": "node"` until the merged journal exists |
+| `requests_query` | `GET /imposters/:port/requests` | as shipped (§8.1 note 2): `"scope": "fleet"` for the merged journal (#147 H), `"node"` when a `match` predicate forces a local read, plus the `Rift-Cluster-Partial` marker on an incomplete merge |
 | `verify` | request-count/match assertions over the same read | |
 | `fleet_health` / `op_status` | §5.2 `/_fleet/*` | `op_status` closes the async-write loop below |
 | `lint` | in-process `rift_lint::lint_json` | dry-run; no network, no side effects |
@@ -429,11 +429,11 @@ the admin API re-projected, not re-specified. v1 set:
 **Write semantics surface as tool behavior, not as prose in a description.**
 Every write tool sends an `Idempotency-Key` derived deterministically from the
 MCP tool-call id, so an agent retrying a timed-out call dedups instead of
-double-applying (`base_op_id`, `admin_front.rs:1293-1302`). Mutating tools
+double-applying (`base_op_id`, `admin_front.rs`). Mutating tools
 accept an optional `expected_revision` and pass it as `If-Match`; a `409`
 comes back as a structured tool error — `{conflict: true, current_revision}` —
 telling the agent to re-read and rebase, which is precisely the loop the
-header was built for (`admin_front.rs:24-48`). A `503`-parked or `202` answer
+header was built for (`admin_front.rs`). A `503`-parked or `202` answer
 returns `{parked: true, op_id}` and points at `op_status` — the agent learns
 the fleet's durability model by using it.
 
@@ -679,6 +679,11 @@ screen rather than replacing it.
    `ClusterAdmin`-only? Topology is infrastructure, not tenant data — but
    "which nodes exist" may itself be sensitive in some shops. Settle in the
    RFC-002 T2 review, where the enforcement matrix lives.
+
+   ***Resolved: `ClusterAdmin`-only*** — settled in
+   `docs/architecture/08-tenancy-security.md` ("`/_fleet/*` is `ClusterAdmin`"): the projection
+   must not be a privilege reduction relative to the cluster port, `SYSTEM_READ` already maps to
+   `ClusterAdmin`, and topology is infrastructure inventory. Nothing per-tenant is deferred.
 4. **Session-signing-key rotation cadence** — operator-triggered only, or
    scheduled? Scheduled rotation logs everyone out on a timer; v1 leans
    operator-triggered with a documented runbook.
@@ -686,6 +691,9 @@ screen rather than replacing it.
    release-grade at M1 time, the fallback is implementing the (small) stdio
    framing directly; the tool layer above it is transport-agnostic either way.
    Verify at M1.
+
+   ***Resolved by #292 (MCP-A):*** `rmcp` is the workspace dependency
+   `crates/rift-cluster-server/src/mcp/` ships on; the hand-rolled stdio fallback was not needed.
 6. **Match diagnostics are not on the request-log endpoint.** *Raised by C6
    (#189). **Resolved by #208**, engine-side and console-side.* As raised: `GET
    /imposters/:port/requests` served `RecordedRequest`

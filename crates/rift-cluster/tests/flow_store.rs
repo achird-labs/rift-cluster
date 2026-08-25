@@ -232,6 +232,11 @@ fn counter(name: &str, label: (&str, &str)) -> u64 {
 ///
 /// Also pins the cost claim: the two cross-checking strong reads below cost at
 /// most one forwarded RPC each.
+///
+/// Pins D-10: the default read is owner-authoritative (`strong`) — no imposter
+/// config, and the read through the non-owner still sees the write.
+/// Pins D-13: correctness does not depend on the receiving node being the
+/// owner — the budget is one forwarded LAN RPC, never an assumed co-location.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_strong_read_anywhere_observes_a_write_made_anywhere() {
     let _lock = TEST_LOCK.lock().await;
@@ -275,6 +280,9 @@ async fn a_strong_read_anywhere_observes_a_write_made_anywhere() {
 /// `readConsistency: "local"` restores the replica read: served from the local
 /// shard, no forward — and the replica *has* the data, because the owner pushes
 /// every applied write to its successors.
+///
+/// Pins D-10: replica reads are a per-imposter opt-in (`readConsistency`), not
+/// a fleet-wide degraded mode.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_local_read_stays_on_the_replica_and_sees_replicated_state() {
     let _lock = TEST_LOCK.lock().await;
@@ -332,6 +340,9 @@ async fn a_local_read_stays_on_the_replica_and_sees_replicated_state() {
 /// imposter's local read observes the write, which proves replication landed —
 /// only then is the other imposter's empty read attributable to scoping rather
 /// than to a push still in flight.
+///
+/// Pins D-20: the ring key is scope-prefixed (`i{port}:` by default), so two
+/// imposters' same-named flows are two flows — each with its own owner.
 #[tokio::test(flavor = "multi_thread")]
 async fn imposter_scope_isolates_two_imposters_sharing_one_flow_id() {
     let _lock = TEST_LOCK.lock().await;
@@ -413,6 +424,9 @@ async fn imposter_scope_isolates_two_imposters_sharing_one_flow_id() {
 /// of the two namespaces — a `fleet` store must not pick up an `imposter`-scoped
 /// write either, which is why `fleet` carries its own `f:` prefix instead of
 /// passing the flow id through bare.
+///
+/// Pins D-20: under `fleet` two imposters' same-named flows are one flow with
+/// one owner (`f:` prefix), and that namespace is disjoint from `i{port}:`.
 #[tokio::test(flavor = "multi_thread")]
 async fn fleet_scope_shares_across_imposters_and_stays_disjoint_from_imposter_scope() {
     let _lock = TEST_LOCK.lock().await;
@@ -764,6 +778,11 @@ async fn every_write_op_is_scoped_including_prefix_shaped_flow_ids() {
 /// RFC-001 §7.6: an op minted under a stale membership view is rejected and
 /// counted, never applied under an ownership the sender no longer holds. Driven
 /// over the real wire with a hand-built body, which pins the wire contract too.
+///
+/// Pins D-17: ownership is derived from the *committed* membership — the
+/// applied index is the fencing token, and a write minted under an older
+/// membership is refused rather than applied under an ownership the sender no
+/// longer holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_fencing_token_is_rejected_and_counted() {
     let _lock = TEST_LOCK.lock().await;
@@ -819,6 +838,9 @@ async fn a_stale_fencing_token_is_rejected_and_counted() {
 /// the same HRW owner from the same membership), and applying it would pollute
 /// a replica's shard with owner-versioned entries. Exactly one of the two nodes
 /// owns the flow; the other must answer `NotOwner`.
+///
+/// Pins D-20: a flow has exactly one owner (HRW over the applied membership),
+/// and a misrouted write answers `NotOwner{owner}` instead of being applied.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_misrouted_write_with_a_valid_token_is_refused() {
     let _lock = TEST_LOCK.lock().await;
@@ -1260,6 +1282,10 @@ async fn a_replica_that_missed_a_push_converges_within_one_tick() {
 ///
 /// Anti-entropy is effectively off (60 s) so the repair being observed is
 /// adoption's, not the loop's.
+///
+/// Pins D-17: flow state is not on consensus — a membership change moves
+/// ownership, and the new owner recovers the state from successor replicas
+/// (adopting the highest version), not from the Raft log.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_owner_adopts_from_the_surviving_replica_on_takeover() {
     let _lock = TEST_LOCK.lock().await;
@@ -1450,6 +1476,10 @@ async fn a_none_durability_write_is_not_persisted_by_the_replica_either() {
 /// Before the node exists the store fails loud — it must never quietly hand an
 /// imposter process-local semantics (the "silent builtin fallback" the design
 /// forbids).
+///
+/// Pins D-7: the provider hands out a per-imposter face over the shared,
+/// late-bound net — the store can be constructed before the node exists, and
+/// that construction-time gap surfaces as a loud error, not a local store.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unbound_store_fails_loud_never_silently_local() {
     let shard = FlowShard::in_memory(ShardConfig::default());

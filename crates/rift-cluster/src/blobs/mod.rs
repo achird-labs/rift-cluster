@@ -3,13 +3,22 @@
 //! Large payloads leave the Raft log and travel out of band: this module owns
 //! the bytes on disk, `blobs::routes` exposes them over the signed cluster
 //! transport (`PUT`/`GET /internal/v1/blob/{digest}`), and `blobs::client`
-//! moves them between nodes. Nothing routes
-//! through it yet — #438 fans blobs out before propose and #439 fetches them on
-//! apply; this child builds the store and the transport they will call.
+//! moves them between nodes. A blob's identity *is* its digest (D-4): the
+//! sha256 of the bytes names the file, and bytes that do not hash to the digest
+//! they were sent under are never committed here.
 //!
 //! The store is **node-local**: it is not replicated, it is not part of the
 //! state machine, and two nodes holding different blob sets is normal rather
-//! than divergence.
+//! than divergence. Completeness — every member holds every live blob (D-18) —
+//! is established by the **write path**, not by the store:
+//! `RaftNode::fan_out_blob` (#438) puts the bytes on a joint-consensus quorum
+//! (D-19) before the referencing op is proposed, so a commit implies
+//! quorum-durability. Fetch-on-apply for a member the fan-out missed is #439.
+//!
+//! Until D-23 (#439) lands, `SpecPut`/`DatasetPut` still carry their bytes on
+//! the log as well; the fan-out sideloads the same bytes ahead of propose. An
+//! object-store mirror/backup tier (D-30, #456/#457) is pending — nothing here
+//! consults a bucket, and nothing may on the serving path.
 
 pub mod client;
 pub(crate) mod routes;

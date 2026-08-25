@@ -27,7 +27,7 @@ flowchart TB
             direction LR
             P0["rift-0<br/>AZ-a"] ; P1["rift-1<br/>AZ-b"] ; P2["rift-2<br/>AZ-c"]
         end
-        HS["headless svc rift-hs<br/>publishNotReadyAddresses: true"]
+        HS["headless svc rift-peers<br/>publishNotReadyAddresses: true"]
     end
     TG --> P0 & P1 & P2
     P0 --- V0[("EBS gp3 PVC<br/>(cluster-state-dir)")]
@@ -83,8 +83,8 @@ preference:
    ECS shape.
 2. **Fargate ephemeral + external re-seeding**: accept that a *simultaneous*
    full-fleet replacement loses control-plane disk, and lean on sources (#20)
-   as the recovery story — on cold start, one task runs `--cluster-init` and
-   re-pulls every `pinned` source. Configs survive (they live in Git/S3/the
+   as the recovery story — on cold start, one task runs with
+   `--cluster-allow-solo` and no seeds, and re-pulls every `pinned` source. Configs survive (they live in Git/S3/the
    registry — provenance makes this legitimate, not a hack); **flow state does
    not**. Acceptable for perf-test fleets; state so in the runbook.
 3. **EC2 launch type** with instance EBS when neither fits.
@@ -117,6 +117,22 @@ No ElastiCache, no RDS, no MSK, no external coordinator — the zero-dependency
 premise is precisely what makes the bill this short. (The optional Redis-strict
 backends of Phases 4–5 are the one feature that adds a managed service, by
 explicit choice.)
+
+## What you deploy: the chart and the image
+
+Every reference deployment in this chapter and the next consumes exactly two
+portable artifacts (D-35): the Helm chart at
+`oci://ghcr.io/achird-labs/charts/rift-cluster` and the image at
+`ghcr.io/achird-labs/rift-cluster-server` (`vX.Y.Z`, plus a `-static` flavor),
+both published by `.github/workflows/release.yml` on a `v*` tag and
+smoke-tested before anything discoverable is promoted. The non-goals are
+stated so they are not re-proposed: **no Terraform / CloudFormation / Bicep
+modules, no OS package-manager packages, no auto-update.** The EKS and ECS
+shapes above are compositions of those two artifacts with the platform's own
+primitives — `deploy/helm/rift-cluster/values-eks.yaml` is the AWS half of the
+diagram as values, and `deploy/k8s/statefulset.yaml` is kept only for shops
+that refuse Helm. `deploy/README.md` is the artifact inventory, with what each
+one is verified by.
 
 ## The checklist
 

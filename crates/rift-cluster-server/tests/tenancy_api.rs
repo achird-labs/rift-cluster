@@ -387,6 +387,8 @@ async fn an_unknown_key_costs_zero_argon2_verifications() {
 /// so there are no two header sets to drift apart. What would actually be worth
 /// asserting is that the two refusals come from different *reasons*, and that
 /// is what the two probes below arrange.
+///
+/// Pins D-45: a tenant the caller is not bound to answers exactly like a tenant that does not exist.
 #[tokio::test]
 async fn a_cross_tenant_probe_is_indistinguishable_from_a_missing_tenant() {
     let _guard = ARGON2_COUNTER_LOCK.lock().await;

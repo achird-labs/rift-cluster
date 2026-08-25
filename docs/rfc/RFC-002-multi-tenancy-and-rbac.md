@@ -39,9 +39,9 @@ delivers.
 Checked at `919495e`, not assumed:
 
 - Admin authentication is one global bearer: `AdminApiServer` holds
-  `api_key: Option<Arc<String>>` (`admin_api/server.rs:36`) and gates requests on
-  a single constant-time comparison — the gate at `server.rs:479-491`, the
-  comparison in `api_key_matches` at `:581`. Success yields *access*, not an
+  `api_key: Option<Arc<String>>` (`admin_api/server.rs`) and gates requests on
+  a single constant-time comparison — the gate and the `api_key_matches`
+  comparison in the same file. Success yields *access*, not an
   identity: there is nothing to attribute a change to.
 - The words *principal*, *role* and *tenant* do not appear in `rift-mock-core`
   or `rift-http-proxy` in any authorization sense.
@@ -198,6 +198,10 @@ A closed enum, one per route class:
 `FlowStateRead` · `FlowStateClear` · `ImposterTry` · `SourceRead` · `VerifyRun` ·
 `StreamSubscribe` · `TenantManage` · `AuditRead` · `ClusterAdmin`
 
+> **As shipped.** RFC-004 (`SpecRead` · `SpecWrite` · `SpecDelete`) and RFC-005 (`DatasetRead` ·
+> `DatasetWrite` · `DatasetDelete`) have since added six actions; `authz::Action` in
+> `crates/rift-cluster-server/src/authz.rs` is the authoritative list.
+
 `ImposterTry` (issue #335) authorizes `POST /admin/imposters/{port}/try` — the
 console's "send a sample request to this stub" affordance. As first shipped it
 was the **only** action under which the server originated outbound HTTP on a
@@ -319,7 +323,7 @@ Cluster routes, on the same admin port:
 POST/GET         /admin/tenants                      FleetAdmin
 GET/PUT/DELETE   /admin/tenants/:id                  FleetAdmin  (DELETE = tombstoned cascade, §3.3)
 POST/GET         /admin/tenants/:id/principals       TenantAdmin
-PUT/DELETE       /admin/tenants/:id/principals/:pid  TenantAdmin
+PUT/DELETE       /admin/tenants/:id/principals/:pid  FleetAdmin   (as shipped, T3 — §3's rule; this draft said TenantAdmin)
 PUT/DELETE       /admin/tenants/:id/bindings/:pid    TenantAdmin  body: {role}
 GET              /admin/whoami                       any authenticated principal → {principal, displayName, bindings}
 ```
@@ -459,6 +463,11 @@ as upstream #817, so there is nothing left to compose with — the earlier
 A fleet-wide delete is a `ClusterAdmin` action and its audit record (§9) has
 `tenant: null` and `resource: "*"` — correct, but worth stating so the null is
 not read as a bug.
+
+> **As shipped (T1, #159).** Every `ControlOp` now carries an explicit `tenant`, so the
+> fleet-wide delete's audit row records the **real tenant** with `resource: "*"`, not
+> `tenant: null`. Pinned by `delete_all_is_audited_with_the_real_tenant_and_a_wildcard_resource`;
+> see `docs/architecture/08-tenancy-security.md`.
 
 *Generic justification.* Audit logging is already a listed motivation of the
 event seam; today an event says *what* changed but not *who* changed it, which

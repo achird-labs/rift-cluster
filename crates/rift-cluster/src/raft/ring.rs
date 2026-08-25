@@ -2,10 +2,13 @@
 //! by ADR-001).
 //!
 //! A [`Ring`] assigns each key an owner by **rendezvous (HRW) hashing** over the
-//! voters of the *applied* Raft membership at a given log index. Because every
-//! node computes ownership from the same committed membership, they all agree on
-//! `owner(key)` at a given `m_idx` — no gossip-era epoch, settle delay, or
-//! per-key generation is needed (all deleted by the re-scope). Liveness is *not*
+//! voters of the *applied* Raft membership at a given log index — HRW, no
+//! vnodes (D-3): a membership change moves only the departed node's keys, and an
+//! O(N) scan is nothing at a handful of voters. Because every node computes
+//! ownership from the same committed membership, they all agree on `owner(key)`
+//! at a given `m_idx` — ownership is *derived* from consensus, never carried on
+//! it (D-17) — so no gossip-era epoch, settle delay, or per-key generation is
+//! needed (all deleted by the re-scope). Liveness is *not*
 //! mixed into ownership (that would make it non-deterministic across nodes);
 //! whether the local owner may actually serve is the separate isolated-owner
 //! gate ([`super::RaftNode::is_isolated`]). The membership log index
@@ -21,9 +24,11 @@ use super::NodeId;
 
 /// The classes of key the ring owns.
 ///
-/// **Only [`KeyClass::FlowKv`] is live.** The ring exists to give each *stateful
-/// flow* exactly one node that holds and mutates its state; everything else a
-/// node serves is replicated rather than owned.
+/// **Two classes are live: [`KeyClass::FlowKv`] and [`KeyClass::Proxy`]**
+/// (D-20). The ring exists to give each *stateful flow* exactly one node that
+/// holds and mutates its state, and each `proxyOnce` `(port, signature)` claim
+/// exactly one node that arbitrates it ([`super::super::stores::proxy`]);
+/// everything else a node serves is replicated rather than owned.
 ///
 /// That distinction is the one worth keeping straight, because the natural
 /// reading of "owner" is the wrong one here:
@@ -36,22 +41,22 @@ use super::NodeId;
 ///   ([`super::super::stores::flow`]); a node that receives a request for a flow
 ///   it does not own talks to the owner instead of answering from its own copy.
 ///
-/// [`KeyClass::Config`] is **vestigial**: it belonged to the gossip-era design
-/// where a `cfg:<port>` key had a per-port config owner (RFC-001 §7.4, which the
-/// RFC itself flags as a superseded mechanism). Nothing constructs one — it is
-/// retained only so [`KeyClass::tag`] keeps its historical numbering, and to
-/// exercise class separation in this module's tests. `Sequence` and `Proxy` are
-/// reserved and share the same ownership function so the ring does not change
-/// when they arrive.
+/// [`KeyClass::Config`] is **vestigial** (D-20): it belonged to the gossip-era
+/// design where a `cfg:<port>` key had a per-port config owner (RFC-001 §7.4,
+/// which the RFC itself flags as a superseded mechanism). Nothing constructs
+/// one — it is retained only so [`KeyClass::tag`] keeps its historical
+/// numbering (it must never be renumbered), and to exercise class separation in
+/// this module's tests. `Sequence` is reserved and shares the same ownership
+/// function so the ring does not change when it arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyClass {
     /// Vestigial — the superseded gossip-era `cfg:<port>` config owner. Unused.
     Config,
-    /// Flow key/value state — the only class the ring actually owns today.
+    /// Flow key/value state: one owner per scoped flow id.
     FlowKv,
     /// Sequence counters (reserved).
     Sequence,
-    /// Proxy recordings (reserved).
+    /// `proxyOnce` claims: one owner per `(port, signature)` (#226).
     Proxy,
 }
 
@@ -278,6 +283,9 @@ mod tests {
     /// HRW's defining property: removing one node reassigns only the keys that
     /// node owned; every other key keeps its owner. This is what keeps a
     /// membership change from reshuffling the whole cluster.
+    ///
+    /// Pins D-3: ownership is HRW with no vnodes — minimal churn on membership
+    /// change, so a departure moves exactly the departed node's keys.
     #[test]
     fn removing_a_node_only_moves_its_own_keys() {
         let full = Ring::new([1, 2, 3, 4, 5], 10);
@@ -299,6 +307,9 @@ mod tests {
 
     /// Symmetric property: adding a node only steals keys for the newcomer; no key
     /// moves between two pre-existing nodes.
+    ///
+    /// Pins D-3: a join moves keys only *to* the newcomer, never between
+    /// survivors — the HRW property that makes vnodes unnecessary here.
     #[test]
     fn adding_a_node_only_steals_keys_for_the_newcomer() {
         let before = Ring::new([1, 2, 3], 10);
@@ -330,6 +341,34 @@ mod tests {
     #[test]
     fn m_idx_is_carried() {
         assert_eq!(Ring::new([1, 2, 3], 42).m_idx(), 42);
+    }
+
+    /// Pins D-20: the class tags are hash inputs and append-only — `Config`
+    /// keeps its number even though nothing constructs it, because renumbering
+    /// any tag re-scores every key in that class and silently reassigns live
+    /// flows to different owners.
+    #[test]
+    fn key_class_tags_are_frozen() {
+        assert_eq!(KeyClass::Config.tag(), 0);
+        assert_eq!(KeyClass::FlowKv.tag(), 1);
+        assert_eq!(KeyClass::Sequence.tag(), 2);
+        assert_eq!(KeyClass::Proxy.tag(), 3);
+        // The owner of a flow key is a pure function of (members, tag, key), so a
+        // renumbering would show up here as a different owner for the same key.
+        let ring = Ring::new([1, 2, 3, 4, 5, 6, 7], 1);
+        let owners: Vec<_> = keys(50)
+            .iter()
+            .map(|k| ring.owner(OwnedKey::flow(k)).expect("non-empty"))
+            .collect();
+        assert_eq!(
+            owners,
+            keys(50)
+                .iter()
+                .map(|k| ring
+                    .owner(OwnedKey::new(KeyClass::FlowKv, k))
+                    .expect("non-empty"))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

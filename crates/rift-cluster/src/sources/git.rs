@@ -56,7 +56,8 @@
 //! running fleet.
 //!
 //! The probe's two failure modes are kept apart on purpose, because composition
-//! answers them differently (#270). *Absent* (`ErrorKind::NotFound`) is a
+//! answers them differently (#270; D-34: `git+` is a probed capability of the
+//! image, never assumed from the build). *Absent* (`ErrorKind::NotFound`) is a
 //! property of the image — the `-static` flavor has no git and must still boot
 //! and serve, with `git+` registered as an unavailable scheme. *Present but
 //! unusable* is a broken host: it still refuses the boot, exactly as before,

@@ -20,6 +20,10 @@ use super::shard::Durability;
 
 /// Which copy a flow-state read consults.
 ///
+/// D-10: `Strong` is the default — a read that cannot reach the owner *errors*
+/// rather than silently answering from the replica — and `Local` is a
+/// per-imposter opt-in, not a fleet-wide degraded mode.
+///
 /// The `lowercase` serialization is the same vocabulary [`FlowConfig::from_imposter`] parses, so
 /// the knob the admin read publishes (#370) round-trips through the value an operator wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
@@ -116,6 +120,11 @@ impl ContextScope {
     }
 
     /// The key a flow's state is actually stored and **owned** under.
+    ///
+    /// D-20: the ring key is the *scoped* id, never the bare flow id — under
+    /// `Imposter` two imposters' same-named flows are two keys with two owners;
+    /// under `Fleet` they are one key with one owner. Any code that derives an
+    /// owner from the bare id names the wrong node.
     ///
     /// The one place this composition lives. Both callers need the identical
     /// string or they disagree about who owns a flow: the store writes under it
@@ -627,6 +636,26 @@ mod tests {
             assert!(prefix.ends_with(':'), "{prefix}");
             assert_eq!(prefix.matches(':').count(), 1, "{prefix}");
         }
+    }
+
+    /// Pins D-20: the ring key is scope-prefixed, so two imposters' same-named
+    /// flows are distinct keys (two owners) under the default `imposter` scope
+    /// and one key (one owner) only under `fleet` — `i{port}:` by default,
+    /// `f:` under fleet.
+    #[test]
+    fn same_named_flows_share_one_ring_key_only_under_fleet() {
+        let a = ContextScope::Imposter.scoped_flow_id(Some(6400), None, "checkout-77");
+        let b = ContextScope::Imposter.scoped_flow_id(Some(6401), None, "checkout-77");
+        assert_eq!(a, "i6400:checkout-77");
+        assert_eq!(b, "i6401:checkout-77");
+        assert_ne!(a, b, "imposter scope must keep same-named flows apart");
+
+        let fa = ContextScope::Fleet.scoped_flow_id(Some(6400), None, "checkout-77");
+        let fb = ContextScope::Fleet.scoped_flow_id(Some(6401), None, "checkout-77");
+        assert_eq!(fa, "f:checkout-77");
+        assert_eq!(fa, fb, "fleet scope must make them one flow with one owner");
+
+        assert_eq!(ContextScope::default(), ContextScope::Imposter);
     }
 
     #[test]

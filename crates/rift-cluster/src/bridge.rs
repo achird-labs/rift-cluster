@@ -1,11 +1,13 @@
-//! The sync→async bridge and the private cluster-io runtime (RFC-001 §7.7).
+//! The sync→async bridge and the private cluster-io runtime (RFC-001 §7.7,
+//! D-9).
 //!
 //! The open-source engine's state seams are synchronous — they are called from
 //! async request handlers *and* from the blocking script-pool threads — while
 //! clustered implementations perform network RPC. Rather than async-ifying
 //! those traits upstream (which would ripple through both scripting engines and
 //! every call site), the cluster side owns a small runtime and parks the
-//! calling thread on a channel.
+//! calling thread on a `std::sync::mpsc` channel behind a sized semaphore
+//! (D-9).
 //!
 //! Two properties make that safe:
 //!
@@ -248,6 +250,9 @@ mod tests {
         );
     }
 
+    /// Pins D-9: the semaphore is sized, not unbounded — a caller past the
+    /// permit bound is shed immediately rather than queued, so an owner outage
+    /// cannot exhaust the data-plane threads.
     #[test]
     fn bridge_sheds_beyond_permit_bound() {
         let bridge = Arc::new(bridge(1));
@@ -359,6 +364,8 @@ mod tests {
             .expect("holder op resolves");
     }
 
+    /// Pins D-9: data-plane permits are `max(2, workers/2)`, so at least half
+    /// the workers stay on the stateless path while an owner black-holes.
     #[test]
     fn permit_sizing_keeps_half_the_data_plane_free() {
         assert_eq!(BridgeConfig::for_workers(16).data_plane_permits, 8);

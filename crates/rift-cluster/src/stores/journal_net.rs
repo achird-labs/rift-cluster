@@ -91,6 +91,9 @@ pub struct MergeOutcome {
 /// even when that entry's `space_gen` is numerically higher than the space threshold (an
 /// earlier scoped teardown of the same space, before the wider clear). Folding them into a
 /// single `max(port_gen, space_gen)` stamp would defeat exactly that case.
+///
+/// D-37: this is the read-side merge — shards are unioned and k-way ordered here, and
+/// nothing on the write side coordinates.
 #[must_use]
 pub(crate) fn merge_shards(slices: &[ShardSlice], partial: bool) -> MergeOutcome {
     // The port's live generation is the highest any shard reports. #224 raises it through the
@@ -232,6 +235,8 @@ pub struct TailPage {
 /// [`super::journal::ClusterJournal`]'s `cursor_since_zero_differs_from_baseline_only_in_truncation`
 /// pins it. Collapsing the two here would make every uncursored read of an evicting port claim
 /// truncation forever — the header crying wolf on the most common read there is.
+///
+/// D-39: the cursor walk — per-shard filtering and monotone advance live here.
 #[must_use]
 pub(crate) fn merge_shards_since(
     slices: &[ShardSlice],
@@ -1117,6 +1122,10 @@ impl JournalNet {
     }
 
     /// Split `ports` into the most recently active `cap` and the rest (issue #362).
+    ///
+    /// D-32: the fleet tail walks a coverage set capped by `fleet_journal_port_cap` and every
+    /// answer declares it — this is where the set is built. Rejected alternatives (a
+    /// `(timestamp, tiebreak)` watermark, a hybrid shape) are recorded on the decision, not here.
     ///
     /// Recency is the newest *recorded timestamp* known for the port — the same string-compared
     /// stamp [`merge_shards`] orders by, so coverage and ordering cannot disagree about what
@@ -2336,6 +2345,9 @@ mod tests {
         /// not, because with a cursor (#225) those entries are skipped permanently for that walk.
         /// `x-rift-truncated` is the mechanism that exists to say so, and before this fix it stayed
         /// `false` because `evicted_through` could only see the origin's watermark.
+        ///
+        /// Pins D-39: eviction overtaking a cursor is declared with `x-rift-truncated`, the
+        /// shipped replacement for the RFC's `Rift-Cluster-Cursor-Lapsed`.
         #[test]
         fn a_cursored_walk_over_a_dropped_range_declares_truncation() {
             let net = net();
@@ -3505,6 +3517,8 @@ mod tests {
             );
         }
 
+        /// Pins D-39: the vector advances one shard per entry and never rewinds — the
+        /// per-shard, monotone property a scalar cursor cannot express.
         #[test]
         fn advanced_by_advances_only_the_entrys_own_shard_and_never_rewinds() {
             let cursor = JournalCursor {
@@ -3996,6 +4010,9 @@ mod tests {
         }
 
         /// AC3. The cap is not silent: what it left out is named, in the answer itself.
+        ///
+        /// Pins D-32: a page over more ports than the cap carries `coverage.omitted` naming the
+        /// ports it did not walk, so a partial view cannot pass for the whole.
         #[test]
         fn coverage_states_omitted_ports() {
             let covered = vec![port(
@@ -4226,6 +4243,9 @@ mod tests {
         /// Three ports, a cap of two. The two most recently active are covered and the stalest is
         /// named as omitted — not silently dropped, and not chosen by port order, which is what the
         /// console's `MERGED_JOURNAL_FANOUT` did.
+        ///
+        /// Pins D-32: the coverage set is ranked by most recent recorded entry and capped, and the
+        /// ports the cap excludes are named in `omitted` rather than counted or dropped.
         #[test]
         fn coverage_ranks_by_recency_and_names_what_the_cap_omits() {
             use crate::stores::journal::{JournalConfig, MonotonicClock};
@@ -4260,6 +4280,10 @@ mod tests {
 
         /// Under the cap nothing is omitted and nothing claims to be capped — the ordinary case,
         /// which must not inherit the capped case's warning.
+        ///
+        /// Pins D-32: `coverage` is on every answer, not only capped ones — below the cap it says
+        /// so (`omitted` empty, not capped), which is the other half of "never mistaken for the
+        /// whole".
         #[test]
         fn coverage_below_the_cap_omits_nothing() {
             use crate::stores::journal::{JournalConfig, MonotonicClock};
@@ -4278,6 +4302,33 @@ mod tests {
             assert_eq!(coverage.covered, vec![4545, 4546]);
             assert!(coverage.omitted.is_empty());
             assert!(!coverage.is_capped());
+        }
+
+        /// Pins D-32: the default cap is 100 ports. One port over it, the walk covers exactly 100
+        /// and names the one it left out — the number is the decision's, and a build that changed
+        /// it silently would change how much every fleet answer covers.
+        #[test]
+        fn the_default_cap_covers_a_hundred_ports_and_names_the_rest() {
+            use crate::stores::DEFAULT_FLEET_JOURNAL_PORT_CAP;
+            use crate::stores::journal::{JournalConfig, MonotonicClock};
+
+            let journal = ClusterJournal::with_parts(
+                1,
+                JournalConfig::default(),
+                Arc::new(MonotonicClock::default()),
+            );
+            let net = JournalNet::new(journal);
+            let ports: Vec<u16> = (5000..5101).collect();
+
+            let coverage = net.coverage_for(&ports, DEFAULT_FLEET_JOURNAL_PORT_CAP);
+
+            assert_eq!(DEFAULT_FLEET_JOURNAL_PORT_CAP, 100);
+            assert_eq!(coverage.covered.len(), 100);
+            // Nothing is recorded, so ranking ties break by port ascending and the highest port
+            // is the one the cap leaves out — named, not merely counted.
+            assert_eq!(coverage.omitted, vec![5100]);
+            assert_eq!(coverage.total(), 101);
+            assert!(coverage.is_capped());
         }
 
         /// Ranking must not create shards: `known_ports` drives the anti-entropy fan-out, so a port

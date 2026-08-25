@@ -62,7 +62,10 @@ const MEMBERSHIP_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The file a confirmed departure leaves behind in the cluster state directory.
 ///
-/// Presence is the whole signal; the contents are informational.
+/// Presence is the whole signal; the contents are informational. Decision D-26:
+/// this marker, the presence of a Raft vote, and the reachability of seeds are
+/// what [`join_or_bootstrap`] decides on — state is never wiped to force a
+/// clean join.
 const DEPARTED_MARKER: &str = "departed";
 
 /// How long a resumed node must see no leader at all before it starts offering
@@ -349,7 +352,7 @@ impl ComposedServer {
                 // Only a real departure is recorded. `Retained` means the
                 // cluster deliberately kept this node — a sole voter cannot
                 // leave (openraft refuses to empty the voter set) and the
-                // leader refuses one that would breach the voter floor (#69) —
+                // leader refuses one that would breach the voter floor (#69, D-25) —
                 // so it is still a full member and must *resume* on the next
                 // start. Marking it would refuse that start outright, which
                 // turns a graceful stop of a solo node, or of a whole fleet,
@@ -446,6 +449,9 @@ pub async fn start_with_runtimes(
 ) -> anyhow::Result<ComposedServer> {
     let cluster = cli.resolve_cluster()?;
 
+    // D-33: without `--cluster` this binary composes exactly what `rift` composes — no admin
+    // front (so no `/console`, no `Rift-Cluster-*` headers, no fleet routes), no probes, no cluster
+    // port. Everything `Some` below this branch is what makes a node distinguishable.
     if !cluster.enabled {
         let server = ServerBuilder::from_cli(cli.oss)
             .accept_runtimes(accept_runtimes)
@@ -1099,7 +1105,7 @@ const NO_GIT_REASON: &str = "no `git` binary on PATH; install git, or use the de
 /// have git — the absent arm is the one that ships in the `-static` image and
 /// would otherwise be exercised for the first time in production.
 ///
-/// The arms are deliberately asymmetric:
+/// The arms are deliberately asymmetric (D-34):
 /// - **present** → register the provider, byte-identical to before.
 /// - **absent** → boot and serve, log once, register the schemes as
 ///   unavailable. Losing `git+` must not cost an operator the other 99% of a
@@ -1508,7 +1514,8 @@ fn cluster_manager(
         // configured or not: scenario state on a process-local store behind a
         // round-robin LB is wrong for all of them, not just the ones that set
         // `flowState` (#120). The `--cluster`-off path never reaches this
-        // function, which is the whole off-switch.
+        // function, which is the whole off-switch. A manager-scoped *provider*
+        // over one shared `FlowNet`, rather than a per-imposter store, is D-7.
         .with_flow_store_provider(Arc::new(ClusteredFlowStoreProvider::new(flow_net)))
         // One journal shared by every imposter on this node, keyed by port — the shard
         // a fleet-wide verification read merges (#223). Same reasoning as the flow store:
@@ -1616,6 +1623,11 @@ async fn drain_parked_intents(node: &RaftNode) {
 
 /// Attach to an existing cluster through the seeds, or found one when the
 /// operator has said that is what they want.
+///
+/// This is the join-or-bootstrap table of decision D-26: the `departed` marker,
+/// whether the store is initialized (a Raft vote exists), and whether the seeds
+/// or the log's remembered peers are reachable pick *resume*, *rejoin* or
+/// *bootstrap*. The retained state directory is never wiped on any row.
 async fn join_or_bootstrap(node: &RaftNode, cli: &EeCli) -> anyhow::Result<()> {
     let state_dir = cli.cluster_state_dir();
     let departed = has_departed_marker(&state_dir)?;
@@ -2024,6 +2036,8 @@ mod tests {
         (sources::SourceProviders::default(), resolver)
     }
 
+    /// Pins D-34: with no git binary the node boots and serves, and `git+` is
+    /// registered as an unavailable — named — capability rather than vanishing.
     #[test]
     fn git_absent_still_composes_and_leaves_the_scheme_explained() {
         let (mut providers, resolver) = empty_providers();
@@ -2056,6 +2070,9 @@ mod tests {
     /// not just for a representative one. `NotFound` is the *only* arm allowed
     /// to degrade, and a future variant that quietly joined the degrading side
     /// is exactly the regression this issue exists to prevent.
+    /// Pins D-34: only absence degrades; a git that is present but unusable
+    /// refuses the boot, so the capability is probed rather than inferred from
+    /// the image flavor.
     #[test]
     fn every_probe_failure_that_is_not_absence_refuses_the_boot() {
         for probe_failure in [

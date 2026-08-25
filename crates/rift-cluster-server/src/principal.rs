@@ -156,6 +156,9 @@ pub(crate) fn resolve_stored_principal(
 /// any authorization data (RFC-002 §3.4). `Ok(true)` only when neither an
 /// `--api-key` nor any principal exists at all; this is also what
 /// `rift_cluster_no_principals` reports.
+///
+/// D-44: the first committed principal (or a configured key) closes the plane for good — there is
+/// no grace window and no per-node flag to reopen it, and this is read fresh on every request.
 pub(crate) fn should_bypass(node: &RaftNode, api_key: Option<&str>) -> Result<bool, NodeError> {
     Ok(api_key.is_none() && !node.has_any_principals()?)
 }

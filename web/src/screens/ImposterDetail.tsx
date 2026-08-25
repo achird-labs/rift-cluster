@@ -286,7 +286,7 @@ function OwnershipTab({
           </p>
           {/*
             There were `Owner`, `Successors` and `Fencing tuple` rows here, each pending on #359 and
-            each implying this imposter has one of them. It does not: placement is per flow, and an
+            each implying this imposter has one of them. It does not (D-20): placement is per flow, and an
             imposter has as many owners as it has flows. Naming the scope is the honest replacement
             — it is also the thing an operator needs, because `contextScope` decides whether two
             imposters' same-named flows are one flow or two.

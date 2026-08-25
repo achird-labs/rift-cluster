@@ -184,7 +184,8 @@ pub struct SourceProviders {
     /// listing and every refusal would blame the operator's spelling for an
     /// image decision they never made. Registered-as-unavailable keeps the
     /// scheme nameable, so a declaration is refused with the cause and the fix
-    /// instead of "no such scheme".
+    /// instead of "no such scheme". The scheme is a *probed* capability of the
+    /// node, never assumed from the build (D-34).
     unavailable: BTreeMap<String, String>,
 }
 
@@ -398,7 +399,8 @@ pub struct SourcePuller {
     /// Leader-local poll status from the tracking scheduler (#135), when one is
     /// running. Absent on a node with no scheduler (a test fixture, or an
     /// embedder that wired only explicit pulls) — and, by construction, empty
-    /// on a follower, since only the leader polls.
+    /// on a follower, since only the leader polls. Node-local by design
+    /// (D-31): the replicated `SourceRecord` never carries it.
     poll_status: OnceLock<Weak<scheduler::PollStatus>>,
 }
 
@@ -904,7 +906,7 @@ impl SourcePuller {
     /// source" outcome to report here, and deleting an absent id commits and
     /// answers the same as deleting one that exists. The imposters a deleted
     /// source owned stay bound; only their provenance is cleared (see the
-    /// module doc's "delete" note) — orphaned, never torn down.
+    /// module doc's "delete" note) — orphaned, never torn down (D-29).
     ///
     /// # Errors
     /// A malformed tenant or id is [`PullError::BadRequest`] — unreachable

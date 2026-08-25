@@ -778,6 +778,11 @@ jobs:
   # ---------------------------------------------------------------------------
   # Helm chart → GHCR (OCI)
   # ---------------------------------------------------------------------------
+  # D-35: the chart (this job) and the GHCR image (`image` / `image-manifest`) are the portable
+  # release artifacts. There is deliberately no Terraform / CloudFormation / Bicep lane, no OS
+  # package lane and no auto-update mechanism in this workflow — the cloud chapters compose these
+  # two with each platform's primitives, and the binary tarballs below are the no-container path.
+  #
   # Needs `image-manifest`, not just the guard: the chart's default `image.tag` is its `appVersion`,
   # so publishing a chart before the image it points at exists would produce a one-command install
   # that pulls a tag nobody can resolve.

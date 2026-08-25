@@ -275,6 +275,8 @@ async fn a_viewer_reads_datasets_but_only_an_editor_writes_them() {
 ///
 /// 403 would confirm the dataset exists, which is the leak RFC-002 §8.4 closes. Asserting the two
 /// bodies are *equal* is the part that matters: two different 404s would still be an oracle.
+///
+/// Pins D-45: another tenant's dataset and a missing dataset are one byte-identical 404.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cross_tenant_probe_is_indistinguishable_from_a_missing_dataset() {
     let f = fixture().await;

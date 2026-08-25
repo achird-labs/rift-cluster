@@ -175,8 +175,8 @@ function View({ view }: { view: FleetView }): ReactNode {
        * The design drew three operational panels. One remains, and it is the only one of the three
        * that asked to *read* rather than to *act*.
        *
-       * Membership (#366) and Snapshots (#365) are gone rather than pending. Neither was a missing
-       * endpoint:
+       * Membership (#366, D-21) and Snapshots (#365, D-24) are gone rather than pending. Neither was a
+       * missing endpoint:
        *
        * - Membership changes happen only through a node's own lifecycle — a node is started and
        *   joins, or a node leaves. The console is deliberately not an admission or eviction vector.

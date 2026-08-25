@@ -10,7 +10,8 @@ proxy, its glue scripts, its config drift — stops existing. Tracked as issues
 ## The front door: many imposters, one port, zero client cooperation
 
 Chapter 2's gateway mode asks the *client* to name the target imposter
-(`X-Rift-Port` header, `p-8080.` subdomain, `/__rift/8080` prefix). Test
+(the `/__rift/8080` path prefix — Chapter 2 lists the header and subdomain
+forms that were designed but not built). Test
 harnesses can do that; an unmodified system-under-test cannot — it believes it
 is calling `payments.example.com/api/charge`. The front door closes the gap
 with a **content-based route table**: host, path-prefix, header, and method
@@ -22,13 +23,13 @@ socket, no sidecar to keep in sync with imposter churn).
 flowchart LR
     SUT1["SUT calls<br/>payments.test/api/charge"] --> FD
     SUT2["SUT calls<br/>search.test/query"] --> FD
-    TH["test harness calls<br/>X-Rift-Port: 9092"] --> FD
+    TH["test harness calls<br/>/__rift/9092/…"] --> FD
 
     subgraph Node["any node — front-door listener :8080"]
         FD{route table<br/>priority → specificity → id} 
         FD -- "host = payments.test" --> I1["imposter :9090<br/>(in-process dispatch)"]
         FD -- "host = search.test" --> I2["imposter :9091"]
-        FD -- "no route → gateway<br/>fallback (X-Rift-Port…)" --> I3["imposter :9092"]
+        FD -- "no route → gateway<br/>fallback (/__rift/:port)" --> I3["imposter :9092"]
         FD -- "nothing matched" --> NF["404 + x-rift-front-door: no-route"]
     end
 ```
@@ -155,6 +156,43 @@ predicate the front's bypass reads; composition tells the puller the credential
 half). The refusal names the port and the way in (`PUT /imposters` as a
 `FleetAdmin`, or `tenant` scope in the document); configs an earlier pull
 admitted keep serving.
+
+**Deleting a source orphans; it never cascades (D-29).** `DELETE
+/admin/sources/{id}` commits a `SourceDelete`, which removes the source record
+and — on the leader — stops polling it. The imposters that source pulled in
+stay bound and keep serving; the apply step only clears their provenance
+(`source` becomes unset), so nothing points at a record that no longer exists.
+Cascading would turn an admin's bookkeeping change into a fleet-wide teardown
+of live mocks. Deleting an absent id is applied, not failed, like
+`DeleteImposter`. Sources have no action of their own: they are authorized
+under `imposter.write` / `imposter.delete` (above), and there is deliberately
+no `SourceWrite`.
+
+**Two kinds of fact, two shapes (D-31).** What a source *is* — `SourceRecord`:
+URI, mode, `authRef`, `onDrift`, poll interval, the `last` applied version and
+digest, the drift flag — is a Raft value, byte-identical on every converged
+node; diffing two nodes' `GET /admin/sources` answers is how an operator checks
+a `SourcePut` converged. What *this node* last saw when it polled is not:
+`PollStatus` (`sources/scheduler.rs`) is an in-memory, leader-local map of the
+last poll error per `(tenant, id)`, and a failed poll never writes a log entry
+— an upstream outage is exactly when fleet-wide writes are unwanted. The admin
+front therefore answers in two halves: `sources`/`source` verbatim from the
+projection, and `nodeLocal` — `nodeId` plus `pollErrors` — for the node that
+answered. Flattening `lastPollError` into the record would report one node's
+view as fleet state. The cluster-port read *does* flat-merge it, and that is
+not a contradiction: there the caller addressed one node explicitly.
+
+**`git+` is a detected capability, not a build fact (D-34).** The
+`git+https:`/`git+file:` provider shells out to a `git` binary, and the musl
+`FROM scratch` `-static` image has none. Composition probes once at startup
+(`GitSource::probe`, i.e. `git --version`) and acts on *which* failure it got.
+`NotFound` boots the node with `git+https`/`git+file` registered as
+**unavailable** schemes — still nameable, so a `git+` declaration is refused
+at source creation with the cause and the fix rather than with "no such
+scheme", and rather than at the first poll; an unknown-scheme refusal lists
+what is unavailable in this build too. Any other probe failure (a git that is
+present but unusable) refuses the boot: a broken git is a broken host, not an
+image flavor, and degrading it would leave a fleet that quietly never fetches.
 
 **Verified, not asserted.** Container scenarios C20–C23
 (`tests/cluster-chaos/tests/scenarios.rs`) hold this section to its claims: a

@@ -378,6 +378,8 @@ async fn wait_stub_count(members: &[ProxyMember], port: u16, want: usize) {
 // ---------------------------------------------------------------------------
 // AC2 — concurrent first-hits: exactly one claim, one recording, replicated.
 // ---------------------------------------------------------------------------
+// Pins D-40: N concurrent first hits yield one claim, one upstream call and one committed
+// `ProxyRecorded` — marker and stub together — replayed from every node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_first_hits_record_exactly_once_fleet_wide() {
     let _lock = TEST_LOCK.lock().await;
@@ -540,6 +542,8 @@ async fn record_without_stub_replays_fleet_wide() {
 // AC3a — upstream failure: release makes the signature immediately
 // re-claimable, no wedge.
 // ---------------------------------------------------------------------------
+// Pins D-40: Pending supports release — a failed upstream call frees the signature at once,
+// which a grow-only replicated claim set could not express.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upstream_failure_releases_claim_and_signature_is_reclaimable() {
     let _lock = TEST_LOCK.lock().await;
@@ -622,6 +626,8 @@ async fn publication_failure_releases_claim_and_is_retryable() {
 // AC4 — the claim dies with its owner: after the owner leaves, re-claim
 // succeeds once membership settles.
 // ---------------------------------------------------------------------------
+// Pins D-40: Pending is owner-local and dies with its owner; the signature is re-claimable at
+// the new owner once membership settles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn owner_death_while_pending_allows_reclaim_after_membership_settles() {
     let _lock = TEST_LOCK.lock().await;
@@ -680,6 +686,8 @@ async fn owner_death_while_pending_allows_reclaim_after_membership_settles() {
 // AC5 — deadline expiry frees the claim; the expired token is a stale fence
 // that cannot clobber the new claim's recording.
 // ---------------------------------------------------------------------------
+// Pins D-40: the claim TTL is a fixed deadline; an expired token is a stale fence that cannot
+// misattribute a recording after re-claim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_token_after_deadline_expiry_cannot_clobber_new_claim() {
     let _lock = TEST_LOCK.lock().await;
