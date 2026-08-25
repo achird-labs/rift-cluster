@@ -524,7 +524,7 @@ fallback dispatch, §7.4.6) stay cluster.
 
 ### 7.1 Membership & gossip
 
-> ⚠️ **Superseded by ADR-001 (v3).** Membership is now a value in the **Raft log**, not gossip:
+> ⚠️ **Superseded by ADR-001 (v3), decision D-15.** Membership is now a value in the **Raft log**, not gossip:
 > at any log index every node computes byte-identical membership (and therefore ownership).
 > chitchat, node incarnations, and the versioned-KV budget below are **removed**; bootstrap is
 > `--cluster-init` (not `--cluster-allow-solo`), identity is a leader-minted `u64`, and join is
@@ -615,7 +615,7 @@ Phase-1 exit test: "unreachable seeds ⇒ never Ready" (§10).
 
 ### 7.2 Ring, ownership, epochs, handoff
 
-> ⚠️ **Partly superseded by ADR-001 (v3).** The ownership *contract* survives verbatim — one
+> ⚠️ **Partly superseded by ADR-001 (v3), decision D-15 — flow-state ownership itself stands (D-17).** The ownership *contract* survives verbatim — one
 > authoritative owner per key by rendezvous (HRW) hashing, owner-serialized writes, and the
 > §7.2.4 owner-authoritative reads that make R2 hold under any load balancer. What is **removed**
 > is the machinery that existed only because gossip membership was not agreed: the ring epoch
@@ -785,7 +785,7 @@ Connection pooling per peer.
 
 ### 7.4 Config replication
 
-> ⚠️ **Superseded by ADR-001 (v3).** Config is now a **Raft state machine**: an admin write is a
+> ⚠️ **Superseded by ADR-001 (v3), decision D-15.** Config is now a **Raft state machine**: an admin write is a
 > `ControlOp` that is validated on the leader, appended, replicated to a fsync'd majority
 > (commit = R3 durability), applied everywhere via the incremental `apply_config` (#316), and
 > gated by a **read-after-write barrier** (leader waits for every Ready node's applied index ≥
@@ -1993,22 +1993,8 @@ follow-up)"* — then one PR per seam:
 
 ## Appendix C — decision log
 
-| # | Decision | Alternatives rejected & why |
-|---|---|---|
-| ~~D-1~~ | ~~No consensus layer; AP + single-writer-by-ownership + settle/generations~~ **SUPERSEDED by D-15 (ADR-001).** | The four requirements R1–R4 (§1.1) are a request for a strongly consistent *control plane*, which D-1 declined. D-1's premise — "quorum ops on the request path" — was the error: Raft carries only the control plane (human/CI-frequency), never the data path. Retained for history. |
-| ~~D-2~~ | ~~chitchat (MIT) for membership + small-KV gossip~~ **SUPERSEDED by D-15/D-16 (ADR-001).** | Membership is now a Raft-log value (`openraft`); the versioned-KV gossip it provided is replaced by the Raft state machine. Retained for history. |
-| D-3 | HRW hashing, no vnodes | Consistent-hash rings with vnodes shine at N≫16 and weighted nodes; HRW is simpler, minimal churn on membership change, O(N) fine at our scale |
-| D-4 | Config bodies via content-addressed RPC fetch, not gossip | Gossiping full configs blows the SWIM payload budget and re-floods every round; digests converge fast and bodies transfer once per node |
-| D-5 | Two-level, order-aware reconcile (LCS edit script) on top of by-id/positional stub CRUD | Whole-imposter replace per change resets runtime state cluster-wide; set-diff (v2 draft 1) missed reorders and reordered keyless edits — order is match priority, so the edit script must be order-aware |
-| D-6 | Redis impls of the *new* traits are cluster; existing `RedisFlowStore` (incl. U-1 CAS) stays OSS. **Accepted erosion:** OSS + shared Redis can DIY multi-instance scenario/flow-KV correctness. **The moat is not "coordination"** — any Redis impl of these small traits is community-reproducible in days — it is zero-dependency clustering, config-sync/membership/HA, cluster-merged verification, and fleet operations | Withholding CAS from an existing OSS backend would be bad-faith open-core and raise more upstream suspicion than shipping it; pretending trait-impl code is the moat mis-prices the product |
-| D-7 | Manager-scoped store via provider resolves the construction-time caveat | Per-imposter stores kept for OSS compat; a provider returning a shared store is strictly more flexible |
-| D-8 | Sequence cursors reset on ownership change | Replicating cursors puts a network write on the hottest stateful path; a documented reset matches test-run-scoped data |
-| D-9 | Sync traits + cluster-side bridge runtime (std mpsc park, sized semaphore) | Async-ifying `FlowStore` ripples into Lua/JS engines and every call site — huge OSS churn benefiting only clustering |
-| D-10 | Degraded reads reject by default (except sequencing = local); shipped per-imposter as `readConsistency` (#120), not as the `--cluster-degraded-mode` flag first sketched | Silent local fallback for CAS/proxyOnce converts partitions into wrong test results — the one thing a verification tool must never do; sequencing degrades by default because blocking all cyclic responses during a blip is worse than a possible duplicate index, and it's flagged |
-| D-11 | Plain gateway listener upstreams with U-7 (promotion of #212); only cluster-aware dispatch (bind-failure fallback) stays cluster | Keeping a generic single-node convenience cluster-only has bad optics, zero moat (community can promote #212 trivially), and weakens U-7's story |
-| D-12 | Strict sequencing/proxyOnce ship **Redis-backed first**; gossip-native single-writer versions are demand-gated experimental follow-ons | Gossip-exact semantics are the hardest engineering in the RFC aimed at the least-demanded guarantee; the trait seams make the backend invisible to callers; teams that need this already operate Redis. The zero-dependency premise stays intact for Phases 1–3 (membership, config-sync, scenario state, verification) |
-| D-13 | LB header affinity treated as stickiness only; owner co-location is NOT assumed (one LAN RPC per stateful op is the budget) | v1/v2-draft claimed "receiving node is usually the owner" — false: LBs hash onto their own ring. A future sticky-owner lease (first-touch ownership) could align them but is a separate design with its own fencing story; recorded as future work, not assumed |
-| D-14 | `--cluster` + `--runtime per-core` rejected at startup; `--cluster` + intercept mode likewise | Upstream RFC-712's per-core topology runs single-threaded pinned worker runtimes; the §7.7 sync bridge parks caller threads, and a per-core worker has only one thread to park, so a single owner outage would stall every connection pinned to it. Enforced in the #8 config guard. |
-| **D-15** | **Embedded Raft (`openraft`) control plane over gossip (ADR-001).** Membership + configs + tenancy + admin intents in a Raft log; flow state stays off consensus. | Bolting a barrier + persist-before-ack + intent log + dedup onto v2 gossip = four hand-rolled protocols atop the settle/generation machinery that only existed because membership wasn't agreed — a worse consensus by hand. External Temporal/etcd violates the zero-dependency premise (revisit only as an *optional* integration, D-12 pattern). **Supersedes D-1, D-2.** |
-| **D-16** | **`redb` for all cluster durability** (Raft log/vote/snapshot metadata + the #16 flow WAL). **Amended 2026-08-24 (#436):** the snapshot *payload* is a plain file beside redb — `SNAPSHOT_TABLE` keeps only `{meta, file}`. Inlining it as a redb value cost ~3.7x the bytes it carried and read the whole payload on every send. | Hand-rolled WAL is error-prone; `sled` rejected on maintenance; `fjall` kept as the LSM fallback if write-amplification bites. Pure Rust — static-musl/`FROM scratch` safe. `Durability` is `Immediate`-only since redb 2.0, so #16's `async` flow durability is group-commit (batch one `Immediate` per interval), not an `Eventual` mode. |
-| **D-17** | **Flow state stays off consensus** (HRW ownership + successor replication + WAL); ownership derived from *committed* membership. | A quorum write per scenario transition at 20–40k RPS is an outage. D-8 (cursor reset on ownership move) and D-12 (Redis-strict path) both still stand. |
+**Moved.** Every decision this RFC made or that later amended it is defined **once**, in
+[`docs/decisions/DECISIONS.md`](../decisions/DECISIONS.md) — the register is the only place a
+`D-n` is defined, so the table that used to live here would have been a second, drifting copy
+(it had already fallen behind: D-18 and D-19 existed only in ADR-001). The identifiers cited
+throughout this RFC (`D-1` … `D-17`) resolve there; D-1 and D-2 are superseded by D-15.

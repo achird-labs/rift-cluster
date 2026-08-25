@@ -189,6 +189,14 @@ refused with a 400 naming the row and value — never accepted-but-broken.
 
 ### 3.2 Distribution — the bytes ride the log
 
+> **Amended by D-18 and D-23** (2026-08-24, epic #432): they do not, any more. The decision below
+> — "dataset bytes are committed through the Raft log … no blob sidecar, no fetch protocol" — is
+> reversed: bytes are sideloaded through the content-addressed blob store (#437), fanned out to a
+> joint-consensus quorum *before* the referencing op is proposed (#438, D-19), and fetched on
+> apply by any member that lacks them (#439). Every member still ends up holding every live blob
+> (D-18); what changed is the carrier. The quota bound in this section still stands and is the
+> reason the corpus can be fully replicated at all. Prose rewrite: #441.
+
 > **As shipped (#285, D1).** `DatasetPut { tenant, record, csv }` /
 > `DatasetDelete { tenant, name }`; `sm_datasets (tenant, name, version)` and
 > `sm_dataset_blobs digest → csv` (referenced-by-scan, like `sm_spec_blobs`);
@@ -216,7 +224,8 @@ refused with a 400 naming the row and value — never accepted-but-broken.
 > **One caveat remains, and it is not about the transfer:** on a
 > CPU-constrained host a large entry can still trip #430, where an empty log read
 > panics openraft's replication worker and the leader loses its streams. The
-> 8 MiB restart test stays `#[ignore]`d against that issue, not against #411.
+> 8 MiB restart test was `#[ignore]`d against that issue, not against #411, and
+> re-enabled by #461 once #430 and #431 closed.
 > See `docs/architecture/09-durability-failure.md`.
 
 **Decision: dataset bytes are committed through the Raft log and materialized

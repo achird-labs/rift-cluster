@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# design-check: ignore-file — the self-test table below contains deliberately fake paths
 # Decide whether a change set warrants running a path-gated CI job.
 # Two callers today: `cluster-smoke` (the container chaos tier) and `parity`
 # (issue #37 — the upstream behavioural suites run against `rift-cluster-server`),

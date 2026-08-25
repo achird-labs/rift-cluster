@@ -18,32 +18,36 @@ single-node behavior byte-for-byte — and the cluster crates supply
 cluster-aware implementations. All eight seams are merged upstream
 (`achird-labs/rift#311–#318`); Phase 0 of the program is *complete*:
 
-| Seam (upstream issue) | Upstream trait | Cluster implementation |
-|---|---|---|
-| #311 | `FlowStore::compare_and_set` (+`CasOutcome`) | atomic scenario transitions — also fixed an OSS race |
-| #312 | `FlowStoreProvider` | per-imposter `ClusteredFlowStore` injection |
-| #313 | `ResponseSequencer` / `SequenceKey` | owner/Redis sequencing (Phase 4) |
-| #314 | `RequestJournal` (+ cursor reads #603) | sharded CRDT journal, vector cursors |
-| #315 | `ProxyRecordingStore` (claim/release) | owner claim state machine — also fixed a stuck-pending OSS bug |
-| #316 | `apply_config` + `ImposterEvent` + `stub_key` + `move_stub` | incremental reconcile as the Raft apply step |
-| #317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` (+ its per-imposter half `handle_imposter_request`, re-exported for #344) | `rift-cluster-server` composes instead of forking `main.rs`; the admin try answers in-process from the imposter it resolved, never a socket |
-| #318 | `BackendUnavailable` + `annotate()` + `ResponseDecorator` | every `Rift-Cluster-*` header, without core handlers knowing what a cluster is |
-| #966 (U-13) | `ExchangeInspector` / `ExchangeInspectorProvider` (`extensions::exchange_inspector`) | request-side hook after journaling and before matching, response-side hook in the shared funnel before the decorator; synchronous, per imposter, inert by default — what spec enforcement (RFC-004 §3.6) hangs on; re-exported, not yet consumed (S6, #282) |
+Every seam has a stable identifier, `U-n`, which is what code, RFCs and this guide cite; this
+table is where a `U-n` is defined (`scripts/design-check.py` resolves citations against it).
 
-The pattern in #318 deserves a sentence: cluster backends *annotate* the
-request task-locally ("degraded: kv-adopt", "revision: 421"), and an
+| Seam | Upstream | Surface | Cluster use | Status |
+|---|---|---|---|---|
+| U-1 | rift#311 | `FlowStore::compare_and_set` (+`CasOutcome`) | atomic scenario transitions — also fixed an OSS race | merged (v0.14.0) |
+| U-2 | rift#312 | `FlowStoreProvider` | per-imposter `ClusteredFlowStore` injection | merged |
+| U-3 | rift#313 | `ResponseSequencer` / `SequenceKey` | owner/Redis sequencing (Phase 4, D-12) | merged |
+| U-4 | rift#314 | `RequestJournal` (+ cursor reads rift#603) | sharded CRDT journal, vector cursors (Ch.7) | merged |
+| U-5 | rift#315 | `ProxyRecordingStore` (claim/release) | owner claim state machine — also fixed a stuck-pending OSS bug | merged |
+| U-6 | rift#316 | `apply_config` + `ImposterEvent` + `stub_key` + `move_stub` | incremental reconcile as the Raft apply step (D-5) | merged |
+| U-7 | rift#317 | `ServerBuilder` / `run_metrics_server` / `dispatch_to_port` (+ `handle_imposter_request`, re-exported for #344) | `rift-cluster-server` composes instead of forking `main` (D-11) | merged |
+| U-8 | rift#318 | `BackendUnavailable` + `annotate()` + `ResponseDecorator` | every `Rift-Cluster-*` header, without core handlers knowing what a cluster is | merged |
+| U-9 | — | `AdminAuthorizer` | RFC-002 enforcement point (Chapter 8) | merged |
+| U-10 | — | principal-on-events | audit attribution (RFC-002, Chapter 8) | merged |
+| U-11 | — | front-door route table + listener | single-port content routing (#19, Chapter 13) | merged |
+| U-12 | — | `ImposterSource` provider trait, `file`/`https` built-ins | imposter sources (#20, Chapter 13) | merged |
+| U-13 | rift#966/#967 | `ExchangeInspector` / `ExchangeInspectorProvider` (`extensions::exchange_inspector`) | request-side hook after journaling and before matching; response-side hook in the shared funnel — spec traffic validation (RFC-004 §6); re-exported by #281 | merged |
+| U-14 | — | `extensions::template_fn` — template-function registration | template read parity for datasets (RFC-005 §3.8, §6.2) | **queued** (#291) |
+| U-15 | — | `extensions::state_ops` — declarative state operations | `_rift.stateOps` (RFC-005 §3.7, §6.1); landed by #418 | merged |
+| U-16 | rift#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once | clustered `proxyOnce` (#226, Chapter 7) | merged |
+
+The pattern in U-8 deserves a sentence: cluster backends *annotate* the
+request task-locally ("degraded: kv-adopt", "revision: 421"), and a
 cluster decorator translates annotations into response headers. The OSS
 handlers never learn cluster vocabulary — which is what keeps the seams
-honestly generic and upstreamable.
-
-Four further seams are queued, same rules — generic names, `Local`/default-off
-behavior, independently justifiable to an OSS maintainer: U-9 `AdminAuthorizer`
-and U-10 principal-on-events (RFC-002, Chapter 8), U-11 the front-door route
-table and listener (#19, Chapter 13), and U-12 the `ImposterSource` provider
-trait with `file`/`https` built-ins (#20, Chapter 13). U-13, the exchange
-inspector (RFC-004 §6), landed the same way — upstream #966/#967, re-exported
-here by #281 — and is the first seam that can act on an in-flight exchange
-rather than only observe or decorate it.
+honestly generic and upstreamable. U-13 is the first seam that can act on an
+in-flight exchange rather than only observe or decorate it. Every seam follows
+the same rules — generic names, `Local`/default-off behavior, independently
+justifiable to an OSS maintainer.
 
 ## The dependency architecture
 

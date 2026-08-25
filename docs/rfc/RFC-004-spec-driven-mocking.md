@@ -410,6 +410,15 @@ counted, and visible in `/readyz` detail if persistent.
 
 ### 4.1 On consensus (Raft state machine) — small, must-agree
 
+> **Amended by D-23** (2026-08-24, epic #432): spec *bytes* no longer ride the log. `SpecPut`
+> carries `{digest, size, meta}`; the bytes are sideloaded through the content-addressed blob
+> store (#437) with a quorum fan-out before propose (#438, D-18/D-19) and fetch-on-apply
+> (#439). The reason given below for putting the blob on consensus — that a log entry of that
+> size is unremarkable — was measured to be false at the quota sizes this RFC sets (#411,
+> #430, #431). The ordering argument survives: log order still guarantees the bytes are local
+> before any config referencing them applies. The prose rewrite is #441; until it lands, read
+> `bytes` below as `digest`.
+
 New `ControlOp` variants (joining the closed set at `control.rs:89`, tags
 frozen by the same stability test at `control.rs:460`):
 
@@ -717,7 +726,7 @@ S5 is the upstream PR; S8 gates on #20.
 | **S4** `feat(spec): soft validation — bus consumer + violations read` | in-process validator, `jsonschema` cache, per-node violations table, merged `validationFailures` read with `since=` cursor, `ValidationPolicySet` (`off`/`soft` only) | an off-contract request on a `soft` imposter yields exactly one violation row, joinable to its journal index; `off` imposters measure zero overhead |
 | **S5** `feat(spec): U-13 exchange inspector — upstream PR + pin bump` | upstream: trait, provider, two hook points, inert default; here: seam re-export in `rift-cluster-base::seams`, `seams_resolve` extended | upstream suites green with no inspector installed; parity gate (#37/#139) unchanged |
 | **S6** `feat(spec): hard + hard-spec-compliant enforcement` | EE inspector implementation, `hard`/`hard-spec-compliant` modes, Accept negotiation, RBAC actions wired per §4.3 | request + response violations rejected with declared shapes; policy flip visible fleet-wide at barrier; internal-defect path proceeds loudly (counter asserted) |
-| **S7** `test(cluster): C19/C20 — spec state converges and survives restart` | C19: deploy + policy flip converge on every node and survive full-cluster restart (the C17/C18 pattern from `5b98fef`); C20: hard-mode rejection identical through any node under round-robin while a follower restarts | both scenarios green in the chaos tier |
+| **S7** `test(cluster): C31/C32 — spec state converges and survives restart` | C31: deploy + policy flip converge on every node and survive full-cluster restart (the C17/C18 pattern from `5b98fef`); C32: hard-mode rejection identical through any node under round-robin while a follower restarts | both scenarios green in the chaos tier | *(renumbered from C19/C20 by #283 — those numbers belong to the front-door scenarios, Ch.12.)*
 | **S8** `feat(spec): openapi+https/git source kinds` — **blocked on #20/U-12** | the two schemes as `ImposterSource` providers; drift policy inherited | Git spec bump → one pull op → fleet converges; unchanged poll = zero log growth |
 
 ## 10. Open questions

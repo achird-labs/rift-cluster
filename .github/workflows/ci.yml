@@ -96,6 +96,20 @@ jobs:
   # reproducible, not because any specific pair is required. If you bump either,
   # just re-run this job: an incompatibility shows up immediately as a parse
   # error, not as a wrong answer.
+  design-check:
+    # Design <-> code coherence (docs/process/design-code-sync.md): every D-n / RFC § / ADR / U-n
+    # / docs path cited from code or docs resolves, every amended RFC section carries its
+    # callout, the decision register is well-formed. Warnings (uncited decisions, stale docs)
+    # are printed, not fatal — they are the backlog. Pure stdlib Python; no build needed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: design-check --strict
+        run: python3 scripts/design-check.py --strict
+
   public-api:
     runs-on: ubuntu-latest
     steps:

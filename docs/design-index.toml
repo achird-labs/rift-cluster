@@ -1,0 +1,156 @@
+# Design-doc verification index — read by scripts/design-check.py.
+#
+# One table per normative or explanatory design document. `verified_sha` is the commit at which a
+# person (or a reviewed PR) last confirmed the document describes what the code does; `code` lists
+# the source globs the document describes. A document is STALE when any file matching `code`, or
+# any file citing the document, changed after `verified_sha`. Re-verify with:
+#
+#   scripts/design-check.py --mark-verified docs/architecture/03-control-plane.md
+#
+# after actually re-reading the document against the code — the tool records the claim, it does
+# not make it true. `verified_sha = ""` means never verified; the report says so instead of
+# pretending.
+#
+# status: current | amended (a D-n changed part of it; callouts in place) | superseded | draft
+
+["docs/decisions/DECISIONS.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = []
+note = "The register itself; verified by design-check's structural checks rather than by reading."
+
+["docs/adr/ADR-001-raft-control-plane.md"]
+status = "amended"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/raft/**"]
+
+["docs/rfc/RFC-001-self-clustering-rift.md"]
+status = "amended"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/**"]
+note = "v3.2. §7.1/§7.2/§7.4 superseded by D-15 (gossip → Raft); Appendix C is now a pointer to the register."
+
+["docs/rfc/RFC-002-multi-tenancy-and-rbac.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster-server/src/authz.rs", "crates/rift-cluster-server/src/principal.rs", "crates/rift-cluster-server/src/tenancy.rs", "crates/rift-cluster-server/src/authorizer.rs", "crates/rift-cluster-server/src/admin_front.rs"]
+
+["docs/rfc/RFC-004-spec-driven-mocking.md"]
+status = "amended"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster-spec/**", "crates/rift-cluster/src/blobs/**"]
+note = "§4.1 'on consensus' reversed for blob bytes by D-23; prose revision tracked by #441."
+
+["docs/rfc/RFC-005-data-sources-and-state-ergonomics.md"]
+status = "amended"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/blobs/**", "crates/rift-cluster/src/stores/flow_config.rs"]
+note = "§3.2 'the bytes ride the log' reversed by D-18/D-23; prose revision tracked by #441."
+
+["docs/rfc/RFC-006-web-console-and-mcp.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["web/src/**", "crates/rift-cluster-server/src/console.rs", "crates/rift-cluster-server/src/session.rs", "crates/rift-cluster-server/src/fleet.rs", "crates/rift-cluster-server/src/mcp/**"]
+
+["docs/architecture/01-overview.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = []
+
+["docs/architecture/02-topology.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster-server/src/compose.rs"]
+
+["docs/architecture/03-control-plane.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/raft/**", "crates/rift-cluster/src/blobs/**"]
+
+["docs/architecture/04-write-path.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/control.rs", "crates/rift-cluster/src/raft/node.rs", "crates/rift-cluster-server/src/admin_front.rs"]
+
+["docs/architecture/05-read-path.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/shard.rs"]
+
+["docs/architecture/06-flow-state.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/flow_config.rs", "crates/rift-cluster/src/stores/shard.rs", "crates/rift-cluster/src/raft/ring.rs"]
+
+["docs/architecture/07-verification-plane.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/stores/journal.rs", "crates/rift-cluster/src/stores/journal_net.rs", "crates/rift-cluster/src/stores/journal_seq.rs", "crates/rift-cluster/src/stores/proxy.rs"]
+
+["docs/architecture/08-tenancy-security.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster-server/src/authz.rs", "crates/rift-cluster-server/src/principal.rs", "crates/rift-cluster-server/src/tenancy.rs", "crates/rift-cluster-server/src/session.rs", "crates/rift-cluster/src/rpc/**"]
+
+["docs/architecture/09-durability-failure.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores/flow.rs"]
+
+["docs/architecture/10-operations.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster-server/src/cli.rs", "crates/rift-cluster-server/src/probes.rs", "crates/rift-cluster-server/src/readiness.rs", "deploy/**"]
+
+["docs/architecture/11-upstream-boundary.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster-base/**", "Cargo.toml"]
+
+["docs/architecture/12-testing.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**"]
+
+["docs/architecture/13-front-door-and-sources.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["crates/rift-cluster-server/src/route_hits.rs", "crates/rift-cluster/src/sources/**"]
+
+["docs/architecture/14-cloud-deployment.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["deploy/**"]
+
+["docs/architecture/15-azure-deployment.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["deploy/**"]
+
+["docs/design/console/README.md"]
+status = "current"
+verified_sha = ""
+verified_on = ""
+code = ["web/src/**"]

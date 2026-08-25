@@ -11,3 +11,6 @@ Cargo.lock.orig
 # Local knowledge-graph tooling output (graphify)
 /graphify-out
 /.rift-ship
+
+# python tooling (scripts/design-check.py tests)
+__pycache__/

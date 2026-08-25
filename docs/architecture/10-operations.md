@@ -19,9 +19,12 @@ rift-cluster-server \
   --cluster-state-dir /var/lib/rift  # redb: raft log/vote/snapshot + flow shard
   --cluster-features config-sync,flow-state   # per-phase enablement / rollback lever
   --cluster-write-barrier ready-nodes|none    # Ch.4; default ready-nodes
-  --cluster-degraded-mode reject|local        # Ch.9 table override
   --cluster-leave-timeout 10s
 ```
+
+There is no `--cluster-degraded-mode` flag: what a node does when a flow's owner is unreachable
+is a per-imposter `readConsistency` setting (D-10, Chapter 9's degradation table), not a
+fleet-wide switch — the flag sketched in earlier drafts was superseded rather than built (#378).
 
 One subcommand is not a server at all:
 
