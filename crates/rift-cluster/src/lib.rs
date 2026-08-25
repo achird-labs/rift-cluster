@@ -21,6 +21,7 @@
 //!   `Rift-Cluster-*` headers, so the open-source handlers stay cluster-unaware.
 
 pub mod audit_export;
+pub mod blobs;
 pub mod bridge;
 pub mod config;
 pub mod control;

@@ -4043,3 +4043,230 @@ async fn a_joiner_behind_a_purged_log_starts_as_learner_and_the_leader_promotes_
     }
     cluster.shutdown_all().await;
 }
+
+// ---------------------------------------------------------------------------
+// Blob transfer (#437, epic #432 child 2)
+//
+// The store's own rules are unit-tested in `src/blobs/mod.rs`; what can only be
+// proven here is that the bytes cross a real signed connection between two real
+// nodes, at the size the epic's quotas actually permit.
+// ---------------------------------------------------------------------------
+
+/// sha256 of `b"hello"` — a digest no node in these tests ever receives.
+const ABSENT_DIGEST: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+fn blob_transfer() -> rift_cluster::blobs::BlobTransfer {
+    let client = Arc::new(rift_cluster::rpc::RpcClient::new(
+        Some(rift_cluster::rpc::Signer::new(SECRET)),
+        Arc::new(rift_cluster::rpc::AlwaysHealthy),
+        rift_cluster::rpc::RpcClientConfig::default(),
+    ));
+    rift_cluster::blobs::BlobTransfer::new(client)
+}
+
+#[tokio::test]
+async fn blob_of_the_per_tenant_ceiling_crosses_between_nodes() {
+    // Acceptance criterion 1. 64 MiB is RFC-005 §4's per-tenant total — the size
+    // the epic measured as un-replicable *through the log*, which is the whole
+    // reason this transport exists. A smaller payload would not test the claim.
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+
+    let bytes = vec![b'Z'; 64 * 1024 * 1024];
+    let digest = rift_cluster::blobs::digest_of_bytes(&bytes);
+    let target = cluster.members[1].addr;
+    let transfer = blob_transfer();
+
+    let outcome = transfer
+        .put(target, &digest, &bytes)
+        .await
+        .expect("put 64 MiB to a peer");
+    assert_eq!(outcome.resumed_from, 0, "nothing was staged beforehand");
+    assert_eq!(outcome.bytes_sent, bytes.len() as u64);
+
+    // The have/lack probe criterion 1 names. It is `?stat=1` rather than the
+    // `HEAD` the issue asks for: a HEAD response carries no body, so it can
+    // report neither a size nor a distinguishable 404 (see `blobs::routes`).
+    assert!(
+        transfer.have(target, &digest).await.expect("have"),
+        "the receiver must report the blob it just accepted"
+    );
+    let stat = transfer.stat(target, &digest).await.expect("stat");
+    assert!(stat.have);
+    assert_eq!(stat.size, bytes.len() as u64);
+
+    // And the bytes that come back are the bytes that went out.
+    let fetched = transfer
+        .get(target, &digest)
+        .await
+        .expect("get 64 MiB back");
+    assert_eq!(fetched.len(), bytes.len());
+    assert_eq!(rift_cluster::blobs::digest_of_bytes(&fetched), digest);
+
+    cluster.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn an_interrupted_transfer_resumes_from_its_offset() {
+    // Acceptance criterion 1, second half. The observable is `bytes_sent`: a
+    // resumed transfer that quietly restarted from zero would still leave a
+    // correct blob behind, so "the blob arrived" cannot distinguish the two.
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+
+    let bytes = vec![b'Q'; 9 * 1024 * 1024];
+    let digest = rift_cluster::blobs::digest_of_bytes(&bytes);
+    let target = cluster.members[1].addr;
+    let transfer = blob_transfer();
+
+    // Deliver a prefix and stop, exactly as a killed origin would.
+    let partial = transfer
+        .put_prefix(target, &digest, &bytes, 4 * 1024 * 1024)
+        .await
+        .expect("partial put");
+    assert_eq!(partial, 4 * 1024 * 1024);
+    assert!(
+        !transfer.have(target, &digest).await.expect("have"),
+        "a partial transfer must not be visible as a blob"
+    );
+
+    let outcome = transfer.put(target, &digest, &bytes).await.expect("resume");
+    assert_eq!(
+        outcome.resumed_from,
+        4 * 1024 * 1024,
+        "the sender must pick up from what the receiver already held"
+    );
+    assert_eq!(
+        outcome.bytes_sent,
+        bytes.len() as u64 - 4 * 1024 * 1024,
+        "the resumed transfer must not re-send the bytes already staged"
+    );
+    assert!(transfer.have(target, &digest).await.expect("have"));
+
+    cluster.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_zero_byte_blob_crosses_the_wire_like_any_other() {
+    // `BlobTransfer::put` special-cases `total == 0` (there is no chunk for the
+    // loop to send, so the commit has to be driven explicitly). Nothing else
+    // exercises that branch over a real connection.
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+
+    let target = cluster.members[1].addr;
+    let transfer = blob_transfer();
+    let digest = rift_cluster::blobs::digest_of_bytes(&[]);
+
+    let outcome = transfer
+        .put(target, &digest, &[])
+        .await
+        .expect("put empty blob");
+    assert_eq!(outcome.bytes_sent, 0);
+
+    assert!(
+        transfer.have(target, &digest).await.expect("have"),
+        "an empty blob is still a blob the receiver holds"
+    );
+    assert_eq!(transfer.stat(target, &digest).await.expect("stat").size, 0);
+    assert_eq!(
+        transfer.get(target, &digest).await.expect("get"),
+        Vec::<u8>::new()
+    );
+
+    cluster.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_partially_staged_blob_is_not_served_and_still_completes_on_resume() {
+    // Two things at once, both about the staging/committed boundary as seen
+    // over the wire: a `.part` must never be readable, and a resume onto one
+    // must still commit.
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+
+    let bytes = vec![b'P'; 6 * 1024 * 1024];
+    let digest = rift_cluster::blobs::digest_of_bytes(&bytes);
+    let target = cluster.members[1].addr;
+    let transfer = blob_transfer();
+
+    transfer
+        .put_prefix(target, &digest, &bytes, 4 * 1024 * 1024)
+        .await
+        .expect("partial put");
+
+    let err = transfer.get(target, &digest).await;
+    assert!(
+        matches!(err, Err(rift_cluster::rpc::RpcError::NotFound { .. })),
+        "a staged-but-unverified blob must not be readable, got {err:?}"
+    );
+
+    transfer.put(target, &digest, &bytes).await.expect("resume");
+    assert_eq!(
+        transfer
+            .get(target, &digest)
+            .await
+            .expect("get after resume"),
+        bytes
+    );
+
+    cluster.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn fetching_a_blob_the_node_lacks_is_a_typed_not_found() {
+    // Acceptance criterion 3: a 404 the caller can act on, never a 500. #439's
+    // fetch-on-apply has to tell "this peer does not have it, ask another" from
+    // "this peer is broken", and a 500 collapses that distinction.
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+
+    let target = cluster.members[1].addr;
+    let transfer = blob_transfer();
+    let digest = rift_cluster::blobs::BlobDigest::parse(ABSENT_DIGEST).expect("digest");
+
+    let err = transfer.get(target, &digest).await;
+    assert!(
+        matches!(err, Err(rift_cluster::rpc::RpcError::NotFound { .. })),
+        "expected RpcError::NotFound, got {err:?}"
+    );
+    assert!(!transfer.have(target, &digest).await.expect("have"));
+    let stat = transfer
+        .stat(target, &digest)
+        .await
+        .expect("stat is not an error");
+    assert!(!stat.have);
+    assert_eq!(stat.staged, 0);
+
+    cluster.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_chunk_that_does_not_match_the_digest_leaves_no_blob_on_the_receiver() {
+    // Acceptance criterion 2, over the wire rather than in the store: the
+    // receiver, not the sender, is what must refuse.
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+
+    let bytes = vec![b'M'; 1024];
+    let honest = rift_cluster::blobs::digest_of_bytes(&bytes);
+    let target = cluster.members[1].addr;
+    let transfer = blob_transfer();
+
+    // Claim one digest, send the bytes of another.
+    let lie = rift_cluster::blobs::BlobDigest::parse(ABSENT_DIGEST).expect("digest");
+    let err = transfer.put(target, &lie, &bytes).await;
+    // The concrete class, not merely `is_err()`: "you sent bytes that are not
+    // what you named them" is a 400 the sender must not retry identically. An
+    // implementation that answered 500 would pass an `is_err()` check while
+    // telling every caller the fault was the receiver's, and retryable.
+    assert!(
+        matches!(err, Err(rift_cluster::rpc::RpcError::BadRequest(_))),
+        "expected BadRequest for a digest mismatch, got {err:?}"
+    );
+
+    assert!(!transfer.have(target, &lie).await.expect("have"));
+    assert!(!transfer.have(target, &honest).await.expect("have"));
+
+    cluster.shutdown_all().await;
+}

@@ -95,6 +95,15 @@ pub enum RpcError {
     /// The registered handler failed.
     #[error("handler error: {0}")]
     Handler(String),
+
+    /// The route exists, but the specific resource it names does not (#437).
+    ///
+    /// Distinct from [`Self::UnknownRoute`] — "no such route" — because the
+    /// two answer different questions a caller must be able to tell apart: a
+    /// blob fetch (#439) needs "this peer lacks the blob, ask another" to
+    /// read differently from "this build has no blob route at all".
+    #[error("not found: {what}")]
+    NotFound { what: String },
 }
 
 impl RpcError {
@@ -113,6 +122,7 @@ impl RpcError {
             Self::Unavailable { .. } => "unavailable",
             Self::NotLeader { .. } => "not_leader",
             Self::Handler(_) => "handler",
+            Self::NotFound { .. } => "not_found",
         }
     }
 
@@ -136,6 +146,7 @@ impl RpcError {
             // automatically over the signed cluster transport.
             Self::NotLeader { .. } => 421,
             Self::Handler(_) => 500,
+            Self::NotFound { .. } => 404,
         }
     }
 

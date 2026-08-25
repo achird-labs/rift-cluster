@@ -579,9 +579,19 @@ fn status_to_error(status: u16, body: &[u8], method: &str, path: &str) -> RpcErr
         // a `Handler` error is the peer failing at something it should have
         // managed, and is worth escalating rather than rewriting the request.
         400 => RpcError::BadRequest(detail),
-        404 => RpcError::UnknownRoute {
-            method: method.to_owned(),
-            path: path.to_owned(),
+        // Two different 404s share this status, told apart by the envelope's
+        // reason label exactly like the 503 pair below: "no such route"
+        // (`UnknownRoute`) and "this route exists, but not this resource"
+        // (`NotFound`, #437) are different questions a caller must be able to
+        // tell apart — #439's fetch-on-apply needs "this peer lacks the
+        // blob, ask another" to read differently from "this build has no
+        // blob route at all".
+        404 => match field("error").as_deref() {
+            Some("not_found") => RpcError::NotFound { what: detail },
+            _ => RpcError::UnknownRoute {
+                method: method.to_owned(),
+                path: path.to_owned(),
+            },
         },
         413 => RpcError::BodyTooLarge { limit: 0 },
         // The peer is a follower and named the leader (or an election is in

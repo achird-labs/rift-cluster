@@ -244,7 +244,11 @@ const MIN_REPLICATION_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 /// How long a transfer of `body_len` bytes is given, from the client's ordinary
 /// per-attempt timeout plus an allowance at [`MIN_REPLICATION_BYTES_PER_SEC`].
-fn replication_deadline(request_timeout: Duration, body_len: usize) -> Duration {
+///
+/// `pub(crate)` rather than private: `blobs::client` (#437) needs the identical
+/// size-aware deadline for its own single-attempt transfers, and re-deriving it
+/// there would risk the two drifting apart.
+pub(crate) fn replication_deadline(request_timeout: Duration, body_len: usize) -> Duration {
     // Milliseconds rather than whole seconds so a few-hundred-KiB entry gets a
     // proportional allowance instead of being truncated to zero.
     let allowance = (body_len as u64).saturating_mul(1_000) / MIN_REPLICATION_BYTES_PER_SEC;
