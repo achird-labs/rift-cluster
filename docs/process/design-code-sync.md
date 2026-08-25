@@ -40,7 +40,7 @@ lower — in an issue thread, a review, a session — *is not made* until it is 
 | code cites a `superseded` decision | warning | the code may still do the old thing — look |
 | an active decision is cited from no code | warning | either unbuilt, or built without saying so |
 | an active decision is pinned by no test | info | nothing would go red if it were broken |
-| a doc's code (per the index) changed after `verified_sha` | warning | the doc may now be lying |
+| a doc's code (per the index) changed after `verified_sha` **in a commit that did not touch the doc** | warning | the doc may now be lying; a commit that edited the doc and its code together is the synced case, not drift |
 | `--diff` | report | see §3 |
 
 CI runs `--strict`: errors fail, warnings are printed. Warnings are the backlog, not noise —
@@ -88,8 +88,9 @@ The PR body carries one of:
 - `Design: n/a — <why no design doc describes this change>`
 
 and `design-check.py --diff <worktree>` output is what you confirm against, not memory. Silence
-is not an option: every PR says which it is. After merge, the doc(s) you re-read get
-`--mark-verified`.
+is not an option: every PR says which it is. The doc(s) you re-read get `--mark-verified` in
+the same PR — a doc and its code changed in one commit count as verified together, so the
+mark does not go stale on merge.
 
 ## 4. Session and tool boundaries (why this exists)
 
