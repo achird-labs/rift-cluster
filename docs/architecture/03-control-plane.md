@@ -38,7 +38,7 @@ flowchart TB
     subgraph Node["each rift-cluster-server process"]
         RN["openraft node<br/>(leader OR follower/learner)"]
         SM["State machine (apply loop)"]
-        DB[("redb — cluster-state-dir<br/>raft_log · raft_vote · snapshot<br/>sm_configs · sm_tenants · sm_principals<br/>sm_bindings · sm_audit · sm_op_dedup · pending_intents")]
+        DB[("redb — cluster-state-dir<br/>raft_log · raft_vote · snapshot meta<br/>sm_configs · sm_tenants · sm_principals<br/>sm_bindings · sm_audit · sm_op_dedup · pending_intents")]
         IM["ImposterManager (OSS engine)"]
         RPC["cluster RPC (hyper + HMAC)<br/>/internal/v1/raft/append · vote · snapshot<br/>/internal/v1/blob/{digest} (PUT · GET)"]
         BLOBS[("blobs — data-dir/blobs<br/>content-addressed, node-local<br/>staging/ + refcount GC")]
@@ -70,7 +70,10 @@ flowchart TB
   status (Chapter 2), preserving "one node's local problem never stalls the
   fleet's log."
 - **Snapshots** serialize the `sm_*` tables at 5k entries / 64 MiB and truncate
-  the log. Config bodies ride in log entries (small JSON); snapshots are the
+  the log. The payload is a file at `<cluster-state-dir>/snapshot/<snapshot_id>`,
+  written temp-file → fsync → rename → fsync-dir before the redb row naming it
+  commits, so the row never points at a payload that is not already durable
+  (#436; Chapter 9). Config bodies ride in log entries (small JSON); snapshots are the
   compaction story, replacing v2's content-addressed body fetch entirely.
   The one deliberately larger payload is an OpenAPI spec (RFC-004 §4.1, #278):
   its bytes ride a `SpecPut` entry too — every node must hold *identical*

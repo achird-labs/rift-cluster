@@ -675,6 +675,67 @@ fn path_id_unknown_route_reports_the_callers_method() {
     );
 }
 
+/// The `<id>/pull` route used to carry its own copy of `path_id`'s checks, so
+/// #382's fix reached `GET`/`DELETE` and left the same hard-coded verb standing
+/// in the copy. Both routes now share one definition; this pins that the shared
+/// one still rejects everything the copy did, and still strips the action after
+/// the query string rather than before it.
+#[test]
+fn the_pull_route_validates_its_id_exactly_as_a_bare_id_does() {
+    assert_eq!(
+        super::action_path_id("POST", "src-1/pull", "/pull").expect("valid id"),
+        "src-1"
+    );
+    assert_eq!(
+        super::action_path_id("POST", "src-1/pull?force=1", "/pull")
+            .expect("the query string is not part of the action"),
+        "src-1"
+    );
+
+    for suffix in ["a/b/pull", "/pull", "src-1", "src-1/pullx", ""] {
+        let err = super::action_path_id("POST", suffix, "/pull")
+            .expect_err("names no source under the pull route");
+        assert_eq!(
+            err,
+            crate::rpc::RpcError::UnknownRoute {
+                method: "POST".into(),
+                path: format!("/admin/sources/{suffix}"),
+            },
+            "{suffix:?} must be an unknown POST route"
+        );
+    }
+
+    // `path_id` is the same function with an empty action, so the bare-id route
+    // cannot drift away from the one above.
+    assert_eq!(super::path_id("GET", "src-1").expect("valid id"), "src-1");
+}
+
+/// `pull_error` mapped `UnknownSource` onto a hard-coded `"POST"`. That was
+/// correct only because `SourcePuller::pull` is the variant's one producer
+/// today — the same latent bug #382 fixed one layer up. The caller's verb is
+/// now threaded through, so a future non-POST producer cannot silently
+/// misreport (#382 follow-up).
+#[test]
+fn pull_error_reports_the_callers_method_for_an_unknown_source() {
+    for method in ["GET", "POST", "DELETE"] {
+        assert_eq!(
+            super::pull_error(method, PullError::UnknownSource("gone".to_owned())),
+            crate::rpc::RpcError::UnknownRoute {
+                method: method.to_owned(),
+                path: "/admin/sources/gone".to_owned(),
+            },
+            "an unknown source must be reported against the verb that asked for it"
+        );
+    }
+
+    // The other arms do not name a method at all; pinned here so threading the
+    // verb through is visibly a no-op for them.
+    assert_eq!(
+        super::pull_error("DELETE", PullError::BadRequest("nope".to_owned())),
+        crate::rpc::RpcError::BadRequest("nope".to_owned())
+    );
+}
+
 /// Claims a fixed scheme list and nothing else — enough to drive the
 /// registration guards without standing up a real provider.
 #[derive(Debug)]

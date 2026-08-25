@@ -1143,7 +1143,7 @@ pub fn routes(base: Router, puller: Arc<SourcePuller>) -> Router {
         Arc::new(move |_body: Vec<u8>| -> HandlerFuture {
             let puller = Arc::clone(&list);
             Box::pin(async move {
-                let node = puller.node().map_err(pull_error)?;
+                let node = puller.node().map_err(|e| pull_error("GET", e))?;
                 let sources = node.sources(DEFAULT_TENANT).map_err(handler_error)?;
                 serde_json::to_vec(&serde_json::json!({ "sources": sources }))
                     .map_err(handler_error)
@@ -1230,13 +1230,13 @@ async fn create_source(puller: &SourcePuller, body: &[u8]) -> Result<Vec<u8>, Rp
     let (record, _op_id) = puller
         .put(TenantId::default(), body, None)
         .await
-        .map_err(pull_error)?;
+        .map_err(|e| pull_error("POST", e))?;
     serde_json::to_vec(&record).map_err(handler_error)
 }
 
 async fn read_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, RpcError> {
     let id = path_id("GET", suffix)?;
-    let node = puller.node().map_err(pull_error)?;
+    let node = puller.node().map_err(|e| pull_error("GET", e))?;
     let record = node
         .source(DEFAULT_TENANT, id)
         .map_err(handler_error)?
@@ -1261,27 +1261,19 @@ async fn delete_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, R
     let (revision, _op_id) = puller
         .delete(TenantId::default(), id, None)
         .await
-        .map_err(pull_error)?;
+        .map_err(|e| pull_error("DELETE", e))?;
     serde_json::to_vec(&serde_json::json!({ "revision": revision })).map_err(handler_error)
 }
 
 async fn pull_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, RpcError> {
-    let id = suffix
-        .split('?')
-        .next()
-        .unwrap_or_default()
-        .strip_suffix("/pull")
-        .ok_or_else(|| unknown_route("POST", suffix))?;
-    if id.is_empty() || id.contains('/') {
-        return Err(unknown_route("POST", suffix));
-    }
+    let id = action_path_id("POST", suffix, "/pull")?;
     // The cluster port's source CRUD is default-tenant throughout; widening it
     // is an operator-surface authz question of its own (RFC-005), not part of
     // widening the scheduler.
     let report = puller
         .pull(DEFAULT_TENANT, id, None)
         .await
-        .map_err(pull_error)?;
+        .map_err(|e| pull_error("POST", e))?;
     serde_json::to_vec(&report).map_err(handler_error)
 }
 
@@ -1291,7 +1283,23 @@ async fn pull_source(puller: &SourcePuller, suffix: &str) -> Result<Vec<u8>, Rpc
 /// `method` is the HTTP verb of the caller so a malformed suffix is reported as
 /// an unknown route for that verb (not hard-coded GET).
 fn path_id<'a>(method: &str, suffix: &'a str) -> Result<&'a str, RpcError> {
-    let id = suffix.split('?').next().unwrap_or_default();
+    action_path_id(method, suffix, "")
+}
+
+/// [`path_id`] for a suffix that ends in a fixed action segment — `<id>/pull`.
+///
+/// The action is stripped *after* the query string, because `<id>/pull?x=1` is
+/// a real request and the `?` does not belong to the action. What remains then
+/// faces exactly the checks a bare id does: the two routes share one definition
+/// of "names a source" rather than two copies that can drift, which is how the
+/// hard-coded `"GET"` #382 fixed in `path_id` survived here as its own copy.
+fn action_path_id<'a>(method: &str, suffix: &'a str, action: &str) -> Result<&'a str, RpcError> {
+    let id = suffix
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .strip_suffix(action)
+        .ok_or_else(|| unknown_route(method, suffix))?;
     if id.is_empty() || id.contains('/') {
         return Err(unknown_route(method, suffix));
     }
@@ -1312,9 +1320,15 @@ fn handler_error(e: impl std::fmt::Display) -> RpcError {
 /// Map a pull failure onto the transport's status classes. The distinction is
 /// the point: a `BadRequest` will fail identically on every retry, while an
 /// `Unavailable` is the cluster's problem and carries the op id to poll.
-fn pull_error(e: PullError) -> RpcError {
+///
+/// `method` is the caller's HTTP verb, for the same reason [`path_id`] takes
+/// one (#382): an `UnknownSource` becomes an unknown-route error, and only the
+/// caller knows which verb was refused. `pull` is the sole producer of that
+/// variant today — so a hard-coded `"POST"` was right by accident, and would
+/// have started lying the first time a `DELETE` or `GET` path could raise it.
+fn pull_error(method: &str, e: PullError) -> RpcError {
     match e {
-        PullError::UnknownSource(id) => unknown_route("POST", &id),
+        PullError::UnknownSource(id) => unknown_route(method, &id),
         PullError::BadRequest(detail) => RpcError::BadRequest(detail),
         // A failed fetch is the *upstream* source's fault, not this cluster's,
         // and retrying can genuinely succeed — so it is reported as a bad

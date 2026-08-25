@@ -26,8 +26,6 @@ pub use node::{
 pub use ring::{KeyClass, OwnStatus, OwnedKey, Ring};
 pub use store::{DEFAULT_AUDIT_RETENTION_SECS, PullOutcome, SourceRecord, SourceRow};
 
-use std::io::Cursor;
-
 use openraft::BasicNode;
 
 use crate::control::{ControlRequest, ControlResponse};
@@ -45,4 +43,8 @@ openraft::declare_raft_types!(
         R = ControlResponse,
         NodeId = u64,
         Node = BasicNode,
+        // The snapshot is a file beside redb, not an in-memory buffer (#436). openraft's default
+        // is `Cursor<Vec<u8>>`, which forced the whole payload through memory twice — once to
+        // build it and once to re-encode it as a JSON integer array for the redb row.
+        SnapshotData = tokio::fs::File,
 );
