@@ -2195,6 +2195,87 @@ async fn ensure_session_key(
     }
 }
 
+/// The blob an op carries, if it carries one (#438).
+///
+/// Only two ops do. Both already hold a digest that was derived from these
+/// exact bytes at mint time, so this re-uses it rather than re-hashing: a
+/// digest computed twice is two chances to disagree, and `control::validate`
+/// re-proves the record against its bytes on every replica anyway.
+fn op_blob(op: &ControlOp) -> Option<(&str, &[u8])> {
+    match op {
+        ControlOp::DatasetPut { record, csv, .. } => {
+            Some((record.digest.as_str(), csv.as_bytes()))
+        }
+        ControlOp::SpecPut { meta, document, .. } => {
+            Some((meta.digest.as_str(), document.as_bytes()))
+        }
+        _ => None,
+    }
+}
+
+/// Store this op's blob locally and fan it out to a joint-consensus quorum
+/// before it is proposed (#438).
+///
+/// Runs **after** the intent is parked and **before** submit, which is what
+/// makes a shortfall recoverable rather than lost: the parked intent replays and
+/// re-runs the fan-out, which is idempotent because `BlobTransfer::put` probes
+/// what the peer already staged and sends only the remainder.
+///
+/// `Ok` when the op carries no blob, or when a majority of both the committed
+/// and the effective configuration holds it. `Err` carries an operator-facing
+/// reason for the refusal — the caller must then leave the intent **parked** and
+/// ask for a replay.
+///
+/// The returned guard must be **held across the submit**. Until the op commits,
+/// the blob is referenced by nothing — the referencing row is exactly what is
+/// being proposed — so the pin is the only thing standing between a
+/// quorum-durable blob and the reaper. Dropping it early would reintroduce the
+/// window it exists to close.
+async fn fan_out_before_propose<'a>(
+    node: &'a RaftNode,
+    op: &ControlOp,
+) -> Result<Option<rift_cluster::blobs::BlobPin<'a>>, String> {
+    let Some((digest, bytes)) = op_blob(op) else {
+        return Ok(None);
+    };
+    let digest = rift_cluster::blobs::BlobDigest::parse(digest)
+        .map_err(|e| format!("the op carries an unusable blob digest: {e}"))?;
+
+    let (outcome, pin) = node
+        .fan_out_blob(&digest, bytes)
+        .await
+        .map_err(|e| format!("blob fan-out failed: {e}"))?;
+
+    if outcome.quorum {
+        tracing::debug!(
+            digest = digest.as_str(),
+            acks = outcome.acks.len(),
+            bytes_sent = outcome.bytes_sent,
+            joint = outcome.joint,
+            "blob fanned out to a quorum before propose"
+        );
+        return Ok(Some(pin));
+    }
+
+    // Naming the skewed peers separately matters for diagnosis: "3 nodes, 2
+    // acks, 1 cannot serve blobs" is an upgrade, while "3 nodes, 2 acks" with
+    // no skew is a partition. Collapsing them would make a half-upgraded fleet
+    // look like a network fault.
+    Err(format!(
+        "the blob reached {} of the current voters, which is not a majority of both \
+         the committed and the effective configuration{}",
+        outcome.acks.len(),
+        if outcome.skewed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({} member(s) run a build that cannot serve blobs)",
+                outcome.skewed.len()
+            )
+        }
+    ))
+}
+
 /// Render the `Set-Cookie` header for a freshly minted session token.
 ///
 /// `HttpOnly` (unreachable from `document.cookie`, so XSS cannot exfiltrate it), `Secure` (never
@@ -4409,6 +4490,19 @@ async fn run_mutation(
         tokio::spawn(async move {
             for request in background {
                 let op_id = request.op_id;
+                // #438, inside the spawned task rather than before it: the
+                // caller already holds its 202, so the fan-out must not be
+                // awaited on the request path or the async contract changes.
+                // A shortfall leaves the intent parked for the replay loop,
+                // exactly as a failed submit does below.
+                let _blob_pin = match fan_out_before_propose(&node, &request.op).await {
+                    Ok(pin) => pin,
+                    Err(reason) => {
+                        tracing::warn!(%op_id, %reason, "async blob fan-out short of quorum; intent stays parked");
+                        node.request_replay();
+                        return;
+                    }
+                };
                 match node.submit(request).await {
                     Ok(_) => {
                         if let Err(e) = node.unpark_intent(&op_id) {
@@ -4446,6 +4540,25 @@ async fn run_mutation(
     let mut last: Option<(Uuid, ControlResponse)> = None;
     for request in requests {
         let op_id = request.op_id;
+        // #438, synchronous branch: same rule as the async one above and as the
+        // tenancy seam — fan out inside the parked window, and on a shortfall
+        // refuse with the op id rather than unparking.
+        let _blob_pin = match fan_out_before_propose(node, &request.op).await {
+            Ok(pin) => pin,
+            Err(reason) => {
+                node.request_replay();
+                let mut response = typed_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorKind::Unavailable,
+                    &format!("blob not durable enough to commit (parked for replay): {reason}"),
+                );
+                response
+                    .headers_mut()
+                    .insert("retry-after", HeaderValue::from_static("1"));
+                set_header(&mut response, HEADER_OP_ID, &base.to_string());
+                return Err(response);
+            }
+        };
         let submitted = tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await;
         let response = match submitted {
             Err(_) => {
@@ -5711,6 +5824,30 @@ async fn terminate_tenancy(
             &format!("cannot durably accept the write: {e}"),
         );
     }
+
+    // #438: the bytes reach a quorum before the op that references them is
+    // proposed, so a commit implies the blob is quorum-durable — the guarantee
+    // the log itself used to provide. Deliberately inside the parked window and
+    // deliberately *not* unparked on failure: the replay loop owns the intent
+    // from here and re-runs the fan-out.
+    // Bound, not discarded: the pin has to outlive the submit below, because
+    // nothing references the blob until the op it carries commits.
+    let _blob_pin = match fan_out_before_propose(node, &request.op).await {
+        Ok(pin) => pin,
+        Err(reason) => {
+            node.request_replay();
+            let mut response = typed_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorKind::Unavailable,
+                &format!("blob not durable enough to commit (parked for replay): {reason}"),
+            );
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+            set_header(&mut response, HEADER_OP_ID, &op_id.to_string());
+            return response;
+        }
+    };
 
     let committed = match tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await {
         Err(_) => {

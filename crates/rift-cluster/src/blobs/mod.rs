@@ -166,6 +166,53 @@ pub struct BlobStore {
     /// a unique temp name. Resume needs the opposite — a stable staging name
     /// the next chunk can find — so the exclusion has to be explicit here.
     writers: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Digests a fan-out is currently in flight for, and how many fan-outs
+    /// each (#438). [`Self::gc`] treats a pinned digest as unreclaimable
+    /// however old and however unreferenced it is.
+    ///
+    /// This is the *state* #437's issue asked for where the grace window is a
+    /// *timer*. The timer alone sufficed only while nothing fanned out: a
+    /// fan-out holds a blob that is referenced by nothing — the referencing row
+    /// is exactly what gets proposed *after* the acks — so between "quorum has
+    /// it" and "the op commits" the reaper is the only thing that can take it.
+    ///
+    /// A **count**, not a set: two concurrent uploads of the same CSV share one
+    /// digest, and a set would let the first to finish clear the second's
+    /// protection. Not to be confused with the state machine's deliberately
+    /// *unmaintained* blob refcount (`spec_digest_referenced` and friends
+    /// answer that by scan) — this is process-local, in-memory, and covers only
+    /// in-flight transfers.
+    pinned: Mutex<HashMap<String, u32>>,
+}
+
+/// A live claim on a digest: while this guard exists, [`BlobStore::gc`] will
+/// not reclaim it. Released on drop.
+///
+/// A guard rather than a `pin`/`unpin` pair because the release must survive
+/// every path out of a fan-out — an early `?`, a quorum shortfall, a panic in a
+/// peer task. A forgotten `unpin` is a leak with the same shape as the bug the
+/// pin prevents, so the type makes forgetting unrepresentable.
+#[derive(Debug)]
+#[must_use = "a dropped pin releases immediately; bind it for the fan-out's lifetime"]
+pub struct BlobPin<'a> {
+    store: &'a BlobStore,
+    digest: String,
+}
+
+impl Drop for BlobPin<'_> {
+    fn drop(&mut self) {
+        let mut pinned = self
+            .store
+            .pinned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = pinned.get_mut(&self.digest) {
+            *count -= 1;
+            if *count == 0 {
+                pinned.remove(&self.digest);
+            }
+        }
+    }
 }
 
 impl BlobStore {
@@ -189,7 +236,66 @@ impl BlobStore {
         Ok(Self {
             root,
             writers: Mutex::new(HashMap::new()),
+            pinned: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Claim `digest` against [`Self::gc`] for as long as the returned guard
+    /// lives — the fan-out's protection between storing the blob and the op
+    /// that will reference it committing (#438).
+    ///
+    /// Re-entrant: concurrent fan-outs of the same digest each hold their own
+    /// pin and the blob is collectable again only when the last one drops.
+    ///
+    /// Deliberately **not** durable. Nothing in this store persists across a
+    /// restart beyond the watermark, and it does not need to: the grace window
+    /// runs from the blob's mtime rather than from process start, so a blob
+    /// written moments before a crash is still protected while the parked
+    /// intent replays and re-runs the (idempotent) fan-out. The pin covers the
+    /// in-process window precisely; the grace covers the restart gap coarsely.
+    pub fn pin(&self, digest: &BlobDigest) -> BlobPin<'_> {
+        let mut pinned = self.pinned.lock().unwrap_or_else(PoisonError::into_inner);
+        *pinned.entry(digest.as_str().to_owned()).or_insert(0) += 1;
+        drop(pinned);
+        BlobPin {
+            store: self,
+            digest: digest.as_str().to_owned(),
+        }
+    }
+
+    /// Commit `bytes` under `digest` in one call, chunking to the receiver's
+    /// cap the same way a transfer would.
+    ///
+    /// The accepting node's own copy in a fan-out (#438): it already holds the
+    /// whole payload in memory, so it does not need the resumable path — but it
+    /// must land in exactly the same committed state a peer's transfer produces,
+    /// including the digest verification `write_chunk` does on completion.
+    ///
+    /// # Errors
+    ///
+    /// Any [`BlobError`] the underlying chunk writes fail with — including a
+    /// mismatch when `bytes` does not hash to `digest`.
+    pub fn store_whole(&self, digest: &BlobDigest, bytes: &[u8]) -> Result<(), BlobError> {
+        let total = bytes.len() as u64;
+        if total == 0 {
+            // A zero-length blob has no chunks to iterate, but it is still a
+            // real blob that must end up committed (edge 7).
+            self.write_chunk(digest, 0, &[], 0)?;
+            return Ok(());
+        }
+        let mut offset = 0_u64;
+        for chunk in bytes.chunks(BLOB_CHUNK_MAX_BYTES) {
+            offset = self.write_chunk(digest, offset, chunk, total)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a fan-out currently holds `digest`.
+    fn is_pinned(&self, digest: &str) -> bool {
+        self.pinned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(digest)
     }
 
     /// The write lock for `digest`, creating it if this is the first writer.
@@ -484,6 +590,15 @@ impl BlobStore {
                 continue;
             };
             if referenced.contains(digest.as_str()) {
+                continue;
+            }
+            // A fan-out in flight holds a blob nothing references yet — the
+            // referencing row is what gets proposed once the acks are in. The
+            // grace window cannot be relied on for this: it is measured from
+            // the blob's mtime, so a fan-out slower than the grace, or a resumed
+            // one whose bytes were staged an hour ago, would be reaped mid-flight
+            // (#438).
+            if self.is_pinned(digest.as_str()) {
                 continue;
             }
             let mtime_secs = mtime_secs(&entry, now_secs)?;
@@ -1031,6 +1146,97 @@ mod tests {
                 .expect("stat")
                 .have
         );
+    }
+
+    // ---- pins (#438): GC must not reap a blob mid-fan-out ----------------
+
+    #[test]
+    fn gc_keeps_a_pinned_blob_that_is_unreferenced_and_past_its_grace() {
+        // The pin's whole reason to exist. `gc_keeps_an_unreferenced_blob_that_is
+        // _still_inside_the_grace_window` covers the *timer*; this covers the
+        // *state*. Deliberately set up so the grace CANNOT be what saves the
+        // blob — `now + 10_000_000` puts it far past any window — so the only
+        // thing standing between it and the reaper is the pin.
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        let _pin = store.pin(&d);
+        let removed = store
+            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+            .expect("gc");
+
+        assert_eq!(removed, 0);
+        assert!(store.stat(&d).expect("stat").have);
+    }
+
+    #[test]
+    fn dropping_the_pin_makes_the_blob_collectable_again() {
+        // The other half: a pin that never released would be a leak with the
+        // same shape as the bug it prevents, so the release path is its own
+        // assertion rather than an assumed consequence of `Drop`.
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        {
+            let _pin = store.pin(&d);
+        }
+        let removed = store
+            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+            .expect("gc");
+
+        assert_eq!(removed, 1);
+        assert!(!store.stat(&d).expect("stat").have);
+    }
+
+    #[test]
+    fn a_digest_pinned_twice_stays_pinned_until_both_pins_drop() {
+        // Edge 1: two concurrent PUTs of the same CSV. A set-valued pin would
+        // let the first release drop the second's protection — the reaper then
+        // deletes a blob a live fan-out is still counting acks for. Hence a
+        // count, and hence this test asserts the *intermediate* state, which is
+        // the only place the set-vs-count distinction is observable.
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        let first = store.pin(&d);
+        let second = store.pin(&d);
+
+        drop(first);
+        let removed = store
+            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+            .expect("gc");
+        assert_eq!(removed, 0, "one release must not clear the other's pin");
+        assert!(store.stat(&d).expect("stat").have);
+
+        drop(second);
+        let removed = store
+            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+            .expect("gc");
+        assert_eq!(removed, 1, "the last release makes it collectable");
+    }
+
+    #[test]
+    fn a_pin_does_not_protect_a_different_digest() {
+        // Guards against a pin implemented as a global "GC is paused" flag,
+        // which would pass all three tests above while reclaiming nothing at
+        // all during any fan-out.
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        put_whole(&store, HELLO_WORLD_DIGEST, b"hello world");
+        let pinned = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+        let other = BlobDigest::parse(HELLO_WORLD_DIGEST).expect("digest");
+
+        let _pin = store.pin(&pinned);
+        let removed = store
+            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+            .expect("gc");
+
+        assert_eq!(removed, 1);
+        assert!(store.stat(&pinned).expect("stat").have);
+        assert!(!store.stat(&other).expect("stat").have);
     }
 
     #[test]

@@ -170,6 +170,31 @@ at the owner, not assumed at the caller.
   the serving path and never a condition for apply. D-12 covers flow state, not
   the blob store.
 
+  The store itself replicates nothing — two nodes holding different blob sets is
+  normal, not divergence. Completeness is established by the **write path**
+  (rift-cluster#438): the accepting node stores the blob, fans it out to the
+  members, and proposes the referencing op only once a quorum acknowledges the
+  digest, so a commit implies quorum-durability — the guarantee the log itself
+  provided while the bytes were still on it.
+
+- **D-19** — That quorum is **joint consensus**: a majority of *both* the
+  committed and the effective voter configuration, read in a single
+  `with_raft_state` closure so the pair cannot be assembled from two membership
+  epochs. Neither set alone is sound. A cluster growing 3→5 with the new config
+  uncommitted has a committed majority of 2, which would commit an op whose blob
+  is on 2 of the 5 nodes now in force; and effective membership can carry an
+  uncommitted entry from a deposed leader that later truncates, so an effective
+  majority can be a majority of a configuration that does not survive.
+
+  This is load-bearing beyond the write path. A majority of both configurations
+  is a set no single membership change can empty, which is precisely the
+  precondition rift-cluster#439's fetch-on-apply needs in order to find a holder
+  at all: fix the quorum rule and the residual window between the fan-out and the
+  commit stops mattering; leave it committed-only and no amount of fetch-on-apply
+  recovers it. An ack from a node outside a configuration does not count toward
+  that configuration, and a member whose build cannot serve blobs at all counts
+  toward neither — it never answered the question.
+
 ## Implementation
 
 The complete, implementation-ready specification — openraft type config, the redb

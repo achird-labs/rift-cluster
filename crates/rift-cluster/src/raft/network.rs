@@ -1271,6 +1271,98 @@ async fn committed_voters(
     .map_err(|e| RpcError::Handler(format!("admit {id}: reading committed membership: {e}")))
 }
 
+/// The two voter sets a blob fan-out must satisfy a majority of *both* of
+/// (#438): the committed configuration and the effective one.
+///
+/// Neither alone is sound, which is why this is a pair rather than a choice:
+///
+/// - **committed only** — a cluster growing 3→5 with the new config still
+///   uncommitted has a committed majority of 2. The op commits, the membership
+///   commits after it, and the blob is on 2 of 5: not a majority of the
+///   configuration now in force.
+/// - **effective only** — effective membership can carry an uncommitted entry
+///   from a deposed leader that later truncates (the hazard
+///   [`committed_voters`] documents). If the truncated config had *removed*
+///   nodes, the majority fanned to may not be a majority of the config that
+///   survives.
+///
+/// A majority of both is the joint-consensus rule Raft itself requires while a
+/// joint configuration is in flight, and it is what makes the set of holders
+/// one that no single membership change can empty — the precondition #439's
+/// fetch-on-apply depends on. Fix this rule and the residual propose-window
+/// stops mattering; leave it committed-only and no amount of fetch-on-apply
+/// recovers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuorumTargets {
+    committed: BTreeSet<NodeId>,
+    effective: BTreeSet<NodeId>,
+}
+
+impl QuorumTargets {
+    #[cfg(test)]
+    pub(crate) fn new(committed: BTreeSet<NodeId>, effective: BTreeSet<NodeId>) -> Self {
+        Self {
+            committed,
+            effective,
+        }
+    }
+
+    /// Every node worth sending to: the union, since a node in either
+    /// configuration can count toward that configuration's majority.
+    pub(crate) fn members(&self) -> BTreeSet<NodeId> {
+        self.committed.union(&self.effective).copied().collect()
+    }
+
+    /// Whether `acks` carries a majority of **both** configurations.
+    pub(crate) fn satisfied_by(&self, acks: &BTreeSet<NodeId>) -> bool {
+        majority_of(&self.committed, acks) && majority_of(&self.effective, acks)
+    }
+
+    /// Whether the two configurations differ — i.e. a membership change is in
+    /// flight and the second majority is doing real work.
+    pub(crate) fn is_joint(&self) -> bool {
+        self.committed != self.effective
+    }
+}
+
+/// Whether `acks` contains a strict majority of `config`.
+///
+/// Acks from nodes outside `config` are ignored rather than counted: a learner
+/// or a departing node holding the blob is not evidence about *this*
+/// configuration's durability.
+///
+/// An **empty** configuration is not satisfied. A real cluster always has at
+/// least one voter, so empty means the membership has not loaded yet — the
+/// question cannot be answered, and this decides whether a write is durable
+/// enough to commit. Answering "yes" to a question that could not be evaluated
+/// is the one direction that is unrecoverable, so the unknown case takes the
+/// refusing branch.
+fn majority_of(config: &BTreeSet<NodeId>, acks: &BTreeSet<NodeId>) -> bool {
+    if config.is_empty() {
+        return false;
+    }
+    let held = config.intersection(acks).count();
+    held * 2 > config.len()
+}
+
+/// Read both voter sets in **one** `with_raft_state` closure (#438).
+///
+/// One read, not two: separate reads can observe different membership epochs,
+/// and a "joint" pair assembled from two epochs describes a configuration that
+/// never existed — the precise failure the joint rule exists to prevent.
+///
+/// # Errors
+///
+/// [`RpcError::Handler`] if the RaftCore loop cannot be reached to answer.
+pub(crate) async fn joint_voters(raft: &Raft<TypeConfig>) -> Result<QuorumTargets, RpcError> {
+    raft.with_raft_state(|state| QuorumTargets {
+        committed: state.membership_state.committed().voter_ids().collect(),
+        effective: state.membership_state.effective().voter_ids().collect(),
+    })
+    .await
+    .map_err(|e| RpcError::Handler(format!("reading membership for blob fan-out: {e}")))
+}
+
 /// Leader-side: demote `node_id` from voter to learner if it currently is one
 /// — the first half of a graceful departure (issue #6), the second being
 /// [`remove_member`]. A no-op if `node_id` is not currently a voter, so a
@@ -1532,6 +1624,113 @@ mod tests {
 
     fn log_id(index: u64) -> LogId<NodeId> {
         LogId::new(CommittedLeaderId::new(1, 0), index)
+    }
+
+    // ---- joint-consensus quorum (#438) ----------------------------------
+    //
+    // The rule the maintainer ruled on, and the one piece of #438 that can be
+    // checked without a cluster. Every expectation below is a literal: a
+    // three-node majority is 2 because 2 is written here, never because the
+    // implementation says so.
+
+    fn ids(ids: &[NodeId]) -> BTreeSet<NodeId> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_stable_configuration_needs_a_simple_majority() {
+        let targets = QuorumTargets::new(ids(&[1, 2, 3]), ids(&[1, 2, 3]));
+
+        assert!(!targets.is_joint());
+        assert!(!targets.satisfied_by(&ids(&[1])), "1 of 3 is not a majority");
+        assert!(targets.satisfied_by(&ids(&[1, 2])), "2 of 3 is");
+        assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
+    }
+
+    #[test]
+    fn growing_three_to_five_is_not_satisfied_by_the_committed_majority_alone() {
+        // The case that makes committed-only unsound, and the concrete reason
+        // this is a pair rather than a choice. Committed is {1,2,3} and its
+        // majority is 2; effective is {1..5} and needs 3. Acking {1,2} would
+        // commit the op with the blob on 2 of the 5 nodes now in force.
+        let targets = QuorumTargets::new(ids(&[1, 2, 3]), ids(&[1, 2, 3, 4, 5]));
+
+        assert!(targets.is_joint());
+        assert!(
+            !targets.satisfied_by(&ids(&[1, 2])),
+            "a committed majority alone must not pass while the config is growing"
+        );
+        assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
+    }
+
+    #[test]
+    fn shrinking_five_to_three_is_not_satisfied_by_the_effective_majority_alone() {
+        // The mirror case, which is what makes effective-only unsound: the
+        // effective entry can truncate under a deposed leader. Effective
+        // {1,2,3} needs 2; committed {1..5} needs 3, so {1,2} must fail.
+        let targets = QuorumTargets::new(ids(&[1, 2, 3, 4, 5]), ids(&[1, 2, 3]));
+
+        assert!(targets.is_joint());
+        assert!(
+            !targets.satisfied_by(&ids(&[1, 2])),
+            "an effective majority alone must not pass while the config is shrinking"
+        );
+        assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
+    }
+
+    #[test]
+    fn an_ack_from_outside_the_configuration_does_not_count() {
+        // Edge 2: the accepting node adds itself to the acks unconditionally
+        // because it has just stored the blob. When it is a learner rather than
+        // a voter, that ack must be ignored — a non-voter holding the blob says
+        // nothing about this configuration's durability. The intersection is
+        // what makes the learner case fall out rather than need its own branch.
+        let targets = QuorumTargets::new(ids(&[1, 2, 3]), ids(&[1, 2, 3]));
+
+        assert!(
+            !targets.satisfied_by(&ids(&[1, 99])),
+            "node 99 is not a voter; 1 of 3 is still not a majority"
+        );
+        assert!(targets.satisfied_by(&ids(&[1, 2, 99])));
+    }
+
+    #[test]
+    fn a_single_node_configuration_is_satisfied_by_itself() {
+        // Edge 3: the solo case must not dial anyone or wait for anyone.
+        let targets = QuorumTargets::new(ids(&[7]), ids(&[7]));
+
+        assert!(targets.satisfied_by(&ids(&[7])));
+        assert!(!targets.satisfied_by(&ids(&[])));
+    }
+
+    #[test]
+    fn members_is_the_union_so_a_node_in_either_configuration_is_dialled() {
+        // Fanning out to only one configuration's members would make the other
+        // majority unreachable by construction.
+        let targets = QuorumTargets::new(ids(&[1, 2, 3]), ids(&[3, 4, 5]));
+
+        assert_eq!(targets.members(), ids(&[1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn an_unloaded_membership_is_never_a_quorum() {
+        // Empty means the membership has not loaded, not that the bar is zero.
+        // This decides whether a write is durable enough to commit, so the
+        // unanswerable case refuses rather than waves through.
+        let targets = QuorumTargets::new(ids(&[]), ids(&[]));
+
+        assert!(!targets.satisfied_by(&ids(&[])));
+        assert!(!targets.satisfied_by(&ids(&[1, 2, 3])));
+    }
+
+    #[test]
+    fn a_four_node_configuration_needs_three_not_two() {
+        // An even configuration is where an off-by-one in the majority rule
+        // hides: `held * 2 > len` gives 3, while `>=` would wrongly accept 2.
+        let targets = QuorumTargets::new(ids(&[1, 2, 3, 4]), ids(&[1, 2, 3, 4]));
+
+        assert!(!targets.satisfied_by(&ids(&[1, 2])), "2 of 4 is a tie, not a majority");
+        assert!(targets.satisfied_by(&ids(&[1, 2, 3])));
     }
 
     /// The retry decision must read openraft's typed error, not its rendered
