@@ -7,6 +7,7 @@
 | **Supersedes** | RFC-001 v2 decisions D-1 (no consensus layer) and D-2 (chitchat gossip); rewrites §7.1, §7.2, §7.4 |
 | **Tracking** | [rift-cluster#14](https://github.com/achird-labs/rift-cluster/issues/14); implementation across [#6](https://github.com/achird-labs/rift-cluster/issues/6), [#7](https://github.com/achird-labs/rift-cluster/issues/7), [#9](https://github.com/achird-labs/rift-cluster/issues/9) |
 | **Depends on** | `openraft` 0.9.x, `redb` 4.x (both verified 2026-07-21) |
+| **Amended** | 2026-08-24, [#436](https://github.com/achird-labs/rift-cluster/issues/436): the snapshot *payload* no longer lives in redb. The decision below stands for the log, the vote and the snapshot's metadata; only where the payload bytes are written changed. |
 
 ## Context
 
@@ -48,8 +49,8 @@ service.
 Adopt an **embedded Raft group** — [`openraft`](https://docs.rs/openraft), in
 process, over the existing HMAC-authenticated cluster port — as the control plane
 for **membership, imposter configs, the `enabled` bit, tenancy/RBAC records, and
-the admin intent log**. Persist the Raft log, vote, and snapshots — and the
-durable flow-state tier of #16 — in an embedded ACID store,
+the admin intent log**. Persist the Raft log, vote, and snapshot metadata — and
+the durable flow-state tier of #16 — in an embedded ACID store,
 [`redb`](https://docs.rs/redb). Both are pure Rust and safe for the static-musl /
 `FROM scratch` builds; neither is a service.
 
@@ -146,9 +147,11 @@ at the owner, not assumed at the caller.
 
 - **D-15** — Embedded Raft (`openraft`) control plane over gossip. Supersedes D-1,
   D-2.
-- **D-16** — `redb` for all cluster durability (log/vote/snapshot + flow WAL).
-  `sled` rejected (maintenance); `fjall` kept as the LSM fallback if write
-  amplification bites.
+- **D-16** — `redb` for all cluster durability (log/vote/snapshot metadata +
+  flow WAL). `sled` rejected (maintenance); `fjall` kept as the LSM fallback if
+  write amplification bites. **Amended by #436:** the snapshot payload is a file
+  beside redb, not a row in it — a payload inlined as a redb value was ~3.7x the
+  bytes it carried and was read whole on every send.
 - **D-17** — Flow state stays off consensus (HRW + WAL); ownership derived from
   committed membership.
 
