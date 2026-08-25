@@ -753,6 +753,13 @@ becomes the §7.6 503, never a silent wrong match. OSS behavior is unchanged in 
 > `GET /internal/v1/config/{port}/{digest}` fetch along with the digest-gossip mechanism it
 > served. Retained for context, like §7.1/§7.2/§7.4. The KV, sequence, proxy and journal
 > rows are unaffected — they are data-plane, which stays off consensus.
+>
+> **Content-addressed fetch returns as `/internal/v1/blob/{digest}` (#437, epic #432).** Not a
+> reinstatement of the deleted config row: that one served digest-gossip for per-port config,
+> which ADR-001 replaced with consensus. This one is the sideloading transport for payloads that
+> should never have been *on* the log — spec documents and dataset CSVs — and it is chunked,
+> resumable and refcount-GC'd rather than a plain cacheable GET. It is also the one route here
+> whose `GET` body is **not** JSON: a blob chunk is raw bytes.
 
 Hyper (already a dependency) over TCP on the cluster port. All bodies JSON; all requests
 carry `X-Rift-Cluster-Auth` (§11.2), `X-Rift-Cluster-Epoch`, and the sender's proto

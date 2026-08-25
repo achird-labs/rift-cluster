@@ -40,7 +40,8 @@ flowchart TB
         SM["State machine (apply loop)"]
         DB[("redb — cluster-state-dir<br/>raft_log · raft_vote · snapshot meta<br/>sm_configs · sm_tenants · sm_principals<br/>sm_bindings · sm_audit · sm_op_dedup · pending_intents")]
         IM["ImposterManager (OSS engine)"]
-        RPC["cluster RPC (hyper + HMAC)<br/>/internal/v1/raft/append · vote · snapshot"]
+        RPC["cluster RPC (hyper + HMAC)<br/>/internal/v1/raft/append · vote · snapshot<br/>/internal/v1/blob/{digest} (PUT · GET)"]
+        BLOBS[("blobs — data-dir/blobs<br/>content-addressed, node-local<br/>staging/ + refcount GC")]
     end
 
     RN -- "append entries (fsync'd)" --> DB
@@ -48,6 +49,7 @@ flowchart TB
     SM -- "sm_* updates" --> DB
     SM -- "apply_config / set_enabled" --> IM
     RN <-- "to peers" --> RPC
+    RPC -- "resumable blob transfer" --> BLOBS
 ```
 
 - **Log and vote storage** commit with `redb`'s `Durability::Immediate` —
@@ -86,6 +88,24 @@ flowchart TB
   log order alone puts the file on every node before any config that names
   it. The file is derived state — rebuilt from `sm_dataset_blobs` on restart,
   never fetched from a peer.
+- **Blob transfer store** (#437, epic #432) — `<data-dir>/blobs/<digest>`, a
+  per-node content-addressed store fed by `PUT`/`GET /internal/v1/blob/{digest}`
+  over the same signed cluster port as the Raft routes. Writes are chunked and
+  resumable, verified against the digest before an atomic rename makes them
+  visible, and reclaimed by a grace-windowed sweep over what the applied state
+  still references. The store itself **replicates nothing** — it has no mechanism
+  of its own for putting a blob on another node, so as of #437 two nodes holding
+  different blob sets is expected rather than divergence, and nothing routes
+  through it at all.
+
+  That is not in tension with **ADR-001 D-18** ("every member holds every live
+  blob"): D-18 describes where the epic lands, and the completeness it asserts is
+  established by #438 fanning a blob to a quorum *before* the op is proposed and
+  #439 fetching on apply — by the write path, never by the store. Until those
+  land, D-18 is a statement of intent about this subsystem rather than a property
+  it has. #441 revises the surrounding text once the bytes actually leave the log,
+  at which point this section's "its bytes ride a `SpecPut` entry" stops being
+  true.
 
 ## Membership lifecycle
 

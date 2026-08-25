@@ -78,6 +78,14 @@ const ELECTION_TIMEOUT_MAX_MS: u64 = 300;
 /// isolated (the isolated-owner rule, RFC-001 §7.2): 3× the election timeout.
 const ISOLATION_WINDOW_MS: u64 = 3 * ELECTION_TIMEOUT_MAX_MS;
 
+/// Grace window #437's blob store GC gives an unreferenced blob before reclaiming it —
+/// long enough that a #438 fan-out has time to land the spec/dataset row that will
+/// reference a freshly delivered blob before it looks abandoned.
+const BLOB_GC_GRACE_SECS: u64 = 3600;
+
+/// How often the blob store's GC sweep runs.
+const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How long [`RaftNode::leave`] waits between polls while chasing a leader
 /// hint that is moving (a demote just committed but the new leader has not
 /// settled, or metrics have not caught up yet). Small relative to typical
@@ -162,7 +170,8 @@ impl std::fmt::Debug for NodeConfig {
 /// than reproduced as a variant per RPC.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
-    /// Opening or using the redb-backed Raft store failed.
+    /// Opening or using this node's local storage failed — the redb-backed
+    /// Raft store, or the node-local blob transfer store (#437).
     #[error("raft storage: {0}")]
     Storage(String),
 
@@ -305,6 +314,14 @@ pub struct RaftNode {
     // The cluster server accept loop. Aborted on shutdown/drop so the listener is
     // released with the node.
     server_task: JoinHandle<()>,
+    // This node's blob transfer store (#437): node-local, not part of the state
+    // machine. `blobs()` exposes it read-write to whatever composes routes on
+    // top of it; #438/#439 are the first such callers.
+    blobs: Arc<crate::blobs::BlobStore>,
+    // Periodic GC sweep over `blobs`. Aborted on shutdown/drop, same as
+    // `server_task` — nothing about it needs the graceful-drain treatment
+    // `spawn_promotion_loop` gets, since it touches no Raft state.
+    gc_task: JoinHandle<()>,
     // Whether shutdown() was ever invoked, so Drop can warn when a node is
     // dropped without the shutdown-then-drop contract — storage release is only
     // guaranteed through shutdown() (see Drop).
@@ -431,6 +448,69 @@ impl RaftNode {
         });
     }
 
+    /// Periodic GC sweep over `store` (#437): every [`BLOB_GC_INTERVAL`], compute what this
+    /// node's own applied state still references and reclaim what `store` holds that is both
+    /// unreferenced and past [`BLOB_GC_GRACE_SECS`].
+    ///
+    /// A `referenced_digests` scan failure is propagated with `?` inside the blocking task and
+    /// the sweep is skipped, never treated as an empty set — an empty set would read as "nothing
+    /// is referenced" and delete the whole store on what might be a transient read error. Runs in
+    /// `spawn_blocking`: both the redb scan and the store's directory walk are synchronous, plain
+    /// I/O, and holding a runtime worker for either is the stall #444 is open against for
+    /// snapshot building.
+    fn spawn_blob_gc_loop(
+        store: Arc<crate::blobs::BlobStore>,
+        sm_reader: RedbStateMachine,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            // Starts one interval in, not immediately: `interval` yields its
+            // first tick at once, which would sweep before this node has
+            // applied anything on a restart — computing "what is referenced"
+            // from state that has not caught up yet.
+            let mut tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + BLOB_GC_INTERVAL,
+                BLOB_GC_INTERVAL,
+            );
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let store = Arc::clone(&store);
+                let sm_reader = sm_reader.clone();
+                let outcome = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+                    let referenced = sm_reader.referenced_digests().map_err(|e| e.to_string())?;
+                    // `0` is the safe direction for *now* (unlike for a
+                    // file's mtime, where it means "infinitely old" — see
+                    // `blobs::mtime_secs`): it makes `now - mtime` saturate to
+                    // zero, which never clears the grace, so a clock this
+                    // broken reclaims nothing rather than everything.
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    store
+                        .gc(&referenced, now_secs, BLOB_GC_GRACE_SECS)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+                match outcome {
+                    Ok(Ok(removed)) if removed > 0 => {
+                        tracing::debug!(removed, "blob store gc swept");
+                    }
+                    Ok(Ok(_)) => {}
+                    // Not `debug!`: a sweep that keeps failing means the blob
+                    // store grows without bound, and the only other symptom is
+                    // a disk filling up. At the default level that is invisible
+                    // — which would make `GcWatermark`, added to answer "is GC
+                    // even running", unable to answer it.
+                    Ok(Err(e)) => tracing::warn!(error = %e, "blob store gc sweep skipped"),
+                    // A `JoinError` here is a panic inside `spawn_blocking`:
+                    // a defect of ours, never an environmental condition.
+                    Err(e) => tracing::error!(error = %e, "blob store gc task panicked"),
+                }
+            }
+        })
+    }
+
     async fn hold_elections_until_leader_heard(raft: &Raft<TypeConfig>) -> Result<(), NodeError> {
         let has_state = raft
             .is_initialized()
@@ -531,6 +611,13 @@ impl RaftNode {
         let state_machine = state_machine.with_spool_dir(config.data_dir.join("datasets"));
         let sm_reader = state_machine.clone();
 
+        // Blob transfer store (#437): node-local, off the redb file, beside the dataset spool
+        // dir this state machine already writes under the same data directory.
+        let blob_store = Arc::new(
+            crate::blobs::BlobStore::open(config.data_dir.join("blobs"))
+                .map_err(|e| NodeError::Storage(format!("blob store: {e}")))?,
+        );
+
         let raft_config = Arc::new(Self::raft_config(config.snapshot_log_entries)?);
 
         // The handlers need the Raft, which needs the bound server address, which
@@ -550,6 +637,7 @@ impl RaftNode {
             Arc::clone(&membership_gate),
             Arc::clone(&auto_voter_ceiling),
         );
+        let router = crate::blobs::routes::blob_routes(router, Arc::clone(&blob_store));
 
         let (signer, verifier) = match &config.secret {
             Some(secret) => (
@@ -622,6 +710,7 @@ impl RaftNode {
         Self::spawn_promotion_loop(&slot, &membership_gate, &auto_voter_ceiling);
 
         let server_task = tokio::spawn(server.serve());
+        let gc_task = Self::spawn_blob_gc_loop(Arc::clone(&blob_store), sm_reader.clone());
 
         Ok(Self {
             id: config.node_id,
@@ -631,6 +720,8 @@ impl RaftNode {
             resolver,
             sm_reader,
             server_task,
+            blobs: blob_store,
+            gc_task,
             shutdown_invoked: AtomicBool::new(false),
             last_leave_error: Mutex::new(None),
             membership_gate,
@@ -660,6 +751,12 @@ impl RaftNode {
     #[must_use]
     pub fn advertise(&self) -> &Authority {
         &self.advertise
+    }
+
+    /// This node's blob transfer store (#437).
+    #[must_use]
+    pub fn blobs(&self) -> &Arc<crate::blobs::BlobStore> {
+        &self.blobs
     }
 
     /// Whether this node's log already carries a cluster membership — i.e. it
@@ -2054,6 +2151,7 @@ impl RaftNode {
         // start on this address fails with a misleading bind error that hides the
         // real cause.
         self.server_task.abort();
+        self.gc_task.abort();
         while !self.server_task.is_finished() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -2198,6 +2296,7 @@ impl Drop for RaftNode {
     /// log line, not a panic (Drop can run mid-unwind).
     fn drop(&mut self) {
         self.server_task.abort();
+        self.gc_task.abort();
         if !self.shutdown_invoked.load(Ordering::Relaxed) {
             tracing::warn!(
                 node_id = self.id,

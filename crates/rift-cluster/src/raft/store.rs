@@ -54,7 +54,7 @@
 //! fatal to the node, and that is the correct severity for a log that can no
 //! longer be applied.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -4206,6 +4206,70 @@ impl RedbStateMachine {
         Ok(false)
     }
 
+    /// The union of every digest a live `sm_specs` or `sm_datasets` row still names (RFC-004 S2 /
+    /// RFC-005 D1) — what the per-node blob transfer store's GC (#437) is allowed to reclaim
+    /// around. A different question from [`Self::spec_digest_referenced`] and
+    /// [`Self::dataset_digest_referenced`]: those gate the state machine's own replicated blob
+    /// tables (`sm_spec_blobs`, the spooled dataset CSVs), which every replica agrees on. The blob
+    /// transfer store (`blobs::BlobStore`) is node-local and unreplicated — nothing about it
+    /// enters the state machine — so its GC needs its own, independently computed answer to "what
+    /// does *this node's* applied state still point at", read straight off the tables.
+    ///
+    /// Read-only, no Raft round trip, the same shape as [`Self::specs`]/[`Self::sources`]: a row
+    /// that will not parse fails the whole scan rather than being silently dropped from the set.
+    /// Dropping it would read as "nothing references this digest" and let the sweep reclaim a
+    /// blob a live (if corrupt) row still names — the same conservatism
+    /// [`Self::dataset_digest_referenced`] applies per-row (a row that will not parse is treated
+    /// as still referencing whatever digest is being asked about), generalised to a whole-table
+    /// union: there is no single digest here to spare, so the entire scan fails instead of
+    /// guessing which one to protect. The caller (`RaftNode`'s GC tick) is required to propagate
+    /// this with `?` and skip that sweep, never to substitute an empty set.
+    #[allow(clippy::result_large_err)]
+    pub fn referenced_digests(&self) -> StorageResult<HashSet<String>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+
+        let mut digests = HashSet::new();
+
+        let specs = read_txn
+            .open_table(SM_SPECS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        for item in specs
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (_, id) = key.value();
+            let stored: StoredSpec = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(spec_id = %id, error = %e, "corrupt stored spec");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            digests.insert(stored.meta.digest.as_str().to_owned());
+        }
+
+        let datasets = read_txn
+            .open_table(SM_DATASETS_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        for item in datasets
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let (tenant, name, version) = key.value();
+            let stored: StoredDataset = serde_json::from_str(value.value()).map_err(|e| {
+                tracing::error!(tenant, name, version, error = %e, "corrupt stored dataset");
+                StorageError::from(StorageIOError::read_state_machine(&e))
+            })?;
+            if !stored.deleted {
+                digests.insert(stored.record.digest.as_str().to_owned());
+            }
+        }
+
+        Ok(digests)
+    }
+
     /// Every port of `tenant` whose applied config binds a stub response to dataset `name`
     /// (RFC-005 §3.3, #285) — what `DatasetDelete` refuses against. The binding lives in a
     /// response's `_rift.dataset.name` extension (D2 compiles it into the engine's lookup
@@ -7265,8 +7329,8 @@ mod tests {
 
     use super::{
         DEDUP_TTL_SECS, DatasetSummary, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine,
-        SM_CONFIGS_TABLE, SM_DEDUP_TABLE, SM_TENANTS_TABLE, SourceRecord, SourceRow, SpecRecord,
-        StoredImposter, new,
+        SM_CONFIGS_TABLE, SM_DATASETS_TABLE, SM_DEDUP_TABLE, SM_SPECS_TABLE, SM_TENANTS_TABLE,
+        SourceRecord, SourceRow, SpecRecord, StoredDataset, StoredImposter, StoredSpec, new,
     };
     use crate::control::{
         AUDIT_RESOURCE_ALL, AuditRow, AuthSource, ControlOp, ControlOutcome, ControlRequest,
@@ -7305,6 +7369,138 @@ mod tests {
     }
 
     // -- issue #9 state-machine gate ------------------------------------------
+
+    /// Write one `sm_specs` row directly, so a test can build an exact reference
+    /// set (including a deliberately corrupt row) without driving apply.
+    fn seed_spec(sm: &RedbStateMachine, tenant: &str, id: &str, value: &str) {
+        let txn = sm.db.begin_write().expect("begin write");
+        {
+            let mut t = txn.open_table(SM_SPECS_TABLE).expect("open sm_specs");
+            t.insert((tenant, id), value).expect("insert spec");
+        }
+        txn.commit().expect("commit");
+    }
+
+    fn seed_dataset(sm: &RedbStateMachine, tenant: &str, name: &str, version: u64, value: &str) {
+        let txn = sm.db.begin_write().expect("begin write");
+        {
+            let mut t = txn.open_table(SM_DATASETS_TABLE).expect("open sm_datasets");
+            t.insert((tenant, name, version), value)
+                .expect("insert dataset");
+        }
+        txn.commit().expect("commit");
+    }
+
+    fn spec_json(digest: &str) -> String {
+        serde_json::to_string(&StoredSpec {
+            meta: SpecMeta {
+                format: SpecFormat::Json,
+                digest: Digest::new(digest.to_owned()),
+                source: SpecSource::Inline,
+            },
+            revision: 1,
+        })
+        .expect("encode spec")
+    }
+
+    fn dataset_json(name: &str, digest: &str, deleted: bool) -> String {
+        serde_json::to_string(&StoredDataset {
+            record: DatasetRecord {
+                name: name.to_owned(),
+                digest: Digest::new(digest.to_owned()),
+                key_columns: vec!["id".to_owned()],
+                delimiter: ',',
+                columns: vec!["id".to_owned()],
+                rows: 1,
+                bytes: 4,
+            },
+            version: 1,
+            created_at_secs: 0,
+            revision: 1,
+            deleted,
+        })
+        .expect("encode dataset")
+    }
+
+    /// #437: what the blob GC actually asks in production. Every `BlobStore::gc`
+    /// unit test passes a hand-built set, so without this nothing proves the
+    /// real answer is right — and a wrong one here reclaims a referenced blob,
+    /// which costs the dataset rather than the disk.
+    #[tokio::test]
+    async fn referenced_digests_unions_specs_and_live_datasets_only() {
+        let (_td, sm) = fresh_sm(None).await;
+        let spec_digest = "a".repeat(64);
+        let live_digest = "b".repeat(64);
+        let shared_digest = "c".repeat(64);
+        let deleted_digest = "d".repeat(64);
+
+        seed_spec(&sm, "acme", "s1", &spec_json(&spec_digest));
+        // The same digest named by both a spec and a dataset must appear once.
+        seed_spec(&sm, "acme", "s2", &spec_json(&shared_digest));
+        seed_dataset(
+            &sm,
+            "acme",
+            "shared",
+            1,
+            &dataset_json("shared", &shared_digest, false),
+        );
+        seed_dataset(
+            &sm,
+            "acme",
+            "live",
+            1,
+            &dataset_json("live", &live_digest, false),
+        );
+        // A tombstoned version no longer entitles its digest to a file.
+        seed_dataset(
+            &sm,
+            "acme",
+            "gone",
+            1,
+            &dataset_json("gone", &deleted_digest, true),
+        );
+
+        let referenced = sm.referenced_digests().expect("scan");
+
+        let expected: std::collections::HashSet<String> = [spec_digest, live_digest, shared_digest]
+            .into_iter()
+            .collect();
+        assert_eq!(referenced, expected);
+    }
+
+    /// #437 edge 15. A scan that cannot read a row must FAIL, not quietly drop
+    /// it: the caller reclaims everything the returned set does not mention, so
+    /// a dropped row is a deleted blob. Fail-closed, like
+    /// `dataset_digest_referenced`'s own unparseable-row rule.
+    #[tokio::test]
+    async fn referenced_digests_fails_closed_on_a_row_it_cannot_parse() {
+        let (_td, sm) = fresh_sm(None).await;
+        let good = "e".repeat(64);
+        seed_dataset(&sm, "acme", "good", 1, &dataset_json("good", &good, false));
+        seed_dataset(&sm, "acme", "corrupt", 1, "{ this is not a dataset");
+
+        let scanned = sm.referenced_digests();
+        assert!(
+            scanned.is_err(),
+            "an unparseable row must fail the scan, not silently shrink the referenced set"
+        );
+    }
+
+    /// The same rule for a corrupt spec row.
+    #[tokio::test]
+    async fn referenced_digests_fails_closed_on_a_corrupt_spec_row() {
+        let (_td, sm) = fresh_sm(None).await;
+        seed_spec(&sm, "acme", "s1", "not json at all");
+        assert!(sm.referenced_digests().is_err());
+    }
+
+    /// An empty state machine references nothing — the honest answer, and the
+    /// one the GC tick is allowed to act on.
+    #[tokio::test]
+    async fn referenced_digests_of_an_empty_state_machine_is_empty() {
+        let (_td, sm) = fresh_sm(None).await;
+        assert!(sm.referenced_digests().expect("scan").is_empty());
+    }
 
     /// Drain a snapshot handle to bytes. Since #436 the handle is a `tokio::fs::File` whose cursor
     /// may sit at the end of a just-written payload, so it is rewound first — `Cursor::into_inner`,

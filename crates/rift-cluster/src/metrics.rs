@@ -788,7 +788,7 @@ static RPC_FAILURES: [AtomicU64; REASONS.len()] = [const { AtomicU64::new(0) }; 
 ///
 /// `handler` is last because it doubles as the bucket for a reason this table
 /// does not know — see [`rpc_failure`].
-const REASONS: [&str; 15] = [
+const REASONS: [&str; 16] = [
     "malformed",
     "bad_mac",
     "stale_timestamp",
@@ -803,6 +803,7 @@ const REASONS: [&str; 15] = [
     "bad_request",
     "unavailable",
     "not_leader",
+    "not_found",
     "handler",
 ];
 
@@ -918,6 +919,9 @@ mod tests {
             },
             RpcError::NotLeader { leader: None },
             RpcError::Handler(String::new()),
+            RpcError::NotFound {
+                what: String::new(),
+            },
         ];
 
         // The list above is hand-written, so on its own it only proves the
@@ -940,7 +944,8 @@ mod tests {
                 | RpcError::BadRequest(_)
                 | RpcError::Unavailable { .. }
                 | RpcError::NotLeader { .. }
-                | RpcError::Handler(_) => {}
+                | RpcError::Handler(_)
+                | RpcError::NotFound { .. } => {}
             }
         }
 
