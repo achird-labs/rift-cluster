@@ -142,6 +142,16 @@ at the owner, not assumed at the caller.
 - **Raft for flow state too.** A quorum write per scenario transition at
   20–40k RPS is unacceptable. Flow state stays single-writer HRW + WAL; D-8
   (cursor reset on ownership move) and D-12 (Redis-strict path) both stand.
+- **Object-store tiering of the blob corpus** (evict cold datasets/specs
+  locally, fetch from a bucket on demand — rift-cluster#458, 2026-08-24). D-12's
+  "external system by choice" is *not* a precedent for this: the Redis-strict
+  path lets a customer swap one consistency model for another, whereas tiering
+  would trade away availability the fleet already has — a bucket outage,
+  credential rotation, or lifecycle deletion becomes a request-path failure, and
+  a blob no member holds can never apply, stalling the log fleet-wide. RFC-005
+  §3.2 bounds dataset bytes by quota precisely so the corpus is
+  consensus-worthy small and fully replicated; a corpus that outgrows a voter's
+  disk is a redesign with numbers, not a tier. See D-18.
 
 ## Decision-log entries (RFC-001 Appendix C)
 
@@ -154,6 +164,11 @@ at the owner, not assumed at the caller.
   bytes it carried and was read whole on every send.
 - **D-17** — Flow state stays off consensus (HRW + WAL); ownership derived from
   committed membership.
+- **D-18** — Every member holds every live blob. The content-addressed blob
+  store (rift-cluster#437) is quorum-complete on each node; an object store
+  (rift-cluster#448) is an opt-in cache/backup tier that is never consulted on
+  the serving path and never a condition for apply. D-12 covers flow state, not
+  the blob store.
 
 ## Implementation
 
