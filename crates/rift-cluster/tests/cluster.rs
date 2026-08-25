@@ -3532,20 +3532,26 @@ async fn a_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
 /// adapter, so it outlives the RPC deadline and a re-send attaches to it rather than restarting
 /// it, with the timers untouched. Unloaded, this test passes in ~9.4 s.
 ///
-/// It stays ignored for a *different* and pre-existing reason (#430). `try_get_log_entries` can
-/// be asked for a range whose entries openraft has counted but `append` has not yet made
-/// readable; it answers with an empty vec, and openraft 0.9.24 does
+/// It was `#[ignore]`d for a *different* and pre-existing reason (#430), now closed:
+/// `try_get_log_entries` could be asked for a range whose entries openraft had counted but
+/// `append` had not yet made readable; it answered with an empty vec, and openraft 0.9.24 did
 /// `logs.first().….unwrap()` on that (`replication/mod.rs:399`), panicking the replication
 /// workers and costing the leader its leadership. The window scales with entry size, so #411 is
-/// what makes it reachable — but it reproduces identically on a tree with #411's changes
-/// reverted, and it is a storage/openraft interaction rather than anything about the transfer.
-/// On a CPU-constrained runner it fires reliably.
+/// what made it reachable. #446 fixed that; #449 then fixed the restarted-voter livelock (#431)
+/// that kept the write failing afterwards. Both issues are closed, so the attribute is gone and
+/// this runs.
 ///
-/// Un-ignore this when #430 is fixed; it is that issue's acceptance test now. The 4 MiB
-/// `SpecPut` case below is #411's own CI-green proof.
+/// It is the end-to-end gate for the #411 → #430 → #431 ladder, and the only test that asserts
+/// the whole claim: an 8 MiB dataset commits, survives a full-cluster restart, and is rebuilt
+/// after its spool is lost. What #446 shipped alongside it is deliberately narrower — it counts
+/// panics located in openraft's replication module and does not assert the write's own result.
+/// The 4 MiB `SpecPut` case below is #411's own CI-green proof.
+///
+/// Read its verdict off CI, not off a developer machine. The failure this guards against was
+/// load-dependent: it reproduced on GitHub's 2-vCPU runners and never once locally, unloaded or
+/// loaded, on either openraft version. A local pass says the blocker is cleared; it is not
+/// evidence the test is CI-stable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked on #430: an empty log read panics openraft's replication worker under load; \
-            #411's transfer fix is what makes an entry this large reach that window"]
 async fn an_eight_mebibyte_dataset_survives_a_full_cluster_restart_and_a_lost_spool() {
     let _serial = TEST_LOCK.lock().await;
     let bytes = 8 * 1024 * 1024 - 1_100;
