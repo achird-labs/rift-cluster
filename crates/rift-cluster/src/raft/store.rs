@@ -56,7 +56,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::io::Cursor;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -846,6 +845,22 @@ struct SnapshotPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSnapshot {
     meta: SnapshotMeta<u64, BasicNode>,
+    /// File name under [`RedbStateMachine::snapshot_dir`] holding the payload (#436).
+    ///
+    /// Invariant: by the time this row commits, that file is fully written, fsynced and renamed
+    /// into place — the row never names a payload that is not already durable.
+    file: String,
+}
+
+/// The pre-#436 row: the payload inlined as a JSON integer array (~3.7x its own size).
+///
+/// Read-only, and read exactly once — [`RedbStateMachine::migrate_legacy_snapshot_row`] converts it
+/// to a file on first open. Distinguishable from [`StoredSnapshot`] by serde without a version tag:
+/// a legacy row has no `file`, so the current shape fails with *missing field `file`*, and the
+/// legacy shape's extra `data` is simply ignored when the current one is what is present.
+#[derive(Debug, Deserialize)]
+struct LegacyStoredSnapshot {
+    meta: SnapshotMeta<u64, BasicNode>,
     data: Vec<u8>,
 }
 
@@ -861,6 +876,14 @@ struct StoredSnapshot {
 // storage contract expects. Same reason as the other sites in this file.
 #[allow(clippy::result_large_err)]
 pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbStateMachine)> {
+    // Beside the database file, not inside it (#436): `path` is the redb file, so its parent is the
+    // node's data directory — the same place a dataset's spool file already goes. Taken before
+    // `Database::create` consumes `path`.
+    let snapshot_dir = path
+        .as_ref()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("snapshot");
     let db = Database::create(path).map_err(|e| StorageError::from(StorageIOError::write(&e)))?;
     {
         // `open_table` on a write transaction creates the table if it doesn't exist
@@ -908,7 +931,11 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
             .map_err(|e| StorageError::from(StorageIOError::write(&e)))?;
     }
     let db = Arc::new(db);
-    Ok((RedbLogStore { db: db.clone() }, RedbStateMachine::new(db)))
+    std::fs::create_dir_all(&snapshot_dir)
+        .map_err(|e| StorageError::from(StorageIOError::write(&e)))?;
+    let sm = RedbStateMachine::new(db.clone(), snapshot_dir);
+    sm.migrate_legacy_snapshot_row()?;
+    Ok((RedbLogStore { db }, sm))
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,6 +1281,25 @@ pub struct RedbStateMachine {
     /// succeeds for that port. Key 0 is the set-level slot (an `apply_config`
     /// refusal that names no single port). This is node status, not replicated
     /// state — every replica has its own bind outcomes.
+    /// Where snapshot payload files live: `<redb's parent>/snapshot/` (#436).
+    ///
+    /// Not an `Option` and not a builder, unlike `spool_dir`: a snapshot has nowhere else it could
+    /// go, so "no directory" is not a representable state. Derived from the path `new` already
+    /// receives rather than plumbed through `NodeConfig`, which is also what keeps `raft/node.rs`
+    /// out of this change entirely.
+    snapshot_dir: PathBuf,
+    /// Serialises everything that writes into [`Self::snapshot_dir`] (#436).
+    ///
+    /// openraft runs `build_snapshot` on a **detached, unabortable task** — `sm::worker` spawns it
+    /// and the worker loop immediately takes the next command, which may be an `install_snapshot`
+    /// — and its own docs require the builder to "acquire a lock that prevents any write
+    /// operations". Without one, a finishing build's GC can unlink the temp file an install is
+    /// still streaming into, and the failure surfaces later as a rename `ENOENT` that looks like
+    /// disk trouble rather than a self-inflicted race.
+    ///
+    /// `Arc` because clones share the directory: `get_snapshot_builder` hands openraft a
+    /// `self.clone()`.
+    snapshot_guard: Arc<Mutex<()>>,
     apply_failures: Arc<Mutex<BTreeMap<u16, String>>>,
     /// This node's local request journal, late-bound (issue #224): `apply` pushes a committed
     /// clear generation into it via [`ClusterJournal::set_clear_gen`], and `install_snapshot`
@@ -1300,15 +1346,18 @@ impl std::fmt::Debug for RedbStateMachine {
             .field("engine", &self.engine.is_some())
             .field("routes", &self.routes.is_some())
             .field("journal", &self.journal.get().is_some())
+            .field("snapshot_dir", &self.snapshot_dir)
             .field("spool_dir", &self.spool_dir)
             .finish_non_exhaustive()
     }
 }
 
 impl RedbStateMachine {
-    fn new(db: Arc<Database>) -> Self {
+    fn new(db: Arc<Database>, snapshot_dir: PathBuf) -> Self {
         Self {
             db,
+            snapshot_dir,
+            snapshot_guard: Arc::new(Mutex::new(())),
             snapshot_idx: Arc::new(AtomicU64::new(0)),
             engine: None,
             routes: None,
@@ -1429,6 +1478,197 @@ impl RedbStateMachine {
 }
 
 impl RedbStateMachine {
+    /// Write a snapshot payload durably into [`Self::snapshot_dir`] and point the row at it (#436).
+    ///
+    /// Temp file -> fsync file -> rename -> fsync directory, so the `SNAPSHOT_TABLE` row committed
+    /// afterwards can never name a payload that is not already on disk. `write` streams the payload
+    /// in; callers never materialise it as one buffer.
+    ///
+    /// Superseded payload files are removed once the new one is durable — without that, every build
+    /// leaves a full copy of the state machine behind.
+    #[allow(clippy::result_large_err)]
+    fn write_snapshot_file<F>(
+        &self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        write: F,
+    ) -> StorageResult<()>
+    where
+        F: FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    {
+        let io = |e: std::io::Error| {
+            StorageError::from(StorageIOError::write_snapshot(Some(meta.signature()), &e))
+        };
+        // Held across the whole write: see `snapshot_guard`. A concurrent build and install
+        // otherwise share this directory with no coordination at all.
+        let _guard = self.snapshot_guard.lock();
+        std::fs::create_dir_all(&self.snapshot_dir).map_err(io)?;
+        let tmp = self.snapshot_dir.join(format!("tmp-{}", meta.snapshot_id));
+        {
+            // 0o600, matching `write_spool`: a snapshot payload carries `session_key` and every
+            // `principals` row, so it is strictly more sensitive than the CSVs that mode was
+            // chosen for.
+            #[cfg(unix)]
+            let mut file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)
+                    .map_err(io)?
+            };
+            #[cfg(not(unix))]
+            let mut file = std::fs::File::create(&tmp).map_err(io)?;
+            write(&mut file).map_err(io)?;
+            file.sync_all().map_err(io)?;
+        }
+        let final_path = self.snapshot_dir.join(&meta.snapshot_id);
+        std::fs::rename(&tmp, &final_path).map_err(io)?;
+        // Renaming is only durable once the *directory* entry is, which is the step that makes the
+        // row's invariant hold across a power loss rather than merely across a process exit.
+        #[cfg(unix)]
+        std::fs::File::open(&self.snapshot_dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(io)?;
+        Ok(())
+    }
+
+    /// Point `SNAPSHOT_TABLE` at the payload file for `meta`.
+    ///
+    /// Always called *after* [`Self::write_snapshot_file`], never before: the row is the claim that
+    /// a durable payload exists, so committing it first would leave a window where the claim is
+    /// false. `install_snapshot` does not use this — it writes the same row inside the single
+    /// transaction that installs the tables, so the state and the snapshot that produced it commit
+    /// together or not at all.
+    #[allow(clippy::result_large_err)]
+    fn commit_snapshot_row(&self, meta: &SnapshotMeta<u64, BasicNode>) -> StorageResult<()> {
+        let row = serde_json::to_vec(&StoredSnapshot {
+            meta: meta.clone(),
+            file: meta.snapshot_id.clone(),
+        })
+        .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        {
+            let mut table = write_txn
+                .open_table(SNAPSHOT_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            table
+                .insert((), row.as_slice())
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        // Only now: until this row is committed the *previous* payload is still the live one, and
+        // sweeping it beforehand leaves a window where a crash strands a committed row pointing at
+        // a file that has already been deleted.
+        self.gc_snapshot_files(&meta.snapshot_id);
+        Ok(())
+    }
+
+    /// Remove every payload file in [`Self::snapshot_dir`] except `keep`, plus any `tmp-`/
+    /// `receiving-` leftovers from an interrupted build or transfer.
+    ///
+    /// Best-effort by design: a file that cannot be removed is wasted disk, not incorrect state,
+    /// and failing a completed snapshot over it would trade a real guarantee for a cosmetic one.
+    /// Logged so it is visible rather than silent.
+    fn gc_snapshot_files(&self, keep: &str) {
+        // Anything touched inside this window may belong to an operation still in flight — an
+        // install streaming chunks into its `receiving-` file (which happens *outside*
+        // `snapshot_guard`, between `begin_receiving_snapshot` and `install_snapshot`), or a build
+        // that has renamed its payload but not yet committed the row naming it. Deleting either is
+        // how a GC turns into data loss, so age is the guard: a genuine leftover is minutes old,
+        // an in-flight file is seconds old.
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
+        let entries = match std::fs::read_dir(&self.snapshot_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not scan the snapshot directory to GC old payloads");
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name == keep {
+                continue;
+            }
+            let recent = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+                .map(|age| age < GRACE)
+                // Unreadable mtime: treat the file as recent and leave it. Wasted disk is
+                // recoverable on the next sweep; deleting a live transfer is not.
+                .unwrap_or(true);
+            if recent {
+                continue;
+            }
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                tracing::warn!(file = %name, error = %e, "could not remove a superseded snapshot payload");
+            }
+        }
+    }
+
+    /// Open the payload file for `snapshot_id` as the handle openraft streams from.
+    #[allow(clippy::result_large_err)]
+    fn open_snapshot_file(&self, snapshot_id: &str) -> StorageResult<tokio::fs::File> {
+        let path = self.snapshot_dir.join(snapshot_id);
+        let file =
+            std::fs::File::open(&path).map_err(|e| StorageIOError::read_snapshot(None, &e))?;
+        Ok(tokio::fs::File::from_std(file))
+    }
+
+    /// Convert a pre-#436 snapshot row (payload inlined as a JSON integer array) into a payload
+    /// file plus a `{meta, file}` row, once, at open.
+    ///
+    /// Migrated rather than discarded: a node restarted onto a new binary part-way through catching
+    /// a peer up must not lose the snapshot it already holds. A row already in the current shape,
+    /// or no row at all, is left untouched.
+    #[allow(clippy::result_large_err)]
+    fn migrate_legacy_snapshot_row(&self) -> StorageResult<()> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_snapshot(None, &e))?;
+        let table = read_txn
+            .open_table(SNAPSHOT_TABLE)
+            .map_err(|e| StorageIOError::read_snapshot(None, &e))?;
+        let Some(guard) = table
+            .get(())
+            .map_err(|e| StorageIOError::read_snapshot(None, &e))?
+        else {
+            return Ok(());
+        };
+        let bytes = guard.value().to_vec();
+        drop(read_txn);
+
+        if serde_json::from_slice::<StoredSnapshot>(&bytes).is_ok() {
+            return Ok(());
+        }
+        // Not the current shape — the only other thing it can legitimately be is the pre-#436 one.
+        // A parse failure here is propagated, not swallowed: silently dropping a snapshot would
+        // look identical to a fleet that never had one.
+        let legacy: LegacyStoredSnapshot =
+            serde_json::from_slice(&bytes).map_err(|e| StorageIOError::read_snapshot(None, &e))?;
+
+        self.write_snapshot_file(&legacy.meta, |file| {
+            std::io::Write::write_all(file, &legacy.data)
+        })?;
+        self.commit_snapshot_row(&legacy.meta)?;
+        tracing::info!(
+            snapshot_id = %legacy.meta.snapshot_id,
+            bytes = legacy.data.len(),
+            "migrated a pre-#436 inlined snapshot row to a payload file"
+        );
+        Ok(())
+    }
+
     /// Read the applied config JSON for `tenant`'s `port`, or `None` if no
     /// config has been applied for it.
     ///
@@ -6136,9 +6376,6 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             last_membership: applied.last_membership.clone(),
             logical_clock_secs: applied.logical_clock_secs,
         };
-        let data =
-            serde_json::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
-
         let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot_id = match applied.last_applied_log {
             Some(last) => format!("{}-{}-{snapshot_idx}", last.leader_id, last.index),
@@ -6151,32 +6388,22 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
             snapshot_id,
         };
 
-        let stored = StoredSnapshot {
-            meta: meta.clone(),
-            data: data.clone(),
-        };
-        let bytes = serde_json::to_vec(&stored)
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        {
-            let mut table = write_txn
-                .open_table(SNAPSHOT_TABLE)
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            table
-                .insert((), bytes.as_slice())
-                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-
+        // Streamed, never collected: `to_vec` here would rebuild the entire snapshot as one
+        // `Vec<u8>` purely to hand it to the writer (#436 AC2).
+        self.write_snapshot_file(&meta, |file| {
+            // `to_writer` serialises and returns; it never flushes. Dropping the `BufWriter` here
+            // would discard the flush error by design, so an ENOSPC in the last 8 KiB would look
+            // like success and this node would commit a row naming a truncated snapshot — which
+            // every joiner then fails to parse, for ever, with nothing on this side to say why.
+            let mut writer = std::io::BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &payload).map_err(std::io::Error::other)?;
+            std::io::Write::flush(&mut writer)
+        })?;
+        self.commit_snapshot_row(&meta)?;
+        let file = self.open_snapshot_file(&meta.snapshot_id)?;
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(file),
         })
     }
 }
@@ -6498,29 +6725,88 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> StorageResult<Box<Cursor<Vec<u8>>>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    async fn begin_receiving_snapshot(&mut self) -> StorageResult<Box<tokio::fs::File>> {
+        // A fresh temp file per receive: openraft writes chunks into it and hands the same handle
+        // back to `install_snapshot`, so it must be writable, seekable and private to this transfer.
+        let path = self.snapshot_dir.join(format!(
+            "receiving-{}",
+            self.snapshot_idx.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = tokio::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
+        Ok(Box::new(file))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<u64, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<tokio::fs::File>,
     ) -> StorageResult<()> {
-        let data = snapshot.into_inner();
-        let payload: SnapshotPayload = serde_json::from_slice(&data)
+        // Parsed straight off the received file (#436). Before this, install did `from_slice` on a
+        // `Vec<u8>`, then `data.clone()`, then `to_vec` of the whole thing again to store it —
+        // roughly 3x the snapshot in allocation for one install. The payload struct still lands in
+        // memory (it has to; it is applied field by field), but the *bytes* now stream.
+        use std::io::Seek as _;
+        // `meta.snapshot_id` arrives from a peer and becomes a path component below. Nothing else
+        // validates it, and the traversal that a `../` id would otherwise attempt is blocked today
+        // only by the incidental `tmp-` prefix on the temp name. Make the defence deliberate.
+        if meta.snapshot_id.is_empty()
+            || !meta
+                .snapshot_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(StorageIOError::read_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(format!(
+                    "peer sent an unusable snapshot id {:?}",
+                    meta.snapshot_id
+                )),
+            )
+            .into());
+        }
+        let mut received = snapshot.into_std().await;
+        // Rewind before reading. openraft streams the transfer in by writing chunk after chunk into
+        // this handle, so it arrives positioned at EOF — parsing from where it sits reads nothing
+        // and the install fails with an empty-input error, which looks exactly like a peer that
+        // sent a corrupt snapshot. The in-process tests never saw it: their handles come straight
+        // from `build_snapshot` or a freshly opened file, both already at 0.
+        received
+            .seek(std::io::SeekFrom::Start(0))
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        // `try_clone` shares the file *offset* on Unix, so parsing through the clone advances this
+        // handle too — which is why the copy below must seek back to 0 rather than assuming it is
+        // still where the rewind above left it.
+        let received_for_parse = received
+            .try_clone()
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        let payload: SnapshotPayload =
+            serde_json::from_reader(std::io::BufReader::new(received_for_parse)).map_err(|e| {
+                StorageError::from(StorageIOError::read_snapshot(Some(meta.signature()), &e))
+            })?;
         // Counted here — after the payload parses, before it is applied — so the metric means "a
         // peer's snapshot really arrived and was readable", which is what a scenario asserting the
         // wire path needs to distinguish from catch-up-by-replication (issue #183).
         crate::metrics::snapshot_installed();
 
-        let stored = StoredSnapshot {
+        // The received bytes are copied verbatim rather than re-encoded from `payload`: what the
+        // peer sent is what this node should serve on, and a re-encode would be a second full pass.
+        let mut source = received;
+        source
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        self.write_snapshot_file(meta, |file| std::io::copy(&mut source, file).map(|_| ()))?;
+        let row = serde_json::to_vec(&StoredSnapshot {
             meta: meta.clone(),
-            data: data.clone(),
-        };
-        let bytes = serde_json::to_vec(&stored)
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            file: meta.snapshot_id.clone(),
+        })
+        .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
         let mut write_txn = self
             .db
@@ -6534,7 +6820,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                 .open_table(SNAPSHOT_TABLE)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             snap_table
-                .insert((), bytes.as_slice())
+                .insert((), row.as_slice())
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
             let mut configs_table = write_txn
@@ -6900,6 +7186,10 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         // does — after the durable write, best-effort. Unattributed: a snapshot
         // is the sum of many principals' writes, so naming any one of them
         // would be a lie.
+        // Same ordering rule as `commit_snapshot_row`: sweep only once the row naming the new
+        // payload is durable. A follower that only ever installs would otherwise never sweep at all.
+        self.gc_snapshot_files(&meta.snapshot_id);
+
         self.drive_engine(vec![
             AttributedAction::unattributed(config_action),
             AttributedAction::unattributed(routes_action),
@@ -6926,9 +7216,27 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         };
         let stored: StoredSnapshot =
             serde_json::from_slice(&bytes).map_err(|e| StorageIOError::read_snapshot(None, &e))?;
+        let path = self.snapshot_dir.join(&stored.file);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            // The row survived but its payload did not — a manual deletion, a half-restored backup,
+            // a filesystem that lost it. openraft reads `None` as "this node has no snapshot" and
+            // builds a fresh one, which is the correct outcome; erroring here would instead take a
+            // healthy node out of service over derived state it can regenerate. Logged rather than
+            // silent, because it is still a fact about the disk that an operator should see.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %path.display(),
+                    snapshot_id = %stored.meta.snapshot_id,
+                    "snapshot row names a file that is gone; reporting no snapshot so one is rebuilt"
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(StorageIOError::read_snapshot(None, &e).into()),
+        };
         Ok(Some(Snapshot {
             meta: stored.meta,
-            snapshot: Box::new(Cursor::new(stored.data)),
+            snapshot: Box::new(tokio::fs::File::from_std(file)),
         }))
     }
 }
@@ -6997,6 +7305,41 @@ mod tests {
     }
 
     // -- issue #9 state-machine gate ------------------------------------------
+
+    /// Drain a snapshot handle to bytes. Since #436 the handle is a `tokio::fs::File` whose cursor
+    /// may sit at the end of a just-written payload, so it is rewound first — `Cursor::into_inner`,
+    /// which these tests used before, had no such state to undo.
+    async fn read_snapshot_bytes(mut snapshot: Box<tokio::fs::File>) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        snapshot
+            .seek(std::io::SeekFrom::Start(0))
+            .await
+            .expect("rewind snapshot");
+        let mut bytes = Vec::new();
+        snapshot
+            .read_to_end(&mut bytes)
+            .await
+            .expect("read snapshot");
+        bytes
+    }
+
+    /// Wrap `bytes` in a snapshot handle, for the tests that install a deliberately older-shaped
+    /// payload. Replaces the `Box::new(Cursor::new(bytes))` those tests used before #436 made the
+    /// snapshot a file; their assertions are unchanged.
+    async fn snapshot_handle_from(dir: &std::path::Path, bytes: &[u8]) -> Box<tokio::fs::File> {
+        use tokio::io::AsyncSeekExt;
+        let path = dir.join(format!("older-{}", bytes.len()));
+        tokio::fs::write(&path, bytes)
+            .await
+            .expect("write older payload");
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .expect("open older payload");
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .expect("rewind older payload");
+        Box::new(file)
+    }
 
     async fn fresh_sm(engine: Option<Arc<ImposterManager>>) -> (TempDir, RedbStateMachine) {
         let td = TempDir::new().expect("tempdir");
@@ -10785,12 +11128,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_snapshot_without_specs_installs_and_reads_empty() {
-        let (_td, mut sm) = fresh_sm(None).await;
+        let (td, mut sm) = fresh_sm(None).await;
         apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
         let mut payload: serde_json::Value =
-            serde_json::from_slice(&snapshot.into_inner()).expect("snapshot is json");
+            serde_json::from_slice(&read_snapshot_bytes(snapshot).await).expect("snapshot is json");
         let object = payload.as_object_mut().expect("object");
         assert!(
             object.remove("specs").is_some(),
@@ -10800,9 +11143,9 @@ mod tests {
             object.remove("spec_blobs").is_some(),
             "blobs travel in a current snapshot"
         );
-        let older = Box::new(std::io::Cursor::new(
-            serde_json::to_vec(&payload).expect("re-encode"),
-        ));
+        let older =
+            snapshot_handle_from(td.path(), &serde_json::to_vec(&payload).expect("re-encode"))
+                .await;
         let (_td2, mut follower) = fresh_sm(None).await;
         follower
             .install_snapshot(&meta, older)
@@ -11379,18 +11722,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_snapshot_without_datasets_installs_and_reads_empty() {
-        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        let (td, mut sm, _spool) = fresh_sm_with_spool().await;
         apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
         let mut payload: serde_json::Value =
-            serde_json::from_slice(&snapshot.into_inner()).expect("snapshot is json");
+            serde_json::from_slice(&read_snapshot_bytes(snapshot).await).expect("snapshot is json");
         let object = payload.as_object_mut().expect("object");
         assert!(object.remove("datasets").is_some());
         assert!(object.remove("dataset_blobs").is_some());
-        let older = Box::new(std::io::Cursor::new(
-            serde_json::to_vec(&payload).expect("re-encode"),
-        ));
+        let older =
+            snapshot_handle_from(td.path(), &serde_json::to_vec(&payload).expect("re-encode"))
+                .await;
         let (_td2, mut follower, _) = fresh_sm_with_spool().await;
         follower
             .install_snapshot(&meta, older)
@@ -11538,6 +11881,378 @@ mod tests {
         assert_eq!(sm.spool_path("abc"), None);
     }
 
+    /// #436: the snapshot payload lives as a **file** beside redb, and the redb row keeps only
+    /// `{meta, file}`.
+    ///
+    /// The row assertion is the load-bearing half: before #436 the row *was* the payload,
+    /// re-encoded as a JSON integer array (~3.7x). A row that stays small is the only direct
+    /// evidence the bytes moved rather than being copied.
+    #[tokio::test]
+    async fn the_stored_snapshot_is_a_file_beside_redb_not_a_row() {
+        let (td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "rift-prod-eu"))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, .. } = builder.build_snapshot().await.expect("build snapshot");
+
+        let file = td.path().join("snapshot").join(&meta.snapshot_id);
+        let on_disk = std::fs::read(&file)
+            .unwrap_or_else(|e| panic!("the snapshot must exist at {file:?}: {e}"));
+        let payload: super::SnapshotPayload =
+            serde_json::from_slice(&on_disk).expect("the file is the payload verbatim");
+        assert_eq!(payload.fleet_name.as_deref(), Some("rift-prod-eu"));
+
+        // redb allows one open handle per file, and `sm`/`builder` still hold this one.
+        drop(builder);
+        drop(sm);
+        let db = super::Database::create(td.path().join("raft.redb")).expect("reopen");
+        let read = db.begin_read().expect("read txn");
+        let table = read
+            .open_table(super::SNAPSHOT_TABLE)
+            .expect("snapshot table");
+        let row = table.get(()).expect("get row").expect("a row exists");
+        // Size alone is a weak claim: a *small* payload inlined the old way would also fit under
+        // any threshold. Assert the row's shape instead — it must parse as `{meta, file}` naming
+        // this snapshot, and must NOT parse as the pre-#436 `{meta, data}`.
+        let parsed: super::StoredSnapshot =
+            serde_json::from_slice(row.value()).expect("the row is the current shape");
+        assert_eq!(parsed.file, meta.snapshot_id);
+        assert!(
+            serde_json::from_slice::<super::LegacyStoredSnapshot>(row.value()).is_err(),
+            "the row must not carry an inlined payload"
+        );
+        assert!(
+            row.value().len() < 4096,
+            "the row must carry only meta + file name, not the payload — got {} bytes",
+            row.value().len()
+        );
+    }
+
+    /// #436 AC1: the stored artifact is within 1.1x the raw bytes it carries (was ~3.7x).
+    ///
+    /// Measured at 4 MiB rather than the AC's 64 MiB because the ratio is scale-invariant by
+    /// construction — the file *is* the payload encoding, so nothing about it varies with size —
+    /// and a 64 MiB in-process build costs tens of seconds. The literal 64 MiB figure is recorded
+    /// as a measurement in `09-durability-failure.md` (AC4), not as a gate.
+    #[tokio::test]
+    async fn a_stored_snapshot_is_within_one_point_one_times_the_raw_bytes() {
+        let (td, mut sm) = fresh_sm(None).await;
+        let mut csv = String::from("id,payload\n");
+        let mut i = 0u64;
+        while csv.len() < 4 * 1024 * 1024 {
+            csv.push_str(&format!("{i},{}\n", "x".repeat(1_000)));
+            i += 1;
+        }
+        let raw = csv.len();
+        let applied = sm
+            .apply(vec![entry(1, dataset_put(1, "big", &csv))])
+            .await
+            .expect("apply");
+        // Without this the whole test passes vacuously if the write were refused: a near-empty
+        // snapshot trivially satisfies a "<= 1.1x raw" bound.
+        assert_eq!(
+            applied.first().map(|r| &r.outcome),
+            Some(&ControlOutcome::Applied),
+            "the dataset must actually be stored, or the ratio below measures nothing"
+        );
+        let mut builder = sm.clone();
+        let Snapshot { meta, .. } = builder.build_snapshot().await.expect("build snapshot");
+
+        let stored = std::fs::metadata(td.path().join("snapshot").join(&meta.snapshot_id))
+            .expect("snapshot file")
+            .len() as usize;
+        assert!(
+            stored <= raw * 11 / 10,
+            "stored {stored} must be <= 1.1x raw {raw} (ratio {:.2})",
+            stored as f64 / raw as f64
+        );
+    }
+
+    /// An installed snapshot must be readable back as the current one.
+    ///
+    /// This pins the regression that openraft's conformance suite caught and none of my own tests
+    /// did: `build_snapshot` wrote the payload file and never committed the `SNAPSHOT_TABLE` row,
+    /// so the file existed and nothing pointed at it. Every other install assertion reads the
+    /// *other* tables written in the same transaction, so deleting the row write left them all
+    /// green — the state was right, the snapshot was simply lost.
+    #[tokio::test]
+    async fn an_installed_snapshot_is_readable_back_as_the_current_snapshot() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "readable-back"))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        assert_eq!(
+            builder
+                .get_current_snapshot()
+                .await
+                .expect("read back")
+                .expect("a built snapshot must be the current one")
+                .meta
+                .snapshot_id,
+            meta.snapshot_id,
+            "build must commit the row that names its payload, not only write the file"
+        );
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        follower
+            .install_snapshot(&meta, snapshot)
+            .await
+            .expect("install");
+        assert_eq!(
+            follower
+                .get_current_snapshot()
+                .await
+                .expect("read back")
+                .expect("an installed snapshot must be the current one")
+                .meta
+                .snapshot_id,
+            meta.snapshot_id,
+            "install must commit the row too — a follower that cannot serve on what it just \
+             installed will rebuild from nothing"
+        );
+    }
+
+    /// A handle that arrives positioned at EOF must still install.
+    ///
+    /// This is how openraft actually delivers a transfer: it writes chunk after chunk into the
+    /// handle from `begin_receiving_snapshot` and hands that same handle to `install_snapshot`,
+    /// so it arrives at the end of the payload rather than the start. Every other unit test here
+    /// supplies a handle already at 0, which is exactly why this bug reached the cluster tests
+    /// before anything in this file noticed.
+    #[tokio::test]
+    async fn a_received_snapshot_positioned_at_eof_still_installs() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "written-at-eof"))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let payload = read_snapshot_bytes(snapshot).await;
+
+        let (_td2, mut follower) = fresh_sm(None).await;
+        let mut handle = follower
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving");
+        // Deliberately NOT rewound afterwards — that is the whole point.
+        handle
+            .write_all(&payload)
+            .await
+            .expect("stream the payload");
+        handle.flush().await.expect("flush");
+
+        follower
+            .install_snapshot(&meta, handle)
+            .await
+            .expect("a handle left at EOF by the transport must still install");
+        assert_eq!(
+            follower.fleet_name().expect("read fleet name"),
+            Some("written-at-eof".to_owned())
+        );
+    }
+
+    /// A build's GC must not delete a transfer that is still arriving.
+    ///
+    /// openraft spawns `build_snapshot` as a detached task (`sm::worker`) and its worker loop moves
+    /// straight on to the next command, so a build finishing while an install streams into the same
+    /// directory is ordinary scheduling, not a rare interleaving.
+    #[tokio::test]
+    async fn a_build_does_not_gc_a_transfer_that_is_still_arriving() {
+        let (td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "concurrent"))])
+            .await
+            .expect("apply");
+
+        // An install in flight: the handle exists and its file is being written to.
+        let _receiving = sm
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving");
+        let before: Vec<_> = std::fs::read_dir(td.path().join("snapshot"))
+            .expect("scan")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            before
+                .iter()
+                .any(|n| n.to_string_lossy().starts_with("receiving-")),
+            "the in-flight transfer must have a file to protect"
+        );
+
+        let mut builder = sm.clone();
+        builder.build_snapshot().await.expect("build snapshot");
+
+        let after: Vec<_> = std::fs::read_dir(td.path().join("snapshot"))
+            .expect("scan")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        for name in &before {
+            assert!(
+                after.contains(name),
+                "a concurrent build's GC deleted {name:?}, which an in-flight transfer is using"
+            );
+        }
+    }
+
+    /// #436 AC3: a row written in the pre-#436 format is migrated to a file on first open.
+    ///
+    /// Migration rather than rebuild: a node part-way through catching a peer up must not lose the
+    /// snapshot it already holds just because it restarted onto a new binary.
+    #[tokio::test]
+    async fn a_legacy_json_snapshot_row_is_migrated_on_open() {
+        let (td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "legacy-fleet"))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let payload_bytes = read_snapshot_bytes(snapshot).await;
+        drop(sm);
+        drop(builder);
+
+        // Rewrite the row in the OLD shape and delete the file, so the only way to answer is to
+        // migrate what the row carries.
+        let legacy = serde_json::json!({ "meta": meta, "data": payload_bytes });
+        let path = td.path().join("raft.redb");
+        {
+            let db = super::Database::create(&path).expect("reopen");
+            let write = db.begin_write().expect("write txn");
+            {
+                let mut table = write
+                    .open_table(super::SNAPSHOT_TABLE)
+                    .expect("snapshot table");
+                table
+                    .insert(
+                        (),
+                        serde_json::to_vec(&legacy)
+                            .expect("encode legacy")
+                            .as_slice(),
+                    )
+                    .expect("insert legacy row");
+            }
+            write.commit().expect("commit");
+        }
+        std::fs::remove_dir_all(td.path().join("snapshot")).ok();
+
+        let (_, mut reopened) = new(&path).await.expect("reopen store");
+        let current = reopened
+            .get_current_snapshot()
+            .await
+            .expect("read current snapshot")
+            .expect("the migrated snapshot must still be there");
+        assert_eq!(current.meta.snapshot_id, meta.snapshot_id);
+        let migrated = read_snapshot_bytes(current.snapshot).await;
+        assert_eq!(
+            migrated, payload_bytes,
+            "migration must preserve the payload byte-for-byte"
+        );
+        assert!(
+            td.path().join("snapshot").join(&meta.snapshot_id).exists(),
+            "the migrated payload must now live in a file"
+        );
+    }
+
+    /// A row naming a file that is gone reads as "no snapshot" so openraft rebuilds, rather than
+    /// erroring the node out of service. The one deliberate fallback in #436 — it must be a
+    /// *correct* answer, not a silenced failure.
+    #[tokio::test]
+    async fn a_snapshot_row_whose_file_vanished_reports_no_snapshot() {
+        let (td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "vanishing"))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, .. } = builder.build_snapshot().await.expect("build snapshot");
+        std::fs::remove_file(td.path().join("snapshot").join(&meta.snapshot_id))
+            .expect("remove the snapshot file");
+
+        assert!(
+            builder
+                .get_current_snapshot()
+                .await
+                .expect("a missing file is not an error")
+                .is_none(),
+            "a row whose file is gone must read as no snapshot, so one gets rebuilt"
+        );
+    }
+
+    /// Superseded payloads are swept once they are old enough to be unambiguously dead — and a
+    /// recent one is deliberately left alone.
+    ///
+    /// Both halves matter. Sweeping is what stops every build leaking a full copy of the state
+    /// machine; the age guard is what stops a sweep deleting a file another in-flight operation is
+    /// still writing or has renamed but not yet committed a row for. A GC that only did the first
+    /// half was the shape this change originally shipped, and it could unlink a live transfer.
+    #[tokio::test]
+    async fn a_superseded_snapshot_file_is_swept_once_it_is_old_but_not_before() {
+        let (td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "first"))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let first = builder.build_snapshot().await.expect("build 1").meta;
+
+        let dir = td.path().join("snapshot");
+        // A file old enough that no in-flight operation could own it.
+        let stale = dir.join("stale-leftover");
+        std::fs::write(&stale, b"orphan").expect("plant a stale leftover");
+        std::fs::File::open(&stale)
+            .expect("open stale")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .expect("age the stale leftover");
+
+        sm.apply(vec![entry(2, set_fleet_name(2, "second"))])
+            .await
+            .expect("apply");
+        let second = builder.build_snapshot().await.expect("build 2").meta;
+
+        assert_ne!(first.snapshot_id, second.snapshot_id);
+        assert!(
+            dir.join(&second.snapshot_id).exists(),
+            "the current snapshot must be on disk"
+        );
+        assert!(
+            !stale.exists(),
+            "a payload old enough to be unambiguously dead must be swept"
+        );
+        assert!(
+            dir.join(&first.snapshot_id).exists(),
+            "a payload this recent must be left alone — it is indistinguishable from one an \
+             in-flight build has renamed but not yet committed a row for"
+        );
+    }
+
+    /// A received snapshot that does not parse is an error, never a silently empty state machine.
+    #[tokio::test]
+    async fn an_unparseable_received_snapshot_is_an_error_not_a_default() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        sm.apply(vec![entry(1, set_fleet_name(1, "keep-me"))])
+            .await
+            .expect("apply");
+        let mut builder = sm.clone();
+        let Snapshot { meta, .. } = builder.build_snapshot().await.expect("build snapshot");
+
+        let (td2, mut follower) = fresh_sm(None).await;
+        let junk = td2.path().join("not-a-snapshot");
+        std::fs::write(&junk, b"{ this is not json").expect("write junk");
+        let handle = Box::new(
+            tokio::fs::File::open(&junk)
+                .await
+                .expect("open junk snapshot"),
+        );
+        follower
+            .install_snapshot(&meta, handle)
+            .await
+            .expect_err("an unparseable snapshot must fail loudly");
+    }
+
     #[tokio::test]
     async fn snapshot_round_trips_the_fleet_name() {
         let (_td, mut sm) = fresh_sm(None).await;
@@ -11565,7 +12280,7 @@ mod tests {
         // The #134/#137 lesson, applied before it can bite again: a snapshot built before this
         // field existed must still install. Simulated faithfully by stripping the key from a
         // real snapshot's JSON rather than by trusting `#[serde(default)]` in the abstract.
-        let (_td, mut sm) = fresh_sm(None).await;
+        let (td, mut sm) = fresh_sm(None).await;
         sm.apply(vec![entry(1, set_fleet_name(1, "rift-prod-eu"))])
             .await
             .expect("apply");
@@ -11573,7 +12288,7 @@ mod tests {
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
 
         let mut payload: serde_json::Value =
-            serde_json::from_slice(&snapshot.into_inner()).expect("snapshot is json");
+            serde_json::from_slice(&read_snapshot_bytes(snapshot).await).expect("snapshot is json");
         let removed = payload
             .as_object_mut()
             .expect("snapshot payload is an object")
@@ -11582,9 +12297,9 @@ mod tests {
             removed.is_some(),
             "the field must be present in a current snapshot, or this test proves nothing"
         );
-        let older = Box::new(std::io::Cursor::new(
-            serde_json::to_vec(&payload).expect("re-encode"),
-        ));
+        let older =
+            snapshot_handle_from(td.path(), &serde_json::to_vec(&payload).expect("re-encode"))
+                .await;
 
         let (_td2, mut follower) = fresh_sm(None).await;
         follower
@@ -12522,7 +13237,7 @@ mod tests {
     /// same `#[serde(default)]` contract every table added since #134 carries.
     #[tokio::test]
     async fn a_pre_audit_export_snapshot_still_installs() {
-        let (_td, mut sm) = fresh_sm(None).await;
+        let (td, mut sm) = fresh_sm(None).await;
         apply_one(&mut sm, 1, put(1, 8080, json!([{ "id": "a" }]))).await;
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
@@ -12530,7 +13245,8 @@ mod tests {
         // Strip the #164 fields plus #185's `session_key`, standing in for a payload serialized
         // by a binary that predates all of them.
         let mut payload: serde_json::Value =
-            serde_json::from_slice(snapshot.get_ref()).expect("snapshot payload is JSON");
+            serde_json::from_slice(&read_snapshot_bytes(snapshot).await)
+                .expect("snapshot payload is JSON");
         for field in [
             "audit_sink",
             "audit_checkpoint",
@@ -12542,11 +13258,13 @@ mod tests {
                 .expect("payload is an object")
                 .remove(field);
         }
-        let stripped = std::io::Cursor::new(serde_json::to_vec(&payload).expect("re-encode"));
+        let stripped =
+            snapshot_handle_from(td.path(), &serde_json::to_vec(&payload).expect("re-encode"))
+                .await;
 
         let (_td2, mut follower) = fresh_sm(None).await;
         follower
-            .install_snapshot(&meta, Box::new(stripped))
+            .install_snapshot(&meta, stripped)
             .await
             .expect("a pre-#164/#185 snapshot must still install");
         assert_eq!(follower.audit_sink().expect("read sink"), None);

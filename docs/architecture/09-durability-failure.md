@@ -15,7 +15,8 @@ What state lives where, and what it survives:
 
 | State | Store | Node crash | Full-cluster restart | Notes |
 |---|---|---|---|---|
-| Membership, node ids | Raft log/vote/snapshot (`redb`, fsync) | ✅ | ✅ | Group re-forms from disk |
+| Membership, node ids | Raft log/vote (`redb`, fsync) | ✅ | ✅ | Group re-forms from disk |
+| Raft snapshot payload | file at `<data-dir>/snapshot/<id>` (temp → fsync → rename → dir fsync); `redb` holds only `{meta, file}` | ✅ | ✅ | Derived state — a missing payload is rebuilt, not mourned (#436) |
 | Imposter configs + `enabled` + revisions | Raft state machine | ✅ | ✅ | Committed = fsync'd on majority |
 | Tenants, principals, bindings | Raft state machine | ✅ | ✅ | Authz survives anything the configs survive |
 | Admin intents + op-dedup | Raft SM + accepting node's `pending_intents` | ✅ | ✅ | R4: parked before forwarded |
@@ -172,6 +173,24 @@ entry commits, the node starts up as a learner, and the leader promotes it to
 voter when its replication is current. However long the catch-up above takes,
 it delays *promotion*, never startup; a refused, unreachable, or mis-secreted
 join still fails the deployment exactly as before.
+
+**What a snapshot costs to store, measured (#436).** The payload is written as a plain file beside
+redb rather than inlined into a `redb` row as a JSON integer array, which is what made the stored
+artifact ~3.7× the bytes it carried. Measured after the change, on loopback: a fleet holding 4 MiB
+of datasets stores **1.00×** its raw bytes, and one holding 16 MiB likewise **1.00×**.
+
+**Fresh-joiner catch-up, before and after (#436),** same probe on both sides, 1 voter → 2:
+
+| fleet state | before | after |
+|---|---|---|
+| 4 MiB | 3.1 s | **2.2 s** |
+| 16 MiB | 12.3 s | **8.8 s** |
+| 64 MiB | never converges | **still never converges** |
+
+The 64 MiB row is the honest headline: binary, file-backed snapshots cut what a snapshot costs to
+*store* and to *install*, but they do not move the ceiling, because the payload is still chunked
+onto the wire as a JSON integer array by openraft's own `InstallSnapshotRequest`. That is what
+`#432`'s later children address — the ceiling sits between 16 MiB and 64 MiB until then.
 
 **Catch-up has a size ceiling below the documented quotas, and it is not the one
 above.** A fleet holding a few MiB of state catches a node up in seconds
