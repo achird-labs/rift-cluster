@@ -250,6 +250,23 @@ class Index(unittest.TestCase):
         self.assertIn("doc-stale", out)
         self.assertIn("crates/x/src/new.rs", out)
 
+    def test_code_changed_together_with_the_doc_is_not_stale(self):
+        f = Fixture()
+        f.run("--mark-verified", "docs/rfc/RFC-001-test.md")
+        # One commit edits the code AND the document it describes: the synced case.
+        f.write("crates/x/src/new.rs", "// D-2 changed, doc updated alongside\n")
+        f.write("docs/rfc/RFC-001-test.md", RFC.replace("body\n\n### 2.2", "body, updated\n\n### 2.2"))
+        git(f.root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-am", "co-change")
+        _, out = f.run()
+        self.assertNotIn("doc-stale", out)
+        self.assertIn("doc-edited-since-verify", out)
+        # A later commit that touches only the code IS drift again.
+        f.write("crates/x/src/new.rs", "// D-2 changed again, silently\n")
+        git(f.root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-am", "code-only")
+        _, out = f.run()
+        self.assertIn("doc-stale", out)
+        self.assertIn("changed without the doc", out)
+
 
 class Diff(unittest.TestCase):
     def test_code_to_design_flags_untouched_docs(self):
