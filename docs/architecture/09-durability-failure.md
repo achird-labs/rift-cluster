@@ -192,6 +192,29 @@ The 64 MiB row is the honest headline: binary, file-backed snapshots cut what a 
 onto the wire as a JSON integer array by openraft's own `InstallSnapshotRequest`. That is what
 `#432`'s later children address — the ceiling sits between 16 MiB and 64 MiB until then.
 
+**Producing a snapshot costs the leader CPU, but never its runtime (#444).** The chapter above
+describes what a catch-up costs the *joiner*; the other half is what building one costs the node
+that serves it. A build walks every state-machine table and encodes the result — O(state) CPU with
+no await in it — and an install does the same in reverse under one `Durability::Immediate`
+transaction. All three of `build_snapshot`, `get_current_snapshot` and `install_snapshot` run that
+work on tokio's **blocking pool**, never on a runtime worker, so heartbeats, elections and the
+per-peer liveness ticker are unaffected by a build or an install of any size.
+
+That placement is load-bearing rather than tidy. tokio cannot preempt a synchronous body, so before
+#444 a build held a runtime worker for its whole duration; on a two-vCPU runner — where all three
+in-process nodes' runtimes share two vCPUs — that was long enough for a follower's election timeout
+(150–300 ms) to fire and for the leader to lose office while doing nothing but snapshotting. The
+`worker_threads = 1` gate in `raft::store`'s tests pins it: the leader's tick gap across a build,
+read and install of a ≥ 16 MiB snapshot stays under `election_timeout_min`, measured with **no
+joiner present** so the leader-side cost is isolated from anything on the install path.
+
+**The write path still has this shape, in two places.** `apply` is synchronous in the same way — a
+`DatasetPut` carries its whole CSV through serde and an fsync on a runtime worker — and so is
+`RaftLogStorage::append`, which commits and fsyncs every entry before acknowledging it. Neither is
+hoisted: a blocking-pool hop per committed entry buys latency for nothing on the hot path, and
+#432's move to digest-only entries shrinks the serde half of it anyway. A heartbeat gap observed
+during a large `DatasetPut` is that residual, not a regression of the fix above.
+
 **Catch-up has a size ceiling below the documented quotas, and it is not the one
 above.** A fleet holding a few MiB of state catches a node up in seconds
 (measured: ~4 MiB in 8 s on loopback). A fleet at RFC-005's 64 MiB per-tenant

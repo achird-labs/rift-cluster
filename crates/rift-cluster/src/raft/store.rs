@@ -6110,7 +6110,33 @@ impl RedbStateMachine {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachine {
+    /// Builds on the blocking pool, never on a runtime worker.
+    ///
+    /// The body below walks every state-machine table and encodes the result — hundreds of lines
+    /// with no `.await` in them. tokio cannot preempt that, so running it on a worker stops the
+    /// timer wheel and the replication tasks sharing that worker for as long as it takes. On a
+    /// two-core runner that is long enough for a follower's election timeout to fire and for this
+    /// node to lose leadership while doing nothing but snapshotting (#444).
+    #[allow(clippy::result_large_err)]
     async fn build_snapshot(&mut self) -> StorageResult<Snapshot<TypeConfig>> {
+        let sm = self.clone();
+        tokio::task::spawn_blocking(move || sm.build_snapshot_blocking())
+            .await
+            // A `JoinError` here is a panic inside the closure, or the runtime shutting down with
+            // the task still queued. Both are storage faults from openraft's point of view; the
+            // alternative — unwrapping the join — turns a recoverable one into a process abort.
+            .map_err(|e| StorageIOError::write_snapshot(None, &std::io::Error::other(e)))?
+    }
+}
+
+impl RedbStateMachine {
+    /// [`RaftSnapshotBuilder::build_snapshot`]'s body, off the runtime.
+    ///
+    /// `&self` rather than `&mut self`: it mutates no field, which is what makes the `self.clone()`
+    /// above sound — a clone shares the redb handle and the engine/journal handles, so a mutation
+    /// here would be lost, and there is none to lose.
+    #[allow(clippy::result_large_err)]
+    fn build_snapshot_blocking(&self) -> StorageResult<Snapshot<TypeConfig>> {
         let applied = self.read_applied()?;
 
         let (
@@ -6807,6 +6833,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         Ok(Box::new(file))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<u64, BasicNode>,
@@ -6816,7 +6843,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         // `Vec<u8>`, then `data.clone()`, then `to_vec` of the whole thing again to store it —
         // roughly 3x the snapshot in allocation for one install. The payload struct still lands in
         // memory (it has to; it is applied field by field), but the *bytes* now stream.
-        use std::io::Seek as _;
+        //
         // `meta.snapshot_id` arrives from a peer and becomes a path component below. Nothing else
         // validates it, and the traversal that a `../` id would otherwise attempt is blocked today
         // only by the incidental `tmp-` prefix on the temp name. Make the defence deliberate.
@@ -6835,7 +6862,54 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             )
             .into());
         }
-        let mut received = snapshot.into_std().await;
+        let received = snapshot.into_std().await;
+
+        // Everything from the rewind to the durable commit is one contiguous synchronous block —
+        // parse, full table clear-and-reinsert, `Durability::Immediate` commit. Off the runtime for
+        // #444's reason; the engine drive that used to close this function is returned instead and
+        // awaited by the caller, which keeps the documented order (durable write first, engine
+        // after) true by construction rather than by comment.
+        let sm = self.clone();
+        let meta_owned = meta.clone();
+        let actions =
+            tokio::task::spawn_blocking(move || sm.install_snapshot_blocking(meta_owned, received))
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "snapshot install task did not complete");
+                    StorageIOError::read_snapshot(Some(meta.signature()), &std::io::Error::other(e))
+                })??;
+
+        self.drive_engine(actions).await;
+
+        Ok(())
+    }
+    /// Reads on the blocking pool, for [`RaftSnapshotBuilder::build_snapshot`]'s reason.
+    ///
+    /// Cheaper than a build since #436 made the payload a file rather than a JSON row to parse, but
+    /// still a redb read with no `.await` in it, and openraft calls it on every send attempt.
+    #[allow(clippy::result_large_err)]
+    async fn get_current_snapshot(&mut self) -> StorageResult<Option<Snapshot<TypeConfig>>> {
+        let sm = self.clone();
+        tokio::task::spawn_blocking(move || sm.get_current_snapshot_blocking())
+            .await
+            .map_err(|e| StorageIOError::read_snapshot(None, &std::io::Error::other(e)))?
+    }
+}
+
+impl RedbStateMachine {
+    /// [`RaftStateMachine::install_snapshot`]'s synchronous middle, off the runtime.
+    ///
+    /// Returns the engine actions rather than driving them: driving is the one `.await` in the
+    /// original body, and returning it is what lets the whole rest of the install run on the
+    /// blocking pool without changing the order those actions are applied in.
+    #[allow(clippy::result_large_err)]
+    fn install_snapshot_blocking(
+        &self,
+        meta: SnapshotMeta<u64, BasicNode>,
+        mut received: std::fs::File,
+    ) -> StorageResult<Vec<AttributedAction>> {
+        use std::io::Seek as _;
+        let meta = &meta;
         // Rewind before reading. openraft streams the transfer in by writing chunk after chunk into
         // this handle, so it arrives positioned at EOF — parsing from where it sits reads nothing
         // and the install fails with an empty-input error, which looks exactly like a peer that
@@ -7254,16 +7328,15 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         // payload is durable. A follower that only ever installs would otherwise never sweep at all.
         self.gc_snapshot_files(&meta.snapshot_id);
 
-        self.drive_engine(vec![
+        Ok(vec![
             AttributedAction::unattributed(config_action),
             AttributedAction::unattributed(routes_action),
         ])
-        .await;
-
-        Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> StorageResult<Option<Snapshot<TypeConfig>>> {
+    /// [`RaftStateMachine::get_current_snapshot`]'s body, off the runtime.
+    #[allow(clippy::result_large_err)]
+    fn get_current_snapshot_blocking(&self) -> StorageResult<Option<Snapshot<TypeConfig>>> {
         let read_txn = self
             .db
             .begin_read()
@@ -12131,6 +12204,120 @@ mod tests {
     /// construction — the file *is* the payload encoding, so nothing about it varies with size —
     /// and a 64 MiB in-process build costs tens of seconds. The literal 64 MiB figure is recorded
     /// as a measurement in `09-durability-failure.md` (AC4), not as a gate.
+    /// #444's gate: the snapshot trio must not run its synchronous body on a runtime worker.
+    ///
+    /// Pinned to **one** worker on purpose. That is what makes the failure deterministic on any
+    /// machine rather than only on a 2-vCPU CI runner: with a single worker, a synchronous body
+    /// inside an `async fn` stops the timer wheel outright, so the ticker below simply does not run
+    /// for the duration of the build. On a 10-core laptop the same defect hides, which is exactly
+    /// why the original report could not be reproduced locally.
+    ///
+    /// The threshold is `election_timeout_min` (150 ms, `node.rs::raft_config`) because that is the
+    /// figure with consequences: a leader that stops servicing its runtime for longer than a
+    /// follower's election timeout loses leadership while doing nothing wrong. Measuring the gap
+    /// with **no joiner present** is deliberate — it isolates the leader-side cost of *producing* a
+    /// snapshot from anything on the install path, which is what made this hard to see when it was
+    /// only observable through a catch-up scenario under CI load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_snapshot_build_does_not_starve_the_runtime_worker() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let (_td, mut sm) = fresh_sm(None).await;
+
+        // >= 16 MiB of state machine, spread over four datasets because the per-dataset quota is
+        // 8 MiB. Anything much smaller stops discriminating: the point is a build long enough to
+        // outrun an election timeout, and a snapshot that fits comfortably inside one would pass
+        // against the unfixed code too.
+        //
+        // Each dataset gets **distinct** bytes, and that is load-bearing rather than incidental:
+        // dataset blobs are content-addressed — `SM_DATASET_BLOBS_TABLE` is keyed by digest and
+        // the `DatasetPut` arm inserts only on a digest's first reference — so four datasets
+        // sharing one CSV would store a single blob, and this would quietly measure a quarter of
+        // what it claims to.
+        for (i, name) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+            let mut csv = String::from("id,payload\n");
+            let mut row = 0u64;
+            while csv.len() < 4 * 1024 * 1024 {
+                csv.push_str(&format!("{row},{name}-{}\n", "x".repeat(1_000)));
+                row += 1;
+            }
+            let op = i as u128 + 1;
+            let applied = sm
+                .apply(vec![entry(i as u64 + 1, dataset_put(op, name, &csv))])
+                .await
+                .expect("apply dataset");
+            // Without this the whole test passes vacuously if the writes were refused — a tiny
+            // snapshot builds fast enough to clear the threshold on the unfixed code.
+            assert_eq!(
+                applied.first().map(|r| &r.outcome),
+                Some(&ControlOutcome::Applied),
+                "dataset {name} must actually be stored, or the gap below measures nothing"
+            );
+        }
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let max_gap_ms = std::sync::Arc::new(AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let stop = std::sync::Arc::clone(&stop);
+            let max_gap_ms = std::sync::Arc::clone(&max_gap_ms);
+            async move {
+                let mut last = std::time::Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let now = std::time::Instant::now();
+                    let gap = now.duration_since(last).as_millis() as u64;
+                    max_gap_ms.fetch_max(gap, Ordering::Relaxed);
+                    last = now;
+                }
+            }
+        });
+
+        // Let the ticker reach its cadence, then discard the warm-up: the first gaps include this
+        // task's own scheduling and the tail of the population above, neither of which is what is
+        // being measured.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        max_gap_ms.store(0, Ordering::Relaxed);
+
+        // Run the snapshot work in a *spawned task*, not in the test future. On a `multi_thread`
+        // runtime `block_on` drives the test future on the calling thread, while spawned tasks get
+        // the worker pool — so doing the build inline would put it on a different thread from the
+        // ticker and observe nothing, however long it blocked. Production runs `build_snapshot` on
+        // openraft's state-machine task, which is a spawned task on the same runtime, and that is
+        // the arrangement being reproduced: one worker, the ticker and the snapshot work competing
+        // for it.
+        let worked = tokio::spawn({
+            let mut builder = sm.clone();
+            let mut sm = sm.clone();
+            async move {
+                let Snapshot { meta, snapshot } =
+                    builder.build_snapshot().await.expect("build snapshot");
+                let current = sm
+                    .get_current_snapshot()
+                    .await
+                    .expect("get current snapshot");
+                assert!(
+                    current.is_some(),
+                    "the build must leave a readable current snapshot, or the read measured nothing"
+                );
+                sm.install_snapshot(&meta, snapshot)
+                    .await
+                    .expect("install snapshot");
+            }
+        });
+        worked.await.expect("snapshot task");
+
+        stop.store(true, Ordering::Relaxed);
+        ticker.await.expect("ticker task");
+
+        let observed = max_gap_ms.load(Ordering::Relaxed);
+        assert!(
+            observed < 150,
+            "the runtime worker stalled {observed} ms across build/read/install; \
+             anything at or past 150 ms (election_timeout_min) is long enough for a follower to \
+             call an election and take leadership from a leader that is merely snapshotting"
+        );
+    }
+
     #[tokio::test]
     async fn a_stored_snapshot_is_within_one_point_one_times_the_raw_bytes() {
         let (td, mut sm) = fresh_sm(None).await;
