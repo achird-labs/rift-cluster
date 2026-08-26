@@ -263,21 +263,25 @@ carried and read the whole payload on every send. The decision stands for the lo
 the snapshot's metadata; only where the payload bytes are written changed.
 
 ### D-17 — Flow state stays off consensus
-- **Status:** amended
+- **Status:** active
 - **Decided:** 2026-07-21 · ADR-001
+- **Implemented by:** #465 (the isolated-owner rule, for flow KV)
 - **Code:** crates/rift-cluster/src/stores/flow.rs, crates/rift-cluster/src/raft/ring.rs
+
+**Paid, honestly (2026-08-25, #465).** Enforcing the isolated-owner rule puts one
+consensus-shaped pause on the otherwise consensus-free flow path: `is_isolated()` is `true`
+whenever a node's `current_leader` is unknown, so a leader election makes every node that has lost
+sight of the leader refuse owner-side flow writes and `strong` reads until a leader is
+re-established — sub-second typically, up to the ~1–3 s D-15 accepts for admin writes when
+contended. This is stricter than this entry's own "3 × election_timeout" wording, which would ride
+out a routine election; the primitive fails closed immediately and that is what ships. Whether the
+flow path should take the looser grace is #472. `local` reads (D-10) are unaffected.
 
 HRW ownership + successor replication + WAL; ownership is *derived from committed membership*. A
 quorum write per scenario transition at 20–40k RPS is an outage, not a design. D-8 (cursor reset
 on ownership move) and D-12 (Redis-strict path) both still stand. The residual window (a
 partitioned node that has not applied the entry deposing it) is closed by the isolated-owner rule:
 no leader heartbeat within `3 × election_timeout` ⇒ reject owner-side stateful ops.
-
-**Amendment (2026-08-25, verification pass):** the isolated-owner rule is enforced for proxyOnce
-claims (`stores/proxy.rs` checks `RaftNode::is_isolated`) but **not** for flow-KV owner
-operations — `FlowNet::owner_write` / `blocking_read` never consult it, so the residual
-split-brain window this entry says is closed is open for flow state. Tracked as a defect
-(#465); the decision stands, the code is behind it.
 
 ### D-18 — Every member holds every live blob
 - **Status:** active

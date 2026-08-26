@@ -2253,7 +2253,7 @@ but does not own from their owners, so a replica that missed a push converges
 within one tick.
 
 Observability: `rift_cluster_flow_reads_total{path=owner|forward|local}` says
-where reads are answered, `rift_cluster_cas_conflicts_total{reason=cas|fence|misroute}`
+where reads are answered, `rift_cluster_cas_conflicts_total{reason=cas|fence|misroute|isolated}`
 counts owner-side refusals, `rift_cluster_flow_adoptions_total{outcome}` makes
 takeovers visible (`unreachable` is the label worth alerting on), and
 `rift_cluster_flow_repairs_total` counts anti-entropy merges that actually fixed

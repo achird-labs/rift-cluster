@@ -98,6 +98,12 @@ const SYNC_PATH: &str = "/_cluster/flow/sync";
 const COUNTS_PATH: &str = "/_cluster/flow/counts";
 const SPACES_PATH: &str = "/_cluster/flow/spaces";
 
+/// The refusal every owner-side entry returns while this node cannot see a
+/// quorum — D-17's isolated-owner rule. One constant because every one of those
+/// entries and the acceptance gate match on it, and a literal that drifted in
+/// one of them would turn that gate into a test of nothing.
+const ISOLATED_REFUSAL: &str = "flow store: owner is isolated from the cluster";
+
 /// How often a replica pulls the flows it holds from their owners (#16's
 /// anti-entropy interval). A missed push heals within one tick. Deliberately
 /// not a CLI flag — it is a repair cadence, not an operator trade-off — but
@@ -520,6 +526,20 @@ impl FlowNet {
             }
         }
 
+        // D-17's isolated-owner rule: a node that cannot see a quorum must not
+        // mutate owned state — a majority that re-homed this key is already
+        // serving it, and the `(m_idx, v, origin)` tuple only reconciles the
+        // divergence afterwards rather than preventing it. Placed *after* the
+        // ownership check so a misroute is still reported as `NotOwner`, and
+        // *before* adoption so a partitioned owner opens no RPCs to peers it
+        // cannot reach.
+        if node.is_isolated() {
+            metrics::flow_conflict("isolated");
+            return WriteReply::Error {
+                reason: ISOLATED_REFUSAL.to_owned(),
+            };
+        }
+
         // Verify the copy before first serving it under this membership —
         // outside the RMW lock, because adoption does RPC and holding the
         // per-node lock across the network would stall every other flow's
@@ -528,6 +548,18 @@ impl FlowNet {
         self.ensure_adopted(&node, &ring, &req.flow_id).await;
 
         let _serialize = self.rmw.lock().await;
+        // Re-taken under the lock, deliberately. `is_isolated()` lags a fresh
+        // partition by up to `ISOLATION_WINDOW_MS`, and the check above is
+        // followed by `ensure_adopted`, whose per-peer RPCs each burn up to the
+        // request timeout discovering the peers are gone — so the very call that
+        // *first observes* a partition is the one that would otherwise go on to
+        // mutate. One watch-borrow bounds the window to the shard write itself.
+        if node.is_isolated() {
+            metrics::flow_conflict("isolated");
+            return WriteReply::Error {
+                reason: ISOLATED_REFUSAL.to_owned(),
+            };
+        }
         let flow = req.flow_id.as_str();
         let expiry = super::shard::expiry_from(
             req.ttl_seconds
@@ -1134,6 +1166,17 @@ impl FlowNet {
                     RpcError::Handler("flow store: ring has no members".to_owned())
                 })?;
                 if owner == node.id() {
+                    // D-17: an owner-answered `strong` read is an owner-side
+                    // serve, so an isolated node refuses it rather than answer
+                    // a value a healed majority may already disagree with.
+                    // Before the counter: a refusal is not a read this node
+                    // served. `local` reads never reach this branch (D-10).
+                    if node.is_isolated() {
+                        return Err(RpcError::Unavailable {
+                            detail: ISOLATED_REFUSAL.to_owned(),
+                            op_id: None,
+                        });
+                    }
                     metrics::flow_read("owner");
                     net.ensure_adopted(&node, &ring, &req.flow_id).await;
                     Ok(net.shard.get(&req.flow_id, &req.key))
@@ -1603,9 +1646,28 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
                     // Adoption runs here too (#126): a forwarded strong read is
                     // an owner-side serve, and a fresh owner must verify its
                     // copy before answering with it.
-                    if let Ok((node, ring)) = net.view() {
-                        net.ensure_adopted(&node, &ring, &req.flow_id).await;
+                    // Refuses rather than answering when there is no view, like
+                    // every sibling route here: `view()` fails when this node is
+                    // unbound, shutting down, or has no applied membership — and
+                    // that last state is one `is_isolated()` itself calls isolated
+                    // (`uninitialized_node_is_isolated_with_empty_ring`). Serving
+                    // from the local shard there would skip the gate in exactly
+                    // the state the gate exists for, and answer `None` for a key
+                    // this node may simply not have loaded yet, which reads to the
+                    // caller as "absent" rather than as a failure.
+                    let (node, ring) = net.view().map_err(RpcError::Handler)?;
+                    // D-17: the ownership check is deliberately absent here (the
+                    // caller routed to us), but isolation is a property of *this*
+                    // node rather than of the route — a forwarded owner-read
+                    // landing on a node that cannot see a quorum is the
+                    // minority-side serve the rule exists to refuse.
+                    if node.is_isolated() {
+                        return Err(RpcError::Unavailable {
+                            detail: ISOLATED_REFUSAL.to_owned(),
+                            op_id: None,
+                        });
                     }
+                    net.ensure_adopted(&node, &ring, &req.flow_id).await;
                     let reply = GetReply {
                         entry: net.shard.get(&req.flow_id, &req.key),
                     };

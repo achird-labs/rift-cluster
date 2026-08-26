@@ -1437,7 +1437,7 @@ registered in `crates/rift-cluster/src/metrics.rs`:
 | `rift_cluster_config_revision{port}` | Applied config revision per port. **This is the convergence signal** — two nodes disagreeing here have not converged |
 | `rift_cluster_bind_failures{port}` | Ports that failed to bind |
 | `rift_cluster_flow_reads_total{path}` | Flow-state reads by answering path (#120): `owner` (this node owns the key), `forward` (one RPC to the owner — the whole cost of `strong` on a non-owner), `local` (a replica read the imposter opted into) |
-| `rift_cluster_cas_conflicts_total{reason}` | Owner-side flow-write refusals (#120): `cas` lost to the current value, `fence` carried a stale `m_idx` (§7.6) |
+| `rift_cluster_cas_conflicts_total{reason}` | Owner-side flow-write refusals (#120): `cas` lost to the current value, `fence` carried a stale `m_idx` (§7.6), `misroute` reached a non-owner, `isolated` the owner could not see a quorum (D-17) |
 | `rift_cluster_flow_fsync_seconds` | Durable flow-state commit latency (#119) — `sync` writes wait on its tail |
 | `rift_cluster_flow_wal_lag_ops` | `async` writes acknowledged but not yet fsynced — the loss window, measured (#119) |
 | `rift_cluster_flow_replay_entries_total` | Flow entries recovered from disk at startup (#119); zero after a restart that should have recovered is the durability alarm |
