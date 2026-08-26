@@ -280,8 +280,10 @@ async fn fleet_projection_matches_the_cluster_port_shapes() {
             "/_fleet/members" => &["members"],
             // #360: the parked-write depth summed across voters. `parked_intents` itself is NOT
             // listed — it is in the shared `health_body`, so both ports carry it and it is not an
-            // addition at all. Only the fleet-wide sum is.
-            "/_fleet/health" => &["parked_intents_fleet"],
+            // addition at all. Only the fleet-wide sum is. #439 (D-48): likewise
+            // `blob_fetch_stall` is shared and `blob_fetch_stalls_fleet` — one row per stalled
+            // voter — is the fleet-only fold. Alphabetical, because the keys are compared sorted.
+            "/_fleet/health" => &["blob_fetch_stalls_fleet", "parked_intents_fleet"],
             _ => &[],
         };
         let dropped: Vec<&String> = b.iter().filter(|key| !a.contains(key)).collect();
