@@ -118,6 +118,14 @@ table in Chapter 9):
   owner black-holes, excess stateful ops shed immediately and *stateless*
   traffic keeps flowing at full speed (chaos scenario C13 — Chapter 12, not yet
   built — specifies p99 < 5 ms through an owner loss).
+- **The owner refuses itself**: the case this section's title does not cover.
+  An owner that cannot see a quorum reports `is_isolated()` and declines its own
+  owner-side reads rather than answering from a copy a healed majority may
+  already disagree with (D-17, the isolated-owner rule, Chapter 6). It applies
+  to the local owner branch and to a forwarded owner-read alike, and the refusal
+  is `RpcError::Unavailable` — so it reaches the caller as the same `503` an
+  unreachable owner produces, for a different reason. `local` reads never enter
+  that branch and stay available (D-10).
 
 ## Admin reads
 
