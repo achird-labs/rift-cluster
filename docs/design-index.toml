@@ -15,8 +15,8 @@
 
 ["docs/decisions/DECISIONS.md"]
 status = "current"
-verified_sha = ""
-verified_on = ""
+verified_sha = "550ea954e"
+verified_on = "2026-08-26"
 code = []
 note = "The register itself; verified by design-check's structural checks rather than by reading."
 
@@ -115,8 +115,8 @@ code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores
 
 ["docs/architecture/10-operations.md"]
 status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "550ea954e"
+verified_on = "2026-08-26"
 code = ["crates/rift-cluster-server/src/cli.rs", "crates/rift-cluster-server/src/probes.rs", "crates/rift-cluster-server/src/readiness.rs", "deploy/**"]
 
 ["docs/architecture/11-upstream-boundary.md"]

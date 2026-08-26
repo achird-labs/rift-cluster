@@ -1345,6 +1345,14 @@ pub struct RedbStateMachine {
     /// its own copy of the file under its own data directory, the same way every replica keeps
     /// its own `redb` file for the tables the files sit beside.
     spool_dir: Option<PathBuf>,
+    /// Where the bytes of a digest-only `SpecPut`/`DatasetPut` come from (#439) — `None` in
+    /// storage tests and on an embedder that never wires one, exactly like `engine`.
+    ///
+    /// Injected rather than owned because this type deliberately has no network of its own:
+    /// `raft::node::PeerBlobSource` is the only thing holding a store, an RPC client and a
+    /// membership view together. Consulted **before** `apply` opens its write transaction —
+    /// see [`RedbStateMachine::resolve_blobs`] for why it cannot be consulted inside one.
+    blob_source: Option<Arc<dyn crate::blobs::BlobSource>>,
 }
 
 impl std::fmt::Debug for RedbStateMachine {
@@ -1355,6 +1363,7 @@ impl std::fmt::Debug for RedbStateMachine {
             .field("journal", &self.journal.get().is_some())
             .field("snapshot_dir", &self.snapshot_dir)
             .field("spool_dir", &self.spool_dir)
+            .field("blob_source", &self.blob_source.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1373,7 +1382,121 @@ impl RedbStateMachine {
             journal: OnceLock::new(),
             audit_retention_secs: DEFAULT_AUDIT_RETENTION_SECS,
             spool_dir: None,
+            blob_source: None,
         }
+    }
+
+    /// Attach the source apply fetches digest-only op payloads from (#439). Same
+    /// before-`Raft::new` contract as [`Self::with_engine`].
+    ///
+    /// Without one, an op whose bytes are not carried has nowhere to get them: apply refuses
+    /// rather than inventing an empty document, because a replica that applied a dataset as
+    /// zero rows while its peers applied the real thing is precisely the divergence the whole
+    /// content-addressing scheme exists to prevent.
+    #[must_use]
+    pub fn with_blob_source(mut self, source: Arc<dyn crate::blobs::BlobSource>) -> Self {
+        self.blob_source = Some(source);
+        self
+    }
+
+    /// Which blobs this batch needs and cannot supply itself (#439), in first-mention order,
+    /// each digest once.
+    ///
+    /// Pure and total: no I/O, no clock, no membership. That is deliberate — it is the half of
+    /// fetch-on-apply that can be exhaustively tested without a fleet, so the fetching half has
+    /// only one job left to get wrong.
+    ///
+    /// An op that still carries its payload contributes nothing, which is what makes replaying
+    /// a pre-#439 log entirely free of network calls.
+    fn required_blobs(entries: &[Entry<TypeConfig>]) -> Vec<(String, u64)> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut required = Vec::new();
+        for entry in entries {
+            let EntryPayload::Normal(request) = &entry.payload else {
+                continue;
+            };
+            // An op `validate` refuses at apply is refused identically on every replica and
+            // never reads its bytes. Resolving them first would turn that per-op refusal into
+            // an apply parked on a blob nobody needs — or, for a digest that is not even hex,
+            // into a fatal storage error — over an op that was going to be refused anyway.
+            if crate::control::validate(&request.op).is_err() {
+                continue;
+            }
+            let (digest, origin) = match &request.op {
+                ControlOp::SpecPut {
+                    meta,
+                    document: None,
+                    origin,
+                    ..
+                } => (meta.digest.as_str(), *origin),
+                ControlOp::DatasetPut {
+                    record,
+                    csv: None,
+                    origin,
+                    ..
+                } => (record.digest.as_str(), *origin),
+                _ => continue,
+            };
+            if seen.insert(digest) {
+                required.push((digest.to_owned(), origin));
+            }
+        }
+        required
+    }
+
+    /// Resolve every digest-only payload in `entries` to its bytes, **before** `apply` opens its
+    /// write transaction.
+    ///
+    /// This is why fetch-on-apply is a pre-pass and not a branch inside the apply arm: a fetch
+    /// is up to 17 network round trips (`BLOB_CHUNK_MAX_BYTES` caps a chunk at 4 MiB regardless
+    /// of what the caller asks for), and holding a redb write transaction across that would
+    /// block every other write on this node — the leadership-costing stall #444 closed.
+    ///
+    /// Returns only once **every** required digest is in hand, so the apply arms downstream
+    /// cannot encounter a missing blob and never have to decide what to do about one.
+    // `StorageError` is openraft's type and not ours to shrink (#424); every other fallible
+    // storage path here returns it through a trait impl, which the lint does not see.
+    #[allow(clippy::result_large_err)]
+    async fn resolve_blobs(
+        &self,
+        entries: &[Entry<TypeConfig>],
+    ) -> StorageResult<HashMap<String, String>> {
+        let required = Self::required_blobs(entries);
+        if required.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let Some(source) = self.blob_source.as_ref() else {
+            return Err(StorageIOError::write_state_machine(&std::io::Error::other(
+                "this batch carries digest-only ops but no blob source is attached; \
+                 the node cannot obtain the bytes they name",
+            ))
+            .into());
+        };
+
+        let mut resolved = HashMap::with_capacity(required.len());
+        for (hex, origin) in required {
+            let digest = crate::blobs::BlobDigest::parse(&hex).map_err(|e| {
+                StorageIOError::write_state_machine(&std::io::Error::other(format!(
+                    "op names an unusable blob digest {hex:?}: {e}"
+                )))
+            })?;
+            let bytes = source.load(&digest, origin).await.map_err(|e| {
+                StorageIOError::write_state_machine(&std::io::Error::other(format!(
+                    "fetching blob {hex}: {e}"
+                )))
+            })?;
+            // Both payloads are `String` on the op and `&str` in their tables, and the front
+            // door refuses a non-UTF-8 body before either op is minted. A blob that is not
+            // UTF-8 here therefore means the transport handed back something that is not the
+            // document it claims to be — refuse rather than lossily convert.
+            let text = String::from_utf8(bytes).map_err(|e| {
+                StorageIOError::write_state_machine(&std::io::Error::other(format!(
+                    "blob {hex} is not UTF-8: {e}"
+                )))
+            })?;
+            resolved.insert(hex, text);
+        }
+        Ok(resolved)
     }
 
     /// Set the audit retention window. Same before-`Raft::new` contract as
@@ -4573,6 +4696,12 @@ impl RedbStateMachine {
         // (RFC-005 D1, #285) — `None` in storage tests and on an embedder that never attached
         // one, matching every other node-local handle threaded through here.
         spool_dir: Option<&Path>,
+        // Bytes for the digest-only ops in this batch, resolved by `apply` *before* the write
+        // transaction opened (#439) — keyed by digest hex. Empty when every op in the batch
+        // carries its own payload, which is the case for any pre-#439 entry being replayed.
+        // Threaded in rather than fetched here because a fetch is network I/O and this runs
+        // inside a redb write transaction.
+        blobs: &HashMap<String, String>,
         op: &ControlOp,
         index: u64,
         issued_at_secs: u64,
@@ -5688,7 +5817,26 @@ impl RedbStateMachine {
                 id,
                 meta,
                 document,
+                origin: _,
             } => {
+                // The document either rides the op (a pre-#439 entry) or was resolved into
+                // `blobs` before this transaction opened. Absent from both is not a case to
+                // paper over with a default: this op is already *committed*, so writing an
+                // empty document here would diverge this replica from every peer that had the
+                // bytes. `apply` is what guarantees the entry exists; this is the assertion.
+                let Some(document) = document
+                    .as_deref()
+                    .or_else(|| blobs.get(meta.digest.as_str()).map(String::as_str))
+                else {
+                    return Err(StorageIOError::write_state_machine(&std::io::Error::other(
+                        format!(
+                            "spec {id:?} names blob {} but neither the op nor the pre-apply \
+                             resolution carries it",
+                            meta.digest.as_str()
+                        ),
+                    ))
+                    .into());
+                };
                 // Read before the row is overwritten: this is the digest the record is about to
                 // stop naming, which is exactly what the GC pass below needs to check.
                 let previous = Self::stored_spec(specs, tenant.as_str(), id)?;
@@ -5710,7 +5858,7 @@ impl RedbStateMachine {
                 // sha256, so a hit means the bytes already stored are these bytes.
                 if spec_blobs.get(meta.digest.as_str()).map_err(io)?.is_none() {
                     spec_blobs
-                        .insert(meta.digest.as_str(), document.as_str())
+                        .insert(meta.digest.as_str(), document)
                         .map_err(io)?;
                 }
                 // A digest change may have orphaned the old blob. Checked *after* the row above
@@ -5813,7 +5961,26 @@ impl RedbStateMachine {
                 tenant,
                 record,
                 csv,
+                origin: _,
             } => {
+                // Same rule as `SpecPut` above: carried by a pre-#439 entry, or resolved into
+                // `blobs` before this transaction opened. Never defaulted — the op is committed,
+                // and an empty CSV here would be this replica silently disagreeing with every
+                // peer that held the bytes.
+                let Some(csv) = csv
+                    .as_deref()
+                    .or_else(|| blobs.get(record.digest.as_str()).map(String::as_str))
+                else {
+                    return Err(StorageIOError::write_state_machine(&std::io::Error::other(
+                        format!(
+                            "dataset {:?} names blob {} but neither the op nor the pre-apply \
+                             resolution carries it",
+                            record.name,
+                            record.digest.as_str()
+                        ),
+                    ))
+                    .into());
+                };
                 let quotas = match Self::quotas_for(tenants, tenant.as_str())? {
                     Ok(quotas) => quotas,
                     Err(reason) => return Ok(Err(reason)),
@@ -5876,7 +6043,7 @@ impl RedbStateMachine {
                     .is_none()
                 {
                     dataset_blobs
-                        .insert(record.digest.as_str(), csv.as_str())
+                        .insert(record.digest.as_str(), csv)
                         .map_err(io)?;
                 }
                 let stored = StoredDataset {
@@ -6552,6 +6719,13 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
     {
         let mut applied = self.read_applied()?;
 
+        // #439: collected rather than streamed so the batch can be inspected before any of it
+        // is applied. Every digest-only op's bytes are obtained here, outside the write
+        // transaction opened below — see `resolve_blobs`. Doing it for the whole batch up front
+        // is also what stops a batch half-applying when a later op's blob is the slow one.
+        let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
+        let blobs = self.resolve_blobs(&entries).await?;
+
         let entries_iter = entries.into_iter();
         let mut responses = Vec::with_capacity(entries_iter.size_hint().0);
         let mut engine_actions = Vec::new();
@@ -6717,6 +6891,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut proxy_recorded,
                                         journal.as_deref(),
                                         self.spool_dir.as_deref(),
+                                        &blobs,
                                         &request.op,
                                         log_id.index,
                                         applied.logical_clock_secs,
@@ -6742,6 +6917,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut proxy_recorded,
                                     journal.as_deref(),
                                     self.spool_dir.as_deref(),
+                                    &blobs,
                                     &request.op,
                                     log_id.index,
                                     applied.logical_clock_secs,
@@ -7507,6 +7683,7 @@ mod tests {
                 format: SpecFormat::Json,
                 digest: Digest::new(digest.to_owned()),
                 source: SpecSource::Inline,
+                size: 0,
             },
             revision: 1,
         })
@@ -11032,8 +11209,10 @@ mod tests {
                     format: SpecFormat::Json,
                     digest: spec_digest(document),
                     source: SpecSource::Inline,
+                    size: document.len() as u64,
                 },
-                document: document.to_owned(),
+                document: Some(document.to_owned()),
+                origin: 0,
             },
         )
     }
@@ -11553,7 +11732,8 @@ mod tests {
                     rows,
                     bytes: csv.len() as u64,
                 },
-                csv: csv.to_owned(),
+                csv: Some(csv.to_owned()),
+                origin: 0,
             },
         )
     }
@@ -14651,5 +14831,253 @@ mod tests {
         );
 
         engine.shutdown().await;
+    }
+
+    // ---- #439: digest-only ops resolve their bytes before the transaction (D-23, D-49) ----
+
+    /// A `BlobSource` that answers from a map and counts how often it was asked. The real one
+    /// never returns `NotFound` — it retries forever (D-48) — so this fake is also how the
+    /// "source failed for an unfixable reason" branch of `resolve_blobs` gets exercised.
+    struct MapSource {
+        blobs: std::collections::HashMap<String, Vec<u8>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MapSource {
+        fn holding(csv: &str) -> Arc<Self> {
+            let mut blobs = std::collections::HashMap::new();
+            blobs.insert(
+                dataset_digest(csv).as_str().to_owned(),
+                csv.as_bytes().to_vec(),
+            );
+            Arc::new(Self {
+                blobs,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::blobs::BlobSource for MapSource {
+        fn load<'a>(
+            &'a self,
+            digest: &'a crate::blobs::BlobDigest,
+            _origin: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<u8>, crate::blobs::BlobError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let found = self.blobs.get(digest.as_str()).cloned();
+            Box::pin(async move { found.ok_or(crate::blobs::BlobError::NotFound) })
+        }
+    }
+
+    /// `dataset_put`, with the bytes taken off the op and `origin` stamped — the shape the
+    /// admin front submits once a quorum holds the blob (D-49).
+    fn digest_only_dataset_put(op_id: u128, name: &str, csv: &str, origin: u64) -> ControlRequest {
+        let mut request = dataset_put(op_id, name, csv);
+        if let ControlOp::DatasetPut {
+            csv,
+            origin: accepted_by,
+            ..
+        } = &mut request.op
+        {
+            *csv = None;
+            *accepted_by = origin;
+        }
+        request
+    }
+
+    fn digest_only_spec_put(op_id: u128, id: &str, document: &str, origin: u64) -> ControlRequest {
+        let mut request = spec_put_as(op_id, DEFAULT_TENANT, id, document);
+        if let ControlOp::SpecPut {
+            document,
+            origin: accepted_by,
+            ..
+        } = &mut request.op
+        {
+            *document = None;
+            *accepted_by = origin;
+        }
+        request
+    }
+
+    /// Pure and total: the half of fetch-on-apply that needs no fleet to test exhaustively.
+    #[test]
+    fn required_blobs_lists_each_missing_digest_once_in_first_mention_order() {
+        let customers = dataset_digest(CUSTOMERS).as_str().to_owned();
+        let spec = digest_only_spec_put(2, "orders", "{}", 8);
+        let ControlOp::SpecPut { meta, .. } = &spec.op else {
+            unreachable!("built as SpecPut")
+        };
+        let spec_digest = meta.digest.as_str().to_owned();
+
+        let entries = [
+            entry(1, digest_only_dataset_put(1, "customers", CUSTOMERS, 7)),
+            entry(2, spec),
+            // The same digest again, under another name and origin: listed once, first origin.
+            entry(
+                3,
+                digest_only_dataset_put(3, "customers-copy", CUSTOMERS, 9),
+            ),
+            // Carries its bytes (a pre-#439 entry): contributes nothing.
+            entry(4, dataset_put(4, "orders-carried", ORDERS_CSV)),
+        ];
+
+        assert_eq!(
+            RedbStateMachine::required_blobs(&entries),
+            vec![(customers, 7), (spec_digest, 8)]
+        );
+    }
+
+    /// Pins D-49: apply sources the bytes from the resolution, writes the spool file from them,
+    /// and records the dataset exactly as a carried put would.
+    #[tokio::test]
+    async fn a_digest_only_dataset_put_applies_from_the_fetched_bytes_and_materialises_its_spool() {
+        let (_td, sm, spool) = fresh_sm_with_spool().await;
+        let source = MapSource::holding(CUSTOMERS);
+        let mut sm = sm.with_blob_source(source.clone());
+
+        let response = apply_one(
+            &mut sm,
+            1,
+            digest_only_dataset_put(1, "customers", CUSTOMERS, 7),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+
+        let stored = one_dataset(&sm, "customers");
+        assert_eq!(stored.digest, dataset_digest(CUSTOMERS).as_str());
+        assert_eq!(
+            std::fs::read(spool_file(&spool, CUSTOMERS)).expect("spool file"),
+            CUSTOMERS.as_bytes()
+        );
+        assert_eq!(source.calls(), 1);
+    }
+
+    /// A pre-#439 entry — bytes on the op — never touches the source: replaying an old log
+    /// costs no network calls.
+    #[tokio::test]
+    async fn a_carried_payload_never_asks_the_blob_source() {
+        let (_td, sm, _spool) = fresh_sm_with_spool().await;
+        let source = MapSource::holding(CUSTOMERS);
+        let mut sm = sm.with_blob_source(source.clone());
+
+        let response = apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert_eq!(source.calls(), 0);
+    }
+
+    /// Two ops naming one digest in a batch: fetched once, both applied.
+    #[tokio::test]
+    async fn a_batch_naming_one_digest_twice_asks_the_source_once() {
+        let (_td, sm, _spool) = fresh_sm_with_spool().await;
+        let source = MapSource::holding(CUSTOMERS);
+        let mut sm = sm.with_blob_source(source.clone());
+
+        let responses = sm
+            .apply([
+                entry(1, digest_only_dataset_put(1, "a", CUSTOMERS, 7)),
+                entry(2, digest_only_dataset_put(2, "b", CUSTOMERS, 7)),
+            ])
+            .await
+            .expect("apply");
+        assert!(
+            responses
+                .iter()
+                .all(|r| r.outcome == ControlOutcome::Applied)
+        );
+        assert_eq!(source.calls(), 1);
+        one_dataset(&sm, "a");
+        one_dataset(&sm, "b");
+    }
+
+    /// No source attached is not "apply an empty document": it is a storage error, because a
+    /// replica that applied zero rows while its peers applied the real ones has diverged.
+    #[tokio::test]
+    async fn a_digest_only_op_with_no_blob_source_attached_is_a_storage_error() {
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        let result = sm
+            .apply([entry(
+                1,
+                digest_only_dataset_put(1, "customers", CUSTOMERS, 7),
+            )])
+            .await;
+        assert!(result.is_err(), "must refuse loudly, got {result:?}");
+        assert!(
+            sm.dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_none(),
+            "nothing may be recorded for an op whose bytes were never obtained"
+        );
+    }
+
+    /// A source failure the retry loop cannot fix propagates; it is never defaulted.
+    #[tokio::test]
+    async fn a_source_failure_fails_the_apply_rather_than_applying_nothing() {
+        let (_td, sm, _spool) = fresh_sm_with_spool().await;
+        // Holds a different blob than the op names.
+        let source = MapSource::holding(ORDERS_CSV);
+        let mut sm = sm.with_blob_source(source.clone());
+        let result = sm
+            .apply([entry(
+                1,
+                digest_only_dataset_put(1, "customers", CUSTOMERS, 7),
+            )])
+            .await;
+        assert!(result.is_err(), "got {result:?}");
+        assert_eq!(source.calls(), 1);
+    }
+
+    /// An op `validate` will refuse never has its blob resolved: the refusal is per-op and
+    /// deterministic, and fetching for it could park the node — or, for a digest that is not
+    /// hex, kill the state machine — over an op nobody will apply.
+    #[test]
+    fn required_blobs_skips_an_op_validate_will_refuse() {
+        let mut refused = digest_only_dataset_put(1, "customers", CUSTOMERS, 7);
+        if let ControlOp::DatasetPut { record, .. } = &mut refused.op {
+            record.digest = Digest::new("NOTHEX");
+        }
+        assert_eq!(
+            RedbStateMachine::required_blobs(&[entry(1, refused)]),
+            Vec::<(String, u64)>::new()
+        );
+    }
+
+    /// A batch never half-applies: when a later op's blob cannot be resolved, the earlier op —
+    /// whose blob *was* available — is not committed either. The resolution runs for the whole
+    /// batch before the transaction opens.
+    #[tokio::test]
+    async fn a_batch_with_one_unresolvable_blob_applies_nothing() {
+        let (_td, sm, _spool) = fresh_sm_with_spool().await;
+        // Holds `CUSTOMERS` but not `ORDERS_CSV`.
+        let source = MapSource::holding(CUSTOMERS);
+        let mut sm = sm.with_blob_source(source.clone());
+
+        let result = sm
+            .apply([
+                entry(1, digest_only_dataset_put(1, "customers", CUSTOMERS, 7)),
+                entry(2, digest_only_dataset_put(2, "orders", ORDERS_CSV, 7)),
+            ])
+            .await;
+        assert!(result.is_err(), "got {result:?}");
+        assert!(
+            sm.dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_none(),
+            "the resolvable op must not have committed alone"
+        );
+        assert_eq!(
+            source.calls(),
+            2,
+            "both were asked before anything was written"
+        );
     }
 }

@@ -20,8 +20,9 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
 use prometheus::{
-    Gauge, GaugeVec, Histogram, IntCounter, IntCounterVec, register_gauge, register_gauge_vec,
-    register_histogram, register_int_counter, register_int_counter_vec,
+    Gauge, GaugeVec, Histogram, IntCounter, IntCounterVec, IntGauge, register_gauge,
+    register_gauge_vec, register_histogram, register_int_counter, register_int_counter_vec,
+    register_int_gauge,
 };
 
 use crate::raft::{Ring, StatusReport};
@@ -66,6 +67,27 @@ lazy_static! {
         "1 when the fleet has no principal defined at all"
     )
     .expect("rift_cluster_no_principals registers once");
+
+    // -- sideloaded blobs (#439, D-48) ---------------------------------------
+
+    /// `rift_cluster_blob_fetch_stalled` — `1` while this node's apply is parked on a
+    /// sideloaded blob no member can supply; `0` otherwise. The metric form of
+    /// `/_cluster/health`'s `blob_fetch_stall`. Degraded, not not-ready: the node stays in
+    /// the load balancer, and every committed write behind the parked entry is unapplied
+    /// on it until a holder returns.
+    static ref BLOB_FETCH_STALLED: IntGauge = register_int_gauge!(
+        "rift_cluster_blob_fetch_stalled",
+        "1 while apply is parked on a blob no member can supply"
+    )
+    .expect("rift_cluster_blob_fetch_stalled registers once");
+
+    /// `rift_cluster_blob_fetch_stalls_total` — one per stall onset. Rising on a fleet with
+    /// no partition says a blob is being reaped before its op commits — the #438 pin failing.
+    static ref BLOB_FETCH_STALLS: IntCounter = register_int_counter!(
+        "rift_cluster_blob_fetch_stalls_total",
+        "Blob fetches that went unsatisfied past the escalation window"
+    )
+    .expect("rift_cluster_blob_fetch_stalls_total registers once");
 
     // -- config-sync (issue #9) ---------------------------------------------
 
@@ -592,6 +614,17 @@ pub(crate) fn intent_unparked() {
 
 pub fn intent_replayed() {
     INTENTS_REPLAYED.inc();
+}
+
+/// A blob fetch crossed the escalation window (#439, D-48). Counted once per stall.
+pub(crate) fn blob_fetch_stalled() {
+    BLOB_FETCH_STALLED.set(1);
+    BLOB_FETCH_STALLS.inc();
+}
+
+/// The stalled fetch was satisfied; apply resumes.
+pub(crate) fn blob_fetch_recovered() {
+    BLOB_FETCH_STALLED.set(0);
 }
 
 /// Resample the pending-intents depth from the ledger itself. The inc/dec pair

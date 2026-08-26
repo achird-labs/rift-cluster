@@ -13,12 +13,14 @@
 //! an opaque string body); they are wiped, not migrated — the format changed
 //! before any release shipped.
 
+pub(crate) mod blob_source;
 pub mod identity;
 pub(crate) mod network;
 pub mod node;
 pub mod ring;
 pub(crate) mod store;
 
+pub use blob_source::BlobFetchStall;
 pub use identity::NodeIdentity;
 pub use node::{
     JoinOutcome, JoinedAs, LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport,

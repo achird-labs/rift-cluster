@@ -158,6 +158,12 @@ async fn fleet_health(node: &Arc<RaftNode>, readiness: &Readiness) -> FleetBody 
     }
 
     let mut total = mine;
+    // This node's own row, read off the body just built (the same never-disagree rule as
+    // `mine` above), then one per stalled voter (#439, D-48).
+    let mut stalls: Vec<serde_json::Value> = Vec::new();
+    if let PeerStall::Stalled(row) = peer_stall_row(me, &value) {
+        stalls.push(row);
+    }
     let mut unanswered = 0usize;
     let drained = tokio::time::timeout(MEMBER_PEER_BUDGET, async {
         while let Some(joined) = set.join_next().await {
@@ -170,6 +176,19 @@ async fn fleet_health(node: &Arc<RaftNode>, readiness: &Readiness) -> FleetBody 
                         // unknown, which makes the sum a floor exactly as an unreachable peer does.
                         unanswered += 1;
                         tracing::warn!(peer, "health fan-out: peer reported no parked depth");
+                    }
+                    match peer_stall_row(peer, &reply) {
+                        PeerStall::Healthy => {}
+                        PeerStall::Stalled(row) => stalls.push(row),
+                        PeerStall::Unknown => {
+                            // An old build omits the key; a malformed object is not a stall
+                            // either. Both are "unknown", which makes the list a floor.
+                            unanswered += 1;
+                            tracing::warn!(
+                                peer,
+                                "health fan-out: peer reports no blob_fetch_stall"
+                            );
+                        }
                     }
                 }
                 Ok((peer, Err(e))) => {
@@ -193,10 +212,54 @@ async fn fleet_health(node: &Arc<RaftNode>, readiness: &Readiness) -> FleetBody 
     let timed_out = drained.is_err();
     if let Some(map) = value.as_object_mut() {
         map.insert("parked_intents_fleet".to_owned(), serde_json::json!(total));
+        map.insert(
+            "blob_fetch_stalls_fleet".to_owned(),
+            serde_json::Value::Array(stalls),
+        );
     }
     FleetBody {
         value,
         partial: timed_out || unanswered > 0,
+    }
+}
+
+/// One voter's `blob_fetch_stall`, as the fleet roll-up reads it (#439, D-48).
+#[derive(Debug, PartialEq, Eq)]
+enum PeerStall {
+    /// The key is present and `null`: this build reports stalls and has none.
+    Healthy,
+    /// A `blob_fetch_stalls_fleet` row.
+    Stalled(serde_json::Value),
+    /// The key is absent (an old build) or its object lacks a required field. Not a stall,
+    /// and — deliberately — not healthy either: the caller counts it toward `Rift-Cluster-Partial`.
+    Unknown,
+}
+
+/// Fold one `/_cluster/health` body into a `blob_fetch_stalls_fleet` row for `peer`.
+///
+/// Extracted for the same reason as [`add_peer_depth`]: every wire test here runs a solo
+/// node, so the answering-peer arm of the fan-out is otherwise reachable by no test at all.
+/// Absent key and malformed object both collapse to [`PeerStall::Unknown`] because they mean
+/// the same thing to the list — this voter's state is not known — and reading either as
+/// "healthy" would let a stalled old-build node hide behind the roll-up.
+fn peer_stall_row(peer: u64, reply: &serde_json::Value) -> PeerStall {
+    match reply.get("blob_fetch_stall") {
+        None => PeerStall::Unknown,
+        Some(serde_json::Value::Null) => PeerStall::Healthy,
+        Some(stall) => {
+            let digest = stall.get("digest").and_then(serde_json::Value::as_str);
+            let secs = stall
+                .get("stalled_for_secs")
+                .and_then(serde_json::Value::as_u64);
+            match (digest, secs) {
+                (Some(digest), Some(secs)) => PeerStall::Stalled(serde_json::json!({
+                    "node_id": peer.to_string(),
+                    "digest": digest,
+                    "stalled_for_secs": secs,
+                })),
+                _ => PeerStall::Unknown,
+            }
+        }
     }
 }
 
@@ -673,5 +736,58 @@ mod tests {
         let (total, usable) = add_peer_depth(10, None);
         assert_eq!(total, 10);
         assert!(!usable);
+    }
+
+    // ---- #439: blob_fetch_stall roll-up (D-48) ----
+
+    /// An old build omits the key. That is unknown, not healthy — otherwise a stalled
+    /// old-build node would hide behind the roll-up.
+    #[test]
+    fn a_peer_without_the_stall_key_is_unknown_not_healthy() {
+        assert_eq!(
+            peer_stall_row(2, &serde_json::json!({ "ready": true })),
+            PeerStall::Unknown
+        );
+    }
+
+    #[test]
+    fn a_null_stall_is_healthy() {
+        assert_eq!(
+            peer_stall_row(2, &serde_json::json!({ "blob_fetch_stall": null })),
+            PeerStall::Healthy
+        );
+    }
+
+    #[test]
+    fn a_stalled_peer_yields_a_fleet_row_keyed_by_its_id() {
+        let reply = serde_json::json!({
+            "blob_fetch_stall": {
+                "digest": "ab12",
+                "stalled_for_secs": 41,
+                "origin": "1",
+                "tried": ["1", "3"],
+                "skewed": [],
+            }
+        });
+        assert_eq!(
+            peer_stall_row(2, &reply),
+            PeerStall::Stalled(serde_json::json!({
+                "node_id": "2",
+                "digest": "ab12",
+                "stalled_for_secs": 41,
+            }))
+        );
+    }
+
+    /// A stall object missing a required field is not a stall and not healthy either.
+    #[test]
+    fn a_malformed_stall_object_is_unknown() {
+        assert_eq!(
+            peer_stall_row(
+                2,
+                &serde_json::json!({ "blob_fetch_stall": { "digest": "ab12" } })
+            ),
+            PeerStall::Unknown
+        );
     }
 }

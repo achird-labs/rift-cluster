@@ -762,6 +762,48 @@ fn mtime_secs_of(modified: std::time::SystemTime, now_secs: u64) -> u64 {
         .map_or(now_secs, |d| d.as_secs())
 }
 
+/// How the state machine obtains blob bytes this node does not hold (#439).
+///
+/// The seam exists because [`crate::raft::store::RedbStateMachine`] has no network of its own
+/// and should keep it that way — the live implementation (`raft::node::PeerBlobSource`) is the
+/// only thing that owns a store, an RPC client and a membership view at once. Tests substitute
+/// a fake and drive every branch without a fleet.
+///
+/// Returns a boxed future rather than using `async fn` so the trait stays `dyn`-compatible; the
+/// state machine holds it as `Option<Arc<dyn BlobSource>>`, matching how `engine` and `routes`
+/// are already injected there.
+pub trait BlobSource: Send + Sync + 'static {
+    /// Return `digest`'s bytes, fetching them from `origin` first and then any other member if
+    /// this node does not already hold them.
+    ///
+    /// **`Ok` always carries the real bytes.** There is deliberately no "absent but fine"
+    /// success: the caller applies a committed log entry against them, so a success that did
+    /// not produce them would be a silent divergence between replicas. Returning the bytes
+    /// rather than merely staging them is what keeps the state machine free of both a store
+    /// handle and any file I/O inside its write transaction.
+    ///
+    /// Blocks until the bytes are in hand. When no member answers it does **not** give up — it
+    /// keeps retrying, escalating to an error-level log, a counter and a degraded health signal
+    /// once [`BLOB_FETCH_ESCALATE_AFTER`] has passed, and returns as soon as some holder comes
+    /// back. The alternative — failing the apply — is fatal to the openraft state machine, so a
+    /// partition longer than any bound would take a healthy node down with no self-heal.
+    ///
+    /// `Err` is therefore reserved for failures retrying cannot fix: a malformed digest, or a
+    /// local filesystem failure on bytes that were successfully fetched.
+    fn load<'a>(
+        &'a self,
+        digest: &'a BlobDigest,
+        origin: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, BlobError>> + Send + 'a>>;
+}
+
+/// How long a blob fetch may go unsatisfied before it stops being a routine retry and starts
+/// being reported as a fault — error-level log, counter, degraded health.
+///
+/// Not a give-up bound: nothing gives up. It is the point at which "a peer is briefly busy"
+/// stops being a plausible explanation and an operator should be looking.
+pub const BLOB_FETCH_ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[cfg(test)]
 mod tests {
     use super::*;

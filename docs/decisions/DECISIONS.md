@@ -300,7 +300,9 @@ acknowledges the digest, so a commit implies quorum-durability — the guarantee
 provided while the bytes were still on it. **Until D-23 (#439) lands** the guarantee at commit is
 quorum-completeness, not every-member completeness — a member the fan-out did not reach still
 receives the bytes from the log entry, so nothing is lost, but "every member holds every live
-blob" is the target state, not yet the invariant.
+blob" is the target state, not yet the invariant. *As of #439 it is the invariant:* a member the
+fan-out did not reach fetches the blob on apply (D-48), so completeness is the write path plus
+fetch-on-apply, and a member that cannot fetch parks rather than diverges.
 
 *Rejected:* object-store tiering of the corpus (evict cold datasets locally, fetch from a bucket
 on demand). A bucket outage, credential rotation or lifecycle deletion becomes a request-path
@@ -386,8 +388,8 @@ correct and each failed for this unmeasured reason. Instrument both ends before 
 - **Status:** pending
 - **Decided:** 2026-08-24 · #432 (epic), RCA "Bytes on the Log"
 - **Amends:** RFC-005 §3.2, RFC-004 §4.1
-- **Implemented by:** #436, #437, #438, #439 (open), #440 (open), #441 (open)
-- **Code:** crates/rift-cluster/src/blobs/mod.rs
+- **Implemented by:** #436, #437, #438, #439, #440 (open), #441 (open)
+- **Code:** crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/raft/blob_source.rs
 
 RFC-004/005 put 4–64 MiB blobs through a Raft log and snapshot whose timers, health tracker,
 snapshot encoding and admission protocol all assume KiB entries; openraft 0.9 opens a silent
@@ -401,6 +403,9 @@ and a follower that lacks it fetches (origin first, then any member) before appl
 are manifests of digests. RFC-005's ordering argument survives intact — log order still
 guarantees the bytes are on disk before any config referencing them applies. Do not re-argue the
 reversal; #441 revises the prose.
+
+Refined by D-48 (what a node does when no member can supply a blob) and D-49 (the wire shape
+that keeps every existing log replayable, and where the bytes leave the op).
 
 ### D-24 — The cluster maintains itself: no snapshot or log-compaction admin actions
 - **Status:** active
@@ -718,3 +723,64 @@ cross-node sequencing should carry an explicit `id`.
 
 *Deferred, not done:* the peek-amplification benchmark RFC-001 §11.3 asks Phase 4 for, and a
 container chaos scenario — both additive verification on a working feature (#476).
+
+### D-48 — A blob no member can supply parks apply and reports degraded; the node never halts
+- **Status:** active
+- **Decided:** 2026-08-25 · #439 (user ruling)
+- **Implemented by:** #439
+- **Code:** crates/rift-cluster/src/raft/blob_source.rs, crates/rift-cluster-server/src/cluster_api.rs, crates/rift-cluster-server/src/fleet.rs
+
+Refines D-23. Fetch-on-apply asks the write's origin first, then every other joint voter
+(D-19's set — the one no single membership change can empty), and **never gives up**: after
+`BLOB_FETCH_ESCALATE_AFTER` (30 s) the node logs at error level, sets
+`rift_cluster_blob_fetch_stalled` to `1`, counts `rift_cluster_blob_fetch_stalls_total`, and
+reports the stall on `/_cluster/health` as `blob_fetch_stall` (`/_fleet/health` rolls it up as
+`blob_fetch_stalls_fleet`) — then keeps asking, with capped backoff, and clears all of it the
+moment a holder returns.
+
+**Degraded is not not-ready.** `ready` and `state` are untouched and the node stays in the load
+balancer: pulling it would only widen whatever partition caused the stall. Every committed write
+behind the parked entry is unapplied on that node until it clears, which is the failure mode
+D-18's rejected alternative names — made visible rather than silent.
+
+*Rejected:* the issue's original `StorageError` after a bounded retry. An error out of `apply` is
+fatal to the openraft state machine, so a partition longer than the bound would take a healthy
+node down with no self-heal. *Also rejected:* refusing the op (`Ok(Err(..))`) — the entry is
+already committed and "do I have these bytes" is node-local, so holders would apply and
+non-holders refuse, which is replica divergence. A peer whose build cannot serve blobs at all
+(`UnknownRoute`/`VersionSkew`, both 404 on the wire) is reported as *skewed*, separately from
+one that merely lacks the blob, so an upgrade in progress is not misread as a partition; and a
+peer that *refused* (credential, request shape, mismatched bytes) has its refusal carried on the
+stall as `last_error`, never flattened into "no member holds the blob".
+
+The retry loop is entered from the **replay path too**: `compose::drain_parked_intents` runs a
+parked blob write through the same fan-out-then-strip as a fresh one (D-49), so a replay never
+puts the payload back on the log.
+
+### D-49 — Payload fields stay optional on the wire; the bytes leave the op at submit, after the quorum
+- **Status:** active
+- **Decided:** 2026-08-25 · #439
+- **Implemented by:** #439
+- **Code:** crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster-server/src/admin_front.rs
+
+Refines D-23. `SpecPut.document` and `DatasetPut.csv` become `Option<String>` with
+`#[serde(default)]`, plus `origin: NodeId` — **not removed**. Raft log entries are plain
+`serde_json` with no envelope version, so every `SpecPut`/`DatasetPut` already committed in
+every existing cluster carries these fields; a build that could not deserialize them could not
+replay its own log. `Some` therefore means "a pre-#439 entry" and applies exactly as before,
+with no fetch; `None` is everything this build writes. `SpecMeta` gains `size`, because the
+quota was measured from the very bytes that are leaving.
+
+**The strip happens at submit, not at mint.** Ops reach the admin front carrying their bytes, so
+`control::validate` still proves digest⇔bytes on the full op there; `fan_out_then_submit` fans
+the bytes out, and only once a joint quorum holds them (D-19) strips the payload, stamps
+`origin`, and submits — while holding the GC pin, and owning the submit so no caller is ever
+handed a guard it could drop early (#438's disclosed pin-hold gap, closed structurally). The
+parked intent is the un-stripped copy, so a replay re-fans. A minted entry is < 4 KiB.
+
+**Fetch-on-apply is a pre-transaction pass.** `apply` opens one redb write transaction for the
+whole batch; a fetch is up to 17 round trips and holding the transaction across it would block
+every other write — the leadership-costing stall #444 closed. So every digest-only op's bytes
+are resolved *before* `begin_write()`, and the apply arms treat absent-from-both-op-and-resolution
+as a hard error rather than a default: a replica that applied an empty document while its peers
+applied the real one is exactly the divergence content addressing exists to prevent.

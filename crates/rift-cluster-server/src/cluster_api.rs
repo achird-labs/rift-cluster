@@ -456,6 +456,19 @@ pub(crate) fn health_body(node: &RaftNode, readiness: &Readiness) -> serde_json:
             .parked_intent_count()
             .inspect_err(|e| tracing::warn!(error = %e, "health serves without a parked-intent depth"))
             .ok(),
+        // #439, D-48: non-null while this node's apply is parked on a sideloaded blob no member
+        // can supply. Always present on this build, so a peer that *omits* the key is an old
+        // build, not a healthy one — the fleet roll-up in `fleet.rs` relies on that. Degraded,
+        // not not-ready: `ready` and `state` above are untouched, because pulling the node from
+        // the load balancer would only widen whatever partition caused the stall.
+        "blob_fetch_stall": node.blob_fetch_stall().map(|stall| serde_json::json!({
+            "digest": stall.digest,
+            "stalled_for_secs": stall.stalled_for().as_secs(),
+            "origin": node_id(stall.origin),
+            "tried": stall.tried.iter().map(node_id).collect::<Vec<_>>(),
+            "skewed": stall.skewed.iter().map(node_id).collect::<Vec<_>>(),
+            "last_error": stall.last_error,
+        })),
         "ring": {
             // `m_idx` is an epoch counter — a magnitude, and small. The members are ids; see
             // `node_id` for why those are strings.

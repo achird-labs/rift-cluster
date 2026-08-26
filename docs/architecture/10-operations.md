@@ -104,7 +104,7 @@ flowchart TB
 | `GET /_cluster/ring?key=…` | computed owner + m_idx — "who owns this flow right now". *Designed (RFC-001 §10, phase 2); not served by this build* |
 | `GET /_cluster/kv/:flow_id` | owner value vs local replica — the *why is my scenario stuck* endpoint. *Designed (RFC-001 §10, phase 2); not served by this build* |
 | `GET /_cluster/ops/:op_id` | intent state: pending / applied / failed (Chapter 4) |
-| `GET /_cluster/health` | rolled-up diagnostics |
+| `GET /_cluster/health` | rolled-up diagnostics — including `blob_fetch_stall`, non-`null` while this node's apply is parked on a sideloaded blob it cannot fetch from any member (#439). The fleet projection `GET /_fleet/health` adds `blob_fetch_stalls_fleet`, one row per stalled voter. A stall is *degraded*, not *not-ready*: the node stays in the load balancer and self-heals when a holder returns, but every committed write behind the parked entry is unapplied on that node until it does |
 | `GET /_cluster/route-hits` | this node's per-route dispatch counts, in memory since process start — the node-local input the admin port's `GET /front-door/route-hits` sums across the fleet |
 
 **Metrics that page** (Prometheus, served by the standard metrics port).
@@ -124,6 +124,15 @@ first group, and `scripts/check-observability-families.sh` enforces that.
 `rift_cluster_audit_export_*` family, and
 `rift_cluster_source_scheduler_read_failures_total` /
 `rift_cluster_source_scheduler_corrupt_rows`.
+
+*Registered by #439, alert threshold still to be chosen:*
+`rift_cluster_blob_fetch_stalled` (gauge, `1` while this node's apply is parked
+on a blob no member can supply — the metric form of `blob_fetch_stall` above;
+`stalled for > 5m` is the obvious rule, and a stall that outlives every
+plausible transient is a lost blob, which is an operator's problem, not a
+retry's) and `rift_cluster_blob_fetch_stalls_total` (counter, one per stall
+onset — a rising count on a fleet with no partitions says a blob is being
+reaped before its op commits, which is the #438 pin failing).
 
 *Registered, but not alerted on:* `rift_cluster_flow_wal_lag_ops` (async
 durability backlog). It is a legitimate paging signal, but it appears in
@@ -176,6 +185,17 @@ crashes on genuinely new required semantics), and graceful leave means no
 election and no ownership guess per step. Sequence cursors still reset on
 ownership moves (D-8) — schedule upgrades between test runs, stated in the
 docs rather than discovered in one.
+
+**Sideloaded blobs (#439, D-49): upgrade the whole fleet before the first
+dataset or spec write on the new build.** A new node replays every entry an
+old build wrote — the payload fields stayed on the wire, optional — but the
+reverse does not hold: an old build cannot deserialize a digest-only
+`DatasetPut`/`SpecPut` and fails closed at apply. Reads and every other
+write are unaffected during the roll; it is only a sideloaded write landing
+on a mixed fleet that an old member cannot follow. A member whose build
+cannot serve blobs is reported as *skewed* in the fan-out refusal and in
+`blob_fetch_stall`, distinct from a partition, so a half-finished roll reads
+as what it is.
 
 ## Sizing rules of thumb
 

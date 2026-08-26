@@ -373,6 +373,9 @@ pub struct RaftNode {
     // machine. `blobs()` exposes it read-write to whatever composes routes on
     // top of it; #438/#439 are the first such callers.
     blobs: Arc<crate::blobs::BlobStore>,
+    // The live fetch-on-apply source (#439, D-23). Held so `/_cluster/health` can
+    // read the stall it reports (D-48); the state machine holds its own handle.
+    blob_source: Arc<super::blob_source::PeerBlobSource>,
     // Periodic GC sweep over `blobs`. Aborted on shutdown/drop, same as
     // `server_task` — nothing about it needs the graceful-drain treatment
     // `spawn_promotion_loop` gets, since it touches no Raft state.
@@ -685,7 +688,6 @@ impl RaftNode {
         // Dataset blobs materialise under the node's own data directory (RFC-005 D1, #285),
         // beside `RAFT_DB_FILE` — node-local derived state, not itself part of the redb file.
         let state_machine = state_machine.with_spool_dir(config.data_dir.join("datasets"));
-        let sm_reader = state_machine.clone();
 
         // Blob transfer store (#437): node-local, off the redb file, beside the dataset spool
         // dir this state machine already writes under the same data directory.
@@ -694,26 +696,12 @@ impl RaftNode {
                 .map_err(|e| NodeError::Storage(format!("blob store: {e}")))?,
         );
 
-        let raft_config = Arc::new(Self::raft_config(config.snapshot_log_entries)?);
-
         // The handlers need the Raft, which needs the bound server address, which
         // needs the handlers — so the router reads the node through a slot filled
-        // in once construction below completes.
+        // in once construction below completes. The blob source reads it the same
+        // way, for the same reason: it is attached to the state machine here,
+        // before the `Raft` exists to be handed to it.
         let slot: RaftSlot = Arc::new(OnceCell::new());
-        // Control-plane routes register last so a caller's route table can never
-        // shadow the Raft endpoints the cluster itself depends on.
-        let membership_gate: network::MembershipGate = Arc::new(tokio::sync::Mutex::new(()));
-        // One ceiling for both admission phases (#433); see `AutoVoterCeiling`.
-        let auto_voter_ceiling: network::AutoVoterCeiling = Arc::new(
-            std::sync::atomic::AtomicUsize::new(network::MAX_AUTO_VOTERS),
-        );
-        let router = network::control_routes(
-            config.routes.clone(),
-            slot.clone(),
-            Arc::clone(&membership_gate),
-            Arc::clone(&auto_voter_ceiling),
-        );
-        let router = crate::blobs::routes::blob_routes(router, Arc::clone(&blob_store));
 
         let (signer, verifier) = match &config.secret {
             Some(secret) => (
@@ -732,6 +720,41 @@ impl RaftNode {
                 (None, None)
             }
         };
+        let client = RpcClient::new(
+            signer,
+            Arc::new(TrackedPeerHealth::new()),
+            RpcClientConfig::default(),
+        );
+        let resolver: Arc<dyn PeerResolver> = Arc::new(DnsResolver);
+
+        // Where a digest-only op's bytes come from when this node lacks them (#439, D-23).
+        // Same before-`Raft::new`-and-before-clone contract as `with_journal`: attached here
+        // so catch-up replay during a join can fetch, not only live commits afterward.
+        let blob_source = Arc::new(super::blob_source::PeerBlobSource::new(
+            config.node_id,
+            Arc::clone(&blob_store),
+            client.clone(),
+            Arc::clone(&resolver),
+            &slot,
+        ));
+        let state_machine = state_machine.with_blob_source(blob_source.clone());
+        let sm_reader = state_machine.clone();
+
+        let raft_config = Arc::new(Self::raft_config(config.snapshot_log_entries)?);
+        // Control-plane routes register last so a caller's route table can never
+        // shadow the Raft endpoints the cluster itself depends on.
+        let membership_gate: network::MembershipGate = Arc::new(tokio::sync::Mutex::new(()));
+        // One ceiling for both admission phases (#433); see `AutoVoterCeiling`.
+        let auto_voter_ceiling: network::AutoVoterCeiling = Arc::new(
+            std::sync::atomic::AtomicUsize::new(network::MAX_AUTO_VOTERS),
+        );
+        let router = network::control_routes(
+            config.routes.clone(),
+            slot.clone(),
+            Arc::clone(&membership_gate),
+            Arc::clone(&auto_voter_ceiling),
+        );
+        let router = crate::blobs::routes::blob_routes(router, Arc::clone(&blob_store));
 
         let server = RpcServer::bind(config.bind, RpcServerConfig::new(verifier, router))
             .await
@@ -740,13 +763,6 @@ impl RaftNode {
             .local_addr()
             .map_err(|e| NodeError::Bind(e.to_string()))?;
         let advertise = config.advertise.unwrap_or_else(|| Authority::from(local));
-
-        let client = RpcClient::new(
-            signer,
-            Arc::new(TrackedPeerHealth::new()),
-            RpcClientConfig::default(),
-        );
-        let resolver: Arc<dyn PeerResolver> = Arc::new(DnsResolver);
         // The liveness tickers consult this before probing: a probe asserts
         // "your leader is alive", which is only true while we lead — a
         // departed or deposed leader's tickers would otherwise keep every
@@ -797,6 +813,7 @@ impl RaftNode {
             sm_reader,
             server_task,
             blobs: blob_store,
+            blob_source,
             gc_task,
             shutdown_invoked: AtomicBool::new(false),
             last_leave_error: Mutex::new(None),
@@ -833,6 +850,13 @@ impl RaftNode {
     #[must_use]
     pub fn blobs(&self) -> &Arc<crate::blobs::BlobStore> {
         &self.blobs
+    }
+
+    /// The blob fetch this node's apply is currently parked on, if any (#439, D-48) — what
+    /// `/_cluster/health` reports as `blob_fetch_stall`. `None` is the healthy answer.
+    #[must_use]
+    pub fn blob_fetch_stall(&self) -> Option<super::blob_source::BlobFetchStall> {
+        self.blob_source.stall()
     }
 
     /// Store `bytes` locally under `digest`, then fan it out to every other
@@ -1289,13 +1313,7 @@ impl RaftNode {
     /// and must treat as "re-resolve ownership", not as an error.
     #[must_use]
     pub fn member_authority(&self, id: NodeId) -> Option<String> {
-        let receiver = self.raft.metrics();
-        let metrics = receiver.borrow();
-        metrics
-            .membership_config
-            .nodes()
-            .find(|(node_id, _)| **node_id == id)
-            .map(|(_, node)| node.addr.clone())
+        super::blob_source::authority_of(&self.raft, id)
     }
 
     /// Call `method path` on member `id`, resolving its advertise authority and
