@@ -149,16 +149,14 @@ Per-imposter stores kept for OSS compat; a provider returning a shared store is 
 flexible.
 
 ### D-8 — Sequence cursors reset on ownership change
-- **Status:** pending
+- **Status:** active
 - **Decided:** 2026-07-01 · RFC-001 v2
-- **Implemented by:** #466 (open) — RFC-001 Phase 4
+- **Implemented by:** #466 (D-47's owner-routed sequencer)
+- **Code:** crates/rift-cluster/src/stores/sequencer.rs
 
 Replicating cursors puts a network write on the hottest stateful path; a documented reset matches
-test-run-scoped data.
-
-**Not built (verified 2026-08-25):** no clustered sequencer exists. `compose.rs` never installs
-one, so cluster nodes run upstream's `LocalSequencer` with node-local cursors — the D-10
-"sequencing = local" default. There is no ownership to reset on until Phase 4 ships.
+test-run-scoped data. A cursor lives only on its owner, so a membership change hands the key to a
+node that starts it at zero — the reset is the contract, not a fault.
 
 ### D-9 — Sync traits + cluster-side bridge runtime (std mpsc park, sized semaphore)
 - **Status:** active
@@ -185,8 +183,9 @@ cyclic responses during a blip is worse than a possible duplicate index, and it'
 Keeping a generic single-node convenience cluster-only has bad optics, zero moat (community can
 promote #212 trivially), and weakens U-7's story.
 
-### D-12 — Strict sequencing/proxyOnce ship Redis-backed first; gossip-native single-writer versions are demand-gated
-- **Status:** amended
+### ~~D-12 — Strict sequencing/proxyOnce ship Redis-backed first; gossip-native single-writer versions are demand-gated~~
+- **Status:** superseded
+- **Superseded by:** D-47
 - **Decided:** 2026-07-01 · RFC-001 v2
 - **Amends:** RFC-001 §7.5.3
 - **Code:** crates/rift-cluster/src/stores/proxy.rs, crates/rift-cluster-server/src/compose.rs
@@ -683,3 +682,39 @@ and log in with its key; the legacy key is a curl/bootstrap credential only.
 
 *Rejected:* minting the cookie and letting later requests fail `401` — indistinguishable from a
 rotated key or a skewed clock.
+
+### D-47 — Strict sequencing is owner-routed on the ring, opt-in per imposter, and degrades rather than fails
+- **Status:** active
+- **Decided:** 2026-08-26 · #466
+- **Supersedes:** D-12
+- **Amends:** RFC-001 §11.3
+- **Implemented by:** #466
+- **Code:** crates/rift-cluster/src/stores/sequencer.rs, crates/rift-cluster-server/src/compose.rs
+
+A response cursor is owned by one node — HRW over the applied membership under
+`KeyClass::Sequence` — so `responses: [A, B, C]` cycles once fleet-wide instead of once per node
+behind a round-robin load balancer. Opt-in per imposter via `_rift.sequencing.mode: "owner"`;
+absent or `"local"` keeps per-process cursors, byte-identical to a single-node rift.
+
+**No Redis backend, and none planned.** D-12's reason for Redis-first — that gossip-exact
+single-writer semantics were the hardest engineering in the RFC — died with D-15: ownership is now
+a deterministic function of committed Raft membership, and the owner-routed pattern already exists
+end to end in `FlowNet` and was reused for proxyOnce (D-40). A Redis sequencer would be the only
+external dependency on the data path, for the feature with the weakest consistency need of the
+three.
+
+**A cluster failure is a fallback, never an error.** D-10 already settled that sequencing is the
+one stateful op where availability beats consistency: an unreachable, isolated or fenced owner
+means the decision is served from this node's own cursor and the response is annotated, counted by
+`rift_cluster_sequence_fallbacks_total`. A `503` here would block every cyclic response during a
+leadership blip, which is worse than a possible duplicate index. The consequence worth stating: a
+wiring bug looks exactly like a degradation, so the counter — not the returned index — is what
+tells the two apart, and the acceptance test asserts it does *not* move on a healthy fleet.
+
+**Keyed by `stub_key`, not the engine's `slot`** (RFC-001 §8.3): `slot` is node-local and cannot
+be a cluster key. Documented divergence: editing a *keyless* stub changes its `stub_key` and so
+restarts its cluster cursor, where a single-node `LocalSequencer` preserves it. A stub relying on
+cross-node sequencing should carry an explicit `id`.
+
+*Deferred, not done:* the peek-amplification benchmark RFC-001 §11.3 asks Phase 4 for, and a
+container chaos scenario — both additive verification on a working feature (#476).

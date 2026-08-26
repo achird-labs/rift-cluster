@@ -39,6 +39,9 @@ pub mod seams {
         CasOutcome, FlowStore, FlowStoreProvider, NoOpFlowStore,
     };
 
+    /// The cursor arithmetic itself, so a clustered sequencer advances by the
+    /// same packing as the built-in one rather than reimplementing repeats.
+    pub use rift_mock_core::behaviors::RuleCycler;
     /// Response cursors (cycling), keyed by port + slot + stub identity + scope.
     pub use rift_mock_core::behaviors::sequencer::{
         LocalSequencer, ResponseSequencer, SequenceKey,

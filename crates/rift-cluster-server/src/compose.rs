@@ -18,9 +18,10 @@ use arc_swap::ArcSwap;
 use rift_cluster::audit_export::{AuditExporter, ExportContext, ExportStatus};
 use rift_cluster::sources;
 use rift_cluster::stores::{
-    ClusterJournal, ClusterProxyStore, ClusteredFlowStoreProvider, DEFAULT_ANTI_ENTROPY_INTERVAL,
-    FlowBindConfig, FlowNet, FlowShard, JournalNet, ProxyBindConfig, ProxyNet, ShardConfig,
-    flow_routes, journal_routes, proxy_routes, spawn_anti_entropy,
+    ClusterJournal, ClusterProxyStore, ClusteredFlowStoreProvider, ClusteredSequencer,
+    DEFAULT_ANTI_ENTROPY_INTERVAL, FlowBindConfig, FlowNet, FlowShard, JournalNet, ProxyBindConfig,
+    ProxyNet, SequencingRegistry, ShardConfig, flow_routes, journal_routes, proxy_routes,
+    seq_routes, spawn_anti_entropy,
 };
 use rift_cluster::{
     Authority, ClusterDecorator, LeaveOutcome, NodeConfig, NodeError, NodeIdentity, OnDrift,
@@ -596,6 +597,13 @@ pub async fn start_with_runtimes(
     // `flow_net` is — the manager build takes the store handle, and the node binds in later.
     let proxy_net = ProxyNet::new();
 
+    // Response sequencing (#466, D-47). Both are created before the manager for the
+    // same reason `flow_net` is — the manager build takes the sequencer handle, and
+    // the node binds it in later. The registry is handed to the state machine too:
+    // the apply loop is what keeps it current.
+    let sequencing = SequencingRegistry::new();
+    let sequencer = ClusteredSequencer::new(Arc::clone(&sequencing));
+
     let manager = match cluster_manager(
         &cli,
         accept_runtimes,
@@ -603,6 +611,7 @@ pub async fn start_with_runtimes(
         Arc::clone(&flow_net),
         Arc::clone(&request_journal),
         Arc::clone(&proxy_net),
+        Arc::clone(&sequencer),
     ) {
         Ok(manager) => Arc::new(manager),
         Err(e) => {
@@ -701,7 +710,8 @@ pub async fn start_with_runtimes(
                 Arc::clone(&puller),
             )
             .merge(journal_routes(Arc::clone(&journal_net)))
-            .merge(proxy_routes(Arc::clone(&proxy_net))),
+            .merge(proxy_routes(Arc::clone(&proxy_net)))
+            .merge(seq_routes(Arc::clone(&sequencer))),
             engine: Some(Arc::clone(&manager)),
             audit_retention_secs: cli.cluster.cluster_audit_retention,
             snapshot_log_entries: cli.cluster.cluster_snapshot_log_entries,
@@ -712,6 +722,10 @@ pub async fn start_with_runtimes(
         // clear generations into this node's own journal too, not just live commits after
         // `start` returns.
         Arc::clone(&request_journal),
+        // Same contract again: the modes must be current from the first applied
+        // config, including the ones a join replays, or the sequencer answers an
+        // `owner`-mode imposter from local cursors until the next config change.
+        Arc::clone(&sequencing),
     )
     .await
     {
@@ -797,6 +811,9 @@ pub async fn start_with_runtimes(
         DEFAULT_ANTI_ENTROPY_INTERVAL,
     );
 
+    if let Err(e) = sequencer.bind(&node, rift_cluster::BridgeConfig::default()) {
+        tracing::error!(error = %e, "starting the response-sequencer bridge");
+    }
     if let Err(e) = flow_net.bind(&node, FlowBindConfig::default()) {
         source_scheduler.abort();
         audit_exporter.abort();
@@ -1479,6 +1496,7 @@ fn cluster_manager(
     flow_net: Arc<FlowNet>,
     request_journal: Arc<ClusterJournal>,
     proxy_net: Arc<ProxyNet>,
+    sequencer: Arc<ClusteredSequencer>,
 ) -> anyhow::Result<ImposterManager> {
     let default_cert = cli
         .oss
@@ -1559,7 +1577,14 @@ fn cluster_manager(
         // off-switch as the flow store: the `--cluster`-off path never reaches this
         // function, so single-node keeps the upstream per-imposter `LocalProxyStore`
         // byte-identical.
-        .with_proxy_store(Arc::new(ClusterProxyStore::new(proxy_net)));
+        .with_proxy_store(Arc::new(ClusterProxyStore::new(proxy_net)))
+        // Installed for every imposter, like the flow store and the journal: the
+        // *mode* is per-imposter (D-10 keeps `local` the default), but which object
+        // answers is not. An imposter that never opts in gets local cursors from this
+        // one just as it would from upstream's `LocalSequencer` (#466, D-47).
+        .with_sequencer(
+            Arc::clone(&sequencer) as Arc<dyn rift_cluster_base::seams::ResponseSequencer>
+        );
 
     Ok(match upstream_client {
         Some(client) => manager.with_upstream_client(client),

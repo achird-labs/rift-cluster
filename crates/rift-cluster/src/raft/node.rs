@@ -630,7 +630,7 @@ impl RaftNode {
     /// does not form or join a cluster; call [`RaftNode::cluster_init`] to
     /// bootstrap a new one or [`RaftNode::join_via`] to attach to an existing one.
     pub async fn start(config: NodeConfig) -> Result<Self, NodeError> {
-        Self::start_inner(config, None, None).await
+        Self::start_inner(config, None, None, None).await
     }
 
     /// Like [`Self::start`], with the front door's compiled-route handle and this node's local
@@ -645,14 +645,22 @@ impl RaftNode {
         config: NodeConfig,
         front_door_routes: Arc<ArcSwap<CompiledRoutes>>,
         journal: Arc<ClusterJournal>,
+        sequencing: Arc<crate::stores::SequencingRegistry>,
     ) -> Result<Self, NodeError> {
-        Self::start_inner(config, Some(front_door_routes), Some(journal)).await
+        Self::start_inner(
+            config,
+            Some(front_door_routes),
+            Some(journal),
+            Some(sequencing),
+        )
+        .await
     }
 
     async fn start_inner(
         config: NodeConfig,
         front_door_routes: Option<Arc<ArcSwap<CompiledRoutes>>>,
         journal: Option<Arc<ClusterJournal>>,
+        sequencing: Option<Arc<crate::stores::SequencingRegistry>>,
     ) -> Result<Self, NodeError> {
         let (log_store, state_machine) = store::new(config.data_dir.join(RAFT_DB_FILE))
             .await
@@ -663,6 +671,10 @@ impl RaftNode {
         };
         let state_machine = match front_door_routes {
             Some(routes) => state_machine.with_routes_handle(routes),
+            None => state_machine,
+        };
+        let state_machine = match &sequencing {
+            Some(registry) => state_machine.with_sequencing_registry(Arc::clone(registry)),
             None => state_machine,
         };
         let state_machine = match &journal {

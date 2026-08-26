@@ -19,6 +19,7 @@ pub mod journal;
 pub mod journal_net;
 mod journal_seq;
 pub mod proxy;
+pub mod sequencer;
 pub mod shard;
 
 pub use flow::{
@@ -33,6 +34,7 @@ pub use journal::{
     ClusterJournal, CursorError, FleetCursor, JournalConfig, JournalCursor, ShardEntry, ShardRead,
 };
 pub use proxy::{ClusterProxyStore, ProxyBindConfig, ProxyNet, proxy_routes, proxy_sig_key};
+pub use sequencer::{ClusteredSequencer, SequencingMode, SequencingRegistry, seq_routes};
 // Trimmed to what is used outside this module (issue #223 review): the wire types, `ShardSlice`,
 // `merge_shards` and `fleet_count` are consumed only by this module's own `JournalNet` and its
 // `mod tests` (which see ancestor-private items regardless of what is re-exported here). Every
