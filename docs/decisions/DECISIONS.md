@@ -784,3 +784,48 @@ every other write — the leadership-costing stall #444 closed. So every digest-
 are resolved *before* `begin_write()`, and the apply arms treat absent-from-both-op-and-resolution
 as a hard error rather than a default: a replica that applied an empty document while its peers
 applied the real one is exactly the divergence content addressing exists to prevent.
+
+### D-50 — Snapshots carry a manifest of digests; the joiner fetches the bytes on install
+- **Status:** active
+- **Decided:** 2026-08-26 · #440 (#432 child 5)
+- **Implemented by:** #440
+- **Code:** crates/rift-cluster/src/raft/store.rs
+
+Refines D-23 (the bytes leave the log) — the snapshot half of it, as D-49 is the log-entry half.
+`SnapshotPayload`'s `spec_blobs`/`dataset_blobs` become the **manifest** — `(digest hex, byte
+size)` per referenced blob — not the bytes. `build_snapshot` records each blob's byte length
+(1.00× the raw bytes since #436, == `SpecMeta.size`); a fleet holding 64 MiB of datasets snapshots
+to KiB (#440 AC1).
+
+`install_snapshot` fetches every manifest digest this node lacks **before** it opens the redb
+write transaction, through the one existing fetch path (`PeerBlobSource`, D-48 — no second path),
+then writes `sm_spec_blobs`/`sm_dataset_blobs` and materialises spool files from the fetched bytes.
+The fetch is a **pre-pass**, not a branch inside the write, for `resolve_blobs`' reason (D-49,
+#444): a fetch is up to 17 round trips per blob and holding the write transaction across it would
+block every other write. `origin` is `0` — a snapshot has no single accepting node, so the source
+asks every joint voter. A digest no member can supply parks the install and retries forever (D-48)
+rather than failing a committed catch-up; only a malformed digest, a non-UTF-8 blob, or (in a node
+with no source attached) a non-empty manifest fails it — never a silent empty table, the snapshot
+analogue of D-49's divergence guard.
+
+The invariant this relies on is D-18: every live blob is on a quorum's node-local transport store,
+established by the write-path fan-out (#438) — so a joiner always finds a holder. A blob referenced
+by live state is never GC'd (`gc` respects the reference set), so the manifest can never name a
+digest the fleet has reaped.
+
+**Precondition — the invariant holds for fan-out-minted blobs only.** Every write this build
+produces goes through `fan_out_then_submit` (D-49), so its bytes are on a quorum's transport store
+before the referencing op commits, and a follower that applies a digest-only op fetches into its
+own transport store — so in any fleet formed by this build, every `sm_*_blobs` row has a transport
+holder. The one shape without one is a **pre-fan-out** blob: an op that rode its bytes on the log
+before #438 existed, applied straight into `sm_*_blobs` with no `store_whole`. The manifest names
+such a row like any other, but no member can serve it, so its install would park (D-48) with no
+holder able to appear. No such fleet exists — the blob transport (#437/#438) predates any release,
+so there is no pre-fan-out log to replay. The residual rolling-upgrade gap (a mixed-provenance
+fleet) is the same class as **#481** (gate the strip on every joint voter's digest-only support)
+and is tracked there, not closed here; the two closes together give a serve-side or apply-side
+backfill its home.
+
+*Not changed:* D-23 stays `pending` — #441 (the RFC/architecture prose revision) flips it to
+`active`. The `install_snapshot_timeout` / `snapshot_max_chunk_size` knobs stay (#428): a KiB-sized
+install removes the pressure on the deadline, not the restart-from-offset-0 correctness argument.

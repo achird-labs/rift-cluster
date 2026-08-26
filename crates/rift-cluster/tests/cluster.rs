@@ -3131,6 +3131,21 @@ fn big_csv(bytes: usize) -> String {
     tagged_csv(bytes, "")
 }
 
+/// Put `csv`'s bytes into `node`'s blob transport store, mirroring the fan-out the production
+/// admin-front write path (`fan_out_then_submit`, D-49) performs before proposing — which the
+/// low-level `submit` these harness tests use deliberately bypasses.
+///
+/// Manifest-snapshot catch-up (#440, D-50) fetches each referenced blob from a holder's transport
+/// store rather than carrying the bytes in the snapshot, so a holder must exist for the joiner to
+/// fetch from. Production guarantees one on a quorum via fan-out (D-18); a `submit`-driven test
+/// never fans out, so it establishes the same precondition directly on the accepting node.
+fn seed_blob_store(node: &RaftNode, csv: &str) {
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    node.blobs()
+        .store_whole(&digest, csv.as_bytes())
+        .expect("seed the accepting node's blob transport store");
+}
+
 /// Issue #285: the bytes ride the log, so once the leader's write barrier has answered, every
 /// member holds the spool file — byte-identical to the upload — with no fetch and no readiness
 /// handshake. This is the fleet-level "on disk before the 2xx" the front's barrier will surface.
@@ -3385,6 +3400,10 @@ async fn a_restarted_voter_behind_a_purged_log_catches_up_by_snapshot() {
         .await
         .expect("d0");
     assert_eq!(r.outcome, rift_cluster::ControlOutcome::Applied);
+    // d0..d8 are all the same bytes (one digest), so one seed on the leader covers the whole
+    // manifest the restarted voter will fetch on install (D-50); production's fan-out would have
+    // left this holder behind.
+    seed_blob_store(cluster.leader().expect("leader"), &csv);
     cluster.kill(victim).await;
 
     for i in 1..=8 {
@@ -3999,6 +4018,9 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
             .await
             .unwrap_or_else(|e| panic!("dataset d{i} commits: {e}"));
         last_revision = response.revision;
+        // The joiner will fetch this blob over the transport on install (D-50); seed the holder
+        // the fan-out would have created in production.
+        seed_blob_store(&leader, &csv);
         last_csv = csv;
     }
     assert!(
@@ -4137,6 +4159,9 @@ async fn a_snapshot_catch_up_does_not_disturb_a_fleet_that_already_has_quorum() 
             .await
             .unwrap_or_else(|e| panic!("dataset m{i} commits: {e}"))
             .revision;
+        // n3 fetches each blob from a joint voter on install (D-50); seed the accepting node the
+        // fan-out would have populated in production.
+        seed_blob_store(&n1, &csv);
     }
     assert!(
         n1.await_applied(last_revision, CONVERGE_DEADLINE)
@@ -4281,6 +4306,9 @@ async fn a_joiner_behind_a_purged_log_starts_as_learner_and_the_leader_promotes_
             .expect("dataset commits");
         assert_eq!(r.outcome, rift_cluster::ControlOutcome::Applied);
     }
+    // j0..j7 are all the same bytes (one digest); the snapshot-joining fourth node fetches that
+    // one blob on install (D-50), so seed the holder production's fan-out would have created.
+    seed_blob_store(cluster.leader().expect("leader"), &csv);
 
     // A fourth node, exactly as `start_full` would build it.
     let port = reserve_ports(1)[0];

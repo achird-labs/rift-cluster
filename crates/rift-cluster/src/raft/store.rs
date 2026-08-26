@@ -743,26 +743,33 @@ struct SnapshotPayload {
     /// history actually is — no spec has ever been written.
     #[serde(default)]
     specs: Vec<(String, String, String)>,
-    /// `(digest hex, document text)` rows of `sm_spec_blobs` (#278). Travels with `specs` rather
-    /// than being reconstructed from them: a joining node must hold the exact bytes a bound
-    /// spec's digest names, and the blob table's key order carries no tenant to derive it from
-    /// alone if a row here were ever missing.
+    /// The **manifest** of `sm_spec_blobs`: `(digest hex, byte size)` for every referenced spec
+    /// blob, not its bytes (D-23/D-50, #440). A joining node fetches each digest it lacks via the
+    /// blob transport (`install_snapshot` → `resolve_snapshot_blobs`) before the install commits,
+    /// then writes the fetched text into `sm_spec_blobs` — the bytes leave the snapshot the same
+    /// way #439 took them off the log. `size` is the blob's UTF-8 byte length (== `SpecMeta.size`,
+    /// == what a fetch verifies against by digest); it is the manifest's whole payload, which is
+    /// what returns a 64 MiB fleet's snapshot to KiB (AC1). `#[serde(default)]` for the #134/#137
+    /// reason every table above carries it: a pre-#278 snapshot names no spec blobs and installs
+    /// clean.
     #[serde(default)]
-    spec_blobs: Vec<(String, String)>,
+    spec_blobs: Vec<(String, u64)>,
     /// `(tenant, dataset name, version, stored-dataset JSON)` rows of `sm_datasets` (RFC-005 D1,
     /// #285). Defaulted for the #134/#137 reason every table above carries it: a snapshot built
     /// before datasets existed must still install, and the empty vec it decodes to means exactly
     /// what a pre-#285 fleet's history actually is — no dataset has ever been written.
     #[serde(default)]
     datasets: Vec<(String, String, u64, String)>,
-    /// `(digest hex, csv text)` rows of `sm_dataset_blobs` (#285). Travels with `datasets`, and
-    /// for the identical reason `spec_blobs` travels with `specs`: a joining node must hold the
-    /// exact bytes a live dataset's digest names, and installing them here is also what
-    /// materialises every blob's spool file (see `install_snapshot`) — a node that joined by
-    /// snapshot must be able to serve a lookup against this dataset immediately, not after a
-    /// separate catch-up step.
+    /// The **manifest** of `sm_dataset_blobs`: `(digest hex, byte size)` for every referenced
+    /// dataset blob, not its csv (D-23/D-50, #440) — the identical manifest shape `spec_blobs`
+    /// carries, for the identical reason. `install_snapshot` fetches each digest it lacks via the
+    /// blob transport before the install commits, then writes the fetched csv into
+    /// `sm_dataset_blobs` **and** materialises its spool file — a node that joins by snapshot must
+    /// serve a lookup against the dataset immediately, not after a separate catch-up step, and the
+    /// fetched bytes are what makes that possible now that they no longer ride the payload.
+    /// `#[serde(default)]` for the pre-#285 reason `datasets` above carries it.
     #[serde(default)]
-    dataset_blobs: Vec<(String, String)>,
+    dataset_blobs: Vec<(String, u64)>,
     /// `(tenant id, Tenant JSON)` rows of `sm_tenants` (issue #159). Defaulted
     /// for the same reason `routes`/`sources` are: a pre-#159 snapshot still
     /// installs, carrying no tenants — a table omitted here is a table that
@@ -6444,7 +6451,11 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
             {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                spec_blobs.push((key.value().to_owned(), value.value().to_owned()));
+                // The manifest, not the bytes (D-50): the digest and the blob's byte length. The
+                // joiner fetches the bytes on install; recording their size here is what a 64 MiB
+                // fleet's snapshot shrinks to (AC1). The stored text's byte length is the exact
+                // count under that digest — the stored artifact is 1.00× raw since #436.
+                spec_blobs.push((key.value().to_owned(), value.value().len() as u64));
             }
             // Travels with the snapshot for the identical #134/#137 reason `specs`/`spec_blobs`
             // do (RFC-005 D1, #285): a node joining by snapshot must come back holding the same
@@ -6475,7 +6486,9 @@ impl RedbStateMachine {
                 .map_err(|e| StorageIOError::read_state_machine(&e))?
             {
                 let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
-                dataset_blobs.push((key.value().to_owned(), value.value().to_owned()));
+                // The manifest, not the csv (D-50) — see `spec_blobs` above for why the size and
+                // not the bytes.
+                dataset_blobs.push((key.value().to_owned(), value.value().len() as u64));
             }
             let tenants_table = read_txn
                 .open_table(SM_TENANTS_TABLE)
@@ -7079,25 +7092,49 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         }
         let received = snapshot.into_std().await;
 
-        // Everything from the rewind to the durable commit is one contiguous synchronous block —
-        // parse, full table clear-and-reinsert, `Durability::Immediate` commit. Off the runtime for
-        // #444's reason; the engine drive that used to close this function is returned instead and
-        // awaited by the caller, which keeps the documented order (durable write first, engine
-        // after) true by construction rather than by comment.
+        // Three steps, because the manifest snapshot (D-50) inserts a *fetch* into what used to be
+        // one contiguous blocking block:
+        //
+        //   1. parse the payload off the runtime (redb-free, but a JSON parse of a bounded blob),
+        //   2. fetch every manifest digest this node lacks — async, so it cannot live in a
+        //      spawn_blocking, and a pre-pass, so it cannot live inside the redb write transaction
+        //      (a fetch is up to 17 round trips per blob; holding the write txn across it is the
+        //      leadership-costing stall #444 closed — the identical argument `resolve_blobs` makes
+        //      for apply, D-49),
+        //   3. write the durable state off the runtime, consuming the fetched bytes.
+        //
+        // The engine drive stays the caller's, after the durable write, exactly as before.
+        let received_for_parse = received;
+        let (payload, received) = {
+            let meta_owned = meta.clone();
+            tokio::task::spawn_blocking(move || {
+                Self::parse_snapshot(meta_owned, received_for_parse)
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "snapshot parse task did not complete");
+                StorageIOError::read_snapshot(Some(meta.signature()), &std::io::Error::other(e))
+            })??
+        };
+
+        let resolved = self.resolve_snapshot_blobs(meta, &payload).await?;
+
         let sm = self.clone();
         let meta_owned = meta.clone();
-        let actions =
-            tokio::task::spawn_blocking(move || sm.install_snapshot_blocking(meta_owned, received))
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "snapshot install task did not complete");
-                    StorageIOError::read_snapshot(Some(meta.signature()), &std::io::Error::other(e))
-                })??;
+        let actions = tokio::task::spawn_blocking(move || {
+            sm.install_snapshot_blocking(meta_owned, payload, received, resolved)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "snapshot install task did not complete");
+            StorageIOError::read_snapshot(Some(meta.signature()), &std::io::Error::other(e))
+        })??;
 
         self.drive_engine(actions).await;
 
         Ok(())
     }
+
     /// Reads on the blocking pool, for [`RaftSnapshotBuilder::build_snapshot`]'s reason.
     ///
     /// Cheaper than a build since #436 made the payload a file rather than a JSON row to parse, but
@@ -7112,19 +7149,110 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 }
 
 impl RedbStateMachine {
-    /// [`RaftStateMachine::install_snapshot`]'s synchronous middle, off the runtime.
+    /// Fetch every blob the manifest names but this node cannot supply itself, **before** the
+    /// install opens its redb write transaction (D-50).
     ///
-    /// Returns the engine actions rather than driving them: driving is the one `.await` in the
-    /// original body, and returning it is what lets the whole rest of the install run on the
-    /// blocking pool without changing the order those actions are applied in.
+    /// A pre-pass for `resolve_blobs`' reason (#444): a fetch is up to 17 round trips per blob and
+    /// holding the write transaction across it would block every other write on this node. Returns
+    /// only once **every** manifest digest is in hand, so the blocking install downstream writes
+    /// the blob tables and materialises spool files from bytes it already holds and never has to
+    /// decide what to do about a missing one.
+    ///
+    /// Each digest is fetched once even when the manifest names it twice (two datasets, one CSV),
+    /// and `origin` is `0`: a snapshot has no single accepting node, so [`super::blob_source`]
+    /// asks every joint voter rather than a named origin first. A digest no member can supply does
+    /// not error here — [`crate::blobs::BlobSource`] parks and retries forever (D-48), so the
+    /// install blocks until a holder returns rather than failing a committed catch-up.
     #[allow(clippy::result_large_err)]
-    fn install_snapshot_blocking(
+    async fn resolve_snapshot_blobs(
         &self,
+        meta: &SnapshotMeta<u64, BasicNode>,
+        payload: &SnapshotPayload,
+    ) -> StorageResult<HashMap<String, String>> {
+        let mut resolved: HashMap<String, String> = HashMap::new();
+        // Both manifests, deduped by digest across the two: a spec blob and a dataset blob can be
+        // the same bytes, and both tables then read from the one fetch.
+        let needed: Vec<(&str, u64)> = {
+            let mut seen: HashSet<&str> = HashSet::new();
+            payload
+                .spec_blobs
+                .iter()
+                .chain(payload.dataset_blobs.iter())
+                .map(|(hex, size)| (hex.as_str(), *size))
+                .filter(|(hex, _)| seen.insert(hex))
+                .collect()
+        };
+        if needed.is_empty() {
+            return Ok(resolved);
+        }
+        let Some(source) = self.blob_source.as_ref() else {
+            return Err(StorageIOError::read_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(
+                    "snapshot manifest names blobs but no blob source is attached; \
+                     the node cannot obtain the bytes they name",
+                ),
+            )
+            .into());
+        };
+        resolved.reserve(needed.len());
+        for (hex, size) in needed {
+            let digest = crate::blobs::BlobDigest::parse(hex).map_err(|e| {
+                StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(format!(
+                        "manifest names an unusable blob digest {hex:?}: {e}"
+                    )),
+                )
+            })?;
+            let bytes = source.load(&digest, 0).await.map_err(|e| {
+                StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(format!("fetching manifest blob {hex}: {e}")),
+                )
+            })?;
+            // The manifest's size is the blob's byte length recorded at build; a fetched blob whose
+            // length disagrees means the manifest and the bytes came apart (a build/table mismatch,
+            // or a source that answered the wrong thing). The digest check inside a real transport
+            // is strictly stronger, so this only ever fires on an inconsistency that check cannot
+            // see — but it turns `size` from a decorative field into a validated one.
+            if bytes.len() as u64 != size {
+                return Err(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(format!(
+                        "manifest blob {hex} is {size} bytes but the fetch returned {}",
+                        bytes.len()
+                    )),
+                )
+                .into());
+            }
+            // Both blob tables store `&str` and every write path proves the bytes are a UTF-8
+            // document before minting the op; a non-UTF-8 blob here means the transport handed
+            // back something that is not what the digest names — refuse rather than lossily
+            // convert, exactly as `resolve_blobs` does on the apply path.
+            let text = String::from_utf8(bytes).map_err(|e| {
+                StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(format!("manifest blob {hex} is not UTF-8: {e}")),
+                )
+            })?;
+            resolved.insert(hex.to_owned(), text);
+        }
+        Ok(resolved)
+    }
+
+    /// Parse a received snapshot file into its payload, off the runtime, returning the (rewound)
+    /// file so the blocking install below can still copy it verbatim.
+    ///
+    /// Split out of [`Self::install_snapshot_blocking`] because the manifest snapshot (D-50) has
+    /// to *fetch* between parse and write, and the fetch is async: the parse runs in one
+    /// `spawn_blocking`, the fetch on the runtime, the write in a second `spawn_blocking`.
+    #[allow(clippy::result_large_err)]
+    fn parse_snapshot(
         meta: SnapshotMeta<u64, BasicNode>,
         mut received: std::fs::File,
-    ) -> StorageResult<Vec<AttributedAction>> {
+    ) -> StorageResult<(SnapshotPayload, std::fs::File)> {
         use std::io::Seek as _;
-        let meta = &meta;
         // Rewind before reading. openraft streams the transfer in by writing chunk after chunk into
         // this handle, so it arrives positioned at EOF — parsing from where it sits reads nothing
         // and the install fails with an empty-input error, which looks exactly like a peer that
@@ -7134,8 +7262,8 @@ impl RedbStateMachine {
             .seek(std::io::SeekFrom::Start(0))
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         // `try_clone` shares the file *offset* on Unix, so parsing through the clone advances this
-        // handle too — which is why the copy below must seek back to 0 rather than assuming it is
-        // still where the rewind above left it.
+        // handle too — which is why the copy in the blocking install must seek back to 0 rather
+        // than assuming it is still where the rewind above left it.
         let received_for_parse = received
             .try_clone()
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
@@ -7143,11 +7271,41 @@ impl RedbStateMachine {
             serde_json::from_reader(std::io::BufReader::new(received_for_parse)).map_err(|e| {
                 StorageError::from(StorageIOError::read_snapshot(Some(meta.signature()), &e))
             })?;
-        // Counted here — after the payload parses, before it is applied — so the metric means "a
-        // peer's snapshot really arrived and was readable", which is what a scenario asserting the
-        // wire path needs to distinguish from catch-up-by-replication (issue #183).
-        crate::metrics::snapshot_installed();
+        Ok((payload, received))
+    }
 
+    /// [`RaftStateMachine::install_snapshot`]'s synchronous middle, off the runtime.
+    ///
+    /// Takes the payload already parsed by [`Self::parse_snapshot`] and the blobs already fetched
+    /// by [`Self::resolve_snapshot_blobs`] (D-50), so its own body is pure redb: no parse, no
+    /// fetch, no `.await`. Returns the engine actions rather than driving them — driving is the one
+    /// `.await` in the original body, and returning it is what lets the whole durable write run on
+    /// the blocking pool without changing the order those actions are applied in.
+    #[allow(clippy::result_large_err)]
+    fn install_snapshot_blocking(
+        &self,
+        meta: SnapshotMeta<u64, BasicNode>,
+        payload: SnapshotPayload,
+        received: std::fs::File,
+        resolved: HashMap<String, String>,
+    ) -> StorageResult<Vec<AttributedAction>> {
+        use std::io::Seek as _;
+        let meta = &meta;
+        // The blob text this install writes into `sm_spec_blobs`/`sm_dataset_blobs` and materialises
+        // spool from, keyed by digest — fetched by `resolve_snapshot_blobs` before this ran, since
+        // the payload now carries only the manifest (D-50). Every manifest digest is present by
+        // that function's contract; a lookup miss here would be a construction bug, not a runtime
+        // condition, so it is surfaced as a storage error rather than silently skipping the blob.
+        let blob_text = |hex: &str| -> StorageResult<&str> {
+            resolved.get(hex).map(String::as_str).ok_or_else(|| {
+                StorageError::from(StorageIOError::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(format!(
+                        "manifest blob {hex} was not resolved before install"
+                    )),
+                ))
+            })
+        };
         // The received bytes are copied verbatim rather than re-encoded from `payload`: what the
         // peer sent is what this node should serve on, and a re-encode would be a second full pass.
         let mut source = received;
@@ -7254,9 +7412,11 @@ impl RedbStateMachine {
             spec_blobs_table
                 .retain(|_, _| false)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (digest, document) in &payload.spec_blobs {
+            for (digest, _size) in &payload.spec_blobs {
+                // The bytes were fetched before the transaction opened (D-50): the payload carries
+                // only the manifest now, so the document text comes from `resolved`, not the op.
                 spec_blobs_table
-                    .insert(digest.as_str(), document.as_str())
+                    .insert(digest.as_str(), blob_text(digest)?)
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -7297,9 +7457,10 @@ impl RedbStateMachine {
             dataset_blobs_table
                 .retain(|_, _| false)
                 .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-            for (digest, csv) in &payload.dataset_blobs {
+            for (digest, _size) in &payload.dataset_blobs {
+                // Fetched pre-transaction (D-50); csv text comes from `resolved`, not the payload.
                 dataset_blobs_table
-                    .insert(digest.as_str(), csv.as_str())
+                    .insert(digest.as_str(), blob_text(digest)?)
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
 
@@ -7502,8 +7663,10 @@ impl RedbStateMachine {
         // blob this node already had. A no-op with no `spool_dir` attached, like the engine
         // drive below.
         if let Some(dir) = &self.spool_dir {
-            for (digest, csv) in &payload.dataset_blobs {
-                write_spool(dir, digest, csv).map_err(|e| {
+            for (digest, _size) in &payload.dataset_blobs {
+                // The csv comes from the fetched bytes now (D-50), not the payload — the same
+                // `resolved` map the `sm_dataset_blobs` rows above were written from.
+                write_spool(dir, digest, blob_text(digest)?).map_err(|e| {
                     StorageError::from(StorageIOError::write_snapshot(Some(meta.signature()), &e))
                 })?;
             }
@@ -7542,6 +7705,13 @@ impl RedbStateMachine {
         // Same ordering rule as `commit_snapshot_row`: sweep only once the row naming the new
         // payload is durable. A follower that only ever installs would otherwise never sweep at all.
         self.gc_snapshot_files(&meta.snapshot_id);
+
+        // Counted here — after the durable write, the fetched blobs, and the spool — so the metric
+        // means "a peer's snapshot really installed", the wire-path outcome #183 distinguishes from
+        // catch-up-by-replication. Since manifest snapshots (D-50) the fetch sits between parse and
+        // this point and can park (D-48) or fail, so a metric bumped at parse time would count
+        // installs that never landed.
+        crate::metrics::snapshot_installed();
 
         Ok(vec![
             AttributedAction::unattributed(config_action),
@@ -11588,18 +11758,49 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_round_trips_specs_blobs_and_bindings() {
-        let (_td, mut sm) = fresh_sm(None).await;
+        let (td, mut sm) = fresh_sm(None).await;
         apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
         apply_one(&mut sm, 2, put(2, 8080, json!([]))).await;
         apply_one(&mut sm, 3, spec_bind(3, "petstore", 8080)).await;
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
 
-        let (_td2, mut follower) = fresh_sm(None).await;
+        // The payload carries the manifest, not the bytes (D-50): the blob travels as
+        // `(digest, size)`, and a joiner fetches the document over the blob transport on install.
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("snapshot is json");
+        let manifest = json["spec_blobs"].as_array().expect("spec_blobs manifest");
+        let entry = manifest
+            .iter()
+            .find(|e| e[0] == spec_digest(PETSTORE).as_str())
+            .expect("petstore is named in the manifest");
+        assert_eq!(
+            entry[1].as_u64(),
+            Some(PETSTORE.len() as u64),
+            "the manifest carries the blob's byte size, not its text"
+        );
+        assert!(
+            !bytes
+                .windows(PETSTORE.len())
+                .any(|w| w == PETSTORE.as_bytes()),
+            "the document bytes must not ride the snapshot payload"
+        );
+
+        // The joiner fetches the digest it lacks from the blob transport (here a fake holding it).
+        let source =
+            MapSource::holding_all(&[(spec_digest(PETSTORE).as_str(), PETSTORE.as_bytes())]);
+        let handle = snapshot_handle_from(td.path(), &bytes).await;
+        let (_td2, follower) = fresh_sm(None).await;
+        let mut follower = follower.with_blob_source(source.clone());
         follower
-            .install_snapshot(&meta, snapshot)
+            .install_snapshot(&meta, handle)
             .await
             .expect("install");
+        assert_eq!(
+            source.calls(),
+            1,
+            "the joiner fetched the one blob its manifest named and it lacked"
+        );
 
         let record = follower
             .spec(DEFAULT_TENANT, "petstore")
@@ -11613,7 +11814,7 @@ mod tests {
                 .expect("read")
                 .as_deref(),
             Some(PETSTORE),
-            "the blob travels too — a joining node must hold the same bytes"
+            "the fetched blob is written into sm_spec_blobs — the joiner holds the same bytes"
         );
         assert_eq!(
             follower
@@ -12185,18 +12386,47 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_round_trips_datasets_and_materialises_their_spool_files() {
-        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        let (td, mut sm, _spool) = fresh_sm_with_spool().await;
         apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
         apply_one(&mut sm, 2, dataset_put(2, "orders", ORDERS_CSV)).await;
         apply_one(&mut sm, 3, dataset_delete(3, "orders")).await;
         let mut builder = sm.clone();
         let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
 
-        let (_td2, mut follower, follower_spool) = fresh_sm_with_spool().await;
+        // The payload carries the manifest, not the csv (D-50): only the live `customers` blob is
+        // named (the tombstoned `orders` blob was GC'd on delete), as `(digest, size)`.
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("snapshot is json");
+        let manifest = json["dataset_blobs"]
+            .as_array()
+            .expect("dataset_blobs manifest");
+        assert_eq!(manifest.len(), 1, "only the live blob is in the manifest");
+        assert_eq!(manifest[0][0], dataset_digest(CUSTOMERS).as_str());
+        assert_eq!(
+            manifest[0][1].as_u64(),
+            Some(CUSTOMERS.len() as u64),
+            "the manifest carries the byte size, not the csv"
+        );
+        assert!(
+            !bytes
+                .windows(CUSTOMERS.len())
+                .any(|w| w == CUSTOMERS.as_bytes()),
+            "the csv bytes must not ride the snapshot payload"
+        );
+
+        let source = MapSource::holding(CUSTOMERS);
+        let handle = snapshot_handle_from(td.path(), &bytes).await;
+        let (_td2, follower, follower_spool) = fresh_sm_with_spool().await;
+        let mut follower = follower.with_blob_source(source.clone());
         follower
-            .install_snapshot(&meta, snapshot)
+            .install_snapshot(&meta, handle)
             .await
             .expect("install");
+        assert_eq!(
+            source.calls(),
+            1,
+            "the joiner fetched the one live blob its manifest named"
+        );
         let record = follower
             .dataset(DEFAULT_TENANT, "customers")
             .expect("read")
@@ -12210,15 +12440,217 @@ mod tests {
             "a tombstone travels as a tombstone"
         );
         assert_eq!(
-            std::fs::read(spool_file(&follower_spool, CUSTOMERS)).expect("materialised on install"),
+            std::fs::read(spool_file(&follower_spool, CUSTOMERS))
+                .expect("materialised on install from the fetched bytes"),
             CUSTOMERS.as_bytes(),
-            "a node that joins by snapshot holds the same bytes on disk"
+            "a node that joins by snapshot materialises the spool file from the fetched bytes"
         );
         assert!(
             !spool_file(&follower_spool, ORDERS_CSV).exists(),
             "no file for a tombstoned digest"
         );
         assert_eq!(follower.dataset_blob_count().expect("count"), 1);
+    }
+
+    /// A distinct, valid CSV of roughly `target_bytes`, tagged so different `tag`s hash to
+    /// different digests (so a manifest of N of them has N entries).
+    fn tagged_big_csv(tag: &str, target_bytes: usize) -> String {
+        let mut csv = String::from("id,val\n");
+        let mut row = 0u64;
+        while csv.len() < target_bytes {
+            csv.push_str(&format!("{row},{tag}-{}\n", "x".repeat(48)));
+            row += 1;
+        }
+        csv
+    }
+
+    /// Pins D-50: a snapshot of a fleet holding many MiB of datasets is a KiB-sized manifest,
+    /// because the bytes leave the payload. The size the manifest carries is the blob's real byte
+    /// length, and the csv bytes themselves are nowhere in the snapshot (#440 AC1).
+    #[tokio::test]
+    async fn a_manifest_snapshot_carries_sizes_not_bytes_and_is_tiny() {
+        const DATASETS: usize = 4;
+        const PER_DATASET: usize = 512 * 1024;
+
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        let mut expected: Vec<(String, usize)> = Vec::new();
+        let mut total_bytes = 0usize;
+        for i in 0..DATASETS {
+            let csv = tagged_big_csv(&format!("d{i}"), PER_DATASET);
+            total_bytes += csv.len();
+            expected.push((dataset_digest(&csv).as_str().to_owned(), csv.len()));
+            apply_one(
+                &mut sm,
+                (i as u64) + 1,
+                dataset_put((i as u128) + 1, &format!("d{i}"), &csv),
+            )
+            .await;
+        }
+        let mut builder = sm.clone();
+        let Snapshot { snapshot, .. } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+
+        assert!(
+            total_bytes >= 2 * 1024 * 1024,
+            "the fleet really holds multiple MiB of datasets: {total_bytes}"
+        );
+        assert!(
+            bytes.len() < 1024 * 1024,
+            "AC1: the manifest snapshot is under 1 MiB for {total_bytes} bytes of datasets; was {}",
+            bytes.len()
+        );
+        assert!(
+            bytes.len() * 20 < total_bytes,
+            "the manifest is a small fraction of the data it names: {} vs {total_bytes}",
+            bytes.len()
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("snapshot is json");
+        let manifest = json["dataset_blobs"]
+            .as_array()
+            .expect("dataset_blobs manifest");
+        assert_eq!(
+            manifest.len(),
+            DATASETS,
+            "one manifest entry per distinct blob"
+        );
+        for (digest, len) in &expected {
+            let entry = manifest
+                .iter()
+                .find(|e| e[0] == digest.as_str())
+                .unwrap_or_else(|| panic!("{digest} is named in the manifest"));
+            assert_eq!(
+                entry[1].as_u64(),
+                Some(*len as u64),
+                "the manifest carries each blob's exact byte length, not its bytes"
+            );
+        }
+    }
+
+    /// A manifest that names a blob the joiner cannot fetch (no blob source attached) fails the
+    /// install loudly and records nothing — never an empty dataset in place of the real one, the
+    /// snapshot analogue of `resolve_blobs`' divergence guard (D-49).
+    #[tokio::test]
+    async fn a_manifest_install_with_no_blob_source_is_an_error() {
+        let (td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let handle = snapshot_handle_from(td.path(), &bytes).await;
+
+        let (_td2, mut follower, _follower_spool) = fresh_sm_with_spool().await;
+        let result = follower.install_snapshot(&meta, handle).await;
+        assert!(
+            result.is_err(),
+            "a manifest naming a blob with no source to fetch it must fail the install, got {result:?}"
+        );
+        assert!(
+            follower
+                .dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_none(),
+            "nothing may be recorded when the manifest's bytes were never obtained"
+        );
+    }
+
+    /// A fetched blob that is not valid UTF-8 fails the install rather than being lossily written
+    /// into `sm_dataset_blobs` (which stores `&str`): a blob that does not decode to the document
+    /// it claims to be is the transport handing back the wrong thing (D-50), and installing a
+    /// mangled csv would be exactly the divergence content-addressing exists to prevent.
+    #[tokio::test]
+    async fn a_manifest_blob_that_is_not_utf8_fails_the_install() {
+        let (td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let handle = snapshot_handle_from(td.path(), &bytes).await;
+
+        // The source answers the manifest digest with bytes that are not UTF-8 — a fake standing in
+        // for a transport that returned something other than the document the digest names. Same
+        // length as CUSTOMERS so the manifest size-check passes and the UTF-8 guard is what fires
+        // (0xFF never appears in valid UTF-8).
+        let not_utf8 = vec![0xffu8; CUSTOMERS.len()];
+        let source = MapSource::holding_all(&[(dataset_digest(CUSTOMERS).as_str(), &not_utf8)]);
+        let (_td2, follower, _follower_spool) = fresh_sm_with_spool().await;
+        let mut follower = follower.with_blob_source(source);
+        let result = follower.install_snapshot(&meta, handle).await;
+        assert!(
+            result.is_err(),
+            "a non-UTF-8 fetched blob must fail the install, got {result:?}"
+        );
+        assert!(
+            follower
+                .dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_none(),
+            "nothing may be recorded when the fetched bytes were not the document"
+        );
+    }
+
+    /// A fetch whose byte length disagrees with the manifest's recorded size fails the install:
+    /// the manifest and the bytes have come apart (D-50). Turns `size` from a decorative field into
+    /// a validated one — a real transport's digest check is stronger, so this only ever fires on an
+    /// inconsistency that check cannot see.
+    #[tokio::test]
+    async fn a_manifest_blob_whose_size_disagrees_with_the_fetch_fails_the_install() {
+        let (td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let handle = snapshot_handle_from(td.path(), &bytes).await;
+
+        // The manifest recorded CUSTOMERS.len(); the source answers with a shorter blob.
+        let source = MapSource::holding_all(&[(dataset_digest(CUSTOMERS).as_str(), b"short")]);
+        let (_td2, follower, _follower_spool) = fresh_sm_with_spool().await;
+        let mut follower = follower.with_blob_source(source);
+        assert!(
+            follower.install_snapshot(&meta, handle).await.is_err(),
+            "a fetch shorter than the manifest size must fail the install"
+        );
+        assert!(
+            follower
+                .dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_none()
+        );
+    }
+
+    /// Two datasets over the same bytes share one blob row, so the manifest names the digest once
+    /// and a joiner fetches it once — the dedup `resolve_snapshot_blobs` does across the two
+    /// manifests, proven here at the storage level.
+    #[tokio::test]
+    async fn two_datasets_sharing_one_blob_travel_as_one_manifest_entry_and_one_fetch() {
+        let (td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "a", CUSTOMERS)).await;
+        apply_one(&mut sm, 2, dataset_put(2, "b", CUSTOMERS)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            json["dataset_blobs"].as_array().expect("manifest").len(),
+            1,
+            "one shared blob is one manifest entry, not one per referencing dataset"
+        );
+
+        let source = MapSource::holding(CUSTOMERS);
+        let handle = snapshot_handle_from(td.path(), &bytes).await;
+        let (_td2, follower, spool) = fresh_sm_with_spool().await;
+        let mut follower = follower.with_blob_source(source.clone());
+        follower
+            .install_snapshot(&meta, handle)
+            .await
+            .expect("install");
+        assert_eq!(source.calls(), 1, "the shared blob is fetched exactly once");
+        one_dataset(&follower, "a");
+        one_dataset(&follower, "b");
+        assert_eq!(
+            std::fs::read(spool_file(&spool, CUSTOMERS)).expect("materialised"),
+            CUSTOMERS.as_bytes()
+        );
     }
 
     #[tokio::test]
@@ -12469,6 +12901,7 @@ mod tests {
         // the `DatasetPut` arm inserts only on a digest's first reference — so four datasets
         // sharing one CSV would store a single blob, and this would quietly measure a quarter of
         // what it claims to.
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
         for (i, name) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
             let mut csv = String::from("id,payload\n");
             let mut row = 0u64;
@@ -12488,7 +12921,18 @@ mod tests {
                 Some(&ControlOutcome::Applied),
                 "dataset {name} must actually be stored, or the gap below measures nothing"
             );
+            blobs.push((dataset_digest(&csv).as_str().to_owned(), csv.into_bytes()));
         }
+
+        // Install now fetches every manifest digest (D-50); the node needs a source to fetch from,
+        // exactly as production wires one before `Raft::new`. Held in memory here so the fetch adds
+        // no I/O of its own to what this test measures — the worker cost being isolated is the
+        // synchronous redb/JSON work, not the transport.
+        let refs: Vec<(&str, &[u8])> = blobs
+            .iter()
+            .map(|(d, b)| (d.as_str(), b.as_slice()))
+            .collect();
+        let sm = sm.with_blob_source(MapSource::holding_all(&refs));
 
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let max_gap_ms = std::sync::Arc::new(AtomicU64::new(0));
@@ -14852,6 +15296,19 @@ mod tests {
                 dataset_digest(csv).as_str().to_owned(),
                 csv.as_bytes().to_vec(),
             );
+            Arc::new(Self {
+                blobs,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        /// A source holding an arbitrary set of `(digest hex, bytes)` — the shape a snapshot
+        /// joiner needs, whose manifest can name both spec and dataset blobs (#440).
+        fn holding_all(entries: &[(&str, &[u8])]) -> Arc<Self> {
+            let blobs = entries
+                .iter()
+                .map(|(digest, bytes)| ((*digest).to_owned(), bytes.to_vec()))
+                .collect();
             Arc::new(Self {
                 blobs,
                 calls: std::sync::atomic::AtomicUsize::new(0),
