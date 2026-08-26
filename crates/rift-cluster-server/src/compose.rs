@@ -27,9 +27,9 @@ use rift_cluster::{
     PullOnMissInterceptor, RaftNode, SourcePuller, SourceScheduler, metrics,
 };
 use rift_cluster_base::seams::{
-    CompiledRoutes, FileSource, HttpSource, ImposterManager, RouteObserver, RunningFrontDoor,
-    RunningServer, ServerBuilder, SourceRef, SourceRegistry, TlsDefaults,
-    bind_front_door_with_observer, parse_uri_list,
+    CompiledRoutes, FileSource, HttpSource, ImposterManager, OutboundTls, RouteObserver,
+    RunningFrontDoor, RunningServer, ServerBuilder, SourceRef, SourceRegistry, TlsDefaults,
+    bind_front_door_with_observer, build_upstream_client, parse_uri_list,
 };
 
 use crate::admin_front::{self, AdminFront, FrontConfig};
@@ -1495,7 +1495,37 @@ fn cluster_manager(
         .transpose()
         .context("reading --default-tls-key")?;
 
-    Ok(ImposterManager::with_datadir(cli.oss.datadir.clone())
+    // The operator's outbound TLS trust policy for `proxy` stubs (upstream #974/#976).
+    // Mirrored here because injecting a manager replaces upstream's construction
+    // wholesale: without this a clustered node silently ignores `--upstream-ca-file`
+    // and `--upstream-tls-skip-verify` that the single-node binary honours, so an
+    // imposter proxying to an upstream behind a private CA works standalone and fails
+    // under `--cluster`. Realised eagerly, like upstream, so a bad anchor is a startup
+    // error rather than a surprise on the first proxied request; an untouched default
+    // stays lazy because building it reads the OS trust store.
+    let outbound_tls = OutboundTls {
+        ca_pem: cli
+            .oss
+            .upstream_ca_file
+            .as_ref()
+            .map(|path| {
+                // `.context`, not `.with_context`: `manager_parity`'s extractor reads this
+                // function's body textually and counts every `.with_*` as a builder call, so
+                // the lazy form would register as a surplus cluster-only builder call and have
+                // to be declared as one. Same eagerness either way — the closure only runs when
+                // a path was given.
+                std::fs::read_to_string(path)
+                    .context(format!("reading --upstream-ca-file {}", path.display()))
+            })
+            .transpose()?,
+        skip_verify: cli.oss.upstream_tls_skip_verify,
+    };
+    let upstream_client = outbound_tls
+        .is_configured()
+        .then(|| build_upstream_client(&outbound_tls))
+        .transpose()?;
+
+    let manager = ImposterManager::with_datadir(cli.oss.datadir.clone())
         .with_tls_defaults(TlsDefaults {
             default_cert,
             default_key,
@@ -1529,7 +1559,12 @@ fn cluster_manager(
         // off-switch as the flow store: the `--cluster`-off path never reaches this
         // function, so single-node keeps the upstream per-imposter `LocalProxyStore`
         // byte-identical.
-        .with_proxy_store(Arc::new(ClusterProxyStore::new(proxy_net))))
+        .with_proxy_store(Arc::new(ClusterProxyStore::new(proxy_net)));
+
+    Ok(match upstream_client {
+        Some(client) => manager.with_upstream_client(client),
+        None => manager,
+    })
 }
 
 /// Replay parked intents (issue #9 R4): drain whenever a leader (re)appears —

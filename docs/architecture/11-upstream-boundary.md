@@ -111,7 +111,16 @@ stops getting it, at a pin bump, in a file nobody here edited. `rift-cluster-ser
 sites and fails naming the one that diverged (issue #30). When it fires during a
 bump, mirror the call into `cluster_manager` or record it in that test's
 `INTENTIONALLY_NOT_MIRRORED` with a reason — the point is that the divergence
-becomes a decision instead of an accident.
+becomes a decision instead of an accident. It has already paid for itself once:
+the `a2712c5` bump carried upstream's per-client outbound TLS trust (`#976`), and
+without the mirror a clustered node would have gone on ignoring `--upstream-ca-file`
+while the single-node binary honoured it. Two practical notes for the next bump.
+The extraction is *textual*, so any `.with_*` inside `cluster_manager` counts as a
+builder call — use `.context`, not `.with_context`, in that function, or an
+`anyhow` call registers as a surplus cluster-only builder and has to be declared
+as one. And a sibling assertion guards the other direction: calls the clustered
+path makes and upstream does not are held in `CLUSTER_ADDITIONS`, so an upstream
+*removal* is a decision too.
 
 Feature discipline rides the same manifest: `rift-http-proxy` is consumed
 without its binary-only allocator default, with `redis-backend` / `javascript`

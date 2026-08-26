@@ -176,6 +176,17 @@ pub mod seams {
     /// has no opinion about.
     pub use rift_mock_core::imposter::RiftFlowStateConfig;
 
+    /// The operator-configured outbound TLS trust policy for `proxy` stubs, and
+    /// the client that realises it (upstream #974/#976).
+    ///
+    /// Injecting a manager replaces upstream's construction wholesale, so the
+    /// clustered path has to build this itself or a clustered node silently
+    /// ignores `--upstream-ca-file` / `--upstream-tls-skip-verify` that the
+    /// single-node binary honours — the exact divergence #976 fixed upstream.
+    /// `manager_parity`'s builder-call guard is what catches it.
+    pub use rift_mock_core::imposter::build_upstream_client;
+    pub use rift_mock_core::proxy::OutboundTls;
+
     /// Config-time `_rift.script` `file:`/`ref:` resolution (upstream #356):
     /// the clustered admin front resolves before replicating, so nothing
     /// unresolved is ever committed to the log.
