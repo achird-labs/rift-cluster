@@ -3124,6 +3124,17 @@ mod tests {
         }
         let leader = elected.expect("a new leader must be elected after the old one dies");
 
+        // `is_leader` above was a *past* observation, and the write below is a
+        // present one. A node that has just won an election has not yet been
+        // acknowledged by a quorum, so `put_imposter` can legitimately answer
+        // `NotLeader { leader: None }` in the gap — the same past-state-as-present
+        // reading that produced #430-#433. Wait for the lease this node already
+        // knows how to report rather than assuming the sample still holds.
+        assert!(
+            wait_until(|| !leader.is_isolated()).await,
+            "the elected leader must reach a quorum lease before it can commit"
+        );
+
         // The new leader can commit a write (proves it has a live quorum).
         leader
             .put_imposter(imposter(9090, "after-failover"))
