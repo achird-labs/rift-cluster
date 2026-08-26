@@ -1510,6 +1510,11 @@ therefore strictly more informative than the 0/1 gauge it replaces.
 
 ### 11.3 Performance guardrails
 
+> **Amended by D-47** (2026-08-26, #466): sequencing shipped **owner-routed on the ring**, not
+> Redis-backed — D-12's premise died with D-15. The RPC budget below still holds and the
+> peek-amplification cost is still owed a measurement (#476); what changed is that an owner which
+> cannot answer degrades to the local cursor and annotates, rather than failing the request.
+
 - Stateless hot path: **zero cluster code** — `Local` trait impls are the moved current
   code; Phase-0 exit criterion pins bench regressions ≤ 2 %.
 - Stateful ops: budget **one LAN RPC (sub-millisecond typical) per op** — scenario-gated

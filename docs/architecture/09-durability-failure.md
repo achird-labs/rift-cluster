@@ -73,7 +73,7 @@ signal to watch — exposing it as a gauge is #470.
 | Scenario CAS / flow-KV write | flow owner | fast-fail `503` | Single-writer or nothing |
 | Script flow-KV read (`strong`, default) | flow owner | `503` | Scripts drive responses off this |
 | Script flow-KV read (`local`, opt-in) | — | local replica, flagged when owner down | Imposter chose speed |
-| Sequence advance | owner (Phase 4) | **`local`** by default: node-local cursor, flagged | Blocking all cyclic responses during a blip is worse than a possible duplicate index — the one place availability wins |
+| Sequence advance | cursor owner (opt-in, D-47) | **falls back to the node-local cursor, annotated and counted** (`rift_cluster_sequence_fallbacks_total`) | Blocking all cyclic responses during a blip is worse than a possible duplicate index — the one place availability wins (D-10). Never a `503`; the counter, not the returned index, is what distinguishes a degraded answer from a healthy one |
 | proxyOnce claim | signature owner | `503` | Duplicate upstream side-effects are worse than a failed mock call |
 | Journal append / count | — (always local) | unaffected | Mergeable by design |
 | Journal / count read | all peers | merge of reachable shards + `Rift-Cluster-Partial: true` | Partial-and-says-so beats blocked |

@@ -23,7 +23,7 @@ flowchart TB
     SCM -- no --> LOOP
     SCM -- yes --> SEL
     SEL --> MULTI{multiple responses<br/>on the stub?}
-    MULTI -- "yes → sequencer next()<br/>(local today; owner/Redis in Ph.4)" --> RESP
+    MULTI -- "yes → sequencer next()<br/>(local by default; owner-routed opt-in)" --> RESP
     MULTI -- no --> RESP["build response<br/>(behaviors, templates, scripts)"]
     RESP --> TRANS{"stub declares<br/>willSetStateTo?"}
     TRANS -- "yes → owner CAS<br/>(same round-trip class)" --> REC

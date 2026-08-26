@@ -91,6 +91,7 @@ use crate::control::{
     StubEdit, StubEditScript, Tenant, TenantConfigUsage, TenantId, routes_installed_for,
 };
 use crate::stores::journal::ClusterJournal;
+use crate::stores::sequencer::SequencingRegistry;
 
 type StorageResult<T> = Result<T, StorageError<u64>>;
 
@@ -1274,6 +1275,8 @@ pub struct RedbStateMachine {
     /// tests and while the embedder has not wired one — the state machine is
     /// then tables-only, which is exactly what the conformance suite exercises.
     engine: Option<Arc<ImposterManager>>,
+    /// Per-port sequencing modes, refreshed from every applied config set (#466).
+    sequencing: Option<Arc<SequencingRegistry>>,
     /// The front door's hot-swappable compiled table (issue #131). `None` in
     /// storage tests and on a node that never binds a front door — routes are
     /// still replicated and readable from `sm_routes` either way, this is only
@@ -1364,6 +1367,7 @@ impl RedbStateMachine {
             snapshot_guard: Arc::new(Mutex::new(())),
             snapshot_idx: Arc::new(AtomicU64::new(0)),
             engine: None,
+            sequencing: None,
             routes: None,
             apply_failures: Arc::new(Mutex::new(BTreeMap::new())),
             journal: OnceLock::new(),
@@ -1425,6 +1429,19 @@ impl RedbStateMachine {
     #[must_use]
     pub fn with_engine(mut self, engine: Arc<ImposterManager>) -> Self {
         self.engine = Some(engine);
+        self
+    }
+
+    /// Attach the per-port sequencing modes the clustered `ResponseSequencer`
+    /// reads (issue #466, D-47). Same before-`Raft::new` contract as
+    /// [`Self::with_engine`].
+    ///
+    /// The apply loop is the only place that sees every config, complete, on
+    /// every change — a manager-wide sequencer is handed just a port and has no
+    /// per-imposter hook of its own, so this is where its lookup gets filled.
+    #[must_use]
+    pub fn with_sequencing_registry(mut self, registry: Arc<SequencingRegistry>) -> Self {
+        self.sequencing = Some(registry);
         self
     }
 
@@ -5974,6 +5991,12 @@ impl RedbStateMachine {
                 let Some(engine) = &self.engine else { return };
                 let desired_ports: std::collections::BTreeSet<u16> =
                     desired.iter().filter_map(|c| c.port).collect();
+                // Before the engine call, and from the same set: the sequencer
+                // must not answer for a config the engine has accepted while
+                // this map still describes the previous one.
+                if let Some(sequencing) = &self.sequencing {
+                    sequencing.apply(&desired);
+                }
                 match engine.apply_config(desired).await {
                     Ok(report) => self.record_report(&report, &desired_ports),
                     Err(e) => {

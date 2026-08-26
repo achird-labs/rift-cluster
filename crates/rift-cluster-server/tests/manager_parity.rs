@@ -67,6 +67,15 @@ const CLUSTER_ADDITIONS: &[&str] = &[
     // traffic happened to land here, and that is wrong for every imposter rather
     // than only the ones that opted into something.
     "with_request_journal",
+    // Response cursors that can be owned by one node, so `responses: [A, B, C]`
+    // cycles once fleet-wide behind a round-robin LB instead of once per node
+    // (issue #466, D-47). Installed unconditionally like the three above, but
+    // for a different reason: here the *object* is unconditional while the
+    // behaviour is not. D-10 keeps `local` the default — sequencing is the one
+    // stateful op where availability beats consistency — so an imposter that
+    // never sets `_rift.sequencing.mode` gets per-process cursors from this
+    // sequencer exactly as it would from upstream's `LocalSequencer`.
+    "with_sequencer",
     // Exactly-once proxy recording via fleet-wide ownership: ClusterProxyStore
     // claims each (port, signature) at its HRW owner (KeyClass::Proxy), and a
     // recording commits marker and stub in one log entry, so "recorded but

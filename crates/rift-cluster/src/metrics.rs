@@ -372,6 +372,17 @@ lazy_static! {
     /// membership index, which is a bug to file, not noise; `isolated` = the
     /// owner could not see a quorum and refused rather than mutate state a
     /// healed majority may already have re-homed (D-17).
+    /// `rift_cluster_sequence_fallbacks_total` — `owner`-mode cursor decisions
+    /// served from this node's own cursor because the fleet could not answer
+    /// (D-47). Not an error counter: D-10 makes this the one stateful op that
+    /// degrades rather than fails, so this is what makes the degradation
+    /// visible at all.
+    static ref SEQUENCE_FALLBACKS: IntCounter = register_int_counter!(
+        "rift_cluster_sequence_fallbacks_total",
+        "Owner-mode cursor decisions served locally because the owner could not answer"
+    )
+    .expect("rift_cluster_sequence_fallbacks_total registers once");
+
     static ref FLOW_CAS_CONFLICTS: IntCounterVec = register_int_counter_vec!(
         "rift_cluster_cas_conflicts_total",
         "Owner-side flow-write refusals, by reason",
@@ -673,6 +684,17 @@ pub(crate) fn source_scheduler_read_failure() {
 
 pub(crate) fn flow_conflict(reason: &str) {
     FLOW_CAS_CONFLICTS.with_label_values(&[reason]).inc();
+}
+
+/// An `owner`-mode cursor decision the fleet could not answer, served from this
+/// node's own cursor instead (D-47).
+///
+/// The one place a cluster failure is deliberately *not* an error (D-10:
+/// sequencing is where availability wins), so this counter is the only signal
+/// that a response was cycled locally rather than fleet-wide. Persistently
+/// non-zero means owners are unreachable, not that sequencing is off.
+pub(crate) fn sequence_fallback() {
+    SEQUENCE_FALLBACKS.inc();
 }
 
 /// `outcome` ∈ `granted` / `inflight` / `already_recorded` — closed at the call sites.
