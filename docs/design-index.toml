@@ -85,7 +85,7 @@ code = ["crates/rift-cluster/src/control.rs", "crates/rift-cluster/src/raft/node
 
 ["docs/architecture/05-read-path.md"]
 status = "current"
-verified_sha = "9e0433dd0"
+verified_sha = "3c167428a"
 verified_on = "2026-08-25"
 code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/shard.rs"]
 
@@ -127,7 +127,7 @@ code = ["crates/rift-cluster-base/**", "Cargo.toml"]
 
 ["docs/architecture/12-testing.md"]
 status = "current"
-verified_sha = "9e0433dd0"
+verified_sha = "3c167428a"
 verified_on = "2026-08-25"
 code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**"]
 
