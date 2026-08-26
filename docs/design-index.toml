@@ -73,8 +73,8 @@ code = ["crates/rift-cluster-server/src/compose.rs"]
 
 ["docs/architecture/03-control-plane.md"]
 status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "1a7b52b78"
+verified_on = "2026-08-26"
 code = ["crates/rift-cluster/src/raft/**", "crates/rift-cluster/src/blobs/**"]
 
 ["docs/architecture/04-write-path.md"]
@@ -109,8 +109,8 @@ code = ["crates/rift-cluster-server/src/authz.rs", "crates/rift-cluster-server/s
 
 ["docs/architecture/09-durability-failure.md"]
 status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "1a7b52b78"
+verified_on = "2026-08-26"
 code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores/flow.rs"]
 
 ["docs/architecture/10-operations.md"]

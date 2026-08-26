@@ -442,24 +442,26 @@ New tables, following the `sm_*` conventions of `store.rs:76–91`:
   digest, removed when the last referencing spec record goes;
 - `sm_validation`: `(tenant, port) → {mode, spec_id, revision}`.
 
-**Why the blob is on consensus and not per-node or re-fetched.** Every node
-enforces (or observes) against the spec, so every node needs byte-identical
-spec content; fetching per node is exactly the differing-bytes hazard #20's
-one-fetch rule exists to close, and per-node redb is for data that may
-legitimately differ per node (journals, violations) — a spec may not. The
-precedent is already set: config bodies ride in log entries
-(`03-control-plane.md`, "Config bodies ride in log entries (small JSON)"),
-and the snapshot machinery compacts at 5k entries / 64 MiB. What the store
-does **not** have is a size guard (verified, §2) — the 16 MiB
-`MAX_BODY_BYTES` at the admin front is the only cap today. Rather than
-inherit that accident, `SpecPut` gets an explicit deterministic check in
-`control::validate`: **specs over 4 MiB are refused pre-commit**. 4 MiB
-holds every real-world spec we could name while keeping a spec blob the
-same order of magnitude as a large imposter config; raising it later is a
-one-line change, shrinking it later is a migration. `SpecPut` with an
-unchanged digest is refused as a no-op at the accepting node (mirroring
-#20's digest-changed gate) so retries and unchanged Git polls cost zero log
-growth.
+**Why the bytes are content-addressed and sideloaded, not on the log or
+re-fetched per node (revised by epic #432).** Every node enforces (or observes)
+against the spec, so every node needs byte-identical spec content — and
+content-addressing is what *guarantees* that: a digest names the exact bytes, so
+a member either holds those bytes or does not, and can never hold a different
+spec under the same name. The original design put those bytes on the log to
+achieve byte-identity through log order; that reasoning — "a log entry of that
+size is unremarkable" — was measured false at the quota sizes (#411/#430/#431),
+so the bytes now travel the content-addressed blob store instead: `SpecPut`
+carries them to the admin front, `fan_out_then_submit` puts them on a
+joint-consensus quorum (#438, D-19) before proposing a digest-only op (D-49), and
+any member the fan-out missed fetches on apply, origin first then any joint voter
+(#439, D-48). Byte-identity is stronger than before, not weaker — the digest is
+checked on every fetch — and per-node redb is still only for data that may
+legitimately differ per node (journals, violations). Snapshots carry a manifest
+of spec-blob digests the joiner fetches on install (#440, D-50), not the bytes.
+`control::validate` still refuses **specs over 4 MiB pre-commit** (the admin
+front's 16 MiB `MAX_BODY_BYTES` is not a spec guard), and a `SpecPut` whose
+digest is unchanged is still refused as a no-op at the accepting node, so retries
+and unchanged Git polls cost zero log growth.
 
 The imposter record (`StoredImposter`, `store.rs:122`) gains cluster-side
 fields `provenance: Option<{spec_id, digest}>` and `drifted: bool` — stored

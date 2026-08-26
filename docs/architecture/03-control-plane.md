@@ -78,18 +78,18 @@ flowchart TB
   commits, so the row never points at a payload that is not already durable
   (#436; Chapter 9). Config bodies ride in log entries (small JSON); snapshots are the
   compaction story, replacing v2's content-addressed body fetch entirely.
-  The one deliberately larger payload is an OpenAPI spec (RFC-004 §4.1, #278):
-  its bytes ride a `SpecPut` entry too — every node must hold *identical*
-  bytes, and re-fetching per node is exactly the differing-bytes hazard the
-  sources' one-fetch rule closes — but they are capped at **4 MiB** by
-  `control::validate` before commit and stored content-addressed in
-  `sm_spec_blobs`, so identical documents under two ids cost one blob.
-  Datasets (RFC-005 §3.2, #285) follow the same rule with a larger ceiling —
-  a `DatasetPut` carries the CSV, capped by the tenant's `maxDatasetBytes`
-  (default 8 MiB) at apply — and add one derived artefact: apply writes the
-  bytes to `<data-dir>/datasets/<digest>.csv` before inserting the record, so
-  log order alone puts the file on every node before any config that names
-  it. The file is derived state — rebuilt from `sm_dataset_blobs` on restart,
+  The deliberately larger payloads — an OpenAPI spec up to 4 MiB (RFC-004 §4.1,
+  #278) and a dataset up to the tenant's `maxDatasetBytes`, default 8 MiB
+  (RFC-005 §3.2, #285) — **no longer ride the log** (epic #432): every node
+  still needs *identical* bytes, but content-addressing is what guarantees that,
+  so a `SpecPut`/`DatasetPut` commits a digest and the bytes are sideloaded
+  through the blob transfer store below — fanned out to a quorum before propose
+  (#438) and fetched on apply by any member that lacks them (#439). Snapshots
+  carry a manifest of those digests, not the bytes, and a joiner fetches what it
+  lacks on install (#440). A dataset still keeps one derived artefact: apply
+  materializes `<data-dir>/datasets/<digest>.csv` from the resolved bytes before
+  inserting the record, so the file is on every node before any config that names
+  it. That file is derived state — rebuilt from `sm_dataset_blobs` on restart,
   never fetched from a peer.
 - **Blob transfer store** (#437, epic #432) — `<data-dir>/blobs/<digest>`, a
   per-node content-addressed store fed by `PUT`/`GET /internal/v1/blob/{digest}`
@@ -103,14 +103,13 @@ flowchart TB
   on a joint-consensus quorum (D-19) before the referencing op is submitted.
 
   That is not in tension with **ADR-001 D-18** ("every member holds every live
-  blob"): D-18 describes where the epic lands, and the completeness it asserts is
-  established by #438 fanning a blob to a quorum *before* the op is proposed
-  (landed) and #439 fetching on apply (open) — by the write path, never by the
-  store. Until #439 lands, D-18 holds for a quorum rather than for every member:
-  a node the fan-out did not reach still gets the bytes from the log entry, not
-  from this store. #441 revises the surrounding text once the bytes actually leave the log,
-  at which point this section's "its bytes ride a `SpecPut` entry" stops being
-  true.
+  blob"): D-18's completeness is established by the write path, never by the
+  store — #438 fans a blob to a joint-consensus quorum *before* the op is
+  proposed, and #439 fetches on apply for any member the fan-out missed, so a
+  commit implies quorum-durability and every member converges to holding every
+  live blob. A joiner catching up by snapshot fetches the manifest's blobs the
+  same way (#440, D-50). The bytes have left the log; this store is now the only
+  carrier for them.
 
 ## Membership lifecycle
 

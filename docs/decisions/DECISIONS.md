@@ -385,10 +385,10 @@ evidence the peer is down (#442).
 correct and each failed for this unmeasured reason. Instrument both ends before changing timers.
 
 ### D-23 — The bytes leave the log: blobs are sideloaded, ops carry digests
-- **Status:** pending
+- **Status:** active
 - **Decided:** 2026-08-24 · #432 (epic), RCA "Bytes on the Log"
 - **Amends:** RFC-005 §3.2, RFC-004 §4.1
-- **Implemented by:** #436, #437, #438, #439, #440 (open), #441 (open)
+- **Implemented by:** #436, #437, #438, #439, #440; prose revision #441 (this PR)
 - **Code:** crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/raft/blob_source.rs
 
 RFC-004/005 put 4–64 MiB blobs through a Raft log and snapshot whose timers, health tracker,
@@ -402,7 +402,7 @@ Target: `SpecPut`/`DatasetPut` carry `{digest, size, meta}`; apply requires the 
 and a follower that lacks it fetches (origin first, then any member) before applying; snapshots
 are manifests of digests. RFC-005's ordering argument survives intact — log order still
 guarantees the bytes are on disk before any config referencing them applies. Do not re-argue the
-reversal; #441 revises the prose.
+reversal; #441 revised the prose (RFC-005 §3.2, RFC-004 §4.1, ch.3, ch.9).
 
 Refined by D-48 (what a node does when no member can supply a blob) and D-49 (the wire shape
 that keeps every existing log replayable, and where the bytes leave the op).

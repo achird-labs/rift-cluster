@@ -83,12 +83,28 @@ signal to watch — exposing it as a gauge is #470.
 
 ## The replication ceiling
 
-Two shipped quotas put real bytes in a single log entry: a spec document up to
-4 MiB (RFC-004 S2) and a dataset up to a tenant-configurable 8 MiB (RFC-005 §4).
-The fleet carries them as **one entry each** — atomically, or not at all.
+The log carries metadata; blobs are quorum-replicated out of band (epic #432,
+D-23). A spec document up to 4 MiB (RFC-004 S2) and a dataset up to a
+tenant-configurable 8 MiB (RFC-005 §4) no longer ride a log entry: a
+`SpecPut`/`DatasetPut` commits a digest and a size — under 4 KiB — and the bytes
+travel through the content-addressed blob store (`/internal/v1/blob/{digest}`,
+#437), fanned out to a joint-consensus quorum *before* the referencing op is
+proposed (#438, D-18/D-19) and fetched on apply by any member the fan-out missed
+(#439, D-48/D-49). Snapshots became manifests of digests the joiner fetches on
+install (#440, D-50). So the log entry is small again by construction, and the
+large-payload concerns this section used to open with have moved off the log
+onto a transport built for them.
 
-What bounds an entry's size is the transport's own body cap (32 MiB), which sits
-above every quota. What bounds its *latency* is the link:
+The blob transport is **resumable**: a transfer is chunked at 4 MiB
+(`BLOB_CHUNK_MAX_BYTES`), receiver-verified against the digest, and a stalled or
+restarted transfer resumes from its last committed chunk rather than from byte 0
+— which is what lets an 8 MiB blob cross a real link and commit (#453) where an
+8 MiB *log entry* never did (below). Everything from here down describes the
+log's own large-entry path (#411): it still exists, still bounds any entry the
+transport cap admits, and is simply no longer the path the data quotas take.
+
+What bounds a log entry's size is the transport's own body cap (32 MiB), which
+sits above every quota. What bounds its *latency* is the link:
 
 - A large entry commits in **`O(size / link speed)`**, not in one heartbeat.
   openraft grants each AppendEntries RPC only `heartbeat_interval` (50 ms), so
@@ -113,21 +129,23 @@ so a 512 KiB entry took 23–548 s and anything ≥ 1 MiB never committed at all
 the effective ceiling was "whatever replicates in one heartbeat", far below both
 documented quotas.
 
-**The silent window.** A follower's election timer is refreshed only by an
-AppendEntries that reaches its engine. openraft 0.9 sends a follower nothing
-else while a large entry is in flight (a heartbeat tick to a lagging follower
-re-sends the entry) and nothing at all during a snapshot install. Any such
-window longer than `election_timeout_min` (150 ms) makes a **voter** campaign,
-and once its term has moved the leader — which rejects a candidate without
-adopting its term — never reconciles with it. Large payloads make that window
-routine; CPU pressure widens it. That churn is the real mechanism behind the
-issues this chapter used to list separately: a leader that loses its term keeps
-its replication cores alive for a moment, and a stale core reading a range the
-new leader's conflict has truncated was what openraft 0.9.24 panicked on
-(#430 — an empty read is tolerated from 0.9.25, #435). Closing the window
-itself is #431: a per-peer liveness heartbeat that bypasses the health tracker,
-a 50 ms reconnect backoff, and a restart grace for a node that already belongs
-to a cluster. The measured story is in the RCA report linked from those issues.
+**The silent window, and why it is closed.** A follower's election timer is
+refreshed only by an AppendEntries that reaches its engine, and openraft 0.9
+sends a follower nothing else while a large entry is in flight nor anything at
+all during a snapshot install. A window longer than `election_timeout_min`
+(150 ms) makes a **voter** campaign, and once its term has moved the leader —
+which rejects a candidate without adopting its term — never reconciles with it.
+Two independent fixes closed it, and #432 removed what opened it in the first
+place. #431 supplies a per-peer liveness heartbeat that bypasses the health
+tracker, a 50 ms reconnect backoff, and a restart grace for a node that already
+belongs to a cluster, so a voter no longer campaigns through a legitimate
+transfer; a stale replication core reading a range the new leader's conflict had
+truncated — the openraft 0.9.24 panic behind #430 — is tolerated from 0.9.25
+(#435). And because spec/dataset bytes and snapshot payloads no longer ride the
+log (#439/#440), the multi-MiB entries and multi-MiB `InstallSnapshotRequest`s
+that used to make the window *routine* are gone: a digest-only entry and a
+manifest snapshot are both back in KiB, and their bytes cross the blob transport
+without touching a follower's election timer at all.
 
 ## Scenario walkthroughs
 
@@ -200,16 +218,24 @@ of datasets stores **1.00×** its raw bytes, and one holding 16 MiB likewise **1
 
 **Fresh-joiner catch-up, before and after (#436),** same probe on both sides, 1 voter → 2:
 
-| fleet state | before | after |
-|---|---|---|
-| 4 MiB | 3.1 s | **2.2 s** |
-| 16 MiB | 12.3 s | **8.8 s** |
-| 64 MiB | never converges | **still never converges** |
+| fleet state | before (#436) | after file-backed (#436) | after manifest (#440) |
+|---|---|---|---|
+| 4 MiB | 3.1 s | **2.2 s** | seconds |
+| 16 MiB | 12.3 s | **8.8 s** | seconds |
+| 64 MiB | never converges | still never converges | **converges — bytes fetched out of band** |
 
-The 64 MiB row is the honest headline: binary, file-backed snapshots cut what a snapshot costs to
-*store* and to *install*, but they do not move the ceiling, because the payload is still chunked
-onto the wire as a JSON integer array by openraft's own `InstallSnapshotRequest`. That is what
-`#432`'s later children address — the ceiling sits between 16 MiB and 64 MiB until then.
+The 64 MiB row was the honest headline until #440: binary, file-backed snapshots (#436) cut what a
+snapshot costs to *store* and to *install*, but did not move the ceiling, because the payload was
+still chunked onto the wire as a JSON integer array by openraft's own `InstallSnapshotRequest` — the
+same silent window a multi-MiB entry opens (above), now opened by the install instead. #440 removes
+the payload from that path entirely: the snapshot is a **manifest** of digests and sizes (KiB), and
+the joiner fetches each blob it lacks over the resumable blob transport (#437) — a snapshot names no
+single origin, so it asks every joint voter, parking and retrying if none can yet supply it (D-48) —
+*before* the install commits. The `InstallSnapshotRequest` no longer
+carries the dataset bytes, so the ceiling it imposed is gone; a 64 MiB fleet's catch-up is now
+bounded by the same per-blob resumable transport that carries an 8 MiB blob (#453), not by a
+snapshot that restarts from byte 0. Measured multi-MiB catch-up is seconds; the 64 MiB case
+converges by the same construction rather than by a fresh end-to-end measurement at that size.
 
 **Producing a snapshot costs the leader CPU, but never its runtime (#444).** The chapter above
 describes what a catch-up costs the *joiner*; the other half is what building one costs the node
@@ -227,22 +253,28 @@ in-process nodes' runtimes share two vCPUs — that was long enough for a follow
 read and install of a ≥ 16 MiB snapshot stays under `election_timeout_min`, measured with **no
 joiner present** so the leader-side cost is isolated from anything on the install path.
 
-**The write path still has this shape, in two places.** `apply` is synchronous in the same way — a
-`DatasetPut` carries its whole CSV through serde and an fsync on a runtime worker — and so is
-`RaftLogStorage::append`, which commits and fsyncs every entry before acknowledging it. Neither is
-hoisted: a blocking-pool hop per committed entry buys latency for nothing on the hot path, and
-#432's move to digest-only entries shrinks the serde half of it anyway. A heartbeat gap observed
-during a large `DatasetPut` is that residual, not a regression of the fix above.
+**The write path still has this shape, in one place.** `RaftLogStorage::append` is synchronous on a
+runtime worker — it commits and fsyncs every entry before acknowledging it — and is not hoisted: a
+blocking-pool hop per committed entry buys latency for nothing on the hot path, and #432's move to
+digest-only entries (#439) already shrank each entry to KiB, so the serde and fsync it carries are
+small. `apply` no longer carries a dataset's CSV at all: a digest-only op resolves its bytes in a
+pre-transaction fetch (D-49) that runs off both the redb write transaction and the runtime worker
+(the blob is stored via `spawn_blocking`, #444), and only the spool materialisation — plain file
+I/O bounded by the blob's size — remains, done after the durable commit. A heartbeat gap during a
+write is that residual, not a regression of the fix above.
 
-**Catch-up has a size ceiling below the documented quotas, and it is not the one
-above.** A fleet holding a few MiB of state catches a node up in seconds
-(measured: ~4 MiB in 8 s on loopback). A fleet at RFC-005's 64 MiB per-tenant
-dataset ceiling does **not** catch a node up at all — the joiner applies nothing
-even given minutes, though the same 64 MiB writes normally. So the quotas in
-RFC-005 §4 currently describe more state than a node can be brought up to hold,
-and an operator near them should expect a replacement node to fail to converge
-rather than to converge slowly. The per-chunk deadline above is not the cause;
-the remaining bottleneck is #432.
+**Catch-up no longer has a size ceiling below the documented quotas (#440).**
+Before #432's snapshot child, a fleet holding a few MiB of state caught a node up
+in seconds (measured: ~4 MiB in 8 s on loopback) but a fleet at RFC-005's 64 MiB
+per-tenant dataset ceiling did **not** catch a node up at all — the joiner
+applied nothing even given minutes, because the whole payload was chunked through
+`InstallSnapshotRequest` and restarted from byte 0 on any stall. Manifest
+snapshots removed that path: the joiner installs a KiB manifest and fetches the
+bytes it lacks over the resumable blob transport (#437, #440), so RFC-005 §4's
+quotas now describe state a replacement node can actually be brought up to hold,
+and an operator near them should expect a joiner to converge in
+`O(state / link speed)` rather than to fail. The per-blob transport is the only
+remaining bound, and it is the same one the live write path already runs at.
 
 A related case, and the one more likely to be met in practice: the scenario
 above is a node that comes back **empty**. A node that returns still holding its
