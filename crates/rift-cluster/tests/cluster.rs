@@ -3005,7 +3005,10 @@ async fn the_exporter_ships_batch_after_batch_rather_than_once() {
         written.push(cluster.write_on_leader(port, "batched").await);
     }
 
-    let rows = wait_rows(&sink, written.len(), Duration::from_secs(30)).await;
+    // The revisions written, not a row count: `wait_rows` returns as soon as *any* twelve
+    // rows arrive, and under load those can be twelve that are not these (the same shape
+    // `every_audit_row_reaches_the_sink_exactly_once` was cured of at the `4b4f841` bump).
+    let rows = wait_for_revisions(&sink, &written, Duration::from_secs(30)).await;
     let shipped: BTreeSet<u64> = rows.iter().map(|(rev, _)| *rev).collect();
     for revision in &written {
         assert!(
@@ -4779,9 +4782,23 @@ async fn a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns()
             "not yet a stall: the escalation window has not passed"
         );
 
-        tokio::time::sleep(rift_cluster::blobs::BLOB_FETCH_ESCALATE_AFTER + Duration::from_secs(3))
-            .await;
-        let stall = node.blob_fetch_stall().expect("escalated to a stall");
+        // Polled, not slept: the escalation window starts when the *fetch* starts, and the
+        // fetch starts only once the restarted node has caught its log up — which on a 2-vCPU
+        // runner can be seconds after `restart` returns. A fixed sleep of window + 3 s passed
+        // locally and failed on CI for exactly that reason.
+        let escalation_deadline = Instant::now()
+            + rift_cluster::blobs::BLOB_FETCH_ESCALATE_AFTER
+            + Duration::from_secs(45);
+        let stall = loop {
+            if let Some(stall) = node.blob_fetch_stall() {
+                break stall;
+            }
+            assert!(
+                Instant::now() < escalation_deadline,
+                "never escalated to a stall"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
         assert_eq!(stall.digest, digest.as_str());
         assert!(stall.stalled_for() >= rift_cluster::blobs::BLOB_FETCH_ESCALATE_AFTER);
         assert_eq!(stall.origin, origin);

@@ -1415,13 +1415,6 @@ impl RedbStateMachine {
             let EntryPayload::Normal(request) = &entry.payload else {
                 continue;
             };
-            // An op `validate` refuses at apply is refused identically on every replica and
-            // never reads its bytes. Resolving them first would turn that per-op refusal into
-            // an apply parked on a blob nobody needs — or, for a digest that is not even hex,
-            // into a fatal storage error — over an op that was going to be refused anyway.
-            if crate::control::validate(&request.op).is_err() {
-                continue;
-            }
             let (digest, origin) = match &request.op {
                 ControlOp::SpecPut {
                     meta,
@@ -1437,6 +1430,15 @@ impl RedbStateMachine {
                 } => (record.digest.as_str(), *origin),
                 _ => continue,
             };
+            // An op `validate` refuses at apply is refused identically on every replica and
+            // never reads its bytes. Resolving them first would turn that per-op refusal into
+            // an apply parked on a blob nobody needs — or, for a digest that is not even hex,
+            // into a fatal storage error — over an op that was going to be refused anyway.
+            // Checked only for the digest-only ops that reach here: a carried op contributes
+            // nothing, and validating it would parse its CSV a second time on every apply.
+            if crate::control::validate(&request.op).is_err() {
+                continue;
+            }
             if seen.insert(digest) {
                 required.push((digest.to_owned(), origin));
             }
