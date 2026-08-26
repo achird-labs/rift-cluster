@@ -2207,40 +2207,79 @@ async fn ensure_session_key(
 /// re-proves the record against its bytes on every replica anyway.
 fn op_blob(op: &ControlOp) -> Option<(&str, &[u8])> {
     match op {
-        ControlOp::DatasetPut { record, csv, .. } => Some((record.digest.as_str(), csv.as_bytes())),
-        ControlOp::SpecPut { meta, document, .. } => {
-            Some((meta.digest.as_str(), document.as_bytes()))
-        }
+        ControlOp::DatasetPut {
+            record,
+            csv: Some(csv),
+            ..
+        } => Some((record.digest.as_str(), csv.as_bytes())),
+        ControlOp::SpecPut {
+            meta,
+            document: Some(document),
+            ..
+        } => Some((meta.digest.as_str(), document.as_bytes())),
+        // Not a blob op — or a blob op already stripped by `fan_out_then_submit`. The second
+        // cannot reach here from a replay: parking happens before stripping at every site,
+        // so a parked intent always still carries its bytes.
         _ => None,
     }
 }
 
-/// Store this op's blob locally and fan it out to a joint-consensus quorum
-/// before it is proposed (#438; D-18, D-19).
+/// Take the bytes off the op (#439, D-23): what is proposed carries the digest, the declared
+/// size and the accepting node, never the payload. Called only once a joint quorum holds the
+/// bytes — see [`fan_out_then_submit`], the sole caller.
+fn strip_blob(op: &mut ControlOp, accepted_by: u64) {
+    match op {
+        ControlOp::DatasetPut { csv, origin, .. } => {
+            *csv = None;
+            *origin = accepted_by;
+        }
+        ControlOp::SpecPut {
+            document, origin, ..
+        } => {
+            *document = None;
+            *origin = accepted_by;
+        }
+        _ => {}
+    }
+}
+
+/// Fan this op's blob out to a joint-consensus quorum, take the bytes off the op, and submit
+/// it — in one place, so nothing between "a quorum holds it" and "the op that references it
+/// committed" can be dropped by a caller (#438, #439; D-18, D-19, D-23, D-48).
 ///
-/// Runs **after** the intent is parked and **before** submit, which is what
-/// makes a shortfall recoverable rather than lost: the parked intent replays and
-/// re-runs the fan-out, which is idempotent because `BlobTransfer::put` probes
-/// what the peer already staged and sends only the remainder.
+/// Runs **after** the intent is parked and **before** submit, which is what makes a shortfall
+/// recoverable rather than lost: the parked intent still carries its bytes, so a replay
+/// (`compose::drain_parked_intents`) re-enters here and re-runs the fan-out, which is
+/// idempotent because `BlobTransfer::put` probes what the peer already staged and sends only
+/// the remainder.
 ///
-/// `Ok` when the op carries no blob, or when a majority of both the committed
-/// and the effective configuration holds it — the joint rule D-19 fixes, read in
-/// one `with_raft_state` closure by `network::joint_voters` and decided by
-/// `QuorumTargets::satisfied_by`. `Err` carries an operator-facing
-/// reason for the refusal — the caller must then leave the intent **parked** and
-/// ask for a replay.
+/// Only once a majority of both the committed and the effective configuration holds the
+/// bytes — the joint rule D-19 fixes, read in one `with_raft_state` closure by
+/// `network::joint_voters` and decided by `QuorumTargets::satisfied_by` — are they
+/// **stripped** from the op and `origin` stamped with this node. What reaches the log is
+/// metadata-sized (D-23); a member the fan-out missed fetches on apply, asking this node
+/// first. The stripped copy is what `submit` sees; the parked copy is untouched.
 ///
-/// The returned guard must be **held across the submit**. Until the op commits,
-/// the blob is referenced by nothing — the referencing row is exactly what is
-/// being proposed — so the pin is the only thing standing between a
-/// quorum-durable blob and the reaper. Dropping it early would reintroduce the
-/// window it exists to close.
-async fn fan_out_before_propose<'a>(
-    node: &'a RaftNode,
-    op: &ControlOp,
-) -> Result<Option<rift_cluster::blobs::BlobPin<'a>>, String> {
-    let Some((digest, bytes)) = op_blob(op) else {
-        return Ok(None);
+/// `submit` is the caller's own submit expression, with or without a deadline, because the
+/// three write paths differ there and nowhere else. It runs while the blob is pinned and the
+/// pin is released on return. There is no guard handed back and therefore none a caller can
+/// `let _ =` away — which is how the pin-hold gap #438 disclosed is closed structurally
+/// rather than by a test asserting nobody dropped it.
+///
+/// `Err` carries an operator-facing reason the blob did not reach a quorum; the caller must
+/// then leave the intent **parked** and ask for a replay. `Ok` carries whatever `submit`
+/// returned, untouched.
+pub(crate) async fn fan_out_then_submit<F, Fut>(
+    node: &RaftNode,
+    mut request: ControlRequest,
+    submit: F,
+) -> Result<Fut::Output, String>
+where
+    F: FnOnce(ControlRequest) -> Fut,
+    Fut: std::future::Future,
+{
+    let Some((digest, bytes)) = op_blob(&request.op) else {
+        return Ok(submit(request).await);
     };
     let digest = rift_cluster::blobs::BlobDigest::parse(digest)
         .map_err(|e| format!("the op carries an unusable blob digest: {e}"))?;
@@ -2250,34 +2289,37 @@ async fn fan_out_before_propose<'a>(
         .await
         .map_err(|e| format!("blob fan-out failed: {e}"))?;
 
-    if outcome.quorum {
-        tracing::debug!(
-            digest = digest.as_str(),
-            acks = outcome.acks.len(),
-            bytes_sent = outcome.bytes_sent,
-            joint = outcome.joint,
-            "blob fanned out to a quorum before propose"
-        );
-        return Ok(Some(pin));
+    if !outcome.quorum {
+        // Naming the skewed peers separately matters for diagnosis: "3 nodes, 2
+        // acks, 1 cannot serve blobs" is an upgrade, while "3 nodes, 2 acks" with
+        // no skew is a partition. Collapsing them would make a half-upgraded fleet
+        // look like a network fault.
+        return Err(format!(
+            "the blob reached {} of the current voters, which is not a majority of both \
+             the committed and the effective configuration{}",
+            outcome.acks.len(),
+            if outcome.skewed.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} member(s) run a build that cannot serve blobs)",
+                    outcome.skewed.len()
+                )
+            }
+        ));
     }
+    tracing::debug!(
+        digest = digest.as_str(),
+        acks = outcome.acks.len(),
+        bytes_sent = outcome.bytes_sent,
+        joint = outcome.joint,
+        "blob fanned out to a quorum before propose"
+    );
 
-    // Naming the skewed peers separately matters for diagnosis: "3 nodes, 2
-    // acks, 1 cannot serve blobs" is an upgrade, while "3 nodes, 2 acks" with
-    // no skew is a partition. Collapsing them would make a half-upgraded fleet
-    // look like a network fault.
-    Err(format!(
-        "the blob reached {} of the current voters, which is not a majority of both \
-         the committed and the effective configuration{}",
-        outcome.acks.len(),
-        if outcome.skewed.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " ({} member(s) run a build that cannot serve blobs)",
-                outcome.skewed.len()
-            )
-        }
-    ))
+    strip_blob(&mut request.op, node.id());
+    let submitted = submit(request).await;
+    drop(pin);
+    Ok(submitted)
 }
 
 /// Render the `Set-Cookie` header for a freshly minted session token.
@@ -4502,15 +4544,16 @@ async fn run_mutation(
                 // awaited on the request path or the async contract changes.
                 // A shortfall leaves the intent parked for the replay loop,
                 // exactly as a failed submit does below.
-                let _blob_pin = match fan_out_before_propose(&node, &request.op).await {
-                    Ok(pin) => pin,
+                let submitted = match fan_out_then_submit(&node, request, |r| node.submit(r)).await
+                {
+                    Ok(submitted) => submitted,
                     Err(reason) => {
                         tracing::warn!(%op_id, %reason, "async blob fan-out short of quorum; intent stays parked");
                         node.request_replay();
                         return;
                     }
                 };
-                match node.submit(request).await {
+                match submitted {
                     Ok(_) => {
                         if let Err(e) = node.unpark_intent(&op_id) {
                             tracing::error!(%op_id, error = %e, "applied but could not unpark");
@@ -4550,8 +4593,12 @@ async fn run_mutation(
         // #438, synchronous branch: same rule as the async one above and as the
         // tenancy seam — fan out inside the parked window, and on a shortfall
         // refuse with the op id rather than unparking.
-        let _blob_pin = match fan_out_before_propose(node, &request.op).await {
-            Ok(pin) => pin,
+        let submitted = match fan_out_then_submit(node, request, |r| {
+            tokio::time::timeout(WRITE_DEADLINE, node.submit(r))
+        })
+        .await
+        {
+            Ok(submitted) => submitted,
             Err(reason) => {
                 node.request_replay();
                 let mut response = typed_error(
@@ -4566,7 +4613,6 @@ async fn run_mutation(
                 return Err(response);
             }
         };
-        let submitted = tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await;
         let response = match submitted {
             Err(_) => {
                 // Parked, so not lost: the replay loop retries it, and is woken
@@ -5837,10 +5883,15 @@ async fn terminate_tenancy(
     // the log itself used to provide. Deliberately inside the parked window and
     // deliberately *not* unparked on failure: the replay loop owns the intent
     // from here and re-runs the fan-out.
-    // Bound, not discarded: the pin has to outlive the submit below, because
-    // nothing references the blob until the op it carries commits.
-    let _blob_pin = match fan_out_before_propose(node, &request.op).await {
-        Ok(pin) => pin,
+    // The pin lives inside `fan_out_then_submit`, which owns the submit — nothing
+    // references the blob until the op it carries commits, and no caller can drop
+    // a guard it was never handed (#439).
+    let submitted = match fan_out_then_submit(node, request, |r| {
+        tokio::time::timeout(WRITE_DEADLINE, node.submit(r))
+    })
+    .await
+    {
+        Ok(submitted) => submitted,
         Err(reason) => {
             node.request_replay();
             let mut response = typed_error(
@@ -5856,7 +5907,7 @@ async fn terminate_tenancy(
         }
     };
 
-    let committed = match tokio::time::timeout(WRITE_DEADLINE, node.submit(request)).await {
+    let committed = match submitted {
         Err(_) => {
             node.request_replay();
             let mut response = typed_error(
@@ -6356,8 +6407,10 @@ async fn terminate_spec_put(
                 format,
                 digest: control::Digest::new(digest),
                 source: control::SpecSource::Inline,
+                size: text.len() as u64,
             },
-            document: text,
+            document: Some(text),
+            origin: 0,
         }],
         port: None,
         render: Render::Captured {
@@ -11088,5 +11141,91 @@ mod tests {
             assert_eq!(TRY_BUDGET, Duration::from_secs(10));
             assert_eq!(TRY_MAX_RESPONSE_BYTES, 1024 * 1024);
         }
+    }
+
+    // ---- #439: the bytes leave the op at submit, after the quorum (D-49) ----
+
+    fn carried_dataset_put(csv: &str) -> ControlOp {
+        ControlOp::DatasetPut {
+            tenant: TenantId::default(),
+            record: rift_cluster::control::DatasetRecord {
+                name: "customers".to_owned(),
+                digest: rift_cluster::control::Digest::new(
+                    rift_cluster::blobs::digest_of_bytes(csv.as_bytes())
+                        .as_str()
+                        .to_owned(),
+                ),
+                key_columns: vec!["id".to_owned()],
+                delimiter: ',',
+                columns: vec!["id".to_owned(), "name".to_owned()],
+                rows: 1,
+                bytes: csv.len() as u64,
+            },
+            csv: Some(csv.to_owned()),
+            origin: 0,
+        }
+    }
+
+    #[test]
+    fn strip_blob_drops_the_payload_and_stamps_the_origin() {
+        let mut op = carried_dataset_put("id,name\n1,ada\n");
+        assert!(
+            op_blob(&op).is_some(),
+            "carried: there is a blob to fan out"
+        );
+
+        strip_blob(&mut op, 42);
+
+        let ControlOp::DatasetPut { csv, origin, .. } = &op else {
+            panic!("expected DatasetPut")
+        };
+        assert_eq!(csv, &None);
+        assert_eq!(*origin, 42);
+        assert!(
+            op_blob(&op).is_none(),
+            "stripped: nothing left to fan out, so a second pass is a no-op"
+        );
+    }
+
+    /// Pins D-49: what `submit` receives is metadata-sized and names this node as origin, and
+    /// the blob is already in this node's own store — the fan-out ran before the strip, while
+    /// the op still carried its bytes.
+    #[tokio::test]
+    async fn fan_out_then_submit_hands_submit_a_stripped_op_with_this_node_as_origin() {
+        let (node, _dir) = test_node().await;
+        // A quorum needs a membership: an empty one is refused by design (D-19).
+        node.cluster_init().await.expect("solo cluster");
+        let csv = "id,name\n1,ada\n";
+        let request = ControlRequest {
+            op_id: uuid::Uuid::new_v4(),
+            principal: None,
+            issued_at_secs: 0,
+            expected_revision: None,
+            op: carried_dataset_put(csv),
+        };
+
+        let handed = fan_out_then_submit(&node, request, |r| async move { r })
+            .await
+            .expect("a solo cluster is its own joint quorum");
+
+        let ControlOp::DatasetPut {
+            csv: carried,
+            origin,
+            ..
+        } = &handed.op
+        else {
+            panic!("expected DatasetPut")
+        };
+        assert_eq!(carried, &None, "the bytes must not reach the log");
+        assert_eq!(*origin, node.id());
+        assert!(
+            serde_json::to_vec(&handed.op).expect("serialise").len() < 4096,
+            "what is proposed is metadata-sized"
+        );
+        let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+        assert!(
+            node.blobs().stat(&digest).expect("stat").have,
+            "fanned out to this node's own store before the strip"
+        );
     }
 }

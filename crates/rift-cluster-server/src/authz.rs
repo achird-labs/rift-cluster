@@ -744,7 +744,8 @@ mod tests {
             rift_cluster::ControlOp::DatasetPut {
                 tenant: rift_cluster::TenantId::default(),
                 record: dataset_record(),
-                csv: "id\n1\n".to_owned(),
+                csv: Some("id\n1\n".to_owned()),
+                origin: 0,
             }
             .audit_action()
             .expect("a dataset write is audited"),

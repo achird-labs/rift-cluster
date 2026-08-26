@@ -2186,6 +2186,41 @@ export interface components {
              *     **Absent** when this node could not read its own depth — a sum missing an unknown addend is not a sum. When a *peer* fails to answer, the field is present but is a **floor**, and the response carries `Rift-Cluster-Partial` to say so.
              */
             parked_intents_fleet?: number;
+            /**
+             * @description **This node's** apply loop is parked on a content-addressed blob it cannot obtain from any member (#439). `null` when it is not — and always present on a build that reports it, so an old-build node (which omits the key) is distinguishable from a healthy one.
+             *
+             *     A stall is *degraded*, not *not-ready*: the node keeps serving reads and keeps its `ready`/`state` — pulling it from the load balancer would only widen whatever partition caused the stall. It never exits over this and never gives up; the field clears itself the moment any holder comes back. It becomes visible after the fetch has gone unsatisfied for 30 s (`BLOB_FETCH_ESCALATE_AFTER`), at which point the node also logs at error level and sets `rift_cluster_blob_fetch_stalled` to `1`.
+             *
+             *     Until it clears, every committed entry behind the parked one on **this node** is unapplied: the fleet has committed writes this node does not yet reflect. That is the failure mode ADR-001 D-18 names, made visible rather than silent.
+             */
+            blob_fetch_stall?: {
+                /** @description The sha256 hex the parked op names. */
+                digest: string;
+                /**
+                 * Format: int64
+                 * @description Seconds since the fetch first went unsatisfied — a duration recomputed on every read, so it grows until the stall clears.
+                 */
+                stalled_for_secs: number;
+                /** @description Node id of the member that accepted the write and was asked first. A string for the same reason as `FleetMembers.node_id`. */
+                origin: string;
+                /** @description Node ids asked in the most recent round, whether or not they answered. A round asks the origin, then every other joint voter. */
+                tried: string[];
+                /** @description Members whose **build cannot serve blobs at all** — they answered the transport's unknown-route class rather than not-found. Named separately because "3 nodes, 2 tried, 1 skewed" is an upgrade in progress, while "3 nodes, 2 tried" with no skew is a partition; collapsing them makes a half-upgraded fleet look like a network fault. */
+                skewed: string[];
+                /** @description The last **refusal** a member answered with in the most recent round — a peer that answered but would not serve the blob (a credential or request-shape problem, or bytes that did not hash to the digest). `null` when every member merely lacked the blob or did not answer, which is the partition shape. Carried separately because a refusal is what an operator can act on, and flattening it into "no member holds the blob" would hide it. */
+                last_error?: string | null;
+            } | null;
+            /**
+             * @description Every voter currently reporting a `blob_fetch_stall`, this node's own included, read back off the same body rather than recomputed so the two can never disagree (#439). Present on `/_fleet/health` only — `/_cluster/health` is node-local for the same reason `parked_intents_fleet` is.
+             *
+             *     A peer that fails to answer, or that answers **without the key** (an old build), is *unknown*, not stalled: it contributes no row, and the response carries `Rift-Cluster-Partial` to say the list is a floor. An empty array under a partial response therefore does not mean "no stalls".
+             */
+            blob_fetch_stalls_fleet?: {
+                node_id: string;
+                digest: string;
+                /** Format: int64 */
+                stalled_for_secs: number;
+            }[];
             /** @description Whether this node currently sees itself as network-isolated from the rest of the fleet. */
             isolated: boolean;
             ring: {

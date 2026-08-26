@@ -1056,7 +1056,8 @@ pub(crate) async fn dispatch(
                 op: ControlOp::DatasetPut {
                     tenant,
                     record,
-                    csv: csv.to_owned(),
+                    csv: Some(csv.to_owned()),
+                    origin: 0,
                 },
                 status: StatusCode::CREATED,
                 then: Some(json(&uploaded).map_err(TenancyError::Storage)?),

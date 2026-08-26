@@ -3532,3 +3532,118 @@ async fn a_space_stub_body_that_is_not_a_stub_is_refused_through_the_front() {
 
     server.shutdown().await;
 }
+
+/// Pins D-49 on the replay path (#439): a blob write parked on a quorum-less node replays
+/// through the same fan-out-then-strip as a fresh write. The bytes reach the returned leader's
+/// blob *transfer store* before the op is proposed — and only a fan-out or a fetch ever writes
+/// that store, so its holding the digest is proof the replay did not submit the parked,
+/// byte-carrying copy verbatim and put the payload back on the log.
+#[tokio::test]
+async fn a_parked_blob_write_replays_through_the_fan_out() {
+    let leader_bind = common::ports::reserve_addr();
+    let leader_state = TempDir::new().expect("tempdir");
+    let leader = compose::start(cluster_cli_at(
+        &leader_state,
+        &leader_bind,
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+
+    let follower_state = TempDir::new().expect("tempdir");
+    let follower = compose::start(cluster_cli(&follower_state, &["--cluster-seeds", &seed]))
+        .await
+        .expect("follower joins");
+    wait_ready(&follower).await;
+
+    leader.shutdown().await;
+
+    let csv = "id,name\n1,ada\n2,bob\n";
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    let client = reqwest::Client::new();
+    let upload = || {
+        client
+            .post(format!(
+                "http://{}/admin/tenants/default/datasets",
+                follower.admin_addr()
+            ))
+            .header("x-rift-dataset-name", "customers")
+            .header("x-rift-dataset-key-columns", "id")
+            .header("content-type", "text/csv")
+            .body(csv.to_owned())
+            .send()
+    };
+
+    // Park the blob write on the quorum-less survivor: the blob cannot reach a joint quorum,
+    // so 503 with the op id and a retry hint — and the op stays parked, bytes and all.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = upload().await.expect("post without quorum");
+        if response.status().as_u16() == 503 {
+            assert!(
+                response.headers().get("rift-cluster-op-id").is_some(),
+                "the 503 must carry the parked op id"
+            );
+            assert!(response.headers().get("retry-after").is_some());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no-quorum blob write never surfaced 503"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The accepting node stored the bytes locally before trying the fleet (#438).
+    assert!(
+        follower
+            .node()
+            .expect("clustered")
+            .blobs()
+            .stat(&digest)
+            .expect("stat")
+            .have
+    );
+
+    // Quorum returns. The survivor's replay loop must fan the blob out, strip it, and commit —
+    // with no further client action.
+    let leader = compose::start(cluster_cli_at(
+        &leader_state,
+        &leader_bind,
+        &["--cluster-allow-solo"],
+    ))
+    .await
+    .expect("leader restarts");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) = reqwest::get(format!(
+            "http://{}/admin/tenants/default/datasets/customers",
+            follower.admin_addr()
+        ))
+        .await
+            && response.status().as_u16() == 200
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked blob write never replayed after quorum returned"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        leader
+            .node()
+            .expect("clustered")
+            .blobs()
+            .stat(&digest)
+            .expect("stat")
+            .have,
+        "the leader holds the blob because the replay fanned it out, not because it rode the log"
+    );
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}

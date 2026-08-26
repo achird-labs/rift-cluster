@@ -3005,7 +3005,10 @@ async fn the_exporter_ships_batch_after_batch_rather_than_once() {
         written.push(cluster.write_on_leader(port, "batched").await);
     }
 
-    let rows = wait_rows(&sink, written.len(), Duration::from_secs(30)).await;
+    // The revisions written, not a row count: `wait_rows` returns as soon as *any* twelve
+    // rows arrive, and under load those can be twelve that are not these (the same shape
+    // `every_audit_row_reaches_the_sink_exactly_once` was cured of at the `4b4f841` bump).
+    let rows = wait_for_revisions(&sink, &written, Duration::from_secs(30)).await;
     let shipped: BTreeSet<u64> = rows.iter().map(|(rev, _)| *rev).collect();
     for revision in &written {
         assert!(
@@ -3111,7 +3114,8 @@ fn dataset_put(name: &str, csv: &str) -> ControlRequest {
                 rows,
                 bytes: csv.len() as u64,
             },
-            csv: csv.to_owned(),
+            csv: Some(csv.to_owned()),
+            origin: 0,
         },
     }
 }
@@ -3548,8 +3552,10 @@ fn spec_put(id: &str, document: &str) -> ControlRequest {
                 format: rift_cluster::control::SpecFormat::Yaml,
                 digest: rift_cluster::control::Digest::new(dataset_digest_hex(document)),
                 source: rift_cluster::control::SpecSource::Inline,
+                size: document.len() as u64,
             },
-            document: document.to_owned(),
+            document: Some(document.to_owned()),
+            origin: 0,
         },
     }
 }
@@ -4574,5 +4580,271 @@ async fn a_chunk_that_does_not_match_the_digest_leaves_no_blob_on_the_receiver()
     assert!(!transfer.have(target, &lie).await.expect("have"));
     assert!(!transfer.have(target, &honest).await.expect("have"));
 
+    cluster.shutdown_all().await;
+}
+
+// ---- #439: fetch-on-apply — the bytes leave the log (D-23, D-48, D-49) --------------------
+
+/// `dataset_put`, with the bytes taken off the op and `origin` stamped — the shape the admin
+/// front submits once a quorum holds the blob (D-49). The harness submits directly, so the
+/// fan-out is the test's own job: call `fan_out_blob` first.
+fn digest_only_dataset_put(name: &str, csv: &str, origin: NodeId) -> ControlRequest {
+    let mut request = dataset_put(name, csv);
+    if let rift_cluster::ControlOp::DatasetPut {
+        csv,
+        origin: accepted_by,
+        ..
+    } = &mut request.op
+    {
+        *csv = None;
+        *accepted_by = origin;
+    }
+    request
+}
+
+/// Poll `node` until it lists `name`, or `deadline` passes.
+async fn wait_for_dataset(node: &RaftNode, name: &str, deadline: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if node.dataset(DEFAULT_TENANT, name).ok().flatten().is_some() {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Fan `csv` out from the leader with `absent` down, then commit the digest-only op. Returns
+/// the leader's id (the op's origin) and the digest.
+async fn commit_digest_only_with_a_member_down(
+    cluster: &TestCluster,
+    absent: NodeId,
+    csv: &str,
+) -> (NodeId, rift_cluster::blobs::BlobDigest) {
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    let leader = cluster.leader().expect("two of three still lead");
+    let (outcome, pin) = leader
+        .fan_out_blob(&digest, csv.as_bytes())
+        .await
+        .expect("fan-out");
+    assert!(outcome.quorum, "two of three hold it");
+    assert!(
+        !outcome.acks.contains(&absent),
+        "the killed node cannot have acked"
+    );
+    let response = leader
+        .submit(digest_only_dataset_put("customers", csv, leader.id()))
+        .await
+        .expect("commits");
+    assert_eq!(response.outcome, rift_cluster::ControlOutcome::Applied);
+    drop(pin);
+    for node in cluster.live() {
+        assert!(
+            wait_for_dataset(node, "customers", Duration::from_secs(30)).await,
+            "live node {} applies from its own store",
+            node.id()
+        );
+    }
+    (leader.id(), digest)
+}
+
+/// Pins D-23 and D-49: a follower that was down for the fan-out never received the bytes, and
+/// the entry it later replicates carries only the digest — so it must fetch on apply from a
+/// member that holds the blob, and end up with the same spool file every other node has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_down_during_fan_out_fetches_the_blob_on_apply() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let leader_id = cluster.leader().expect("leader").id();
+    let absent = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader_id)
+        .expect("a follower");
+    cluster.kill(absent).await;
+
+    let csv = "id,name\n1,ada\n2,bob\n";
+    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
+
+    cluster.restart(absent).await;
+    {
+        let member = cluster.member(absent);
+        let node = member.node.as_ref().expect("restarted");
+        assert!(
+            wait_for_dataset(node, "customers", Duration::from_secs(30)).await,
+            "the restarted follower applies the digest-only entry"
+        );
+        assert!(
+            node.blobs().stat(&digest).expect("stat").have,
+            "fetched into its own store"
+        );
+        assert_eq!(
+            std::fs::read(spool_file(member.dir.path(), csv)).expect("spool file"),
+            csv.as_bytes(),
+            "the spool file is materialised from the fetched bytes"
+        );
+        assert_eq!(
+            node.blob_fetch_stall(),
+            None,
+            "a fetch that succeeded is not a stall"
+        );
+    }
+    cluster.shutdown_all().await;
+}
+
+/// Pins D-48 (origin first, *then any member*) and epic #432's acceptance 5: killing the node
+/// that accepted the write does not stop a member that missed the fan-out from applying it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_origin_is_not_needed_to_apply_a_digest_only_entry() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let leader_id = cluster.leader().expect("leader").id();
+    let absent = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader_id)
+        .expect("a follower");
+    cluster.kill(absent).await;
+
+    let csv = "id,name\n1,ada\n2,bob\n3,cleo\n";
+    let (origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
+    assert_eq!(origin, leader_id);
+
+    // The origin dies before the absent member comes back: only the third node holds the blob.
+    cluster.kill(origin).await;
+    cluster.restart(absent).await;
+    assert!(
+        cluster.wait_for_leader(LEADER_DEADLINE).await.is_some(),
+        "two of three elect"
+    );
+    {
+        let node = cluster.member(absent).node.as_ref().expect("restarted");
+        assert!(
+            wait_for_dataset(node, "customers", Duration::from_secs(60)).await,
+            "applies by fetching from the surviving holder"
+        );
+        assert!(node.blobs().stat(&digest).expect("stat").have);
+        assert_eq!(node.blob_fetch_stall(), None);
+    }
+    cluster.shutdown_all().await;
+}
+
+/// Pins D-48: a blob no reachable member holds parks the follower's apply — it does not halt
+/// the node, does not apply an empty document, and past `BLOB_FETCH_ESCALATE_AFTER` reports
+/// the stall on the health surface; it applies the moment a holder returns, and the stall
+/// clears. The setup is the failure D-48 exists for: the blob reaped from every holder before
+/// a member that missed the fan-out could fetch it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let leader_id = cluster.leader().expect("leader").id();
+    let absent = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader_id)
+        .expect("a follower");
+    cluster.kill(absent).await;
+
+    let csv = "id,name\n1,ada\n";
+    let (origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
+    for node in cluster.live() {
+        std::fs::remove_file(node.blobs().path_of(&digest)).expect("reap the blob from a holder");
+    }
+
+    cluster.restart(absent).await;
+    {
+        let node = cluster.member(absent).node.as_ref().expect("restarted");
+        assert!(
+            !wait_for_dataset(node, "customers", Duration::from_secs(3)).await,
+            "must not apply without the bytes"
+        );
+        assert_eq!(
+            node.blob_fetch_stall(),
+            None,
+            "not yet a stall: the escalation window has not passed"
+        );
+
+        // Polled, not slept: the escalation window starts when the *fetch* starts, and the
+        // fetch starts only once the restarted node has caught its log up — which on a 2-vCPU
+        // runner can be seconds after `restart` returns. A fixed sleep of window + 3 s passed
+        // locally and failed on CI for exactly that reason.
+        let escalation_deadline = Instant::now()
+            + rift_cluster::blobs::BLOB_FETCH_ESCALATE_AFTER
+            + Duration::from_secs(45);
+        let stall = loop {
+            if let Some(stall) = node.blob_fetch_stall() {
+                break stall;
+            }
+            assert!(
+                Instant::now() < escalation_deadline,
+                "never escalated to a stall"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        assert_eq!(stall.digest, digest.as_str());
+        assert!(stall.stalled_for() >= rift_cluster::blobs::BLOB_FETCH_ESCALATE_AFTER);
+        assert_eq!(stall.origin, origin);
+        assert!(
+            stall.tried.contains(&origin),
+            "the origin was asked: {:?}",
+            stall.tried
+        );
+        assert!(stall.skewed.is_empty(), "no member is version-skewed");
+        assert_eq!(
+            stall.last_error, None,
+            "every member merely lacks the blob; nobody refused"
+        );
+        assert!(
+            node.dataset(DEFAULT_TENANT, "customers")
+                .expect("the node still answers")
+                .is_none(),
+            "parked, not applied"
+        );
+    }
+
+    // A holder returns.
+    cluster
+        .member(origin)
+        .node
+        .as_ref()
+        .expect("live")
+        .blobs()
+        .store_whole(&digest, csv.as_bytes())
+        .expect("restore the blob on the origin");
+    {
+        let member = cluster.member(absent);
+        let node = member.node.as_ref().expect("live");
+        assert!(
+            wait_for_dataset(node, "customers", Duration::from_secs(30)).await,
+            "applies once a holder returns"
+        );
+        assert_eq!(
+            node.blob_fetch_stall(),
+            None,
+            "the stall clears on recovery"
+        );
+        assert_eq!(
+            std::fs::read(spool_file(member.dir.path(), csv)).expect("spool file"),
+            csv.as_bytes()
+        );
+    }
     cluster.shutdown_all().await;
 }

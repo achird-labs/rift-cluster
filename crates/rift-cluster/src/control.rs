@@ -788,7 +788,22 @@ pub enum ControlOp {
         tenant: TenantId,
         id: String,
         meta: SpecMeta,
-        document: String,
+        /// The document bytes — **`None` on everything this build mints** (#439). They travel
+        /// out of band to a quorum before the op is proposed, and apply sources them from the
+        /// node-local blob store, fetching from a peer when absent.
+        ///
+        /// `Option` rather than removed, and `#[serde(default)]`, because raft log entries are
+        /// plain `serde_json` with no envelope version: every `SpecPut` already committed in
+        /// every existing cluster carries this field, and a build that could not deserialize
+        /// them could not replay its own log. `Some` therefore means "a pre-#439 entry" and
+        /// applies with no fetch.
+        #[serde(default)]
+        document: Option<String>,
+        /// The node that accepted this write — asked first when a blob has to be fetched.
+        /// `raft::NodeId`, spelled `u64` here because `control` sits below `raft`.
+        /// `#[serde(default)]` (0) for pre-#439 entries, which name no origin.
+        #[serde(default)]
+        origin: u64,
     },
     /// Remove a spec record (and, if nothing else references its digest, its
     /// blob). Refused at apply while any imposter of the tenant is still bound
@@ -831,7 +846,14 @@ pub enum ControlOp {
     DatasetPut {
         tenant: TenantId,
         record: DatasetRecord,
-        csv: String,
+        /// The CSV bytes — **`None` on everything this build mints** (#439), for the same
+        /// reason and with the same compatibility rule as [`ControlOp::SpecPut::document`]:
+        /// `Some` is a pre-#439 entry and applies with no fetch.
+        #[serde(default)]
+        csv: Option<String>,
+        /// The node that accepted this write — asked first when the blob has to be fetched.
+        #[serde(default)]
+        origin: u64,
     },
     /// Tombstone every live version of a dataset name (and, if nothing else references its
     /// digest, its blob). Refused at apply while any stub of the tenant is still bound to it
@@ -1053,6 +1075,13 @@ pub struct SpecMeta {
     pub format: SpecFormat,
     pub digest: Digest,
     pub source: SpecSource,
+    /// The document's length in bytes — what [`validate`] checks `MAX_SPEC_BYTES` against
+    /// now that the document itself no longer rides the op (#439).
+    ///
+    /// `#[serde(default)]` because entries committed before #439 carry no `size`; they also
+    /// carry their `document`, so the quota is still checkable from the bytes for those.
+    #[serde(default)]
+    pub size: u64,
 }
 
 /// Which spec (and at what digest) an imposter was deployed from — the
@@ -1895,27 +1924,35 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             id,
             meta,
             document,
+            origin: _,
         } => {
             require_real_tenant(tenant)?;
             require_spec_id(id)?;
-            if document.len() > MAX_SPEC_BYTES {
+            // Since #439 the document may not be here to measure, so the quota is checked
+            // against the declared size. For a pre-#439 entry (`document: Some`) the bytes are
+            // still the authority — `size` defaults to 0 there and would wave anything through.
+            let declared = document.as_ref().map_or(meta.size, |d| d.len() as u64);
+            if declared > MAX_SPEC_BYTES as u64 {
                 return Err(format!(
                     "spec exceeds {MAX_SPEC_BYTES} bytes: a document this large would make every \
                      replica's snapshot and every future compile pay for one operator's mistake"
                 ));
             }
-            // The digest is checked against the document's own bytes, not
-            // merely for hex shape, because it is the blob table's key: a
-            // digest that does not match what it is stored under would let a
-            // later `SpecPut` under the same id silently address someone
-            // else's document, or leave a blob GC can never find its way back
-            // to.
+            // The digest is the blob table's key: one that does not match what it is stored
+            // under would let a later `SpecPut` under the same id silently address someone
+            // else's document, or leave a blob GC can never find its way back to.
+            //
+            // #439 splits this check in two. Hex shape is checkable here always. Proving the
+            // digest *is* the sha256 of the bytes needs the bytes, which a minted op no longer
+            // carries — that half moves to the admin front, which still holds the body it was
+            // handed. It is still enforced here for a pre-#439 entry, where the bytes are
+            // present, so replay keeps exactly the guarantee it had.
             let hex = meta.digest.as_str();
-            let is_well_formed_hex = hex.len() == 64
-                && hex
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'));
-            if !is_well_formed_hex || !digest_matches(hex, document.as_bytes()) {
+            let is_well_formed_hex = is_sha256_hex(hex);
+            let matches_carried_bytes = document
+                .as_ref()
+                .is_none_or(|d| digest_matches(hex, d.as_bytes()));
+            if !is_well_formed_hex || !matches_carried_bytes {
                 return Err(
                     "spec digest must be the 64-character lowercase-hex sha256 of the document, \
                      and does not match the document"
@@ -1941,16 +1978,25 @@ pub fn validate(op: &ControlOp) -> Result<(), String> {
             tenant,
             record,
             csv,
+            origin: _,
         } => {
             require_real_tenant(tenant)?;
             require_dataset_name(&record.name)?;
-            validate_dataset_put(record, csv)
+            validate_dataset_put(record, csv.as_deref())
         }
         ControlOp::DatasetDelete { tenant, name } => {
             require_real_tenant(tenant)?;
             require_dataset_name(name)
         }
     }
+}
+
+/// Whether `s` has the shape of a lowercase-hex sha256 — the blob table's key shape, checked
+/// before anything is stored or looked up under it.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
 
 /// Whether `hex` (already shown to be 64 lowercase-hex characters) is the
@@ -2164,14 +2210,19 @@ fn require_source_id(id: &str) -> Result<(), String> {
 /// column 0, which the engine keys its row map on — must be unique across rows. Runs on every
 /// replica at apply as well as at admission, so it must be deterministic and allocate no more
 /// than a row's worth of borrows per row.
-fn validate_dataset_put(record: &DatasetRecord, csv: &str) -> Result<(), String> {
-    // The digest is the blob table's key and `bytes` is the size integrity check —
-    // both must be true of `csv`'s own bytes, the same rule `SpecPut` enforces for a
-    // spec document, and for the same reason: a record that lies about either could
-    // point the blob table at bytes it never actually holds.
-    if record.bytes != csv.len() as u64 || !digest_matches(record.digest.as_str(), csv.as_bytes()) {
+/// `csv` is `None` for an op minted since #439: the bytes travel out of band and the checks
+/// that need them run at the admin front, which still holds the body it was handed. Everything
+/// provable from the record alone is checked either way, so a malformed record is still refused
+/// on the Raft admission path rather than only at the door it came through.
+fn validate_dataset_put(record: &DatasetRecord, csv: Option<&str>) -> Result<(), String> {
+    // ---- Record-only checks. True of the metadata by itself, so they hold with or without
+    // the bytes.
+
+    // Shape only — that the digest *is* the sha256 of the bytes is checked below when they
+    // are present, and at the front door when they are not.
+    if !is_sha256_hex(record.digest.as_str()) {
         return Err(format!(
-            "dataset {:?}: digest/bytes do not match the document",
+            "dataset {:?}: digest must be a 64-character lowercase-hex sha256",
             record.name
         ));
     }
@@ -2184,6 +2235,48 @@ fn validate_dataset_put(record: &DatasetRecord, csv: &str) -> Result<(), String>
             "dataset {:?}: delimiter {:?} cannot split a document — it is a line \
                  terminator, not a cell separator",
             record.name, record.delimiter
+        ));
+    }
+
+    if record.key_columns.is_empty() {
+        return Err(format!(
+            "dataset {:?} must declare at least one key column: a dataset with none \
+                 can never be looked up by one",
+            record.name
+        ));
+    }
+    {
+        let mut seen = std::collections::HashSet::new();
+        for c in &record.key_columns {
+            if !seen.insert(c.as_str()) {
+                return Err(format!("key column {c:?} is declared twice"));
+            }
+        }
+    }
+    // Against the *declared* columns, which is all a digest-only op has. When the bytes are
+    // present the header-equality check below proves the declaration is the real header, so
+    // this is the same assertion in both cases.
+    for c in &record.key_columns {
+        if !record.columns.iter().any(|col| col == c) {
+            return Err(format!("key column {c:?} is not in the header row"));
+        }
+    }
+
+    let Some(csv) = csv else {
+        return Ok(());
+    };
+
+    // ---- Byte-dependent checks. Reached for a pre-#439 log entry, and for any caller that
+    // still holds the document.
+
+    // The digest is the blob table's key and `bytes` is the size integrity check —
+    // both must be true of `csv`'s own bytes, the same rule `SpecPut` enforces for a
+    // spec document, and for the same reason: a record that lies about either could
+    // point the blob table at bytes it never actually holds.
+    if record.bytes != csv.len() as u64 || !digest_matches(record.digest.as_str(), csv.as_bytes()) {
+        return Err(format!(
+            "dataset {:?}: digest/bytes do not match the document",
+            record.name
         ));
     }
 
@@ -2222,26 +2315,9 @@ fn validate_dataset_put(record: &DatasetRecord, csv: &str) -> Result<(), String>
         ));
     }
 
-    if record.key_columns.is_empty() {
-        return Err(format!(
-            "dataset {:?} must declare at least one key column: a dataset with none \
-                 can never be looked up by one",
-            record.name
-        ));
-    }
-    for c in &record.key_columns {
-        if !header.contains(&c.as_str()) {
-            return Err(format!("key column {c:?} is not in the header row"));
-        }
-    }
-    {
-        let mut seen = std::collections::HashSet::new();
-        for c in &record.key_columns {
-            if !seen.insert(c.as_str()) {
-                return Err(format!("key column {c:?} is declared twice"));
-            }
-        }
-    }
+    // The key-column checks are not repeated here: they ran above against `record.columns`,
+    // and the header-equality check immediately above proves `record.columns` *is* this
+    // document's header — so re-checking against `header` would assert the same thing twice.
 
     // Borrowed, not owned: an 8 MiB document of short rows is millions of cells, and
     // this runs on every replica at apply — one allocation per row is the budget.
@@ -3135,8 +3211,10 @@ mod tests {
                         format: SpecFormat::Json,
                         digest: Digest::new("a".repeat(64)),
                         source: SpecSource::Inline,
+                        size: "{}".len() as u64,
                     },
-                    document: "{}".to_owned(),
+                    document: Some("{}".to_owned()),
+                    origin: 0,
                 },
                 "SpecPut",
             ),
@@ -3174,7 +3252,8 @@ mod tests {
                         rows: 0,
                         bytes: 3,
                     },
-                    csv: "id\n".to_owned(),
+                    csv: Some("id\n".to_owned()),
+                    origin: 0,
                 },
                 "DatasetPut",
             ),
@@ -4385,7 +4464,8 @@ mod tests {
                 rows,
                 bytes: csv.len() as u64,
             },
-            csv: csv.to_owned(),
+            csv: Some(csv.to_owned()),
+            origin: 0,
         }
     }
 
@@ -4468,7 +4548,8 @@ mod tests {
                     rows: 1,
                     bytes: 14,
                 },
-                csv: "id\tname\n1\tada\n".to_owned(),
+                csv: Some("id\tname\n1\tada\n".to_owned()),
+                origin: 0,
             }),
             Ok(())
         );
@@ -4553,6 +4634,7 @@ mod tests {
             tenant,
             record,
             csv,
+            origin,
         } = dataset_put("liar", &["id"], CUSTOMERS)
         else {
             unreachable!()
@@ -4561,6 +4643,7 @@ mod tests {
             tenant: tenant.clone(),
             record,
             csv: csv.clone(),
+            origin,
         };
         let mut r = record.clone();
         r.digest = Digest::new("0".repeat(64));
@@ -4629,8 +4712,10 @@ mod tests {
                 format: SpecFormat::Json,
                 digest: spec_digest_of(document),
                 source: SpecSource::Inline,
+                size: document.len() as u64,
             },
-            document: document.to_owned(),
+            document: Some(document.to_owned()),
+            origin: 0,
         }
     }
 
@@ -4650,9 +4735,10 @@ mod tests {
                 format: SpecFormat::Yaml,
                 digest: Digest::new("ab"),
                 source: SpecSource::Inline,
+                size: 0,
             })
             .expect("serialize"),
-            json!({"format": "yaml", "digest": "ab", "source": "inline"})
+            json!({"format": "yaml", "digest": "ab", "source": "inline", "size": 0})
         );
         assert_eq!(
             serde_json::to_value(SpecProvenance {
@@ -4694,6 +4780,7 @@ mod tests {
             id,
             mut meta,
             document,
+            origin,
         } = spec_put("petstore", "{}")
         else {
             unreachable!()
@@ -4704,6 +4791,7 @@ mod tests {
             id: id.clone(),
             meta: meta.clone(),
             document: document.clone(),
+            origin,
         })
         .expect_err("a digest that is not the document's would corrupt the blob table");
         assert!(err.contains("digest"), "{err}");
@@ -4715,6 +4803,7 @@ mod tests {
             id,
             meta,
             document,
+            origin,
         })
         .expect_err("a malformed digest is refused");
         assert!(err.contains("digest"), "{err}");
@@ -4754,8 +4843,10 @@ mod tests {
                     format: SpecFormat::Json,
                     digest: spec_digest_of("{}"),
                     source: SpecSource::Inline,
+                    size: "{}".len() as u64,
                 },
-                document: "{}".to_owned(),
+                document: Some("{}".to_owned()),
+                origin: 0,
             },
             ControlOp::SpecDelete {
                 tenant: TenantId::new(FLEET_SCOPE),
@@ -5452,6 +5543,181 @@ mod tests {
         assert_eq!(
             fleet_name("rift-prod-eu").audit_action(),
             Some("cluster.admin")
+        );
+    }
+
+    // ---- #439: digest-only SpecPut/DatasetPut -------------------------------
+    //
+    // Gate for the change that takes the bytes off the log. Every expectation below is a
+    // literal: none is computed by the code under test.
+
+    /// The 64-hex sha256 of `csv`, spelled out rather than derived, so this module's
+    /// expectations never round-trip through the digest code they are checking.
+    const ADA_CSV: &str = "id,name\n1,ada\n";
+
+    fn big_csv_of(bytes: usize) -> String {
+        let mut csv = String::from("id,name\n");
+        let mut n = 1u64;
+        while csv.len() < bytes {
+            csv.push_str(&format!("{n},{}\n", "x".repeat(48)));
+            n += 1;
+        }
+        csv
+    }
+
+    fn digest_only_dataset_put(csv: &str) -> ControlOp {
+        ControlOp::DatasetPut {
+            tenant: TenantId::new("acme"),
+            record: DatasetRecord {
+                name: "customers".to_owned(),
+                digest: dataset_digest(csv),
+                key_columns: vec!["id".to_owned()],
+                delimiter: ',',
+                columns: vec!["id".to_owned(), "name".to_owned()],
+                rows: csv.lines().count().saturating_sub(1) as u64,
+                bytes: csv.len() as u64,
+            },
+            csv: None,
+            origin: 7,
+        }
+    }
+
+    fn digest_only_spec_put(document: &str) -> ControlOp {
+        ControlOp::SpecPut {
+            tenant: TenantId::new("acme"),
+            id: "orders".to_owned(),
+            meta: SpecMeta {
+                format: SpecFormat::Json,
+                digest: dataset_digest(document),
+                source: SpecSource::Inline,
+                size: document.len() as u64,
+            },
+            document: None,
+            origin: 7,
+        }
+    }
+
+    /// Acceptance criterion 1. The negative control is the point: it proves the bound is met
+    /// *because the bytes left the op*, not because 8 MiB of CSV happens to serialise small.
+    #[test]
+    fn a_newly_minted_dataset_put_entry_is_metadata_sized() {
+        let csv = big_csv_of(8 * 1024 * 1024);
+        assert!(
+            csv.len() >= 8 * 1024 * 1024,
+            "fixture is 8 MiB: {}",
+            csv.len()
+        );
+
+        let minted = digest_only_dataset_put(&csv);
+        let entry = serde_json::to_vec(&minted).expect("serialise");
+        assert!(
+            entry.len() < 4096,
+            "a minted DatasetPut must be metadata-sized, was {} bytes",
+            entry.len()
+        );
+
+        // Negative control: the same op still carrying its bytes.
+        let ControlOp::DatasetPut {
+            tenant,
+            record,
+            origin,
+            ..
+        } = minted
+        else {
+            unreachable!("constructed as DatasetPut")
+        };
+        let carried = ControlOp::DatasetPut {
+            tenant,
+            record,
+            csv: Some(csv),
+            origin,
+        };
+        let carried_entry = serde_json::to_vec(&carried).expect("serialise");
+        assert!(
+            carried_entry.len() > 8 * 1024 * 1024,
+            "control: carrying the bytes must exceed 8 MiB, was {} bytes",
+            carried_entry.len()
+        );
+    }
+
+    /// Acceptance criterion 1, spec half.
+    #[test]
+    fn a_newly_minted_spec_put_entry_is_metadata_sized() {
+        let document = big_csv_of(4 * 1024 * 1024);
+        let entry = serde_json::to_vec(&digest_only_spec_put(&document)).expect("serialise");
+        assert!(
+            entry.len() < 4096,
+            "a minted SpecPut must be metadata-sized, was {} bytes",
+            entry.len()
+        );
+    }
+
+    /// Acceptance criterion 4, the direction the original issue omitted: a **new** binary must
+    /// replay the **old** entries already committed in every existing cluster. The JSON here is
+    /// the pre-#439 wire shape, written out literally — no `origin`, `csv` present and required.
+    #[test]
+    fn a_pre_439_dataset_put_entry_still_deserializes_with_its_bytes() {
+        let old = r#"{"DatasetPut":{"tenant":"acme","record":{"name":"customers",
+            "digest":"0000000000000000000000000000000000000000000000000000000000000000",
+            "keyColumns":["id"],"delimiter":",","columns":["id","name"],"rows":1,"bytes":15},
+            "csv":"id,name\n1,ada\n"}}"#;
+        let op: ControlOp = serde_json::from_str(old).expect("a pre-#439 entry must still replay");
+        let ControlOp::DatasetPut { csv, origin, .. } = op else {
+            panic!("expected DatasetPut")
+        };
+        assert_eq!(csv.as_deref(), Some(ADA_CSV));
+        assert_eq!(origin, 0, "a pre-#439 entry names no origin");
+    }
+
+    /// Same, spec half. `size` is absent from the old `SpecMeta` and must default.
+    #[test]
+    fn a_pre_439_spec_put_entry_still_deserializes_with_its_document() {
+        let old = r#"{"SpecPut":{"tenant":"acme","id":"orders","meta":{"format":"json",
+            "digest":"0000000000000000000000000000000000000000000000000000000000000000",
+            "source":"inline"},"document":"{}"}}"#;
+        let op: ControlOp = serde_json::from_str(old).expect("a pre-#439 entry must still replay");
+        let ControlOp::SpecPut {
+            document,
+            meta,
+            origin,
+            ..
+        } = op
+        else {
+            panic!("expected SpecPut")
+        };
+        assert_eq!(document.as_deref(), Some("{}"));
+        assert_eq!(meta.size, 0, "a pre-#439 SpecMeta declares no size");
+        assert_eq!(origin, 0);
+    }
+
+    /// A digest-only op has no bytes to check the digest against, so `validate` keeps only the
+    /// hex-shape check and must still accept the op.
+    #[test]
+    fn validate_accepts_a_digest_only_dataset_put() {
+        assert_eq!(validate(&digest_only_dataset_put(ADA_CSV)), Ok(()));
+    }
+
+    /// ...but a digest that is not 64 lowercase hex is still refused, without bytes.
+    #[test]
+    fn validate_refuses_a_malformed_digest_without_needing_the_bytes() {
+        let mut op = digest_only_dataset_put(ADA_CSV);
+        if let ControlOp::DatasetPut { record, .. } = &mut op {
+            record.digest = Digest::new("NOTHEX");
+        }
+        assert!(validate(&op).is_err(), "a malformed digest must be refused");
+    }
+
+    /// The spec quota now comes from `SpecMeta::size`, because the document it used to be
+    /// measured from has left the op.
+    #[test]
+    fn validate_refuses_a_spec_whose_declared_size_exceeds_the_quota() {
+        let mut op = digest_only_spec_put("{}");
+        if let ControlOp::SpecPut { meta, .. } = &mut op {
+            meta.size = MAX_SPEC_BYTES as u64 + 1;
+        }
+        assert!(
+            validate(&op).is_err(),
+            "a spec declaring more than MAX_SPEC_BYTES must be refused"
         );
     }
 }

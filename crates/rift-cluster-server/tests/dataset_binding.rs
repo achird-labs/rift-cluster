@@ -100,7 +100,8 @@ async fn put_dataset(server: &ComposedServer, name: &str, csv: &str) {
                     rows,
                     bytes: csv.len() as u64,
                 },
-                csv: csv.to_owned(),
+                csv: Some(csv.to_owned()),
+                origin: 0,
             },
         })
         .await

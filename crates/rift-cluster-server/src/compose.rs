@@ -1642,6 +1642,11 @@ fn spawn_intent_replayer(node: Arc<RaftNode>) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// How soon a replay sweep asks to run again after a blob fan-out fell short of a quorum.
+/// Comfortably inside the peer-health cooldown (5 s), so a leader that has just come back is
+/// retried a few times as its mark clears, and far inside the 30 s periodic sweep.
+const REPLAY_SHORTFALL_RETRY: Duration = Duration::from_secs(1);
+
 async fn drain_parked_intents(node: &RaftNode) {
     let intents = match node.parked_intents() {
         Ok(intents) => intents,
@@ -1653,7 +1658,33 @@ async fn drain_parked_intents(node: &RaftNode) {
     metrics::intents_pending_sampled(intents.len());
     for request in intents {
         let op_id = request.op_id;
-        match node.submit(request).await {
+        // The parked copy still carries its bytes (D-49), so a replay is a full write: the
+        // blob goes to a joint quorum first, the payload comes off, and only then is the op
+        // proposed — exactly as the front door does it. Submitting the parked request as-is
+        // would put the whole payload back on the log, which is what #439 exists to stop.
+        let submitted = match admin_front::fan_out_then_submit(node, request, |r| node.submit(r))
+            .await
+        {
+            Ok(submitted) => submitted,
+            // Short of a joint quorum for the blob. Not this op's own fault, so it stays
+            // parked and the sweep moves on — a non-blob intent behind it may still commit.
+            //
+            // Usually momentary: the drain that fires on "a leader appeared" runs while the
+            // follower's peer-health tracker may still hold that leader in the cooldown its
+            // own election attempts tripped, so the fan-out fast-fails without dialling.
+            // Left to the periodic sweep, that is a 30 s park for a write the fleet can take
+            // in a second — so ask for another drain shortly instead.
+            Err(reason) => {
+                tracing::warn!(%op_id, %reason, "blob fan-out short of quorum on replay; intent stays parked, retrying shortly");
+                let waker = node.replay_waker();
+                tokio::spawn(async move {
+                    tokio::time::sleep(REPLAY_SHORTFALL_RETRY).await;
+                    waker.notify_one();
+                });
+                continue;
+            }
+        };
+        match submitted {
             // Terminal either way — an op the state machine refused is refused
             // identically on every replay, so it retires like a success and
             // stays queryable through GET /_cluster/ops/:id. An unpark that
