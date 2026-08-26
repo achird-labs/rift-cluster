@@ -369,7 +369,9 @@ lazy_static! {
     /// sender no longer holds; `misroute` = the op reached a node that does
     /// not own the flow at the shared `m_idx`, which only a buggy member does
     /// — persistently non-zero means a peer's ring disagrees with its own
-    /// membership index, which is a bug to file, not noise.
+    /// membership index, which is a bug to file, not noise; `isolated` = the
+    /// owner could not see a quorum and refused rather than mutate state a
+    /// healed majority may already have re-homed (D-17).
     static ref FLOW_CAS_CONFLICTS: IntCounterVec = register_int_counter_vec!(
         "rift_cluster_cas_conflicts_total",
         "Owner-side flow-write refusals, by reason",

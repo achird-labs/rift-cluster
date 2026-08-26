@@ -127,6 +127,33 @@ durability spread*, not for read scaling.
 
 ## Versioning and fencing
 
+The **isolated-owner rule** is what keeps that tuple from having to do the whole job. A node whose
+Raft metrics show no current leader — or which is leader but has not been acknowledged by a quorum
+within `3 × election_timeout` — reports `is_isolated()` and refuses the owner-side flow
+operations that serve or mutate a **key**: `owner_write` (re-checked under the write lock, since
+the call that first observes a partition is otherwise the one that proceeds), the owner branch of
+a `strong` read, and the forwarded-read route all return an error naming isolation (D-17, #465).
+The aggregate-metadata routes (`spaces`, `counts`) are deliberately left to their existing `m_idx`
+divergence gate: they report shape rather than serve values, and a caller already marks a
+divergent peer's contribution `partial`. Fencing then reconciles only the writes that were
+actually allowed to happen, instead of a minority-side divergence that ran for the length of a
+partition. The consequence worth stating plainly is broader than a partition. `is_isolated()` reports
+`true` for **any** node whose `current_leader` is `None` — not only for a leader that has lost its
+quorum lease — and a node clears `current_leader` as soon as it stops hearing the leader and
+campaigns. So an ordinary **leader election** makes every node that has lost sight of the leader
+refuse owner-side flow writes and `strong` reads until the new leader is established, whichever
+node owns the flow. In practice that is a sub-second pause on the flow data path (openraft's
+election timeout is 150–300 ms, and a fresh leader additionally reads isolated until its first
+quorum-acknowledged round), and up to the ~1–3 s D-15 already accepts for admin writes when an
+election is contended.
+
+That is stricter than this rule's own wording — "has not heard a leader heartbeat within
+`3 × election_timeout`" would ride out a routine election, whereas the primitive fails closed the
+moment the leader is unknown. Strict is the safe direction and is what ships; whether the flow
+path should instead take the looser grace, so that a routine election costs the 20–40k RPS data
+path nothing, is #472. A `local` read is untouched either way: the imposter opted into replica
+staleness (D-10), and that contract is not silently revoked by this rule.
+
 Every value carries `(m_idx, v, origin)`:
 
 - `m_idx` — the membership log index under which the writing owner held

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use rift_cluster::stores::{
     ClusteredFlowStoreProvider, FlowNet, FlowShard, ShardConfig, flow_routes,
 };
-use rift_cluster::{Authority, NodeConfig, NodeId, RaftNode};
+use rift_cluster::{Authority, KeyClass, NodeConfig, NodeId, OwnedKey, RaftNode};
 use rift_cluster_base::seams::{CasOutcome, FlowStore, FlowStoreProvider, ImposterConfig};
 use tempfile::TempDir;
 
@@ -1921,4 +1921,244 @@ async fn two_imposters_sharing_a_flow_id_do_not_list_each_others_spaces() {
     for member in &members {
         member.node.shutdown().await.expect("shutdown");
     }
+}
+
+/// Pins D-17: a partitioned owner refuses flow writes and owner-answered strong
+/// reads until it sees a quorum again. Before #465 the rule was enforced only
+/// for proxyOnce claims, so a deposed owner on the minority side kept mutating
+/// and serving keys a new owner on the majority side already held.
+#[tokio::test]
+async fn an_isolated_owner_refuses_writes_and_strong_reads_but_not_local_ones() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster_of(3, Duration::from_millis(200)).await;
+
+    // Membership is agreed, so every member computes the same owner for this key.
+    let flow = "flow-isolated";
+    let owner_id = members[0]
+        .node
+        .ring()
+        .owner(OwnedKey::new(KeyClass::FlowKv, &stored(flow)))
+        .expect("a formed cluster owns every key");
+    let owner_ix = members
+        .iter()
+        .position(|m| m.node.id() == owner_id)
+        .expect("the owner is one of the three members");
+
+    let m_idx = members[owner_ix].node.ring().m_idx();
+    let write_body = |val: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "flow_id": stored(flow),
+            "key": "k",
+            "op": { "Set": { "value": val } },
+            "ttl_seconds": null,
+            "durability": "async",
+            "m_idx": m_idx,
+        }))
+        .expect("encode")
+    };
+    let write_on_owner = |body: Vec<u8>| {
+        let node = Arc::clone(&members[owner_ix].node);
+        async move {
+            let raw = node
+                .call_member(owner_id, "POST", "/_cluster/flow/write", body)
+                .await
+                .expect("transport");
+            serde_json::from_slice::<serde_json::Value>(&raw).expect("json")
+        }
+    };
+
+    // Healthy first, through the very same entry point: the refusal below is
+    // then attributable to isolation and not to a path that never worked.
+    let applied = write_on_owner(write_body("healthy")).await;
+    assert!(
+        applied.get("Applied").is_some(),
+        "a healthy owner must apply its own write: {applied}"
+    );
+
+    // Partition it. With both peers gone the owner cannot reach a quorum, which
+    // is exactly what `is_isolated` reports (see
+    // `node.rs::leader_becomes_isolated_when_it_loses_quorum`).
+    for (ix, member) in members.iter().enumerate() {
+        if ix != owner_ix {
+            member.node.shutdown().await.expect("shutdown peer");
+        }
+    }
+    let deadline = Instant::now() + CONVERGE;
+    while !members[owner_ix].node.is_isolated() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        members[owner_ix].node.is_isolated(),
+        "an owner that lost its quorum must report isolated"
+    );
+
+    let refusals_before = counter("rift_cluster_cas_conflicts_total", ("reason", "isolated"));
+    let refused = write_on_owner(write_body("divergent")).await;
+    let reason = refused
+        .get("Error")
+        .and_then(|e| e.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("an isolated owner must refuse the write: {refused}"));
+    assert!(
+        reason.contains("owner is isolated"),
+        "the refusal must name isolation rather than some other failure: {reason}"
+    );
+    assert_eq!(
+        counter("rift_cluster_cas_conflicts_total", ("reason", "isolated")) - refusals_before,
+        1,
+        "the refusal is the runbook's signal and must be counted exactly once"
+    );
+
+    // The safety property itself: the divergent value never reached the shard,
+    // so a healed majority has nothing wrong to reconcile against.
+    assert_eq!(
+        members[owner_ix]
+            .shard
+            .get(&stored(flow), "k")
+            .map(|entry| entry.value),
+        Some(serde_json::json!("healthy")),
+        "an isolated owner must not mutate owned state"
+    );
+
+    // A forwarded owner-read landing here is the minority-side serve in its
+    // purest form, and the route must refuse it rather than answer.
+    let get_body = serde_json::to_vec(&serde_json::json!({ "flow_id": stored(flow), "key": "k" }))
+        .expect("encode");
+    let forwarded = members[owner_ix]
+        .node
+        .call_member(owner_id, "POST", "/_cluster/flow/get", get_body)
+        .await
+        .expect_err("an isolated node must refuse a forwarded owner-read, not answer it");
+    assert!(
+        forwarded.contains("owner is isolated"),
+        "the route's refusal must carry the same discriminator as the other two \
+         entries — a bare `is_err()` here would pass on a drifted literal, a \
+         transport failure or a decode failure alike: {forwarded}"
+    );
+
+    // The store face: `strong` fails loudly; `local` still answers, because the
+    // imposter opted into replica staleness (D-10) and this rule must not
+    // silently revoke that contract.
+    let strong = store_on(&members[owner_ix], serde_json::json!({}));
+    let err = blocking(move || strong.get(flow, "k"))
+        .await
+        .expect_err("a strong read on an isolated owner must fail loudly");
+    assert!(
+        err.to_string().contains("owner is isolated"),
+        "the strong read must name isolation: {err}"
+    );
+
+    let local = store_on(
+        &members[owner_ix],
+        serde_json::json!({ "readConsistency": "local" }),
+    );
+    assert_eq!(
+        blocking(move || local.get(flow, "k"))
+            .await
+            .expect("a local read never consults the owner"),
+        Some(serde_json::json!("healthy")),
+        "`local` is the imposter's opted-in replica read and stays available while isolated"
+    );
+
+    members[owner_ix]
+        .node
+        .shutdown()
+        .await
+        .expect("shutdown owner");
+}
+
+/// Pins where the D-17 check sits in `owner_write`'s sequence: fence, then
+/// ownership, then isolation. It does **not** prove the guard exists — delete the
+/// guard entirely and this still passes, because both refusals below are reached
+/// before it; that job belongs to
+/// `an_isolated_owner_refuses_writes_and_strong_reads_but_not_local_ones`. What it
+/// discriminates is a guard hoisted too early: an isolated non-owner would then
+/// answer `Error{isolated}` instead of `NotOwner`, sending a correct caller off to
+/// rebuild a ring that was already right and hiding the misroute the counter
+/// exists to surface — and an isolated stale-token write would lose its `Fenced`
+/// reply, which is the one that tells the caller to retry at all.
+#[tokio::test]
+async fn a_misroute_is_still_a_misroute_when_the_receiving_node_is_isolated() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster_of(3, Duration::from_millis(200)).await;
+
+    let flow = "flow-misroute-isolated";
+    let owner_id = members[0]
+        .node
+        .ring()
+        .owner(OwnedKey::new(KeyClass::FlowKv, &stored(flow)))
+        .expect("a formed cluster owns every key");
+    let survivor_ix = members
+        .iter()
+        .position(|m| m.node.id() != owner_id)
+        .expect("with three members at least one is not the owner");
+
+    // Leave a single non-owner alive: it is isolated *and* it does not own the
+    // key, which is the collision this test is about.
+    for (ix, member) in members.iter().enumerate() {
+        if ix != survivor_ix {
+            member.node.shutdown().await.expect("shutdown");
+        }
+    }
+    let deadline = Instant::now() + CONVERGE;
+    while !members[survivor_ix].node.is_isolated() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        members[survivor_ix].node.is_isolated(),
+        "a lone survivor of a three-voter cluster must report isolated"
+    );
+
+    // Membership cannot change without a quorum, so the ring — and therefore the
+    // owner it names — is the same one the healthy cluster agreed on.
+    let survivor = &members[survivor_ix];
+    let body = serde_json::to_vec(&serde_json::json!({
+        "flow_id": stored(flow),
+        "key": "k",
+        "op": { "Set": { "value": "misrouted" } },
+        "ttl_seconds": null,
+        "durability": "async",
+        "m_idx": survivor.node.ring().m_idx(),
+    }))
+    .expect("encode");
+    let raw = survivor
+        .node
+        .call_member(survivor.node.id(), "POST", "/_cluster/flow/write", body)
+        .await
+        .expect("transport");
+    let reply: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+    assert_eq!(
+        reply
+            .get("NotOwner")
+            .and_then(|n| n.get("owner"))
+            .and_then(serde_json::Value::as_u64),
+        Some(owner_id),
+        "a misroute must be reported as a misroute naming the real owner, not as isolation: {reply}"
+    );
+
+    // The other half of the ordering: the fence check runs before both, so a
+    // stale token on an isolated node is still `Fenced` — the reply that tells
+    // the caller to rebuild its ring and retry, rather than one that reads as
+    // "this node is out of the picture".
+    let stale = serde_json::to_vec(&serde_json::json!({
+        "flow_id": stored(flow),
+        "key": "k",
+        "op": { "Set": { "value": "stale" } },
+        "ttl_seconds": null,
+        "durability": "async",
+        "m_idx": survivor.node.ring().m_idx() - 1,
+    }))
+    .expect("encode");
+    let raw = survivor
+        .node
+        .call_member(survivor.node.id(), "POST", "/_cluster/flow/write", stale)
+        .await
+        .expect("transport");
+    let reply: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+    assert!(
+        reply.get("Fenced").is_some(),
+        "a stale membership token must still be reported as `Fenced` on an isolated node: {reply}"
+    );
+
+    survivor.node.shutdown().await.expect("shutdown survivor");
 }

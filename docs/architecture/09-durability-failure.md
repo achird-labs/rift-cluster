@@ -49,6 +49,23 @@ Behavior per operation class when the relevant authority is unreachable.
 Defaults shown; `local` overrides exist per feature and stamp
 `Rift-Cluster-Degraded: <feature>` on every response they taint:
 
+One class the word *unreachable* does not cover: an authority that is perfectly
+reachable and **refuses itself**. A flow owner that cannot see a quorum reports
+`is_isolated()` and declines its own owner-side writes and strong reads (D-17,
+the isolated-owner rule, Chapter 6). The outcomes in the table are unchanged —
+the caller still gets a fast failure rather than a stale answer — but the cause
+is the owner's own quorum state, not the network between caller and owner, and
+`Rift-Cluster-Degraded` does **not** fire for it: nothing degraded, the write was
+refused.
+
+What is observable differs by operation, and it is worth stating exactly:
+a refused **write** increments `rift_cluster_cas_conflicts_total{reason="isolated"}`;
+a refused **forwarded** read surfaces on the serving node as
+`rift_cluster_rpc_failures_total{reason="unavailable"}`; a refused **local**
+owner-read emits no metric at all today. The condition itself is on the
+`isolated` field of `/_cluster/health` (and `/_fleet/health`), which is the
+signal to watch — exposing it as a gauge is #470.
+
 | Operation | Authority | Unreachable ⇒ default | Rationale |
 |---|---|---|---|
 | Admin write (config, tenancy, enable) | Raft quorum | `503` + `Retry-After` + **op-id, durably parked, auto-replayed** | R4: refused ≠ lost |
