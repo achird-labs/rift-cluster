@@ -2217,6 +2217,34 @@ async fn wait_checkpoint(cluster: &TestCluster, want: u64, deadline: Duration) -
 /// Poll until the sink has seen at least `want` distinct rows, or the deadline
 /// passes. Returns what it saw either way, so the caller asserts on content
 /// rather than on this helper's verdict.
+/// Wait until every revision in `want` has reached the sink.
+///
+/// Not [`wait_rows`] with `want.len()`: the sink receives a row for *every*
+/// auditable control op, including ones this test did not write — declaring the
+/// sink itself, and whatever the engine happens to do at startup. Counting rows
+/// therefore returns as soon as `n` arrive, which may be `n` rows that are not
+/// the `n` this test is about, and the assertion that follows then reports a
+/// committed-but-unshipped revision that was merely still in flight. Waiting for
+/// the specific revisions makes the test immune to an unrelated op appearing
+/// before them — which is exactly what an upstream change did (vendor bump to
+/// `4b4f841`: one extra revision is consumed before the writes, so the first six
+/// rows started one too early).
+async fn wait_for_revisions(
+    sink: &CountingSink,
+    want: &[u64],
+    deadline: Duration,
+) -> Vec<(u64, String)> {
+    let start = Instant::now();
+    loop {
+        let rows = sink.rows();
+        let shipped: BTreeSet<u64> = rows.iter().map(|(rev, _)| *rev).collect();
+        if want.iter().all(|rev| shipped.contains(rev)) || start.elapsed() > deadline {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_rows(sink: &CountingSink, want: usize, deadline: Duration) -> Vec<(u64, String)> {
     let start = Instant::now();
     loop {
@@ -2297,7 +2325,7 @@ async fn every_audit_row_reaches_the_sink_exactly_once() {
         written.push(cluster.write_on_leader(port, "shipped").await);
     }
 
-    let rows = wait_rows(&sink, written.len(), Duration::from_secs(20)).await;
+    let rows = wait_for_revisions(&sink, &written, Duration::from_secs(20)).await;
     let distinct: BTreeSet<(u64, String)> = rows.iter().cloned().collect();
 
     // The strong assertion: no duplicates at all. Three nodes each derive these
