@@ -228,38 +228,47 @@ refused with a 400 naming the row and value — never accepted-but-broken.
 > re-enabled by #461 once #430 and #431 closed.
 > See `docs/architecture/09-durability-failure.md`.
 
-**Decision: dataset bytes are committed through the Raft log and materialized
-to a per-node spool file at apply time.** No blob sidecar, no fetch protocol,
-no gossip.
+**Decision (as shipped, revised by epic #432): dataset bytes are sideloaded
+through a content-addressed blob store, and the log carries a digest.** The
+op commits `{tenant, record{digest, size, …}}` — under 4 KiB; the CSV travels
+out of band.
 
-- `ControlOp::DatasetPut { tenant, record, bytes }` commits metadata and bytes
-  together. Apply, on every node, writes the bytes to
-  `<data-dir>/datasets/<digest>.csv` (write-temp-then-rename, `0600`), then
-  inserts the record. `ControlOp::DatasetDelete { tenant, name }` tombstones
-  the record; the blob is removed when no live record references its digest
-  (digests are refcounted — two tenants uploading identical bytes share one
-  blob and one spool file).
-- **Ordering is the correctness argument.** A stub binding (§3.3) names a
-  `(name, version)` whose digest must already be applied; leader validation
-  refuses a binding to an absent or tombstoned dataset. Because dataset put
-  and imposter put are both log entries, *log order alone* guarantees every
-  node has the bytes on disk before any config referencing them applies —
-  which is #20's "one fetch, then replicate" rule with the upload as the one
-  fetch and the log as the replication. No readiness handshake needed.
-- **R3 for free.** The snapshot carries the dataset tables like every other
-  state-machine table (`raft/store.rs:76-91` precedent); a restarted or
-  freshly-joined node re-materializes spool files from the snapshot during
-  apply. A missing spool file on disk is repaired from the state machine at
-  startup, not fetched from a peer.
+- `ControlOp::DatasetPut { tenant, record, csv: Option<String>, origin }`. On
+  the write path the op reaches the admin front carrying its bytes;
+  `fan_out_then_submit` puts them on a joint-consensus quorum's blob store
+  (#438, D-19) *before* proposing, then strips the payload to a digest and
+  stamps `origin` (D-49). Apply, on every node, resolves the digest to bytes —
+  locally if held, else fetched from `origin` first and then any joint voter
+  (#439, D-48) — in a pass that runs *before* the redb write transaction opens,
+  writes them to `<data-dir>/datasets/<digest>.csv` (write-temp-then-rename,
+  `0600`), then inserts the record. `DatasetDelete` tombstones the record; the
+  blob is removed when no live record references its digest (two tenants
+  uploading identical bytes share one blob and one spool file).
+- **Ordering is still the correctness argument.** A stub binding (§3.3) names a
+  `(name, version)` whose digest must already be applied; validation refuses a
+  binding to an absent or tombstoned dataset. Log order still guarantees every
+  node has the bytes on disk before any config referencing them applies — the
+  fan-out establishes the bytes on a quorum *before* the op commits, and
+  fetch-on-apply covers any member the fan-out missed, so "on disk before the
+  reference applies" holds exactly as it did when the bytes rode the log. This
+  is still #20's "one fetch, then replicate" rule; what changed is that the
+  replication carrier is the blob store, not the log entry.
+- **R3.** The snapshot carries a **manifest** of the dataset blobs — digest and
+  size, not the bytes (#440, D-50) — like every other state-machine table; a
+  restarted or freshly-joined node fetches each blob it lacks over the same
+  transport before the install completes, then materializes its spool file. A
+  missing spool file on disk is repaired from `sm_dataset_blobs` at startup.
 
-Why in-log rather than a fetched blob tier: the admin front already caps
-terminated bodies at 16 MiB (`admin_front.rs:82`, `MAX_BODY_BYTES`), and this
-RFC caps datasets well under that (§4, default 8 MiB per dataset). At that
-scale a log entry is unremarkable — the log already carries whole
-`ImposterConfig`s with inline stub bodies — and the alternative buys nothing
-but a second distribution mechanism to test. Datasets that outgrow the cap are
-an explicit non-goal for v1 and an open question (§10.2) pointing at the #20
-fetch machinery, which exists precisely for large external artifacts.
+Why sideloaded rather than in-log: the original decision put the bytes on the
+log because "at that scale a log entry is unremarkable" — and that was measured
+false at exactly the quota sizes this RFC sets. openraft 0.9 caps each
+AppendEntries at the 50 ms heartbeat and a multi-MiB entry restarted from byte 0
+forever (#411); a multi-MiB entry or snapshot also opened a silent no-heartbeat
+window that let a voter campaign and never reconcile (#430/#431/#433). The blob
+store is the second distribution mechanism the original decision hoped to avoid,
+but it is the one built for payloads this size: chunked, receiver-verified,
+resumable, and off both the election-timer path and the redb write transaction.
+Datasets that outgrow the quota remain an explicit non-goal for v1 (§10.2).
 
 Content-addressing also dissolves G2: a new version is a new digest is a new
 path, so the engine's path-keyed `CsvCache` misses naturally and the stale-file
@@ -765,9 +774,14 @@ Stated so review knows where the ice is thin:
   bindings.
 - **WireMock Cloud semantics** are as summarized in §2.1 from docs.wiremock.io
   (2026-07-26); not re-tested against a live WireMock Cloud instance.
-- **openraft/redb comfort with multi-MiB log entries** (§3.2) is asserted from
-  the existing whole-`ImposterConfig` precedent, not benchmarked; D1's exit
-  criteria include a fleet-restart test at the quota ceiling.
+- **openraft/redb comfort with multi-MiB log entries** (§3.2) is no longer a
+  claim this RFC rests on: epic #432 took the bytes off the log, so a
+  `DatasetPut` is a sub-4-KiB digest entry and the multi-MiB payloads travel the
+  blob transport instead (§3.2). The original assertion (from the
+  whole-`ImposterConfig` precedent) was in fact measured false at the quota
+  sizes — a multi-MiB entry did not replicate under openraft 0.9's heartbeat cap
+  (#411) — which is why the design changed. The question is now answered by
+  design, not deferred to a benchmark.
 
 ---
 
