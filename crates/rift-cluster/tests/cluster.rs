@@ -4036,15 +4036,47 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     // the entry count is what makes it certain, the same argument the chaos tier's snapshot
     // overlay relies on.
     tokio::time::sleep(Duration::from_secs(2)).await;
+    // DIAG492: was the snapshot built and the log purged inside the settle?
+    eprintln!("DIAG492 leader after settle: {}", leader.diag_492());
 
     let joiner = spawn_with_snapshot_policy(2, addr2, dir2.path(), retention, Some(2)).await;
     let seed = Authority::from(addr1);
     // Admission commits the membership entry and returns (#433); the install it used to have to
     // outlast is no longer on this call's path, so the first attempt succeeds.
+    let t_join = Instant::now();
     joiner
         .join_via(&seed)
         .await
         .expect("admission returns once the membership entry commits, ahead of the install");
+    let join_took = t_join.elapsed();
+    // DIAG492: the observation the assertion is made on, captured FIRST, exactly as before.
+    let voters_after_join = leader.status().voters.clone();
+    let leader_at_assert = leader.diag_492();
+    let joiner_at_assert = joiner.diag_492();
+    eprintln!("DIAG492 join_via took {join_took:?}; leader voters right after = {voters_after_join:?}");
+    eprintln!("DIAG492 leader at assert: {leader_at_assert}");
+    eprintln!("DIAG492 joiner at assert: {joiner_at_assert}");
+    // DIAG492: how long the install actually takes, measured from the join call.
+    let mut snap_at = None;
+    let mut applied_at = None;
+    let diag_deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < diag_deadline {
+        if snap_at.is_none() && joiner.diag_492_snapshot().is_some() {
+            snap_at = Some(t_join.elapsed());
+        }
+        if applied_at.is_none() && joiner.status().last_applied.is_some() {
+            applied_at = Some(t_join.elapsed());
+        }
+        if snap_at.is_some() && applied_at.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    eprintln!(
+        "DIAG492 joiner: snapshot installed at {snap_at:?} after join start; first last_applied at {applied_at:?}"
+    );
+    eprintln!("DIAG492 leader after install: {}", leader.diag_492());
+    eprintln!("DIAG492 joiner after install: {}", joiner.diag_492());
 
     // The joiner is a member now — and, for the whole install, a learner. A multi-MiB snapshot
     // cannot be current inside the admission's currency window, so no joint configuration exists
@@ -4056,10 +4088,12 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     // of margin — but shrink `DATASETS`/`PER_DATASET_BYTES` for speed and this fails with the
     // joiner correctly promoted in-call, which is not two-phase admission breaking.
     assert!(
-        !leader.status().voters.contains(&2),
+        !voters_after_join.contains(&2),
         "a joiner that must install a multi-MiB snapshot is admitted as a learner, not a voter \
          (requires the install to outlast the 500 ms admission currency window; if the fixture \
-         was shrunk, in-call promotion is the correct outcome and this test needs a bigger one)"
+         was shrunk, in-call promotion is the correct outcome and this test needs a bigger one) \
+         DIAG492 join_took={join_took:?} snap_at={snap_at:?} applied_at={applied_at:?} \
+         leader_at_assert=[{leader_at_assert}] joiner_at_assert=[{joiner_at_assert}]"
     );
 
     let last_name = format!("d{}", DATASETS - 1);

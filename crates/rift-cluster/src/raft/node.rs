@@ -2310,6 +2310,44 @@ impl RaftNode {
         self.raft.metrics().borrow().current_term
     }
 
+    /// THROWAWAY (#492 diagnosis, spike branch only): the raw Raft metrics the joiner test's
+    /// admission assertion depends on, in one line.
+    #[doc(hidden)]
+    pub fn diag_492(&self) -> String {
+        let receiver = self.raft.metrics();
+        let m = receiver.borrow();
+        let matching: Vec<String> = m
+            .replication
+            .as_ref()
+            .map(|r| {
+                r.iter()
+                    .map(|(id, l)| format!("{id}={:?}", l.as_ref().map(|l| l.index)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        format!(
+            "last_log={:?} applied={:?} snapshot={:?} purged={:?} state={:?} voters={:?} matching=[{}]",
+            m.last_log_index,
+            m.last_applied.as_ref().map(|l| l.index),
+            m.snapshot.as_ref().map(|l| l.index),
+            m.purged.as_ref().map(|l| l.index),
+            m.state,
+            m.membership_config.voter_ids().collect::<Vec<_>>(),
+            matching.join(",")
+        )
+    }
+
+    /// THROWAWAY (#492): index of the last snapshot this node holds, if any.
+    #[doc(hidden)]
+    pub fn diag_492_snapshot(&self) -> Option<u64> {
+        self.raft
+            .metrics()
+            .borrow()
+            .snapshot
+            .as_ref()
+            .map(|l| l.index)
+    }
+
     pub fn status(&self) -> StatusReport {
         let receiver = self.raft.metrics();
         let metrics = receiver.borrow();

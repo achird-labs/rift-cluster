@@ -29,7 +29,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        # SPIKE #492 — throwaway: run only the flaky joiner test, repeatedly, with its output.
+        run: |
+          fails=0
+          for i in 1 2 3 4 5 6 7 8; do
+            echo "===== DIAG492 run $i ====="
+            if ! cargo test -p rift-cluster --test cluster a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot -- --nocapture 2>&1 | grep -E "DIAG492|test result|panicked"; then
+              fails=$((fails+1)); echo "DIAG492 run $i FAILED"
+            fi
+          done
+          echo "DIAG492 SUMMARY: $fails of 8 runs failed"
 
       # The wasm lint crate is workspace-excluded so no default lane needs the wasm target — which
       # would also mean nothing notices it breaking until a release builds it. Exercise it here:
@@ -148,7 +157,7 @@ jobs:
   # 3× PR run — the deviation from RFC-001 §12 is deliberate and recorded there.
   cluster-smoke:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: false # SPIKE #492 — throwaway branch, only `build` is informative
     steps:
       - uses: actions/checkout@v4
         with:
@@ -268,7 +277,7 @@ jobs:
   # here.
   parity:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: false # SPIKE #492 — throwaway branch, only `build` is informative
     steps:
       - uses: actions/checkout@v4
         with:
@@ -390,6 +399,7 @@ jobs:
   # The whole job is well under a minute; a filter would cost more in risk than it saves in time.
   console-web:
     runs-on: ubuntu-latest
+    if: false # SPIKE #492 — throwaway branch, only `build` is informative
     defaults:
       run:
         working-directory: web
@@ -799,7 +809,7 @@ jobs:
   # every PR that touches a cluster source file.
   observability-runtime:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: false # SPIKE #492 — throwaway branch, only `build` is informative
     steps:
       - uses: actions/checkout@v4
         with:
