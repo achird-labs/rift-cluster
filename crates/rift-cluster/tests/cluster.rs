@@ -4743,6 +4743,57 @@ fn digest_only_dataset_put(name: &str, csv: &str, origin: NodeId) -> ControlRequ
     request
 }
 
+fn dataset_delete(name: &str) -> ControlRequest {
+    ControlRequest {
+        op_id: uuid::Uuid::new_v4(),
+        principal: None,
+        issued_at_secs: 0,
+        expected_revision: None,
+        op: rift_cluster::ControlOp::DatasetDelete {
+            tenant: rift_cluster::TenantId::default(),
+            name: name.to_owned(),
+        },
+    }
+}
+
+/// Poll `node` until it no longer lists `name`, or `deadline` passes.
+///
+/// Only `Ok(None)` counts as gone. `wait_for_dataset`'s `.ok().flatten()` is safe for the
+/// *presence* question — a read error there degrades to "not yet", and the loop keeps polling —
+/// but the polarity is flipped here, so the same idiom would let a transient read failure report
+/// a deletion that never happened. Restart and recovery windows, which is exactly when this
+/// helper is used, are also when such a transient is likeliest.
+async fn wait_for_dataset_gone(node: &RaftNode, name: &str, deadline: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if matches!(node.dataset(DEFAULT_TENANT, name), Ok(None)) {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll `node` until its blob transport store holds `digest`, or `deadline` passes.
+async fn wait_for_blob(
+    node: &RaftNode,
+    digest: &rift_cluster::blobs::BlobDigest,
+    deadline: Duration,
+) -> bool {
+    let started = Instant::now();
+    loop {
+        if node.blobs().stat(digest).is_ok_and(|stat| stat.have) {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Poll `node` until it lists `name`, or `deadline` passes.
 async fn wait_for_dataset(node: &RaftNode, name: &str, deadline: Duration) -> bool {
     let started = Instant::now();
@@ -4882,11 +4933,91 @@ async fn a_dead_origin_is_not_needed_to_apply_a_digest_only_entry() {
     cluster.shutdown_all().await;
 }
 
+/// Pins D-51 (#486): a member serves a **referenced** blob out of applied state when its own
+/// transport store does not have the bytes.
+///
+/// The setup is the pre-fan-out shape the issue names, reproduced exactly: every live member has
+/// the `sm_dataset_blobs` row (it applied the entry) and none has the bytes in a blob transport
+/// store — which is the state a node reaches by applying an op that carried its bytes on the log,
+/// since that arm writes redb and never `store_whole`s. Before this fix the joiner's fetch found
+/// no holder and parked forever (D-48), applying nothing thereafter; now applied state answers.
+///
+/// This is the same setup as `a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns`
+/// below, with the opposite outcome — which is the fix, stated as a diff between two tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_only_applied_state_holds_is_served_to_a_member_that_must_fetch_it() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let leader_id = cluster.leader().expect("leader").id();
+    let absent = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader_id)
+        .expect("a follower");
+    cluster.kill(absent).await;
+
+    let csv = "id,name\n1,ada\n2,bob\n";
+    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
+
+    // Erase every transport-store copy. The dataset is still live, so every live member still
+    // holds the referenced `sm_dataset_blobs` row — bytes in applied state, held by nobody in a
+    // transport store.
+    for node in cluster.live() {
+        std::fs::remove_file(node.blobs().path_of(&digest)).expect("erase the transport copy");
+        assert!(
+            !node.blobs().stat(&digest).expect("stat").have,
+            "node {} must not hold the bytes in its transport store",
+            node.id()
+        );
+    }
+
+    cluster.restart(absent).await;
+    {
+        let member = cluster.member(absent);
+        let node = member.node.as_ref().expect("restarted");
+        assert!(
+            wait_for_dataset(node, "customers", Duration::from_secs(60)).await,
+            "applies by fetching from a member that holds it only in applied state"
+        );
+        assert_eq!(
+            node.blob_fetch_stall(),
+            None,
+            "a fetch that succeeded is not a stall"
+        );
+        assert!(
+            node.blobs().stat(&digest).expect("stat").have,
+            "the fetched bytes land in the joiner's own transport store, so it is now an \
+             ordinary holder"
+        );
+        assert_eq!(
+            std::fs::read(spool_file(member.dir.path(), csv)).expect("spool file"),
+            csv.as_bytes(),
+            "the spool file is materialised from the bytes applied state served"
+        );
+    }
+    cluster.shutdown_all().await;
+}
+
 /// Pins D-48: a blob no reachable member holds parks the follower's apply — it does not halt
 /// the node, does not apply an empty document, and past `BLOB_FETCH_ESCALATE_AFTER` reports
 /// the stall on the health surface; it applies the moment a holder returns, and the stall
 /// clears. The setup is the failure D-48 exists for: the blob reaped from every holder before
 /// a member that missed the fan-out could fetch it.
+///
+/// **Reaching that state now takes a delete.** Since D-51 (#486) applied state is itself a
+/// holder, so erasing the transport files leaves every live member still able to serve the
+/// referenced `sm_dataset_blobs` row — see
+/// `a_blob_only_applied_state_holds_is_served_to_a_member_that_must_fetch_it` above, which is
+/// this same setup with the opposite outcome. Deleting the dataset first drops that row on
+/// every live member (`gc_dataset_blob_if_unreferenced`, in the delete's own transaction), so
+/// nothing in the fleet holds the bytes and D-48's park is reachable again. That the parked
+/// entry's own `DatasetDelete` sits *behind* it in the log — making the park permanent until a
+/// holder returns or compaction intervenes — is the residual #480 tracks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns() {
     let _serial = TEST_LOCK.lock().await;
@@ -4906,7 +5037,20 @@ async fn a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns()
 
     let csv = "id,name\n1,ada\n";
     let (origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
+
+    // Unreference it, so applied state stops being a holder (D-51), then reap the bytes.
+    cluster
+        .leader()
+        .expect("two of three still lead")
+        .submit(dataset_delete("customers"))
+        .await
+        .expect("commits");
     for node in cluster.live() {
+        assert!(
+            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
+            "live node {} applies the delete, dropping its blob row",
+            node.id()
+        );
         std::fs::remove_file(node.blobs().path_of(&digest)).expect("reap the blob from a holder");
     }
 
@@ -4973,18 +5117,22 @@ async fn a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns()
     {
         let member = cluster.member(absent);
         let node = member.node.as_ref().expect("live");
+        // The fetch landing in this node's own store is what proves the parked apply drained:
+        // it is reachable only through the apply that was parked. Asserting on the dataset
+        // instead would prove nothing here, because the `DatasetDelete` queued behind the
+        // parked entry removes it again moments later.
         assert!(
-            wait_for_dataset(node, "customers", Duration::from_secs(30)).await,
-            "applies once a holder returns"
+            wait_for_blob(node, &digest, Duration::from_secs(30)).await,
+            "the parked apply drains and fetches once a holder returns"
         );
         assert_eq!(
             node.blob_fetch_stall(),
             None,
             "the stall clears on recovery"
         );
-        assert_eq!(
-            std::fs::read(spool_file(member.dir.path(), csv)).expect("spool file"),
-            csv.as_bytes()
+        assert!(
+            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
+            "and it keeps going past the parked entry, applying the delete behind it"
         );
     }
     cluster.shutdown_all().await;

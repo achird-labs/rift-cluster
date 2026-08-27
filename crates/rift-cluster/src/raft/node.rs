@@ -71,6 +71,19 @@ const STORAGE_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 /// been dropped and the redb lock is releasable. Asserted in the tests so a
 /// future field that clones the database fails loudly here instead of hanging the
 /// shutdown wait.
+///
+/// A *running* node holds a second clone: the blob route's `Arc<dyn BlobFallback>`
+/// (#486, D-51). That this constant is still `1` at rest is therefore an ordering
+/// guarantee, not an accident — [`RaftNode::shutdown`] aborts `server_task` and
+/// waits for it to finish *before* calling `await_storage_release`, which is what
+/// drops the router and with it that clone. Do not reorder those two steps.
+///
+/// One consequence worth knowing: a fallback read is served inside
+/// `spawn_blocking`, and blocking tasks cannot be aborted. A peer-initiated read
+/// in flight when shutdown begins therefore holds a database handle that nothing
+/// can cancel, and delays the release by however long that read takes. Bounded in
+/// practice — the reads are of a spec- or dataset-sized value — but it is the
+/// first time peer traffic can push on [`STORAGE_RELEASE_TIMEOUT`].
 const NODE_HELD_DB_REFS: usize = 1;
 
 /// How long `--cluster-init` waits for the founding node to elect itself leader
@@ -795,7 +808,13 @@ impl RaftNode {
             Arc::clone(&membership_gate),
             Arc::clone(&auto_voter_ceiling),
         );
-        let router = crate::blobs::routes::blob_routes(router, Arc::clone(&blob_store));
+        // `sm_reader` is the fallback: applied state serves a referenced blob whose bytes
+        // never reached this node's transport store (#486, D-51).
+        let router = crate::blobs::routes::blob_routes(
+            router,
+            Arc::clone(&blob_store),
+            Arc::new(sm_reader.clone()),
+        );
 
         let server = RpcServer::bind(config.bind, RpcServerConfig::new(verifier, router))
             .await

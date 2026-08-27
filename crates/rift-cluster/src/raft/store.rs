@@ -7763,6 +7763,32 @@ impl RedbStateMachine {
     }
 }
 
+/// Applied state as a blob source of last resort for the transport (#486, D-51).
+///
+/// Answers from `sm_spec_blobs` then `sm_dataset_blobs`: both are keyed by the sha256 hex of the
+/// bytes they hold, so a digest present in either names the same bytes, and asking specs first is
+/// an ordering, not a precedence. Two read transactions rather than one — `spec_document` and
+/// `dataset_blob` each open their own — because the answer is a single row and the second lookup
+/// only happens when the first missed; sharing a transaction would buy nothing and duplicate two
+/// accessors that already exist.
+///
+/// What this can answer is exactly the **referenced** set: `gc_spec_blob_if_unreferenced` and its
+/// dataset twin drop the row in the same write transaction that drops the last reference to it.
+/// So this can never serve a reaped blob, and a manifest (D-50) can never name a digest it cannot
+/// answer for.
+impl crate::blobs::routes::BlobFallback for RedbStateMachine {
+    fn applied_blob(&self, digest: &crate::blobs::BlobDigest) -> Result<Option<Vec<u8>>, String> {
+        let digest_str = digest.as_str();
+        if let Some(document) = self.spec_document(digest_str).map_err(|e| e.to_string())? {
+            return Ok(Some(document.into_bytes()));
+        }
+        Ok(self
+            .dataset_blob(digest_str)
+            .map_err(|e| e.to_string())?
+            .map(String::into_bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -7787,8 +7813,9 @@ mod tests {
 
     use super::{
         DEDUP_TTL_SECS, DatasetSummary, DedupEntry, PullOutcome, RedbLogStore, RedbStateMachine,
-        SM_CONFIGS_TABLE, SM_DATASETS_TABLE, SM_DEDUP_TABLE, SM_SPECS_TABLE, SM_TENANTS_TABLE,
-        SourceRecord, SourceRow, SpecRecord, StoredDataset, StoredImposter, StoredSpec, new,
+        SM_CONFIGS_TABLE, SM_DATASET_BLOBS_TABLE, SM_DATASETS_TABLE, SM_DEDUP_TABLE,
+        SM_SPEC_BLOBS_TABLE, SM_SPECS_TABLE, SM_TENANTS_TABLE, SourceRecord, SourceRow, SpecRecord,
+        StoredDataset, StoredImposter, StoredSpec, new,
     };
     use crate::control::{
         AUDIT_RESOURCE_ALL, AuditRow, AuthSource, ControlOp, ControlOutcome, ControlRequest,
@@ -7837,6 +7864,57 @@ mod tests {
             t.insert((tenant, id), value).expect("insert spec");
         }
         txn.commit().expect("commit");
+    }
+
+    fn seed_spec_blob(sm: &RedbStateMachine, digest: &str, document: &str) {
+        let txn = sm.db.begin_write().expect("begin write");
+        {
+            let mut t = txn
+                .open_table(SM_SPEC_BLOBS_TABLE)
+                .expect("open sm_spec_blobs");
+            t.insert(digest, document).expect("insert spec blob");
+        }
+        txn.commit().expect("commit");
+    }
+
+    fn seed_dataset_blob(sm: &RedbStateMachine, digest: &str, csv: &str) {
+        let txn = sm.db.begin_write().expect("begin write");
+        {
+            let mut t = txn
+                .open_table(SM_DATASET_BLOBS_TABLE)
+                .expect("open sm_dataset_blobs");
+            t.insert(digest, csv).expect("insert dataset blob");
+        }
+        txn.commit().expect("commit");
+    }
+
+    /// #486 / D-51. The transport's fallback reads whichever blob table holds the digest, and
+    /// answers `None` — not an error, and not stale bytes — for one no table holds, which after
+    /// `gc_*_if_unreferenced` is exactly a reaped digest.
+    #[tokio::test]
+    async fn applied_blob_answers_from_either_table_and_none_for_a_reaped_digest() {
+        use crate::blobs::routes::BlobFallback;
+        let (_td, sm) = fresh_sm(None).await;
+        let spec_digest = crate::blobs::digest_of_bytes(b"{\"openapi\":\"3.0.0\"}");
+        let dataset_digest = crate::blobs::digest_of_bytes(b"id,name\n1,ada\n");
+        let reaped = crate::blobs::BlobDigest::parse(&"f".repeat(64)).expect("digest");
+
+        seed_spec_blob(&sm, spec_digest.as_str(), "{\"openapi\":\"3.0.0\"}");
+        seed_dataset_blob(&sm, dataset_digest.as_str(), "id,name\n1,ada\n");
+
+        assert_eq!(
+            sm.applied_blob(&spec_digest).expect("spec lookup"),
+            Some(b"{\"openapi\":\"3.0.0\"}".to_vec())
+        );
+        assert_eq!(
+            sm.applied_blob(&dataset_digest).expect("dataset lookup"),
+            Some(b"id,name\n1,ada\n".to_vec())
+        );
+        assert_eq!(
+            sm.applied_blob(&reaped).expect("reaped lookup"),
+            None,
+            "a digest no table holds is absent, not an error and not someone else's bytes"
+        );
     }
 
     fn seed_dataset(sm: &RedbStateMachine, tenant: &str, name: &str, version: u64, value: &str) {

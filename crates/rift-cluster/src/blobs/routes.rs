@@ -19,12 +19,46 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::{BLOB_PATH_PREFIX, BlobDigest, BlobError, BlobStore};
+use super::{BLOB_CHUNK_MAX_BYTES, BLOB_PATH_PREFIX, BlobDigest, BlobError, BlobStore};
 use crate::rpc::{HandlerFuture, Router, RpcError};
 
+/// Applied state, asked for a blob's bytes when this node's transport store
+/// does not have them (#486, D-51).
+///
+/// The state machine holds `sm_spec_blobs`/`sm_dataset_blobs` keyed by the same
+/// digest the transport store files are named with, and drops a row in the very
+/// transaction that drops its last reference — so what this can answer is
+/// exactly the **referenced** set, which is exactly the set a snapshot manifest
+/// names. It can therefore never serve a reaped or stale blob, and needs no pin.
+///
+/// Declared here, next to its one consumer, so `blobs` keeps knowing nothing
+/// about `raft`; `raft::store::RedbStateMachine` implements it.
+pub(crate) trait BlobFallback: Send + Sync + 'static {
+    /// The bytes applied state holds under `digest`, or `None` if it holds none.
+    ///
+    /// Absence is a domain value, not an error — the same distinction
+    /// [`super::BlobStat::have`] draws — so [`BlobError::NotFound`] is left to
+    /// mean the route's own answer.
+    ///
+    /// # Errors
+    ///
+    /// The lookup itself failing, as a display string. Never conflated with
+    /// `Ok(None)`: a read this node could not perform is not evidence that the
+    /// blob is absent, and answering 404 to it would tell a fetching peer that
+    /// nobody holds the blob.
+    fn applied_blob(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String>;
+}
+
 /// Register the blob transfer routes onto `router`.
+///
+/// `fallback` backs the chunk-read half of `GET` only — see [`handle_get`] for
+/// why `?stat` deliberately does not consult it.
 #[must_use]
-pub(crate) fn blob_routes(router: Router, store: Arc<BlobStore>) -> Router {
+pub(crate) fn blob_routes(
+    router: Router,
+    store: Arc<BlobStore>,
+    fallback: Arc<dyn BlobFallback>,
+) -> Router {
     let put_store = Arc::clone(&store);
     let get_store = store;
 
@@ -42,7 +76,8 @@ pub(crate) fn blob_routes(router: Router, store: Arc<BlobStore>) -> Router {
             BLOB_PATH_PREFIX,
             Arc::new(move |suffix: String, body: Vec<u8>| -> HandlerFuture {
                 let store = Arc::clone(&get_store);
-                Box::pin(async move { handle_get(store, suffix, body).await })
+                let fallback = Arc::clone(&fallback);
+                Box::pin(async move { handle_get(store, fallback, suffix, body).await })
             }),
         )
 }
@@ -68,6 +103,7 @@ async fn handle_put(
 
 async fn handle_get(
     store: Arc<BlobStore>,
+    fallback: Arc<dyn BlobFallback>,
     suffix: String,
     _body: Vec<u8>,
 ) -> Result<Vec<u8>, RpcError> {
@@ -84,11 +120,86 @@ async fn handle_get(
 
     let offset = required_u64(query, "offset")?;
     let len = required_u64(query, "len")?;
-    let bytes = tokio::task::spawn_blocking(move || store.read_chunk(&digest, offset, len))
+    let fallback_digest = digest.clone();
+    let read = tokio::task::spawn_blocking(move || store.read_chunk(&digest, offset, len))
         .await
-        .map_err(|e| RpcError::Handler(format!("blob read task: {e}")))?
-        .map_err(|e| map_blob_error(e, digest_str))?;
-    Ok(bytes)
+        .map_err(|e| RpcError::Handler(format!("blob read task: {e}")))?;
+    match read {
+        Ok(bytes) => Ok(bytes),
+        // Only absence falls through to applied state. Any other `BlobError` is
+        // a fault of this node's own store — a disk that a second source would
+        // hide rather than fix, and that the operator has to be able to see.
+        Err(BlobError::NotFound) => {
+            // Debug, not warn: on a healthy node this is the rare pre-fan-out case, but a store
+            // that is *chronically* missing blobs it should hold would otherwise be papered over
+            // silently and indefinitely by state-machine reads.
+            tracing::debug!(
+                digest = digest_str,
+                "blob served from applied state; transport store missed"
+            );
+            applied_chunk(&fallback, fallback_digest, offset, len, digest_str).await
+        }
+        Err(e) => Err(map_blob_error(e, digest_str)),
+    }
+}
+
+/// Serve `digest`'s chunk from applied state — the transport store's miss is
+/// not the fleet's (#486, D-51).
+///
+/// Shapes its answer exactly as [`BlobStore::read_chunk`] shapes its own, cap
+/// included, because [`super::client::BlobTransfer::get`] cannot tell the two
+/// sources apart and must not have to: it reads chunks until one comes back
+/// empty, then hashes the whole assembly against the digest it asked for.
+///
+/// Unlike `read_chunk`'s `seek` + `read_exact`, this reloads and copies the
+/// **whole** blob per call — redb has no partial read into a value — so one
+/// fallback transfer costs `ceil(size / BLOB_CHUNK_MAX_BYTES) + 1` full reads.
+/// Accepted rather than optimised: this is the last-resort path, not the
+/// steady-state one, and the sizes are bounded (a spec is capped at 4 MiB, a
+/// dataset at the tenant's `max_dataset_bytes`), so it is a handful of reads
+/// against a fetch that is already doing that many round trips. Making the
+/// seam offset-aware would buy little and cost `slice_chunk`'s one-to-one
+/// correspondence with `read_chunk`, which is what makes the two agree.
+async fn applied_chunk(
+    fallback: &Arc<dyn BlobFallback>,
+    digest: BlobDigest,
+    offset: u64,
+    len: u64,
+    digest_str: &str,
+) -> Result<Vec<u8>, RpcError> {
+    let fallback = Arc::clone(fallback);
+    let held = tokio::task::spawn_blocking(move || fallback.applied_blob(&digest))
+        .await
+        .map_err(|e| RpcError::Handler(format!("blob fallback task: {e}")))?
+        // A lookup that failed is not a blob that is absent. Mapping this to
+        // `NotFound` would tell the fetching peer to cross this member off
+        // (`FetchStep::NextPeer`) over a transient read, and would lose the
+        // reason; as a 500 the sweep records it in the stall and moves on.
+        .map_err(|e| {
+            // The fetching peer records this on its stall, but the fault is *here*; without this
+            // the node that actually failed the read leaves no local trace of it.
+            tracing::error!(digest = digest_str, error = %e, "blob fallback lookup failed");
+            RpcError::Handler(format!("blob fallback for {digest_str}: {e}"))
+        })?;
+    match held {
+        Some(bytes) => Ok(slice_chunk(&bytes, offset, len)),
+        None => Err(map_blob_error(BlobError::NotFound, digest_str)),
+    }
+}
+
+/// [`BlobStore::read_chunk`]'s slicing rule over bytes already in memory: at
+/// most `len`, never past the end, never more than [`BLOB_CHUNK_MAX_BYTES`].
+///
+/// An offset at or past the end is an empty chunk, not an error — that empty
+/// answer is what ends `BlobTransfer::get`'s read loop.
+fn slice_chunk(bytes: &[u8], offset: u64, len: u64) -> Vec<u8> {
+    let total = bytes.len() as u64;
+    if offset >= total {
+        return Vec::new();
+    }
+    let want = len.min(total - offset).min(BLOB_CHUNK_MAX_BYTES as u64) as usize;
+    let start = offset as usize;
+    bytes[start..start + want].to_vec()
 }
 
 /// Split a `PrefixHandler` suffix into its digest and query components. The
@@ -141,8 +252,176 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blobs::{BLOB_CHUNK_MAX_BYTES, BlobStat};
 
+    /// sha256 of `b"hello"` — the bytes every fallback test below serves.
     const DIGEST: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    /// sha256 of 5 MiB of `b'A'` — one byte over the chunk cap.
+    const FIVE_MIB_A_DIGEST: &str =
+        "dbbe5517996826bd5861ac22b745d21d11219055d89243ca1aea0ad31f552b12";
+
+    /// A [`BlobFallback`] that answers one canned result, so a route test can
+    /// state what applied state holds without standing a state machine up.
+    struct StubFallback(Result<Option<Vec<u8>>, String>);
+
+    impl BlobFallback for StubFallback {
+        fn applied_blob(&self, _digest: &BlobDigest) -> Result<Option<Vec<u8>>, String> {
+            self.0.clone()
+        }
+    }
+
+    fn holding(bytes: &[u8]) -> Arc<dyn BlobFallback> {
+        Arc::new(StubFallback(Ok(Some(bytes.to_vec()))))
+    }
+
+    fn holding_nothing() -> Arc<dyn BlobFallback> {
+        Arc::new(StubFallback(Ok(None)))
+    }
+
+    /// An *empty* transport store: every fallback test needs the store to miss,
+    /// which is the only condition under which applied state is consulted.
+    fn empty_store() -> (Arc<BlobStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::open(dir.path().join("blobs")).expect("open blob store");
+        (Arc::new(store), dir)
+    }
+
+    async fn get_chunk(
+        fallback: Arc<dyn BlobFallback>,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, RpcError> {
+        let (store, _dir) = empty_store();
+        handle_get(
+            store,
+            fallback,
+            format!("{DIGEST}?offset={offset}&len={len}"),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// #486 / D-51. The transport store misses, applied state holds the blob, so
+    /// the chunk is served from applied state. This is the whole fix: the fetch
+    /// sweep (`PeerBlobSource::fetch_round`) calls `BlobTransfer::get`, which is
+    /// nothing but this chunk loop.
+    #[tokio::test]
+    async fn a_chunk_read_falls_back_to_applied_state_when_the_store_misses() {
+        assert_eq!(
+            get_chunk(holding(b"hello"), 0, BLOB_CHUNK_MAX_BYTES as u64)
+                .await
+                .expect("served from applied state"),
+            b"hello".to_vec()
+        );
+        // Mid-blob, so the answer is a real slice and not "the whole thing
+        // whatever was asked for".
+        assert_eq!(
+            get_chunk(holding(b"hello"), 2, 2)
+                .await
+                .expect("served from applied state"),
+            b"ll".to_vec()
+        );
+    }
+
+    /// The fallback obeys the same cap `BlobStore::read_chunk` does, so a peer
+    /// cannot make this node allocate an unbounded response by asking for one.
+    #[tokio::test]
+    async fn a_fallback_chunk_read_respects_the_chunk_cap() {
+        let five_mib = vec![b'A'; 5 * 1024 * 1024];
+        let (store, _dir) = empty_store();
+        let chunk = handle_get(
+            store,
+            holding(&five_mib),
+            format!("{FIVE_MIB_A_DIGEST}?offset=0&len={}", five_mib.len()),
+            Vec::new(),
+        )
+        .await
+        .expect("served from applied state");
+        assert_eq!(chunk.len(), BLOB_CHUNK_MAX_BYTES);
+        assert!(chunk.iter().all(|b| *b == b'A'));
+    }
+
+    /// Load-bearing: `BlobTransfer::get` loops until a chunk comes back
+    /// **empty**, so a read at or past the end must be an empty `Ok`, not a 404.
+    /// A 404 here would fail every fallback fetch on its last round trip.
+    #[tokio::test]
+    async fn a_fallback_chunk_read_past_the_end_is_empty_so_the_fetch_loop_ends() {
+        assert_eq!(
+            get_chunk(holding(b"hello"), 5, 64)
+                .await
+                .expect("empty tail"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            get_chunk(holding(b"hello"), 99, 64)
+                .await
+                .expect("empty past the end"),
+            Vec::<u8>::new()
+        );
+        // A zero-length blob is a real blob: its very first chunk is the empty
+        // one that ends the loop.
+        assert_eq!(
+            get_chunk(holding(b""), 0, 64).await.expect("empty blob"),
+            Vec::<u8>::new()
+        );
+    }
+
+    /// Absence is still absence. The fetch sweep reads a 404 as "ask the next
+    /// member" (`FetchStep::NextPeer`), which is only correct while a 404 keeps
+    /// meaning the node genuinely does not hold the blob.
+    #[tokio::test]
+    async fn a_blob_neither_the_store_nor_applied_state_holds_is_still_not_found() {
+        let err = get_chunk(holding_nothing(), 0, 64)
+            .await
+            .expect_err("nobody holds it");
+        assert!(matches!(&err, RpcError::NotFound { what } if what == DIGEST));
+        assert_eq!(err.status(), 404);
+    }
+
+    /// A lookup this node could not perform is not evidence the blob is absent.
+    /// Reporting it as 404 would make the fetching peer cross this member off
+    /// its list on a transient redb error; 500 keeps it a refusal the sweep
+    /// records in the stall (`FetchStep::Refused`) instead of losing.
+    #[tokio::test]
+    async fn a_fallback_lookup_failure_is_a_server_error_not_an_absence() {
+        let fallback: Arc<dyn BlobFallback> =
+            Arc::new(StubFallback(Err("state machine read failed".to_owned())));
+        let err = get_chunk(fallback, 0, 64).await.expect_err("lookup failed");
+        assert!(
+            !matches!(err, RpcError::NotFound { .. }),
+            "a failed lookup must never be reported as absence, got {err:?}"
+        );
+        assert_eq!(err.status(), 500);
+    }
+
+    /// The asymmetry is deliberate (#486). `BlobTransfer::put` skips sending
+    /// bytes to any peer whose `?stat` says `have`, and that peer's ack counts
+    /// toward the fan-out quorum `fan_out_then_submit` strips on (D-19/D-49).
+    /// If `?stat` answered from applied state, a member could ack a fan-out
+    /// without ever receiving the bytes into its transport store — resting
+    /// D-18's quorum durability on a redb row a later delete can drop. `?stat`
+    /// therefore stays a pure transport-store probe; the fallback serves reads.
+    #[tokio::test]
+    async fn a_stat_probe_does_not_consult_applied_state() {
+        let (store, _dir) = empty_store();
+        let body = handle_get(
+            store,
+            holding(b"hello"),
+            format!("{DIGEST}?stat=1"),
+            Vec::new(),
+        )
+        .await
+        .expect("stat answers");
+        let stat: BlobStat = serde_json::from_slice(&body).expect("decode stat");
+        assert_eq!(
+            stat,
+            BlobStat {
+                have: false,
+                size: 0,
+                staged: 0
+            }
+        );
+    }
 
     #[test]
     fn a_suffix_splits_into_its_digest_and_query() {
