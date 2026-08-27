@@ -293,6 +293,10 @@ The content-addressed blob store (#437) is quorum-complete on each node; an obje
 is an opt-in cache/backup tier that is never consulted on the serving path and never a condition
 for apply. D-12 covers flow state, not the blob store.
 
+Refined by D-51: "holds" means **can serve**. A member answers a blob read from applied state
+when its own transport store misses, so completeness is a property of the state machine rather
+than of how the bytes happened to arrive.
+
 The store itself replicates nothing — two nodes holding different blob sets is normal, not
 divergence. Completeness is established by the **write path** (#438): the accepting node stores
 the blob, fans it out to the members, and proposes the referencing op only once a quorum
@@ -813,6 +817,9 @@ established by the write-path fan-out (#438) — so a joiner always finds a hold
 by live state is never GC'd (`gc` respects the reference set), so the manifest can never name a
 digest the fleet has reaped.
 
+> **Amended by D-51** (2026-08-27): the precondition below is closed — a member serves any
+> referenced blob from applied state, so a pre-fan-out row always has a holder.
+
 **Precondition — the invariant holds for fan-out-minted blobs only.** Every write this build
 produces goes through `fan_out_then_submit` (D-49), so its bytes are on a quorum's transport store
 before the referencing op commits, and a follower that applies a digest-only op fetches into its
@@ -821,11 +828,75 @@ holder. The one shape without one is a **pre-fan-out** blob: an op that rode its
 before #438 existed, applied straight into `sm_*_blobs` with no `store_whole`. The manifest names
 such a row like any other, but no member can serve it, so its install would park (D-48) with no
 holder able to appear. No such fleet exists — the blob transport (#437/#438) predates any release,
-so there is no pre-fan-out log to replay. The residual rolling-upgrade gap (a mixed-provenance
-fleet) is the same class as **#481** (gate the strip on every joint voter's digest-only support)
-and is tracked there, not closed here; the two closes together give a serve-side or apply-side
-backfill its home.
+so there was no pre-fan-out log to replay. **D-51 (#486) closes this**: applied state serves the
+row, so a pre-fan-out digest has a holder on every member that references it, and a manifest can
+no longer name a blob nobody can supply. The separate rolling-upgrade concern — an un-upgraded
+member wedging on a digest-only op it cannot decode — is **#481**, and is tracked there.
 
 *Not changed:* D-23 stays `pending` — #441 (the RFC/architecture prose revision) flips it to
 `active`. The `install_snapshot_timeout` / `snapshot_max_chunk_size` knobs stay (#428): a KiB-sized
 install removes the pressure on the deadline, not the restart-from-offset-0 correctness argument.
+
+### D-51 — A member serves a referenced blob from applied state when its transport store misses
+- **Status:** active
+- **Decided:** 2026-08-27 · #486 (#432/#440 follow-up)
+- **Refines:** D-18, D-48, D-50
+- **Implemented by:** #486
+- **Code:** crates/rift-cluster/src/blobs/routes.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/raft/node.rs
+
+`GET /internal/v1/blob/{digest}` answers a chunk read from `sm_spec_blobs`/`sm_dataset_blobs`
+when this node's blob transport store does not have the bytes. Applied state is therefore a
+holder of last resort on every member, and D-18's "every member holds every live blob" means
+**can serve** — true by construction of the state machine, not by the provenance of the bytes.
+
+What this closes is the shape D-50's precondition named: a **pre-fan-out** blob, applied straight
+into `sm_*_blobs` from an op that carried its bytes on the log, with no `store_whole` and so no
+transport holder anywhere. A manifest names such a row like any other and its install would park
+forever (D-48) with no holder able to appear. It also retires the out-of-band repair D-48
+documents ("write the bytes back into any member's `<data-dir>/blobs/`") as the *only* path back:
+any *peer* that still references the blob can serve it, even after its transport store is wiped.
+
+**Peers only — a node does not serve itself from applied state.** `resolve_blobs` goes straight to
+`BlobSource::load`, and `PeerBlobSource` checks the local *transport* store and then filters this
+node out of the peer sweep, so the one member certain to hold a referenced row — the node doing the
+applying — is the holder this entry cannot reach. That matters because the blob tables are shared
+by digest and their own docs call byte-sharing common: a tenant re-putting identical bytes under a
+second dataset name produces a digest-only op whose bytes the applying node already has in
+`sm_dataset_blobs`, and it will still go to the network for them. Tracked as a follow-up, not
+closed here; the fetch path is not this entry's seam to move.
+
+The fallback can only ever answer for the **referenced** set — `gc_spec_blob_if_unreferenced` and
+its dataset twin drop the row in the same write transaction that drops the last reference — which
+is exactly the set a manifest names. So it can never serve a reaped or stale blob, and it needs no
+pin. The bytes are identical to what a transport holder would serve: the key is the sha256 hex
+`validate` proved over exactly these bytes (D-4/D-49), and `BlobTransfer::get` re-verifies the
+whole assembly against the digest it asked under, so a mixed-source read is safe by construction.
+
+**`?stat` deliberately does not consult applied state.** `BlobTransfer::put` skips sending to any
+peer whose stat reports `have`, and that peer's ack counts toward the fan-out quorum
+`fan_out_then_submit` strips on (D-19/D-49). A stat that answered from applied state would let a
+member ack a fan-out without ever receiving the bytes into its transport store — resting D-18's
+quorum durability on a redb row a later delete can drop, which is a new hole in the invariant this
+entry exists to close. `?stat` stays a pure transport-store probe: the fallback serves reads, it
+does not claim to hold. The fetch path is unaffected either way — `PeerBlobSource` calls
+`BlobTransfer::get`, which stats nothing and reads chunks until one comes back empty.
+
+A fallback lookup that **fails** answers 500, never 404. A read this node could not perform is not
+evidence the blob is absent, and a 404 would have the fetching peer cross this member off
+(`FetchStep::NextPeer`) over a transient error and lose the reason; as a refusal it is carried on
+the stall record instead.
+
+*Rejected:* backfilling at apply (`store_whole` from the legacy carried-bytes arm, plus a one-time
+sweep at open). It puts filesystem writes inside the redb write transaction — the thing D-49/#444
+keep out of `apply` — duplicates every legacy row's bytes on every member, and still cannot help a
+member that applied before the backfill build shipped. *Also rejected:* leaning on the object-store
+mirror tier (#448/#456) for this. Its upload queue and its completeness sweep are both anchored on
+the node-local `BlobStore`, so a blob that was never in one is never mirrored either — the same
+provenance gap, one tier out — and D-30 makes the bucket opt-in, while this is a correctness gap in
+the default build.
+
+**Residual:** the self-serve gap above; and a blob that is *unreferenced* has no holder in applied
+state either, by design. A
+replica parked on a `PUT` whose `DELETE` sits behind it in the log therefore still parks — that is
+**#480**, and it is what `a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns`
+now has to construct deliberately in order to pin D-48 at all.

@@ -108,8 +108,19 @@ flowchart TB
   proposed, and #439 fetches on apply for any member the fan-out missed, so a
   commit implies quorum-durability and every member converges to holding every
   live blob. A joiner catching up by snapshot fetches the manifest's blobs the
-  same way (#440, D-50). The bytes have left the log; this store is now the only
-  carrier for them.
+  same way (#440, D-50). The bytes have left the log; this store is now the
+  primary carrier for them.
+
+  Not the *only* carrier, though. A `GET` this store cannot answer falls back to
+  `sm_spec_blobs`/`sm_dataset_blobs` (#486, **D-51**), so every member that still
+  references a blob can serve it even if its own `blobs/` directory never held
+  the bytes or has since been wiped — which is what makes D-18's "holds" mean
+  *can serve*, by construction rather than by how the bytes arrived. The fallback
+  reaches the referenced set only: a row is dropped in the same transaction that
+  drops its last reference, so it can never serve something the fleet has reaped.
+  A `?stat` probe deliberately does **not** consult it — that probe is what the
+  fan-out uses to decide it may skip a peer, and it must keep meaning "this
+  store has the bytes".
 
 ## Membership lifecycle
 
