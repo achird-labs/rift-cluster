@@ -2301,15 +2301,71 @@ impl RaftNode {
             .map_err(|e| NodeError::Storage(e.to_string()))
     }
 
-    /// A snapshot of the node's current status, from Raft metrics.
-    #[must_use]
     /// This node's current Raft term. Test-facing: the #431 probe asserts a
     /// restarted voter's term never runs ahead of the leader's.
     #[doc(hidden)]
+    #[must_use]
     pub fn raft_term(&self) -> u64 {
         self.raft.metrics().borrow().current_term
     }
 
+    /// The index of the newest snapshot this node holds, or `None` before it
+    /// holds one. Test-facing: #492's joiner probe polls this to measure how
+    /// long an `install_snapshot` actually took, so the fixture's margin over
+    /// [`ADMIT_CURRENCY_WAIT`](crate::ADMIT_CURRENCY_WAIT) is checked rather
+    /// than assumed.
+    ///
+    /// Reported as a bare index, like [`StatusReport::last_applied`], so a
+    /// test never has to name an openraft type.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn snapshot_index(&self) -> Option<u64> {
+        self.raft
+            .metrics()
+            .borrow()
+            .snapshot
+            .map(|log_id| log_id.index)
+    }
+
+    /// The index the log has been purged up to, or `None` if nothing has been
+    /// purged. Test-facing: #492's joiner probe polls it to establish that the
+    /// log the joiner would otherwise be caught up *from* is gone, so
+    /// `install_snapshot` is openraft's only remaining route — the assumption
+    /// the whole test rests on, previously left to a fixed sleep.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn purged_index(&self) -> Option<u64> {
+        self.raft
+            .metrics()
+            .borrow()
+            .purged
+            .map(|log_id| log_id.index)
+    }
+
+    /// The leader's view of each peer's matched log index, sorted by node id —
+    /// **empty on a non-leader**, since openraft populates replication metrics
+    /// only while leading. Test-facing: #492's failure messages carry it,
+    /// because `matching` against the leader's `last_log` is what decides
+    /// whether admission sees a joiner as current.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn replication_matching(&self) -> Vec<(NodeId, Option<u64>)> {
+        self.raft
+            .metrics()
+            .borrow()
+            .replication
+            .as_ref()
+            .map(|peers| {
+                peers
+                    .iter()
+                    .map(|(id, matched)| (*id, matched.map(|log_id| log_id.index)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A snapshot of the node's current status, from Raft metrics.
+    #[must_use]
     pub fn status(&self) -> StatusReport {
         let receiver = self.raft.metrics();
         let metrics = receiver.borrow();

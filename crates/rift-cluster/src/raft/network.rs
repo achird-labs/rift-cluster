@@ -1199,7 +1199,14 @@ fn is_catching_up(raft: &Raft<TypeConfig>, id: NodeId) -> bool {
 /// answering with `catching_up: true` — the fast path's budget, not a
 /// correctness bound. Well inside `ADMIT_COMMIT_TIMEOUT` and the joiner's own
 /// RPC budget, both of which bounded the whole handler before #433.
-const ADMIT_CURRENCY_WAIT: Duration = Duration::from_millis(500);
+///
+/// Public as hidden testability surface (D-43's pattern), not as a knob: a
+/// fixture that must outlast this window has to be sized *against* it, and
+/// #492 is what happens when a test carries its own copy of the number
+/// instead — the constant stayed at 500 ms, the install shrank below it, and
+/// nothing connected the two.
+#[doc(hidden)]
+pub const ADMIT_CURRENCY_WAIT: Duration = Duration::from_millis(500);
 
 /// The poll cadence inside [`ADMIT_CURRENCY_WAIT`]'s window.
 const ADMIT_CURRENCY_POLL: Duration = Duration::from_millis(20);
