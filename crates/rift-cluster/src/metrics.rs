@@ -109,6 +109,17 @@ lazy_static! {
     )
     .expect("rift_cluster_blob_fetch_stalls_total registers once");
 
+    /// `rift_cluster_blob_gc_retained` — tombstoned blobs this node's most recent GC sweep kept
+    /// because its own log has not yet been purged past the index that unreferenced them (#480).
+    /// A gauge, resampled every sweep like `rift_cluster_intents_pending`: "how many right now"
+    /// is the useful reading, and the count falls back to 0 on its own once compaction catches
+    /// up — nothing here needs to be reset by hand.
+    static ref BLOB_GC_RETAINED: IntGauge = register_int_gauge!(
+        "rift_cluster_blob_gc_retained",
+        "Tombstoned blobs kept because this node's log has not purged past their unreferencing index"
+    )
+    .expect("rift_cluster_blob_gc_retained registers once");
+
     // -- config-sync (issue #9) ---------------------------------------------
 
     /// `rift_cluster_write_forwards_total` — writes this node accepted and
@@ -645,6 +656,11 @@ pub(crate) fn blob_fetch_stalled() {
 /// The stalled fetch was satisfied; apply resumes.
 pub(crate) fn blob_fetch_recovered() {
     BLOB_FETCH_STALLED.set(0);
+}
+
+/// Resample the tombstoned-but-not-yet-purged count from the blob GC sweep that just ran (#480).
+pub(crate) fn blob_gc_retained(kept: u64) {
+    BLOB_GC_RETAINED.set(i64::try_from(kept).unwrap_or(i64::MAX));
 }
 
 /// Resample the pending-intents depth from the ledger itself. The inc/dec pair

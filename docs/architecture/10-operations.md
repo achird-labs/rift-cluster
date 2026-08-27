@@ -148,6 +148,24 @@ retry's) and `rift_cluster_blob_fetch_stalls_total` (counter, one per stall
 onset — a rising count on a fleet with no partitions says a blob is being
 reaped before its op commits, which is the #438 pin failing).
 
+*Registered by #480, no alert:* `rift_cluster_blob_gc_retained` (gauge, the
+number of unreferenced blobs this node is holding back because its log has not
+been purged past the index at which they stopped being referenced — **D-52**).
+Not a fault signal: a non-zero value is retention working as designed, and it
+falls to zero on its own as the log compacts. Worth a dashboard line rather than
+an alert, because a value that stays high while `purged` advances is the one
+shape that would suggest the tombstone table is not being cleared.
+
+Two things this changes for the `blob_fetch_stall` runbook above. A stall now
+means the blob is held by nobody *and* referenced by no live state anywhere —
+in practice a digest whose own delete sits behind the parked entry — because a
+blob that is merely unreferenced is retained until the log passes it, and one
+that is being actively requested is never reaped at all. And **compaction is not
+a remedy**: a parked apply blocks openraft's state-machine worker, so the
+snapshot that would let the node skip the blob queues behind the park and never
+runs (D-48 as amended by D-52). Waiting does not clear a stall; a holder
+returning, or the out-of-band repair, does.
+
 *Registered, but not alerted on:* `rift_cluster_flow_wal_lag_ops` (async
 durability backlog). It is a legitimate paging signal, but it appears in
 neither the alert pack nor the shipped dashboards yet: nobody has chosen a
