@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use rift_cluster::stores::ClusterJournal;
 use rift_cluster::{
-    Authority, ControlRequest, DEFAULT_TENANT, NodeConfig, NodeId, RaftNode, Router,
+    ADMIT_CURRENCY_WAIT, Authority, ControlRequest, DEFAULT_TENANT, NodeConfig, NodeId, RaftNode,
+    Router,
 };
 use tempfile::TempDir;
 
@@ -3982,16 +3983,39 @@ fn tagged_csv(bytes: usize, tag: &str) -> String {
 /// the two observations that make the new shape checkable — no voterhood during the install,
 /// voterhood after it.
 ///
+/// **The fixture size is load-bearing, and is measured here rather than asserted in prose (#492).**
+/// The install must outlast the 500 ms window, and it had stopped doing so: #436 (binary,
+/// file-backed snapshots) and #440 (a KiB manifest plus a blob fetch) each cut the install time
+/// while this fixture stayed at 8 × 512 KiB, until it landed at 577–592 ms locally and 502–1219 ms
+/// on CI. Against a 500 ms window that is a coin flip — ~55% failure in CI, 0% locally across four
+/// attempts, which is why it read as an infrastructure flake for a day. `MIN_INSTALL_MARGIN` now
+/// checks the margin on every run, so the next time something makes installs faster this fails
+/// with the remedy named instead of flaking.
+///
 /// `snapshot_log_entries: Some(2)` (with the `max_in_snapshot_log_to_keep: 0` it implies) is what
 /// makes the catch-up a *snapshot* rather than log replication: by the time the joiner arrives the
 /// log it would need has been purged, so `install_snapshot` is openraft's only route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
-    /// ~4 MiB of state — well under RFC-005's 8 MiB per-dataset and 64 MiB per-tenant ceilings,
-    /// and already 20× what a default chunk could carry in its 200 ms budget.
+    /// 32 MiB of state — under RFC-005's 8 MiB per-dataset and 64 MiB per-tenant ceilings, and
+    /// sized so the install outlasts `ADMIT_CURRENCY_WAIT` by a wide margin on the *fastest*
+    /// environment measured, not the average one. See `MIN_INSTALL_MARGIN` below and #492.
     const DATASETS: usize = 8;
-    const PER_DATASET_BYTES: usize = 512 * 1024;
-    const CONVERGE_BY: Duration = Duration::from_secs(30);
+    const PER_DATASET_BYTES: usize = 4 * 1024 * 1024;
+    const CONVERGE_BY: Duration = Duration::from_secs(60);
+
+    /// The install must outlast the admission window by this factor for the learner assertion
+    /// below to be measuring two-phase admission rather than a coin flip. Checked, not assumed:
+    /// #492 was exactly this margin silently going to zero.
+    ///
+    /// **Enlarging the fixture has roughly 2x left, and then it stops working.** RFC-005 caps a
+    /// dataset at `DEFAULT_MAX_DATASET_BYTES` (8 MiB) and a tenant at
+    /// `DEFAULT_MAX_DATASET_TOTAL_BYTES` (64 MiB), so 8 x 8 MiB is the ceiling and the write is
+    /// already ~0.35 s/MiB of test time. If another change makes installs 3x faster again, the
+    /// answer is a different mechanism — spreading across tenants, or the deterministic variant
+    /// #492 defers to #486 (seed the blob store after the join so the install parks) — not a
+    /// bigger `PER_DATASET_BYTES`.
+    const MIN_INSTALL_MARGIN: u32 = 3;
 
     let _serial = TEST_LOCK.lock().await;
     let ports = reserve_ports(2);
@@ -4030,36 +4054,111 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
             .is_empty()
     );
 
-    // Let the snapshot policy run before the joiner arrives, so the log it would otherwise be
-    // caught up from has been purged and `install_snapshot` is openraft's only route. There is no
-    // public signal for "snapshot built and log purged", so this is a settle rather than a poll —
-    // the entry count is what makes it certain, the same argument the chaos tier's snapshot
-    // overlay relies on.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the snapshot policy to run before the joiner arrives, so the log it would
+    // otherwise be caught up *from* has been purged and `install_snapshot` is openraft's only
+    // route. Polled, not slept: this fixture is 32 MiB, and a fixed settle sized for a smaller
+    // one would let the joiner arrive before the purge — at which point it catches up by log
+    // replication, the install this test measures never happens, and the failure looks like a
+    // margin problem instead of a route problem (#492).
+    let deadline = Instant::now() + CONVERGE_BY;
+    loop {
+        let applied = leader.status().last_applied;
+        if applied.is_some()
+            && leader.snapshot_index() == applied
+            && leader.purged_index() == applied
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the leader never snapshotted and purged within {CONVERGE_BY:?}, so the joiner would \
+             be caught up by log replication rather than an install: applied={applied:?} \
+             snapshot={:?} purged={:?}",
+            leader.snapshot_index(),
+            leader.purged_index()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let joiner = spawn_with_snapshot_policy(2, addr2, dir2.path(), retention, Some(2)).await;
     let seed = Authority::from(addr1);
+    // Timed from *before* the call: the install races the admission window from here, so this is
+    // the same quantity `ADMIT_CURRENCY_WAIT` is compared against inside `admit`.
+    let join_started = Instant::now();
     // Admission commits the membership entry and returns (#433); the install it used to have to
     // outlast is no longer on this call's path, so the first attempt succeeds.
     joiner
         .join_via(&seed)
         .await
         .expect("admission returns once the membership entry commits, ahead of the install");
+    let join_took = join_started.elapsed();
+
+    // Everything this test can observe at the instant an assertion reads it. Carried into every
+    // failure message below so a future failure classifies itself instead of needing a rerun with
+    // instrumentation — which is what #492 cost, and what #460 added to the chaos tier for the
+    // same reason.
+    let state = |stage: &str| {
+        let leader_status = leader.status();
+        // `is_leader` is here because `replication_matching()` renders "not leading" and "leading
+        // with nothing replicating" identically as `[]`. Without it a failure after an unexpected
+        // election reads as a replication stall, which is the wrong thing to go and investigate.
+        format!(
+            "[{stage}] join_via took {join_took:?}; leader is_leader={} voters={:?} \
+             matching={:?}; joiner snapshot={:?} last_applied={:?}",
+            leader_status.is_leader,
+            leader_status.voters,
+            leader.replication_matching(),
+            joiner.snapshot_index(),
+            joiner.status().last_applied,
+        )
+    };
 
     // The joiner is a member now — and, for the whole install, a learner. A multi-MiB snapshot
     // cannot be current inside the admission's currency window, so no joint configuration exists
     // yet and the leader owes this node nothing. That is what makes a never-landing snapshot
     // unable to wedge the fleet, and it is checkable: no voterhood before catch-up.
     //
-    // This rests on the *fixture*, not only on the code: it holds while the install outlasts
-    // `ADMIT_CURRENCY_WAIT` (500 ms). At ~4 MiB the install takes seconds, an order of magnitude
-    // of margin — but shrink `DATASETS`/`PER_DATASET_BYTES` for speed and this fails with the
-    // joiner correctly promoted in-call, which is not two-phase admission breaking.
+    // This rests on the *fixture*, not only on the code, and that dependence is no longer left to
+    // a comment — the margin guard below measures it. Do not weaken this assertion to make a
+    // failure go away: it guards two-phase admission (#433), and a failure here means the install
+    // finished inside the window, which the guard will name.
     assert!(
         !leader.status().voters.contains(&2),
         "a joiner that must install a multi-MiB snapshot is admitted as a learner, not a voter \
-         (requires the install to outlast the 500 ms admission currency window; if the fixture \
-         was shrunk, in-call promotion is the correct outcome and this test needs a bigger one)"
+         (requires the install to outlast the {ADMIT_CURRENCY_WAIT:?} admission currency window; \
+         if the fixture was shrunk, in-call promotion is the correct outcome and this test needs \
+         a bigger one — see #492). {}",
+        state("learner")
+    );
+
+    // The margin the assertion above depends on, measured rather than assumed. #492: #436 (binary,
+    // file-backed snapshots) and #440 (KiB manifest + blob fetch) each made the install faster
+    // while this fixture stayed at 8 x 512 KiB, until the install landed at ~0.5 s against a
+    // 500 ms window and the test failed ~55% of the time in CI and never once locally. Erosion
+    // must fail loudly, with the remedy named, instead of flaking.
+    //
+    // `snapshot_index().is_some()` means "holds a snapshot", not "installed one" — the joiner runs
+    // the same snapshot policy and would eventually build its own. This reads as an *install*
+    // measurement only because the purge poll above forecloses log replication, so the joiner's
+    // first snapshot can only have arrived over the wire. The two are one argument: remove that
+    // poll and this measurement silently stops meaning anything.
+    let deadline = Instant::now() + CONVERGE_BY;
+    while joiner.snapshot_index().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the joiner never installed a snapshot within {CONVERGE_BY:?}. {}",
+            state("install-poll")
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let install_took = join_started.elapsed();
+    assert!(
+        install_took >= MIN_INSTALL_MARGIN * ADMIT_CURRENCY_WAIT,
+        "the install took {install_took:?} against a {ADMIT_CURRENCY_WAIT:?} admission window — \
+         the fixture no longer produces a slow install, so the learner assertion above is a coin \
+         flip rather than a check on two-phase admission. Enlarge `PER_DATASET_BYTES` (see #492 \
+         and `MIN_INSTALL_MARGIN`'s note on the quota ceiling); do not loosen the assertion. {}",
+        state("margin")
     );
 
     let last_name = format!("d{}", DATASETS - 1);
@@ -4076,11 +4175,11 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let joiner_status = joiner.status();
-    let leader_status = leader.status();
     assert!(
         converged,
-        "the joiner was never caught up by snapshot within {CONVERGE_BY:?}: joiner          {joiner_status:?}, leader {leader_status:?}"
+        "the joiner was never caught up by snapshot within {CONVERGE_BY:?} (install measured at \
+         {install_took:?}). {}",
+        state("converge")
     );
 
     // The other half of the new shape: once current, the leader's promotion sweep makes the
@@ -4089,8 +4188,8 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     while !leader.status().voters.contains(&2) {
         assert!(
             Instant::now() < deadline,
-            "a caught-up learner must be promoted to voter by the leader's sweep: leader {:?}",
-            leader.status()
+            "a caught-up learner must be promoted to voter by the leader's sweep. {}",
+            state("promote")
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

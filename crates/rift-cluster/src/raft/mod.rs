@@ -22,6 +22,7 @@ pub(crate) mod store;
 
 pub use blob_source::BlobFetchStall;
 pub use identity::NodeIdentity;
+pub use network::ADMIT_CURRENCY_WAIT;
 pub use node::{
     JoinOutcome, JoinedAs, LeaveOutcome, NodeConfig, NodeError, RaftNode, StatusReport,
 };

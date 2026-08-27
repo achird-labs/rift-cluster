@@ -47,9 +47,9 @@ pub use control::{
 pub use decorate::ClusterDecorator;
 pub use pull_on_miss::PullOnMissInterceptor;
 pub use raft::{
-    DEFAULT_AUDIT_RETENTION_SECS, JoinOutcome, JoinedAs, KeyClass, LeaveOutcome, NodeConfig,
-    NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey, PullOutcome, RaftNode, Ring,
-    SourceRecord, SourceRow, StatusReport,
+    ADMIT_CURRENCY_WAIT, DEFAULT_AUDIT_RETENTION_SECS, JoinOutcome, JoinedAs, KeyClass,
+    LeaveOutcome, NodeConfig, NodeError, NodeId, NodeIdentity, OwnStatus, OwnedKey, PullOutcome,
+    RaftNode, Ring, SourceRecord, SourceRow, StatusReport,
 };
 // `raft::store` is `pub(crate)` (not re-exported by `raft`'s own `pub use`, unlike
 // `SourceRecord`/`SourceRow`) — reached directly here rather than widening that module's own
