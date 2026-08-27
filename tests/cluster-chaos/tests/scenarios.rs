@@ -2045,7 +2045,11 @@ async fn c16_pull_on_miss_rescues_lagging_follower() {
     );
     assert_eq!(
         body, "rescued-body",
-        "rescued with the wrong stub: {body:?}"
+        "rescued with the wrong stub: {body:?} (header {rescue}). The header is what \
+         separates the readings: `rescued-wait` means the rescue completed and still \
+         served the wrong body — a real defect; `retry-after-timeout` means the 250 ms \
+         lag outran the 500 ms budget — tier noise; `<absent>` means the no-match hook \
+         never fired — wiring"
     );
     assert_eq!(
         rescue, "rescued-wait",
