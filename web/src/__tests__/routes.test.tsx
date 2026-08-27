@@ -985,3 +985,31 @@ describe("a disabled route's zero is explained, not alarming", () => {
     );
   });
 });
+
+/**
+ * #467: the gateway-fallback card once told operators a harness could target an imposter with an
+ * `X-Rift-Port` header. That scheme was designed (chapter 02's addressing table) but never built —
+ * upstream's `gateway.rs` parses only `/__rift/:port/<path>`, and the front door uses that same
+ * form as its no-route fallback. Advertising it made the console the one place in the system still
+ * promising it, so this pins both halves: the unbuilt scheme is gone, and the built one is named.
+ */
+describe("the gateway-fallback card names only addressing that exists", () => {
+  it("does not advertise the X-Rift-Port header, which was designed but never built", async () => {
+    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: HITS } });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    const card = screen.getByText("Gateway fallback").closest(".card");
+    expect(card).not.toBeNull();
+    expect(card?.textContent ?? "").not.toMatch(/X-Rift-Port/i);
+  });
+
+  it("names the path prefix, which is the only addressing the gateway actually parses", async () => {
+    stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: HITS } });
+    renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
+
+    await waitFor(() => expect(screen.getAllByTestId("route-row").length).toBe(2));
+    const card = screen.getByText("Gateway fallback").closest(".card");
+    expect(card?.textContent ?? "").toContain("/__rift/");
+  });
+});
