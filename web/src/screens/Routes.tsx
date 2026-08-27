@@ -655,9 +655,10 @@ function FrontDoorNotes(): ReactNode {
       <Card title="Gateway fallback">
         <p className="muted">Consulted only after every route misses.</p>
         <p>
-          A test harness can name its own target three ways — the imposter&rsquo;s own port, an
-          <code> X-Rift-Port</code> header, or a route. An unmodified system under test can do none
-          of them, which is the whole reason the route table exists.
+          A test harness can name its own target two ways — the imposter&rsquo;s own port, or the
+          gateway prefix <code>/__rift/&lt;port&gt;/…</code>, which is stripped before dispatch so
+          predicates and recordings still see the bare path. An unmodified system under test can do
+          neither, which is the whole reason the route table exists.
         </p>
       </Card>
       <Card title="Why one port is enough">
