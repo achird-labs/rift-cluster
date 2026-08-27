@@ -2387,7 +2387,7 @@ async fn a_leader_kill_duplicates_only_across_the_failover_boundary() {
     for port in 19_200..19_206 {
         written.push(cluster.write_on_leader(port, "before-failover").await);
     }
-    wait_rows(&sink, written.len(), Duration::from_secs(20)).await;
+    wait_for_revisions(&sink, &written, Duration::from_secs(20)).await;
 
     cluster.kill(first_leader).await;
     let new_leader = cluster
@@ -2400,7 +2400,7 @@ async fn a_leader_kill_duplicates_only_across_the_failover_boundary() {
     for port in 19_210..19_216 {
         written.push(cluster.write_on_leader(port, "after-failover").await);
     }
-    let rows = wait_rows(&sink, written.len(), Duration::from_secs(30)).await;
+    let rows = wait_for_revisions(&sink, &written, Duration::from_secs(30)).await;
 
     let distinct: BTreeSet<(u64, String)> = rows.iter().cloned().collect();
     let shipped_revisions: BTreeSet<u64> = distinct.iter().map(|(rev, _)| *rev).collect();
@@ -2409,8 +2409,12 @@ async fn a_leader_kill_duplicates_only_across_the_failover_boundary() {
     for revision in &written {
         assert!(
             shipped_revisions.contains(revision),
-            "revision {revision} was committed but never shipped across the failover; \
-             shipped: {shipped_revisions:?}"
+            "revision {revision} was committed but never shipped across the failover. \
+             missing: {:?}; written: {written:?}; shipped: {shipped_revisions:?}",
+            written
+                .iter()
+                .filter(|r| !shipped_revisions.contains(r))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2645,10 +2649,29 @@ async fn sink_and_checkpoint_survive_a_node_restart() {
     let sink = CountingSink::start(200).await;
     declare_sink(&cluster, &sink.uri()).await;
     let tasks = attach_exporters(&cluster);
+    let mut written = Vec::new();
     for port in 19_400..19_404 {
-        cluster.write_on_leader(port, "snapshotted").await;
+        written.push(cluster.write_on_leader(port, "snapshotted").await);
     }
-    wait_rows(&sink, 4, Duration::from_secs(20)).await;
+    wait_for_revisions(&sink, &written, Duration::from_secs(20)).await;
+
+    // Rows at the sink do **not** mean the checkpoint has advanced: the exporter
+    // ships first and checkpoints second, and the checkpoint is a replicated
+    // `AuditCheckpointPut` — a whole consensus round after the bytes leave. So
+    // wait for it before aborting the exporters, or the abort freezes it at
+    // whatever it happened to be. Measured on this tree before the fix: the
+    // checkpoint read **0** at the moment the old row-count wait returned, on 2 of
+    // 3 local runs, which is exactly the `must have advanced` failure (#495).
+    let last_written = *written.iter().max().expect("the test wrote something");
+    let expected_checkpoint = wait_checkpoint(&cluster, last_written, CONVERGE_DEADLINE).await;
+    assert!(
+        expected_checkpoint >= last_written,
+        "the exporter never checkpointed the rows it shipped within {CONVERGE_DEADLINE:?} — \
+         nothing below can be measured until it has: checkpoint={expected_checkpoint} \
+         last_written={last_written} written={written:?} sink_rows={}",
+        sink.rows().len()
+    );
+
     for task in tasks {
         task.abort();
     }
@@ -2659,15 +2682,6 @@ async fn sink_and_checkpoint_survive_a_node_restart() {
         .audit_sink()
         .expect("read sink")
         .expect("a sink is declared");
-    let expected_checkpoint = cluster
-        .leader()
-        .expect("a leader")
-        .audit_checkpoint()
-        .expect("read checkpoint");
-    assert!(
-        expected_checkpoint > 0,
-        "the checkpoint must have advanced before this test means anything"
-    );
 
     // Restart a follower: it reloads from its own persisted state machine, and
     // catches the rest up from the leader.

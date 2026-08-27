@@ -3904,6 +3904,20 @@ mod tests {
         let all = BTreeSet::from([1, 2, 3]);
         assert_eq!(wait_voters(&n1, &all).await, all, "three voters to start");
 
+        // Hold the auto-voter ceiling at the survivor count for the rest of the
+        // test. `promote_ready_learners` re-promotes every caught-up learner in
+        // the committed membership on a cadence and has no notion of a member
+        // that is *leaving* (#496), so without this the departing n3 is voted
+        // straight back in during the takeover window below — which on a loaded
+        // runner is seconds, and several sweep ticks. Pinned on all three
+        // because the sweep runs on whichever node leads. This is #55's
+        // testability surface used for its stated purpose: bound the sweep so a
+        // membership property can be tested on a three-node cluster.
+        const SURVIVORS: usize = 2;
+        for node in [&n1, &n2, &n3] {
+            node.set_auto_voter_ceiling(SURVIVORS);
+        }
+
         // Half of the departure only: n3 is demoted but still a member.
         network::demote_voter(&n1.raft, 3)
             .await
@@ -3965,6 +3979,20 @@ mod tests {
                 .log_id()
                 .map(|l| l.index)
         };
+        // The demote below is only *redundant* while n3 is still a learner —
+        // and with the ceiling pinned above, that holds. Asserted rather than
+        // assumed: it is the premise the assertion after it rests on, and when
+        // the sweep broke that premise on CI the failure surfaced as the no-op
+        // guard appearing to fail, which sent #495's diagnosis to the wrong
+        // place entirely.
+        let voters_before: BTreeSet<NodeId> = n2.status().voters.into_iter().collect();
+        assert!(
+            !voters_before.contains(&3),
+            "n3 must still be the learner the demote above made it, or the demote below is not \
+             redundant and this test measures nothing: voters={voters_before:?} \
+             (a departing member being re-promoted by the sweep is #496)"
+        );
+
         let before_redundant_demote = membership_index(&n2);
         network::demote_voter(&n2.raft, 3)
             .await
@@ -3973,7 +4001,8 @@ mod tests {
             membership_index(&n2),
             before_redundant_demote,
             "a redundant demote must append no membership entry — without that guard, every \
-             retried departure writes to the log"
+             retried departure writes to the log. voters before={voters_before:?} after={:?}",
+            n2.status().voters
         );
 
         assert_eq!(
