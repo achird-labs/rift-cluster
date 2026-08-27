@@ -125,6 +125,20 @@ first group, and `scripts/check-observability-families.sh` enforces that.
 `rift_cluster_source_scheduler_read_failures_total` /
 `rift_cluster_source_scheduler_corrupt_rows`.
 
+*Registered by #470, alert threshold still to be chosen:*
+`rift_cluster_isolated` (gauge, `1` while this node cannot see the quorum and is
+refusing owner-side operations — proxyOnce claims under D-40, flow-KV owner
+writes and strong reads under D-17). This is the *condition*, not a symptom, and
+it is deliberately the thing to alert on: the symptom counters are incomplete by
+design (`rift_cluster_cas_conflicts_total{reason="isolated"}` counts write
+refusals only, so a read-heavy workload can trip the rule continuously and move
+nothing). `isolated == 1 for 2m` is the obvious rule — longer than an election,
+short enough to catch a real partition — but a threshold shipped without being
+tried against a real fleet's election noise is a page nobody trusts, so the
+choice is left explicit rather than guessed. Note the gauge publishes `0` on a
+healthy node rather than being absent, so such a rule is falsifiable from the
+first scrape.
+
 *Registered by #439, alert threshold still to be chosen:*
 `rift_cluster_blob_fetch_stalled` (gauge, `1` while this node's apply is parked
 on a blob no member can supply — the metric form of `blob_fetch_stall` above;
