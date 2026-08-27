@@ -62,9 +62,22 @@ What is observable differs by operation, and it is worth stating exactly:
 a refused **write** increments `rift_cluster_cas_conflicts_total{reason="isolated"}`;
 a refused **forwarded** read surfaces on the serving node as
 `rift_cluster_rpc_failures_total{reason="unavailable"}`; a refused **local**
-owner-read emits no metric at all today. The condition itself is on the
-`isolated` field of `/_cluster/health` (and `/_fleet/health`), which is the
-signal to watch — exposing it as a gauge is #470.
+owner-read emits no metric at all today. That asymmetry is the reason to watch
+the *condition* rather than its symptoms: a read-heavy workload can trip the
+isolated-owner rule continuously and move none of the counters above.
+
+The condition is `rift_cluster_isolated` — a gauge, `1` while this node cannot
+see the quorum, `0` otherwise (#470) — and the `isolated` field of
+`/_cluster/health` (and `/_fleet/health`). Both are the same sample of the same
+rule: `StatusReport::isolated` and `RaftNode::is_isolated` both evaluate
+`isolated_from`, so the gauge an alert fires on and the field a human reads
+cannot drift apart. Prefer the gauge: a JSON field is not scrapable by an alert
+rule, which is what left this condition alertable only through its symptoms
+until #470.
+
+Widening `rift_cluster_cas_conflicts_total{reason="isolated"}` to cover reads
+was rejected: it is documented as owner-side **write** refusals, and changing
+what an existing family counts would silently redefine a shipped runbook signal.
 
 | Operation | Authority | Unreachable ⇒ default | Rationale |
 |---|---|---|---|

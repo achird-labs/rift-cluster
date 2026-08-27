@@ -86,6 +86,38 @@ const ELECTION_TIMEOUT_MAX_MS: u64 = 300;
 /// isolated (the isolated-owner rule, RFC-001 §7.2): 3× the election timeout.
 const ISOLATION_WINDOW_MS: u64 = 3 * ELECTION_TIMEOUT_MAX_MS;
 
+/// The isolated-owner rule itself (RFC-001 §7.2), as a pure function of the three Raft metrics it
+/// reads — so the safety gate and the metric that reports it cannot disagree.
+///
+/// It **fails closed**: every uncertain state is isolated.
+///
+/// - **No known leader** → isolated. A follower partitioned away loses its leader once the
+///   election timeout elapses.
+/// - **This node is the leader, with no quorum ack inside the window** → isolated. openraft reports
+///   `millis_since_quorum_ack == None` for a leader no quorum has acknowledged (a just-elected
+///   leader before its first `AppendEntries` round, or one partitioned from its followers), and
+///   `None` must read as isolated rather than healthy — that `is_none_or` is the fail-closed half.
+/// - **Someone else leads** → not isolated. Hearing another node's leadership *is* the evidence of
+///   contact with the quorum.
+///
+/// Extracted from [`RaftNode::is_isolated`] by #470: the condition became observable
+/// (`rift_cluster_isolated`) at the same time it was already load-bearing for D-17 and D-40, and
+/// two readings of one safety rule is one more than a rule can safely have.
+#[must_use]
+fn isolated_from(
+    me: NodeId,
+    current_leader: Option<NodeId>,
+    millis_since_quorum_ack: Option<u64>,
+) -> bool {
+    match current_leader {
+        None => true,
+        Some(leader) if leader == me => {
+            millis_since_quorum_ack.is_none_or(|ms| ms > ISOLATION_WINDOW_MS)
+        }
+        Some(_) => false,
+    }
+}
+
 /// Grace window #437's blob store GC gives an unreferenced blob before reclaiming it —
 /// long enough that a #438 fan-out has time to land the spec/dataset row that will
 /// reference a freshly delivered blob before it looks abandoned.
@@ -249,6 +281,15 @@ pub struct StatusReport {
     /// indefinitely, still binding listeners and still taking traffic. Anything proving a negative
     /// about "the fleet" has to know they exist.
     pub learners: Vec<NodeId>,
+    /// Whether this node was isolated from the quorum at the instant this report was taken —
+    /// the isolated-owner rule (RFC-001 §7.2), the same condition [`RaftNode::is_isolated`]
+    /// enforces, via the same [`isolated_from`].
+    ///
+    /// Carried on the report rather than left to a second `is_isolated()` call so that the gauge
+    /// (`rift_cluster_isolated`, #470) and the `/_cluster/status` field describe *one* sample. Two
+    /// calls a few microseconds apart can straddle an election and disagree, which on a
+    /// safety-critical condition is the one thing an operator must not be shown.
+    pub isolated: bool,
 }
 
 /// What a [`RaftNode::leave`] actually did.
@@ -2289,6 +2330,12 @@ impl RaftNode {
                     .filter(|id| !voters.contains(id))
                     .collect()
             },
+            // Same borrow, same instant, same rule as `is_isolated`.
+            isolated: isolated_from(
+                self.id,
+                metrics.current_leader,
+                metrics.millis_since_quorum_ack,
+            ),
         }
     }
 
@@ -2325,24 +2372,19 @@ impl RaftNode {
     /// owner-side stateful operations (the isolated-owner rule, RFC-001 §7.2).
     ///
     /// This is a safety gate, so it **fails closed** — every uncertain state
-    /// reports isolated. A node is isolated when it knows no current leader (a
-    /// follower partitioned away loses its leader once the election timeout
-    /// elapses), or when it *is* the leader but does not currently hold a quorum
-    /// lease: openraft reports `millis_since_quorum_ack == None` for a leader that
-    /// no quorum has acknowledged (a just-elected leader before its first
-    /// `AppendEntries` round, or one partitioned from its followers), so that case
-    /// is treated as isolated too, not healthy.
+    /// reports isolated. See [`isolated_from`] for the rule itself; this is the
+    /// live-metrics reading of it, and [`StatusReport::isolated`] is the sampled
+    /// one. Both go through that one function so the condition an operator
+    /// alerts on and the condition the write path enforces cannot drift apart.
     #[must_use]
     pub fn is_isolated(&self) -> bool {
         let receiver = self.raft.metrics();
         let metrics = receiver.borrow();
-        match metrics.current_leader {
-            None => true,
-            Some(leader) if leader == self.id => metrics
-                .millis_since_quorum_ack
-                .is_none_or(|ms| ms > ISOLATION_WINDOW_MS),
-            Some(_) => false,
-        }
+        isolated_from(
+            self.id,
+            metrics.current_leader,
+            metrics.millis_since_quorum_ack,
+        )
     }
 
     /// Stop the Raft runtime, release the cluster port, and wait for storage to
@@ -4244,5 +4286,61 @@ mod tests {
             ours.max_in_snapshot_log_to_keep, 0,
             "a snapshot policy without immediate purge never forces install_snapshot"
         );
+    }
+
+    // ---- the isolated-owner rule (#470) ------------------------------------------------
+    //
+    // `is_isolated` reads a live metrics watch, so before #470 the rule could only be
+    // exercised by standing a cluster up and partitioning it — which is why the arm that
+    // matters most (a leader with *no* quorum ack yet) had no direct test at all. The rule is
+    // now a pure function of its three inputs, so every arm is reachable, and the gauge
+    // `rift_cluster_isolated` reports the same function these pin.
+
+    const ME: NodeId = 1;
+    const OTHER: NodeId = 2;
+
+    /// Fails closed: no known leader is isolated. A follower partitioned away loses its
+    /// leader once the election timeout elapses, and that is exactly when it must stop
+    /// acting as an owner.
+    #[test]
+    fn a_node_that_knows_no_leader_is_isolated() {
+        assert!(isolated_from(ME, None, None));
+        // Even a fresh quorum ack cannot rescue it: with no leader there is no quorum to
+        // have acknowledged anything, so the ack is stale by construction.
+        assert!(isolated_from(ME, None, Some(0)));
+    }
+
+    /// The fail-closed half of the rule, and the one most easily broken by "simplifying"
+    /// `is_none_or` to `is_some_and`. openraft reports `None` for a leader no quorum has
+    /// acknowledged — a just-elected leader before its first `AppendEntries` round, or one
+    /// partitioned from its followers. Reading that as healthy would let a leader that has
+    /// never been acknowledged accept owner-side writes.
+    #[test]
+    fn a_leader_with_no_quorum_ack_yet_is_isolated_not_healthy() {
+        assert!(isolated_from(ME, Some(ME), None));
+    }
+
+    /// A leader a quorum acknowledged inside the window holds its lease and is not isolated.
+    #[test]
+    fn a_leader_acknowledged_inside_the_window_is_not_isolated() {
+        assert!(!isolated_from(ME, Some(ME), Some(0)));
+        assert!(!isolated_from(ME, Some(ME), Some(ISOLATION_WINDOW_MS - 1)));
+    }
+
+    /// The boundary is exclusive: the window itself still counts as held. Pinned because an
+    /// off-by-one here silently widens or narrows a safety gate.
+    #[test]
+    fn the_isolation_window_boundary_is_exclusive() {
+        assert!(!isolated_from(ME, Some(ME), Some(ISOLATION_WINDOW_MS)));
+        assert!(isolated_from(ME, Some(ME), Some(ISOLATION_WINDOW_MS + 1)));
+    }
+
+    /// Hearing another node's leadership *is* evidence of contact with the quorum, so this
+    /// node is not isolated — and its own quorum-ack figure is irrelevant, because that
+    /// number describes a leadership it does not hold.
+    #[test]
+    fn a_follower_that_can_see_a_leader_is_not_isolated() {
+        assert!(!isolated_from(ME, Some(OTHER), None));
+        assert!(!isolated_from(ME, Some(OTHER), Some(u64::MAX)));
     }
 }

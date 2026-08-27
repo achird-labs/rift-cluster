@@ -40,6 +40,26 @@ lazy_static! {
     )
     .expect("rift_cluster_members registers once");
 
+    /// `rift_cluster_isolated` — 1 when this node cannot see the quorum (#470).
+    ///
+    /// The isolated-owner rule (RFC-001 §7.2) is a safety gate: an isolated node
+    /// refuses proxyOnce claims (D-40) and flow-KV owner writes and strong reads
+    /// (D-17). Until this gauge existed the condition was observable only as the
+    /// `isolated` field of `/_cluster/status`, which an alert rule cannot scrape,
+    /// so an operator could alert on the *symptoms* and never on the cause.
+    ///
+    /// Alerting on the condition is also what keeps
+    /// `rift_cluster_cas_conflicts_total{reason="isolated"}` honest: that counter
+    /// is documented as owner-side **write** refusals, and read-side refusals are
+    /// deliberately not counted there. Widening it would have silently changed an
+    /// existing runbook signal, and a read-heavy workload tripping the rule
+    /// repeatedly would still have been invisible.
+    static ref ISOLATED: Gauge = register_gauge!(
+        "rift_cluster_isolated",
+        "1 when this node cannot see the cluster quorum and refuses owner-side operations"
+    )
+    .expect("rift_cluster_isolated registers once");
+
     /// `rift_cluster_ring_epoch` — the membership log index the ownership ring
     /// was derived from. Two nodes reporting different epochs have not converged.
     static ref RING_EPOCH: Gauge = register_gauge!(
@@ -834,6 +854,8 @@ pub fn observe_node(status: &StatusReport, ring: &Ring) {
     MEMBERS
         .with_label_values(&["leader"])
         .set(f64::from(u8::from(status.is_leader)));
+    // Read off the same report as the gauges above, so one scrape cannot mix two samples (#470).
+    ISOLATED.set(f64::from(u8::from(status.isolated)));
     RING_EPOCH.set(ring.m_idx() as f64);
 }
 
@@ -1072,6 +1094,7 @@ mod tests {
             last_applied: Some(42),
             voters: vec![7, 8, 9],
             learners: Vec::new(),
+            isolated: false,
         };
         observe_node(&status, &Ring::new([7, 8, 9], 31));
 
@@ -1087,6 +1110,46 @@ mod tests {
             gauge_from_registry("rift_cluster_ring_epoch", None),
             Some(31.0)
         );
+        assert_eq!(
+            gauge_from_registry("rift_cluster_isolated", None),
+            Some(0.0)
+        );
+    }
+
+    /// #470: the whole point of the gauge is that an alert rule can scrape the *condition*,
+    /// so it must reach the registry the metrics server serves — and it must publish `0`
+    /// when healthy rather than being absent, or `rift_cluster_isolated == 1` is a rule that
+    /// silently never fires on a node that has simply never been isolated.
+    #[test]
+    fn an_isolated_node_publishes_the_gauge_the_alert_rule_scrapes() {
+        let _guard = counter_guard();
+        let status = StatusReport {
+            node_id: 7,
+            is_leader: false,
+            current_leader: None,
+            last_applied: Some(42),
+            voters: vec![7, 8, 9],
+            learners: Vec::new(),
+            isolated: true,
+        };
+        observe_node(&status, &Ring::new([7, 8, 9], 31));
+        assert_eq!(
+            gauge_from_registry("rift_cluster_isolated", None),
+            Some(1.0)
+        );
+
+        // And it clears: a gauge that only ever rises would keep an operator paged after the
+        // partition healed.
+        let healthy = StatusReport {
+            isolated: false,
+            current_leader: Some(7),
+            ..status
+        };
+        observe_node(&healthy, &Ring::new([7, 8, 9], 31));
+        assert_eq!(
+            gauge_from_registry("rift_cluster_isolated", None),
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -1099,6 +1162,7 @@ mod tests {
             last_applied: Some(42),
             voters: vec![7, 8],
             learners: Vec::new(),
+            isolated: false,
         };
         observe_node(&status, &Ring::new([7, 8], 12));
         // Summing this label across a fleet is how an operator asks "is there
