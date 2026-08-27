@@ -214,6 +214,22 @@ pub mod seams {
     /// same check the core admin applies before storing.
     pub use rift_http_proxy::injection_gate::config_uses_script_surface;
 
+    /// TCP-fault carrier classification (upstream #965): whether a response is
+    /// the placeholder a fault stub produces — the one the engine's own serve
+    /// loop throws away in favour of aborting the socket, so a client over TCP
+    /// never sees it. An embedder answering in-process (the `try` endpoint,
+    /// #344) *does* receive it, and needs this to say "the connection would
+    /// have been aborted" instead of presenting the carrier's `502` as the
+    /// imposter's answer.
+    ///
+    /// Authoritative because it reads the `TcpFaultKind` response extension —
+    /// the same signal `FaultIo` acts on — rather than the `x-rift-fault`
+    /// header, which is neither necessary (a v2 script's `reset()` carrier set
+    /// no header before #984) nor sufficient (`_rift.fault.error` stamps one on
+    /// a response the client genuinely receives). The extension is only
+    /// readable while the response is still in memory; see `perform_try`.
+    pub use rift_mock_core::{TcpFaultKind, tcp_fault_carrier};
+
     /// Backend-outage reporting and response decoration: how a backend surfaces
     /// as a structured 503, and how per-request annotations become response
     /// headers without the core handlers knowing what they mean.

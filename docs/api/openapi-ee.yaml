@@ -1913,14 +1913,14 @@ paths:
         * **Redirects are never followed.** A `3xx` is returned like any
           other answer, `Location` header and all.
 
-        * A stub that injects a connection-level fault (`fault:
-          CONNECTION_RESET_BY_PEER` and its kin, `_rift.fault.tcp`) has no
-          response on the wire; the try reports that as a `502` naming the
-          fault rather than presenting a fabricated answer. One shape is not
-          yet recognised: a v2 script's `reset()` carries no fault marker the
-          front can see, so it renders as the engine's carrier — `status:
-          502`, empty body, an `x-rift-script` header — until upstream
-          exposes that classification (achird-labs/rift#965).
+        * A stub that injects a connection-level fault has no response on the
+          wire; the try reports that as a `502` naming the fault rather than
+          presenting a fabricated answer. **All three** ways to inject one are
+          recognised — `_rift.fault.tcp`, a top-level `fault:
+          CONNECTION_RESET_BY_PEER` and its kin, and a v2 script's `reset()` —
+          because the front classifies on the engine's own fault marker rather
+          than on a response header (achird-labs/rift#965). The fault is named
+          canonically for its kind, whichever alias the stub spelled it with.
 
 
         Requires `imposter.try` (Operator and up). A try is not read-only in
@@ -1988,9 +1988,16 @@ paths:
             does not by itself mean this node bound the port — the try answers
             only from an imposter this node actually serves), the imposter left
             this node mid-exchange, or its stub injected a connection-level
-            fault (`x-rift-fault`), which on the wire is an aborted connection
-            with no response. Distinct from a `200` carrying the imposter's own
-            `502`: this one means there is no answer to show.
+            fault, which on the wire is an aborted connection with no response.
+            Distinct from a `200` carrying the imposter's own `502`: this one
+            means there is no answer to show.
+
+            A connection fault is named by the engine's canonical name for the
+            kind — `CONNECTION_RESET_BY_PEER`, `EMPTY_RESPONSE`,
+            `RANDOM_DATA_THEN_CLOSE`, `MALFORMED_RESPONSE_CHUNK` — regardless of
+            which alias the stub spelled it with, and covers every way a stub can
+            inject one (`_rift.fault.tcp`, a top-level `fault`, a v2 script's
+            `reset()`). The name appears in the error message, not as a field.
           content:
             application/json:
               schema:

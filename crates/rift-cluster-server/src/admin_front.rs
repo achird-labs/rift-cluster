@@ -90,7 +90,8 @@ use rift_cluster::{
 use rift_cluster_base::seams::{
     ErrorKind, ImposterConfig, RecordedRequest, RiftScriptConfig, RouteTable, SCOPE_HEADER,
     ScriptBaseDir, Stub, classify as classify_upstream, config_uses_script_surface,
-    error_response_typed, resolve_scripts, resolve_stub_scripts, validate_stub, validate_stubs,
+    error_response_typed, resolve_scripts, resolve_stub_scripts, tcp_fault_carrier, validate_stub,
+    validate_stubs,
 };
 // The compiler crate (RFC-004 S2, issue #278): the front compiles specs on the accepting node
 // (PUT, deploy, edit-time warnings). `serde_json::Value` stays fully-qualified below, matching
@@ -5191,40 +5192,6 @@ enum TryFailure {
     Fault(String),
 }
 
-/// The TCP-fault names/aliases the engine's carrier response names via its `x-rift-fault` header,
-/// when a stub's `_rift.fault.tcp` would have aborted the connection instead of sending a real
-/// response (issue #344).
-///
-/// Mirrors `rift_mock_core::imposter::fault_io::TcpFaultKind::parse` — which is `pub(crate)`
-/// upstream, so this header is the only observable of that classification available outside the
-/// crate, and the alias list is duplicated here rather than imported. A name this list has not
-/// caught up with (a future upstream alias) degrades gracefully rather than breaking: the carrier
-/// response then renders as the imposter's own answer, which is still truthful — that response
-/// really did come back from the engine — just less explicit than naming the fault.
-///
-/// Two known edges of this header-based detection, stated rather than hidden. **A v2 script's
-/// `reset()`** (upstream #357) builds its carrier without the `x-rift-fault` header — only the
-/// `TcpFaultKind` extension, which is not visible from here — so that one shape renders as the
-/// carrier itself: `status: 502`, empty body, `x-rift-script` header. The fix is upstream —
-/// achird-labs/rift#965: either stamp the header on that third carrier, or make the
-/// classification a seam so `RaftNode::dispatch_to_imposter` can turn the extension into the
-/// header itself *before* the response crosses the in-memory connection (extensions do not
-/// survive serialization; only there is it still attached). Until it lands the OpenAPI names the
-/// gap. And the reverse: a stub is free to
-/// set `x-rift-fault: reset` on an ordinary response the wire would send — self-inflicted, and
-/// reported here as the fault it claims to be.
-const TCP_FAULT_NAMES: &[&str] = &[
-    "reset",
-    "CONNECTION_RESET_BY_PEER",
-    "empty",
-    "EMPTY_RESPONSE",
-    "garbage",
-    "random",
-    "RANDOM_DATA_THEN_CLOSE",
-    "malformed",
-    "MALFORMED_RESPONSE_CHUNK",
-];
-
 /// The in-process try server's service error: "this exchange produced no response" — the
 /// dispatch was already taken, or the imposter left this node ([`perform_try`]'s `gone` path).
 ///
@@ -5382,6 +5349,16 @@ where
     let dispatch = Arc::new(Mutex::new(Some(dispatch)));
     let gone = Arc::new(AtomicBool::new(false));
 
+    // Set inside the service below, and for the same reason `gone` is: it is a fact about the
+    // dispatch that is only knowable *there*. `tcp_fault_carrier` reads the `TcpFaultKind`
+    // response extension — the authoritative signal, the one the engine's own `FaultIo` acts on —
+    // and an extension is process memory, not bytes. The exchange under this function is a real
+    // HTTP/1.1 round trip over `tokio::io::duplex`: the service's response is serialized by
+    // `serve_connection` and re-parsed by the client, which builds a *fresh* response whose
+    // extension map is empty. So the classification cannot be moved out to where the response is
+    // read — it has to happen while the dispatch's own response is still in hand.
+    let fault: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
+
     // The server half is spawned, and its handle is **kept**: the budget below cancels only the
     // future it wraps, and the dispatch — the imposter's own handler, `wait` behaviour and all —
     // runs inside this task. Left detached, a stub slower than the budget would outlive the
@@ -5391,17 +5368,28 @@ where
     let server = {
         let dispatch = Arc::clone(&dispatch);
         let gone = Arc::clone(&gone);
+        let fault = Arc::clone(&fault);
         AbortOnDrop::new(tokio::spawn(async move {
             let service = service_fn(move |req: Request<Incoming>| {
                 let dispatch = Arc::clone(&dispatch);
                 let gone = Arc::clone(&gone);
+                let fault = Arc::clone(&fault);
                 async move {
                     let taken = dispatch.lock().expect("dispatch lock poisoned").take();
                     let Some(dispatch) = taken else {
                         return Err(TryExchangeEnded);
                     };
                     match dispatch(req).await {
-                        Some(response) => Ok(response),
+                        Some(response) => {
+                            // Classify here, where the extension still exists. The carrier is
+                            // still handed to hyper afterwards: the client half needs *a*
+                            // response to complete the exchange, and the caller below discards
+                            // it in favour of the fault.
+                            if let Some(name) = tcp_fault_carrier(&response) {
+                                *fault.lock().expect("fault lock poisoned") = Some(name);
+                            }
+                            Ok(response)
+                        }
                         // The imposter left this node between the ownership gate and this
                         // exchange. Answering with an invented status would be worse than no
                         // answer at all, so the connection is dropped instead — hyper reports
@@ -5459,14 +5447,13 @@ where
         };
 
         // The fault carrier is checked before anything else about the response: a fault is not an
-        // answer, whatever its (fabricated) status or body say.
-        if let Some(fault) = response
-            .headers()
-            .get("x-rift-fault")
-            .and_then(|value| value.to_str().ok())
-            .filter(|name| TCP_FAULT_NAMES.contains(name))
-        {
-            return Err(TryFailure::Fault(fault.to_owned()));
+        // answer, whatever its (fabricated) status or body say. The verdict was reached in the
+        // service above; by the time `send_request` has resolved, the service has necessarily run
+        // (the response head cannot exist before the future that produced it), so the cell is
+        // settled. The name is the engine's canonical one for the kind — `CONNECTION_RESET_BY_PEER`
+        // rather than whichever alias the config author typed.
+        if let Some(name) = *fault.lock().expect("fault lock poisoned") {
+            return Err(TryFailure::Fault(name.to_owned()));
         }
 
         let status = response.status().as_u16();
@@ -10345,6 +10332,10 @@ mod tests {
         use std::pin::Pin;
         use std::sync::Mutex;
 
+        // Only the tests name the kinds; production code asks `tcp_fault_carrier` for the name
+        // and never branches on the variant, so this import stays out of the module header.
+        use rift_cluster_base::seams::TcpFaultKind;
+
         /// The record a canned service keeps of the one request it served.
         #[derive(Debug, Clone)]
         struct Arrived {
@@ -10931,30 +10922,45 @@ mod tests {
             }
         }
 
+        /// Attach the `TcpFaultKind` extension the engine stamps on a carrier response. This is
+        /// what `handle_imposter_request` does at all three carrier sites (`_rift.fault.tcp`, a
+        /// top-level `fault`, and a v2 script's `reset()`), and it is the signal
+        /// `tcp_fault_carrier` reads.
+        fn carrier(kind: TcpFaultKind, headers: &[(&str, &[u8])]) -> Response<Full<Bytes>> {
+            let mut response = answer(502, headers, "");
+            response.extensions_mut().insert(kind);
+            response
+        }
+
         /// A stub that injects a connection-level fault answers, in-process, with the engine's
         /// carrier response — a `502` that on the wire is never sent, because the serve loop
         /// aborts the socket instead. Presenting that carrier as "the imposter said 502" would
         /// be a fabricated answer; the try says what the wire would have done. And the `error`
         /// fault — a real `5xx` the wire does send — stays a successful try, so the two must not
-        /// be conflated by the header alone.
+        /// be conflated.
+        ///
+        /// The name reported is the engine's *canonical* one for the kind, not whichever alias
+        /// the config author typed: one kind, one name, whether the stub said `garbage` or
+        /// `RANDOM_DATA_THEN_CLOSE`.
         #[tokio::test]
         async fn a_connection_fault_carrier_is_an_explicit_transport_outcome() {
-            for name in [
-                "CONNECTION_RESET_BY_PEER",
-                "reset",
-                "EMPTY_RESPONSE",
-                "RANDOM_DATA_THEN_CLOSE",
-                "malformed",
+            for (kind, canonical) in [
+                (TcpFaultKind::Reset, "CONNECTION_RESET_BY_PEER"),
+                (TcpFaultKind::Empty, "EMPTY_RESPONSE"),
+                (TcpFaultKind::RandomData, "RANDOM_DATA_THEN_CLOSE"),
+                (TcpFaultKind::MalformedChunk, "MALFORMED_RESPONSE_CHUNK"),
             ] {
-                let (dispatch, _seen) =
-                    canned(answer(502, &[("x-rift-fault", name.as_bytes())], ""));
+                let (dispatch, _seen) = canned(carrier(kind, &[]));
                 let failure = perform_try(dispatch, PORT, &spec("GET", "/reset"), BUDGET, CAP)
                     .await
                     .expect_err("a connection fault is not an answer");
                 let TryFailure::Fault(reported) = &failure else {
-                    panic!("{name}: expected an explicit fault outcome, got {failure:?}");
+                    panic!("{canonical}: expected an explicit fault outcome, got {failure:?}");
                 };
-                assert_eq!(reported, name, "the fault is named as the stub spelled it");
+                assert_eq!(
+                    reported, canonical,
+                    "the fault is named canonically, not by the stub's alias"
+                );
             }
 
             let (dispatch, _seen) = canned(answer(500, &[("x-rift-fault", b"error")], "injected"));
@@ -10963,6 +10969,65 @@ mod tests {
                 .expect("an `error` fault is a real response the wire sends");
             assert_eq!(outcome.status, 500);
             assert_eq!(outcome.body, "injected");
+        }
+
+        /// The extension is the whole signal, and the `x-rift-fault` header is not consulted at
+        /// all. Both halves matter, and each was a real defect under the header-based check this
+        /// replaced (upstream #965 / #984):
+        ///
+        /// - **Extension, no header.** A v2 script's `reset()` built its carrier without the
+        ///   header, so the old check missed it and rendered the carrier's fabricated `502` as
+        ///   though the imposter had answered it. Now it is the fault it is.
+        /// - **Header, no extension.** A stub is free to set `x-rift-fault: reset` on an ordinary
+        ///   response the wire really does send. The old check reported that as an aborted
+        ///   connection; it is a response, and the try must show it.
+        #[tokio::test]
+        async fn the_extension_classifies_the_carrier_and_the_header_does_not() {
+            let (dispatch, _seen) = canned(carrier(TcpFaultKind::Reset, &[]));
+            let failure = perform_try(dispatch, PORT, &spec("GET", "/script-reset"), BUDGET, CAP)
+                .await
+                .expect_err("a carrier with no header is still a fault");
+            assert!(
+                matches!(&failure, TryFailure::Fault(name) if name == "CONNECTION_RESET_BY_PEER"),
+                "expected a fault named for the extension, got {failure:?}"
+            );
+
+            let (dispatch, _seen) = canned(answer(
+                200,
+                &[("x-rift-fault", b"reset")],
+                "a real body the wire sends",
+            ));
+            let outcome = perform_try(dispatch, PORT, &spec("GET", "/self-inflicted"), BUDGET, CAP)
+                .await
+                .expect("a header a stub set on a real response does not make it a fault");
+            assert_eq!(outcome.status, 200);
+            assert_eq!(outcome.body, "a real body the wire sends");
+        }
+
+        /// Why the classification lives inside the service rather than next to the response the
+        /// exchange returns — the trap a later simplification would fall into.
+        ///
+        /// `perform_try` runs a genuine HTTP/1.1 round trip over `tokio::io::duplex`: the
+        /// dispatch's response is serialized by `serve_connection` and re-parsed by the client
+        /// half, which builds a fresh response. `http::Extensions` is process memory and does not
+        /// cross a byte stream, so the extension is gone by then — reading it there would
+        /// silently classify *every* carrier as an ordinary answer. This pins that the carrier is
+        /// still caught even though the response the caller would see no longer carries the mark.
+        #[tokio::test]
+        async fn the_carrier_is_classified_before_the_exchange_erases_the_extension() {
+            // The same carrier, but with a body and status that would be plainly visible if the
+            // classification had been missed and the carrier rendered as an answer.
+            let mut response = answer(502, &[], "carrier body that must never be shown");
+            response.extensions_mut().insert(TcpFaultKind::Empty);
+            let (dispatch, _seen) = canned(response);
+
+            let failure = perform_try(dispatch, PORT, &spec("GET", "/empty"), BUDGET, CAP)
+                .await
+                .expect_err("the carrier must not survive as an answer");
+            assert!(
+                matches!(&failure, TryFailure::Fault(name) if name == "EMPTY_RESPONSE"),
+                "expected EMPTY_RESPONSE, got {failure:?}"
+            );
         }
 
         /// A caller cannot smuggle in addressing of its own. The envelope is closed, so a `host`,
