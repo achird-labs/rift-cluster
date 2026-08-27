@@ -3847,20 +3847,35 @@ async fn the_pin_a_fan_out_returns_protects_the_blob_until_it_is_dropped() {
         .as_secs()
         + 10_000_000;
 
-    let removed = leader
+    let outcome = leader
         .blobs()
-        .gc(&unreferenced, far_future, 3600)
+        .gc(
+            &unreferenced,
+            &std::collections::HashMap::new(),
+            0,
+            far_future,
+            3600,
+        )
         .expect("gc");
-    assert_eq!(removed, 0, "the returned pin must still be protecting it");
+    assert_eq!(
+        outcome.removed, 0,
+        "the returned pin must still be protecting it"
+    );
     assert!(leader.blobs().stat(&digest).expect("stat").have);
 
     drop(pin);
-    let removed = leader
+    let outcome = leader
         .blobs()
-        .gc(&unreferenced, far_future, 3600)
+        .gc(
+            &unreferenced,
+            &std::collections::HashMap::new(),
+            0,
+            far_future,
+            3600,
+        )
         .expect("gc");
     assert_eq!(
-        removed, 1,
+        outcome.removed, 1,
         "released, it is collectable like any other blob"
     );
 
@@ -4998,6 +5013,92 @@ async fn a_blob_only_applied_state_holds_is_served_to_a_member_that_must_fetch_i
             std::fs::read(spool_file(member.dir.path(), csv)).expect("spool file"),
             csv.as_bytes(),
             "the spool file is materialised from the bytes applied state served"
+        );
+    }
+    cluster.shutdown_all().await;
+}
+
+/// Pins D-52 (#480): blob GC retains an unreferenced digest until this node's log is purged past
+/// the index that unreferenced it. End to end: a blob whose last reference is deleted while a voter is
+/// down stays on the holders' stores until the log is purged past the index that unreferenced it,
+/// so the returning voter can still fetch it and apply the entry that references it.
+///
+/// This is the failure #480 describes: the delete makes the digest unreferenced fleet-wide, the
+/// 60 s GC tick would reap it on every member (the grace is measured from the blob's *mtime*, not
+/// from when it became unreferenced), and the returning replica then replays the original
+/// digest-only `PUT` and finds no holder anywhere. It cannot be rescued by compaction either —
+/// openraft's state-machine worker runs `apply` and `install_snapshot` on one sequential loop, so
+/// the snapshot that would skip the blob queues behind the parked apply and never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_deleted_while_a_voter_lags_is_retained_until_the_log_is_purged_past_it() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let leader_id = cluster.leader().expect("leader").id();
+    let absent = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader_id)
+        .expect("a follower");
+    cluster.kill(absent).await;
+
+    let csv = "id,name\n1,ada\n2,bob\n";
+    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, absent, csv).await;
+
+    // The delete unreferences the digest on every live member.
+    cluster
+        .leader()
+        .expect("two of three still lead")
+        .submit(dataset_delete("customers"))
+        .await
+        .expect("commits");
+    for node in cluster.live() {
+        assert!(
+            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
+            "live node {} applies the delete",
+            node.id()
+        );
+    }
+
+    // Sweep as the 60 s tick would, but **at a `now` past the mtime grace**. Sweeping at the real
+    // clock would prove nothing: the blob was written seconds ago, so `BLOB_GC_GRACE_SECS` alone
+    // keeps it whether or not retention works, and the test would pass against an implementation
+    // that had no tombstone rule at all. Past the grace, the tombstone is the only thing left that
+    // can keep it — its index is far above these nodes' purge point, so it must.
+    let past_the_grace = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs()
+        + 10_000;
+    for node in cluster.live() {
+        node.run_blob_gc_now(past_the_grace).expect("sweep");
+        assert!(
+            node.blobs().stat(&digest).expect("stat").have,
+            "node {} must retain a blob its log has not been purged past",
+            node.id()
+        );
+    }
+
+    // So the returning voter still finds a holder and applies the entry it was missing.
+    cluster.restart(absent).await;
+    {
+        let node = cluster.member(absent).node.as_ref().expect("restarted");
+        assert!(
+            wait_for_blob(node, &digest, Duration::from_secs(60)).await,
+            "the returning voter fetches the retained blob"
+        );
+        assert_eq!(
+            node.blob_fetch_stall(),
+            None,
+            "retention means it never had to stall"
+        );
+        assert!(
+            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
+            "and it applies the delete behind the entry it was parked on"
         );
     }
     cluster.shutdown_all().await;

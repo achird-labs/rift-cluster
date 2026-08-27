@@ -761,6 +761,17 @@ The retry loop is entered from the **replay path too**: `compose::drain_parked_i
 parked blob write through the same fan-out-then-strip as a fresh one (D-49), so a replay never
 puts the payload back on the log.
 
+**Amended by D-52 (2026-08-27): a parked apply cannot be rescued by compaction.** openraft's
+state-machine worker is a single sequential loop over one command channel
+(`openraft-0.9.25/src/core/sm/worker.rs`): `CommandPayload::Apply` is awaited **inline**, and
+`CommandPayload::InstallFullSnapshot` is a sibling arm of the same `match` — nothing is spawned
+(unlike `BuildSnapshot`, which is). Since `apply` awaits `resolve_blobs`, which awaits a fetch that
+retries forever under this entry, a parked apply blocks the worker: **any snapshot install queued
+behind it never runs.** So a park ends only when a holder returns — never by the node being handed
+a snapshot that would skip the blob. This is why D-52's rule B (holders keep a blob that is being
+actively requested) is not a redundancy but the sole recovery path for a replica that has already
+parked, and why "wait for compaction" was never a real remedy.
+
 ### D-49 — Payload fields stay optional on the wire; the bytes leave the op at submit, after the quorum
 - **Status:** active
 - **Decided:** 2026-08-25 · #439
@@ -900,3 +911,97 @@ state either, by design. A
 replica parked on a `PUT` whose `DELETE` sits behind it in the log therefore still parks — that is
 **#480**, and it is what `a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns`
 now has to construct deliberately in order to pin D-48 at all.
+
+### D-52 — Blob GC retains an unreferenced digest until this node's log is purged past it, and never while a peer is asking for it
+- **Status:** active
+- **Decided:** 2026-08-27 · #480 (#432 follow-up)
+- **Refines:** D-18, D-48, D-50
+- **Implemented by:** #480
+- **Code:** crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/raft/node.rs
+
+Two local rules. No new gossip, no leader-driven GC, no fleet-minimum index to disseminate.
+
+**A — tombstone plus this node's own purge point.** When apply drops a digest's last reference it
+writes `sm_blob_tombstones[digest] = <the log index of the entry that unreferenced it>` in the same
+write transaction; re-referencing the digest clears it. GC reaps a committed blob only if it is
+unreferenced **and** unpinned **and** past the mtime grace **and** (carries no tombstone — a
+never-referenced fan-out leftover, the pre-#480 rule — or its tombstone index is at or below this
+node's `RaftMetrics.purged`).
+
+Why a node's *own* purge point is the right index, when the replica at risk is elsewhere: the node
+that decides whether a lagging follower is caught up by *entries* or by a *snapshot* is the leader,
+using its own purge point. If the leader has not purged past `d` it still holds the blob under this
+rule, and the follower's fetch — which asks every joint voter (D-19/D-48) — finds it. If the leader
+has purged past `d`, the follower's next needed index is below the purge point, so it receives a
+snapshot at `>= d`, whose manifest (D-50) omits a digest that was already unreferenced at `d`.
+Leadership changes re-run the argument for whoever leads. A follower that purged earlier and reaped
+is harmless, because the leader has not.
+
+`purged` unknown (`None`, before the log has ever been compacted) reads as `0`, which protects every
+tombstoned digest: `0` is never a genuine purge boundary, and a node that cannot say where its own
+log begins must not be the one deciding a blob is expendable.
+
+**B — a blob a peer is asking for is not garbage.** `BlobStore` keeps an in-memory
+`last_requested`, bumped by `handle_get` (both the `?stat` and chunk branches); GC skips any digest
+requested within the grace, tombstone or not. **This is not defence in depth — for an
+already-parked replica it is the only recovery path**, and that is the finding recorded on D-48
+below: a replica parked mid-apply can never install the snapshot rule A's argument hands it, because
+the install queues behind the parked apply and never runs. Its fetch rounds hit every voter every
+`<= FETCH_BACKOFF_MAX` (5 s), far inside the grace, so the holders keep the blob for exactly as long
+as somebody still needs it. Precisely: rule B protects a holder that **answers**, not one that is
+merely asked — a request lost to a timeout, a transport error or load shedding never reaches
+`handle_get` and so refreshes nothing. Sustained shedding for a whole grace window would expose the
+blob, which is the same "not asking" residual below seen from the holder's side. The map is pruned each sweep so a departed peer's one probe cannot pin
+an entry forever.
+
+**Snapshot install clears the tombstone table.** After an install this node's log position *is* the
+snapshot boundary, so every pre-existing tombstone index is at or below it — already "purged past"
+by rule A, i.e. carrying them forward would preserve rows the rule can never again act on. A
+brand-new joiner has the property for a simpler reason: it fetches only the blobs the fresh
+manifests name. The table is opened and emptied rather than skipped, so it is never silently absent
+from an installed database (the `#[serde(default)]` lesson on `SnapshotPayload`). The cross-node
+case this leaves — a node that just installed reaping a blob some *other*, already-parked replica
+needs — is exactly what rule B covers.
+
+`BLOB_GC_GRACE_SECS` is the **never-referenced** grace only: it is measured from the blob file's
+mtime, so it was never a retention window for a blob that was live and then deleted. Before this
+entry, such a blob was reaped on the next 60 s tick on every member — the window in #480 was 60
+seconds, not an hour.
+
+*Rejected:* a leader-published fleet-minimum applied index — it needs a dissemination channel that
+does not exist, and watches the wrong index (a parked node's *matched* index keeps advancing while
+its applied index does not, so the leader's view could never see the case). *Also rejected:*
+leader-only GC (followers grow without bound); accepting the gap (the window is 60 s, not an hour);
+and retaining the redb row instead of the transport blob (the fetch path reads the transport store,
+and D-51's fallback serves *referenced* rows only — a blob in this state is by definition not one).
+
+**Residual — a replica that is not *asking*.** Rule B protects a replica for exactly as long as it
+keeps fetching; rule A protects it only while some holder's log has not passed the index. A replica
+that stops asking for longer than the grace — partitioned, shut down, or restarting — and comes back
+after every voter has purged past the unreferencing index finds no holder, and must be repaired out
+of band.
+
+One shape of this is worth naming because it is not exotic: **a follower whose log is ahead of its
+applied index**. openraft chooses snapshot-versus-entries on a follower's *matching/log* position,
+not its applied index (`progress::entry`: "every candidate matching position is purged"), and rift
+does not implement `save_committed`. So a node that parked (D-48) while replication kept filling its
+log, then restarted, replays the `PUT` **from its own log** and is never handed the snapshot rule A's
+argument above assumes — while the holders, whose `purged` has passed the tombstone, have already
+reaped. Rule A's snapshot argument is therefore sound for a replica that was simply *down*
+(`log == applied`, so its `matching` is below the purge point and it does receive a snapshot), and
+not for one whose apply lagged its log. Closing that would need retention keyed to a *fleet-minimum
+applied* index — the rejected rule 1 above, which has no dissemination channel — so it is documented
+here rather than closed.
+
+**Tombstones are reclaimed, not accumulated.** Each sweep drops rows at or below this node's
+`purged`. That is information-free — a purge point only advances, so such a row can never again
+satisfy `index > purged` — and it is what stops the table growing by a permanent row per delete on a
+node that never installs a snapshot (which is the normal case for a long-lived leader). Node-local,
+like the rest of this entry's state: the table is already excluded from the snapshot payload and
+cleared on install, so its contents differ between members by design. A prune failure is logged and
+the sweep continues; losing a row costs disk, while losing the sweep costs every blob it would have
+freed.
+
+**Observability:** `rift_cluster_blob_gc_retained` (gauge) — committed blobs this node actually held
+back under rule A, counted by `gc` itself rather than re-derived, so the gauge cannot drift from the
+rule it reports on.

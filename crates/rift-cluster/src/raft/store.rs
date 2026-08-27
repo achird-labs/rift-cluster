@@ -156,6 +156,29 @@ const SM_DATASETS_TABLE: TableDefinition<(&str, &str, u64), &str> =
 /// rather than a maintained refcount, for the same trade that table's doc explains.
 const SM_DATASET_BLOBS_TABLE: TableDefinition<&str, &str> =
     TableDefinition::new("sm_dataset_blobs");
+/// `digest hex -> log index` (#480): the index at which a digest most recently stopped being
+/// named by any live `sm_spec_blobs`/`sm_dataset_blobs` reference. Written in the same
+/// transaction that removes the last reference (`gc_spec_blob_if_unreferenced`, and the two
+/// inline dataset-unreference sites in `mutate_tables`), and cleared the moment the same digest
+/// is inserted again (a re-put after a delete has nothing left for a lagging replica to wait on).
+///
+/// Absence is deliberately ambiguous between two states, and that is fine: "never referenced" (a
+/// fan-out leftover — the blob store's own mtime grace already covers this) and "referenced right
+/// now" both read as "no tombstone", and the per-node blob store's plain grace-window rule is the
+/// correct answer for both. Only a *present* row carries information this table exists for: this
+/// digest became unreferenced at the index in the value, so a replica whose next unapplied entry
+/// is at or before that index may still need to fetch the blob it names — the per-node blob
+/// store's GC must not reap it until this node's own log has been purged past that index (D-52; see
+/// `RaftNode::spawn_blob_gc_loop`, `blobs::BlobStore::gc`).
+///
+/// Keyed by digest alone, though specs and datasets are refcounted separately — so bytes held as
+/// both can carry a tombstone written by one family while the other still references them. That is
+/// harmless *because of an ordering*: `gc` checks the referenced set before it checks the
+/// tombstone, so a still-referenced digest is kept regardless of the row, and the next genuine
+/// unreference overwrites the index. Stated here because the safety depends on that order (see
+/// `RaftNode::spawn_blob_gc_loop`, `blobs::BlobStore::gc`).
+const SM_BLOB_TOMBSTONES_TABLE: TableDefinition<&str, u64> =
+    TableDefinition::new("sm_blob_tombstones");
 /// `tenant id -> Tenant` (JSON): tenant records, including deleted tombstones
 /// (issue #159, RFC-002 §10 slice T1). See [`Tenant::deleted`]'s doc for why a
 /// delete leaves the row behind instead of removing it.
@@ -918,6 +941,7 @@ pub async fn new<P: AsRef<Path>>(path: P) -> StorageResult<(RedbLogStore, RedbSt
         write_txn.open_table(SM_SPEC_BLOBS_TABLE).map_err(io)?;
         write_txn.open_table(SM_DATASETS_TABLE).map_err(io)?;
         write_txn.open_table(SM_DATASET_BLOBS_TABLE).map_err(io)?;
+        write_txn.open_table(SM_BLOB_TOMBSTONES_TABLE).map_err(io)?;
         write_txn.open_table(SM_TENANTS_TABLE).map_err(io)?;
         write_txn.open_table(SM_PRINCIPALS_TABLE).map_err(io)?;
         write_txn.open_table(SM_BINDINGS_TABLE).map_err(io)?;
@@ -4241,13 +4265,19 @@ impl RedbStateMachine {
     #[allow(clippy::result_large_err)]
     fn gc_spec_blob_if_unreferenced(
         spec_blobs: &mut Table<'_, &'static str, &'static str>,
+        tombstones: &mut Table<'_, &'static str, u64>,
         specs: &Table<'_, (&'static str, &'static str), &'static str>,
         digest: &str,
+        index: u64,
     ) -> StorageResult<()> {
         let io =
             |e: redb::StorageError| StorageError::from(StorageIOError::write_state_machine(&e));
         if !Self::spec_digest_referenced(specs, digest)? {
             spec_blobs.remove(digest).map_err(io)?;
+            // Same transaction as the removal above (#480): a crash between the two would leave
+            // this digest reapable under the blob store's plain grace rule with nothing recording
+            // that a lagging replica might still need it to apply an entry it hasn't caught up to.
+            tombstones.insert(digest, index).map_err(io)?;
         }
         Ok(())
     }
@@ -4421,6 +4451,87 @@ impl RedbStateMachine {
         }
 
         Ok(digests)
+    }
+
+    /// Every digest this node's applied state currently tombstones, and the log index at which
+    /// each one became unreferenced (#480) — what the per-node blob store's GC sweep must not
+    /// reap ahead of this node's own log purge point. The dual of [`Self::referenced_digests`]:
+    /// that answers "still live"; this answers "unreferenced as of which index", the fact that
+    /// tells the sweep whether a lagging replica might still need the bytes to apply an entry it
+    /// has not caught up to yet.
+    ///
+    /// Read-only, no Raft round trip, the same shape as [`Self::referenced_digests`]: a row that
+    /// will not parse fails the whole scan rather than being silently dropped. Dropping it would
+    /// read as "never tombstoned" and let the sweep reap a blob a lagging replica may still need —
+    /// exactly the silent-swallow #480 exists to close. The caller (`RaftNode`'s GC tick) is
+    /// Drop every tombstone at or below `purged`, returning how many rows went.
+    ///
+    /// **Information-free, which is why a node may do it alone.** A log's purge point only ever
+    /// advances, so a row with `index <= purged` can never again satisfy the retention rule's
+    /// `index > purged` — it has already stopped protecting anything and never will again.
+    /// Without this the table is write-only: a row is added per unreference and removed only by a
+    /// re-put of the same digest or a snapshot install, so a long-lived leader (which never
+    /// installs one) accumulates a permanent row per delete forever, and the 60 s
+    /// [`Self::blob_tombstones`] scan grows with lifetime delete count rather than with live state.
+    ///
+    /// Node-local by design, and consistent with how this table is already treated: it is excluded
+    /// from the snapshot payload and cleared wholesale on install, so its contents already differ
+    /// between members. It is derived retention metadata, not applied state — nothing reads it to
+    /// decide what the state machine holds.
+    ///
+    /// # Errors
+    ///
+    /// A redb failure opening, retaining over, or committing the table.
+    #[allow(clippy::result_large_err)]
+    pub fn prune_blob_tombstones(&self, purged: u64) -> StorageResult<u64> {
+        if purged == 0 {
+            return Ok(0);
+        }
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        let dropped = {
+            let mut tombstones = write_txn
+                .open_table(SM_BLOB_TOMBSTONES_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let before = tombstones
+                .len()
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            tombstones
+                .retain(|_, index| index > purged)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let after = tombstones
+                .len()
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            before.saturating_sub(after)
+        };
+        write_txn
+            .commit()
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        Ok(dropped)
+    }
+
+    /// required to propagate this with `?` and skip that sweep, never to substitute an empty map.
+    #[allow(clippy::result_large_err)]
+    pub fn blob_tombstones(&self) -> StorageResult<HashMap<String, u64>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let table = read_txn
+            .open_table(SM_BLOB_TOMBSTONES_TABLE)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+
+        let mut tombstones = HashMap::new();
+        for item in table
+            .iter()
+            .map_err(|e| StorageIOError::read_state_machine(&e))?
+        {
+            let (key, value) = item.map_err(|e| StorageIOError::read_state_machine(&e))?;
+            tombstones.insert(key.value().to_owned(), value.value());
+        }
+        Ok(tombstones)
     }
 
     /// Every port of `tenant` whose applied config binds a stub response to dataset `name`
@@ -4687,6 +4798,10 @@ impl RedbStateMachine {
         spec_blobs: &mut Table<'_, &'static str, &'static str>,
         datasets: &mut Table<'_, (&'static str, &'static str, u64), &'static str>,
         dataset_blobs: &mut Table<'_, &'static str, &'static str>,
+        // The unreference-time tombstone table (#480): written alongside `spec_blobs`/
+        // `dataset_blobs` at every unreference site in this function, and cleared wherever a
+        // digest is (re)inserted into either.
+        tombstones: &mut Table<'_, &'static str, u64>,
         tenants: &mut Table<'_, &'static str, &'static str>,
         principals: &mut Table<'_, &'static str, &'static str>,
         bindings: &mut Table<'_, (&'static str, &'static str), &'static str>,
@@ -5387,7 +5502,9 @@ impl RedbStateMachine {
                 }
                 specs.retain(|(t, _), _| t != tenant_str).map_err(io)?;
                 for digest in freed_digests {
-                    Self::gc_spec_blob_if_unreferenced(spec_blobs, specs, &digest)?;
+                    Self::gc_spec_blob_if_unreferenced(
+                        spec_blobs, tombstones, specs, &digest, index,
+                    )?;
                 }
                 // Datasets cascade too (RFC-005 D1, #285), the same shape as specs above: the
                 // tenant's rows go — every version, live or already tombstoned, since a deleted
@@ -5418,6 +5535,9 @@ impl RedbStateMachine {
                 for digest in freed_dataset_digests {
                     if !Self::dataset_digest_referenced(datasets, &digest)? {
                         dataset_blobs.remove(digest.as_str()).map_err(io)?;
+                        // Same transaction as the removal above (#480): see
+                        // `gc_spec_blob_if_unreferenced`'s doc for why this cannot be a separate step.
+                        tombstones.insert(digest.as_str(), index).map_err(io)?;
                         dataset_actions.push(EngineAction::UnspoolDataset { digest });
                     }
                 }
@@ -5869,6 +5989,10 @@ impl RedbStateMachine {
                     spec_blobs
                         .insert(meta.digest.as_str(), document)
                         .map_err(io)?;
+                    // A live reference now names this digest, so any tombstone recording it as
+                    // unreferenced is stale (#480) — a re-put after a delete leaves nothing for a
+                    // lagging replica to still be waiting on.
+                    tombstones.remove(meta.digest.as_str()).map_err(io)?;
                 }
                 // A digest change may have orphaned the old blob. Checked *after* the row above
                 // is rewritten, so the reference scan sees the post-write truth — this record
@@ -5878,8 +6002,10 @@ impl RedbStateMachine {
                 {
                     Self::gc_spec_blob_if_unreferenced(
                         spec_blobs,
+                        tombstones,
                         specs,
                         previous.meta.digest.as_str(),
+                        index,
                     )?;
                 }
                 Ok(Ok(Vec::new()))
@@ -5901,7 +6027,13 @@ impl RedbStateMachine {
                     )));
                 }
                 specs.remove((tenant.as_str(), id.as_str())).map_err(io)?;
-                Self::gc_spec_blob_if_unreferenced(spec_blobs, specs, stored.meta.digest.as_str())?;
+                Self::gc_spec_blob_if_unreferenced(
+                    spec_blobs,
+                    tombstones,
+                    specs,
+                    stored.meta.digest.as_str(),
+                    index,
+                )?;
                 Ok(Ok(Vec::new()))
             }
             ControlOp::SpecBind { tenant, id, port } => {
@@ -6054,6 +6186,9 @@ impl RedbStateMachine {
                     dataset_blobs
                         .insert(record.digest.as_str(), csv)
                         .map_err(io)?;
+                    // A live reference now names this digest, so any tombstone recording it as
+                    // unreferenced is stale (#480) — see the identical clear in `SpecPut`.
+                    tombstones.remove(record.digest.as_str()).map_err(io)?;
                 }
                 let stored = StoredDataset {
                     record: record.clone(),
@@ -6117,6 +6252,9 @@ impl RedbStateMachine {
                     // post-write truth — nothing this delete just tombstoned still counts.
                     if !Self::dataset_digest_referenced(datasets, &digest)? {
                         dataset_blobs.remove(digest.as_str()).map_err(io)?;
+                        // Same transaction as the removal above (#480): see
+                        // `gc_spec_blob_if_unreferenced`'s doc for why this cannot be a separate step.
+                        tombstones.insert(digest.as_str(), index).map_err(io)?;
                         actions.push(EngineAction::UnspoolDataset { digest });
                     }
                 }
@@ -6490,6 +6628,11 @@ impl RedbStateMachine {
                 // not the bytes.
                 dataset_blobs.push((key.value().to_owned(), value.value().len() as u64));
             }
+            // `sm_blob_tombstones` deliberately does NOT travel with the snapshot (#480): a node
+            // installing one only ever fetches the blobs the manifests above still name, so it can
+            // never hold a *stale* unreferenced blob a carried-over tombstone would need to
+            // protect — and see `install_snapshot_blocking`'s matching comment for why clearing the
+            // table there rather than carrying a copy is the safe direction, not a silent drop.
             let tenants_table = read_txn
                 .open_table(SM_TENANTS_TABLE)
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
@@ -6774,6 +6917,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             let mut dataset_blobs = write_txn
                 .open_table(SM_DATASET_BLOBS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
+            let mut blob_tombstones = write_txn
+                .open_table(SM_BLOB_TOMBSTONES_TABLE)
+                .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let mut tenants = write_txn
                 .open_table(SM_TENANTS_TABLE)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -6895,6 +7041,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                         &mut spec_blobs,
                                         &mut datasets,
                                         &mut dataset_blobs,
+                                        &mut blob_tombstones,
                                         &mut tenants,
                                         &mut principals,
                                         &mut bindings,
@@ -6921,6 +7068,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                                     &mut spec_blobs,
                                     &mut datasets,
                                     &mut dataset_blobs,
+                                    &mut blob_tombstones,
                                     &mut tenants,
                                     &mut principals,
                                     &mut bindings,
@@ -7463,6 +7611,29 @@ impl RedbStateMachine {
                     .insert(digest.as_str(), blob_text(digest)?)
                     .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
             }
+
+            // `sm_blob_tombstones` is cleared, not repopulated (#480): the payload carries no
+            // manifest for it (see the matching comment in `build_snapshot_blocking`), and a
+            // stale copy would be actively wrong here, not merely absent. Whatever this node
+            // tombstoned before now describes a log position this install has just superseded —
+            // a tombstone can only be written by an apply this node already ran at some index at
+            // or below its own prior `last_applied_log`, which is at or below the snapshot's own
+            // index. This node's log position after install is the snapshot boundary, so every
+            // one of those old entries is already behind it; carrying them forward would just be
+            // dead rows this node can never again treat as "not yet purged past". A brand-new
+            // joiner has the identical property for a simpler reason: it fetches only the blobs
+            // the fresh manifests above name, so it can never hold an unreferenced blob a
+            // leftover tombstone would need to protect. Either way, the table itself must still
+            // exist afterward (opened and cleared here) so a fresh or upgraded db is left with it
+            // present — never silently dropped, just correctly empty (see the `#[serde(default)]`
+            // comments on `SnapshotPayload` for the failure this crate has already been bitten by
+            // when a table *is* forgotten).
+            let mut blob_tombstones_table = write_txn
+                .open_table(SM_BLOB_TOMBSTONES_TABLE)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+            blob_tombstones_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
             let mut tenants_table = write_txn
                 .open_table(SM_TENANTS_TABLE)
@@ -11982,6 +12153,62 @@ mod tests {
         );
     }
 
+    /// `TenantDelete`'s cascade runs its own digest-collection loop for specs, and a separate one
+    /// for datasets — distinct from `SpecDelete`/`DatasetDelete`, and from the specs-only case
+    /// above. A tenant with one live spec and one live dataset must have both digests tombstoned
+    /// at the delete's own index, not merely removed.
+    #[tokio::test]
+    async fn deleting_a_tenant_tombstones_the_blobs_its_specs_and_datasets_orphan() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        apply_one(
+            &mut sm,
+            1,
+            request(
+                1,
+                ControlOp::TenantPut {
+                    tenant: TenantId::new("acme"),
+                    display_name: "Acme".to_owned(),
+                    quotas: Quotas::default(),
+                    journal_retention_secs: 0,
+                },
+            ),
+        )
+        .await;
+        apply_one(&mut sm, 2, spec_put_as(2, "acme", "petstore", PETSTORE)).await;
+        let csv = "id,name\n1,ada\n";
+        apply_one(&mut sm, 3, dataset_put_as(3, "acme", "customers", csv)).await;
+
+        let spec_blob_digest = spec_digest(PETSTORE);
+        let dataset_blob_digest = crate::blobs::digest_of_bytes(csv.as_bytes());
+
+        // The delete's own index (7) is deliberately distinct from its op id (4): a tombstone
+        // must record the log index, and this is the only way a test can tell the two apart.
+        let response = apply_one(
+            &mut sm,
+            7,
+            request(
+                4,
+                ControlOp::TenantDelete {
+                    tenant: TenantId::new("acme"),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+
+        let tombstones = sm.blob_tombstones().expect("tombstones");
+        assert_eq!(
+            tombstones.get(spec_blob_digest.as_str()),
+            Some(&7),
+            "the tenant's spec blob is tombstoned at the delete's own index"
+        );
+        assert_eq!(
+            tombstones.get(dataset_blob_digest.as_str()),
+            Some(&7),
+            "the tenant's dataset blob is tombstoned at the delete's own index"
+        );
+    }
+
     // -- datasets (#285) --------------------------------------------------------------
 
     fn dataset_digest(csv: &str) -> Digest {
@@ -12031,6 +12258,224 @@ mod tests {
                 name: name.to_owned(),
             },
         )
+    }
+
+    /// #480 / rule A. The tombstone is what lets GC tell "this blob was never referenced"
+    /// (a fan-out leftover, today's grace rule) from "this blob stopped being referenced at log
+    /// index N" (keep until the log is purged past N). It must be written in the *same*
+    /// transaction that drops the last reference, or a crash between the two loses the retention
+    /// and the blob becomes reapable while a lagging replica still needs it.
+    #[tokio::test]
+    async fn deleting_the_last_reference_tombstones_the_digest_at_that_log_index() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let csv = "id,name\n1,ada\n";
+        let digest = crate::blobs::digest_of_bytes(csv.as_bytes());
+
+        apply_one(&mut sm, 1, dataset_put(1, "customers", csv)).await;
+        assert!(
+            sm.blob_tombstones().expect("tombstones").is_empty(),
+            "a live reference is not a tombstone"
+        );
+
+        apply_one(&mut sm, 7, dataset_delete(2, "customers")).await;
+
+        assert_eq!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .get(digest.as_str()),
+            Some(&7),
+            "the tombstone records the index of the entry that unreferenced it, not the put's"
+        );
+    }
+
+    /// Re-referencing clears it: the digest is live again, so the retention rule must stop
+    /// applying or a re-put would leave a blob permanently pinned by a stale index.
+    #[tokio::test]
+    async fn re_putting_a_tombstoned_digest_clears_its_tombstone() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let csv = "id,name\n1,ada\n";
+        let digest = crate::blobs::digest_of_bytes(csv.as_bytes());
+
+        apply_one(&mut sm, 1, dataset_put(1, "customers", csv)).await;
+        apply_one(&mut sm, 7, dataset_delete(2, "customers")).await;
+        assert!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .contains_key(digest.as_str())
+        );
+
+        apply_one(&mut sm, 9, dataset_put(3, "regulars", csv)).await;
+
+        assert_eq!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .get(digest.as_str()),
+            None,
+            "the same bytes are referenced again, so nothing is owed to a lagging replica"
+        );
+    }
+
+    /// A tombstone is a point-in-time fact — "unreferenced as of index N" — so a second orphaning
+    /// of the same digest must overwrite it with the newer index. A stale first index left
+    /// standing would let a node purge past the *first* delete while a replica needing the entry
+    /// at the *second* delete's index is still not caught up, reaping a blob it can still need.
+    #[tokio::test]
+    async fn a_second_delete_records_the_later_index() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let csv = "id,name\n1,ada\n";
+        let digest = crate::blobs::digest_of_bytes(csv.as_bytes());
+
+        apply_one(&mut sm, 1, dataset_put(1, "customers", csv)).await;
+        apply_one(&mut sm, 5, dataset_delete(2, "customers")).await;
+        assert_eq!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .get(digest.as_str()),
+            Some(&5)
+        );
+
+        apply_one(&mut sm, 9, dataset_put(3, "customers", csv)).await;
+        assert!(
+            !sm.blob_tombstones()
+                .expect("tombstones")
+                .contains_key(digest.as_str()),
+            "re-put clears the stale tombstone"
+        );
+
+        apply_one(&mut sm, 20, dataset_delete(4, "customers")).await;
+        assert_eq!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .get(digest.as_str()),
+            Some(&20),
+            "the second orphaning must record its own (later) index, not the first delete's"
+        );
+    }
+
+    /// D-52's reclamation half. Without it the table is write-only — a row per unreference,
+    /// removed only by a re-put of the same digest or a snapshot install — so a node that never
+    /// installs one grows a permanent row per delete and rescans them all every 60 s.
+    #[tokio::test]
+    async fn pruning_drops_tombstones_the_log_has_passed_and_keeps_the_rest() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let early = "id,name\n1,ada\n";
+        let late = "id,name\n2,bob\n";
+        let early_digest = crate::blobs::digest_of_bytes(early.as_bytes());
+        let late_digest = crate::blobs::digest_of_bytes(late.as_bytes());
+
+        apply_one(&mut sm, 1, dataset_put(1, "early", early)).await;
+        apply_one(&mut sm, 5, dataset_delete(2, "early")).await;
+        apply_one(&mut sm, 9, dataset_put(3, "late", late)).await;
+        apply_one(&mut sm, 20, dataset_delete(4, "late")).await;
+        assert_eq!(sm.blob_tombstones().expect("tombstones").len(), 2);
+
+        // Purged past the first tombstone but not the second: exactly one row can never protect
+        // anything again, and exactly one still can.
+        let dropped = sm.prune_blob_tombstones(10).expect("prune");
+
+        assert_eq!(dropped, 1);
+        let left = sm.blob_tombstones().expect("tombstones");
+        assert_eq!(
+            left.get(early_digest.as_str()),
+            None,
+            "index 5 <= purged 10"
+        );
+        assert_eq!(
+            left.get(late_digest.as_str()),
+            Some(&20),
+            "index 20 is still ahead of purged 10, so the row still protects"
+        );
+    }
+
+    /// An unknown purge point prunes nothing — the same fail-closed reading `gc` gives it. A `0`
+    /// that meant "everything is purged" here would delete the whole table on a node whose log has
+    /// simply never been compacted.
+    #[tokio::test]
+    async fn pruning_with_an_unknown_purge_point_drops_nothing() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let csv = "id,name\n1,ada\n";
+        apply_one(&mut sm, 1, dataset_put(1, "customers", csv)).await;
+        apply_one(&mut sm, 5, dataset_delete(2, "customers")).await;
+
+        assert_eq!(sm.prune_blob_tombstones(0).expect("prune"), 0);
+        assert_eq!(sm.blob_tombstones().expect("tombstones").len(), 1);
+    }
+
+    /// A spec blob takes the identical path, through `gc_spec_blob_if_unreferenced`.
+    #[tokio::test]
+    async fn deleting_a_spec_tombstones_its_document_blob() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let document = "{\"openapi\":\"3.0.0\"}";
+        let digest = crate::blobs::digest_of_bytes(document.as_bytes());
+
+        apply_one(&mut sm, 1, spec_put(1, "s1", document)).await;
+        apply_one(&mut sm, 4, spec_delete(2, "s1")).await;
+
+        assert_eq!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .get(digest.as_str()),
+            Some(&4)
+        );
+    }
+
+    /// The spec-put mirror of `re_putting_a_tombstoned_digest_clears_its_tombstone`, which only
+    /// exercises the dataset path. `SpecPut` and `DatasetPut` clear a tombstone through separate
+    /// match arms in `mutate_tables`, so the dataset test pins nothing about this one.
+    #[tokio::test]
+    async fn re_putting_a_tombstoned_spec_document_clears_its_tombstone() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let document = "{\"openapi\":\"3.0.0\"}";
+        let digest = crate::blobs::digest_of_bytes(document.as_bytes());
+
+        apply_one(&mut sm, 1, spec_put(1, "s1", document)).await;
+        apply_one(&mut sm, 4, spec_delete(2, "s1")).await;
+        assert!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .contains_key(digest.as_str())
+        );
+
+        apply_one(&mut sm, 9, spec_put(3, "s2", document)).await;
+
+        assert_eq!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .get(digest.as_str()),
+            None,
+            "the same bytes are referenced again, so nothing is owed to a lagging replica"
+        );
+    }
+
+    /// `re_putting_a_spec_with_new_bytes_swaps_the_blob_and_bumps_the_revision` proves the old
+    /// blob is gone; it never checks *how*. This pins that the orphaned digest is tombstoned at
+    /// the index of the repointing put — not merely removed — so a lagging replica whose next
+    /// entry is at or before that index still finds it if this node has not purged past it, and
+    /// that the new digest, still live, is never tombstoned.
+    #[tokio::test]
+    async fn repointing_a_spec_to_a_new_digest_tombstones_the_old_one() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let old_digest = spec_digest(PETSTORE);
+        let new_digest = spec_digest(ORDERS);
+
+        apply_one(&mut sm, 1, spec_put(1, "petstore", PETSTORE)).await;
+        apply_one(&mut sm, 5, spec_put(2, "petstore", ORDERS)).await;
+
+        assert_eq!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .get(old_digest.as_str()),
+            Some(&5),
+            "the orphaned digest is tombstoned at the index of the entry that stopped \
+             referencing it"
+        );
+        assert_eq!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .get(new_digest.as_str()),
+            None,
+            "a live reference is never tombstoned"
+        );
     }
 
     fn dataset_delete(op_id: u128, name: &str) -> ControlRequest {
@@ -12752,6 +13197,36 @@ mod tests {
             .expect("a pre-#285 snapshot still installs");
         assert!(follower.datasets(DEFAULT_TENANT).expect("list").is_empty());
         assert_eq!(follower.dataset_blob_count().expect("count"), 0);
+    }
+
+    /// `install_snapshot_blocking` clears `sm_blob_tombstones` rather than carrying a copy
+    /// forward (#480: the payload has no manifest for it, and a stale tombstone would describe a
+    /// log position the install has just superseded). "Cleared" must mean the table still opens
+    /// and reads as empty — not that a future reader hits a missing-table error, which is exactly
+    /// the failure this crate has already shipped once for an omitted table (#134/#137).
+    #[tokio::test]
+    async fn a_snapshot_install_leaves_the_tombstone_table_present_but_empty() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let csv = "id,name\n1,ada\n";
+        apply_one(&mut sm, 1, dataset_put(1, "customers", csv)).await;
+        apply_one(&mut sm, 2, dataset_delete(2, "customers")).await;
+        assert!(
+            !sm.blob_tombstones().expect("tombstones").is_empty(),
+            "the fixture must actually carry a tombstone, or this test proves nothing"
+        );
+
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        sm.install_snapshot(&meta, snapshot)
+            .await
+            .expect("install snapshot");
+
+        assert!(
+            sm.blob_tombstones()
+                .expect("the table must still open and read, not error as missing")
+                .is_empty(),
+            "the table survives the install — cleared, not silently dropped"
+        );
     }
 
     #[tokio::test]

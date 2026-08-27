@@ -569,19 +569,84 @@ impl RaftNode {
         });
     }
 
-    /// Periodic GC sweep over `store` (#437): every [`BLOB_GC_INTERVAL`], compute what this
-    /// node's own applied state still references and reclaim what `store` holds that is both
-    /// unreferenced and past [`BLOB_GC_GRACE_SECS`].
+    /// One blob-store GC sweep's worth of work (#437/#480), shared by [`Self::spawn_blob_gc_loop`]
+    /// and the test-facing [`Self::run_blob_gc_now`] so the two can never drift apart on what a
+    /// sweep actually does.
     ///
-    /// A `referenced_digests` scan failure is propagated with `?` inside the blocking task and
-    /// the sweep is skipped, never treated as an empty set — an empty set would read as "nothing
-    /// is referenced" and delete the whole store on what might be a transient read error. Runs in
-    /// `spawn_blocking`: both the redb scan and the store's directory walk are synchronous, plain
-    /// I/O, and holding a runtime worker for either is the stall #444 is open against for
-    /// snapshot building.
+    /// A `referenced_digests`/`blob_tombstones` scan failure is propagated with `?` and the sweep
+    /// is skipped, never treated as an empty map — an empty referenced set would read as "nothing
+    /// is referenced" and delete the whole store on a transient read error, and an empty tombstone
+    /// map would read as "nothing is tombstoned" and reap precisely what #480's retention exists
+    /// to keep. Plain, synchronous I/O throughout (the redb scans and the store's directory walk),
+    /// so the caller is responsible for keeping it off the async runtime.
+    ///
+    /// Also prunes tombstones this node's log has already passed (D-52), which is the only thing
+    /// that keeps `sm_blob_tombstones` from growing by a permanent row per delete.
+    fn blob_gc_sweep(
+        store: &crate::blobs::BlobStore,
+        sm_reader: &RedbStateMachine,
+        purged: Option<u64>,
+        now_secs: u64,
+    ) -> Result<u64, String> {
+        let referenced = sm_reader.referenced_digests().map_err(|e| e.to_string())?;
+        let tombstones = sm_reader.blob_tombstones().map_err(|e| e.to_string())?;
+        // `None` (this node's log has never been purged) becomes `0`, the fail-closed reading:
+        // `0` can never be a genuine purge boundary (real log indices start at 1), so it protects
+        // every tombstoned digest rather than deciding — on no evidence — that any of them are
+        // safe to reap. See `blobs::BlobStore::gc`'s doc for the full reasoning.
+        let purged = purged.unwrap_or(0);
+        // Reclaim rows the rule can never act on again (D-52). Best-effort and logged rather than
+        // fatal: failing to prune costs a row, while failing the sweep costs the reclamation of
+        // every blob this pass would have freed — so a prune failure must not take the sweep with
+        // it. Deliberately after the `blob_tombstones()` read above, so this pass still sees the
+        // rows it is about to drop and cannot reap a blob on a half-pruned view.
+        match sm_reader.prune_blob_tombstones(purged) {
+            Ok(dropped) if dropped > 0 => {
+                tracing::debug!(
+                    dropped,
+                    purged,
+                    "blob gc: pruned tombstones the log has passed"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, purged, "blob gc: could not prune tombstones");
+            }
+        }
+        let outcome = store
+            .gc(
+                &referenced,
+                &tombstones,
+                purged,
+                now_secs,
+                BLOB_GC_GRACE_SECS,
+            )
+            .map_err(|e| e.to_string())?;
+        // `outcome.retained` is `gc`'s own count of blobs kept under D-52 rule A — not
+        // re-derived here from `tombstones` by hand, which could drift from what `gc` actually
+        // did and would count tombstoned digests rather than blobs this node held (a digest may
+        // name bytes this node never had).
+        if outcome.retained > 0 {
+            tracing::debug!(
+                retained = outcome.retained,
+                purged,
+                "blob gc: retaining tombstoned blobs this node's log has not purged past"
+            );
+        }
+        crate::metrics::blob_gc_retained(outcome.retained);
+        Ok(outcome.removed)
+    }
+
+    /// Periodic GC sweep over `store` (#437): every [`BLOB_GC_INTERVAL`], run
+    /// [`Self::blob_gc_sweep`] against this node's own applied state and its own log purge point.
+    ///
+    /// Runs the sweep in `spawn_blocking`: both the redb scans and the store's directory walk are
+    /// synchronous, plain I/O, and holding a runtime worker for either is the stall #444 is open
+    /// against for snapshot building.
     fn spawn_blob_gc_loop(
         store: Arc<crate::blobs::BlobStore>,
         sm_reader: RedbStateMachine,
+        raft: Raft<TypeConfig>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             // Starts one interval in, not immediately: `interval` yields its
@@ -597,20 +662,17 @@ impl RaftNode {
                 tick.tick().await;
                 let store = Arc::clone(&store);
                 let sm_reader = sm_reader.clone();
-                let outcome = tokio::task::spawn_blocking(move || -> Result<u64, String> {
-                    let referenced = sm_reader.referenced_digests().map_err(|e| e.to_string())?;
-                    // `0` is the safe direction for *now* (unlike for a
-                    // file's mtime, where it means "infinitely old" — see
-                    // `blobs::mtime_secs`): it makes `now - mtime` saturate to
-                    // zero, which never clears the grace, so a clock this
-                    // broken reclaims nothing rather than everything.
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    store
-                        .gc(&referenced, now_secs, BLOB_GC_GRACE_SECS)
-                        .map_err(|e| e.to_string())
+                let purged = raft.metrics().borrow().purged.map(|log_id| log_id.index);
+                // `0` is the safe direction for *now* (unlike for a file's mtime, where it means
+                // "infinitely old" — see `blobs::mtime_secs`): it makes `now - mtime` saturate to
+                // zero, which never clears the grace, so a clock this broken reclaims nothing
+                // rather than everything.
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let outcome = tokio::task::spawn_blocking(move || {
+                    Self::blob_gc_sweep(&store, &sm_reader, purged, now_secs)
                 })
                 .await;
                 match outcome {
@@ -630,6 +692,27 @@ impl RaftNode {
                 }
             }
         })
+    }
+
+    /// Run exactly one blob-store GC sweep synchronously, with the same inputs
+    /// [`Self::spawn_blob_gc_loop`] uses (#480) — test-facing, because the loop's 60 s interval
+    /// and its constants are private. Modelled on [`Self::purged_index`]: a plain, hidden
+    /// accessor a test can call directly rather than waiting out a real tick.
+    ///
+    /// `now_secs` is a parameter rather than read from the clock **because a test that swept at
+    /// the real `now` could not tell the retention rule from the mtime grace**: a blob written
+    /// seconds ago is inside `BLOB_GC_GRACE_SECS` regardless of any tombstone, so such a sweep
+    /// keeps it either way and asserts nothing. The unit tests in `blobs::mod` use the same
+    /// convention. It ages files only — a *request* (rule B) is aged by `Instant::elapsed` and no
+    /// value passed here can move it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::blob_gc_sweep`] returns: a `referenced_digests`/`blob_tombstones` scan
+    /// failure, or a `blobs::BlobStore::gc` filesystem failure, both as a display string.
+    #[doc(hidden)]
+    pub fn run_blob_gc_now(&self, now_secs: u64) -> Result<u64, String> {
+        Self::blob_gc_sweep(&self.blobs, &self.sm_reader, self.purged_index(), now_secs)
     }
 
     async fn hold_elections_until_leader_heard(raft: &Raft<TypeConfig>) -> Result<(), NodeError> {
@@ -862,7 +945,8 @@ impl RaftNode {
         Self::spawn_promotion_loop(&slot, &membership_gate, &auto_voter_ceiling);
 
         let server_task = tokio::spawn(server.serve());
-        let gc_task = Self::spawn_blob_gc_loop(Arc::clone(&blob_store), sm_reader.clone());
+        let gc_task =
+            Self::spawn_blob_gc_loop(Arc::clone(&blob_store), sm_reader.clone(), raft.clone());
 
         Ok(Self {
             id: config.node_id,

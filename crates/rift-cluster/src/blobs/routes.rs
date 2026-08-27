@@ -110,6 +110,12 @@ async fn handle_get(
     let (digest_str, query) = split_suffix(&suffix);
     let digest = BlobDigest::parse(digest_str).map_err(|e| map_blob_error(e, digest_str))?;
 
+    // A peer asking is a peer asking, whichever branch below answers it (#480): `?stat` and a
+    // chunk read both mean the same thing to GC — this digest is not just old, someone still
+    // wants it. In-memory and cheap enough to run unconditionally rather than gating it behind
+    // which branch is about to run.
+    store.touch(&digest);
+
     if has_flag(query, "stat") {
         let stat = tokio::task::spawn_blocking(move || store.stat(&digest))
             .await
@@ -251,6 +257,9 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RpcError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
     use super::*;
     use crate::blobs::{BLOB_CHUNK_MAX_BYTES, BlobStat};
 
@@ -421,6 +430,101 @@ mod tests {
                 staged: 0
             }
         );
+    }
+
+    /// A transport store that already holds `bytes` under `DIGEST` — `empty_store` deliberately
+    /// misses, which is fine for the fallback tests above but useless here: rule B (D-52) only
+    /// matters for a blob GC would otherwise reap, and an empty store has nothing to protect.
+    fn store_holding(bytes: &[u8]) -> (Arc<BlobStore>, tempfile::TempDir) {
+        let (store, dir) = empty_store();
+        let digest = BlobDigest::parse(DIGEST).expect("digest");
+        store
+            .write_chunk(&digest, 0, bytes, bytes.len() as u64)
+            .expect("commit blob");
+        (store, dir)
+    }
+
+    /// Mirrors `blobs::mod`'s own `backdate`: age a committed blob's mtime so the plain grace rule
+    /// cannot be what keeps it, isolating whatever else (here, `handle_get`'s `store.touch`) is
+    /// under test.
+    fn backdate(store: &BlobStore, digest: &BlobDigest, by_secs: u64) {
+        let path = store.path_of(digest);
+        let when = SystemTime::now() - Duration::from_secs(by_secs);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open the committed blob");
+        file.set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("backdate the blob's mtime");
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs()
+    }
+
+    /// #480 rule B's wiring point: `handle_get` calls `store.touch` before either branch runs, and
+    /// nothing before this test exercised that the route actually reaches it — every fallback test
+    /// above asks an *empty* store, so it never even sees a digest worth touching. Backdating the
+    /// blob is required, or the still-fresh mtime grace alone would keep it and this test would
+    /// pass with the `touch` call deleted.
+    #[tokio::test]
+    async fn a_stat_probe_marks_the_digest_as_wanted_so_gc_can_see_it() {
+        let (store, _dir) = store_holding(b"hello");
+        let digest = BlobDigest::parse(DIGEST).expect("digest");
+        backdate(&store, &digest, 10_000);
+
+        handle_get(
+            Arc::clone(&store),
+            holding_nothing(),
+            format!("{DIGEST}?stat=1"),
+            Vec::new(),
+        )
+        .await
+        .expect("stat answers");
+
+        let outcome = store
+            .gc(&HashSet::new(), &HashMap::new(), 0, now_secs(), 3600)
+            .expect("gc");
+        assert_eq!(
+            outcome.removed, 0,
+            "the stat probe must have touched the digest"
+        );
+        assert!(store.stat(&digest).expect("stat").have);
+    }
+
+    /// The other branch of the same wiring point: a chunk read must touch too, not just `?stat`.
+    /// See the sibling stat-probe test above for why the blob must be backdated.
+    #[tokio::test]
+    async fn a_chunk_read_marks_the_digest_as_wanted_so_gc_can_see_it() {
+        let (store, _dir) = store_holding(b"hello");
+        let digest = BlobDigest::parse(DIGEST).expect("digest");
+        backdate(&store, &digest, 10_000);
+
+        let bytes = handle_get(
+            Arc::clone(&store),
+            holding_nothing(),
+            format!("{DIGEST}?offset=0&len=64"),
+            Vec::new(),
+        )
+        .await
+        .expect("chunk read");
+        assert_eq!(
+            bytes,
+            b"hello".to_vec(),
+            "sanity: served from the transport store, not the fallback"
+        );
+
+        let outcome = store
+            .gc(&HashSet::new(), &HashMap::new(), 0, now_secs(), 3600)
+            .expect("gc");
+        assert_eq!(
+            outcome.removed, 0,
+            "the chunk read must have touched the digest"
+        );
+        assert!(store.stat(&digest).expect("stat").have);
     }
 
     #[test]

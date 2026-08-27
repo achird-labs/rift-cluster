@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -147,6 +147,20 @@ pub struct GcWatermark {
     pub removed_total: u64,
 }
 
+/// What one [`BlobStore::gc`] sweep did. `retained` counts committed blobs this node actually
+/// held back under D-52's retention rule (rule A, the tombstone arm) — not tombstones, which may
+/// name digests whose bytes were never on this node. `RaftNode::blob_gc_sweep` reports this
+/// field to the `blob_gc_retained` metric instead of re-deriving it from `sm_blob_tombstones`
+/// by hand, which both risked drifting from this function's actual rule and counted tombstoned
+/// digests rather than blobs this node held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlobGcOutcome {
+    /// Committed blobs this sweep removed.
+    pub removed: u64,
+    /// Committed blobs this sweep kept alive under D-52 rule A (a tombstone not yet purged past).
+    pub retained: u64,
+}
+
 const WATERMARK_FILE: &str = "gc-watermark.json";
 const STAGING_DIR: &str = "staging";
 const STAGING_SUFFIX: &str = ".part";
@@ -192,6 +206,25 @@ pub struct BlobStore {
     /// answer that by scan) — this is process-local, in-memory, and covers only
     /// in-flight transfers.
     pinned: Mutex<HashMap<String, u32>>,
+    /// The last time a peer asked this node for `digest` (#480), via [`Self::touch`] — a `GET`
+    /// on `blobs::routes`, whichever branch answers it. A replica already parked on an apply
+    /// cannot be rescued by a snapshot (openraft runs `apply` and `install_snapshot` on one
+    /// sequential loop, so an install queues behind the parked apply and never runs), so a
+    /// holder keeping the blob for as long as it is being actively asked for is the *only*
+    /// recovery path left for it. A parked replica's fetch rounds hit every voter every
+    /// `<= FETCH_BACKOFF_MAX` (5 s) — well inside the grace — so continued asking keeps
+    /// refreshing this entry faster than [`Self::gc`] can act on its age.
+    ///
+    /// Aged by [`Instant::elapsed`] alone, and deliberately **not** against `gc`'s caller-supplied
+    /// `now_secs`. `now_secs` is wall clock (`CLOCK_REALTIME`); an `Instant` is monotonic. Placing
+    /// one on the other's timeline — via any anchor taken at open — adds the divergence between
+    /// the two clocks to every age this computes, and that divergence is unbounded: monotonic time
+    /// does not advance while a container is suspended, and an NTP step moves wall clock and not
+    /// monotonic. Past `grace_secs` of drift, every request would read as stale, rule B would be
+    /// silently off for the life of the process, and the prune below would delete the evidence.
+    /// A duration since a recording is all rule B ever needed, and it is exactly what `elapsed`
+    /// gives — so the two clocks never have to be reconciled at all.
+    last_requested: Mutex<HashMap<String, Instant>>,
 }
 
 /// A live claim on a digest: while this guard exists, [`BlobStore::gc`] will
@@ -246,6 +279,7 @@ impl BlobStore {
             root,
             writers: Mutex::new(HashMap::new()),
             pinned: Mutex::new(HashMap::new()),
+            last_requested: Mutex::new(HashMap::new()),
         })
     }
 
@@ -305,6 +339,51 @@ impl BlobStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(digest)
+    }
+
+    /// Record that a peer just asked this node for `digest` (#480) — `blobs::routes` calls this
+    /// for a `GET`, `?stat` or chunk, whichever branch answers. See [`Self::last_requested`]'s
+    /// doc for why an active request is the only thing that can save a blob a lagging replica's
+    /// parked apply still needs once the log has not yet been purged past its tombstone.
+    ///
+    /// Memory-only, like [`Self::pin`], and for the identical reason: the grace window this
+    /// covers runs from a real timestamp on the next side (the digest's own tombstone, and the
+    /// blob file's mtime), so losing this map across a restart costs nothing a restart cannot
+    /// otherwise recover from.
+    pub fn touch(&self, digest: &BlobDigest) {
+        let mut last_requested = self
+            .last_requested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        last_requested.insert(digest.as_str().to_owned(), Instant::now());
+    }
+
+    /// Whether a peer asked this node for `digest` within the last `grace_secs` (#480) —
+    /// [`Self::gc`]'s rule B. See [`Self::last_requested`]'s doc for why an active request is a
+    /// protection independent of the tombstone rule (rule A), and why this is measured with
+    /// [`Instant::elapsed`] rather than against `gc`'s wall-clock `now_secs`.
+    fn requested_recently(&self, digest: &str, grace_secs: u64) -> bool {
+        let grace = Duration::from_secs(grace_secs);
+        let last_requested = self
+            .last_requested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        last_requested
+            .get(digest)
+            .is_some_and(|instant| instant.elapsed() < grace)
+    }
+
+    /// Drop every [`Self::last_requested`] entry [`Self::requested_recently`] would already treat
+    /// as stale, so a departed peer's one-time probe cannot pin an entry in memory forever
+    /// (#480). Called once per [`Self::gc`] sweep — housekeeping bound to the same grace, not a
+    /// correctness requirement of the rule B check itself.
+    fn prune_stale_requests(&self, grace_secs: u64) {
+        let grace = Duration::from_secs(grace_secs);
+        let mut last_requested = self
+            .last_requested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        last_requested.retain(|_, instant| instant.elapsed() < grace);
     }
 
     /// The write lock for `digest`, creating it if this is the first writer.
@@ -545,11 +624,14 @@ impl BlobStore {
         Ok(buf)
     }
 
-    /// Remove every committed blob that is both unreferenced and past
-    /// `grace_secs` since it was last written, and reap any staging file past
-    /// the same grace (referenced by nobody, readable by nobody — pure leak
-    /// once abandoned). Returns the count of *committed* blobs removed;
-    /// reaped staging files are not counted (they were never a blob).
+    /// Remove every committed blob that is unreferenced, unpinned, not tombstoned ahead of
+    /// `purged`, not recently requested, and past `grace_secs` since it was last written; also
+    /// reap any staging file past the same grace (referenced by nobody, readable by nobody —
+    /// pure leak once abandoned). Returns [`BlobGcOutcome`]: `removed` counts *committed* blobs
+    /// removed (reaped staging files are not counted — they were never a blob); `retained` counts
+    /// committed blobs kept alive by rule A below (a live tombstone), which is what
+    /// `RaftNode::blob_gc_sweep` reports to its metric rather than re-deriving from
+    /// `sm_blob_tombstones` by hand.
     ///
     /// `grace_secs == 0` disables GC entirely — mirrors `gc_audit`'s
     /// `retention_secs == 0` early return — and removes nothing, including
@@ -559,6 +641,26 @@ impl BlobStore {
     /// fanned-out blob is referenced by nothing yet: without it, GC would
     /// reap exactly the blobs a transfer just delivered.
     ///
+    /// Two more criteria, both #480: `tombstones` maps a digest that recently stopped being
+    /// referenced to the log index at which that happened, and `purged` is this node's own log
+    /// purge point (`0` when unknown — see the fail-closed reasoning below). A digest tombstoned
+    /// at an index still ahead of `purged` is kept regardless of how old its file looks: a
+    /// replica whose next unapplied entry is at or before that index may still need to fetch it,
+    /// and the mtime grace alone cannot see that — it is measured from the blob's *own* write
+    /// time, not from when it stopped being referenced. And a digest [`Self::touch`]ed inside
+    /// `grace_secs` of `now_secs` is kept too, independent of any tombstone: a replica already
+    /// parked on the apply that needs this digest cannot be rescued by a snapshot (openraft runs
+    /// `apply` and `install_snapshot` on one sequential loop, so an install queues behind the
+    /// parked apply and never runs), so the peer's own repeated fetch attempts are the only
+    /// recovery path left, and this is what keeps this node from reaping the blob out from under
+    /// them.
+    ///
+    /// `purged == 0` protects every tombstoned digest, not just those tombstoned at index 0:
+    /// real log indices start at 1, so `0` can never be a genuine purge boundary — it only ever
+    /// means "this node cannot say where its own log has been purged to" (`RaftNode::purged_index`
+    /// returns `None` until the log is first compacted). A node that does not know its own purge
+    /// point must not be the one that decides a tombstoned blob is expendable.
+    ///
     /// # Errors
     ///
     /// A filesystem failure reading the store's directories or removing a
@@ -566,14 +668,22 @@ impl BlobStore {
     pub fn gc(
         &self,
         referenced: &HashSet<String>,
+        tombstones: &HashMap<String, u64>,
+        purged: u64,
         now_secs: u64,
         grace_secs: u64,
-    ) -> Result<u64, BlobError> {
+    ) -> Result<BlobGcOutcome, BlobError> {
+        // Before the disable check, not after: `last_requested` is fed by every peer GET, and
+        // this sweep is its only bound. Returning early with GC disabled would otherwise leave
+        // the map growing by one entry per digest any peer has ever asked about (#480).
+        self.prune_stale_requests(grace_secs);
+
         if grace_secs == 0 {
-            return Ok(0);
+            return Ok(BlobGcOutcome::default());
         }
 
         let mut removed = 0_u64;
+        let mut retained = 0_u64;
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
             // A `file_type()` failure is a filesystem fault, not a domain
@@ -608,6 +718,21 @@ impl BlobStore {
             // one whose bytes were staged an hour ago, would be reaped mid-flight
             // (#438).
             if self.is_pinned(digest.as_str()) {
+                continue;
+            }
+            // D-52 rule A (#480) — see this function's doc for the full reasoning. Counted here,
+            // at the exact point a blob is kept *because of this rule*, so `retained` can never
+            // drift from what this arm actually does — unlike counting tombstone rows directly,
+            // which would count a digest whose bytes were never on this node at all.
+            if let Some(&tombstoned_at) = tombstones.get(digest.as_str())
+                && (purged == 0 || tombstoned_at > purged)
+            {
+                retained += 1;
+                continue;
+            }
+            // D-52 rule B (#480) — the one thing rule A cannot see: an active request right now, from a
+            // replica whose own purge point this node has no way to know.
+            if self.requested_recently(digest.as_str(), grace_secs) {
                 continue;
             }
             let mtime_secs = mtime_secs(&entry, now_secs)?;
@@ -685,7 +810,7 @@ impl BlobStore {
         watermark.removed_total = watermark.removed_total.saturating_add(removed);
         self.save_watermark(&watermark)?;
 
-        Ok(removed)
+        Ok(BlobGcOutcome { removed, retained })
     }
 
     /// This store's GC watermark — `{0, 0}` if [`Self::gc`] has never run.
@@ -808,7 +933,7 @@ pub const BLOB_FETCH_ESCALATE_AFTER: std::time::Duration = std::time::Duration::
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// sha256 of the empty string.
     const EMPTY_DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -1134,6 +1259,224 @@ mod tests {
 
     // ---- GC --------------------------------------------------------------
 
+    /// No digest has ever been unreferenced — the shape every pre-#480 caller had, and the one
+    /// under which the grace rule below must behave exactly as it always did.
+    fn no_tombstones() -> HashMap<String, u64> {
+        HashMap::new()
+    }
+
+    fn tombstoned(entries: &[(&str, u64)]) -> HashMap<String, u64> {
+        entries.iter().map(|(d, i)| ((*d).to_owned(), *i)).collect()
+    }
+
+    /// #480 / rule A. A digest unreferenced at log index `d` is still needed by any replica whose
+    /// next entry is at or before `d`, and the thing that decides whether such a replica is caught
+    /// up by *entries* or by a *snapshot* is this node's own purge point. Below it, keep.
+    #[test]
+    fn gc_keeps_a_tombstoned_blob_until_the_log_is_purged_past_the_unreferencing_index() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &tombstoned(&[(HELLO_DIGEST, 42)]),
+                41,
+                now_secs() + 10_000_000,
+                3600,
+            )
+            .expect("gc");
+
+        assert_eq!(
+            outcome.removed, 0,
+            "purged 41 has not passed the unreferencing index 42"
+        );
+        assert!(store.stat(&d).expect("stat").have);
+    }
+
+    /// The boundary is inclusive: purged == the unreferencing index means every replica that still
+    /// needed the entry is now snapshot-fed, and the manifest at that index omits the digest.
+    #[test]
+    fn gc_reaps_a_tombstoned_blob_once_the_log_is_purged_past_it() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &tombstoned(&[(HELLO_DIGEST, 42)]),
+                42,
+                now_secs() + 10_000_000,
+                3600,
+            )
+            .expect("gc");
+
+        assert_eq!(outcome.removed, 1);
+        assert!(!store.stat(&d).expect("stat").have);
+    }
+
+    /// Fail closed. `RaftMetrics.purged` is `None` until the log is first compacted, and a node
+    /// that cannot say where its log starts must not be the one that decides a blob is expendable.
+    #[test]
+    fn gc_reaps_nothing_tombstoned_when_the_purge_point_is_unknown() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &tombstoned(&[(HELLO_DIGEST, 0)]),
+                0,
+                now_secs() + 10_000_000,
+                3600,
+            )
+            .expect("gc");
+
+        // Index 0 with purge point 0 is the only ambiguous pair; the safe reading is "keep".
+        assert_eq!(
+            outcome.removed, 0,
+            "an unpurged log reaps nothing that was ever referenced"
+        );
+    }
+
+    /// A blob no row ever referenced carries no tombstone — a fan-out leftover — and keeps today's
+    /// rule untouched. This pins that #480 narrowed nothing it was not meant to.
+    #[test]
+    fn gc_of_a_never_referenced_blob_still_follows_the_plain_grace_rule() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+
+        let outcome = store
+            .gc(&referenced(&[]), &no_tombstones(), 0, now_secs(), 3600)
+            .expect("gc");
+        assert_eq!(
+            outcome.removed, 0,
+            "inside the grace: kept, exactly as before #480"
+        );
+
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000,
+                3600,
+            )
+            .expect("gc");
+        assert_eq!(
+            outcome.removed, 1,
+            "past the grace: reaped, exactly as before #480"
+        );
+    }
+
+    /// #480 / rule B, and the openraft finding makes this the load-bearing half: a replica already
+    /// parked on the entry can never be rescued by a snapshot (the install queues behind the parked
+    /// apply and never runs), so the only thing that saves it is holders keeping the blob for as
+    /// long as it is being asked for. Its fetch rounds hit every voter well inside the grace.
+    /// Backdate `digest`'s committed file so the mtime grace has genuinely lapsed for it.
+    ///
+    /// The sibling tests get the same effect by sweeping at an inflated `now_secs`, but rule B
+    /// cannot be tested that way: inflating `now` ages the *request* too, which is the very thing
+    /// under test. Only the file can move.
+    fn backdate(store: &BlobStore, digest: &str, by_secs: u64) {
+        let path = store.path_of(&BlobDigest::parse(digest).expect("digest"));
+        let when = SystemTime::now() - Duration::from_secs(by_secs);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open the committed blob");
+        file.set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("backdate the blob's mtime");
+    }
+
+    #[test]
+    fn gc_keeps_a_blob_a_peer_asked_for_within_the_grace() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        // The blob must be genuinely old, or the mtime grace keeps it on its own and this test
+        // passes against an implementation with no rule B at all — the vacuity its sibling in
+        // `tests/cluster.rs` was also written with, and fixed the same way.
+        backdate(&store, HELLO_DIGEST, 10_000);
+        store.touch(&d);
+
+        // Unreferenced, tombstoned at an index the log has passed, and past its mtime grace:
+        // every other arm now says reap. The request alone must hold it.
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &tombstoned(&[(HELLO_DIGEST, 1)]),
+                99,
+                now_secs(),
+                3600,
+            )
+            .expect("gc");
+
+        assert_eq!(
+            outcome.removed, 0,
+            "a blob a peer is fetching is not garbage"
+        );
+        assert!(store.stat(&d).expect("stat").have);
+    }
+
+    /// The other half of the same discrimination: with the request removed and nothing else
+    /// changed, the identical sweep reaps. Without this pair, "kept" could still be an artefact
+    /// of some arm other than rule B.
+    #[test]
+    fn the_same_blob_with_no_request_is_reaped_by_the_same_sweep() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        backdate(&store, HELLO_DIGEST, 10_000);
+
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &tombstoned(&[(HELLO_DIGEST, 1)]),
+                99,
+                now_secs(),
+                3600,
+            )
+            .expect("gc");
+
+        assert_eq!(
+            outcome.removed, 1,
+            "nothing is asking for it, so nothing holds it"
+        );
+    }
+
+    /// The request window is a window, not a permanent pin: once it lapses, the blob is
+    /// reclaimable again. Without this, one probe from a since-departed peer would leak the blob
+    /// forever.
+    ///
+    /// Sleeps, rather than inflating `now_secs` like its neighbours. Rule B ages a request with
+    /// [`Instant::elapsed`] — deliberately, so no wall-clock jump can expire it (see
+    /// [`BlobStore::last_requested`]) — and the consequence is that only real elapsed time can
+    /// age it. `grace_secs` is dropped to 1 so the wait is a second rather than an hour; the
+    /// backdated mtime is what keeps the file itself past that same grace.
+    #[test]
+    fn a_request_older_than_the_grace_no_longer_protects_a_blob() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        backdate(&store, HELLO_DIGEST, 10_000);
+        store.touch(&d);
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        let outcome = store
+            .gc(&referenced(&[]), &no_tombstones(), 0, now_secs(), 1)
+            .expect("gc");
+
+        assert_eq!(
+            outcome.removed, 1,
+            "the request has aged out of the grace window"
+        );
+        assert!(!store.stat(&d).expect("stat").have);
+    }
+
     #[test]
     fn gc_keeps_a_referenced_blob_however_old_it_is() {
         // Criterion 4, the half that matters most: reclaiming a blob a live row
@@ -1142,11 +1485,17 @@ mod tests {
         put_whole(&store, HELLO_DIGEST, b"hello");
         let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
 
-        let removed = store
-            .gc(&referenced(&[HELLO_DIGEST]), now_secs() + 10_000_000, 3600)
+        let outcome = store
+            .gc(
+                &referenced(&[HELLO_DIGEST]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000_000,
+                3600,
+            )
             .expect("gc");
 
-        assert_eq!(removed, 0);
+        assert_eq!(outcome.removed, 0);
         assert!(store.stat(&d).expect("stat").have);
     }
 
@@ -1157,11 +1506,17 @@ mod tests {
         put_whole(&store, HELLO_DIGEST, b"hello");
         let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
 
-        let removed = store
-            .gc(&referenced(&[]), now_secs() + 10_000, 3600)
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000,
+                3600,
+            )
             .expect("gc");
 
-        assert_eq!(removed, 1);
+        assert_eq!(outcome.removed, 1);
         assert!(!store.stat(&d).expect("stat").have);
     }
 
@@ -1174,9 +1529,11 @@ mod tests {
         put_whole(&store, HELLO_DIGEST, b"hello");
         let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
 
-        let removed = store.gc(&referenced(&[]), now_secs(), 3600).expect("gc");
+        let outcome = store
+            .gc(&referenced(&[]), &no_tombstones(), 0, now_secs(), 3600)
+            .expect("gc");
 
-        assert_eq!(removed, 0);
+        assert_eq!(outcome.removed, 0);
         assert!(store.stat(&d).expect("stat").have);
     }
 
@@ -1186,11 +1543,17 @@ mod tests {
         let (store, _dir) = store();
         put_whole(&store, HELLO_DIGEST, b"hello");
 
-        let removed = store
-            .gc(&referenced(&[]), now_secs() + 10_000_000, 0)
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000_000,
+                0,
+            )
             .expect("gc");
 
-        assert_eq!(removed, 0);
+        assert_eq!(outcome.removed, 0);
         assert!(
             store
                 .stat(&BlobDigest::parse(HELLO_DIGEST).expect("digest"))
@@ -1213,11 +1576,17 @@ mod tests {
         let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
 
         let _pin = store.pin(&d);
-        let removed = store
-            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000_000,
+                3600,
+            )
             .expect("gc");
 
-        assert_eq!(removed, 0);
+        assert_eq!(outcome.removed, 0);
         assert!(store.stat(&d).expect("stat").have);
     }
 
@@ -1233,11 +1602,17 @@ mod tests {
         {
             let _pin = store.pin(&d);
         }
-        let removed = store
-            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000_000,
+                3600,
+            )
             .expect("gc");
 
-        assert_eq!(removed, 1);
+        assert_eq!(outcome.removed, 1);
         assert!(!store.stat(&d).expect("stat").have);
     }
 
@@ -1256,17 +1631,32 @@ mod tests {
         let second = store.pin(&d);
 
         drop(first);
-        let removed = store
-            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000_000,
+                3600,
+            )
             .expect("gc");
-        assert_eq!(removed, 0, "one release must not clear the other's pin");
+        assert_eq!(
+            outcome.removed, 0,
+            "one release must not clear the other's pin"
+        );
         assert!(store.stat(&d).expect("stat").have);
 
         drop(second);
-        let removed = store
-            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000_000,
+                3600,
+            )
             .expect("gc");
-        assert_eq!(removed, 1, "the last release makes it collectable");
+        assert_eq!(outcome.removed, 1, "the last release makes it collectable");
     }
 
     #[test]
@@ -1281,11 +1671,17 @@ mod tests {
         let other = BlobDigest::parse(HELLO_WORLD_DIGEST).expect("digest");
 
         let _pin = store.pin(&pinned);
-        let removed = store
-            .gc(&referenced(&[]), now_secs() + 10_000_000, 3600)
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000_000,
+                3600,
+            )
             .expect("gc");
 
-        assert_eq!(removed, 1);
+        assert_eq!(outcome.removed, 1);
         assert!(store.stat(&pinned).expect("stat").have);
         assert!(!store.stat(&other).expect("stat").have);
     }
@@ -1300,7 +1696,13 @@ mod tests {
         assert_eq!(store.stat(&d).expect("stat").staged, 6);
 
         store
-            .gc(&referenced(&[]), now_secs() + 10_000, 3600)
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000,
+                3600,
+            )
             .expect("gc");
 
         assert_eq!(store.stat(&d).expect("stat").staged, 0);
@@ -1314,7 +1716,9 @@ mod tests {
         let d = BlobDigest::parse(HELLO_WORLD_DIGEST).expect("digest");
         store.write_chunk(&d, 0, b"hello ", 11).expect("partial");
 
-        store.gc(&referenced(&[]), now_secs(), 3600).expect("gc");
+        store
+            .gc(&referenced(&[]), &no_tombstones(), 0, now_secs(), 3600)
+            .expect("gc");
 
         assert_eq!(store.stat(&d).expect("stat").staged, 6);
     }
@@ -1330,7 +1734,9 @@ mod tests {
         put_whole(&store, HELLO_DIGEST, b"hello");
         put_whole(&store, HELLO_WORLD_DIGEST, b"hello world");
         let swept_at = now_secs() + 10_000;
-        store.gc(&referenced(&[]), swept_at, 3600).expect("gc");
+        store
+            .gc(&referenced(&[]), &no_tombstones(), 0, swept_at, 3600)
+            .expect("gc");
 
         let watermark = store.watermark().expect("watermark");
         assert_eq!(watermark.removed_total, 2);
@@ -1345,7 +1751,13 @@ mod tests {
             let store = BlobStore::open(root.clone()).expect("open");
             put_whole(&store, HELLO_DIGEST, b"hello");
             store
-                .gc(&referenced(&[]), now_secs() + 10_000, 3600)
+                .gc(
+                    &referenced(&[]),
+                    &no_tombstones(),
+                    0,
+                    now_secs() + 10_000,
+                    3600,
+                )
                 .expect("gc");
         }
         let reopened = BlobStore::open(root).expect("reopen");
@@ -1557,7 +1969,13 @@ mod tests {
             .expect("a corrupt watermark must not be fatal");
         assert_eq!(watermark.removed_total, 0);
         store
-            .gc(&referenced(&[]), now_secs() + 10_000, 3600)
+            .gc(
+                &referenced(&[]),
+                &no_tombstones(),
+                0,
+                now_secs() + 10_000,
+                3600,
+            )
             .expect("gc must still run over a corrupt watermark");
     }
 
@@ -1566,9 +1984,15 @@ mod tests {
         let (store, _dir) = store();
         assert_eq!(
             store
-                .gc(&referenced(&[]), now_secs() + 10_000, 3600)
+                .gc(
+                    &referenced(&[]),
+                    &no_tombstones(),
+                    0,
+                    now_secs() + 10_000,
+                    3600
+                )
                 .expect("gc"),
-            0
+            BlobGcOutcome::default()
         );
     }
 }
