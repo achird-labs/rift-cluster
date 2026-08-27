@@ -443,6 +443,8 @@ pub(crate) fn health_body(node: &RaftNode, readiness: &Readiness) -> serde_json:
         "ready": readiness.state().is_ready(),
         "state": readiness.state().as_str(),
         "pending_gates": readiness.pending(),
+        // Same rule as `rift_cluster_isolated` (#470), via the same `isolated_from`: an operator
+        // comparing the gauge against this field must never be shown two different answers.
         "isolated": node.is_isolated(),
         // This node's own parked-write backlog (issue #360): writes it accepted under
         // `--cluster-admin-async` and has not replayed. A magnitude, so a number.
