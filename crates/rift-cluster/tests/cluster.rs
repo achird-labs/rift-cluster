@@ -4053,7 +4053,9 @@ async fn a_joiner_is_caught_up_by_a_multi_mebibyte_snapshot() {
     let voters_after_join = leader.status().voters.clone();
     let leader_at_assert = leader.diag_492();
     let joiner_at_assert = joiner.diag_492();
-    eprintln!("DIAG492 join_via took {join_took:?}; leader voters right after = {voters_after_join:?}");
+    eprintln!(
+        "DIAG492 join_via took {join_took:?}; leader voters right after = {voters_after_join:?}"
+    );
     eprintln!("DIAG492 leader at assert: {leader_at_assert}");
     eprintln!("DIAG492 joiner at assert: {joiner_at_assert}");
     // DIAG492: how long the install actually takes, measured from the join call.
