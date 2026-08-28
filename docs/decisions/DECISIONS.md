@@ -1687,6 +1687,33 @@ dependency build — correct, they are dependencies — and nothing else does.
 no PR latency and a mistake in it would surface for the first time during a release. The stage worth
 restructuring is the one every cluster-touching PR exercises.
 
+**Measured, cold then warm, on the two runs that landed this:**
+
+| | before | cold (this change) | warm |
+|---|--:|--:|--:|
+| `cargo build` layer | 404.3 s | 439 s¹ | **184.7 s** |
+| "Build the node image" step | 478 s | 581 s | **314 s** |
+| `cluster-smoke-prepare` job | ~462–507 s | 615 s | **357 s** |
+| `cluster-smoke` wall clock | 17–18.5 min | — | **~14 min** |
+
+¹ cold is the sum of `cargo install cargo-chef` (58.9 s) + `cook` (240.7 s) + `cargo build`
+(139.5 s); all three are cached on a warm run except the last. A cold build is genuinely slower,
+which is the trade: it happens once per dependency change, and the warm path is what every PR pays.
+
+`importing cache manifest` and `preparing build cache for export` appear in the log for the first
+time, and `cargo install cargo-chef`, `cargo chef prepare` and `cargo chef cook` all report `CACHED`
+on the warm run. That is the whole claim, and it is now checkable rather than asserted.
+
+**Still on the table, and measured rather than guessed: ~100 s.** The warm `cargo build` recompiles
+the five vendored crates — the log shows `rift-types`, `rift-http-proxy`, `rift-lint`,
+`rift-mock-core` and `rift-store-redis` starting at 0.4 s, i.e. *after* the third-party graph came
+back from cache but before this repo's own four. `cook` built them, so cargo should have found them
+fresh; what dirties them is the blanket `COPY . .` after `cook`, which rewrites `vendor/rift` with
+new mtimes and so busts cargo's fingerprint. Copying only what the build actually needs after that
+point (`Cargo.toml`, `Cargo.lock`, `crates/`, `tests/`) would leave the submodule untouched. Not
+done here: it trades a blanket copy that cannot omit anything for an explicit list that can, and it
+belongs behind its own run rather than bundled into the change that made it visible.
+
 *Rejected:* `crazy-max/ghaction-github-runtime` to export the tokens into the existing `run:` step —
 it works, but it adds a publisher to the supply chain to keep a shell loop that the action replaces
 outright, and `release.yml` already establishes the action as this repo's way. A `lukemathwalker/

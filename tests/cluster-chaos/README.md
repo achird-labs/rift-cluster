@@ -829,9 +829,11 @@ divides rather than removes.
 
 The prepare job's own build is `cargo build --release`, 404 s of its ~460 s.
 D-60 makes that a cached layer (`cargo-chef`) and fixes the build cache, which
-had never actually run — `type=gha` cannot authenticate from a `run:` step. If
-that regresses, the log says so: no `importing cache manifest` at the start of
-the build, and the cargo step back near 400 s.
+had never actually run — `type=gha` cannot authenticate from a `run:` step.
+Measured after: the cargo layer is **184.7 s** warm, the prepare job 357 s, and
+the tier's wall clock **~14 min**. If that regresses, the log says so: no
+`importing cache manifest` at the start of the build, `cargo chef cook` not
+reporting `CACHED`, and the cargo step back near 400 s.
 
 Three things about this are easy to get wrong, so they are all guarded:
 
