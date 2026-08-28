@@ -1485,6 +1485,10 @@ impl RedbStateMachine {
     /// of what the caller asks for), and holding a redb write transaction across that would
     /// block every other write on this node — the leadership-costing stall #444 closed.
     ///
+    /// Each digest is answered from this node's own applied state when it holds it — the blob
+    /// tables are shared by digest, so bytes applied under one name answer for any later op naming
+    /// the same digest (D-51, as amended by #501) — and fetched only otherwise.
+    ///
     /// Returns only once **every** required digest is in hand, so the apply arms downstream
     /// cannot encounter a missing blob and never have to decide what to do about one.
     // `StorageError` is openraft's type and not ours to shrink (#424); every other fallible
@@ -1513,6 +1517,20 @@ impl RedbStateMachine {
                     "op names an unusable blob digest {hex:?}: {e}"
                 )))
             })?;
+            // This node is itself a holder. The blob tables are keyed by digest and share their
+            // bytes across names, versions and tenants, so a row applied under one name answers
+            // for every later op naming the same digest — one redb read against up to 17 network
+            // round trips (D-51, as amended by #501). A lookup failure is not a miss: it fails the
+            // batch here rather than falling through to the network on an unread local answer.
+            if let Some(text) = self.applied_blob_text_off_thread(&hex).await.map_err(|e| {
+                StorageIOError::write_state_machine(&std::io::Error::other(format!(
+                    "reading applied state for blob {hex}: {e}"
+                )))
+            })? {
+                tracing::debug!(digest = %hex, "blob served from this node's applied state");
+                resolved.insert(hex, text);
+                continue;
+            }
             let bytes = source.load(&digest, origin).await.map_err(|e| {
                 StorageIOError::write_state_machine(&std::io::Error::other(format!(
                     "fetching blob {hex}: {e}"
@@ -2375,6 +2393,55 @@ impl RedbStateMachine {
             .get(digest)
             .map_err(|e| StorageIOError::read_state_machine(&e))?
             .map(|guard| guard.value().to_owned()))
+    }
+
+    /// The document `digest` names, from whichever blob table currently references it, or `None`
+    /// when neither does (D-51, as amended by #501).
+    ///
+    /// The one lookup shared by the two things that ask what this node holds: the transport's
+    /// fallback route ([`crate::blobs::routes::BlobFallback`]) and the two fetch paths, which
+    /// consult it before going to the network. Both tables are content-addressed and share their
+    /// bytes, so a hit under `digest` is by construction the bytes `validate` proved for it
+    /// (D-4/D-49) — asking specs first is an ordering, not a precedence, and there is nothing to
+    /// re-verify. Two read transactions rather than one because the answer is a single row and
+    /// the second lookup only happens when the first missed.
+    ///
+    /// A read that **fails** is an error, never `None`: a lookup this node could not perform is
+    /// not evidence the blob is absent, so every caller falls closed on it rather than reading it
+    /// as a miss and going elsewhere.
+    #[allow(clippy::result_large_err)]
+    fn applied_blob_text(&self, digest: &str) -> StorageResult<Option<String>> {
+        if let Some(document) = self.spec_document(digest)? {
+            return Ok(Some(document));
+        }
+        self.dataset_blob(digest)
+    }
+
+    /// [`Self::applied_blob_text`] off the runtime's worker threads, for the two `resolve_*`
+    /// paths: redb reads are blocking and every other consumer of these tables wraps them the
+    /// same way. Cloning `self` for the closure is cheap — `Arc` bumps plus the two small path
+    /// fields — and is the same thing `build_snapshot` and `install_snapshot_blocking` do.
+    ///
+    /// Note the suffix runs the other way from this file's `x`/`x_blocking` pairs, where the bare
+    /// name is the async half. It cannot follow them here: the bare name is the shared *sync*
+    /// lookup, called directly by the `BlobFallback` impl, so this wrapper needs a suffix of its
+    /// own rather than reusing `_blocking` for the opposite meaning.
+    ///
+    /// Both failure modes — the lookup itself and a panicked blocking task — stay distinct from a
+    /// miss, so neither can be read as "this node does not hold it". The caller maps the message
+    /// into whichever storage error its own path reports.
+    // Load-bearing, despite this fn's own `Err` being a `String`: the lint fires on the
+    // **closure** below, whose `Err` is `applied_blob_text`'s `StorageError` (224 bytes) —
+    // openraft's type and not ours to shrink (#424). An `allow` on `applied_blob_text` does not
+    // reach the closure, so removing this fails `clippy -D warnings`. Verified by deleting it.
+    #[allow(clippy::result_large_err)]
+    async fn applied_blob_text_off_thread(&self, digest: &str) -> Result<Option<String>, String> {
+        let sm = self.clone();
+        let digest = digest.to_owned();
+        tokio::task::spawn_blocking(move || sm.applied_blob_text(&digest))
+            .await
+            .map_err(|e| format!("applied-state blob lookup did not complete: {e}"))?
+            .map_err(|e| e.to_string())
     }
 
     /// How many live stubs bind each of `tenant`'s datasets, by dataset name, plus whether the
@@ -7353,37 +7420,63 @@ impl RedbStateMachine {
                     )),
                 )
             })?;
-            let bytes = source.load(&digest, 0).await.map_err(|e| {
+            // A member re-installing a snapshot commonly already references many of the manifest's
+            // digests in the very state the install is about to replace, so ask applied state
+            // before the network (D-51, as amended by #501): each digest answered here is up to 17
+            // round trips not made. A lookup failure fails the install rather than being read as a
+            // miss. Non-UTF-8 cannot arise on this path — redb stores these tables as `&str`.
+            let text = match self.applied_blob_text_off_thread(hex).await.map_err(|e| {
                 StorageIOError::read_snapshot(
                     Some(meta.signature()),
-                    &std::io::Error::other(format!("fetching manifest blob {hex}: {e}")),
+                    &std::io::Error::other(format!(
+                        "reading applied state for manifest blob {hex}: {e}"
+                    )),
                 )
-            })?;
-            // The manifest's size is the blob's byte length recorded at build; a fetched blob whose
-            // length disagrees means the manifest and the bytes came apart (a build/table mismatch,
-            // or a source that answered the wrong thing). The digest check inside a real transport
+            })? {
+                Some(text) => {
+                    tracing::debug!(
+                        digest = %hex,
+                        "manifest blob served from this node's applied state"
+                    );
+                    text
+                }
+                None => {
+                    let bytes = source.load(&digest, 0).await.map_err(|e| {
+                        StorageIOError::read_snapshot(
+                            Some(meta.signature()),
+                            &std::io::Error::other(format!("fetching manifest blob {hex}: {e}")),
+                        )
+                    })?;
+                    // Both blob tables store `&str` and every write path proves the bytes are a
+                    // UTF-8 document before minting the op; a non-UTF-8 blob here means the
+                    // transport handed back something that is not what the digest names — refuse
+                    // rather than lossily convert, exactly as `resolve_blobs` does on apply.
+                    String::from_utf8(bytes).map_err(|e| {
+                        StorageIOError::read_snapshot(
+                            Some(meta.signature()),
+                            &std::io::Error::other(format!(
+                                "manifest blob {hex} is not UTF-8: {e}"
+                            )),
+                        )
+                    })?
+                }
+            };
+            // The manifest's size is the blob's byte length recorded at build; bytes whose length
+            // disagrees mean the manifest and the bytes came apart (a build/table mismatch, or a
+            // source that answered the wrong thing). Applied to a self-served row as much as to a
+            // fetched one — a local row is not privileged evidence. A real transport's digest check
             // is strictly stronger, so this only ever fires on an inconsistency that check cannot
-            // see — but it turns `size` from a decorative field into a validated one.
-            if bytes.len() as u64 != size {
+            // see, but it turns `size` from a decorative field into a validated one.
+            if text.len() as u64 != size {
                 return Err(StorageIOError::read_snapshot(
                     Some(meta.signature()),
                     &std::io::Error::other(format!(
-                        "manifest blob {hex} is {size} bytes but the fetch returned {}",
-                        bytes.len()
+                        "manifest blob {hex} is {size} bytes but the bytes in hand are {}",
+                        text.len()
                     )),
                 )
                 .into());
             }
-            // Both blob tables store `&str` and every write path proves the bytes are a UTF-8
-            // document before minting the op; a non-UTF-8 blob here means the transport handed
-            // back something that is not what the digest names — refuse rather than lossily
-            // convert, exactly as `resolve_blobs` does on the apply path.
-            let text = String::from_utf8(bytes).map_err(|e| {
-                StorageIOError::read_snapshot(
-                    Some(meta.signature()),
-                    &std::io::Error::other(format!("manifest blob {hex} is not UTF-8: {e}")),
-                )
-            })?;
             resolved.insert(hex.to_owned(), text);
         }
         Ok(resolved)
@@ -7936,12 +8029,9 @@ impl RedbStateMachine {
 
 /// Applied state as a blob source of last resort for the transport (#486, D-51).
 ///
-/// Answers from `sm_spec_blobs` then `sm_dataset_blobs`: both are keyed by the sha256 hex of the
-/// bytes they hold, so a digest present in either names the same bytes, and asking specs first is
-/// an ordering, not a precedence. Two read transactions rather than one — `spec_document` and
-/// `dataset_blob` each open their own — because the answer is a single row and the second lookup
-/// only happens when the first missed; sharing a transaction would buy nothing and duplicate two
-/// accessors that already exist.
+/// The lookup is [`RedbStateMachine::applied_blob_text`], shared with the two fetch paths since
+/// #501 — see it for why specs are asked first and why each accessor opens its own read
+/// transaction. This impl only adapts it to the trait's `Vec<u8>`.
 ///
 /// What this can answer is exactly the **referenced** set: `gc_spec_blob_if_unreferenced` and its
 /// dataset twin drop the row in the same write transaction that drops the last reference to it.
@@ -7949,12 +8039,8 @@ impl RedbStateMachine {
 /// answer for.
 impl crate::blobs::routes::BlobFallback for RedbStateMachine {
     fn applied_blob(&self, digest: &crate::blobs::BlobDigest) -> Result<Option<Vec<u8>>, String> {
-        let digest_str = digest.as_str();
-        if let Some(document) = self.spec_document(digest_str).map_err(|e| e.to_string())? {
-            return Ok(Some(document.into_bytes()));
-        }
         Ok(self
-            .dataset_blob(digest_str)
+            .applied_blob_text(digest.as_str())
             .map_err(|e| e.to_string())?
             .map(String::into_bytes))
     }
@@ -8085,6 +8171,26 @@ mod tests {
             sm.applied_blob(&reaped).expect("reaped lookup"),
             None,
             "a digest no table holds is absent, not an error and not someone else's bytes"
+        );
+    }
+
+    /// The two tables are keyed by the sha256 of the bytes they hold, so a digest both hold names
+    /// the same bytes and specs-first is an ordering rather than a precedence. Pins that ordering
+    /// so a later reshuffle of `applied_blob_text` cannot quietly become bytes-dependent.
+    #[tokio::test]
+    async fn applied_state_answers_a_digest_both_tables_hold_from_either_table_alike() {
+        use crate::blobs::routes::BlobFallback;
+        let (_td, sm) = fresh_sm(None).await;
+        let shared = "id,name\n1,ada\n";
+        let digest = crate::blobs::digest_of_bytes(shared.as_bytes());
+
+        seed_spec_blob(&sm, digest.as_str(), shared);
+        seed_dataset_blob(&sm, digest.as_str(), shared);
+
+        assert_eq!(
+            sm.applied_blob(&digest).expect("lookup"),
+            Some(shared.as_bytes().to_vec()),
+            "content addressing makes the two rows the same bytes; either may answer"
         );
     }
 
@@ -13141,6 +13247,129 @@ mod tests {
         );
     }
 
+    /// Pins D-51 (as amended, #501) on the install path. A lagging member commonly already holds
+    /// manifest digests in the state it is about to replace; `resolve_snapshot_blobs` reads them
+    /// from applied state, so each one is up to 17 round trips it does not make.
+    #[tokio::test]
+    async fn a_snapshot_install_serves_itself_the_manifest_digests_it_already_holds() {
+        let (td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let handle = snapshot_handle_from(td.path(), &bytes).await;
+
+        let (_td2, follower, follower_spool) = fresh_sm_with_spool().await;
+        // The follower already references these bytes; the source holds nothing.
+        seed_dataset_blob(&follower, dataset_digest(CUSTOMERS).as_str(), CUSTOMERS);
+        let source = MapSource::holding_all(&[]);
+        let mut follower = follower.with_blob_source(source.clone());
+
+        follower
+            .install_snapshot(&meta, handle)
+            .await
+            .expect("install resolves the manifest from applied state");
+
+        assert_eq!(
+            source.calls(),
+            0,
+            "every manifest digest was answerable locally; none may be fetched"
+        );
+        assert_eq!(
+            follower
+                .dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .expect("dataset installed")
+                .digest,
+            dataset_digest(CUSTOMERS).as_str()
+        );
+        assert_eq!(
+            std::fs::read(spool_file(&follower_spool, CUSTOMERS)).expect("spool file"),
+            CUSTOMERS.as_bytes()
+        );
+    }
+
+    /// The install twin of `a_batch_asks_the_source_only_for_the_digests_applied_state_cannot_answer`:
+    /// a manifest naming two blobs of which the follower already holds one fetches **exactly** the
+    /// other. Without it the snapshot path is only ever exercised all-self-served.
+    #[tokio::test]
+    async fn a_snapshot_install_fetches_only_the_manifest_digests_it_cannot_answer_itself() {
+        let (td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        apply_one(&mut sm, 2, dataset_put(2, "orders", ORDERS_CSV)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let handle = snapshot_handle_from(td.path(), &bytes).await;
+
+        let (_td2, follower, _follower_spool) = fresh_sm_with_spool().await;
+        // Holds one of the two already; the source can supply only the other.
+        seed_dataset_blob(&follower, dataset_digest(CUSTOMERS).as_str(), CUSTOMERS);
+        let source =
+            MapSource::holding_all(&[(dataset_digest(ORDERS_CSV).as_str(), ORDERS_CSV.as_bytes())]);
+        let mut follower = follower.with_blob_source(source.clone());
+
+        follower
+            .install_snapshot(&meta, handle)
+            .await
+            .expect("install");
+
+        assert_eq!(
+            source.calls(),
+            1,
+            "exactly the one manifest digest applied state could not answer was fetched"
+        );
+        assert!(
+            follower
+                .dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_some()
+        );
+        assert!(
+            follower
+                .dataset(DEFAULT_TENANT, "orders")
+                .expect("read")
+                .is_some()
+        );
+    }
+
+    /// The manifest's `size` check applies to a self-served hit exactly as to a fetched one: a
+    /// local row whose length disagrees with what the manifest recorded is the manifest and the
+    /// bytes having come apart, and it fails the install rather than being written through.
+    #[tokio::test]
+    async fn a_self_served_manifest_blob_whose_size_disagrees_fails_the_install() {
+        let (td, mut sm, _spool) = fresh_sm_with_spool().await;
+        apply_one(&mut sm, 1, dataset_put(1, "customers", CUSTOMERS)).await;
+        let mut builder = sm.clone();
+        let Snapshot { meta, snapshot } = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = read_snapshot_bytes(snapshot).await;
+        let handle = snapshot_handle_from(td.path(), &bytes).await;
+
+        let (_td2, follower, _follower_spool) = fresh_sm_with_spool().await;
+        // Seeded directly, so the row's bytes are shorter than the digest that keys them — the
+        // inconsistency a real transport's digest check could never produce, which is why the
+        // manifest carries `size` at all.
+        seed_dataset_blob(&follower, dataset_digest(CUSTOMERS).as_str(), "short");
+        let source = MapSource::holding_all(&[]);
+        let mut follower = follower.with_blob_source(source.clone());
+
+        assert!(
+            follower.install_snapshot(&meta, handle).await.is_err(),
+            "a self-served blob shorter than the manifest size must fail the install"
+        );
+        assert_eq!(
+            source.calls(),
+            0,
+            "the local answer was used and found wrong; that is not a reason to go to the network"
+        );
+        assert!(
+            follower
+                .dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_none()
+        );
+    }
+
     /// Two datasets over the same bytes share one blob row, so the manifest names the digest once
     /// and a joiner fetches it once — the dedup `resolve_snapshot_blobs` does across the two
     /// manifests, proven here at the storage level.
@@ -16011,6 +16240,102 @@ mod tests {
         one_dataset(&sm, "b");
     }
 
+    // ---- #501: a node serves itself from applied state before going to the network (D-51) ----
+
+    /// Pins D-51 (as amended, #501): the applying node is itself a holder. A digest-only put of
+    /// bytes this node already has in `sm_dataset_blobs` under another name resolves from applied
+    /// state — the source is never asked, so a member whose transport store was wiped no longer
+    /// goes to the network for bytes it is holding.
+    #[tokio::test]
+    async fn an_applying_node_serves_itself_a_dataset_digest_it_already_holds() {
+        let (_td, sm, spool) = fresh_sm_with_spool().await;
+        // The bytes are already referenced here, under a dataset applied earlier.
+        seed_dataset_blob(&sm, dataset_digest(CUSTOMERS).as_str(), CUSTOMERS);
+        // A source that holds nothing at all: any call to it fails the apply.
+        let source = MapSource::holding_all(&[]);
+        let mut sm = sm.with_blob_source(source.clone());
+
+        let response = apply_one(
+            &mut sm,
+            1,
+            digest_only_dataset_put(1, "customers", CUSTOMERS, 7),
+        )
+        .await;
+
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert_eq!(
+            source.calls(),
+            0,
+            "applied state holds these bytes; the network must not be asked for them"
+        );
+        assert_eq!(
+            std::fs::read(spool_file(&spool, CUSTOMERS)).expect("spool file"),
+            CUSTOMERS.as_bytes(),
+            "the spool file is materialised from the self-served bytes, as from a fetch"
+        );
+    }
+
+    /// The spec twin of the above: `sm_spec_blobs` answers for a digest-only `SpecPut` too, so
+    /// the self-serve read is kind-blind exactly as the route fallback is.
+    #[tokio::test]
+    async fn an_applying_node_serves_itself_a_spec_digest_it_already_holds() {
+        let (_td, sm) = fresh_sm(None).await;
+        seed_spec_blob(&sm, spec_digest(PETSTORE).as_str(), PETSTORE);
+        let source = MapSource::holding_all(&[]);
+        let mut sm = sm.with_blob_source(source.clone());
+
+        let response =
+            apply_one(&mut sm, 1, digest_only_spec_put(1, "petstore", PETSTORE, 7)).await;
+
+        assert_eq!(response.outcome, ControlOutcome::Applied);
+        assert_eq!(source.calls(), 0);
+        assert_eq!(
+            sm.spec_document(spec_digest(PETSTORE).as_str())
+                .expect("read")
+                .as_deref(),
+            Some(PETSTORE),
+        );
+    }
+
+    /// The discriminating case: a batch mixing one digest applied state can answer with one it
+    /// cannot. The source is asked for the second **only** — a self-serve check that short-circuits
+    /// the whole batch, or one that runs but still fetches, both fail here.
+    #[tokio::test]
+    async fn a_batch_asks_the_source_only_for_the_digests_applied_state_cannot_answer() {
+        let (_td, sm, _spool) = fresh_sm_with_spool().await;
+        seed_dataset_blob(&sm, dataset_digest(CUSTOMERS).as_str(), CUSTOMERS);
+        // Holds the *other* blob only: ORDERS_CSV must be fetched, CUSTOMERS must not be.
+        let source = MapSource::holding(ORDERS_CSV);
+        let mut sm = sm.with_blob_source(source.clone());
+
+        let responses = sm
+            .apply([
+                entry(1, digest_only_dataset_put(1, "customers", CUSTOMERS, 7)),
+                entry(2, digest_only_dataset_put(2, "orders", ORDERS_CSV, 7)),
+            ])
+            .await
+            .expect("apply");
+
+        assert!(
+            responses
+                .iter()
+                .all(|r| r.outcome == ControlOutcome::Applied)
+        );
+        assert_eq!(
+            source.calls(),
+            1,
+            "exactly the one digest applied state could not answer was fetched"
+        );
+        assert_eq!(
+            one_dataset(&sm, "customers").digest,
+            dataset_digest(CUSTOMERS).as_str()
+        );
+        assert_eq!(
+            one_dataset(&sm, "orders").digest,
+            dataset_digest(ORDERS_CSV).as_str()
+        );
+    }
+
     /// No source attached is not "apply an empty document": it is a storage error, because a
     /// replica that applied zero rows while its peers applied the real ones has diverged.
     #[tokio::test]
@@ -16028,6 +16353,36 @@ mod tests {
                 .expect("read")
                 .is_none(),
             "nothing may be recorded for an op whose bytes were never obtained"
+        );
+    }
+
+    /// The no-source guard runs **before** the self-serve read and stays that way, deliberately:
+    /// a node applying digest-only ops with no blob source is misconfigured at construction, and
+    /// serving itself from applied state is a fast path in front of the source, not a substitute
+    /// for having one. Without this, moving the guard below the self-serve check — which reads
+    /// like a tidy-up — would silently let a misconfigured node apply, and nothing would fail.
+    #[tokio::test]
+    async fn a_digest_only_op_with_no_blob_source_is_an_error_even_when_this_node_holds_the_bytes()
+    {
+        let (_td, mut sm, _spool) = fresh_sm_with_spool().await;
+        // Applied state *could* answer this digest; no source is attached.
+        seed_dataset_blob(&sm, dataset_digest(CUSTOMERS).as_str(), CUSTOMERS);
+
+        let result = sm
+            .apply([entry(
+                1,
+                digest_only_dataset_put(1, "customers", CUSTOMERS, 7),
+            )])
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the guard is ahead of the self-serve read by design, got {result:?}"
+        );
+        assert!(
+            sm.dataset(DEFAULT_TENANT, "customers")
+                .expect("read")
+                .is_none()
         );
     }
 

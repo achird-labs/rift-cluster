@@ -852,9 +852,9 @@ install removes the pressure on the deadline, not the restart-from-offset-0 corr
 
 ### D-51 — A member serves a referenced blob from applied state when its transport store misses
 - **Status:** active
-- **Decided:** 2026-08-27 · #486 (#432/#440 follow-up)
+- **Decided:** 2026-08-27 · #486 (#432/#440 follow-up); amended 2026-08-28 · #501
 - **Refines:** D-18, D-48, D-50
-- **Implemented by:** #486
+- **Implemented by:** #486, #501
 - **Code:** crates/rift-cluster/src/blobs/routes.rs, crates/rift-cluster/src/raft/store.rs, crates/rift-cluster/src/raft/node.rs
 
 `GET /internal/v1/blob/{digest}` answers a chunk read from `sm_spec_blobs`/`sm_dataset_blobs`
@@ -869,14 +869,35 @@ forever (D-48) with no holder able to appear. It also retires the out-of-band re
 documents ("write the bytes back into any member's `<data-dir>/blobs/`") as the *only* path back:
 any *peer* that still references the blob can serve it, even after its transport store is wiped.
 
-**Peers only — a node does not serve itself from applied state.** `resolve_blobs` goes straight to
-`BlobSource::load`, and `PeerBlobSource` checks the local *transport* store and then filters this
-node out of the peer sweep, so the one member certain to hold a referenced row — the node doing the
-applying — is the holder this entry cannot reach. That matters because the blob tables are shared
-by digest and their own docs call byte-sharing common: a tenant re-putting identical bytes under a
-second dataset name produces a digest-only op whose bytes the applying node already has in
-`sm_dataset_blobs`, and it will still go to the network for them. Tracked as a follow-up, not
-closed here; the fetch path is not this entry's seam to move.
+**Amended (2026-08-28, #501) — a node now serves itself from applied state too.** As shipped this
+entry was peers-only: `resolve_blobs` went straight to `BlobSource::load`, and `PeerBlobSource`
+checks the local *transport* store and then filters this node out of the peer sweep, so the one
+member certain to hold a referenced row — the node doing the applying — was the holder it could not
+reach. That mattered because the blob tables are shared by digest and their own docs call
+byte-sharing common: a tenant re-putting identical bytes under a second dataset name produces a
+digest-only op whose bytes the applying node already has in `sm_dataset_blobs`, and it went to the
+network for them anyway. Closed: `resolve_blobs` (apply) and `resolve_snapshot_blobs` (the D-50
+install pre-pass) both consult `applied_blob_text` — the same two-table lookup the route fallback
+uses — **before** the source, and skip it entirely on a hit. One redb read against up to 17 round
+trips, and it is content-addressed, so a hit under `d` is by construction the bytes `validate`
+proved for `d` (D-4/D-49): nothing to re-verify, no ordering question. A lookup that *fails* fails
+the batch or the install; it is not read as a miss and does not fall through to the network, the
+same fail-closed reading this entry gave the route. The install's `size` check applies to a
+self-served row exactly as to a fetched one — a local row is not privileged evidence.
+
+*The `blob_source == None` guard stays ahead of both reads.* A node applying digest-only ops with
+no source attached still fails the batch or the install, even when it holds every digest they name.
+That is deliberate, not the same gap one level down: no source attached is a construction-time
+misconfiguration, and serving yourself from applied state is a fast path *in front of* the source,
+not a substitute for having one. Pinned by
+`a_digest_only_op_with_no_blob_source_is_an_error_even_when_this_node_holds_the_bytes`.
+
+**A self-serve hit does not write the transport store.** No `store_whole`, for the `?stat` reason
+below: the fallback serves reads, it does not claim to hold. Stated plainly, because it is a real
+consequence rather than an oversight — after a self-serve hit the digest still has no transport
+holder on this node, so D-52's rule B does not see requests for it and the next fan-out of the same
+bytes will `put` it again (`?stat` answers `have: false`). Both are correct: D-18's "holds" means
+*can serve* since this entry.
 
 The fallback can only ever answer for the **referenced** set — `gc_spec_blob_if_unreferenced` and
 its dataset twin drop the row in the same write transaction that drops the last reference — which
@@ -902,14 +923,17 @@ the stall record instead.
 *Rejected:* backfilling at apply (`store_whole` from the legacy carried-bytes arm, plus a one-time
 sweep at open). It puts filesystem writes inside the redb write transaction — the thing D-49/#444
 keep out of `apply` — duplicates every legacy row's bytes on every member, and still cannot help a
-member that applied before the backfill build shipped. *Also rejected:* leaning on the object-store
+member that applied before the backfill build shipped. This is **not** what the #501 amendment
+does, and "rejected backfill" should not be read as covering it: a self-serve *read* in
+`resolve_blobs` writes nothing, sits outside the write transaction, and helps every member that
+already holds the row — only the first of the three grounds above touches it at all, and it is the
+one that argues *for* reading rather than duplicating. *Also rejected:* leaning on the object-store
 mirror tier (#448/#456) for this. Its upload queue and its completeness sweep are both anchored on
 the node-local `BlobStore`, so a blob that was never in one is never mirrored either — the same
 provenance gap, one tier out — and D-30 makes the bucket opt-in, while this is a correctness gap in
 the default build.
 
-**Residual:** the self-serve gap above; and a blob that is *unreferenced* has no holder in applied
-state either, by design. A
+**Residual:** a blob that is *unreferenced* has no holder in applied state either, by design. A
 replica parked on a `PUT` whose `DELETE` sits behind it in the log therefore still parks — that is
 **#480**, and it is what `a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns`
 now has to construct deliberately in order to pin D-48 at all.
