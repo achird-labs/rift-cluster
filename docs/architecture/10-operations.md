@@ -186,6 +186,15 @@ snapshot that would let the node skip the blob queues behind the park and never
 runs (D-48 as amended by D-52). Waiting does not clear a stall; a holder
 returning, or the out-of-band repair, does.
 
+**A stalled node still stops cleanly** (D-56). Restarting one is a legitimate
+step — it releases nothing you need and costs nothing — but it is not a repair:
+the node replays the same entry and parks again, and the stall reappears, because
+the blob is still held by nobody. The log line to expect on the way down is
+`blob fetch abandoned: node is shutting down`, at info level. If `shutdown`
+instead reports `raft core did not release storage within 2s`, the shutdown
+signal did not reach the parked fetch — that is a defect worth an issue, not an
+operational condition.
+
 *Registered, but not alerted on:* `rift_cluster_flow_wal_lag_ops` (async
 durability backlog). It is a legitimate paging signal, but it appears in
 neither the alert pack nor the shipped dashboards yet: nobody has chosen a

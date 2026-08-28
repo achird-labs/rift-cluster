@@ -536,6 +536,12 @@ pub struct RaftNode {
     // dropped without the shutdown-then-drop contract — storage release is only
     // guaranteed through shutdown() (see Drop).
     shutdown_invoked: AtomicBool,
+    // Ends a parked blob fetch so this node can actually stop (D-56, #513). A fetch that no
+    // member can satisfy retries for as long as the node is up (D-48), and it runs *inside*
+    // openraft's state-machine worker, which holds the storage handle — so without this signal
+    // a parked node's `shutdown` times out and leaves its redb file locked. Sent by both
+    // `shutdown()` and `Drop`.
+    shutdown_signal: tokio::sync::watch::Sender<bool>,
     // The most recent reason a leave attempt failed, so the deadline's error can
     // name a cause instead of only reporting that time ran out.
     last_leave_error: Mutex<Option<String>>,
@@ -1050,12 +1056,14 @@ impl RaftNode {
         // Where a digest-only op's bytes come from when this node lacks them (#439, D-23).
         // Same before-`Raft::new`-and-before-clone contract as `with_journal`: attached here
         // so catch-up replay during a join can fetch, not only live commits afterward.
+        let (shutdown_signal, shutdown_rx) = tokio::sync::watch::channel(false);
         let blob_source = Arc::new(super::blob_source::PeerBlobSource::new(
             config.node_id,
             Arc::clone(&blob_store),
             client.clone(),
             Arc::clone(&resolver),
             &slot,
+            shutdown_rx,
         ));
         let state_machine = state_machine.with_blob_source(blob_source.clone());
         let sm_reader = state_machine.clone();
@@ -1153,6 +1161,7 @@ impl RaftNode {
             blob_source,
             gc_task,
             shutdown_invoked: AtomicBool::new(false),
+            shutdown_signal,
             last_leave_error: Mutex::new(None),
             membership_gate,
             auto_voter_ceiling,
@@ -2886,6 +2895,13 @@ impl RaftNode {
         // its error to the caller — a second warn from Drop would point at the
         // wrong contract.
         self.shutdown_invoked.store(true, Ordering::Relaxed);
+        // First, before the core is asked to stop: a fetch parked inside `apply` occupies
+        // openraft's state-machine worker, and that worker is what holds the storage handle
+        // `await_storage_release` below waits for. Signalling after would wait out a timeout
+        // this is meant to prevent; signalling when nothing is parked costs one atomic store.
+        // The `Err` is discarded because it means every receiver is gone — the `PeerBlobSource`
+        // itself has dropped — so there is no parked fetch left to tell.
+        let _ = self.shutdown_signal.send(true);
         let raft_stopped = self
             .raft
             .shutdown()
@@ -2918,7 +2934,8 @@ impl RaftNode {
             if tokio::time::Instant::now() >= deadline {
                 return Err(NodeError::Runtime(format!(
                     "raft core did not release storage within {STORAGE_RELEASE_TIMEOUT:?} \
-                     ({} database handles still live)",
+                     ({} database handles still live); if this node was parked on a blob fetch, \
+                     the D-56 shutdown signal did not reach it",
                     self.sm_reader.db_refs()
                 )));
             }
@@ -3042,6 +3059,11 @@ impl Drop for RaftNode {
     fn drop(&mut self) {
         self.server_task.abort();
         self.gc_task.abort();
+        // Also here, not only in `shutdown()`: a parked fetch would otherwise keep the storage
+        // handle alive indefinitely after a plain drop, which is the one case
+        // `drop_without_shutdown_eventually_releases_storage` could not have covered. `Err` is
+        // discarded for the reason it is in `shutdown()`: no receivers left means nothing parked.
+        let _ = self.shutdown_signal.send(true);
         if !self.shutdown_invoked.load(Ordering::Relaxed) {
             tracing::warn!(
                 node_id = self.id,
