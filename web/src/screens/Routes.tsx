@@ -649,6 +649,9 @@ function NewRoute({
  * what happens when nothing matches, and why a fleet behind a load balancer needs only one data
  * port. Neither is a reading, so neither pretends to be.
  */
+// D-54: this card names the path prefix and the imposter's own port because those are the only
+// two addressing schemes that exist. The `X-Rift-Port` header and `p-<port>.` subdomain of
+// RFC-001 §6.3 were withdrawn, not deferred — a front-door route expresses either.
 function FrontDoorNotes(): ReactNode {
   return (
     <div className="front-door-notes">

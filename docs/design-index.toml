@@ -67,8 +67,8 @@ code = []
 
 ["docs/architecture/02-topology.md"]
 status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "1ce94fc75"
+verified_on = "2026-08-28"
 code = ["crates/rift-cluster-server/src/compose.rs"]
 
 ["docs/architecture/03-control-plane.md"]

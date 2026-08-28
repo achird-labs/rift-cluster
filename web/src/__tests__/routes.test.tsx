@@ -987,14 +987,17 @@ describe("a disabled route's zero is explained, not alarming", () => {
 });
 
 /**
- * #467: the gateway-fallback card once told operators a harness could target an imposter with an
- * `X-Rift-Port` header. That scheme was designed (chapter 02's addressing table) but never built —
- * upstream's `gateway.rs` parses only `/__rift/:port/<path>`, and the front door uses that same
- * form as its no-route fallback. Advertising it made the console the one place in the system still
- * promising it, so this pins both halves: the unbuilt scheme is gone, and the built one is named.
+ * Pins D-54: the gateway-fallback card once told operators a harness could target an imposter
+ * with an `X-Rift-Port` header. That scheme was designed (chapter 02's addressing table) but never
+ * built — upstream's `gateway.rs` parses only `/__rift/:port/<path>`, and the front door uses that
+ * same form as its no-route fallback. #467 removed the claim; D-54 (#491) then withdrew the scheme
+ * outright rather than leaving it deferred, so this pins both halves: the withdrawn scheme is gone,
+ * and the built one is named.
  */
 describe("the gateway-fallback card names only addressing that exists", () => {
-  it("does not advertise the X-Rift-Port header, which was designed but never built", async () => {
+  // Pins D-54: the console must not name an addressing scheme that was withdrawn rather than
+  // merely unbuilt. This assertion is what fails if the card starts advertising it again.
+  it("does not advertise the X-Rift-Port header, which D-54 withdrew", async () => {
     stubFetch({ [ROUTES]: { json: TABLE }, [ROUTE_HITS]: { json: HITS } });
     renderInApp(<RouteTableScreen />, { whoami: whoamiWith("editor") });
 
