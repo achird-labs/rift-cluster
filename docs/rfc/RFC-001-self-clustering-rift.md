@@ -513,6 +513,13 @@ Prefer header or subdomain — nothing to strip, so path/host predicates, `saved
 and proxy `recorded_from` all see the true downstream request. Path-prefix requires clean
 stripping (the #212 gateway already does this) or those three break.
 
+> **Amended by D-54** (2026-08-28, #491): the preference is withdrawn. Only the path prefix was
+> built (`/__rift/:port/<path>`, upstream `gateway.rs`; also the front door's no-route fallback).
+> The header and subdomain forms are not features — express either as a front-door route
+> (`match.headers` / `match.host`, chapter 13), which sees the true request by default
+> (`strip_prefix` is `false` unless asked) and is tenant-scoped. D-11 is unaffected; nothing has to
+> move upstream first.
+
 Because dispatch is in-process against the existing `HashMap<u16, Arc<Imposter>>`, a
 freshly minted port is addressable immediately with zero LB reconfiguration. Port and
 flow-id stay orthogonal. **On Kubernetes this mode is effectively mandatory** (§11.5).

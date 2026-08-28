@@ -10,8 +10,8 @@ proxy, its glue scripts, its config drift — stops existing. Tracked as issues
 ## The front door: many imposters, one port, zero client cooperation
 
 Chapter 2's gateway mode asks the *client* to name the target imposter
-(the `/__rift/8080` path prefix — Chapter 2 lists the header and subdomain
-forms that were designed but not built). Test
+(the `/__rift/8080` path prefix — the header and subdomain forms were withdrawn
+by D-54 in favour of the route table below). Test
 harnesses can do that; an unmodified system-under-test cannot — it believes it
 is calling `payments.example.com/api/charge`. The front door closes the gap
 with a **content-based route table**: host, path-prefix, header, and method

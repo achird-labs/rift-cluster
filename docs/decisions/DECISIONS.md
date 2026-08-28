@@ -1092,3 +1092,44 @@ smuggled onto an existing variant.
 
 **Replays are covered by construction:** `compose::drain_parked_intents` runs a parked write through
 this same function, so it cannot bypass the gate.
+
+### D-54 — Gateway addressing is the path prefix; the header and subdomain schemes are withdrawn in favour of front-door routes
+
+- **Status:** active
+- **Decided:** 2026-08-28 · #491
+- **Amends:** RFC-001 §6.3
+- **Implemented by:** #491
+- **Code:** vendor/rift/crates/rift-http-proxy/src/gateway.rs, vendor/rift/crates/rift-http-proxy/src/front_door/route_table.rs, web/src/screens/Routes.tsx
+
+RFC-001 §6.3 listed three gateway addressing schemes and recommended two of them. Only the third
+was ever built: upstream's `gateway.rs` parses `/__rift/:port/<path>`, and the front door uses that
+same form as its no-route fallback. The header (`X-Rift-Port`) and subdomain (`p-8080.…`) schemes
+are **withdrawn**, not deferred.
+
+**What §6.3 wanted, and what delivers it now.** Its stated reason for preferring header or subdomain
+was transparency — *"nothing to strip, so path/host predicates, `savedRequests`, and proxy
+`recorded_from` all see the true downstream request."* The front door (#19/#130, U-11, chapter 13)
+delivers exactly that by a different mechanism: a content-based route table on the same listener.
+`RouteMatch.host` takes an exact host or one leading wildcard label, so `p-8080.mocks.example.com →
+:8080` is a host route; `RouteMatch.headers` is a list of exact `(name, value)` matches, so
+`X-Rift-Port: 8080 → :8080` is a header route; and `RouteTarget.strip_prefix` defaults to **false**,
+whose own doc reads "predicates and recorded requests see the true path unless the route asks
+otherwise". Transparency-by-default is already the route table's rule.
+
+**Why withdrawn rather than "not yet".** Both rows are expressible *today*, per imposter, as
+operator-authored routes — with two properties a hard-wired scheme could not have had: they are
+tenant-scoped (routes belong to tenants and are compiled in per `routes_installed_for`, chapter 8)
+and they are replicated control-plane state (`ControlOp::PutRoutes`, R1/R3). All a built-in scheme
+would add over a route is the *implicit* any-port mapping — no route per imposter — and that
+implicit form is precisely what the path prefix already provides as the no-route fallback
+(`gateway::dispatch_gateway_path`). A second and third implicit scheme would be three spellings of
+one thing, and each one is another path the tenancy rule has to account for beside the single
+fallback it has now.
+
+D-11 is untouched and is not a dependency in either direction: the plain listener *and* the route
+table are both upstream already, so nothing has to move first. (§6.3 says only that the plain
+listener is upstream, which remains true; "D-11 would have to move first" was #491's own inference.)
+
+*Rejected:* keeping them as a deferred preference. Because the code is equally consistent with "not
+yet" and "never", a preference nobody is building is a claim the docs cannot keep true — #467, #489
+and this issue are three corrections of the same one sentence, in three different places.
