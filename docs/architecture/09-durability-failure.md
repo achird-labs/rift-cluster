@@ -184,7 +184,7 @@ flowchart TB
     W1["admin writes: ✅ normal<br/>(quorum intact)"] -.-> M
     W2["admin writes: 503 + op-id,<br/>parked & replayed on heal"] -.-> m
     F1["flow keys owned in M: ✅ normal<br/>keys owned in m: adopted at<br/>next membership commit"] -.-> M
-    F2["mock traffic: stateless ✅<br/>stateful ops on M-owned keys: 503<br/>own-side owners: isolated-owner<br/>rule kicks in after 3× heartbeat"] -.-> m
+    F2["mock traffic: stateless ✅<br/>stateful ops on M-owned keys: 503<br/>own-side owners: isolated-owner rule —<br/>followers at 450–600 ms (openraft lease),<br/>leader at 900 ms (ISOLATION_WINDOW_MS)"] -.-> m
 ```
 
 The minority never diverges — it *refuses*. On heal: parked intents replay

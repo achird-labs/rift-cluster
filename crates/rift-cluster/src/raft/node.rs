@@ -3606,6 +3606,108 @@ mod tests {
         n1.shutdown().await.ok();
     }
 
+    /// Pins D-17: a routine election isolates a node for the election **round trip**, not for the
+    /// election *timeout*. `current_leader` is `None` only while this node's vote is uncommitted —
+    /// from campaigning or granting a vote until the winner's first `AppendEntries` — which is why
+    /// the measured pause is ~13–40 ms and not the sub-second figure D-17 used to state (#472).
+    ///
+    /// Its job is to catch a future openraft that clears `current_leader` at **lease expiry**
+    /// instead of at campaign: that would silently grow the pause to one election timeout
+    /// (150–300 ms) and invalidate the numbers D-17 now records, with no other test noticing.
+    ///
+    /// The 400 ms bound is deliberately loose against a measured ~13–40 ms (and a ≤ 300 ms
+    /// split-vote round) so it does not flake on CI's 2-vCPU runners. Red-confirmed by setting the
+    /// bound to zero: this observes a real 32–40 ms window locally, so it is measuring the pause
+    /// rather than passing on a window it never sees. Sampling stalls are the one
+    /// way this could report an isolation it never observed, so the failure message carries the
+    /// largest gap between consecutive samples — a run that failed because the sampler was starved
+    /// says so, instead of looking like a real regression.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_routine_election_isolates_a_node_for_the_round_trip_not_the_timeout() {
+        use std::time::{Duration, Instant};
+
+        let (d1, d2, d3) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+        n2.join_via(n1.advertise()).await.expect("n2 join");
+        n3.join_via(n1.advertise()).await.expect("n3 join");
+
+        // Start from a genuinely healthy fleet, or "isolated" below would just be "never settled".
+        assert!(
+            wait_until(|| n1.status().is_leader
+                && !n1.is_isolated()
+                && !n2.is_isolated()
+                && !n3.is_isolated())
+            .await,
+            "the cluster must be healthy before the leader is killed"
+        );
+
+        n1.shutdown().await.ok();
+
+        // Sample both survivors until each knows a new leader, then settle briefly.
+        let survivors = [(2u64, &n2), (3u64, &n3)];
+        let mut longest = [Duration::ZERO; 2];
+        let mut run_start: [Option<Instant>; 2] = [None, None];
+        let mut widest_gap = Duration::ZERO;
+        let mut last_sample = Instant::now();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut settled_at: Option<Instant> = None;
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let now = Instant::now();
+            widest_gap = widest_gap.max(now - last_sample);
+            last_sample = now;
+
+            for (i, (_, node)) in survivors.iter().enumerate() {
+                if node.is_isolated() {
+                    run_start[i].get_or_insert(now);
+                } else if let Some(started) = run_start[i].take() {
+                    longest[i] = longest[i].max(now - started);
+                }
+            }
+
+            let new_leader_known = survivors
+                .iter()
+                .all(|(_, node)| matches!(node.status().current_leader, Some(id) if id != 1));
+            match (new_leader_known, settled_at) {
+                (true, None) => settled_at = Some(now + Duration::from_millis(200)),
+                (true, Some(at)) if now >= at => break,
+                (false, _) => settled_at = None,
+                _ => {}
+            }
+        }
+        // Close any run still open at the end so it is not silently dropped.
+        let end = Instant::now();
+        for i in 0..2 {
+            if let Some(started) = run_start[i].take() {
+                longest[i] = longest[i].max(end - started);
+            }
+        }
+
+        for (i, (id, _)) in survivors.iter().enumerate() {
+            assert!(
+                longest[i] < Duration::from_millis(400),
+                "node {id} was isolated for {:?} across one routine election; D-17 records ~13–40 ms \
+                 and this bound is 400 ms. Largest gap between consecutive samples was {:?} — if \
+                 that approaches the reported isolation the sampler was starved and this is a CI \
+                 load artefact, not a regression.",
+                longest[i],
+                widest_gap
+            );
+        }
+
+        for node in [&n2, &n3] {
+            node.shutdown().await.ok();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn follower_write_is_rejected() {
         let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());

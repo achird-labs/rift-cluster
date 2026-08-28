@@ -142,10 +142,14 @@ partition. The consequence worth stating plainly is broader than a partition. `i
 quorum lease — and a node clears `current_leader` as soon as it stops hearing the leader and
 campaigns. So an ordinary **leader election** makes every node that has lost sight of the leader
 refuse owner-side flow writes and `strong` reads until the new leader is established, whichever
-node owns the flow. In practice that is a sub-second pause on the flow data path (openraft's
-election timeout is 150–300 ms, and a fresh leader additionally reads isolated until its first
-quorum-acknowledged round), and up to the ~1–3 s D-15 already accepts for admin writes when an
-election is contended.
+node owns the flow. Measured, that pause is **~13–40 ms** per node per election (13–31 ms on the #472 probe,
+32–40 ms re-measured on other hardware) — the election round trip plus the new leader's first
+quorum-ack, because `current_leader` is `None` exactly while a node's vote is uncommitted (#472). It is *not* the sub-second-to-1–3 s this chapter previously stated, which was
+reasoned from the election timeout rather than measured. Two graces sit in front of it and are
+asymmetric: a **follower** does not report isolated until **450–600 ms** after it last heard the
+leader (openraft campaigns only after `leader_lease + rand(election_timeout_min..max)`), while a
+**leader** has **900 ms** from its last quorum ack (`ISOLATION_WINDOW_MS`). A split vote adds one
+150–300 ms round.
 
 That is stricter than this rule's own wording — "has not heard a leader heartbeat within
 `3 × election_timeout`" would ride out a routine election, whereas the primitive fails closed the
