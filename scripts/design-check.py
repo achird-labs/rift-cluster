@@ -576,22 +576,44 @@ def resolve_diff_base(root: Path, ref: str | None) -> tuple[list[str], str, dict
     if ref and Path(ref).exists() and (Path(ref) / ".git").exists():
         wt = Path(ref).resolve()
         base = sh(["git", "merge-base", "origin/master", "HEAD"], wt).strip() or "origin/master"
-        names = sh(["git", "diff", "--name-only", f"{base}...HEAD"], wt)
-        hunks = sh(["git", "diff", "-U0", f"{base}...HEAD"], wt)
-        desc = f"{wt.name} vs merge-base {base[:9]}"
+        # Two-dot against the *working tree*, not `{base}...HEAD`: the change-time question is
+        # asked while the work is still uncommitted (CLAUDE.md says so, and `/ship-issues` runs
+        # this at 1c-docs, before the commit exists). Diffing to HEAD answered "0 changed files"
+        # there — which reads exactly like a pass, and is the one wrong answer a gate must not
+        # give. `git diff <base>` covers committed, staged and unstaged alike.
+        names = sh(["git", "diff", "--name-only", base], wt)
+        hunks = sh(["git", "diff", "-U0", base], wt)
+        desc = f"{wt.name} vs merge-base {base[:9]} (incl. uncommitted)"
     elif ref:
-        names = sh(["git", "diff", "--name-only", f"{ref}...HEAD"], root)
-        hunks = sh(["git", "diff", "-U0", f"{ref}...HEAD"], root)
-        if not names.strip():
-            names = sh(["git", "diff", "--name-only", ref], root)
-            hunks = sh(["git", "diff", "-U0", ref], root)
-        desc = f"changes since {ref}"
+        # Same reasoning as the worktree branch above: two-dot to the working tree, so a ref
+        # with *both* committed and uncommitted work reports both. The old form fell back to this
+        # only when the committed diff was empty, so uncommitted work was invisible whenever a
+        # single commit already existed on the branch.
+        names = sh(["git", "diff", "--name-only", ref], root)
+        hunks = sh(["git", "diff", "-U0", ref], root)
+        desc = f"changes since {ref} (incl. uncommitted)"
     else:
         names = sh(["git", "diff", "--name-only", "HEAD"], root)
         hunks = sh(["git", "diff", "-U0", "HEAD"], root)
         desc = "uncommitted changes vs HEAD"
     files = [ln for ln in names.splitlines() if ln.strip()]
+    # A file that has never been `git add`-ed is still part of the change -- and a brand-new module
+    # is exactly where a fresh citation tends to live. `git diff` cannot see one, so ask separately
+    # and treat the whole file as changed, which for a new file is simply true.
+    is_worktree = bool(ref) and Path(ref).exists() and (Path(ref) / ".git").exists()
+    untracked_root = Path(ref).resolve() if is_worktree else root
+    untracked = [
+        ln for ln in sh(["git", "ls-files", "--others", "--exclude-standard"], untracked_root).splitlines()
+        if ln.strip() and ln not in files
+    ]
+    files.extend(untracked)
     changed_lines: dict[str, set[int]] = defaultdict(set)
+    for rel in untracked:
+        try:
+            n = len((untracked_root / rel).read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError:
+            continue
+        changed_lines[rel].update(range(1, n + 1))
     cur = None
     for ln in hunks.splitlines():
         if ln.startswith("+++ b/"):

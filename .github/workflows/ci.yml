@@ -110,6 +110,12 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+      # The gate's own unit tests, which nothing ran until now: `scripts/tests/test_design_check.py`
+      # has existed and grown for several changes without ever being a CI step, so a regression in
+      # the checker itself could only be caught by `--strict` happening to notice — and `--strict`
+      # passing says nothing about whether `--diff` still reports the right files.
+      - name: design-check unit tests
+        run: python3 -m unittest scripts.tests.test_design_check -v
       - name: design-check --strict
         run: python3 scripts/design-check.py --strict
 

@@ -190,6 +190,64 @@ class Resolution(unittest.TestCase):
         self.assertIn("crates/x/src/old.rs", out)
 
 
+class DiffSeesUncommittedWork(unittest.TestCase):
+    """`--diff <worktree>` must report work that is not committed yet.
+
+    CLAUDE.md prescribes this check *before implementing* and calls it "uncommitted changes", and
+    `/ship-issues` runs it at 1c-docs — both moments where the work has no commit. Diffing
+    `{base}...HEAD` answered "0 changed file(s) / nothing changed" there, which is indistinguishable
+    from a clean pass. A gate that reports success when it has looked at nothing is worse than one
+    that fails: it is quietly wrong at exactly the moment it is relied on.
+    """
+
+    def base_at_head(self, f: "Fixture") -> None:
+        """Give the fixture an `origin/master` for `merge-base` to resolve against."""
+        git(f.root, "update-ref", "refs/remotes/origin/master", "HEAD")
+
+    def test_uncommitted_change_in_a_worktree_is_reported(self):
+        f = Fixture()
+        self.base_at_head(f)
+        f.write("crates/x/src/uncommitted.rs", "// D-2 is touched here\n")
+        code, out = f.run("--diff", str(f.root))
+        self.assertIn("crates/x/src/uncommitted.rs", out, "an uncommitted file is part of the change")
+        self.assertNotIn("0 changed file(s)", out)
+        self.assertEqual(code, 0, out)
+
+    def test_staged_but_uncommitted_change_is_reported(self):
+        """Staging is not committing -- `git add` alone must not hide the file either."""
+        f = Fixture()
+        self.base_at_head(f)
+        f.write("crates/x/src/staged.rs", "// D-2 is touched here\n")
+        git(f.root, "add", "crates/x/src/staged.rs")
+        _, out = f.run("--diff", str(f.root))
+        self.assertIn("crates/x/src/staged.rs", out)
+
+    def test_committed_and_uncommitted_are_reported_together(self):
+        """The half a naive fix breaks: switching to the working tree must not lose the commits.
+
+        A branch normally has both -- some work committed, some still in the editor -- and the
+        change-time question is about the union, not whichever half the flag happens to look at.
+        """
+        f = Fixture()
+        self.base_at_head(f)
+        f.write("crates/x/src/committed.rs", "// D-2 committed\n")
+        git(f.root, "add", "-A")
+        git(f.root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "work")
+        f.write("crates/x/src/still_open.rs", "// D-2 not yet committed\n")
+
+        _, out = f.run("--diff", str(f.root))
+        self.assertIn("crates/x/src/committed.rs", out, "committed work must still be reported")
+        self.assertIn("crates/x/src/still_open.rs", out, "uncommitted work must also be reported")
+
+    def test_a_genuinely_clean_worktree_still_reports_nothing(self):
+        """"Nothing changed" must keep meaning nothing changed."""
+        f = Fixture()
+        self.base_at_head(f)
+        code, out = f.run("--diff", str(f.root))
+        self.assertIn("0 changed file(s)", out)
+        self.assertEqual(code, 0)
+
+
 class UninitialisedSubmodule(unittest.TestCase):
     """A declared-but-absent `vendor/rift` must be named once, not inferred from its wreckage.
 
