@@ -85,7 +85,7 @@ use rift_cluster::stores::{
 };
 use rift_cluster::{
     ControlOutcome, ControlResponse, FLEET_SCOPE, KeyClass, NodeError, NodeId, OwnedKey, PullError,
-    RaftNode, SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId, routes_installed_for,
+    RaftNode, SESSION_KEY_BYTES, SessionKey, SourcePuller, TenantId, metrics, routes_installed_for,
 };
 use rift_cluster_base::seams::{
     ErrorKind, ImposterConfig, RecordedRequest, RiftScriptConfig, RouteTable, SCOPE_HEADER,
@@ -2256,10 +2256,16 @@ fn strip_blob(op: &mut ControlOp, accepted_by: u64) {
 ///
 /// Only once a majority of both the committed and the effective configuration holds the
 /// bytes — the joint rule D-19 fixes, read in one `with_raft_state` closure by
-/// `network::joint_voters` and decided by `QuorumTargets::satisfied_by` — are they
-/// **stripped** from the op and `origin` stamped with this node. What reaches the log is
-/// metadata-sized (D-23); a member the fan-out missed fetches on apply, asking this node
-/// first. The stripped copy is what `submit` sees; the parked copy is untouched.
+/// `network::joint_voters` and decided by `QuorumTargets::satisfied_by` — **and** every member
+/// of that configuration (voters and learners alike) is confirmed able to apply a digest-only
+/// entry (`outcome.sideload_safe`, #481, D-53) are the bytes **stripped** from the op and `origin`
+/// stamped with this node. A byte quorum alone is not enough: a member outside it, or one
+/// running a build that cannot decode a digest-only reference, would take the fatal
+/// `StorageIOError` path in `RedbLogStore::try_get_log_entries` rather than a refused apply —
+/// so the shape stays unchanged (bytes carried, the pre-D-49 shape every build applies) until
+/// `sideload_safe` says otherwise. What a stripped entry carries is metadata-sized (D-23); a
+/// member the fan-out missed fetches on apply, asking this node first. The stripped (or
+/// unchanged) copy is what `submit` sees; the parked copy is untouched.
 ///
 /// `submit` is the caller's own submit expression, with or without a deadline, because the
 /// three write paths differ there and nowhere else. It runs while the blob is pinned and the
@@ -2317,7 +2323,32 @@ where
         "blob fanned out to a quorum before propose"
     );
 
-    strip_blob(&mut request.op, node.id());
+    // A byte quorum is not a decode quorum (#481): `outcome.quorum` says a majority holds the
+    // bytes, but a member outside that byte quorum (or one that answered `applies_digest_only:
+    // false`) may still be unable to *decode* a digest-only reference to them. Stripping is
+    // D-53: only safe once `sideload_safe` confirms every member of the committed ∪ effective
+    // configuration can apply one — otherwise this keeps the pre-D-49 shape every build
+    // applies, which every replica (whatever it runs) can always apply.
+    if outcome.sideload_safe {
+        strip_blob(&mut request.op, node.id());
+    } else {
+        // Exactly one increment per deferred write, so `sum by ()` over the labels still counts
+        // writes rather than reasons. `incapable` wins when both are present: it is the
+        // actionable one — a member that answered "I cannot" needs an upgrade or a removal, while
+        // an unobserved member may simply be a fresh join that the next fan-out resolves.
+        metrics::blob_sideload_deferred(if outcome.sideload_incapable.is_empty() {
+            "member_unobserved"
+        } else {
+            "member_incapable"
+        });
+        tracing::warn!(
+            digest = digest.as_str(),
+            incapable = ?outcome.sideload_incapable,
+            unobserved = ?outcome.sideload_unobserved,
+            "blob fan-out: keeping the op's bytes on the log; not every member is confirmed able \
+             to apply a digest-only entry"
+        );
+    }
     let submitted = submit(request).await;
     drop(pin);
     Ok(submitted)
@@ -9573,6 +9604,12 @@ mod tests {
     /// (which "does not require leadership", per its own doc comment) without
     /// paying for `cluster_init`/election. The `TempDir` must outlive the node.
     async fn test_node() -> (Arc<RaftNode>, tempfile::TempDir) {
+        test_node_advertising(false).await
+    }
+
+    /// [`test_node`] with this node's own digest-only capability forced off (#481) — the solo
+    /// stand-in for a fleet member running a build that cannot apply a stripped op.
+    async fn test_node_advertising(incapable: bool) -> (Arc<RaftNode>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config = rift_cluster::NodeConfig {
             node_id: 1,
@@ -9584,6 +9621,7 @@ mod tests {
             engine: None,
             audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
             snapshot_log_entries: None,
+            advertise_as_digest_only_incapable: incapable,
         };
         let node = RaftNode::start(config).await.expect("node starts");
         (Arc::new(node), dir)
@@ -11254,6 +11292,49 @@ mod tests {
 
     /// Pins D-49: what `submit` receives is metadata-sized and names this node as origin, and
     /// the blob is already in this node's own store — the fan-out ran before the strip, while
+    /// Pins D-53 (#481): the mirror of the test below, and the one that actually pins the gate. With a member
+    /// that is not known to apply digest-only ops, `fan_out_then_submit` must hand `submit` the
+    /// op **with its bytes** — the pre-D-49 shape every build can decode — rather than the
+    /// stripped one that would stop an un-upgraded member's Raft core at log read
+    /// (`RedbLogStore::try_get_log_entries`, not at apply as the operations chapter used to say).
+    ///
+    /// Solo, and that is enough *here* precisely because the capability under test is node-local:
+    /// this node's own `digest_only_capable` is off, so it is the member that is not capable. The
+    /// peer half of the question — that a real remote build is probed and classified — cannot be
+    /// asked solo and is pinned by `an_op_carries_its_bytes_while_a_member_cannot_apply_digest_only`
+    /// in `rift-cluster`'s cluster suite.
+    #[tokio::test]
+    async fn fan_out_then_submit_keeps_the_bytes_when_a_member_cannot_apply_digest_only() {
+        let (node, _dir) = test_node_advertising(true).await;
+        node.cluster_init().await.expect("solo cluster");
+        let csv = "id,name\n1,ada\n";
+        let request = ControlRequest {
+            op_id: uuid::Uuid::new_v4(),
+            principal: None,
+            issued_at_secs: 0,
+            expected_revision: None,
+            op: carried_dataset_put(csv),
+        };
+
+        let handed = fan_out_then_submit(&node, request, |r| async move { r })
+            .await
+            .expect("a solo cluster is its own joint quorum");
+
+        let ControlOp::DatasetPut { csv: carried, .. } = &handed.op else {
+            panic!("expected DatasetPut")
+        };
+        assert_eq!(
+            carried.as_deref(),
+            Some(csv),
+            "an un-upgraded member is in the membership, so the bytes must stay on the op"
+        );
+        let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+        assert!(
+            node.blobs().stat(&digest).expect("stat").have,
+            "the fan-out still happened; only the strip is withheld"
+        );
+    }
+
     /// the op still carried its bytes.
     #[tokio::test]
     async fn fan_out_then_submit_hands_submit_a_stripped_op_with_this_node_as_origin() {

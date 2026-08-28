@@ -79,6 +79,29 @@ async fn spawn_with_snapshot_policy(
     audit_retention_secs: u64,
     snapshot_log_entries: Option<u64>,
 ) -> Arc<RaftNode> {
+    spawn_full(
+        id,
+        addr,
+        dir,
+        audit_retention_secs,
+        snapshot_log_entries,
+        false,
+    )
+    .await
+}
+
+/// [`spawn_with_snapshot_policy`] plus the #481 capability knob: `advertise_as_digest_only_incapable`
+/// makes this one node's blob route claim it cannot apply a digest-only `ControlOp`, pretending
+/// to be a pre-#481 build — the only way this in-process harness can put a version-skewed member
+/// in a cluster without two binary versions.
+async fn spawn_full(
+    id: NodeId,
+    addr: SocketAddr,
+    dir: &Path,
+    audit_retention_secs: u64,
+    snapshot_log_entries: Option<u64>,
+    advertise_as_digest_only_incapable: bool,
+) -> Arc<RaftNode> {
     let config = NodeConfig {
         node_id: id,
         bind: addr,
@@ -89,6 +112,7 @@ async fn spawn_with_snapshot_policy(
         engine: None,
         audit_retention_secs,
         snapshot_log_entries,
+        advertise_as_digest_only_incapable,
     };
     // No retry-on-lock-contention: `RaftNode::shutdown` now waits for the Raft
     // core to release its storage handles before returning (#41), so a restart on
@@ -121,19 +145,40 @@ impl TestCluster {
     /// [`Self::start`] with an explicit audit retention window, for the tests
     /// that need GC to actually run within a test's lifetime.
     async fn start_with_audit_retention(n: usize, audit_retention_secs: u64) -> Self {
-        Self::start_full(n, audit_retention_secs, None).await
+        Self::start_full(n, audit_retention_secs, None, None).await
     }
 
     /// [`Self::start`] with every node snapshotting every `entries` log entries and purging to
     /// the tip, so a member that falls behind must be caught up by `install_snapshot`.
     async fn start_with_snapshots(n: usize, entries: u64) -> Self {
-        Self::start_full(n, rift_cluster::DEFAULT_AUDIT_RETENTION_SECS, Some(entries)).await
+        Self::start_full(
+            n,
+            rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
+            Some(entries),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::start`] with `incapable`'s blob route advertising `applies_digest_only: false`
+    /// (#481) — that one member's build pretends to predate D-49, the digest-only `ControlOp`
+    /// shape. The only way this in-process harness puts a version-skewed member in a cluster
+    /// without standing up two binary versions.
+    async fn start_with_one_member_digest_only_incapable(n: usize, incapable: NodeId) -> Self {
+        Self::start_full(
+            n,
+            rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
+            None,
+            Some(incapable),
+        )
+        .await
     }
 
     async fn start_full(
         n: usize,
         audit_retention_secs: u64,
         snapshot_log_entries: Option<u64>,
+        digest_only_incapable: Option<NodeId>,
     ) -> Self {
         assert!(n >= 1, "a cluster needs at least one node");
         let mut members: Vec<Member> = reserve_ports(n)
@@ -147,12 +192,13 @@ impl TestCluster {
             })
             .collect();
 
-        let n1 = spawn_with_snapshot_policy(
+        let n1 = spawn_full(
             members[0].id,
             members[0].addr,
             members[0].dir.path(),
             audit_retention_secs,
             snapshot_log_entries,
+            digest_only_incapable == Some(members[0].id),
         )
         .await;
         n1.cluster_init().await.expect("bootstrap node 1");
@@ -160,12 +206,13 @@ impl TestCluster {
 
         let seed = Authority::from(members[0].addr);
         for member in members.iter_mut().skip(1) {
-            let node = spawn_with_snapshot_policy(
+            let node = spawn_full(
                 member.id,
                 member.addr,
                 member.dir.path(),
                 audit_retention_secs,
                 snapshot_log_entries,
+                digest_only_incapable == Some(member.id),
             )
             .await;
             node.join_via(&seed)
@@ -5235,6 +5282,95 @@ async fn a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns()
             wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
             "and it keeps going past the parked entry, applying the delete behind it"
         );
+    }
+    cluster.shutdown_all().await;
+}
+
+// ---- #481: a byte quorum is not a decode quorum -----------------------------------------
+
+/// Pins the half of D-53 (#481) that only a real fleet can ask: that a **peer** running a build which
+/// cannot apply digest-only ops is probed over the wire and classified, rather than merely acked.
+///
+/// One member advertises `applies_digest_only: false` (the hidden knob). As a full voter it still
+/// receives the blob during fan-out, so a byte quorum forms exactly as before (`outcome.quorum`) —
+/// D-19 is untouched. What must differ is the fan-out's *verdict*: not every member is confirmed
+/// capable, so it is not safe to strip, and the incapable member is named rather than merged into
+/// a bare boolean an operator could not act on.
+///
+/// Deliberately stops at the verdict. The strip itself lives in
+/// `rift_cluster_server::admin_front::fan_out_then_submit`, which this crate cannot depend on, and
+/// a test that re-implemented the gate here would be asserting against its own copy of the logic —
+/// green no matter what production did. That gate is pinned where it lives, by
+/// `fan_out_then_submit_keeps_the_bytes_when_a_member_cannot_apply_digest_only`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_cannot_apply_digest_only_is_probed_and_named() {
+    let _serial = TEST_LOCK.lock().await;
+    let incapable: NodeId = 3;
+    let mut cluster = TestCluster::start_with_one_member_digest_only_incapable(3, incapable).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    let csv = "id,name\n1,ada\n2,bob\n";
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    {
+        let leader = cluster.leader().expect("leader");
+        let (outcome, pin) = leader
+            .fan_out_blob(&digest, csv.as_bytes())
+            .await
+            .expect("fan-out");
+        assert!(
+            outcome.quorum,
+            "the byte quorum is unaffected: an incapable member still stores the blob (D-19)"
+        );
+        assert!(
+            !outcome.sideload_safe,
+            "one member is not confirmed capable, so stripping is not safe: {:?} / {:?}",
+            outcome.sideload_incapable, outcome.sideload_unobserved
+        );
+        assert!(
+            outcome.sideload_incapable.contains(&incapable),
+            "the incapable member is named so the warning can say who: {:?}",
+            outcome.sideload_incapable
+        );
+        assert!(
+            outcome.skewed.is_empty(),
+            "it has blob routes — it is not the pre-#437 skew case"
+        );
+        drop(pin);
+    }
+    cluster.shutdown_all().await;
+}
+
+/// The mirror: with every member on this build, the same fan-out reports it *is* safe to strip.
+/// Without this, `sideload_safe` could be hard-wired to `false` — closing #481's wedge by
+/// disabling sideloading altogether, which is the epic's whole point undone — and the test above
+/// would still pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fleet_of_capable_members_is_safe_to_strip() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+
+    let csv = "id,name\n1,carol\n2,dan\n";
+    let digest = rift_cluster::blobs::digest_of_bytes(csv.as_bytes());
+    {
+        let leader = cluster.leader().expect("leader");
+        let (outcome, pin) = leader
+            .fan_out_blob(&digest, csv.as_bytes())
+            .await
+            .expect("fan-out");
+        assert!(outcome.quorum);
+        assert!(
+            outcome.sideload_safe,
+            "every member is this build, so nothing should be held back: {:?} / {:?}",
+            outcome.sideload_incapable, outcome.sideload_unobserved
+        );
+        drop(pin);
     }
     cluster.shutdown_all().await;
 }

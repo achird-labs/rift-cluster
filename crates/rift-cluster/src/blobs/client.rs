@@ -26,6 +26,11 @@ pub struct PutOutcome {
     pub resumed_from: u64,
     /// Bytes this call actually sent.
     pub bytes_sent: u64,
+    /// Whether `peer`'s build applies a digest-only `ControlOp` (#481) — surfaced from the
+    /// `?stat` probe `put` already makes of every target before deciding what to send, so a
+    /// caller (`RaftNode::fan_out_blob`) learns each byte-recipient's sideload capability for
+    /// free rather than issuing a second round trip it already paid for.
+    pub applies_digest_only: bool,
 }
 
 /// The node-driven side of the blob transport: moves bytes to and from a
@@ -74,6 +79,18 @@ impl BlobTransfer {
     /// not hold `digest` is `Ok(false)`, not an error.
     pub async fn have(&self, peer: SocketAddr, digest: &BlobDigest) -> Result<bool, RpcError> {
         Ok(self.stat(peer, digest).await?.have)
+    }
+
+    /// Whether `peer`'s build applies a digest-only `ControlOp` (#481), probed without any
+    /// intent to send it bytes — the capability half of `RaftNode::fan_out_blob`'s sweep for a
+    /// member the byte quorum does not include (a learner: it applies the log the same as a
+    /// voter, but D-19 never sends it a `put`, so nothing else would ever ask its `?stat`).
+    ///
+    /// # Errors
+    ///
+    /// Any [`RpcError`] the call itself fails with.
+    pub async fn stat_only(&self, peer: SocketAddr, digest: &BlobDigest) -> Result<bool, RpcError> {
+        Ok(self.stat(peer, digest).await?.applies_digest_only)
     }
 
     /// Fetch `digest` whole from `peer`, looping `GET` chunks until an empty
@@ -136,6 +153,7 @@ impl BlobTransfer {
             return Ok(PutOutcome {
                 resumed_from: total,
                 bytes_sent: 0,
+                applies_digest_only: stat.applies_digest_only,
             });
         }
         if total == 0 {
@@ -146,6 +164,7 @@ impl BlobTransfer {
             return Ok(PutOutcome {
                 resumed_from: 0,
                 bytes_sent: 0,
+                applies_digest_only: stat.applies_digest_only,
             });
         }
         // Never resume at exactly `total`. `write_chunk` commits only on the
@@ -161,6 +180,7 @@ impl BlobTransfer {
         Ok(PutOutcome {
             resumed_from,
             bytes_sent,
+            applies_digest_only: stat.applies_digest_only,
         })
     }
 

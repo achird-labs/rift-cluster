@@ -715,6 +715,10 @@ pub async fn start_with_runtimes(
             engine: Some(Arc::clone(&manager)),
             audit_retention_secs: cli.cluster.cluster_audit_retention,
             snapshot_log_entries: cli.cluster.cluster_snapshot_log_entries,
+            // A hidden testability knob (#481), not an operator flag — a shipped fleet never
+            // sets this, so nothing in `cli` drives it, in the same style as
+            // `NodeConfig::advertise_as_digest_only_incapable`'s own doc comment describes.
+            advertise_as_digest_only_incapable: false,
         },
         Arc::clone(&front_door_routes),
         // Bound before `Raft::new` (issue #224), the same before-construction contract as
