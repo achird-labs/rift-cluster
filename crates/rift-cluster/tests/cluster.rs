@@ -3900,6 +3900,7 @@ async fn the_pin_a_fan_out_returns_protects_the_blob_until_it_is_dropped() {
             &unreferenced,
             &std::collections::HashMap::new(),
             0,
+            0,
             far_future,
             3600,
         )
@@ -3916,6 +3917,7 @@ async fn the_pin_a_fan_out_returns_protects_the_blob_until_it_is_dropped() {
         .gc(
             &unreferenced,
             &std::collections::HashMap::new(),
+            0,
             0,
             far_future,
             3600,
@@ -5076,6 +5078,11 @@ async fn a_blob_only_applied_state_holds_is_served_to_a_member_that_must_fetch_i
 /// digest-only `PUT` and finds no holder anywhere. It cannot be rescued by compaction either —
 /// openraft's state-machine worker runs `apply` and `install_snapshot` on one sequential loop, so
 /// the snapshot that would skip the blob queues behind the parked apply and never runs.
+///
+/// Since D-55 (#504) the sweep below retains for a second reason as well: the lagging voter is
+/// *down* when it runs, so the fleet applied floor is unknown and rule C holds every tombstoned
+/// blob regardless of the purge point. Rule A still holds it on its own — the purge point here
+/// is far below the tombstone — so this test's claim is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_blob_deleted_while_a_voter_lags_is_retained_until_the_log_is_purged_past_it() {
     let _serial = TEST_LOCK.lock().await;
@@ -5122,7 +5129,7 @@ async fn a_blob_deleted_while_a_voter_lags_is_retained_until_the_log_is_purged_p
         .as_secs()
         + 10_000;
     for node in cluster.live() {
-        node.run_blob_gc_now(past_the_grace).expect("sweep");
+        node.run_blob_gc_now(past_the_grace).await.expect("sweep");
         assert!(
             node.blobs().stat(&digest).expect("stat").have,
             "node {} must retain a blob its log has not been purged past",
@@ -5149,6 +5156,255 @@ async fn a_blob_deleted_while_a_voter_lags_is_retained_until_the_log_is_purged_p
         );
     }
     cluster.shutdown_all().await;
+}
+
+/// Pins D-55 (#504): blob GC retains a tombstoned digest until **every member has applied past
+/// it** — rule C — because the purge point alone (D-52 rule A) does not protect a replica whose
+/// log is ahead of its applied index. The issue's exact sequence, end to end:
+///
+/// 1. A voter is down for a digest-only `PUT` at `p` and the `DatasetDelete` at `t` behind it.
+/// 2. The bytes are reaped from every live member; the voter returns, replays `p` from the log,
+///    finds no holder and **parks** (D-48) while replication keeps filling its log. This is the
+///    state rule A cannot see: its log runs past `t` — and past the leader's purge point, once
+///    the log compacts — so it will never be offered a snapshot; its applied index is below `p`.
+/// 3. The request grace lapses (rule B no longer holds anything), one holder is restored, and
+///    that holder sweeps with its log purged past `t`. **Under D-52 alone this reaps the blob**
+///    — `t <= purged`, nobody asked within the grace — and the parked voter, still replaying `p`
+///    from its own log against a fleet that holds nothing, wedges forever. Under rule C the
+///    floor is the parked voter's own applied index, below `p`, so the blob stays.
+/// 4. The parked voter's next probe finds the retained holder: it fetches, applies `p` and then
+///    the delete at `t`. Now every member has applied past `t`, and the same sweep reaps it.
+///
+/// Both halves are asserted; the first is the discriminator. The request grace is expired by
+/// hand for the same reason the sweep runs at a synthetic `now`: the loop's real clocks would
+/// keep the blob for an hour whether or not retention works, and the test would prove nothing.
+/// The issue's step 4 — the voter *restarts* between the delete and the sweep — is the same
+/// state seen from the holders (no request inside the grace), and is not staged literally: a
+/// parked apply holds openraft's state-machine worker, so an in-process restart of a parked node
+/// cannot release its storage (see `RaftNode::shutdown`'s storage-release wait).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_deleted_while_a_replica_is_parked_is_retained_until_every_member_has_applied_past_it()
+ {
+    let _serial = TEST_LOCK.lock().await;
+    // Snapshot (and purge to the tip) every 24 entries: late enough that nothing is purged before
+    // the returning voter has caught its log up past `t`, early enough that a few dozen fill
+    // writes push every live member's purge point past `t` inside the test.
+    let mut cluster = TestCluster::start_with_snapshots(3, 24).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let leader_id = cluster.leader().expect("leader").id();
+    let parked = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader_id)
+        .expect("a follower");
+    cluster.kill(parked).await;
+
+    // (1) `PUT` at `p`, delete at `t`, with the voter down for both.
+    let csv = "id,name\n1,ada\n2,bob\n";
+    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, parked, csv).await;
+    let p = cluster
+        .leader()
+        .expect("leader")
+        .status()
+        .last_applied
+        .expect("applied the put");
+    let t = cluster
+        .leader()
+        .expect("two of three still lead")
+        .submit(dataset_delete("customers"))
+        .await
+        .expect("commits")
+        .revision;
+    assert!(t > p);
+    for node in cluster.live() {
+        assert!(
+            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
+            "live node {} applies the delete, dropping its blob row",
+            node.id()
+        );
+        // Reap the bytes so the returning voter has nothing to fetch (D-51's applied-state
+        // holder is gone with the delete) and parks — the D-48 setup.
+        std::fs::remove_file(node.blobs().path_of(&digest)).expect("reap the blob from a holder");
+    }
+
+    // (2) The voter returns, replays `p` from its log and parks; replication keeps filling its
+    // log. Fill until every live member's log is purged past `t`, one write at a time, waiting
+    // for the parked voter's log to reach each entry before the next: the leader purges the
+    // moment it snapshots, and the parked voter must be at the tip when that happens or openraft
+    // switches it to a snapshot — the *other* case, which D-52 already covers.
+    cluster.restart(parked).await;
+    let fill_deadline = Instant::now() + Duration::from_secs(120);
+    let mut fill = 0_u32;
+    loop {
+        let purged_past_t = cluster
+            .live()
+            .filter(|node| node.id() != parked)
+            .all(|node| node.purged_index().is_some_and(|purged| purged >= t));
+        if purged_past_t {
+            break;
+        }
+        assert!(
+            Instant::now() < fill_deadline,
+            "the live members never purged past t={t} (fills: {fill})"
+        );
+        let revision = cluster
+            .leader()
+            .expect("leader")
+            .submit(dataset_put(
+                &format!("fill{fill}"),
+                &format!("id,v\n{fill},x\n"),
+            ))
+            .await
+            .expect("fill commits")
+            .revision;
+        fill += 1;
+        let parked_node = cluster.member(parked).node.as_ref().expect("restarted");
+        assert!(
+            wait_for_log_index(parked_node, revision, Duration::from_secs(30)).await,
+            "the parked voter's log must keep up with the tip (wanted {revision}, at {:?})",
+            parked_node.last_log_index()
+        );
+    }
+    let purge_floor = cluster
+        .live()
+        .filter(|node| node.id() != parked)
+        .map(|node| node.purged_index().expect("purged past t"))
+        .max()
+        .expect("two live members");
+    {
+        let node = cluster.member(parked).node.as_ref().expect("restarted");
+        assert!(
+            wait_for_log_index(node, purge_floor, Duration::from_secs(30)).await,
+            "log ahead of the purge point: the voter is caught up by entries, never a snapshot"
+        );
+        let applied = node.status().last_applied.unwrap_or(0);
+        assert!(
+            applied < p,
+            "parked below p={p}: applied {applied} — the bytes must be unobtainable"
+        );
+        assert!(
+            node.dataset(DEFAULT_TENANT, "customers")
+                .expect("the node still answers")
+                .is_none(),
+            "parked, not applied"
+        );
+    }
+
+    // (3) Restore ONE holder, let the request grace lapse, and sweep past the mtime grace — all
+    // three within the same few milliseconds. Restoring the holder is also what lets the parked
+    // voter's next fetch round succeed, so the window between the restore and the sweep's own
+    // floor probe must be small against the voter's round interval: one holder keeps the window
+    // to this node's probe (a restore on a second holder would let the voter fetch, apply past
+    // `t`, and lift the floor before the second sweep). The voter's backoff doubles from
+    // `FETCH_BACKOFF_MIN` to its 5 s cap in about 6 s of parking; waiting that out first puts the
+    // window at a few ms in 5 s. A lost race reads as a voided premise below, not as retention
+    // failing.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    let past_the_grace = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs()
+        + 10_000;
+    let holder = cluster
+        .live()
+        .find(|node| node.id() != parked)
+        .expect("a live member other than the parked voter");
+    let purged = holder.purged_index().expect("purged");
+    assert!(
+        purged >= t,
+        "precondition: rule A alone would reap at {purged}"
+    );
+    holder
+        .blobs()
+        .store_whole(&digest, csv.as_bytes())
+        .expect("restore the blob on a holder");
+    holder.blobs().expire_requests();
+    holder.run_blob_gc_now(past_the_grace).await.expect("sweep");
+    let still_parked = cluster
+        .member(parked)
+        .node
+        .as_ref()
+        .expect("live")
+        .status()
+        .last_applied
+        .is_none_or(|applied| applied < p);
+    assert!(
+        still_parked,
+        "premise void, not a retention failure: the voter fetched and applied past p={p} inside \
+         the restore→sweep window"
+    );
+    assert!(
+        holder.blobs().stat(&digest).expect("stat").have,
+        "node {} must retain a blob a member parked below p={p} still needs — \
+         under D-52 alone (purged {purged} >= t {t}, nobody asked within the grace) this is reaped",
+        holder.id()
+    );
+
+    // (4) The parked voter's next probe finds a holder: it fetches, applies `p` and the delete.
+    {
+        let node = cluster.member(parked).node.as_ref().expect("live");
+        assert!(
+            wait_for_blob(node, &digest, Duration::from_secs(60)).await,
+            "the parked voter fetches the retained blob"
+        );
+        assert!(
+            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
+            "and applies the delete behind the entry it was parked on"
+        );
+        assert!(
+            wait_for_applied_index(node, t, Duration::from_secs(30)).await,
+            "applied past t={t}: at {:?}",
+            node.status().last_applied
+        );
+        assert_eq!(
+            node.blob_fetch_stall(),
+            None,
+            "the stall clears on recovery"
+        );
+    }
+    // Every member has now applied past `t`: the floor lifts and the same sweep reaps.
+    for node in cluster.live().filter(|node| node.id() != parked) {
+        node.blobs().expire_requests();
+        node.run_blob_gc_now(past_the_grace).await.expect("sweep");
+        assert!(
+            !node.blobs().stat(&digest).expect("stat").have,
+            "node {} reaps once every member has applied past the tombstone",
+            node.id()
+        );
+    }
+    cluster.shutdown_all().await;
+}
+
+/// Poll `node` until its log reaches `index`, or `deadline` passes.
+async fn wait_for_log_index(node: &RaftNode, index: u64, deadline: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if node.last_log_index().is_some_and(|last| last >= index) {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Poll `node` until its applied index reaches `index`, or `deadline` passes.
+async fn wait_for_applied_index(node: &RaftNode, index: u64, deadline: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if node.status().last_applied.is_some_and(|last| last >= index) {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Pins D-48: a blob no reachable member holds parks the follower's apply — it does not halt

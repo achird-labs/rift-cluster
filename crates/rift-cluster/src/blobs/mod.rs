@@ -390,6 +390,19 @@ impl BlobStore {
             .is_some_and(|instant| instant.elapsed() < grace)
     }
 
+    /// Forget every recorded request, as if rule B's grace had lapsed for all of them — test-facing
+    /// (D-55, #504). A request is aged by [`Instant::elapsed`] and nothing else, on purpose (see
+    /// [`Self::last_requested`]), which is also why `RaftNode::run_blob_gc_now`'s synthetic `now`
+    /// cannot move it: a fleet test that must sweep *after* a parked replica has stopped asking
+    /// would otherwise wait out the whole grace, or prove nothing.
+    #[doc(hidden)]
+    pub fn expire_requests(&self) {
+        self.last_requested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
     /// Drop every [`Self::last_requested`] entry [`Self::requested_recently`] would already treat
     /// as stale, so a departed peer's one-time probe cannot pin an entry in memory forever
     /// (#480). Called once per [`Self::gc`] sweep — housekeeping bound to the same grace, not a
@@ -649,13 +662,13 @@ impl BlobStore {
     }
 
     /// Remove every committed blob that is unreferenced, unpinned, not tombstoned ahead of
-    /// `purged`, not recently requested, and past `grace_secs` since it was last written; also
-    /// reap any staging file past the same grace (referenced by nobody, readable by nobody —
-    /// pure leak once abandoned). Returns [`BlobGcOutcome`]: `removed` counts *committed* blobs
-    /// removed (reaped staging files are not counted — they were never a blob); `retained` counts
-    /// committed blobs kept alive by rule A below (a live tombstone), which is what
-    /// `RaftNode::blob_gc_sweep` reports to its metric rather than re-deriving from
-    /// `sm_blob_tombstones` by hand.
+    /// `purged` or of `fleet_min_applied`, not recently requested, and past `grace_secs` since it
+    /// was last written; also reap any staging file past the same grace (referenced by nobody,
+    /// readable by nobody — pure leak once abandoned). Returns [`BlobGcOutcome`]: `removed`
+    /// counts *committed* blobs removed (reaped staging files are not counted — they were never a
+    /// blob); `retained` counts committed blobs kept alive by the tombstone rules A and C below,
+    /// which is what `RaftNode::blob_gc_sweep` reports to its metric rather than re-deriving
+    /// from `sm_blob_tombstones` by hand.
     ///
     /// `grace_secs == 0` disables GC entirely — mirrors `gc_audit`'s
     /// `retention_secs == 0` early return — and removes nothing, including
@@ -685,6 +698,16 @@ impl BlobStore {
     /// returns `None` until the log is first compacted). A node that does not know its own purge
     /// point must not be the one that decides a tombstoned blob is expendable.
     ///
+    /// A third criterion, D-55 (#504): `fleet_min_applied` is the lowest applied index across
+    /// every member of the fleet, and a tombstone still ahead of *it* keeps the blob too, however
+    /// far this node's own log has been purged. The purge point covers a replica that is caught up
+    /// by a snapshot; it says nothing about one whose log is already ahead of its applied index —
+    /// a replica that parked (D-48) while replication kept filling its log, then restarted, is
+    /// never offered a snapshot and replays the `PUT` from the log it already holds. Only "every
+    /// member has applied past the unreferencing index" rules that out. `fleet_min_applied == 0`
+    /// carries the same meaning as `purged == 0`: some member could not be asked, so nothing
+    /// tombstoned is expendable this sweep.
+    ///
     /// # Errors
     ///
     /// A filesystem failure reading the store's directories or removing a
@@ -694,6 +717,7 @@ impl BlobStore {
         referenced: &HashSet<String>,
         tombstones: &HashMap<String, u64>,
         purged: u64,
+        fleet_min_applied: u64,
         now_secs: u64,
         grace_secs: u64,
     ) -> Result<BlobGcOutcome, BlobError> {
@@ -744,12 +768,16 @@ impl BlobStore {
             if self.is_pinned(digest.as_str()) {
                 continue;
             }
-            // D-52 rule A (#480) — see this function's doc for the full reasoning. Counted here,
-            // at the exact point a blob is kept *because of this rule*, so `retained` can never
-            // drift from what this arm actually does — unlike counting tombstone rows directly,
-            // which would count a digest whose bytes were never on this node at all.
+            // D-52 rule A (#480) and D-55 rule C (#504) — see this function's doc for the full
+            // reasoning. Counted here, at the exact point a blob is kept *because of these rules*,
+            // so `retained` can never drift from what this arm actually does — unlike counting
+            // tombstone rows directly, which would count a digest whose bytes were never on this
+            // node at all.
             if let Some(&tombstoned_at) = tombstones.get(digest.as_str())
-                && (purged == 0 || tombstoned_at > purged)
+                && (purged == 0
+                    || tombstoned_at > purged
+                    || fleet_min_applied == 0
+                    || tombstoned_at > fleet_min_applied)
             {
                 retained += 1;
                 continue;
@@ -1329,6 +1357,7 @@ mod tests {
                 &referenced(&[]),
                 &tombstoned(&[(HELLO_DIGEST, 42)]),
                 41,
+                42,
                 now_secs() + 10_000_000,
                 3600,
             )
@@ -1354,6 +1383,7 @@ mod tests {
                 &referenced(&[]),
                 &tombstoned(&[(HELLO_DIGEST, 42)]),
                 42,
+                42,
                 now_secs() + 10_000_000,
                 3600,
             )
@@ -1375,6 +1405,7 @@ mod tests {
                 &referenced(&[]),
                 &tombstoned(&[(HELLO_DIGEST, 0)]),
                 0,
+                1,
                 now_secs() + 10_000_000,
                 3600,
             )
@@ -1387,6 +1418,119 @@ mod tests {
         );
     }
 
+    /// Pins D-55 / rule C (#504): the purge point is not enough. A replica whose log is ahead of
+    /// its applied index (it parked, replication kept filling its log, it restarted) is never
+    /// offered a snapshot — it replays the `PUT` from its own log — so a holder whose log has
+    /// purged past the tombstone must still keep the blob until *every* member has applied past
+    /// it. Purged 50 has passed the unreferencing index 42; the fleet floor 41 has not. Keep.
+    #[test]
+    fn gc_keeps_a_tombstoned_blob_the_log_has_purged_past_while_a_member_has_not_applied_past_it() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &tombstoned(&[(HELLO_DIGEST, 42)]),
+                50,
+                41,
+                now_secs() + 10_000_000,
+                3600,
+            )
+            .expect("gc");
+
+        assert_eq!(
+            outcome.removed, 0,
+            "fleet floor 41 has not passed the unreferencing index 42, whatever purged says"
+        );
+        assert_eq!(
+            outcome.retained, 1,
+            "held under the tombstone rules, so the gauge must count it"
+        );
+        assert!(store.stat(&d).expect("stat").have);
+    }
+
+    /// Pins D-55 (#504): rule A is not subsumed by rule C. A fleet that has applied past the
+    /// tombstone says nothing about a *future* member — a joiner takes a snapshot, and only this
+    /// node's own purge point guarantees that snapshot's manifest omits the digest (D-50). Floor
+    /// 50 has passed 42; purged 41 has not. Keep.
+    #[test]
+    fn gc_keeps_a_tombstoned_blob_the_fleet_has_applied_past_while_this_log_has_not_purged_past_it()
+    {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &tombstoned(&[(HELLO_DIGEST, 42)]),
+                41,
+                50,
+                now_secs() + 10_000_000,
+                3600,
+            )
+            .expect("gc");
+
+        assert_eq!(outcome.removed, 0, "purged 41 has not passed 42");
+        assert_eq!(outcome.retained, 1);
+        assert!(store.stat(&d).expect("stat").have);
+    }
+
+    /// Pins D-55 (#504): both bounds inclusive. Purged == floor == the unreferencing index means
+    /// every current member has applied the entry that unreferenced the digest and every future
+    /// member is snapshot-fed from a manifest that omits it. Reap.
+    #[test]
+    fn gc_reaps_a_tombstoned_blob_once_both_the_purge_point_and_the_fleet_floor_pass_it() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &tombstoned(&[(HELLO_DIGEST, 42)]),
+                42,
+                42,
+                now_secs() + 10_000_000,
+                3600,
+            )
+            .expect("gc");
+
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.retained, 0);
+        assert!(!store.stat(&d).expect("stat").have);
+    }
+
+    /// Pins D-55 (#504), fail closed: a fleet floor of `0` means "some member could not be
+    /// asked", never "everyone is at index 0" (real indices start at 1) — the same convention
+    /// `purged == 0` already carries. A purge point far past the tombstone changes nothing.
+    #[test]
+    fn gc_reaps_nothing_tombstoned_when_the_fleet_floor_is_unknown() {
+        let (store, _dir) = store();
+        put_whole(&store, HELLO_DIGEST, b"hello");
+        let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
+
+        let outcome = store
+            .gc(
+                &referenced(&[]),
+                &tombstoned(&[(HELLO_DIGEST, 42)]),
+                1_000,
+                0,
+                now_secs() + 10_000_000,
+                3600,
+            )
+            .expect("gc");
+
+        assert_eq!(
+            outcome.removed, 0,
+            "an unknown fleet floor reaps nothing that was ever referenced"
+        );
+        assert_eq!(outcome.retained, 1);
+        assert!(store.stat(&d).expect("stat").have);
+    }
+
     /// A blob no row ever referenced carries no tombstone — a fan-out leftover — and keeps today's
     /// rule untouched. This pins that #480 narrowed nothing it was not meant to.
     #[test]
@@ -1395,7 +1539,7 @@ mod tests {
         put_whole(&store, HELLO_DIGEST, b"hello");
 
         let outcome = store
-            .gc(&referenced(&[]), &no_tombstones(), 0, now_secs(), 3600)
+            .gc(&referenced(&[]), &no_tombstones(), 0, 0, now_secs(), 3600)
             .expect("gc");
         assert_eq!(
             outcome.removed, 0,
@@ -1406,6 +1550,7 @@ mod tests {
             .gc(
                 &referenced(&[]),
                 &no_tombstones(),
+                0,
                 0,
                 now_secs() + 10_000,
                 3600,
@@ -1456,6 +1601,7 @@ mod tests {
                 &referenced(&[]),
                 &tombstoned(&[(HELLO_DIGEST, 1)]),
                 99,
+                99,
                 now_secs(),
                 3600,
             )
@@ -1481,6 +1627,7 @@ mod tests {
             .gc(
                 &referenced(&[]),
                 &tombstoned(&[(HELLO_DIGEST, 1)]),
+                99,
                 99,
                 now_secs(),
                 3600,
@@ -1513,7 +1660,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1_100));
 
         let outcome = store
-            .gc(&referenced(&[]), &no_tombstones(), 0, now_secs(), 1)
+            .gc(&referenced(&[]), &no_tombstones(), 0, 0, now_secs(), 1)
             .expect("gc");
 
         assert_eq!(
@@ -1536,6 +1683,7 @@ mod tests {
                 &referenced(&[HELLO_DIGEST]),
                 &no_tombstones(),
                 0,
+                0,
                 now_secs() + 10_000_000,
                 3600,
             )
@@ -1557,6 +1705,7 @@ mod tests {
                 &referenced(&[]),
                 &no_tombstones(),
                 0,
+                0,
                 now_secs() + 10_000,
                 3600,
             )
@@ -1576,7 +1725,7 @@ mod tests {
         let d = BlobDigest::parse(HELLO_DIGEST).expect("digest");
 
         let outcome = store
-            .gc(&referenced(&[]), &no_tombstones(), 0, now_secs(), 3600)
+            .gc(&referenced(&[]), &no_tombstones(), 0, 0, now_secs(), 3600)
             .expect("gc");
 
         assert_eq!(outcome.removed, 0);
@@ -1593,6 +1742,7 @@ mod tests {
             .gc(
                 &referenced(&[]),
                 &no_tombstones(),
+                0,
                 0,
                 now_secs() + 10_000_000,
                 0,
@@ -1627,6 +1777,7 @@ mod tests {
                 &referenced(&[]),
                 &no_tombstones(),
                 0,
+                0,
                 now_secs() + 10_000_000,
                 3600,
             )
@@ -1652,6 +1803,7 @@ mod tests {
             .gc(
                 &referenced(&[]),
                 &no_tombstones(),
+                0,
                 0,
                 now_secs() + 10_000_000,
                 3600,
@@ -1682,6 +1834,7 @@ mod tests {
                 &referenced(&[]),
                 &no_tombstones(),
                 0,
+                0,
                 now_secs() + 10_000_000,
                 3600,
             )
@@ -1697,6 +1850,7 @@ mod tests {
             .gc(
                 &referenced(&[]),
                 &no_tombstones(),
+                0,
                 0,
                 now_secs() + 10_000_000,
                 3600,
@@ -1722,6 +1876,7 @@ mod tests {
                 &referenced(&[]),
                 &no_tombstones(),
                 0,
+                0,
                 now_secs() + 10_000_000,
                 3600,
             )
@@ -1746,6 +1901,7 @@ mod tests {
                 &referenced(&[]),
                 &no_tombstones(),
                 0,
+                0,
                 now_secs() + 10_000,
                 3600,
             )
@@ -1763,7 +1919,7 @@ mod tests {
         store.write_chunk(&d, 0, b"hello ", 11).expect("partial");
 
         store
-            .gc(&referenced(&[]), &no_tombstones(), 0, now_secs(), 3600)
+            .gc(&referenced(&[]), &no_tombstones(), 0, 0, now_secs(), 3600)
             .expect("gc");
 
         assert_eq!(store.stat(&d).expect("stat").staged, 6);
@@ -1781,7 +1937,7 @@ mod tests {
         put_whole(&store, HELLO_WORLD_DIGEST, b"hello world");
         let swept_at = now_secs() + 10_000;
         store
-            .gc(&referenced(&[]), &no_tombstones(), 0, swept_at, 3600)
+            .gc(&referenced(&[]), &no_tombstones(), 0, 0, swept_at, 3600)
             .expect("gc");
 
         let watermark = store.watermark().expect("watermark");
@@ -1800,6 +1956,7 @@ mod tests {
                 .gc(
                     &referenced(&[]),
                     &no_tombstones(),
+                    0,
                     0,
                     now_secs() + 10_000,
                     3600,
@@ -2019,6 +2176,7 @@ mod tests {
                 &referenced(&[]),
                 &no_tombstones(),
                 0,
+                0,
                 now_secs() + 10_000,
                 3600,
             )
@@ -2033,6 +2191,7 @@ mod tests {
                 .gc(
                     &referenced(&[]),
                     &no_tombstones(),
+                    0,
                     0,
                     now_secs() + 10_000,
                     3600
