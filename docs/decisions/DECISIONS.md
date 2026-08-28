@@ -264,17 +264,44 @@ the snapshot's metadata; only where the payload bytes are written changed.
 ### D-17 — Flow state stays off consensus
 - **Status:** active
 - **Decided:** 2026-07-21 · ADR-001
-- **Implemented by:** #465 (the isolated-owner rule, for flow KV)
+- **Implemented by:** #465 (the isolated-owner rule, for flow KV), #472 (the measured cost)
 - **Code:** crates/rift-cluster/src/stores/flow.rs, crates/rift-cluster/src/raft/ring.rs
 
-**Paid, honestly (2026-08-25, #465).** Enforcing the isolated-owner rule puts one
-consensus-shaped pause on the otherwise consensus-free flow path: `is_isolated()` is `true`
-whenever a node's `current_leader` is unknown, so a leader election makes every node that has lost
-sight of the leader refuse owner-side flow writes and `strong` reads until a leader is
-re-established — sub-second typically, up to the ~1–3 s D-15 accepts for admin writes when
-contended. This is stricter than this entry's own "3 × election_timeout" wording, which would ride
-out a routine election; the primitive fails closed immediately and that is what ships. Whether the
-flow path should take the looser grace is #472. `local` reads (D-10) are unaffected.
+**Paid, honestly — measured (2026-08-28, #472; supersedes the #465 estimate).** Enforcing the
+isolated-owner rule puts one consensus-shaped pause on the otherwise consensus-free flow path:
+`is_isolated()` is `true` whenever a node's `current_leader` is unknown, so a node that has lost
+sight of the leader refuses owner-side flow writes and `strong` reads until a leader is
+re-established. The cost is **not** the "sub-second typically, up to the ~1–3 s D-15 accepts"
+figure this entry carried from #465 — that was reasoned from the election *timeout*, never
+measured, and it is ~30× too high. Measured on a 3-node cluster (leader killed, survivors sampled
+at ~1 ms, 10 rounds / 20 observations):
+
+- a **follower** isolates **450–600 ms** after it last heard the leader — openraft sets
+  `leader_lease = election_timeout_max` and campaigns only after `leader_lease +
+  rand(election_timeout_min..max)`, so followers already have a lease-shaped grace and this
+  primitive only bites after it;
+- a **leader** isolates **900 ms** after its last quorum ack (`ISOLATION_WINDOW_MS`);
+- a routine election isolates each node for **tens of milliseconds** — the election round trip
+  plus the new leader's first quorum-ack, because `current_leader` is `None` exactly while the
+  node's vote is uncommitted — plus 150–300 ms per extra round on a split vote (0 of 10 rounds).
+  The #472 probe measured **13–31 ms**; re-measuring while writing this entry's guard test, on
+  different hardware and with a coarser ~8 ms sampler, gave **32–40 ms**. Both are the same
+  quantity and both are two orders of magnitude below the figure this entry used to state; take
+  the band as **~13–40 ms, hardware-dependent**, and do not quote either end as exact.
+
+State the asymmetry plainly: the follower grace is openraft's 450–600 ms, the leader grace is our
+900 ms. At ~25 ms per node per election this is stricter than this entry's own
+"3 × election_timeout" wording, which would ride out a routine election; the primitive fails closed
+immediately and that is what ships. `local` reads (D-10) are unaffected.
+
+*Rejected (#472, on these numbers):* a follower-side grace matching the literal wording — it buys
+~25 ms and pays ~900 ms, letting a partitioned minority owner serve for ~1.4 s before refusing,
+which is the "CAS succeeded, then vanished" outcome D-10 exists to forbid. *If* election-time
+`503`s are ever observed in a real deployment, the shape to reach for is a **bounded wait** in
+`owner_write` and the owner branch of a `strong` read (delay the decision rather than refuse it;
+zero safety regression, since the node still never serves while leaderless) — that would change
+what an election costs the data path from errors to latency, so it gets its own `D-n` rather than
+being folded in here.
 
 HRW ownership + successor replication + WAL; ownership is *derived from committed membership*. A
 quorum write per scenario transition at 20–40k RPS is an outage, not a design. D-8 (cursor reset
