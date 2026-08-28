@@ -2068,6 +2068,119 @@ async fn an_isolated_owner_refuses_writes_and_strong_reads_but_not_local_ones() 
         .expect("shutdown owner");
 }
 
+/// Pins D-61 (#471): the runbook signal survives the forwarding hop.
+///
+/// The sibling test above reads on the isolated owner itself. This one reads through a **live
+/// non-owner**, which is the path an on-call actually hits, and the path that used to lie: the
+/// owner's `Unavailable` was flattened into this hop's `RpcError::Transport`, so the client saw
+/// `502 transport failure: <authority> unreachable (…)` for a peer that was up and had said
+/// exactly what was wrong — sending triage at the network instead of at quorum state.
+///
+/// Four members, not three: the owner must be isolated *while another node is still alive to
+/// forward through*, so the survivors have to be a minority. Two of four is; two of three is not.
+#[tokio::test]
+async fn a_forwarded_refusal_from_an_isolated_owner_is_unavailable_not_unreachable() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster_of(4, Duration::from_millis(200)).await;
+
+    // `flow_cluster_of` returns as soon as the ring holds four members, but a joiner enters as a
+    // learner — so wait for the promotion sweep before counting on a quorum. Without this the
+    // effective membership can still be three voters plus a learner, where killing two leaves
+    // 2 of 3 and the survivors keep their quorum; the test would then fail on arithmetic that
+    // has nothing to do with what it pins.
+    let voters_by = Instant::now() + CONVERGE;
+    while members
+        .iter()
+        .any(|m| m.node.status().voters.len() != members.len())
+        && Instant::now() < voters_by
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for member in &members {
+        assert_eq!(
+            member.node.status().voters.len(),
+            4,
+            "every member must be a voter, or `two of four is a minority` is not the arithmetic \
+             this test is running"
+        );
+    }
+
+    let flow = "flow-forwarded-refusal";
+    let owner_id = members[0]
+        .node
+        .ring()
+        .owner(OwnedKey::new(KeyClass::FlowKv, &stored(flow)))
+        .expect("a formed cluster owns every key");
+    let owner_ix = members
+        .iter()
+        .position(|m| m.node.id() == owner_id)
+        .expect("the owner is one of the four members");
+    // The forwarder must be a *follower*, and the leader must not survive. D-17 isolates a
+    // follower only while it cannot see a leader, so keeping the leader alive as the forwarder
+    // would leave the owner hearing heartbeats and never isolated — the survivors would be one
+    // correctly-isolated leader and one unbothered follower, which is not the situation this
+    // test is about. The exception is an owner that *is* the leader: it isolates on its own
+    // quorum-ack age, and any surviving follower can forward to it.
+    let leader_id = members[0]
+        .node
+        .status()
+        .current_leader
+        .expect("a converged cluster has a leader");
+    let forwarder_ix = (0..members.len())
+        .find(|ix| {
+            *ix != owner_ix && (owner_id == leader_id || members[*ix].node.id() != leader_id)
+        })
+        .expect("a four-member cluster has a non-owner that is not the leader");
+
+    // Two of four left alive: short of the three-voter majority, so the owner loses its quorum
+    // while staying reachable over RPC from the forwarder.
+    for (ix, member) in members.iter().enumerate() {
+        if ix != owner_ix && ix != forwarder_ix {
+            member.node.shutdown().await.expect("shutdown peer");
+        }
+    }
+
+    let isolated_by = Instant::now() + CONVERGE;
+    while !members[owner_ix].node.is_isolated() && Instant::now() < isolated_by {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        members[owner_ix].node.is_isolated(),
+        "an owner that lost its quorum must report isolated"
+    );
+
+    let forwarded = store_on(&members[forwarder_ix], serde_json::json!({}));
+    let err = blocking(move || forwarded.get(flow, "k"))
+        .await
+        .expect_err("a strong read forwarded to an isolated owner must fail loudly");
+    let text = err.to_string();
+
+    assert!(
+        text.contains("owner is isolated"),
+        "the owner's own reason must survive the hop: {text}"
+    );
+    assert!(
+        !text.contains("unreachable"),
+        "the owner answered, so the hop must not report it as unreachable: {text}"
+    );
+    assert!(
+        !text.contains("transport failure"),
+        "a peer-answered refusal is not this hop's transport failure (502): {text}"
+    );
+    assert!(
+        text.contains("unavailable:"),
+        "the refusal must keep the owner's `Unavailable` class (503): {text}"
+    );
+
+    for ix in [owner_ix, forwarder_ix] {
+        members[ix]
+            .node
+            .shutdown()
+            .await
+            .expect("shutdown survivor");
+    }
+}
+
 /// Pins where the D-17 check sits in `owner_write`'s sequence: fence, then
 /// ownership, then isolation. It does **not** prove the guard exists — delete the
 /// guard entirely and this still passes, because both refusals below are reached

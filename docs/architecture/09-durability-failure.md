@@ -66,6 +66,25 @@ owner-read emits no metric at all today. That asymmetry is the reason to watch
 the *condition* rather than its symptoms: a read-heavy workload can trip the
 isolated-owner rule continuously and move none of the counters above.
 
+The **message** is the same refusal wherever the read entered the cluster. A
+`strong` read forwarded to an isolated owner fails with `flow store: unavailable:
+flow store: owner is isolated from the cluster` through any node (D-61): the
+forwarding hop relays the owner's own error instead of restating it as its own
+transport failure. Before #471 the same read reported `flow store: transport
+failure: <authority> unreachable (<addr>: …)`, which pointed on-call at the
+network for a peer that was up and had answered — the reason survived only as a
+substring of a sentence that contradicted it.
+
+The **status** does not change, and it is worth knowing which one you get. The
+store hands the engine a bare `anyhow::Error`, so the data plane's
+`backend_error_response` finds no `BackendUnavailable` to downcast to and answers
+**500** — or, for a `{{ state.k }}` token with `RIFT_DEBUG` unset, **200** with the
+token rendered empty. Isolation is therefore not distinguishable by status on the
+data plane, before or after this change; the message and the `rift_cluster_isolated`
+gauge are the signals. Giving the refusal its own 503 would mean carrying
+`BackendUnavailable` out of the clustered store, which is a data-plane contract
+change and is not this one.
+
 The condition is `rift_cluster_isolated` — a gauge, `1` while this node cannot
 see the quorum, `0` otherwise (#470) — and the `isolated` field of
 `/_cluster/health` (and `/_fleet/health`). Both are the same sample of the same
