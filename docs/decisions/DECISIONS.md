@@ -970,9 +970,15 @@ mtime, so it was never a retention window for a blob that was live and then dele
 entry, such a blob was reaped on the next 60 s tick on every member — the window in #480 was 60
 seconds, not an hour.
 
-*Rejected:* a leader-published fleet-minimum applied index — it needs a dissemination channel that
-does not exist, and watches the wrong index (a parked node's *matched* index keeps advancing while
-its applied index does not, so the leader's view could never see the case). *Also rejected:*
+*Rejected:* a leader-published fleet-minimum applied index — it watches the wrong index (a parked
+node's *matched* index keeps advancing while its applied index does not, so the leader's replication
+view could never see the case), and disseminating the *applied* index instead is a layering change
+this entry did not want to make. **Correction (#504):** this rejection originally also claimed such
+a channel "does not exist". That was wrong — `RaftNode::status()` already reports `last_applied` per
+node, and `rift-cluster-server`'s `fleet_health` already fans out to every member and folds each
+one's `/_cluster/health` into a rolled-up row. What is actually in the way is that blob GC lives in
+`rift-cluster` and that fan-out lives in `rift-cluster-server`, so the dependency would invert the
+two. A build, not an impossibility; tracked in **#504**. *Also rejected:*
 leader-only GC (followers grow without bound); accepting the gap (the window is 60 s, not an hour);
 and retaining the redb row instead of the transport blob (the fetch path reads the transport store,
 and D-51's fallback serves *referenced* rows only — a blob in this state is by definition not one).
@@ -992,8 +998,11 @@ argument above assumes — while the holders, whose `purged` has passed the tomb
 reaped. Rule A's snapshot argument is therefore sound for a replica that was simply *down*
 (`log == applied`, so its `matching` is below the purge point and it does receive a snapshot), and
 not for one whose apply lagged its log. Closing that would need retention keyed to a *fleet-minimum
-applied* index — the rejected rule 1 above, which has no dissemination channel — so it is documented
-here rather than closed.
+applied* index — the rejected rule 1 above — so it is documented here rather than closed, and
+**tracked in #504**, which carries the reachability walk-through, the openraft evidence, and the
+candidate rules. Note the residual is not merely a slow recovery: such a replica never applies
+anything again and is recoverable only out of band (D-48's repair), because it is never *offered* a
+snapshot — its `matching` is above the purge point, so openraft replicates by logs.
 
 **Tombstones are reclaimed, not accumulated.** Each sweep drops rows at or below this node's
 `purged`. That is information-free — a purge point only advances, so such a row can never again
