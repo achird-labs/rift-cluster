@@ -149,7 +149,54 @@ def rel(root: Path, p: Path) -> str:
 # --------------------------------------------------------------------------- register
 
 
+VENDOR = Path("vendor") / "rift"
+
+
+def vendor_checked_out(root: Path) -> bool:
+    """Whether the `vendor/rift` submodule actually has a checkout."""
+    d = root / VENDOR
+    return d.is_dir() and any(d.iterdir())
+
+
+def vendor_unverifiable(root: Path) -> bool:
+    """The repo declares the `vendor/rift` submodule, but it has no checkout.
+
+    Only then is a path that resolves under it *unverifiable* rather than *missing*. Both halves
+    matter. A submodule that has never been `git submodule update --init`ed leaves an empty
+    directory behind, and every citation under it then reads as absent — errors that point at the
+    register and the docs, which are fine, while saying nothing about the one thing that is wrong;
+    `--strict` exits 1, so in a fresh worktree that reads as a real gate failure. But a repo that
+    declares *no* such submodule is a different case entirely: there, `vendor/rift/...` can never
+    resolve, so a citation naming it really is broken and must still be reported. Keying only on
+    "no checkout" would silently disable that check for every repo without the submodule.
+    """
+    gitmodules = root / ".gitmodules"
+    declared = gitmodules.is_file() and "vendor/rift" in gitmodules.read_text(encoding="utf-8")
+    return declared and not vendor_checked_out(root)
+
+
+def submodule_finding(root: Path) -> list[Finding]:
+    """The single honest error to report when the submodule is absent, in place of the cascade.
+
+    Gated on the repo actually declaring the submodule, so a repo without one (the synthetic repos
+    the tests build) is unaffected.
+    """
+    if not vendor_unverifiable(root):
+        return []
+    return [
+        Finding(
+            "error",
+            "submodule-not-checked-out",
+            "vendor/rift has no checkout, so citations that resolve under it cannot be verified; "
+            "run `git submodule update --init --recursive`",
+            ".gitmodules",
+            1,
+        )
+    ]
+
+
 def parse_register(root: Path) -> tuple[dict[str, Decision], list[Finding]]:
+    unverifiable = vendor_unverifiable(root)
     findings: list[Finding] = []
     path = root / REGISTER
     if not path.exists():
@@ -213,6 +260,10 @@ def parse_register(root: Path) -> tuple[dict[str, Decision], list[Finding]]:
                 findings.append(Finding("error", "register-malformed", f"{d.id} superseded by unknown {other}", REGISTER, d.line))
         for c in d.code:
             if not (root / c).exists():
+                # An anchor under an un-checked-out submodule is unverifiable, not missing --
+                # `submodule_finding` reports that condition once instead.
+                if unverifiable and c.startswith(f"{VENDOR.as_posix()}/"):
+                    continue
                 findings.append(Finding("error", "register-anchor-missing", f"{d.id} anchors code at '{c}', which does not exist", REGISTER, d.line))
         if d.status == "pending" and not any("open" in x for x in d.implemented_by):
             findings.append(Finding("warning", "pending-without-issue", f"{d.id} is pending but lists no open issue under 'Implemented by'", REGISTER, d.line))
@@ -341,6 +392,7 @@ def scan_all(root: Path) -> list[Citation]:
 
 
 def check_resolution(root: Path, cites: list[Citation], decisions: dict[str, Decision]) -> list[Finding]:
+    unverifiable = vendor_unverifiable(root)
     findings: list[Finding] = []
     rfcs = rfc_sections(root)
     adrs = adr_files(root)
@@ -368,8 +420,12 @@ def check_resolution(root: Path, cites: list[Citation], decisions: dict[str, Dec
             if c.key.split("-")[1] not in seams:
                 findings.append(Finding("error", "unresolved-seam", f"{c.key} is not listed in {SEAMS_DOC}", c.file, c.line))
         elif c.kind == "docpath":
-            if not (root / c.key).exists() and not (root / "vendor" / "rift" / c.key).exists():
-                findings.append(Finding("error", "unresolved-docpath", f"{c.key} does not exist (neither here nor under vendor/rift/)", c.file, c.line))
+            if not (root / c.key).exists() and not (root / VENDOR / c.key).exists():
+                # It may legitimately live under the submodule; with the submodule declared but
+                # absent there is no way to tell, and guessing "missing" blames the document for
+                # the environment. A repo that declares no submodule is not in doubt — report it.
+                if not unverifiable:
+                    findings.append(Finding("error", "unresolved-docpath", f"{c.key} does not exist (neither here nor under vendor/rift/)", c.file, c.line))
     return findings
 
 
@@ -700,6 +756,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     decisions, findings = parse_register(root)
+    findings += submodule_finding(root)
     cites = scan_all(root)
 
     if args.diff is not None:
