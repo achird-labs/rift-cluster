@@ -322,9 +322,34 @@ async fn a_cursor_is_not_replicated_so_a_fresh_owner_starts_at_zero() {
     }
 }
 
+/// Every member's *own* cursor for `stub`, read without routing.
+///
+/// Reading through `peek_on` on one member proves nothing about "every member": in owner mode
+/// that call is routed to whichever member the HRW ring picked, so it reports one cursor three
+/// times — and a routed read whose owner hop fails silently falls back to the caller's local
+/// cursor (D-10), which can read `0` for a reset that never landed anywhere. Flipping each
+/// member to `local` for the duration of the read is the recipe
+/// `a_cursor_is_not_replicated_so_a_fresh_owner_starts_at_zero` already uses to ask a member
+/// about its own copy.
+async fn local_cursors(members: &[Member], stub: &'static str) -> Vec<usize> {
+    let mut cursors = Vec::new();
+    for m in members {
+        m.registry.apply(&[imposter_with_mode(TEST_PORT, "local")]);
+        cursors.push(peek_on(&m.seq, stub, 3, &[1, 1, 1]).await);
+        m.registry.apply(&[imposter_with_mode(TEST_PORT, "owner")]);
+    }
+    cursors
+}
+
 /// `reset_scope` is the engine's GC hook — stub delete, bulk replace, imposter
 /// teardown. It has to clear the *fleet's* cursor, not just this node's, or a
 /// redeployed stub keeps cycling from wherever the owner left off.
+///
+/// Pins D-57 (#514). The assertion reads **every member's own cursor**, not a routed peek: the
+/// cursor that matters lives on the ring owner, which is not necessarily `members[0]`, and a
+/// routed read can answer `0` from a local fallback while the owner still holds `2`. That is how
+/// this test used to fail intermittently under load — the fan-out was lost, nothing retried it,
+/// and the poll exited on a fallback.
 #[tokio::test]
 async fn reset_scope_clears_the_cursor_on_every_member() {
     let _lock = TEST_LOCK.lock().await;
@@ -334,23 +359,24 @@ async fn reset_scope_clears_the_cursor_on_every_member() {
     for _ in 0..2 {
         next_on(&members[0].seq, stub, 3, &[1, 1, 1]).await;
     }
-    assert_ne!(
-        peek_on(&members[0].seq, stub, 3, &[1, 1, 1]).await,
-        0,
-        "the cursor has advanced, so a reset has something to undo"
+    assert!(
+        local_cursors(&members, stub).await.iter().any(|c| *c != 0),
+        "the cursor has advanced somewhere, so a reset has something to undo"
     );
 
     members[0].seq.reset_scope(TEST_PORT, Some(stub));
-    // The fan-out is best-effort and asynchronous; the owner's own copy is
-    // cleared synchronously, which is what the next decision reads.
+
+    // The fan-out is asynchronous and retried; the caller's own copy is cleared synchronously.
     let deadline = Instant::now() + CONVERGE;
-    while peek_on(&members[0].seq, stub, 3, &[1, 1, 1]).await != 0 && Instant::now() < deadline {
+    let mut cursors = local_cursors(&members, stub).await;
+    while cursors.iter().any(|c| *c != 0) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        cursors = local_cursors(&members, stub).await;
     }
     assert_eq!(
-        peek_on(&members[0].seq, stub, 3, &[1, 1, 1]).await,
-        0,
-        "a reset stub must cycle from the start again"
+        cursors,
+        vec![0, 0, 0],
+        "a reset stub must cycle from the start again on every member, including the ring owner"
     );
 
     for member in &members {

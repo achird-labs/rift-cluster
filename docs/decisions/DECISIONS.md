@@ -720,6 +720,9 @@ and log in with its key; the legacy key is a curl/bootstrap credential only.
 rotated key or a skewed clock.
 
 ### D-47 — Strict sequencing is owner-routed on the ring, opt-in per imposter, and degrades rather than fails
+> **Amended by D-57** (2026-08-28, #514): a cursor **reset** is delivered per-peer, retried, and
+> reported when it does not land. "Degrades rather than fails" governs a *decision* on the hot
+> path; it never licensed losing a config-time reset.
 - **Status:** active
 - **Decided:** 2026-08-26 · #466
 - **Supersedes:** D-12
@@ -1278,3 +1281,80 @@ not consulted; it replays its own log after rejoining and parks. Repair is D-48'
 write-back, or wiping the state dir before rejoin so it takes a snapshot instead. Far narrower than
 the sequence above — it needs a parked node to be gracefully evicted — and `blob_fetch_stall`
 surfaces it.
+
+### D-57 — A cursor reset is delivered to every member, retried, and named when it is not
+- **Status:** active
+- **Decided:** 2026-08-28 · #514 (found while verifying #504)
+- **Refines:** D-47; also D-8, D-10
+- **Implemented by:** #514
+- **Code:** crates/rift-cluster/src/stores/sequencer.rs, crates/rift-cluster/src/metrics.rs
+
+`ClusteredSequencer::reset_scope` is the engine's GC hook for response cursors — stub delete, bulk
+replace, imposter teardown. It clears this node's own cursors and fans the reset out to every other
+member, because the port-wide form names no single key and so has no owner.
+
+**Where it is called from, which the fix turns on.** Two paths, and only one of them was obvious.
+The direct one is an embedder or an admin op on the node in hand. The other is the **apply loop**:
+`EngineAction::Sync` runs on *every* member (`store.rs`, `drive_engine`/`drive_one`) and calls
+`engine.apply_config`, which fires this hook (`vendor/rift`'s `ImposterManager`). So each member
+normally drops its own cursors as it applies the committed op, and the fan-out is a **backstop** —
+for the direct call, and for a member whose engine refused the apply.
+
+**What was wrong.** The fan-out ran as one `bridge.call(CallerClass::DataPlane, SEQ_OP_DEADLINE, …)`
+wrapping a *sequential* loop over peers under a **single 2 s deadline shared by all of them**, each
+per-peer error at `debug!`, the aggregate `let _ =`-discarded. Three consequences:
+
+- **It blocked the apply loop.** `Bridge::call` parks the *calling thread* on
+  `recv_timeout` — and on the apply path that thread is openraft's state-machine worker. A bulk
+  `apply_config` that removed K stubs could stall apply for up to 2 s per stub. This is the most
+  serious of the three and the one that most justifies the change.
+- **It could be shed whole.** `DataPlane` permits are capped precisely so cursor traffic cannot
+  starve the stateless path (RFC-001 §11.3), so under load the fan-out could be dropped before it
+  started.
+- **It could be lost silently.** One slow peer consumed the shared budget, leaving later peers
+  never asked; nothing retried; every failure was `debug!` and the result discarded.
+
+The last of these is what #514 surfaced, as an intermittent failure of
+`reset_scope_clears_the_cursor_on_every_member` under load: the test calls `reset_scope` **directly**
+(no committed op, so no apply-path reset anywhere), the cursor lives on the ring owner rather than
+on the caller, and a lost fan-out left the owner answering `2` for the whole converge window.
+
+**The rule.** `forget()` still runs synchronously — that is what the caller's next decision reads.
+The fan-out is then **spawned** on the bridge's runtime instead of running under a sheddable
+data-plane permit, so it never blocks apply. Delivery is per-peer and concurrent, each retried with
+exponential backoff from **1 s** to `RESET_MAX_ATTEMPTS` (5, ≈15 s), the whole sweep bounded by
+`RESET_TOTAL_BUDGET` (60 s). A peer that never accepts is **named** in a `warn!` and counted by
+`rift_cluster_sequence_resets_incomplete_total`.
+
+Three numbers that are not arbitrary:
+
+- **1 s, not 200 ms.** `RpcClient` marks a peer unhealthy after three consecutive liveness failures
+  and fast-fails it for a 5 s cooldown, and it already spends four internal attempts per call — so
+  a shedding peer trips that breaker inside our *first* attempt. A 200 ms schedule would spend
+  every remaining attempt inside the cooldown, answering "not healthy" without ever reaching the
+  wire: a retry loop that cannot retry, in exactly the case it was built for.
+- **Five attempts.** Enough to outlast that cooldown twice; deliberately not enough to chase a
+  member that is down, which re-keys on the next membership change (D-8) and applies the op itself.
+- **A 60 s ceiling.** Spawning dropped the deadline `bridge.call` used to impose, and one attempt
+  sweeps every resolved address at a 2 s request timeout with the client's retries on top. The
+  budget also bounds how long the spawned task holds its `Arc<RaftNode>` — the sequencer holds a
+  `Weak` everywhere else precisely so it never outlives the node.
+
+**A departed member is not a failure.** If a peer has left the membership by the time its turn
+comes, delivery reports `NotAMember`: not retried, not named, not counted. It holds no cursors this
+reset is about, and naming it would send an operator after a node that is correctly gone.
+
+**Not a change to routing.** The reset still goes to every member rather than to an owner:
+ownership can move between the reset and the next decision, and the port-wide form has no owner at
+all. Only delivery changed.
+
+*Rejected:* keeping the fan-out inside `bridge.call` with a longer deadline — still sheddable, and
+still blocking the apply loop; retrying forever — chases a down member for cursors D-8 treats as
+disposable; replicating cursors so no fan-out is needed — D-8 rejected that for the hot path and
+this does not reopen it.
+
+**Residual.** A member that is unreachable for the whole retry window keeps its stale cursors until
+it is asked again, membership changes, or — on the apply path — it applies the committed op itself.
+The last of those is why this is a narrow window in practice rather than the indefinite staleness
+the fan-out alone would imply. What this entry adds is that the gap is now *reported* rather than
+assumed away.

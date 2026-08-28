@@ -451,6 +451,16 @@ lazy_static! {
     )
     .expect("rift_cluster_sequence_fallbacks_total registers once");
 
+    /// `rift_cluster_sequence_resets_incomplete_total` — cursor resets that did not reach every
+    /// member (D-57). One per sweep, not per member; the `warn!` beside it names who. Unlike the
+    /// fallback counter above this *is* a fault signal: a member that missed a reset keeps
+    /// cycling a stub that was deleted or replaced, fleet-wide, until membership changes.
+    static ref SEQUENCE_RESETS_INCOMPLETE: IntCounter = register_int_counter!(
+        "rift_cluster_sequence_resets_incomplete_total",
+        "Cursor resets that did not reach every member"
+    )
+    .expect("rift_cluster_sequence_resets_incomplete_total registers once");
+
     static ref FLOW_CAS_CONFLICTS: IntCounterVec = register_int_counter_vec!(
         "rift_cluster_cas_conflicts_total",
         "Owner-side flow-write refusals, by reason",
@@ -786,6 +796,10 @@ pub(crate) fn flow_conflict(reason: &str) {
 /// non-zero means owners are unreachable, not that sequencing is off.
 pub(crate) fn sequence_fallback() {
     SEQUENCE_FALLBACKS.inc();
+}
+
+pub(crate) fn sequence_reset_incomplete() {
+    SEQUENCE_RESETS_INCOMPLETE.inc();
 }
 
 /// `outcome` ∈ `granted` / `inflight` / `already_recorded` — closed at the call sites.

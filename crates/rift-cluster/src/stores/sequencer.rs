@@ -405,6 +405,108 @@ impl ClusteredSequencer {
     }
 }
 
+/// First pause between reset attempts, doubling to [`RESET_MAX_ATTEMPTS`].
+///
+/// A full second, not the 200 ms a retry loop would otherwise reach for, and the reason is the
+/// RPC client's own circuit breaker: three consecutive liveness failures mark a peer unhealthy
+/// for `DEFAULT_COOLDOWN` (5 s), during which `RpcClient::call` fast-fails without touching the
+/// wire (`rpc/client.rs`). The client already burns four internal attempts per call, so a peer
+/// that sheds trips the breaker inside our *first* attempt — and a 200 ms schedule would spend
+/// every remaining attempt inside that cooldown, answering "not healthy" without ever asking
+/// again. Doubling from 1 s puts attempts 4 and 5 at +7 s and +15 s, past it.
+const RESET_BACKOFF_MIN: Duration = Duration::from_secs(1);
+/// How many times one peer is asked to drop a scope's cursors before it is reported unreached
+/// (D-57, #514). Five attempts on the schedule above spans about fifteen seconds — enough to
+/// outlast the peer-health cooldown twice, and deliberately not enough to keep chasing a member
+/// that is down: such a member re-keys on the next membership change (D-8), and applies the
+/// committed op itself in any case.
+const RESET_MAX_ATTEMPTS: u32 = 5;
+/// Ceiling on one whole fan-out, whatever the peers do.
+///
+/// The old shape inherited a bound from `bridge.call`'s deadline; spawning the fan-out dropped
+/// it and nothing else supplies one — an attempt sweeps every resolved address of a peer at a
+/// 2 s request timeout with the client's own retries on top, so five attempts against a
+/// black-holing dual-stack member could otherwise run for minutes. This also bounds how long the
+/// spawned task holds its `Arc<RaftNode>`, which the sequencer deliberately holds only as a
+/// `Weak` everywhere else.
+const RESET_TOTAL_BUDGET: Duration = Duration::from_secs(60);
+
+/// What one delivery attempt established about a peer.
+enum Delivery {
+    /// The peer dropped the scope's cursors.
+    Done,
+    /// The peer is no longer in the applied membership, so it holds no cursors this reset is
+    /// about. Not a failure, not retried, and deliberately **not** named in the incomplete
+    /// warning — a departed member is not something an operator needs to chase.
+    NotAMember,
+}
+
+/// Deliver a cursor reset to every peer, each independently retried, and report the ones that
+/// never accepted it (D-57, #514).
+///
+/// Per-peer and concurrent, rather than a sequential loop under one shared deadline: the old
+/// shape gave every peer after the first whatever was left of a single 2 s budget, so one slow
+/// member could consume the whole fan-out and the rest were never asked at all — silently,
+/// because each failure was a `debug!` and the aggregate result was discarded.
+///
+/// Takes `send` rather than a `RaftNode` so the retry policy itself is testable without a fleet.
+async fn deliver_reset<F, Fut, E>(
+    peers: Vec<crate::NodeId>,
+    backoff_min: Duration,
+    send: F,
+) -> Vec<crate::NodeId>
+where
+    F: Fn(crate::NodeId) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Delivery, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let mut tasks = tokio::task::JoinSet::new();
+    // Task id -> peer, so a panicked delivery can still be named below. Without it the peer that
+    // task was carrying would vanish from `unreached` and the sweep would report itself complete
+    // — the exact silence this function exists to remove, in the branch that is our own bug.
+    let mut carrying: HashMap<tokio::task::Id, crate::NodeId> = HashMap::new();
+    for peer in peers {
+        let send = send.clone();
+        let handle = tasks.spawn(async move {
+            let mut backoff = backoff_min;
+            for attempt in 1..=RESET_MAX_ATTEMPTS {
+                match send(peer).await {
+                    Ok(Delivery::Done | Delivery::NotAMember) => return None,
+                    Err(e) => {
+                        tracing::debug!(
+                            peer, attempt, error = %e,
+                            "sequencer reset: peer did not accept it"
+                        );
+                    }
+                }
+                if attempt < RESET_MAX_ATTEMPTS {
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2);
+                }
+            }
+            Some(peer)
+        });
+        carrying.insert(handle.id(), peer);
+    }
+    let mut unreached = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Some(peer)) => unreached.push(peer),
+            Ok(None) => {}
+            Err(e) => {
+                // A panicked delivery task is a defect of ours, and its peer is reported
+                // unreached rather than dropped: we do not know that the reset landed.
+                if let Some(peer) = carrying.get(&e.id()) {
+                    unreached.push(*peer);
+                }
+                tracing::error!(error = %e, "sequencer reset delivery panicked");
+            }
+        }
+    }
+    unreached.sort_unstable();
+    unreached
+}
+
 /// The ring key for a cursor. One string so the hash covers all three parts;
 /// `\u{1}` because it cannot appear in a port, a stub key or a space name.
 fn wire_key((port, stub_key, scope): &CursorKey) -> String {
@@ -435,8 +537,13 @@ impl ResponseSequencer for ClusteredSequencer {
     ///
     /// Fanned out to every member rather than routed to an owner: the port-wide
     /// form (`None`) names no single key and so has no owner, and a cursor held
-    /// by a member that is down is gone anyway. Best-effort by construction —
-    /// a member that misses a reset re-keys on the next membership change.
+    /// by a member that is down is gone anyway.
+    ///
+    /// A **backstop**, not the only mechanism (D-57): this hook also runs on every member from
+    /// its own `drive_engine` when the committed config op applies, so each node normally drops
+    /// its own cursors without being asked. The fan-out covers what that misses — a direct call
+    /// on one node, and a member whose engine refused the apply — and since #514 it retries and
+    /// reports rather than losing the reset silently.
     fn reset_scope(&self, port: u16, stub_key: Option<&str>) {
         self.forget(port, stub_key);
         let (Some(bridge), Some((node, ring))) = (self.bridge.get(), self.view()) else {
@@ -452,17 +559,66 @@ impl ResponseSequencer for ClusteredSequencer {
             .copied()
             .filter(|id| *id != node.id())
             .collect();
-        let _ = bridge.call(CallerClass::DataPlane, SEQ_OP_DEADLINE, async move {
-            let body = serde_json::to_vec(&req).map_err(|e| RpcError::Handler(e.to_string()))?;
-            for peer in peers {
-                if let Err(e) = node
-                    .call_member(peer, "POST", RESET_PATH, body.clone())
-                    .await
-                {
-                    tracing::debug!(peer, error = %e, "sequencer reset: peer unreachable");
-                }
+        if peers.is_empty() {
+            return;
+        }
+        let body = match serde_json::to_vec(&req) {
+            Ok(body) => body,
+            // Nothing retryable about a body this process could not encode, and nothing to be
+            // gained by taking the caller down over it — but it must not be silent: every peer's
+            // cursor is about to be left stale.
+            Err(e) => {
+                tracing::error!(port, error = %e, "sequencer reset: could not encode the request");
+                return;
             }
-            Ok::<(), RpcError>(())
+        };
+        // Spawned, not run under `bridge.call`. Two reasons, both learned from #514: a
+        // `DataPlane` permit can be *shed* under load, which silently dropped the whole fan-out
+        // and left the ring owner cycling a deleted stub; and the caller is the engine's
+        // config-time GC hook, which has no business waiting out a fleet round trip. `forget`
+        // above already did the part the caller's next decision depends on.
+        bridge.handle().spawn(async move {
+            let fan_out = deliver_reset(peers, RESET_BACKOFF_MIN, move |peer| {
+                let node = Arc::clone(&node);
+                let body = body.clone();
+                async move {
+                    // A member that has left is not a failed delivery: it holds no cursors this
+                    // reset is about, and retrying it five times only to name it in a fault
+                    // warning would send an operator after a node that is correctly gone.
+                    if node.member_authority(peer).is_none() {
+                        return Ok(Delivery::NotAMember);
+                    }
+                    node.call_member(peer, "POST", RESET_PATH, body)
+                        .await
+                        .map(|_| Delivery::Done)
+                }
+            });
+            let unreached = match tokio::time::timeout(RESET_TOTAL_BUDGET, fan_out).await {
+                Ok(unreached) => unreached,
+                // The budget is a ceiling, not an expectation. Which members were still
+                // outstanding is not recoverable once the whole fan-out is cancelled, so this
+                // reports the sweep incomplete without naming them.
+                Err(_) => {
+                    tracing::warn!(
+                        port,
+                        budget_secs = RESET_TOTAL_BUDGET.as_secs(),
+                        "sequencer reset fan-out exceeded its budget and was abandoned"
+                    );
+                    crate::metrics::sequence_reset_incomplete();
+                    return;
+                }
+            };
+            if !unreached.is_empty() {
+                crate::metrics::sequence_reset_incomplete();
+                // Named, not counted-and-forgotten: a member that missed a reset keeps cycling a
+                // stub that no longer exists until the next membership change re-keys it, and the
+                // operator can only act on that if they know which one (the D-53 shape).
+                tracing::warn!(
+                    ?unreached,
+                    "sequencer reset did not reach every member; their cursors for this scope \
+                     stay stale until they are asked again or membership changes"
+                );
+            }
         });
     }
 }
@@ -514,4 +670,127 @@ pub fn seq_routes(seq: Arc<ClusteredSequencer>) -> Router {
                 }) as crate::rpc::HandlerFuture
             }),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use super::{Delivery, RESET_MAX_ATTEMPTS, deliver_reset};
+
+    /// Pins D-57 (#514): a peer that refuses the first attempts is asked again, and the reset is
+    /// reported delivered once it lands. Before this, one `call_member` was made per peer and its
+    /// error was a `debug!` — a reset lost to a busy peer was lost for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reset_a_peer_first_refuses_is_retried_until_it_lands() {
+        static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+        ATTEMPTS.store(0, Ordering::SeqCst);
+
+        let unreached = deliver_reset(vec![2], Duration::from_millis(1), |_peer| async {
+            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err("shed".to_owned())
+            } else {
+                Ok(Delivery::Done)
+            }
+        })
+        .await;
+
+        assert_eq!(
+            unreached,
+            Vec::<crate::NodeId>::new(),
+            "it landed on the third attempt"
+        );
+        assert_eq!(
+            ATTEMPTS.load(Ordering::SeqCst),
+            3,
+            "two refusals, then the one that stuck"
+        );
+    }
+
+    /// Pins D-57 (#514): a peer that never accepts is **named**, not silently dropped. A stale
+    /// fleet-wide cursor is an operator's problem, and they can only act on it knowing which
+    /// member to look at.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_that_never_accepts_a_reset_is_named() {
+        let unreached = deliver_reset(vec![2, 3], Duration::from_millis(1), |peer| async move {
+            if peer == 3 {
+                Err("down".to_owned())
+            } else {
+                Ok(Delivery::Done)
+            }
+        })
+        .await;
+
+        assert_eq!(unreached, vec![3], "only the member that never accepted it");
+    }
+
+    /// Pins D-57 (#514): a member that has left the membership is **not** retried and **not**
+    /// named. It holds no cursors this reset is about, so chasing it five times and then
+    /// reporting it in a fault warning would send an operator after a node that is correctly
+    /// gone — the counter beside that warning is documented as meaning something is wrong.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_member_that_has_left_is_not_retried_and_not_named() {
+        static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+        ATTEMPTS.store(0, Ordering::SeqCst);
+
+        let unreached = deliver_reset(vec![2], Duration::from_millis(1), |_peer| async {
+            ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(Delivery::NotAMember)
+        })
+        .await;
+
+        assert_eq!(unreached, Vec::<crate::NodeId>::new(), "not a fault");
+        assert_eq!(
+            ATTEMPTS.load(Ordering::SeqCst),
+            1,
+            "asked once, not retried"
+        );
+    }
+
+    /// Pins D-57 (#514): attempts are bounded. A member that is simply down must not have the
+    /// fan-out chasing it forever — the next membership change re-keys its cursors anyway (D-8).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reset_gives_up_after_a_bounded_number_of_attempts() {
+        static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+        ATTEMPTS.store(0, Ordering::SeqCst);
+
+        let unreached = deliver_reset(vec![2], Duration::from_millis(1), |_peer| async {
+            ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            Err::<Delivery, _>("timeout".to_owned())
+        })
+        .await;
+
+        assert_eq!(unreached, vec![2]);
+        assert_eq!(
+            ATTEMPTS.load(Ordering::SeqCst),
+            RESET_MAX_ATTEMPTS,
+            "exactly the bound, neither one short nor unbounded"
+        );
+    }
+
+    /// Peers are asked concurrently, not in a sequential loop under one shared budget — the shape
+    /// that let one slow member starve every peer after it (D-57).
+    ///
+    /// Wall-clock, with the bound placed midway between the two outcomes rather than just under
+    /// the sequential one: three 300 ms deliveries take ~300 ms together and 900 ms in series, so
+    /// 600 ms leaves 300 ms of slack on both sides. (`start_paused` would make this exact, but it
+    /// needs tokio's `test-util` feature, and feature unification would carry that into
+    /// production builds for one assertion.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peers_are_asked_concurrently_not_one_after_another() {
+        let started = std::time::Instant::now();
+        let unreached = deliver_reset(vec![2, 3, 4], Duration::from_millis(1), |_peer| async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok::<_, String>(Delivery::Done)
+        })
+        .await;
+
+        assert!(unreached.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "three 300 ms deliveries run together, not in series: took {:?}",
+            started.elapsed()
+        );
+    }
 }
