@@ -195,6 +195,15 @@ instead reports `raft core did not release storage within 2s`, the shutdown
 signal did not reach the parked fetch — that is a defect worth an issue, not an
 operational condition.
 
+*Registered by #514, no alert yet:* `rift_cluster_sequence_resets_incomplete_total`
+(counter, cursor resets that did not reach every member — **D-57**). Unlike
+`rift_cluster_sequence_fallbacks_total`, which counts a decision degrading as
+designed, this one is a fault signal: the member named in the `sequencer reset
+did not reach every member` warning beside it is still cycling responses for a
+stub that was deleted or replaced, and it will keep doing so until it is asked
+again or the membership changes. A non-zero value with no member down is worth
+looking at; the warning names which member to look at.
+
 *Registered, but not alerted on:* `rift_cluster_flow_wal_lag_ops` (async
 durability backlog). It is a legitimate paging signal, but it appears in
 neither the alert pack nor the shipped dashboards yet: nobody has chosen a
