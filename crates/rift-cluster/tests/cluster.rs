@@ -5179,9 +5179,11 @@ async fn a_blob_deleted_while_a_voter_lags_is_retained_until_the_log_is_purged_p
 /// hand for the same reason the sweep runs at a synthetic `now`: the loop's real clocks would
 /// keep the blob for an hour whether or not retention works, and the test would prove nothing.
 /// The issue's step 4 — the voter *restarts* between the delete and the sweep — is the same
-/// state seen from the holders (no request inside the grace), and is not staged literally: a
-/// parked apply holds openraft's state-machine worker, so an in-process restart of a parked node
-/// cannot release its storage (see `RaftNode::shutdown`'s storage-release wait).
+/// state seen from the holders (no request inside the grace), and is deliberately not staged
+/// here: keeping the voter alive lets this test sweep while the fleet floor is **known and below
+/// `p`**, which is a stronger pin of rule C than the fail-closed "a member is unreachable" arm a
+/// kill would exercise. Restarting a parked node in-process is itself possible since D-56
+/// (#513); `a_parked_node_shuts_down_cleanly_and_its_data_directory_reopens` below covers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_blob_deleted_while_a_replica_is_parked_is_retained_until_every_member_has_applied_past_it()
  {
@@ -5539,6 +5541,105 @@ async fn a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns()
             "and it keeps going past the parked entry, applying the delete behind it"
         );
     }
+    cluster.shutdown_all().await;
+}
+
+/// Pins D-56 (#513): a node parked on a blob nobody holds still shuts down **cleanly**, and its
+/// data directory can be reopened in the same process.
+///
+/// Before D-56 this was impossible, and the failure was silent in the worst way. A parked apply
+/// occupies openraft's state-machine worker, which awaits `apply` inline; the worker therefore
+/// never returns to its command channel, never drops its `RedbStateMachine` clone, and
+/// `RaftNode::shutdown`'s storage-release wait times out and returns `Err` — while the redb file
+/// lock stays held by the stuck task. `TestCluster::kill` discards that `Err`, so the next
+/// `RaftNode::start` on the same directory failed with `redb: Database already open`, several
+/// steps away from the cause. D-56's shutdown signal ends the parked fetch, the apply fails, the
+/// worker exits, and the handle drops.
+///
+/// The park is D-48's, built exactly as
+/// `a_blob_no_member_holds_parks_apply_and_recovers_when_a_holder_returns` builds it: a member
+/// that missed the fan-out, a delete that drops applied state as a holder (D-51), and the bytes
+/// removed from every live member's transport store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_node_shuts_down_cleanly_and_its_data_directory_reopens() {
+    let _serial = TEST_LOCK.lock().await;
+    let mut cluster = TestCluster::start(3).await;
+    cluster
+        .wait_for_leader(LEADER_DEADLINE)
+        .await
+        .expect("leader");
+    let leader_id = cluster.leader().expect("leader").id();
+    let parked = cluster
+        .members
+        .iter()
+        .map(|m| m.id)
+        .find(|&id| id != leader_id)
+        .expect("a follower");
+    cluster.kill(parked).await;
+
+    let csv = "id,name\n1,ada\n";
+    let (_origin, digest) = commit_digest_only_with_a_member_down(&cluster, parked, csv).await;
+    cluster
+        .leader()
+        .expect("two of three still lead")
+        .submit(dataset_delete("customers"))
+        .await
+        .expect("commits");
+    for node in cluster.live() {
+        assert!(
+            wait_for_dataset_gone(node, "customers", Duration::from_secs(30)).await,
+            "live node {} applies the delete, dropping its blob row",
+            node.id()
+        );
+        std::fs::remove_file(node.blobs().path_of(&digest)).expect("reap the blob from a holder");
+    }
+
+    // The member returns and parks: it replays the `PUT` from its own log and no member can
+    // supply the bytes.
+    cluster.restart(parked).await;
+    let node = cluster
+        .member_mut(parked)
+        .node
+        .take()
+        .expect("restarted, and taken so this test owns the shutdown rather than `kill`");
+    let escalation_deadline =
+        Instant::now() + rift_cluster::blobs::BLOB_FETCH_ESCALATE_AFTER + Duration::from_secs(45);
+    while node.blob_fetch_stall().is_none() {
+        assert!(
+            Instant::now() < escalation_deadline,
+            "precondition: the node never parked, so this proves nothing about a parked shutdown"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        node.dataset(DEFAULT_TENANT, "customers")
+            .expect("the node still answers")
+            .is_none(),
+        "parked, not applied"
+    );
+
+    // The claim. Under the old behaviour this is `Err(Runtime("raft core did not release
+    // storage within 2s"))` after the full timeout.
+    let stopped = tokio::time::timeout(Duration::from_secs(30), node.shutdown())
+        .await
+        .expect("shutdown must not hang");
+    assert!(
+        stopped.is_ok(),
+        "a parked node must shut down cleanly, got {stopped:?}"
+    );
+    drop(node);
+
+    // And the consequence that made this worth fixing: the directory is usable again. `restart`
+    // panics inside `spawn_full` on `Database already open`, so reaching this line is most of the
+    // claim; the status read is what proves the reopened node is actually serving.
+    cluster.restart(parked).await;
+    let restarted = cluster.member(parked).node.as_ref().expect("reopened");
+    assert_eq!(
+        restarted.status().node_id,
+        parked,
+        "the reopened node answers as itself"
+    );
+
     cluster.shutdown_all().await;
 }
 

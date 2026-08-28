@@ -756,6 +756,9 @@ cross-node sequencing should carry an explicit `id`.
 container chaos scenario — both additive verification on a working feature (#476).
 
 ### D-48 — A blob no member can supply parks apply and reports degraded; the node never halts
+> **Amended by D-56** (2026-08-28, #513): "never gives up" holds while the node is **up**. A
+> shutdown ends a parked fetch, because the park holds the storage handle the node must release
+> to stop.
 - **Status:** active
 - **Decided:** 2026-08-25 · #439 (user ruling)
 - **Implemented by:** #439
@@ -798,6 +801,12 @@ behind it never runs.** So a park ends only when a holder returns — never by t
 a snapshot that would skip the blob. This is why D-52's rule B (holders keep a blob that is being
 actively requested) is not a redundancy but the sole recovery path for a replica that has already
 parked, and why "wait for compaction" was never a real remedy.
+
+**Amended by D-56 (2026-08-28): the same inline-await is why a parked node could not stop.** The
+worker that is blocked here owns the `RedbStateMachine` clone, so while a fetch retries, nothing
+drops the redb handle: `RaftNode::shutdown`'s storage-release wait timed out and returned `Err`
+with the file lock still held, and reopening the data directory in the same process failed with
+`Database already open`. D-56 signals the fetch on shutdown so the worker can exit.
 
 ### D-49 — Payload fields stay optional on the wire; the bytes leave the op at submit, after the quorum
 > **Amended by D-53** (2026-08-27): a quorum ack is no longer sufficient to strip — every member
@@ -1278,3 +1287,70 @@ not consulted; it replays its own log after rejoining and parks. Repair is D-48'
 write-back, or wiping the state dir before rejoin so it takes a snapshot instead. Far narrower than
 the sequence above — it needs a parked node to be gracefully evicted — and `blob_fetch_stall`
 surfaces it.
+
+### D-56 — Shutdown ends a parked blob fetch; the entry re-applies on restart
+- **Status:** active
+- **Decided:** 2026-08-28 · #513 (found while implementing D-55/#504)
+- **Refines:** D-48; also D-16, D-23
+- **Implemented by:** #513
+- **Code:** crates/rift-cluster/src/raft/blob_source.rs, crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster/src/raft/store.rs
+
+D-48 says a blob no member can supply parks the apply and the node **never gives up**. That is
+right while the node is running, and it is what makes the park recoverable at all (D-52 rule B is
+fed by exactly those repeated requests). But it also made a parked node impossible to stop.
+
+**The mechanism, which is D-48's own amendment read from the other side.** openraft's
+state-machine worker awaits `Apply` inline (`openraft-0.9.25/src/core/sm/worker.rs`), and that
+worker owns the `RedbStateMachine` clone. `Raft::shutdown` joins only the RaftCore task and the
+tick handle — never the sm worker — so a worker parked inside `resolve_blobs` keeps the redb
+handle for as long as the fetch retries, which under D-48 is forever. `RaftNode::shutdown`'s
+storage-release wait (#41) therefore timed out and returned `Err`, with the file lock still held
+by an orphaned task in the same process; a `RaftNode::start` on that directory then failed with
+`redb: Database already open`, several steps from the cause.
+
+**The rule.** A parked fetch ends on one of two events: a holder returns (D-48, unchanged), or
+**this node is shutting down**. `RaftNode` owns a `tokio::sync::watch<bool>`; `shutdown()` sends
+it *before* asking the Raft core to stop, and `Drop` sends it too. `PeerBlobSource` races it
+against **both** halves of the loop — the fetch round and the backoff sleep — so the signal is
+observed at the next poll rather than at the end of whichever is in flight. The fetch returns
+`BlobError::ShuttingDown`, `apply` fails, the worker exits, the handle drops, and shutdown
+completes normally.
+
+Racing the *round*, not only the sleep, is what makes the guarantee real rather than typical. One
+round walks every member and, within each, every resolved address; a single unreachable peer costs
+`replication_deadline` — the 2 s request timeout plus a 4 MiB allowance, about 6 s — so a round
+against a black-holed fleet can run for tens of seconds, against a `STORAGE_RELEASE_TIMEOUT` of
+2 s. A version that waited for the round to drain would therefore still have failed shutdown in
+exactly the partition-shaped case D-48 exists for, while appearing to work in every test whose
+peers answer promptly. Cancelling mid-round is safe: a round only reads from peers, and committing
+fetched bytes to the store is the caller's step.
+
+**Why failing the apply is safe here, and only here.** `RedbStateMachine::apply` resolves every
+digest-only op's bytes **before** it opens its write transaction, so a parked apply has written
+nothing: `last_applied` on disk is still the entry before it. Failing it during shutdown produces
+exactly the state a `kill -9` produces, reached cooperatively — the entry replays on restart. This
+is *not* a licence to fail an apply on a timer, which is what D-48 rejected and what would take a
+healthy node down during a long partition: the trigger is the node stopping, not the fetch being
+slow.
+
+**`ShuttingDown` is its own error, never `NotFound`.** Absence is a domain answer about the
+*fleet*; a shutdown is a fact about this process. Collapsing them would let a caller conclude
+"no member holds this blob" from "this node is stopping". The `BlobSource::load` contract is
+amended to say so.
+
+*Rejected:* aborting the sm worker task — openraft owns it and exposes no handle; a fetch timeout
+or a maximum round count — reopens exactly what D-48 refused, and is the wall-clock guess D-55
+also declined; draining the park by installing a snapshot — cannot run, since the install queues
+behind the parked apply (D-52's amendment to D-48).
+
+**The snapshot-install path too.** `resolve_snapshot_blobs` calls the same `BlobSource::load`, so
+a node parked while installing a snapshot is covered by the same signal. Its safety argument is
+the sibling of the apply one and was checked separately: the install's write transaction has not
+opened when the fetch runs, so a failed install leaves the previous state intact and the node
+takes the snapshot again from the leader on restart.
+
+**Residual.** A node whose apply is parked on something *other* than a blob fetch is not covered
+by this entry; no such path exists today. The `Drop` send makes the guarantee hold for a plain
+drop as well as for `shutdown()`, so the pre-existing
+`drop_without_shutdown_eventually_releases_storage` property is now unconditional rather than
+true-unless-parked.

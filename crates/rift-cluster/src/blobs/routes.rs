@@ -267,6 +267,14 @@ fn map_blob_error(err: BlobError, digest: &str) -> RpcError {
         | BlobError::OffsetGap { .. }
         | BlobError::DigestMismatch => RpcError::BadRequest(err.to_string()),
         BlobError::Io(e) => RpcError::Handler(e.to_string()),
+        // Unreachable from here: `ShuttingDown` is minted by this node's own *fetch* loop
+        // (D-56), never by the store that serves a peer. Mapped rather than `unreachable!()`
+        // because a panic in a route handler is a worse answer than a correct one, and mapped to
+        // `Shed` specifically: `blob_source::classify` reads it as `NextAddress` — try this
+        // member's other addresses, then the next member — which is what a node that is going
+        // away wants a fetcher to do. A `Handler` 500 would classify as a peer-answered
+        // *refusal* and send triage looking for a fault on a node that is merely leaving (#471).
+        BlobError::ShuttingDown => RpcError::Shed,
     }
 }
 

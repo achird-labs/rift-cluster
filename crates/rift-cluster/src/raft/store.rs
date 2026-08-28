@@ -1532,6 +1532,18 @@ impl RedbStateMachine {
                 continue;
             }
             let bytes = source.load(&digest, origin).await.map_err(|e| {
+                // A shutdown is not a storage fault, and it is the expected way a parked apply
+                // ends (D-56, #513) — openraft logs the `StorageError` it becomes at error
+                // level either way, so say here what it actually means. Nothing has been
+                // written: this runs before the write transaction opens, so the entry simply
+                // re-applies on restart.
+                if matches!(e, crate::blobs::BlobError::ShuttingDown) {
+                    tracing::info!(
+                        digest = %hex,
+                        "apply abandoned: node is shutting down while parked on a blob fetch; \
+                         the entry re-applies on restart"
+                    );
+                }
                 StorageIOError::write_state_machine(&std::io::Error::other(format!(
                     "fetching blob {hex}: {e}"
                 )))
@@ -7379,8 +7391,11 @@ impl RedbStateMachine {
     /// Each digest is fetched once even when the manifest names it twice (two datasets, one CSV),
     /// and `origin` is `0`: a snapshot has no single accepting node, so [`super::blob_source`]
     /// asks every joint voter rather than a named origin first. A digest no member can supply does
-    /// not error here — [`crate::blobs::BlobSource`] parks and retries forever (D-48), so the
-    /// install blocks until a holder returns rather than failing a committed catch-up.
+    /// not error here — [`crate::blobs::BlobSource`] parks and retries (D-48), so the install
+    /// blocks until a holder returns rather than failing a committed catch-up. The one exception
+    /// is this node **shutting down** (D-56): the park is abandoned and the install fails, which
+    /// is safe for the same reason it is on the apply path — the install's own write transaction
+    /// has not opened yet, so a restart takes the snapshot again from the leader.
     #[allow(clippy::result_large_err)]
     async fn resolve_snapshot_blobs(
         &self,
@@ -7445,6 +7460,15 @@ impl RedbStateMachine {
                 }
                 None => {
                     let bytes = source.load(&digest, 0).await.map_err(|e| {
+                        // Same reading as `resolve_blobs`': a shutdown here is expected, not a
+                        // storage fault, and nothing has been written (D-56).
+                        if matches!(e, crate::blobs::BlobError::ShuttingDown) {
+                            tracing::info!(
+                                digest = %hex,
+                                "snapshot install abandoned: node is shutting down while parked \
+                                 on a blob fetch; the install runs again on restart"
+                            );
+                        }
                         StorageIOError::read_snapshot(
                             Some(meta.signature()),
                             &std::io::Error::other(format!("fetching manifest blob {hex}: {e}")),
