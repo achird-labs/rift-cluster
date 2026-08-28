@@ -203,7 +203,29 @@ COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --locked --release -p rift-cluster-server --features console \
         --recipe-path recipe.json
 
-COPY . .
+# Named roots, NOT `COPY . .`, and the omission of `vendor/rift` is the point
+# (D-62). `cook` above compiled the five vendored crates, but a blanket copy
+# rewrote them with fresh mtimes, so cargo's fingerprint saw them as dirty and
+# rebuilt all five in the layer below — measured, from the warm build's own log:
+# `rift-types`, `rift-http-proxy`, `rift-lint`, `rift-mock-core` and
+# `rift-store-redis` all recompiling at 0.4 s, i.e. after the third-party graph
+# had come back from cache. Leaving the submodule untouched is what lets `cook`'s
+# work survive into this layer.
+#
+# The second effect is a narrower cache key: this layer no longer depends on
+# `web/`, `scripts/`, `.github/` or anything else the compiler never reads, so
+# editing a workflow or a chaos overlay stops invalidating the build.
+#
+# `docs/` is here because `crates/rift-cluster-server/src/openapi.rs` does
+# `include_str!("../../../docs/api/openapi-ee.yaml")` — the OpenAPI contract is
+# compiled in, so `docs/` is a build input and not documentation. That is easy to
+# miss and would break the image build rather than anything subtler;
+# `the_builder_copies_every_root_the_crates_compile_in` pins it, so a new
+# compile-time file reference outside these roots fails a test first.
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY tests tests
+COPY docs docs
 
 # The build context has no git history (see .dockerignore — `.git` is many
 # megabytes of no use to a compiler), and a submodule's `.git` is only a
