@@ -75,6 +75,14 @@ pub enum BlobError {
     /// A filesystem operation failed.
     #[error("blob store io: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The node is shutting down, so a fetch that would otherwise retry forever gave up
+    /// (D-56, #513). Its own variant, never [`Self::NotFound`]: absence is a domain answer that
+    /// says something about the *fleet*, and a caller that read a shutdown as "no member holds
+    /// this" would draw a conclusion about the cluster from a fact about this process. The apply
+    /// it fails is one openraft has not committed to disk — a restart replays it.
+    #[error("blob fetch abandoned: node shutting down")]
+    ShuttingDown,
 }
 
 /// A validated content digest: exactly 64 lowercase hex characters, the sha256
@@ -959,13 +967,22 @@ pub trait BlobSource: Send + Sync + 'static {
     /// rather than merely staging them is what keeps the state machine free of both a store
     /// handle and any file I/O inside its write transaction.
     ///
-    /// Blocks until the bytes are in hand. When no member answers it does **not** give up — it
-    /// keeps retrying, escalating to an error-level log, a counter and a degraded health signal
-    /// once [`BLOB_FETCH_ESCALATE_AFTER`] has passed, and returns as soon as some holder comes
-    /// back. The alternative — failing the apply — is fatal to the openraft state machine, so a
-    /// partition longer than any bound would take a healthy node down with no self-heal.
+    /// Blocks until the bytes are in hand. When no member answers it does **not** give up while
+    /// the node is up — it keeps retrying, escalating to an error-level log, a counter and a
+    /// degraded health signal once [`BLOB_FETCH_ESCALATE_AFTER`] has passed, and returns as soon
+    /// as some holder comes back. The alternative — failing the apply on a timer — is fatal to
+    /// the openraft state machine, so a partition longer than any bound would take a healthy node
+    /// down with no self-heal.
     ///
-    /// `Err` is therefore reserved for failures retrying cannot fix: a malformed digest, or a
+    /// **Shutdown is the one exception** (D-56, #513): a fetch ends with
+    /// [`BlobError::ShuttingDown`] when this node is stopping. It has to, because the apply this
+    /// fetch is inside occupies openraft's state-machine worker, which holds the storage handle —
+    /// so a fetch that outlived shutdown would keep the node's database locked. That is not a
+    /// weakening of the rule above: the node is going away either way, and the entry re-applies
+    /// on restart because nothing was written (the fetch happens before the write transaction
+    /// opens).
+    ///
+    /// `Err` is otherwise reserved for failures retrying cannot fix: a malformed digest, or a
     /// local filesystem failure on bytes that were successfully fetched.
     fn load<'a>(
         &'a self,
