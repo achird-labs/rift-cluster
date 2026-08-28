@@ -1257,9 +1257,13 @@ pub(crate) async fn promote_ready_learners(
         }
         let _serialized = gate.lock().await;
         // The gate was taken after the scan read; re-check under it so a
-        // concurrent admission's promotion is seen (#55's exactness argument).
-        let voters = committed_voters(raft, id).await?;
-        if !should_promote(&voters, id, max_voters) {
+        // concurrent admission's promotion is seen (#55's exactness argument),
+        // and so a *departure* that committed in between is seen too — a
+        // candidate removed since the scan is no longer a learner, and
+        // `AddVoterIds` on it fails `LearnerNotFound`, which `?` would turn into
+        // a skipped tick for every candidate behind it (#496).
+        let (members, voters) = committed_members_and_voters(raft, id).await?;
+        if !still_promotable(&members, &voters, id, max_voters) {
             continue;
         }
         membership_change(raft, &format!("promote learner {id}"), || {
@@ -1288,6 +1292,31 @@ async fn committed_voters(
     })
     .await
     .map_err(|e| RpcError::Handler(format!("admit {id}: reading committed membership: {e}")))
+}
+
+/// The committed member set and voter set, read together in one pass through
+/// the RaftCore loop so the two cannot describe different membership entries.
+///
+/// The sweep's under-gate re-check needs both: the ceiling is judged on voters,
+/// but a candidate that left between the scan and the gate is judged on
+/// membership, and reading them separately would reintroduce the skew the
+/// single read exists to remove.
+async fn committed_members_and_voters(
+    raft: &Raft<TypeConfig>,
+    id: NodeId,
+) -> Result<(BTreeSet<NodeId>, BTreeSet<NodeId>), RpcError> {
+    raft.with_raft_state(|state| {
+        let committed = state.membership_state.committed();
+        (
+            committed
+                .nodes()
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<_>>(),
+            committed.voter_ids().collect::<BTreeSet<_>>(),
+        )
+    })
+    .await
+    .map_err(|e| RpcError::Handler(format!("reading committed membership for {id}: {e}")))
 }
 
 /// The two voter sets a blob fan-out must satisfy a majority of *both* of
@@ -1575,73 +1604,42 @@ pub(crate) async fn fleet_applied_floor(
     ))
 }
 
-/// Leader-side: demote `node_id` from voter to learner if it currently is one
-/// — the first half of a graceful departure (issue #6), the second being
-/// [`remove_member`]. A no-op if `node_id` is not currently a voter, so a
-/// retried leave (or a leave of a node that was only ever a learner) is
-/// idempotent.
-///
-/// Demoting the *leader itself* does not hand off leadership: openraft's own
-/// model allows a leader to be a non-voter (see `RaftState::is_leading` in the
-/// vendored source — leadership requires only *membership*, checked via
-/// `MembershipState::contains`, not `is_voter`), so a leader that demotes
-/// itself keeps leading right through this step. It only steps down once
-/// [`remove_member`] drops it from membership entirely — which is exactly why
-/// [`super::node::RaftNode::leave`] can run both steps as one local call when
-/// it is itself the leaving leader, with no separate transfer step needed.
-pub(crate) async fn demote_voter(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), RpcError> {
-    let is_voter = raft
-        .with_raft_state(move |state| {
-            state
-                .membership_state
-                .committed()
-                .voter_ids()
-                .any(|id| id == node_id)
-        })
-        .await
-        .map_err(|e| RpcError::Handler(format!("demote {node_id}: reading membership: {e}")))?;
-    if !is_voter {
-        return Ok(());
-    }
-    membership_change(
-        raft,
-        &format!("demote {node_id}: remove from voters"),
-        || raft.change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([node_id])), true),
-    )
-    .await
-}
-
-/// Leader-side: drop `node_id` from membership entirely. Must run after
-/// [`demote_voter`] — openraft refuses to remove a node that is still a voter
-/// (`LearnerNotFound`) — which [`evict`] enforces by sequencing the two. A
-/// no-op if `node_id` is already gone, so a retried leave is idempotent.
-async fn remove_member(raft: &Raft<TypeConfig>, node_id: NodeId) -> Result<(), RpcError> {
-    let is_member = raft
-        .with_raft_state(move |state| {
-            state
-                .membership_state
-                .committed()
-                .nodes()
-                .any(|(id, _)| *id == node_id)
-        })
-        .await
-        .map_err(|e| RpcError::Handler(format!("evict {node_id}: reading membership: {e}")))?;
-    if !is_member {
-        return Ok(());
-    }
-    membership_change(raft, &format!("evict {node_id}: remove node"), || {
-        raft.change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node_id])), false)
-    })
-    .await
-}
-
-/// Leader-side: evict `node_id` from the cluster — demote it from voter to
-/// learner if needed, then drop it from membership (issue #6). Mirrors
+/// Leader-side: evict `node_id` from the cluster (issue #6). Mirrors
 /// [`admit`]'s use of [`membership_change`] so both admission and departure
 /// share the same commit barrier and `InProgress` retry (#38). Must run on the
 /// leader — on any other node openraft returns `ForwardToLeader`, surfaced
 /// here so the caller (the [`CLUSTER_LEAVE_PATH`] handler) can retry against
 /// the leader.
+///
+/// **A voter departs by one `RemoveVoters(retain = false)`, never by
+/// demote-then-remove (D-59).** The old two-step shape left the departing node a
+/// caught-up learner that was still a member between its halves — which is
+/// exactly [`promote_ready_learners`]'s criterion, so a departure and the sweep
+/// could interleave and vote a leaving node back into the quorum (#496).
+/// Sequencing could not fix that: the sweep that does it runs on the *next*
+/// leader, whose gate is a different lock. One change makes the state
+/// unrepresentable instead. openraft's `change_membership` commits the joint
+/// configuration and then the uniform one, and the departing node is a voter in
+/// the first (`voter_ids` is the joint union) and absent from the second — so no
+/// committed membership ever presents it as a learner, on any leader, including
+/// one that takes over mid-departure.
+///
+/// A **learner** still leaves by `RemoveNodes`: `RemoveVoters` on a non-voter
+/// resolves to the same configuration, which would commit an entry that removes
+/// nothing.
+///
+/// Evicting the *leader itself* needs no separate transfer step, though not for
+/// the reason it first appears. The **joint** entry commits under the joint
+/// quorum, in which the leaving leader still counts; the **uniform** entry does
+/// not — `rebuild_progresses` upgrades the leader's progress to the *effective*
+/// membership's quorum set as soon as that entry is appended, so it commits under
+/// the survivors alone, and a departing leader therefore needs every remaining
+/// voter to acknowledge it. What makes the local call sufficient is that openraft
+/// keeps a removed leader replicating until the entry removing it is *committed*
+/// (`leader_step_down` converts only once `effective.log_id() <= committed`), so
+/// it drives its own departure to completion and then steps down — which is why
+/// [`super::node::RaftNode::leave`] can run this as one local call when it is
+/// itself the leaving leader.
 ///
 /// **`Ok` does not mean the node was removed.** The voter floor
 /// ([`MIN_VOTERS`], [`held_by_floor`]; decision D-25) refuses a departure that
@@ -1658,13 +1656,13 @@ pub(crate) async fn evict(
     gate: &Mutex<()>,
     node_id: NodeId,
 ) -> Result<EvictOutcome, RpcError> {
-    // Held across the read and both writes, for the reason the ceiling is
+    // Held across the read and the write, for the reason the ceiling is
     // (#55): the floor is only exact if no other departure can commit between
     // this node counting the voters and acting on that count. Two nodes
     // SIGTERMed together would otherwise both read three voters and both leave.
     let _serialized = gate.lock().await;
 
-    let voters = committed_voters(raft, node_id).await?;
+    let (members, voters) = committed_members_and_voters(raft, node_id).await?;
     // The permit path validates itself — `change_membership` below answers
     // `ForwardToLeader` on a node that only thinks it leads, so a stale read can
     // never commit a removal. The refusal path returns before any write and so
@@ -1682,8 +1680,20 @@ pub(crate) async fn evict(
         return Ok(EvictOutcome::HeldByFloor);
     }
 
-    demote_voter(raft, node_id).await?;
-    remove_member(raft, node_id).await?;
+    if voters.contains(&node_id) {
+        membership_change(raft, &format!("evict {node_id}: remove voter"), || {
+            raft.change_membership(
+                ChangeMembers::RemoveVoters(BTreeSet::from([node_id])),
+                false,
+            )
+        })
+        .await?;
+    } else if members.contains(&node_id) {
+        membership_change(raft, &format!("evict {node_id}: remove node"), || {
+            raft.change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node_id])), false)
+        })
+        .await?;
+    }
     Ok(EvictOutcome::Removed)
 }
 
@@ -1700,6 +1710,21 @@ pub(crate) enum EvictOutcome {
 /// re-promote an existing voter.
 fn should_promote(voters: &BTreeSet<NodeId>, id: NodeId, max_voters: usize) -> bool {
     voters.len() < max_voters && !voters.contains(&id)
+}
+
+/// The sweep's under-gate re-check: promotable only while still *in membership*
+/// as well as under the ceiling.
+///
+/// Split from [`should_promote`] rather than folded into it because the two
+/// callers differ: admission holds a node it has just added, and only the sweep
+/// can have its candidate depart between the scan and the gate (#496).
+fn still_promotable(
+    members: &BTreeSet<NodeId>,
+    voters: &BTreeSet<NodeId>,
+    id: NodeId,
+    max_voters: usize,
+) -> bool {
+    members.contains(&id) && should_promote(voters, id, max_voters)
 }
 
 /// The departure floor: refuse a **voter**'s removal when it would leave fewer
@@ -2054,6 +2079,39 @@ mod tests {
         );
         assert!(
             !should_promote(&voters, 2, 3),
+            "an existing voter is never re-promoted"
+        );
+    }
+
+    /// Pins the sweep's under-gate re-check (#496): a candidate must still be in
+    /// membership, not merely under the ceiling.
+    ///
+    /// The sweep scans members, then takes the gate — and a departure can commit
+    /// in between. Judged on the voter set alone, a node that has just been
+    /// removed still looks promotable (it is not a voter, and the set is under
+    /// the ceiling), so the sweep submits `AddVoterIds` for a node that is no
+    /// longer a learner. openraft answers `LearnerNotFound`, which `?` turns into
+    /// a skipped tick for every candidate behind it — a departure quietly
+    /// stalling unrelated promotions.
+    #[test]
+    fn still_promotable_requires_membership_as_well_as_headroom() {
+        let members: BTreeSet<NodeId> = BTreeSet::from([1, 2, 3]);
+        let voters: BTreeSet<NodeId> = BTreeSet::from([1, 2]);
+
+        assert!(
+            still_promotable(&members, &voters, 3, 3),
+            "a learner still in membership, under the ceiling, promotes"
+        );
+        assert!(
+            !still_promotable(&BTreeSet::from([1, 2]), &voters, 3, 3),
+            "a candidate removed between the scan and the gate is not promotable"
+        );
+        assert!(
+            !still_promotable(&members, &voters, 3, 2),
+            "membership does not override the ceiling"
+        );
+        assert!(
+            !still_promotable(&members, &voters, 2, 3),
             "an existing voter is never re-promoted"
         );
     }

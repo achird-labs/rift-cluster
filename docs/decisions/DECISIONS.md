@@ -399,6 +399,9 @@ learner" taking an advertise address would be a second, weaker entry point — o
 written straight into the replicated membership log. Snapshot/compaction actions (#365) are a
 separate question; this entry does not settle them.
 
+> **Refined by D-59**: the promotion sweep is *joining* machinery, and a leaving node never
+> presents as a joiner — a departing voter is never a learner in committed membership.
+
 ### D-22 — Liveness probes bypass the peer-health gate
 - **Status:** active
 - **Decided:** 2026-08-24 · #431
@@ -1545,3 +1548,85 @@ makes `test_cold_start` pass for the wrong reason); it trades a latency problem 
 one. Cutting scenarios or widening the path filter's skip set — D-41 already settled the
 coverage-for-latency trade at one iteration per scenario, and this entry buys the latency back
 without reopening it.
+
+### D-59 — A voter departs by one `RemoveVoters(retain = false)`; a leaving node is never a learner
+- **Status:** active
+- **Decided:** 2026-08-28
+- **Refines:** D-21, D-27
+- **Implemented by:** #496
+- **Code:** crates/rift-cluster/src/raft/network.rs
+
+`evict` was demote-then-remove: `RemoveVoters(retain = true)`, then `RemoveNodes`. Between those two
+committed changes the departing node was a **caught-up learner that was still a member** — which is
+exactly `promote_ready_learners`' promotion criterion. A departure and the promotion sweep could
+therefore interleave, and the sweep would vote a leaving node back into the quorum.
+
+Not hypothetical: #495 reproduced it deterministically by widening the leadership-takeover window in
+`evict_completes_from_a_new_leader_after_partial_departure` by 3 s — the condition a loaded CI runner
+produces on its own — and observed `voters=[1, 2, 3]` with n3 mid-departure. It had been failing
+intermittently on CI before that, reported as the demote's no-op guard appearing to break, which sent
+the first diagnosis to the wrong place entirely.
+
+**The window is narrower than it looks, and that is what decides the remedy.** On one leader the
+sweep cannot interleave at all: `evict` holds the membership gate across the whole departure and
+`promote_ready_learners` takes the same gate per candidate. The only real window is the #71 case —
+the demote commits on leader A, leadership moves, and B's sweep runs before the leaver's retry
+reaches B's `evict`. B's gate is a *different lock*, so no amount of sequencing on A closes it.
+
+**So the fix is to the shape of the departure, not to the sweep.** A voter leaves by a single
+`change_membership(RemoveVoters({id}), retain = false)`. Verified against `openraft-0.9.25`:
+
+- The public `Raft::change_membership` (`raft/impl_raft_blocking_write.rs`) commits the **joint**
+  configuration and then, when the result is still joint, re-submits the same change to reach the
+  **uniform** one. One call, exactly two committed membership entries.
+- `next_coherent(goal, retain = false)` (`membership/membership.rs`) removes from `nodes` only the
+  ids in `old_voter_ids − new_voter_ids`, both computed over the **joint union**. In the joint step
+  that difference is empty, so the leaver stays in `nodes` — and `voter_ids()` is itself the joint
+  union, so it is still a **voter**. In the uniform step the difference is the leaver, and it is
+  removed outright.
+
+Across both entries the departing node is a voter, then gone. **There is no committed membership in
+which it is a learner**, so the sweep's `voters.contains(&id)` skip covers the entire departure — on
+any leader, including one that takes over mid-departure. The bad state is unrepresentable rather than
+guarded against.
+
+#71's property is unaffected: from the half-finished state (joint committed, uniform not),
+`RemoveVoters({id})` is coherent with the joint config and resolves straight to uniform, so
+`leave_inner`'s retry against the new leader still completes the departure — and in that state the
+leaver is still a voter, so the new leader's sweep cannot touch it either.
+
+A **learner** still leaves by `RemoveNodes`. For a non-voter `last.difference({id}) == last`, so
+`RemoveVoters` resolves to the same configuration and would commit an entry that removes nothing.
+
+*Known, and unchanged by this entry:* `held_by_floor` counts `voter_ids()`, which is the joint
+union, so in the joint half-state a departure sees the pre-departure voter count and D-25's floor is
+evaluated one voter high. The old demote-then-remove shape opened the same window, but the joint
+state is now the only residual half-state and so is exactly where a #71 retry lands. Not fixed here
+— fixing it means deciding what the floor means mid-change, which is its own decision.
+
+The **leaving leader** is a separate asymmetry worth stating, because the obvious reading is wrong:
+the joint entry commits under the joint quorum, in which the leaver still counts, but
+`rebuild_progresses` upgrades the leader's progress to the *effective* membership's quorum set as
+soon as the uniform entry is appended, so that entry commits under the survivors alone. No transfer
+step is needed regardless, because openraft keeps a removed leader replicating until the entry
+removing it is committed (`leader_step_down`).
+
+*Rejected:*
+
+- **A departing set consulted by the sweep** (`evict` marks, remove clears). Per-leader in-memory
+  state, so it is empty on the new leader — the only node where the race actually exists. It cannot
+  cover the one window it was designed for.
+- **Holding the admission gate across both halves of `evict`.** Already the case, and the gate is
+  per node; it does not reach the next leader.
+- **Tolerating the bounce and recording it.** `evict` does converge by retry, but a node the fleet
+  has already decided is leaving re-enters the quorum, and each occurrence writes membership entries
+  nobody asked for. The final state being right does not make the intermediate one acceptable, and
+  "we knew about it" does not make the entries less of a fact in the log.
+- **`SetNodes` or a custom `Node` type marking a departure.** openraft warns that incorrect
+  `SetNodes` use can split the brain, and D-53 already rejected carrying metadata in membership.
+
+*Consequence for tests:* the sweep interference #495 suppressed with an auto-voter ceiling pin is
+gone at the source, so that pin comes out. `evict_completes_from_a_new_leader_after_partial_departure`
+could no longer construct its half-finished state — that state does not exist — and is rewritten as
+`evict_completes_from_a_new_leader`, which pins what #71 actually guarantees: a retried departure
+from a new leader completes and appends nothing.

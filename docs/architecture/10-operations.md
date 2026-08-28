@@ -87,7 +87,7 @@ flowchart TB
   runtime-minted imposter ports can't be exposed) — Chapter 2.
 - Probes: readiness `/readyz`, liveness `/healthz` (both unauthenticated).
   `preStop` = SIGTERM with `terminationGracePeriodSeconds ≥ 2 ×
-  cluster-leave-timeout` so graceful leave (demote → flow handoff → remove)
+  cluster-leave-timeout` so graceful leave (flow handoff → voter removal)
   completes. `PodDisruptionBudget maxUnavailable: 1`.
 - Cluster port stays ClusterIP-internal; secret via K8s Secret →
   `--cluster-secret-file`.

@@ -12,7 +12,7 @@ on log output.
 | `test_config_sync_converges` | Envoy front + toxiproxy partition stack |
 | `test_node_rejoin` | Chaos C4 (config write both sides of a partition), C6 (UDP drop) |
 | `test_cold_start` + `test_uninitialized_fleet_never_ready` | admin-API / Prometheus metric assertions |
-| `test_leader_failover` | `test_graceful_leave` (needs graceful demote-then-remove) |
+| `test_leader_failover` | `test_graceful_leave` (needs graceful voter removal) |
 
 The deferred column needs the `rift-cluster-server` binary (issue #10) and the HTTP
 config/metrics surface (issue #9); it lands in a follow-up under #11 once those
