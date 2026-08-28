@@ -28,11 +28,13 @@ Two rules with teeth: **every assertion reads the admin API or metrics, never
 logs** (logs are for humans; contracts are for machines), and **invariant
 violations never auto-retry** — an infra flake retries once, but a violated
 invariant files a bug, and persistently flaky scenarios get quarantined behind
-an issue rather than deleted. CI budget: the PR-time `cluster-smoke` job runs
-each scenario **once** (a required status check since #104 — a merge may not
-outrun it), and the nightly soak (`nightly-chaos.yml`) iterates each scenario
-60–100× under a 2 h cap. Both are deliberate deviations from RFC-001 §12's
-3×/100× bars, recorded with their reasoning in the harness README.
+an issue rather than deleted. CI budget: at PR time every scenario runs
+**once**, across four `cluster-smoke-shard` jobs that share one prebuilt image
+(D-58); `cluster-smoke` itself is the required status check (#104 — a merge may
+not outrun it) and does no testing, it judges whether the shards ran. The
+nightly soak (`nightly-chaos.yml`) iterates each scenario 60–100× under a 2 h
+cap. Both cadences are deliberate deviations from RFC-001 §12's 3×/100× bars,
+recorded with their reasoning in the harness README.
 
 ## Phase exit criteria (functional)
 

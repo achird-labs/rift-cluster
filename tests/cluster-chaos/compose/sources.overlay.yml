@@ -79,6 +79,12 @@ services:
       - "34790:4790"
 
   source-origin:
+    # The same tag the fleet runs, which is the point: this service is a rift
+    # node acting as an upstream origin, and the comment below says it must be
+    # the same production stage the fleet is. Naming the tag makes that literal
+    # — one image, not two builds of the same stage that could diverge — and it
+    # is the tag `cluster-smoke` prebuilds (D-58).
+    image: "${RIFT_CLUSTER_IMAGE:-rift-cluster-server:local}"
     build:
       context: ../..
       dockerfile: deploy/Dockerfile

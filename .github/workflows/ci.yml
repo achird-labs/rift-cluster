@@ -152,9 +152,20 @@ jobs:
   # D-41: every scenario runs ONCE here, and this job is a required status check. Flake
   # detection is the nightly soak's job (`nightly-chaos.yml`, 60–100× per scenario), not a
   # 3× PR run — the deviation from RFC-001 §12 is deliberate and recorded there.
-  cluster-smoke:
+  #
+  # D-58 split what used to be one job into three: `cluster-smoke-prepare` decides
+  # whether to run and builds the image ONCE, `cluster-smoke-shard` runs a quarter of
+  # the scenarios each, and `cluster-smoke` judges them and carries the required
+  # check's name. Measured before the split: 35–37 min, of which ~10 min was a cold
+  # image build inside the first scenario's `compose up --build` and ~20 min was 36
+  # scenarios run serially on one runner.
+  cluster-smoke-prepare:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    outputs:
+      run: ${{ steps.changed.outputs.run }}
+      shards: ${{ steps.plan.outputs.shards }}
+      total: ${{ steps.plan.outputs.total }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -171,6 +182,15 @@ jobs:
       # job whose greenness depends on it needs no cross-job coordination.
       - name: Verify the path filter before trusting it
         run: scripts/cluster-smoke-paths.sh --self-test
+
+      # The two scripts the sharded shape rests on, checked the same way and for
+      # the same reason: `cluster-smoke` is a required check that now does its
+      # testing somewhere other than the job that carries the name.
+      - name: Verify the shard partition and the gate before trusting them
+        run: |
+          set -euo pipefail
+          scripts/chaos-shard.sh --self-test
+          scripts/cluster-smoke-gate.sh --self-test
 
       - name: Which paths changed
         id: changed
@@ -193,11 +213,114 @@ jobs:
           # (#93). `tee` so the decision is in the log, not just the output.
           printf '%s\n' "$changed" | scripts/cluster-smoke-paths.sh | tee -a "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The shard count and the matrix that expands from it come from ONE place.
+      # Writing `matrix: [1,2,3,4]` beside a separate `total: 4` is two copies of
+      # the same number, and the failure when they drift is silent in the worst
+      # direction: a matrix of three against a total of four never runs shard 4's
+      # scenarios, and every remaining shard still passes.
+      - name: Shard plan
+        id: plan
+        run: |
+          set -euo pipefail
+          total=4
+          {
+            echo "total=$total"
+            echo "shards=[$(seq -s, 1 "$total")]"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      # `docker-container` driver, which is what `type=gha` cache needs; the
+      # default driver cannot export a build cache at all.
+      - uses: docker/setup-buildx-action@v3
         if: steps.changed.outputs.run == 'true'
 
-      - uses: Swatinem/rust-cache@v2
+      # The build every shard would otherwise repeat, in the one place it can be
+      # timed. It used to happen inside the first scenario's `compose up
+      # --build`, which is why its ~10 min cost could only be recovered by
+      # regressing job wall clock against scenario count across a month of runs.
+      #
+      # Both flavors, because the tier runs both and a shard has no build cache
+      # to fall back on: `runtime` is what ships, `runtime-faketime` is the same
+      # stage plus libfaketime for C12's clock skew. They are separate tags as of
+      # D-58 — see `BUILT_IMAGES` in the harness for why sharing one was a latent
+      # bug rather than a tidy saving.
+      #
+      # `RIFT_UPSTREAM_VERSION` is deliberately not passed, matching what the
+      # compose build did here before: the banner says `rift unknown`, which is
+      # cosmetic, and passing it would make the image differ from the one this
+      # job has always tested.
+      #
+      # `ignore-error=true` on the export: the cache is an optimisation, and
+      # `cluster-smoke` is a required check. A cache backend that is down, out of
+      # quota or mid-deprecation must cost this job ten minutes, never a red
+      # merge gate. The import has no such flag and needs none — a miss is just
+      # a slow build.
+      - name: Build the node images once, for every shard
         if: steps.changed.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          for target in runtime runtime-faketime; do
+            case "$target" in
+              runtime) tag=rift-cluster-server:local ;;
+              runtime-faketime) tag=rift-cluster-server:faketime ;;
+            esac
+            docker buildx build \
+              --file deploy/Dockerfile \
+              --target "$target" \
+              --tag "$tag" \
+              --cache-from type=gha,scope=cluster-smoke \
+              --cache-to type=gha,mode=max,scope=cluster-smoke,ignore-error=true \
+              --load \
+              .
+          done
+          # Assert the read-back rather than trusting the exit code: `--load` is
+          # the step that can quietly not happen, and a missing image would
+          # surface four jobs later as a registry pull for a tag that only ever
+          # existed on a runner's disk.
+          for tag in rift-cluster-server:local rift-cluster-server:faketime; do
+            docker image inspect "$tag" >/dev/null
+          done
+
+      # `gzip -1`: the layers are already compressed, so anything harder spends
+      # CPU to save nothing. What matters is that all four shards load the same
+      # bytes — three nodes and four shards on one provable artifact.
+      - name: Save the images for the shards
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          docker save rift-cluster-server:local rift-cluster-server:faketime \
+            | gzip -1 > "${RUNNER_TEMP}/chaos-images.tar.gz"
+          ls -lh "${RUNNER_TEMP}/chaos-images.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.changed.outputs.run == 'true'
+        with:
+          name: chaos-images
+          path: ${{ runner.temp }}/chaos-images.tar.gz
+          # Long enough to be downloaded by the shards in this run, and no
+          # longer: this is a build output, not evidence.
+          retention-days: 1
+          compression-level: 0
+
+  cluster-smoke-shard:
+    needs: cluster-smoke-prepare
+    if: needs.cluster-smoke-prepare.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    # Generous against the slowest quarter of the tier plus a cold rust build,
+    # tight enough that a wedged stack is killed rather than burning the hour.
+    timeout-minutes: 40
+    strategy:
+      # One shard's failure must not cancel the others' evidence — the same
+      # reasoning the nightly soak's matrix gives.
+      fail-fast: false
+      matrix:
+        index: ${{ fromJSON(needs.cluster-smoke-prepare.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       # The tier publishes fixed host ports, and thirteen of them fall inside
       # Linux's ephemeral range (32768-60999). Any outbound connection on the
@@ -212,8 +335,9 @@ jobs:
       # (`ci_reserves_every_published_port_that_linux_could_hand_out`), so a new
       # published port in this range fails the build rather than reintroducing
       # the flake quietly.
+      #
+      # Per shard, not once: each shard is its own runner with its own kernel.
       - name: Reserve the tier's published ports from the ephemeral range
-        if: steps.changed.outputs.run == 'true'
         run: |
           set -euo pipefail
           sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901
@@ -222,35 +346,143 @@ jobs:
           # partially applied or silently truncated write.
           test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901"
 
-      # Serial by necessity, not by preference: the compose file publishes fixed
-      # host ports, so two stacks cannot coexist on one runner.
+      - uses: actions/download-artifact@v4
+        with:
+          name: chaos-images
+          path: ${{ runner.temp }}
+
+      - name: Load the prepared images
+        run: |
+          set -euo pipefail
+          gunzip -c "${RUNNER_TEMP}/chaos-images.tar.gz" | docker load
+          # Same read-back assertion as the build step's, for the same reason —
+          # and here it is what lets the harness trust RIFT_CHAOS_PREBUILT_IMAGE.
+          for tag in rift-cluster-server:local rift-cluster-server:faketime; do
+            docker image inspect "$tag" >/dev/null
+          done
+
+      # Serial WITHIN a shard by necessity: the compose file publishes fixed host
+      # ports, so two stacks cannot coexist on one runner. Across shards it is
+      # four runners, which is the only axis this tier can be parallelised on
+      # without giving up the fixed topology it deliberately shares with the
+      # shipped compose file.
       #
       # `--ignored` runs the ignored tests: the whole tier is gated on a
       # container runtime, so `--ignored` is how it runs at all.
-      # Skips are derived from the quarantine tags in the source, never
-      # hardcoded here: a hardcoded skip outlives the reason for it, and the
-      # scenario stays silently un-run long after its bug is fixed.
+      #
+      # Scenario names are DERIVED, from `--list` through the shard partition,
+      # never written here. The nightly's hand-maintained matrix is what that
+      # costs: it names 24 scenarios where the tier has 36, and nothing said so.
+      # Quarantine skips come from the tags in the source through the same path.
       - name: Container chaos scenarios
-        if: steps.changed.outputs.run == 'true'
+        env:
+          # The prepare job built and loaded both flavors, so `up` must not pass
+          # `--build`: there is no layer cache behind it on this runner and it
+          # would rebuild from cold, which is the cost the prepare job exists to
+          # pay once. The harness asserts the images are present before the first
+          # stack rather than discovering it as a failed pull.
+          RIFT_CHAOS_PREBUILT_IMAGE: "1"
+          CHAOS_TIMING_LOG: ${{ runner.temp }}/chaos-timing.tsv
         run: |
           set -euo pipefail
-          # An array, not a string. `list` emits one token per line precisely so
-          # this can be quoted: the old unquoted `$skips` worked only by
-          # word-splitting, which left SC2086 pointing here — and taking that
-          # advice hands libtest one argument beginning with `--`, which it
-          # rejects outright (`Unrecognized option`, exit 101). Red rather than
-          # silent, but broken either way, and the lint invited it (issue #116).
-          mapfile -t skips < <(scripts/chaos-quarantine.sh list)
-          echo "quarantine skips: ${skips[*]:-<none>}"
-          # Piped through the floor check so a run that matched no scenario is
-          # red rather than a green check that tested nothing. `pipefail` above
-          # keeps cargo's own failure from being masked by the pipe.
-          cargo test -p cluster-chaos -- --ignored --test-threads=1 "${skips[@]}" \
-            | scripts/assert-scenarios-ran.sh
+          # An array, not a string, for the reason `chaos-quarantine.sh`'s header
+          # gives about `--skip`: one token per line is what makes the quoted
+          # form the correct form, so SC2086 has nothing to point at and nobody
+          # is invited to "fix" it into something libtest rejects (issue #116).
+          mapfile -t scenarios < <(
+            cargo test -p cluster-chaos --test scenarios -- --ignored --list \
+              | sed -n 's/^\(.*\): test$/\1/p' \
+              | scripts/chaos-shard.sh --index '${{ matrix.index }}' \
+                                       --total '${{ needs.cluster-smoke-prepare.outputs.total }}'
+          )
+          # `mapfile` reads a process substitution, whose exit status bash does
+          # NOT check — `pipefail` included. So `chaos-shard.sh` refusing to emit
+          # an empty list arrives here as an empty array, not as a failure, and
+          # an empty array expands to no filters at all: `--exact` with nothing
+          # after it makes libtest run EVERY scenario, in every shard, and the
+          # floor below would be 0 and pass. Re-assert it on this side.
+          if [ "${#scenarios[@]}" -eq 0 ]; then
+            echo "shard ${{ matrix.index }} selected no scenarios. Either the list step" >&2
+            echo "failed or the partition refused; libtest would read no filters as" >&2
+            echo "'run everything', so this is a failure, not an empty shard." >&2
+            exit 1
+          fi
+          echo "shard ${{ matrix.index }}/${{ needs.cluster-smoke-prepare.outputs.total }} runs ${#scenarios[@]} scenarios:"
+          printf '  %s\n' "${scenarios[@]}"
+          # The floor is the shard's OWN count, not 1. `assert-scenarios-ran.sh`
+          # defends against a filter that matched nothing; here the expected
+          # number is known exactly, derived from the same list the filters came
+          # from, so a scenario that was selected and then did not run — renamed,
+          # newly ignored, filtered away by an `--exact` that stopped matching —
+          # fails the shard instead of quietly shrinking it.
+          cargo test -p cluster-chaos -- \
+              --ignored --test-threads=1 --exact "${scenarios[@]}" \
+            | scripts/assert-scenarios-ran.sh --assert "${#scenarios[@]}"
+
+      # Where the per-scenario cost of this tier becomes readable. libtest
+      # buffers a piped run's output, so the per-test lines all arrive at the end
+      # with no timestamps — which is why the shape of this job's 33 minutes had
+      # to be recovered by regression rather than read off a log.
+      - name: Per-scenario timing
+        if: always()
+        run: |
+          set -euo pipefail
+          f="${RUNNER_TEMP}/chaos-timing.tsv"
+          [ -s "$f" ] || exit 0
+          {
+            echo "### cluster-smoke shard ${{ matrix.index }} — per-scenario cost"
+            echo
+            echo "| scenario | total | down | ports_free | up | ready | formed | teardown |"
+            echo "|---|--:|--:|--:|--:|--:|--:|--:|"
+            awk -F'\t' '
+              { ms[$1"\t"$2] = $3; if (!($1 in seen)) { seen[$1] = 1; order[++n] = $1 } }
+              END {
+                split("total down ports_free up ready formed teardown", cols, " ")
+                for (i = 1; i <= n; i++) {
+                  s = order[i]
+                  line = "| `" s "` |"
+                  for (c = 1; c <= 7; c++) {
+                    k = s "\t" cols[c]
+                    line = line (k in ms ? sprintf(" %.1fs |", ms[k] / 1000) : " — |")
+                  }
+                  print line
+                }
+              }
+            ' "$f" | sort -t'|' -k3 -rn
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-timing-${{ matrix.index }}
+          path: ${{ runner.temp }}/chaos-timing.tsv
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Cluster logs on failure
-        if: failure() && steps.changed.outputs.run == 'true'
+        if: failure()
         run: docker compose -f deploy/compose/docker-compose.yml logs --tail=100 || true
+
+  # The required status check (#104). It carries the name the ruleset pins while
+  # the testing happens in the shards, so its entire job is to refuse anything
+  # that did not actually run — see `cluster-smoke-gate.sh`, which is where that
+  # rule lives and is self-tested.
+  #
+  # `!cancelled()` rather than `always()`: a cancelled run should leave the check
+  # incomplete, which blocks the merge, rather than spawn a gate that reports a
+  # failure nobody caused.
+  cluster-smoke:
+    needs: [cluster-smoke-prepare, cluster-smoke-shard]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every shard ran, or the filter said not to
+        run: |
+          scripts/cluster-smoke-gate.sh \
+            --want '${{ needs.cluster-smoke-prepare.outputs.run }}' \
+            --prepare '${{ needs.cluster-smoke-prepare.result }}' \
+            --shards '${{ needs.cluster-smoke-shard.result }}'
 
   # Parity (issue #37): upstream's own behavioural suites, run against
   # `rift-cluster-server` with `--cluster` off. This is what turns "composition,

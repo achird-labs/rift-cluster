@@ -1434,3 +1434,114 @@ it is asked again, membership changes, or — on the apply path — it applies t
 The last of those is why this is a narrow window in practice rather than the indefinite staleness
 the fan-out alone would imply. What this entry adds is that the gap is now *reported* rather than
 assumed away.
+
+### D-58 — The chaos tier builds its image once and runs sharded; the required check is a gate
+- **Status:** active
+- **Decided:** 2026-08-28
+- **Refines:** D-41
+- **Implemented by:** #516
+- **Code:** .github/workflows/ci.yml, scripts/chaos-shard.sh, scripts/cluster-smoke-gate.sh, tests/cluster-chaos/src/lib.rs, deploy/compose/docker-compose.yml, tests/cluster-chaos/compose/faketime.overlay.yml
+
+`cluster-smoke` took 35–37 min. Measured, by regressing the tier's own reported wall clock against
+its scenario count over ten runs (2026-07-23 → 2026-08-28, N from 17 to 36):
+**total ≈ 627 s + 33.2 s × N**. Two costs, not one, and they want different remedies.
+
+**The 627 s constant is a cold image build**, and it was invisible. Every scenario brought its stack
+up with `compose up --build`, so the first one paid for a full `deploy/Dockerfile` — wasm-pack
+release, pnpm/vite, `cargo build --locked --release` over the workspace and vendored `rift` — with
+no BuildKit cache mount, no `cache_from`, and a fresh runner's empty layer cache. Nothing timed it,
+because it happened inside a test. It is now its own job (`cluster-smoke-prepare`), which is what
+makes it both measurable and cacheable, and it is built **once per run** and handed to every shard
+as an artifact rather than rebuilt per shard.
+
+**The 33.2 s slope is one full fleet lifecycle per scenario** — `down -v` → ports-free → `up` →
+readiness → `wait_cluster_formed` → teardown. It is not attacked here. Serial execution *within* a
+runner stays forced by the fixed published ports the tier shares with the shipped compose file
+(which is the point of sharing it), so the tier is parallelised on the only free axis: **four
+shards, four runners**, partitioned by `scripts/chaos-shard.sh` from `--list` output.
+
+**Measured after the change**, over the two runs that landed it:
+
+| | before | after |
+|---|--:|--:|
+| wall clock | 35.5 min | **17–18.5 min** |
+| runner-minutes | 35.5 | **38–44** |
+
+The trade is stated honestly because the first draft of this entry got it wrong: runner-minutes go
+**up ~20 %**, not "roughly unchanged". Four shards each pay their own checkout, toolchain, image
+load and `cargo` compile — ~108 s apiece, ~530 s in total — which the single job paid once. Wall
+clock is what a required check costs a person waiting to merge, and that halves.
+
+The image build itself measured **478 s / 460 s**, against the 627 s the regression put on the
+intercept. The intercept was not only the build: it also held the 36 per-scenario `compose up
+--build` context re-transfers, which this change removes as well.
+
+**The GHA layer cache is worth ~4 %** — 478 s cold, 460 s warm on the next run. Predicted, and now
+measured: `COPY . .` sits before `cargo build` in `deploy/Dockerfile`, so any source edit
+invalidates the dependency layer and the cache can only return the apt and pnpm-install layers. It
+is kept because it costs nothing and pays on a docs-shaped rebuild, not because it solves this.
+`ignore-error=true` on the export: the cache is an optimisation and this is a required check, so a
+cache backend that is down must cost minutes, never a red merge gate.
+
+**`cluster-smoke` keeps its name and stops doing the testing.** It is a required status check
+(#104), so the name is load-bearing in `.github/rulesets/master.json`; it is now a gate job that
+judges the prepare job's filter verdict against the shards' aggregate result. That makes the gate
+the whole check, so it is a whitelist — a combination must be recognised as *good* to pass —
+self-tested in `scripts/cluster-smoke-gate.sh`. `skipped` is the result that reads like success
+while meaning nothing ran, and it is accepted only when the path filter itself said the tier was not
+needed. This repo has produced that failure twice by other routes (#93, a filter failing open into
+skipping; #101, a merge outrunning the job).
+
+**Flavors are tagged apart, and that is a correctness fix, not a saving.** Dropping `--build` was
+only safe once it was. `faketime.overlay.yml` overrides `build.target` but inherited the image
+*name*, so the clock-lying flavor and the production one landed on the same compose-derived tag
+(`rift-cluster-rift-1`); what kept the bytes matching the overlay in play was that every scenario
+passed `--build` and so re-tagged on the way up. A real invariant resting on an argument nobody
+would think to preserve — and C12 running on a truthful clock, or a later scenario inheriting a
+lying one, would both have passed quietly. The two tags are now declared with their targets and
+pinned by `compose_images_are_tagged_by_flavor`, so a third flavor fails a test rather than sharing.
+
+**Shards are balanced by count, not by cost**, and those differ more than expected: the first run's
+shards came in at 361–571 s, a 58 % spread. A weight table written before the numbers existed would
+have been a guess, and would rot the way the nightly's hand-maintained matrix has (it names 24
+scenarios where the tier has 36). So the precondition was built instead: `CHAOS_TIMING_LOG` records
+per-phase and per-scenario wall clock, rendered as a step summary and kept as an artifact. Pack by
+measured cost once there is measured cost — there now is.
+
+**What the first measurement says, and it is not what this entry assumed.** Across 37 stacks, the
+tier's 1611 s of stack time divides as: scenario bodies 787 s (49 %), **teardown 576 s (36 %)**,
+`wait_cluster_formed` 181 s (11 %), and everything else — `up`, `ready`, `down`, ports-free —
+66 s (4 %). The floor is a *teardown* cost, not a startup one, which is the opposite of what the
+"full fleet lifecycle" framing above suggests and what any reading of `start_stack` would predict.
+
+Two of those numbers are exact enough to name a mechanism rather than a symptom, and both are left
+for their own change:
+
+- **Teardown clusters at 13–17 s, on a `stop_grace_period: 15s`.** A node that drained inside its
+  `RIFT_CLUSTER_LEAVE_TIMEOUT: 5` and exited should cost ~5–6 s; a 15.6 s mean says most containers
+  ride out the grace period and are SIGKILLed. If that is what is happening it is not only a CI
+  cost — the same shape makes a Kubernetes rolling update spend the full
+  `terminationGracePeriodSeconds` per pod, and D-24's "the cluster maintains itself" assumes
+  otherwise. It needs a diagnosis, not a `-t 1`, which would hide it.
+
+  **It is not D-56's mechanism, and that is measured rather than argued.** D-56 (#513) landed the
+  same day and fixed one concrete way a node could fail to stop — a parked blob fetch held the
+  state-machine worker, so the storage-release wait timed out — which was close enough to this
+  shape to be worth ruling out rather than assuming either way. Two tier runs of this branch,
+  identical but for #513 sitting under the second, 37 stacks each: teardown **15.6 s → 15.2 s**,
+  and the tier's whole stack time 1610.7 s → 1607.2 s. No change. Whatever holds these containers
+  for the full grace period is still unaccounted for.
+- **`wait_cluster_formed` is 5.0 s on every one of 36 stacks**, never more and never less. That is
+  the voter gauge's resample interval, which the function's own doc comment names; it is measuring
+  the sampler, not convergence. A membership read that is not gauge-derived removes it outright.
+
+*Rejected:* restructuring `deploy/Dockerfile` with `cargo-chef` so a source change reuses a
+dependency layer — it is where the remaining minutes are, and the 478 s → 460 s cache measurement
+above is now the evidence for that rather than the prediction it was, but it is surgery on the
+artifact the release lane ships and belongs in its own change. Building the image per shard — same wall
+clock, four times the runner-minutes, and four images that are only *probably* identical. Reusing
+one stack across scenarios — the isolation hazard is documented in `start_stack` (a leftover stack
+makes `test_cold_start` pass for the wrong reason); it trades a latency problem for a correctness
+one. Cutting scenarios or widening the path filter's skip set — D-41 already settled the
+coverage-for-latency trade at one iteration per scenario, and this entry buys the latency back
+without reopening it.

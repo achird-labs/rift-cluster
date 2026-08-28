@@ -772,10 +772,10 @@ Both are deliberate, and recorded here rather than left to be re-discovered as
 - **`cluster-smoke` runs 1 iteration, not the specified 3.** Flake detection is
   the nightly soak's job, and it does it far better: 60–100 iterations of each
   scenario against 3 on a PR. Tripling the most expensive job on every
-  cluster-touching PR — roughly 25 min to 70+ — buys very little the soak does
-  not already catch, and it buys it by taxing every change. If a scenario is
-  suspected flaky, soak that one on demand via `workflow_dispatch` rather than
-  making every PR pay for the general case.
+  cluster-touching PR buys very little the soak does not already catch, and it
+  buys it by taxing every change. If a scenario is suspected flaky, soak that
+  one on demand via `workflow_dispatch` rather than making every PR pay for the
+  general case.
 - **The nightly iterates 60–100 per scenario, not a flat 100.** 100× everything
   does not fit the 2 h cap: C6 alone carries an irreducible 60 s toxic window,
   which puts it at ~3.6 h by itself. The table is sized to the cap, with the
@@ -808,3 +808,67 @@ seconds. Requiring it delays exactly the changes it exists to guard.
 
 `workflow_dispatch` takes a `scenario` filter and an `iterations` override, so a
 single suspect scenario can be soaked on demand.
+
+### How `cluster-smoke` is shaped (D-58)
+
+Three jobs, because the required check's name has to stay put while the work
+fans out:
+
+| job | what it does |
+|---|---|
+| `cluster-smoke-prepare` | runs the path filter, then builds **both** image flavors once and uploads them |
+| `cluster-smoke-shard` (×4) | loads those images and runs a quarter of the scenarios each |
+| `cluster-smoke` | runs nothing; judges the other two — this is the required check |
+
+Two numbers explain the shape, both measured rather than assumed. The tier's
+cost fits **≈ 627 s + 33.2 s × N** over ten runs as N grew 17 → 36. The constant
+was a cold image build happening *inside* the first scenario's `compose up
+--build`, where nothing timed it; it is now `cluster-smoke-prepare`, paid once
+and shared. The slope is one full fleet lifecycle per scenario, which sharding
+divides rather than removes.
+
+Three things about this are easy to get wrong, so they are all guarded:
+
+- **The shard list is derived**, from `--list` through `scripts/chaos-shard.sh`,
+  never written in the workflow. The nightly matrix below is the counter-example
+  — it names 24 scenarios where the tier has 36.
+- **An empty shard is a failure, not an empty shard.** libtest reads *no*
+  filters as "run everything", so a partition that silently emitted nothing
+  would run the whole tier in every shard and still look fine. Both the script
+  and its caller refuse it, because `mapfile` reading a process substitution
+  does not see the script's exit status.
+- **The gate is a whitelist.** `scripts/cluster-smoke-gate.sh --self-test` pins
+  which combinations pass; `skipped` counts as success only when the filter said
+  the tier was not needed.
+
+Per-scenario cost is now recorded (`CHAOS_TIMING_LOG`) and rendered as a step
+summary, which is what the count-balanced partition will be replaced by once
+there are enough numbers to pack against. Measured: **17–18.5 min** wall clock,
+against 35.5 before.
+
+### Where the tier's time actually goes
+
+The first run with `CHAOS_TIMING_LOG` on, over 37 stacks — and it is not what
+`start_stack` reads like:
+
+| phase | total | mean | share |
+|---|--:|--:|--:|
+| scenario bodies | 787 s | — | 49 % |
+| **teardown** | **576 s** | **15.6 s** | **36 %** |
+| `wait_cluster_formed` | 181 s | 5.0 s | 11 % |
+| `up` + `ready` + `down` + ports-free | 66 s | 1.8 s | 4 % |
+
+The per-scenario floor is a **teardown** cost, not a startup one. Two numbers
+there are exact enough to name a mechanism, and both are open (D-58):
+
+- teardown clusters at 13–17 s on a `stop_grace_period: 15s`, where a node that
+  drained inside its 5 s leave timeout should cost ~5–6 s. Most containers look
+  like they ride the grace period out and are SIGKILLed. Worth a diagnosis
+  before a faster teardown flag, since the same shape would cost a Kubernetes
+  rolling update the full grace period per pod. **Not D-56's mechanism**: two
+  runs of this branch differing only by #513 under the second measured
+  teardown at 15.6 s and 15.2 s, 37 stacks each — no change. Still
+  unaccounted for.
+- `wait_cluster_formed` is 5.0 s on every one of 36 stacks — the voter gauge's
+  resample interval, which that function's own doc comment names. It measures
+  the sampler, not convergence.

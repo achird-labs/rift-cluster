@@ -116,6 +116,78 @@ fn stack_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Every image this tier builds for itself, as the compose files tag them.
+///
+/// There are two, and the difference between them is not cosmetic: the faketime
+/// flavor carries an `LD_PRELOAD` that lies about the clock. Before they were
+/// tagged apart they shared whatever name compose derived from the project and
+/// service (`rift-cluster-rift-1`), and the ONLY thing keeping C12 from running
+/// on a truthful clock — or a later scenario from inheriting a lying one — was
+/// that every scenario passed `--build` and so re-tagged on the way up. That is
+/// a real invariant resting on an argument nobody would think to keep.
+///
+/// `compose_images_are_tagged_by_flavor` pins this list against the compose
+/// files, so an overlay that introduces a third flavor fails a test rather than
+/// silently sharing a tag with one of these.
+pub const BUILT_IMAGES: [&str; 2] = ["rift-cluster-server:local", "rift-cluster-server:faketime"];
+
+/// Whether `cluster-smoke` has already built and loaded [`BUILT_IMAGES`].
+///
+/// A shard runner gets the images from the prepare job's artifact, not from a
+/// build of its own (D-58), so `up` must not pass `--build`: there is no layer
+/// cache behind it and it would rebuild the whole thing from cold, which is the
+/// cost the prepare job exists to pay once.
+fn prebuilt() -> bool {
+    std::env::var_os("RIFT_CHAOS_PREBUILT_IMAGE").is_some()
+}
+
+/// Fail before the first stack if a prebuilt image was promised and is missing.
+///
+/// Fail-closed, and once per process. Without it a missing tag sends compose to
+/// a registry for an image that only ever existed on a runner's disk, and the
+/// error names a failed pull of `rift-cluster-server:local` — which reads as a
+/// network problem rather than as "the prepare job did not hand this shard what
+/// it said it did".
+fn ensure_prebuilt_images() -> anyhow::Result<()> {
+    static CHECKED: OnceLock<Result<(), String>> = OnceLock::new();
+    CHECKED
+        .get_or_init(|| {
+            if !prebuilt() {
+                return Ok(());
+            }
+            for image in BUILT_IMAGES {
+                let present = Command::new("docker")
+                    .args(["image", "inspect", image])
+                    .output()
+                    .is_ok_and(|out| out.status.success());
+                if !present {
+                    return Err(format!(
+                        "RIFT_CHAOS_PREBUILT_IMAGE is set but `{image}` is not loaded. The \
+                         prepare job builds and uploads it; unset the variable to build here \
+                         instead."
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
+/// The `up` arguments for this run: `--build` locally, nothing in CI.
+///
+/// Locally `--build` is what makes an edit show up in the next `cargo test`, so
+/// it stays. It is also what has always re-tagged the flavor in use — see
+/// [`BUILT_IMAGES`] — which is why dropping it required tagging the flavors
+/// apart first rather than as a follow-up.
+fn up_args() -> &'static [&'static str] {
+    if prebuilt() {
+        &["up", "-d"]
+    } else {
+        &["up", "-d", "--build"]
+    }
+}
+
 /// A running 3-node cluster. Dropping it tears the stack down, so a scenario
 /// that panics mid-assertion still cleans up after itself.
 pub struct Cluster {
@@ -125,6 +197,9 @@ pub struct Cluster {
     /// scenario inherits them.
     files: Vec<String>,
     _guard: MutexGuard<'static, ()>,
+    /// When this stack was asked for, so `Drop` can report what the scenario
+    /// cost end to end. See [`record`].
+    created: Instant,
 }
 
 impl Cluster {
@@ -178,7 +253,9 @@ impl Cluster {
         let cluster = Self {
             files: vec![base_file()],
             _guard: guard,
+            created: Instant::now(),
         };
+        ensure_prebuilt_images()?;
         compose_with(
             &[base_file(), overlay_file()],
             &["down", "-v", "--remove-orphans"],
@@ -186,9 +263,9 @@ impl Cluster {
         .ok();
         wait_stack_gone();
         wait_ports_free(PORTS_FREE_TIMEOUT)?;
-        cluster
-            .compose(&["up", "-d", "--build", "--no-deps", name])
-            .context("compose up single node")?;
+        let mut args = up_args().to_vec();
+        args.extend(["--no-deps", name]);
+        cluster.compose(&args).context("compose up single node")?;
         Ok(cluster)
     }
 
@@ -199,7 +276,9 @@ impl Cluster {
         let cluster = Self {
             files,
             _guard: guard,
+            created: Instant::now(),
         };
+        ensure_prebuilt_images()?;
 
         // Down first: a stack left behind by an interrupted run would otherwise
         // be silently reused, and its state dirs would make `test_cold_start`
@@ -208,19 +287,23 @@ impl Cluster {
         // Torn down with BOTH files regardless of which this stack wants, so a
         // chaos stack left behind by an interrupted run cannot survive into a
         // plain one.
+        let t = Instant::now();
         compose_with(
             &[base_file(), overlay_file()],
             &["down", "-v", "--remove-orphans"],
         )
         .ok();
         wait_stack_gone();
+        let t = record("down", t);
         wait_ports_free(PORTS_FREE_TIMEOUT)?;
-        cluster
-            .compose(&["up", "-d", "--build"])
-            .context("compose up")?;
+        let t = record("ports_free", t);
+        cluster.compose(up_args()).context("compose up")?;
+        let t = record("up", t);
 
         cluster.wait_all_ready(UP_TIMEOUT).await?;
+        let t = record("ready", t);
         cluster.wait_cluster_formed(UP_TIMEOUT).await?;
+        record("formed", t);
         Ok(cluster)
     }
 
@@ -381,8 +464,49 @@ impl Drop for Cluster {
         }
         // Best effort by construction: this runs during unwind on a failed
         // assertion, where a second failure would replace the real one.
+        let t = Instant::now();
         let _ = self.compose(&["down", "-v", "--remove-orphans"]);
+        record("teardown", t);
+        record("total", self.created);
     }
+}
+
+/// Append `<scenario>\t<phase>\t<ms>` to `$CHAOS_TIMING_LOG`, and return the
+/// instant the next phase starts from.
+///
+/// Unset — every local run, and every lane that has not asked for it — this is a
+/// clock read and nothing else.
+///
+/// It exists because the per-scenario cost of this tier was, until it was
+/// measured, only inferable by regressing whole-job wall clock against scenario
+/// count across a month of runs. libtest buffers a piped run's output, so even
+/// the per-test lines arrive in one burst at the end with no timestamps to read.
+/// `cluster-smoke` renders this file as a step summary, so the next person asking
+/// "which phase is the 19 s floor?" reads an answer instead of deriving one.
+///
+/// Best effort throughout: a timing file that cannot be written must never fail
+/// a scenario, and this is called from `Drop` during unwind.
+fn record(phase: &str, since: Instant) -> Instant {
+    let now = Instant::now();
+    if let Some(path) = std::env::var_os("CHAOS_TIMING_LOG") {
+        let scenario = std::thread::current()
+            .name()
+            .unwrap_or("unknown")
+            .to_owned();
+        let line = format!(
+            "{scenario}\t{phase}\t{}\n",
+            now.duration_since(since).as_millis()
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+    now
 }
 
 impl Cluster {
@@ -1770,5 +1894,118 @@ pub async fn wait_voters(node: &Node, expected: f64, timeout: Duration) -> anyho
             );
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every compose file this tier composes, base and overlays alike.
+    fn compose_sources() -> Vec<(String, String)> {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut files = vec![(
+            "deploy/compose/docker-compose.yml".to_owned(),
+            std::fs::read_to_string(base_file()).expect("read the base compose file"),
+        )];
+        let overlays = std::fs::read_dir(format!("{root}/compose")).expect("read compose/");
+        for entry in overlays {
+            let path = entry.expect("read a compose/ entry").path();
+            if path.extension().is_some_and(|e| e == "yml") {
+                let name = path.file_name().expect("a file name").to_string_lossy();
+                let body = std::fs::read_to_string(&path).expect("read an overlay");
+                files.push((format!("tests/cluster-chaos/compose/{name}"), body));
+            }
+        }
+        files
+    }
+
+    /// Collect the values of a `key:` across a compose file, ignoring comments.
+    ///
+    /// Line-oriented on purpose: pulling a YAML parser into this crate to read
+    /// two keys would be a dependency taken on for a guard, and the guard does
+    /// not need structure — it needs the two flat sets below.
+    fn values_of(key: &str, body: &str) -> Vec<String> {
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().trim_matches('"').to_owned())
+            .collect()
+    }
+
+    /// The default a `${VAR:-default}` resolves to, which is what a run without
+    /// an override uses and what the prebuild tags.
+    fn resolved(image: &str) -> &str {
+        image
+            .rsplit_once(":-")
+            .map_or(image, |(_, d)| d.trim_end_matches('}'))
+    }
+
+    /// A build target and the tag it lands on must be introduced together.
+    ///
+    /// This is the guard for what [`BUILT_IMAGES`] documents. It does not parse
+    /// the compose graph — it compares two flat sets — but the two failures it
+    /// catches are the two that matter, and both have precedent here:
+    ///
+    /// 1. A new `build.target` with no tag of its own. Until D-58 the faketime
+    ///    flavor was exactly this: it shared the production tag, and what kept
+    ///    the bytes matching the overlay was `--build` running before every
+    ///    `up`. `cluster-smoke` no longer passes `--build`, so a repeat would
+    ///    mean a scenario silently running the wrong flavor.
+    /// 2. A tag the prebuild does not produce. `ensure_prebuilt_images` asserts
+    ///    `BUILT_IMAGES` is loaded; a compose file naming some other
+    ///    `rift-cluster-server:` tag would pass that check and then fail at
+    ///    `up`, as a registry pull for an image that never left a runner.
+    #[test]
+    fn compose_images_are_tagged_by_flavor() {
+        let mut targets = std::collections::BTreeSet::new();
+        let mut tags = std::collections::BTreeSet::new();
+
+        for (name, body) in compose_sources() {
+            targets.extend(values_of("target:", &body));
+            for image in values_of("image:", &body) {
+                let tag = resolved(&image);
+                if tag.starts_with("rift-cluster-server:") {
+                    assert!(
+                        BUILT_IMAGES.contains(&tag),
+                        "{name} names `{tag}`, which is not in BUILT_IMAGES, so the prebuild \
+                         never produces it and `up` would try to pull it"
+                    );
+                    tags.insert(tag.to_owned());
+                }
+            }
+        }
+
+        assert_eq!(
+            targets.len(),
+            BUILT_IMAGES.len(),
+            "the compose files build {} distinct targets ({targets:?}) but BUILT_IMAGES has {}. \
+             A new build target needs a tag of its own, or it shares one with another flavor and \
+             whichever built last wins.",
+            targets.len(),
+            BUILT_IMAGES.len()
+        );
+        assert_eq!(
+            tags.len(),
+            BUILT_IMAGES.len(),
+            "only {tags:?} are tagged across the compose files, but BUILT_IMAGES declares \
+             {BUILT_IMAGES:?}. An image nothing names is one the prebuild wastes a build on."
+        );
+    }
+
+    /// `--build` locally, never under a prebuilt image.
+    ///
+    /// The two halves of D-58's trade: a local `cargo test` still picks up a
+    /// working-tree edit, and a shard never rebuilds from cold behind the
+    /// prepare job's back.
+    #[test]
+    fn up_args_drop_the_build_flag_only_when_prebuilt() {
+        // Asserts the mapping against whatever the environment says rather than
+        // setting the variable, which is process-wide and would race any test
+        // running beside it.
+        let args = up_args();
+        assert_eq!(args.contains(&"--build"), !prebuilt());
+        assert!(args.starts_with(&["up", "-d"]));
     }
 }
