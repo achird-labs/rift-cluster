@@ -539,15 +539,21 @@ fn quarantine_list_emits_one_argument_per_line() {
     );
 }
 
-/// The runner must pass the skips as an **array**, never as one string.
+/// The runner must pass its scenario names as an **array**, never as one string.
 ///
-/// `cargo test -- ... "$skips"` hands libtest one argument beginning with `--`,
-/// which it rejects: `error: Unrecognized option: 'skip a --skip b'`, exit 101.
-/// The tier stops running until someone undoes it. Issue #116 predicted a
-/// *silent* skip instead; measured, it is loud — but SC2086 on the old unquoted
-/// form still invited the edit, and this pins the shape that removes the lint.
+/// `cargo test -- ... "$names"` hands libtest one argument, which it reads as a
+/// single filter matching nothing. Issue #116 is the same hazard one argument
+/// over: there the collapsed token began with `--` and libtest rejected it
+/// outright (exit 101), loudly. Here it would be silent — a filter matching
+/// nothing is a green run of zero scenarios — and the only thing between that
+/// and a required check certifying it is the floor asserted below.
+///
+/// Under D-58 the array holds scenario names rather than `--skip` flags: the
+/// shard partition drops quarantined scenarios, so they never reach the command
+/// line. The unquoted-expansion hazard SC2086 keeps pointing at is unchanged,
+/// which is why this still pins the shape rather than the flag.
 #[test]
-fn the_chaos_runner_expands_skips_as_an_array() {
+fn the_chaos_runner_expands_its_scenarios_as_an_array() {
     let ci = read_workflow("ci.yml");
     let runner = ci
         .split("Container chaos scenarios")
@@ -555,19 +561,98 @@ fn the_chaos_runner_expands_skips_as_an_array() {
         .expect("ci.yml has no chaos runner step");
 
     assert!(
-        runner.contains("\"${skips[@]}\""),
-        "the runner must expand the skips as a quoted array"
+        runner.contains("\"${scenarios[@]}\""),
+        "the runner must expand the scenario names as a quoted array"
     );
     assert!(
-        !runner.contains("--test-threads=1 $skips"),
-        "the unquoted string form is back, and quoting it silently skips \
-         everything"
+        !runner.contains("--exact ${scenarios[@]}") && !runner.contains("--exact $scenarios"),
+        "the unquoted form is back; word-splitting is what makes it appear to \
+         work until a name changes"
     );
     assert!(
         runner.contains("mapfile") || runner.contains("readarray"),
-        "the skips have to be read into an array for the quoted expansion above \
+        "the names have to be read into an array for the quoted expansion above \
          to mean anything"
     );
+}
+
+/// The runner must select its scenarios through the shard partition.
+///
+/// Two things ride on that call, and neither is visible in the workflow once it
+/// is gone. It is what drops **quarantined** scenarios now that the runner
+/// passes names instead of `--skip` flags — bypass it and a scenario ignored
+/// behind an open issue runs anyway, which is the quarantine convention silently
+/// undone. And it is what makes each shard run a *quarter* of the tier: with no
+/// partition every shard runs everything, four times over, and passes.
+#[test]
+fn the_chaos_runner_selects_through_the_shard_partition() {
+    let ci = read_workflow("ci.yml");
+    let runner = ci
+        .split("Container chaos scenarios")
+        .nth(1)
+        .expect("ci.yml has no chaos runner step");
+
+    assert!(
+        runner.contains("chaos-shard.sh"),
+        "the runner must partition through chaos-shard.sh — it is what drops \
+         quarantined scenarios and what makes a shard a quarter of the tier"
+    );
+    assert!(
+        runner.contains("--ignored --list") || runner.contains("--list"),
+        "the scenario names must be DERIVED from libtest's own listing; a list \
+         written into the workflow rots the way the nightly's matrix has"
+    );
+    // libtest reads an empty filter list as "run every test", so an empty array
+    // is not an empty shard -- it is the whole tier, in every shard, green. The
+    // partition script refuses to emit one, but `mapfile` reading a process
+    // substitution does not see its exit status, so the caller has to re-check.
+    assert!(
+        runner.contains("${#scenarios[@]}\" -eq 0") || runner.contains("${#scenarios[@]} -eq 0"),
+        "the runner must refuse an empty scenario array; libtest reads no \
+         filters as 'run everything', so an empty shard would silently run the \
+         whole tier and still pass"
+    );
+    assert!(
+        runner.contains("--assert \"${#scenarios[@]}\""),
+        "the floor must be the shard's OWN count, not 1 — the expected number is \
+         known here, so a scenario that was selected and then did not run has to \
+         fail rather than quietly shrink the shard"
+    );
+}
+
+/// The required check must actually judge the shards (D-58).
+///
+/// `cluster-smoke` is the context `.github/rulesets/master.json` pins, and since
+/// D-58 it runs no scenarios of its own — it reads the prepare job's filter
+/// verdict and the shards' aggregate result and decides. Replace that call with
+/// anything unconditional and the required check passes on a run where every
+/// shard was skipped, which is #93 and #101's shared failure shape reached by a
+/// third route.
+#[test]
+fn the_required_check_runs_the_gate() {
+    let ci = read_workflow("ci.yml");
+    let gate = ci
+        .split("\n  cluster-smoke:")
+        .nth(1)
+        .expect("ci.yml has no cluster-smoke gate job");
+
+    assert!(
+        gate.contains("cluster-smoke-gate.sh"),
+        "the required check must run the gate; without it the name certifies \
+         nothing about whether the tier ran"
+    );
+    for input in [
+        "--want",
+        "needs.cluster-smoke-prepare.outputs.run",
+        "--shards",
+        "needs.cluster-smoke-shard.result",
+    ] {
+        assert!(
+            gate.contains(input),
+            "the gate needs `{input}` to tell 'skipped because nothing changed' \
+             from 'skipped because something broke'"
+        );
+    }
 }
 
 /// Both tiers must refuse a run in which no scenario actually ran.

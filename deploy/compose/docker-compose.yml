@@ -25,6 +25,20 @@ networks:
         - subnet: 172.28.7.0/24
 
 x-node: &node
+  # One tag shared by all three services, rather than the three compose derives
+  # from the project and service names (`rift-cluster-rift-1`, `-2`, `-3`).
+  #
+  # Two things follow from naming it. The build happens once instead of once per
+  # service, and — the part that is not just speed — the three nodes provably run
+  # the same bytes: a fleet where node 1 and node 3 were built from different
+  # source is a chaos result nobody can interpret, and nothing before this said
+  # they could not be.
+  #
+  # Overridable so `cluster-smoke` can build the image ONCE, ahead of the
+  # scenarios, and hand every shard the identical artifact (D-58). Left unset —
+  # every local `docker compose up --build` — it is the local tag, and the
+  # `build:` block below still produces it.
+  image: "${RIFT_CLUSTER_IMAGE:-rift-cluster-server:local}"
   build:
     context: ../..
     dockerfile: deploy/Dockerfile

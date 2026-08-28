@@ -21,8 +21,17 @@
 #
 # FAKETIME's leading "+"/"-" means an offset from the true clock, applied at
 # every call — not a frozen instant.
+#
+# Each service also re-tags the image. Overriding `build.target` alone changes
+# what gets built but not what it is called, so this flavor and the production
+# one used to land on the same compose-derived tag, and only the `--build` on
+# every `up` kept the tag matching the overlay in play. That made a truthful
+# clock under C12 — or a lying one under a later scenario — one dropped argument
+# away, with nothing to say it had happened. The tag is part of the flavor, so it
+# is declared with it (D-58).
 services:
   rift-1:
+    image: "${RIFT_CLUSTER_FAKETIME_IMAGE:-rift-cluster-server:faketime}"
     build:
       target: runtime-faketime
     environment:
@@ -33,6 +42,7 @@ services:
       # time long enough to blur what the scenario is measuring.
       FAKETIME_NO_CACHE: "1"
   rift-2:
+    image: "${RIFT_CLUSTER_FAKETIME_IMAGE:-rift-cluster-server:faketime}"
     build:
       target: runtime-faketime
     environment:
@@ -40,6 +50,7 @@ services:
       FAKETIME: "+0"
       FAKETIME_NO_CACHE: "1"
   rift-3:
+    image: "${RIFT_CLUSTER_FAKETIME_IMAGE:-rift-cluster-server:faketime}"
     build:
       target: runtime-faketime
     environment:
