@@ -190,6 +190,63 @@ class Resolution(unittest.TestCase):
         self.assertIn("crates/x/src/old.rs", out)
 
 
+class UninitialisedSubmodule(unittest.TestCase):
+    """A declared-but-absent `vendor/rift` must be named once, not inferred from its wreckage.
+
+    Every `/fix-issue` worktree starts without the submodule checked out, so before this the first
+    `--strict` run in one reported a missing register anchor and an unresolved docpath — two errors
+    blaming the register and the docs, neither of which was wrong, and `--strict` exited 1. That
+    reads as a real gate failure and costs whoever hits it a diagnosis.
+    """
+
+    def declare_submodule(self, f: "Fixture") -> None:
+        f.write(".gitmodules", '[submodule "vendor/rift"]\n\tpath = vendor/rift\n\turl = https://example.invalid/rift\n')
+        (f.root / "vendor" / "rift").mkdir(parents=True)
+
+    def test_a_declared_but_empty_submodule_is_one_error_naming_the_fix(self):
+        f = Fixture()
+        self.declare_submodule(f)
+        code, out = f.run("--strict")
+        self.assertEqual(code, 1)
+        self.assertIn("submodule-not-checked-out", out)
+        self.assertIn("git submodule update --init", out, "the error must carry the remedy")
+
+    def test_paths_under_an_absent_submodule_are_not_reported_as_missing(self):
+        # Same citation shape as `test_docpath_may_resolve_under_vendor`: a `docs/...` key cited
+        # from code, which resolves either here or under the submodule. With the submodule
+        # declared but absent, neither lookup can succeed and the honest answer is "cannot tell".
+        f = Fixture()
+        self.declare_submodule(f)
+        f.write("crates/x/src/v.rs", "// see docs/only-upstream.md\n")
+        code, out = f.run("--strict")
+        self.assertNotIn("unresolved-docpath", out, "unverifiable is not missing")
+        self.assertIn("submodule-not-checked-out", out)
+
+    def test_a_repo_with_no_submodule_still_reports_a_missing_path(self):
+        """The half that a naive fix breaks.
+
+        Suppressing on "no checkout" alone also silences every repo that declares no submodule at
+        all — where `vendor/rift/...` can never resolve, so the citation really is broken. The
+        suppression has to require *declared* and absent, and this is what pins that.
+        """
+        f = Fixture()
+        f.write("docs/architecture/12-vendored.md", "See `docs/nope/missing.md` for details.\n")
+        code, out = f.run("--strict")
+        self.assertEqual(code, 1)
+        self.assertIn("unresolved-docpath", out)
+        self.assertNotIn("submodule-not-checked-out", out)
+
+    def test_a_checked_out_submodule_changes_nothing(self):
+        f = Fixture()
+        self.declare_submodule(f)
+        f.write("vendor/rift/docs/only-upstream.md", "# upstream\n")
+        f.write("crates/x/src/v.rs", "// see docs/only-upstream.md\n")
+        code, out = f.run("--strict")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("submodule-not-checked-out", out)
+        self.assertNotIn("unresolved-docpath", out, "the vendor fallback still resolves")
+
+
 class Callouts(unittest.TestCase):
     def test_missing_callout_is_an_error(self):
         f = Fixture()
