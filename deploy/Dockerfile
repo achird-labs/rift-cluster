@@ -8,7 +8,10 @@
 #
 # The image carries the web console (#265). Three stages build it — wasm, then
 # the bundle, then the binary — in that order, because each consumes the one
-# before it.
+# before it. Since D-60 the binary half is itself two stages, `planner` and
+# `builder`, over a shared `chef` toolchain: the dependency build is keyed on a
+# recipe of the manifests instead of on the source tree, so an ordinary source
+# edit no longer rebuilds all 371 crates.
 #
 # A checkout without the submodule fails at `cargo build` with a missing-path
 # dependency rather than silently producing a binary without the engine in it.
@@ -137,19 +140,69 @@ RUN pnpm build \
     && test -f dist/lint/rift_lint_wasm_bg.wasm
 
 # ---------------------------------------------------------------------------
-# Builder
+# Builder — toolchain, shared by the planner and the build (D-60)
 # ---------------------------------------------------------------------------
-FROM rust:1.92-slim-bookworm AS builder
-
 # `ring` (via rustls) and the scripting engines compile C, so the toolchain is
 # not optional. `git` is here for rift-cluster-base's build script, which reads the
 # vendored submodule's pin to put the upstream version in `--version`; without
 # it the banner degrades to `rift unknown` rather than failing the build.
+FROM rust:1.92-slim-bookworm AS chef
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config git \
     && rm -rf /var/lib/apt/lists/*
 
+# Pinned and `--locked`, and from crates.io rather than a third-party image: this
+# stage's provenance is then the same registry the dependency graph already
+# trusts, and there is no new publisher to keep an eye on. It costs a minute on a
+# cold build and nothing on a warm one — the layer changes only when the version
+# on this line does.
+RUN cargo install cargo-chef --locked --version 0.1.72
+
 WORKDIR /src
+
+# ---------------------------------------------------------------------------
+# Planner — reduce the tree to a dependency recipe
+# ---------------------------------------------------------------------------
+# `prepare` reads the manifests and lockfile and writes `recipe.json`. This stage
+# takes the whole context and so is invalidated by any edit, but it does no
+# compiling: it exists purely so the expensive stage below depends on the recipe
+# rather than on the source.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
+# Why this is split at all, measured rather than assumed. `cargo build` here was
+# 404 s of the image's ~460 s, and none of it could ever be reused: `COPY . .`
+# sat immediately before it, so editing any file in the context — a test, a
+# workflow, a chaos scenario — rebuilt all 371 crates. Measured split of that
+# 404 s: 144 s to reach the first path crate (third-party dependencies), then
+# 260 s for the nine path crates, of which the last 174 s is `rift-cluster` and
+# `rift-cluster-server`. Only those last two change on an ordinary PR.
+#
+# So: build everything else in a layer keyed on the recipe, and let the source
+# copy invalidate only what genuinely depends on the source.
+FROM chef AS builder
+
+# The vendored submodule FIRST, and on its own. `cargo chef prepare` writes a
+# skeleton of the WORKSPACE MEMBERS only — measured: the recipe carries the five
+# `crates/`+`tests/` manifests and nothing from `vendor/rift`, because that is a
+# separate workspace consumed as path dependencies — so `cook` cannot resolve
+# without the real directory on disk. Its own layer means the dependency build
+# below is invalidated by a submodule pin bump, which is correct (the vendored
+# crates ARE dependencies, and cook compiles them: verified), and by nothing else.
+COPY vendor/rift vendor/rift
+
+COPY --from=planner /src/recipe.json recipe.json
+# The same package and features as the real build below. Feature resolution
+# decides which dependencies exist and how they are compiled, so a `cook` that
+# did not mirror them would warm a cache the build then misses.
+RUN cargo chef cook --locked --release -p rift-cluster-server --features console \
+        --recipe-path recipe.json
+
 COPY . .
 
 # The build context has no git history (see .dockerignore — `.git` is many
@@ -194,10 +247,16 @@ RUN cargo build --locked --release -p rift-cluster-server --features console
 # running on. Cross-compiling a musl target from a foreign host is its own can of worms (linker
 # selection, `.cargo/config.toml` target overrides); native builds side-step it entirely rather
 # than solving it.
+# Deliberately NOT split over `chef` the way `builder` is (D-60). Nothing on a
+# pull-request lane builds this stage — only `release.yml`, on a tag — so the
+# split would buy no PR latency, and a mistake in it would surface for the first
+# time during a release. The asymmetry is the point: the stage that runs on every
+# cluster-touching PR is the one worth restructuring, and it is the one CI
+# exercises on every change.
 FROM rust:1.92-slim-bookworm AS builder-static
 
-# `musl-tools`/`musl-dev` alongside the same `build-essential pkg-config git` the default
-# `builder` installs above — `ring` still needs a C toolchain regardless of libc, and `git` is
+# `musl-tools`/`musl-dev` alongside the same `build-essential pkg-config git` the `chef` stage
+# installs above — `ring` still needs a C toolchain regardless of libc, and `git` is
 # here for the identical reason: rift-cluster-base's build script shells out to it to read the
 # vendored submodule's pin for `--version`. `ca-certificates` is also installed here, but not
 # for this stage's own build — it exists so `runtime-static` below has a CA bundle to COPY,

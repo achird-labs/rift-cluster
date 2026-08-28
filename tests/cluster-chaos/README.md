@@ -827,6 +827,12 @@ was a cold image build happening *inside* the first scenario's `compose up
 and shared. The slope is one full fleet lifecycle per scenario, which sharding
 divides rather than removes.
 
+The prepare job's own build is `cargo build --release`, 404 s of its ~460 s.
+D-60 makes that a cached layer (`cargo-chef`) and fixes the build cache, which
+had never actually run — `type=gha` cannot authenticate from a `run:` step. If
+that regresses, the log says so: no `importing cache manifest` at the start of
+the build, and the cargo step back near 400 s.
+
 Three things about this are easy to get wrong, so they are all guarded:
 
 - **The shard list is derived**, from `--list` through `scripts/chaos-shard.sh`,

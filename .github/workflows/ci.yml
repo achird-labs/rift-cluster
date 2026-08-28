@@ -254,28 +254,59 @@ jobs:
       # quota or mid-deprecation must cost this job ten minutes, never a red
       # merge gate. The import has no such flag and needs none — a miss is just
       # a slow build.
-      - name: Build the node images once, for every shard
+      #
+      # **These are actions, not a `run:` step, and that is the whole point**
+      # (D-60). `type=gha` authenticates with `ACTIONS_RUNTIME_TOKEN` and
+      # `ACTIONS_CACHE_URL`, which GitHub injects into JS actions and NOT into
+      # `run:` steps. The first cut of D-58 called `docker buildx build` from a
+      # shell step with these exact cache flags, and it silently cached nothing:
+      # three runs, zero `importing cache manifest` lines, zero `exporting
+      # cache` lines, and a `cargo build` layer that took 404.3 s, 404.4 s —
+      # identical, because it was cold every time. `ignore-error=true` is what
+      # kept it quiet. The release lane got this right from the start by using
+      # this action; this is the same fix applied one lane over.
+      #
+      # If this regresses, the tell is in the log: no `importing cache manifest`
+      # at the start of the build, and the cargo step back at ~400 s.
+      #
+      # ONE scope for both flavors, unlike `release.yml`, which scopes per
+      # flavor. That file's reasoning is sound for the pair it describes —
+      # `runtime` and `runtime-static` diverge at `builder` (musl, different apt
+      # packages), so a shared scope would have each evict the other. These two
+      # do not diverge: `runtime-faketime` is `FROM runtime` plus libfaketime, so
+      # its graph is a superset and one scope holds both.
+      - name: Build the node image
+        if: steps.changed.outputs.run == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: runtime
+          tags: rift-cluster-server:local
+          load: true
+          cache-from: type=gha,scope=cluster-smoke
+          cache-to: type=gha,mode=max,scope=cluster-smoke,ignore-error=true
+
+      - name: Build the faketime flavor
+        if: steps.changed.outputs.run == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: runtime-faketime
+          tags: rift-cluster-server:faketime
+          load: true
+          cache-from: type=gha,scope=cluster-smoke
+          cache-to: type=gha,mode=max,scope=cluster-smoke,ignore-error=true
+
+      # Assert the read-back rather than trusting the steps above: `load` is the
+      # part that can quietly not happen, and a missing image would surface four
+      # jobs later as a registry pull for a tag that only ever existed on a
+      # runner's disk.
+      - name: Both flavors are loaded
         if: steps.changed.outputs.run == 'true'
         run: |
           set -euo pipefail
-          for target in runtime runtime-faketime; do
-            case "$target" in
-              runtime) tag=rift-cluster-server:local ;;
-              runtime-faketime) tag=rift-cluster-server:faketime ;;
-            esac
-            docker buildx build \
-              --file deploy/Dockerfile \
-              --target "$target" \
-              --tag "$tag" \
-              --cache-from type=gha,scope=cluster-smoke \
-              --cache-to type=gha,mode=max,scope=cluster-smoke,ignore-error=true \
-              --load \
-              .
-          done
-          # Assert the read-back rather than trusting the exit code: `--load` is
-          # the step that can quietly not happen, and a missing image would
-          # surface four jobs later as a registry pull for a tag that only ever
-          # existed on a runner's disk.
           for tag in rift-cluster-server:local rift-cluster-server:faketime; do
             docker image inspect "$tag" >/dev/null
           done
