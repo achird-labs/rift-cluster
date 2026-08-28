@@ -367,6 +367,136 @@ fn every_dockerfile_build_site_pins_a_target() {
     }
 }
 
+/// Every compile-time file reference must resolve inside a root the builder copies.
+///
+/// D-62 replaced the builder's `COPY . .` with named roots, so that `cook`'s
+/// output survives into the build layer instead of being dirtied by a blanket
+/// copy. The cost of naming roots is that one can be missing, and this is the
+/// guard for that.
+///
+/// It is not hypothetical. `crates/rift-cluster-server/src/openapi.rs` does
+/// `include_str!("../../../docs/api/openapi-ee.yaml")` — the OpenAPI contract is
+/// compiled into the binary, so `docs/` is a build input rather than
+/// documentation, and a list written from "what a Rust build obviously needs"
+/// omits it. The failure would be a broken image build, which is loud but lands
+/// on whoever adds the next `include_str!` rather than on whoever shortened the
+/// copy list.
+///
+/// Roots are read from the Dockerfile rather than restated here: a list in this
+/// test that had to be kept in step with the one in the Dockerfile would be the
+/// same rot one file over.
+#[test]
+fn the_builder_copies_every_root_the_crates_compile_in() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dockerfile = std::fs::read_to_string(root.join("deploy/Dockerfile"))
+        .unwrap_or_else(|e| panic!("read deploy/Dockerfile: {e}"));
+
+    // The builder stage, and within it everything the cook step leaves behind.
+    let builder = dockerfile
+        .split("\nFROM chef AS builder")
+        .nth(1)
+        .expect("Dockerfile has no `FROM chef AS builder` stage");
+    let copied: std::collections::BTreeSet<String> = builder
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("COPY "))
+        // `--from=<stage>` copies out of another stage, not out of the context.
+        .filter(|l| !l.starts_with("--from="))
+        .filter_map(|l| {
+            let mut parts: Vec<&str> = l.split_whitespace().collect();
+            parts.pop()?; // destination
+            Some(parts)
+        })
+        .flatten()
+        .map(|s| s.trim_end_matches('/').to_owned())
+        .collect();
+
+    assert!(
+        !copied.is_empty(),
+        "parsed no COPY sources out of the builder stage — the parser has drifted \
+         from the Dockerfile, which would make this test pass vacuously"
+    );
+
+    let mut checked = 0usize;
+    for entry in walk_rs(&root.join("crates")) {
+        let text = std::fs::read_to_string(&entry)
+            .unwrap_or_else(|e| panic!("read {}: {e}", entry.display()));
+        for macro_name in ["include_str!(\"", "include_bytes!(\""] {
+            for (idx, _) in text.match_indices(macro_name) {
+                let rest = &text[idx + macro_name.len()..];
+                let Some(end) = rest.find('"') else { continue };
+                let literal = &rest[..end];
+                // Relative to the file that names it, then back to repo-relative.
+                let resolved = entry
+                    .parent()
+                    .expect("a .rs file has a parent")
+                    .join(literal);
+                let rel = resolved
+                    .strip_prefix(&root)
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or(resolved.clone());
+                let normalised = normalise(&rel);
+                let top = normalised
+                    .split('/')
+                    .next()
+                    .expect("a path has a first component");
+                assert!(
+                    copied.contains(top) || copied.contains(&normalised),
+                    "{} compiles in `{literal}` (-> `{normalised}`), whose root `{top}` is \
+                     not copied by the builder stage. The builder copies {copied:?}. Add the \
+                     root to `deploy/Dockerfile`, or the image build fails on a missing file.",
+                    entry.display()
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "found no compile-time file references at all under crates/ — the scan is \
+         broken, and a missing root would sail past it"
+    );
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn walk_rs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // `target/` holds build output, not source, and is enormous.
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            out.extend(walk_rs(&path));
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Collapse `a/b/../c` to `a/c` textually — the paths here are literals from
+/// source, never symlinks, so a lexical fold is the right resolution and does
+/// not need the file to exist.
+fn normalise(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    let mut parts: Vec<&str> = Vec::new();
+    for component in text.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
 fn read_compose(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }

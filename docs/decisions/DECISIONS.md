@@ -1780,3 +1780,49 @@ the local-cycle fallback, so no text or class it produces is ever read.
 
 Rejected: fixing only the flow store's call sites and leaving `call_any`'s wording. The wording is
 wrong for all sixteen `call_member` callers, and every one of them is operator-facing.
+
+### D-62 — The builder copies named roots, not the tree; `vendor/rift` is not re-copied after `cook`
+- **Status:** active
+- **Decided:** 2026-08-28
+- **Refines:** D-60
+- **Implemented by:** #523
+- **Code:** deploy/Dockerfile, tests/cluster-chaos/tests/scenarios.rs
+
+D-60 left ~100 s on the table and said where. `cook` compiles the five vendored crates, but the
+`COPY . .` that followed it rewrote `vendor/rift` with fresh mtimes, so cargo's fingerprint saw them
+as dirty and rebuilt all five. Measured, from the warm build's own log: `rift-types`,
+`rift-http-proxy`, `rift-lint`, `rift-mock-core` and `rift-store-redis` all start compiling at 0.4 s
+— *after* the third-party graph came back from cache, which is exactly the signature of "the
+dependency layer worked and then something dirtied part of it".
+
+**The builder now copies named roots and leaves the submodule alone.** `Cargo.toml`, `Cargo.lock`,
+`crates/`, `tests/`, `docs/`. `vendor/rift` is copied once, before `cook`, and never again.
+
+**A second effect, not incidental.** The layer's cache key is now the compiler's actual inputs, so
+editing `web/`, `scripts/` or `.github/` no longer invalidates the build at all. Under D-60 a
+workflow-only change still paid a full `cargo build`; under this entry it pays nothing.
+
+**`docs/` is a build input, not documentation**, and this is the part that makes the trade real
+rather than free. `crates/rift-cluster-server/src/openapi.rs` does
+`include_str!("../../../docs/api/openapi-ee.yaml")` — the OpenAPI contract is compiled into the
+binary. A copy list written from "what a Rust build obviously needs" omits it, and the first draft
+of this change did exactly that.
+
+That is the whole risk of naming roots: a blanket copy cannot omit anything, and a list can. The
+failure mode is at least loud — a missing file breaks the image build, on the PR that introduces it,
+in a job that runs on every cluster-touching change. But loud is not the same as caught, and it
+lands on whoever adds the next `include_str!` rather than on whoever shortened the list. So
+`the_builder_copies_every_root_the_crates_compile_in` reads the roots **out of the Dockerfile** —
+restating them in the test would be the same rot one file over — walks every `.rs` under `crates/`,
+resolves each `include_str!`/`include_bytes!` literal, and asserts its root is copied. It refuses to
+pass vacuously in both directions: zero parsed roots and zero found references are each an assertion
+failure. Verified by mutation — deleting `COPY docs docs` fails it, naming the file and the resolved
+path.
+
+*Rejected:* `COPY --exclude=vendor/rift . .`, which keeps blanket semantics and would need no list at
+all — it requires the `dockerfile:1.7-labs` syntax directive, which pulls a frontend image at build
+time and changes the parser for every stage in the file, to avoid a list that a test now pins.
+Restoring mtimes after the copy — there is no declarative way to do it, and a `touch` sweep would be
+a second thing to keep correct. Copying `docs/api` alone rather than `docs/` — narrower, but it
+makes the next `include_str!` into `docs/` a build break for no gain; after `.dockerignore` strips
+`**/*.md`, the whole directory is three files.
