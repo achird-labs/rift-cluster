@@ -966,6 +966,10 @@ replica parked on a `PUT` whose `DELETE` sits behind it in the log therefore sti
 now has to construct deliberately in order to pin D-48 at all.
 
 ### D-52 — Blob GC retains an unreferenced digest until this node's log is purged past it, and never while a peer is asking for it
+> **Amended by D-55** (2026-08-28, #504): a third rule, C, retains a tombstoned digest until
+> every member has applied past it. The residual below — a follower whose log is ahead of its
+> applied index — is closed by it, and the "no channel" premise the rejection rested on is
+> corrected in place.
 - **Status:** active
 - **Decided:** 2026-08-27 · #480 (#432 follow-up)
 - **Refines:** D-18, D-48, D-50
@@ -1023,7 +1027,11 @@ seconds, not an hour.
 
 *Rejected:* a leader-published fleet-minimum applied index — it watches the wrong index: a parked
 node's *matched* index keeps advancing while its applied index does not, so the leader's replication
-view could never see the case. That half stands.
+view could never see the case. That half stands, and it is why D-55's rule C **pulls** each
+member's applied index rather than reading the leader's replication view.
+
+> **Amended by D-55** (2026-08-28, #504): closed by rule C — the channel is
+> `POST /internal/v1/applied`, in-crate; what was missing was plumbing, not a channel or a layer.
 
 **Correction (#504), twice over.** This rejection originally also claimed no channel existed for
 disseminating the *applied* index. It then said the obstacle was layering — that blob GC lives in
@@ -1032,9 +1040,9 @@ disseminating the *applied* index. It then said the obstacle was layering — th
 machine has applied, and `RaftNode` already fans it out across members for the write barrier
 (`node.rs`, issue #9) — inside `rift-cluster`, on the signed cluster port, in the same type that
 owns `spawn_blob_gc_loop`. A fleet-minimum applied index is that existing call aggregated with
-`min`, not a new mechanism. What it actually costs is a fan-out per sweep (or a cached view), a
-fail-closed rule when a member does not answer, and the learner-vs-voter question D-53 also had to
-settle. Tracked in **#504**; the rule here is unchanged pending that ruling. *Also rejected:*
+`min`, not a new mechanism. What it actually costs is a fan-out per sweep, a fail-closed rule when
+a member does not answer, and the learner-vs-voter question D-53 also had to settle — all three
+are settled by D-55. *Also rejected:*
 leader-only GC (followers grow without bound); accepting the gap (the window is 60 s, not an hour);
 and retaining the redb row instead of the transport blob (the fetch path reads the transport store,
 and D-51's fallback serves *referenced* rows only — a blob in this state is by definition not one).
@@ -1045,7 +1053,13 @@ that stops asking for longer than the grace — partitioned, shut down, or resta
 after every voter has purged past the unreferencing index finds no holder, and must be repaired out
 of band.
 
-One shape of this is worth naming because it is not exotic: **a follower whose log is ahead of its
+> **Amended by D-55** (2026-08-28, #504): the shape below is closed. Rule C keeps the blob until
+> every member's *applied* index has passed the tombstone, which is exactly the condition under
+> which no member can still replay the `PUT` from its own log. What remains of this residual is
+> narrower and named in D-55: a member that parked, was evicted, and rejoined with its retained
+> state dir.
+
+One shape of this was worth naming because it is not exotic: **a follower whose log is ahead of its
 applied index**. openraft chooses snapshot-versus-entries on a follower's *matching/log* position,
 not its applied index (`progress::entry`: "every candidate matching position is purged"), and rift
 does not implement `save_committed`. So a node that parked (D-48) while replication kept filling its
@@ -1053,12 +1067,11 @@ log, then restarted, replays the `PUT` **from its own log** and is never handed 
 argument above assumes — while the holders, whose `purged` has passed the tombstone, have already
 reaped. Rule A's snapshot argument is therefore sound for a replica that was simply *down*
 (`log == applied`, so its `matching` is below the purge point and it does receive a snapshot), and
-not for one whose apply lagged its log. Closing that would need retention keyed to a *fleet-minimum
-applied* index — the rejected rule 1 above — so it is documented here rather than closed, and
-**tracked in #504**, which carries the reachability walk-through, the openraft evidence, and the
-candidate rules. Note the residual is not merely a slow recovery: such a replica never applies
-anything again and is recoverable only out of band (D-48's repair), because it is never *offered* a
-snapshot — its `matching` is above the purge point, so openraft replicates by logs.
+not for one whose apply lagged its log. Such a replica never applies anything again and is
+recoverable only out of band (D-48's repair), because it is never *offered* a snapshot — its
+`matching` is above the purge point, so openraft replicates by logs. Closing it needed retention
+keyed to a *fleet-minimum applied* index — which this entry had rejected on the false "no channel"
+premise corrected above — and D-55 is that rule.
 
 **Tombstones are reclaimed, not accumulated.** Each sweep drops rows at or below this node's
 `purged`. That is information-free — a purge point only advances, so such a row can never again
@@ -1184,3 +1197,84 @@ listener is upstream, which remains true; "D-11 would have to move first" was #4
 *Rejected:* keeping them as a deferred preference. Because the code is equally consistent with "not
 yet" and "never", a preference nobody is building is a claim the docs cannot keep true — #467, #489
 and this issue are three corrections of the same one sentence, in three different places.
+
+### D-55 — Blob GC retains a tombstoned digest until every member has applied past it
+- **Status:** active
+- **Decided:** 2026-08-28 · #504 (D-52 residual)
+- **Refines:** D-52; also D-18, D-48, D-50, D-53
+- **Implemented by:** #504
+- **Code:** crates/rift-cluster/src/blobs/mod.rs, crates/rift-cluster/src/raft/network.rs, crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/raft/store.rs
+
+D-52 keyed retention on this node's own purge point (rule A) and on a peer actively asking (rule B),
+and recorded as a residual the one replica neither rule sees: **a follower whose log is ahead of its
+applied index**. That is the steady state of any node that parked once (D-48) and restarted —
+replication kept filling its log while apply was stuck — and openraft chooses snapshot-versus-entries
+on the log position, so such a node is never offered a snapshot: it replays the `PUT` from the log it
+already holds, finds every holder has reaped, and wedges permanently, recoverable only out of band.
+Every step of that sequence is documented behaviour and the trigger is ordinary, so it is not an
+acceptable residual. A third rule closes it.
+
+**C — the fleet applied floor.** A committed blob that is unreferenced, unpinned, past the mtime
+grace and carries a tombstone at index `t` is reaped only if **all** of:
+
+- **A** (D-52, unchanged): `t <= this node's purged`. Covers the *snapshot* side — any snapshot a
+  holder that reaped could send has a manifest built at `>= t`, which omits the digest (D-50).
+- **C** (new): `t <= fleet_min_applied`, the minimum `last_applied` over **every** node in the
+  committed ∪ effective membership, voters *and* learners (a learner applies the log too; the
+  widening D-53 made). Covers the *log* side — a member with `last_applied >= t` has applied the
+  unreferencing entry and will never replay the `PUT` below it from its own log.
+- **B** (D-52, unchanged): not requested within the grace.
+
+Why A ∧ C and not C alone: C says nothing about a *future* member. A joiner takes a snapshot from
+the leader, and A on the leader is what guarantees that snapshot's manifest omits the digest. Why A
+alone is not enough is the residual above.
+
+**Pulled, not leader-published.** openraft carries no applied index on the wire —
+`AppendEntriesResponse` reports `matching`, which keeps advancing on a parked node while
+`last_applied` does not — so the leader's replication view can never see this case (the half of
+D-52's rejection that stands). The floor is read by each node's GC sweep over the channel the write
+barrier already uses: `POST /internal/v1/applied` (`raft::network::CLUSTER_APPLIED_PATH`, issue
+#9), in `rift-cluster`, on the signed cluster port. This node answers from its own metrics; each
+peer is asked concurrently, any of its resolved addresses answering being the peer answering (D-28),
+under a 2 s per-member budget. No new endpoint, no new credential, no `rift-cluster-server`
+dependency — what was missing was plumbing, not a channel or a layer.
+
+**Fail closed, and loud.** Any member unreachable, timing out, undecodable or answering
+`applied: None` makes the floor unknown, which reads as `0` — the convention `purged == 0` already
+carries (real indices start at 1) — and every tombstoned blob is retained that sweep. The sweep then
+`warn!`s once, naming the members it could not read, so the retention is attributable rather than
+silent (the D-53 shape: carry the evidence, name who). The trade accepted is the one #481/D-53 made
+explicit: **one unreachable member pins every tombstoned blob until it answers or leaves the
+membership.** What that costs, stated honestly: it is disk, and it is **not** bounded by the
+dataset quota (D-18) — the quota bounds the *live* corpus, and a blob held under C is by definition
+no longer in it. While a member is unreachable, every delete or overwrite adds one more retained
+blob, so the exposure is delete churn × outage duration; and because the prune bound is
+`min(purged, floor)` with the floor unknown, **tombstone rows stop being reclaimed for the same
+window** (they are the evidence C still needs), so `sm_blob_tombstones` and the 60 s scan over it
+grow with the churn too. Under D-52 alone both were transient, bounded by the purge cadence; under
+this entry they last exactly as long as the member is neither answering nor evicted. Both lift on
+their own the moment it is — when the member returns and applies the deletes it missed, or when it
+is evicted (D-21/D-26), which removes it from the set rule C consults. The bound is therefore the
+operator's tolerance for a down member, which is the bound the membership already has: a member
+that will never return has to be evicted anyway, and the once-a-minute warning names it.
+
+**Tombstones are pruned on the lower of the two indices**, `min(purged, fleet_min_applied)`, never
+on the purge point alone. A row this log has passed but some member has not yet applied past still
+protects its blob under C; pruning it would turn that blob into a never-referenced leftover, reaped
+by the plain grace rule on the next sweep with nothing left to say otherwise. With `0` as unknown,
+`min` is itself fail-closed.
+
+*Rejected:* bounding the exposure with a wall-clock floor (never reap a tombstoned blob younger than
+some multiple of the snapshot cadence) — a guess the sequence outruns, since the wedge needs only a
+restart at the wrong time; making a parked apply preemptible so the node could take a snapshot past
+the missing entry — the node is never *offered* one here (its `matching` is above the purge point),
+so D-48 would be reopened for nothing; accepting the residual — a silent-until-noticed wedge with an
+out-of-band-only repair, on an ordinary trigger. The object-store mirror tier (#456/#448) mitigates
+but does not close it: opt-in (D-30), with its own wall-clock GC.
+
+**Remaining residual — depart-then-rejoin.** A member that parked, then *left* (evict, D-21) and
+rejoined under D-26 with its retained state dir is not in the membership during the window and so is
+not consulted; it replays its own log after rejoining and parks. Repair is D-48's out-of-band
+write-back, or wiping the state dir before rejoin so it takes a snapshot instead. Far narrower than
+the sequence above — it needs a parked node to be gracefully evicted — and `blob_fetch_stall`
+surfaces it.

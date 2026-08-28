@@ -139,6 +139,12 @@ const BLOB_GC_GRACE_SECS: u64 = 3600;
 /// How often the blob store's GC sweep runs.
 const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long one GC sweep waits on each member's applied-index answer (D-55). Bounded so a hung
+/// member costs a sweep one budget, not the RPC client's full retry schedule per address; small
+/// against [`BLOB_GC_INTERVAL`], generous against a loopback or in-region round trip. A member
+/// that misses it is simply unknown for that sweep — retained, and named in the warning.
+const BLOB_GC_FLOOR_BUDGET: Duration = Duration::from_secs(2);
+
 /// How long [`RaftNode::leave`] waits between polls while chasing a leader
 /// hint that is moving (a demote just committed but the new leader has not
 /// settled, or metrics have not caught up yet). Small relative to typical
@@ -685,12 +691,14 @@ impl RaftNode {
     /// to keep. Plain, synchronous I/O throughout (the redb scans and the store's directory walk),
     /// so the caller is responsible for keeping it off the async runtime.
     ///
-    /// Also prunes tombstones this node's log has already passed (D-52), which is the only thing
+    /// Also prunes tombstones the rules can never act on again (D-52, D-55) — those at or below
+    /// **both** this node's purge point and the fleet applied floor — which is the only thing
     /// that keeps `sm_blob_tombstones` from growing by a permanent row per delete.
-    fn blob_gc_sweep(
+    pub(crate) fn blob_gc_sweep(
         store: &crate::blobs::BlobStore,
         sm_reader: &RedbStateMachine,
         purged: Option<u64>,
+        fleet_min_applied: Option<u64>,
         now_secs: u64,
     ) -> Result<u64, String> {
         let referenced = sm_reader.referenced_digests().map_err(|e| e.to_string())?;
@@ -698,24 +706,35 @@ impl RaftNode {
         // `None` (this node's log has never been purged) becomes `0`, the fail-closed reading:
         // `0` can never be a genuine purge boundary (real log indices start at 1), so it protects
         // every tombstoned digest rather than deciding — on no evidence — that any of them are
-        // safe to reap. See `blobs::BlobStore::gc`'s doc for the full reasoning.
+        // safe to reap. See `blobs::BlobStore::gc`'s doc for the full reasoning. The fleet floor
+        // (D-55) reads the same way: `None` is "some member could not be asked", and `0` protects
+        // everything tombstoned rather than guessing that member is caught up.
         let purged = purged.unwrap_or(0);
-        // Reclaim rows the rule can never act on again (D-52). Best-effort and logged rather than
-        // fatal: failing to prune costs a row, while failing the sweep costs the reclamation of
-        // every blob this pass would have freed — so a prune failure must not take the sweep with
-        // it. Deliberately after the `blob_tombstones()` read above, so this pass still sees the
-        // rows it is about to drop and cannot reap a blob on a half-pruned view.
-        match sm_reader.prune_blob_tombstones(purged) {
+        let fleet_min_applied = fleet_min_applied.unwrap_or(0);
+        // Reclaim rows the rules can never act on again (D-52, D-55). Best-effort and logged
+        // rather than fatal: failing to prune costs a row, while failing the sweep costs the
+        // reclamation of every blob this pass would have freed — so a prune failure must not take
+        // the sweep with it. Deliberately after the `blob_tombstones()` read above, so this pass
+        // still sees the rows it is about to drop and cannot reap a blob on a half-pruned view.
+        //
+        // Bounded by the *lower* of the two indices, never `purged` alone: a row this log has
+        // passed but some member has not yet applied past still protects its blob under rule C,
+        // and pruning it would turn that blob into a never-referenced leftover — reaped by the
+        // plain grace rule on the next sweep, with nothing left to say otherwise. `min` with the
+        // `0 == unknown` convention is itself fail-closed: either unknown makes the bound `0`.
+        let prune_upto = purged.min(fleet_min_applied);
+        match sm_reader.prune_blob_tombstones(prune_upto) {
             Ok(dropped) if dropped > 0 => {
                 tracing::debug!(
                     dropped,
                     purged,
-                    "blob gc: pruned tombstones the log has passed"
+                    fleet_min_applied,
+                    "blob gc: pruned tombstones both the log and the fleet have passed"
                 );
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!(error = %e, purged, "blob gc: could not prune tombstones");
+                tracing::warn!(error = %e, purged, fleet_min_applied, "blob gc: could not prune tombstones");
             }
         }
         let outcome = store
@@ -723,35 +742,81 @@ impl RaftNode {
                 &referenced,
                 &tombstones,
                 purged,
+                fleet_min_applied,
                 now_secs,
                 BLOB_GC_GRACE_SECS,
             )
             .map_err(|e| e.to_string())?;
-        // `outcome.retained` is `gc`'s own count of blobs kept under D-52 rule A — not
-        // re-derived here from `tombstones` by hand, which could drift from what `gc` actually
-        // did and would count tombstoned digests rather than blobs this node held (a digest may
-        // name bytes this node never had).
+        // `outcome.retained` is `gc`'s own count of blobs kept under the tombstone rules (D-52
+        // rule A, D-55 rule C) — not re-derived here from `tombstones` by hand, which could drift
+        // from what `gc` actually did and would count tombstoned digests rather than blobs this
+        // node held (a digest may name bytes this node never had).
         if outcome.retained > 0 {
             tracing::debug!(
                 retained = outcome.retained,
                 purged,
-                "blob gc: retaining tombstoned blobs this node's log has not purged past"
+                fleet_min_applied,
+                "blob gc: retaining tombstoned blobs the log or the fleet has not passed"
             );
         }
         crate::metrics::blob_gc_retained(outcome.retained);
         Ok(outcome.removed)
     }
 
+    /// The fleet applied floor as one GC sweep should see it (D-55): the probe's answer, or
+    /// `None` when the membership could not be read. Both failure shapes are logged here, once
+    /// per sweep — `warn!`, not `debug!`, and naming the members that could not be asked: an
+    /// unknown floor retains every tombstoned blob on this node until that member answers or is
+    /// evicted, which is the "loud or indefinite" trade D-53 made, and it must be loud.
+    async fn blob_gc_fleet_floor(
+        raft: &Raft<TypeConfig>,
+        client: &RpcClient,
+        resolver: &Arc<dyn PeerResolver>,
+    ) -> Option<u64> {
+        match network::fleet_applied_floor(raft, client, resolver, BLOB_GC_FLOOR_BUDGET).await {
+            Ok(network::FleetAppliedFloor::Known(min)) => Some(min),
+            // Not a member of any cluster yet (started, not initialised or joined): there is no
+            // fleet to have a floor, and nothing tombstoned to retain. Not the "unreachable
+            // member" warning — that would send an operator looking for a peer that does not exist.
+            Ok(network::FleetAppliedFloor::Unknown(unknown)) if unknown.is_empty() => {
+                tracing::debug!(
+                    "blob gc: no fleet membership yet; nothing to compute a floor over"
+                );
+                None
+            }
+            Ok(network::FleetAppliedFloor::Unknown(unknown)) => {
+                tracing::warn!(
+                    ?unknown,
+                    "blob gc: fleet applied floor unknown — retaining every tombstoned blob \
+                     until these members answer or leave the membership"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "blob gc: could not read the membership for the fleet applied floor — \
+                     retaining every tombstoned blob this sweep"
+                );
+                None
+            }
+        }
+    }
+
     /// Periodic GC sweep over `store` (#437): every [`BLOB_GC_INTERVAL`], run
-    /// [`Self::blob_gc_sweep`] against this node's own applied state and its own log purge point.
+    /// [`Self::blob_gc_sweep`] against this node's own applied state, its own log purge point,
+    /// and the fleet's applied floor (D-55).
     ///
-    /// Runs the sweep in `spawn_blocking`: both the redb scans and the store's directory walk are
-    /// synchronous, plain I/O, and holding a runtime worker for either is the stall #444 is open
-    /// against for snapshot building.
+    /// The floor probe is awaited on the runtime — it is a round of small RPCs — and only then is
+    /// the sweep itself run in `spawn_blocking`: both the redb scans and the store's directory
+    /// walk are synchronous, plain I/O, and holding a runtime worker for either is the stall #444
+    /// is open against for snapshot building.
     fn spawn_blob_gc_loop(
         store: Arc<crate::blobs::BlobStore>,
         sm_reader: RedbStateMachine,
         raft: Raft<TypeConfig>,
+        client: RpcClient,
+        resolver: Arc<dyn PeerResolver>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             // Starts one interval in, not immediately: `interval` yields its
@@ -768,6 +833,7 @@ impl RaftNode {
                 let store = Arc::clone(&store);
                 let sm_reader = sm_reader.clone();
                 let purged = raft.metrics().borrow().purged.map(|log_id| log_id.index);
+                let fleet_min_applied = Self::blob_gc_fleet_floor(&raft, &client, &resolver).await;
                 // `0` is the safe direction for *now* (unlike for a file's mtime, where it means
                 // "infinitely old" — see `blobs::mtime_secs`): it makes `now - mtime` saturate to
                 // zero, which never clears the grace, so a clock this broken reclaims nothing
@@ -777,7 +843,7 @@ impl RaftNode {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let outcome = tokio::task::spawn_blocking(move || {
-                    Self::blob_gc_sweep(&store, &sm_reader, purged, now_secs)
+                    Self::blob_gc_sweep(&store, &sm_reader, purged, fleet_min_applied, now_secs)
                 })
                 .await;
                 match outcome {
@@ -799,10 +865,12 @@ impl RaftNode {
         })
     }
 
-    /// Run exactly one blob-store GC sweep synchronously, with the same inputs
-    /// [`Self::spawn_blob_gc_loop`] uses (#480) — test-facing, because the loop's 60 s interval
-    /// and its constants are private. Modelled on [`Self::purged_index`]: a plain, hidden
-    /// accessor a test can call directly rather than waiting out a real tick.
+    /// Run exactly one blob-store GC sweep, with the same inputs [`Self::spawn_blob_gc_loop`]
+    /// uses (#480) — test-facing, because the loop's 60 s interval and its constants are private.
+    /// Modelled on [`Self::purged_index`]: a plain, hidden accessor a test can call directly
+    /// rather than waiting out a real tick. The fleet applied floor (D-55) is probed for real
+    /// over the wire, not stubbed: a fleet test's sweep must go through the same fan-out the loop
+    /// does, or it pins nothing about the rule.
     ///
     /// `now_secs` is a parameter rather than read from the clock **because a test that swept at
     /// the real `now` could not tell the retention rule from the mtime grace**: a blob written
@@ -816,8 +884,18 @@ impl RaftNode {
     /// Whatever [`Self::blob_gc_sweep`] returns: a `referenced_digests`/`blob_tombstones` scan
     /// failure, or a `blobs::BlobStore::gc` filesystem failure, both as a display string.
     #[doc(hidden)]
-    pub fn run_blob_gc_now(&self, now_secs: u64) -> Result<u64, String> {
-        Self::blob_gc_sweep(&self.blobs, &self.sm_reader, self.purged_index(), now_secs)
+    pub async fn run_blob_gc_now(&self, now_secs: u64) -> Result<u64, String> {
+        let fleet_min_applied =
+            Self::blob_gc_fleet_floor(&self.raft, &self.client, &self.resolver).await;
+        let store = Arc::clone(&self.blobs);
+        let sm_reader = self.sm_reader.clone();
+        let purged = self.purged_index();
+        // Off the runtime, as the loop does: `blob_gc_sweep` is synchronous redb and directory I/O.
+        tokio::task::spawn_blocking(move || {
+            Self::blob_gc_sweep(&store, &sm_reader, purged, fleet_min_applied, now_secs)
+        })
+        .await
+        .map_err(|e| format!("blob gc sweep task: {e}"))?
     }
 
     async fn hold_elections_until_leader_heard(raft: &Raft<TypeConfig>) -> Result<(), NodeError> {
@@ -1055,8 +1133,13 @@ impl RaftNode {
         Self::spawn_promotion_loop(&slot, &membership_gate, &auto_voter_ceiling);
 
         let server_task = tokio::spawn(server.serve());
-        let gc_task =
-            Self::spawn_blob_gc_loop(Arc::clone(&blob_store), sm_reader.clone(), raft.clone());
+        let gc_task = Self::spawn_blob_gc_loop(
+            Arc::clone(&blob_store),
+            sm_reader.clone(),
+            raft.clone(),
+            client.clone(),
+            Arc::clone(&resolver),
+        );
 
         Ok(Self {
             id: config.node_id,
@@ -2665,6 +2748,16 @@ impl RaftNode {
             .borrow()
             .purged
             .map(|log_id| log_id.index)
+    }
+
+    /// The index of the last entry in this node's log, or `None` on an empty log. Test-facing
+    /// (D-55, #504): the fleet test for rule C has to establish the one state the purge point
+    /// cannot see — a replica whose log is ahead of its applied index — and that is this number
+    /// against `status().last_applied`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_log_index(&self) -> Option<u64> {
+        self.raft.metrics().borrow().last_log_index
     }
 
     /// The leader's view of each peer's matched log index, sorted by node id —
@@ -4298,6 +4391,130 @@ mod tests {
 
         n1.shutdown().await.ok();
         n2.shutdown().await.ok();
+    }
+
+    /// Pins D-55 (#504), fail closed: a member the floor probe cannot reach is **named** in
+    /// `unknown` and the floor is `None` — never the minimum over whoever did answer. Counting
+    /// only the reachable members would make the sweep reap exactly the blob the unreachable one,
+    /// parked and restarting, is about to replay a `PUT` for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fleet_applied_floor_names_a_member_that_does_not_resolve_and_reports_no_floor() {
+        let (n1, n2, _dirs) = cluster_with_unresolvable_leader().await;
+
+        let floor = network::fleet_applied_floor(
+            &n2.raft,
+            &n2.client,
+            &n2.resolver,
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("membership is readable");
+
+        assert_eq!(
+            floor,
+            network::FleetAppliedFloor::Unknown(vec![1]),
+            "one member unknown means no floor at all, and that member is named — only that one"
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+    }
+
+    /// Pins D-55 (#504): the per-member budget bounds the *round trip*, not just resolution. A
+    /// member that accepts the connection and never answers costs the sweep one budget and is
+    /// named unknown — without the bound, the RPC client's own timeout and retries would hold
+    /// every sweep for several times longer, per hung member.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fleet_applied_floor_bounds_a_member_that_accepts_but_never_answers() {
+        // A listener that accepts every connection and then holds it open, saying nothing.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a silent listener");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = silent.accept().await {
+                held.push(stream);
+            }
+        });
+
+        // Same shape as `cluster_with_unresolvable_leader`: the leader binds a real port but
+        // advertises the silent one, so every probe from the follower dials a socket that hangs.
+        let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let port = reserved_port();
+        let mut c1 = config_in(&d1, 1);
+        c1.bind = format!("127.0.0.1:{port}").parse().expect("bind addr");
+        c1.advertise = Some(
+            silent_addr
+                .to_string()
+                .parse::<Authority>()
+                .expect("a literal authority"),
+        );
+        let n1 = RaftNode::start(c1).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        let bound = format!("127.0.0.1:{port}")
+            .parse::<Authority>()
+            .expect("bound authority");
+        n2.join_via(&bound)
+            .await
+            .expect("join through the bound address");
+        wait_voters(&n1, &BTreeSet::from([1, 2])).await;
+
+        let budget = Duration::from_millis(300);
+        let asked = tokio::time::Instant::now();
+        let floor = network::fleet_applied_floor(&n2.raft, &n2.client, &n2.resolver, budget)
+            .await
+            .expect("membership is readable");
+        let took = asked.elapsed();
+
+        assert_eq!(floor, network::FleetAppliedFloor::Unknown(vec![1]));
+        assert!(
+            took < Duration::from_millis(1500),
+            "the probe must return within about one budget ({budget:?}), took {took:?} — \
+             the RPC client's own timeout is {:?} per attempt, retried",
+            crate::rpc::DEFAULT_REQUEST_TIMEOUT
+        );
+
+        hold.abort();
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
+    }
+
+    /// Pins D-55 (#504): a node is a member of its own fleet and answers from its own metrics —
+    /// no RPC to itself. On a single-node fleet the floor is exactly this node's applied index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fleet_applied_floor_of_a_single_node_is_its_own_applied_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+        let revision = node
+            .put_imposter(imposter(8080, "alone"))
+            .await
+            .expect("write")
+            .revision;
+
+        let floor = network::fleet_applied_floor(
+            &node.raft,
+            &node.client,
+            &node.resolver,
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("membership is readable");
+
+        let applied = node.status().last_applied.expect("the write was applied");
+        assert_eq!(
+            floor,
+            network::FleetAppliedFloor::Known(applied),
+            "the only member is this node, so the floor is its own applied index"
+        );
+        assert!(
+            applied >= revision,
+            "and that index has at least reached the write just applied ({revision})"
+        );
+
+        node.shutdown().await.ok();
     }
 
     /// Issue #68: a seed whose name does not resolve fails the join with a

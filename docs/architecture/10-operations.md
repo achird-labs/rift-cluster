@@ -149,12 +149,32 @@ onset — a rising count on a fleet with no partitions says a blob is being
 reaped before its op commits, which is the #438 pin failing).
 
 *Registered by #480, no alert:* `rift_cluster_blob_gc_retained` (gauge, the
-number of unreferenced blobs this node is holding back because its log has not
-been purged past the index at which they stopped being referenced — **D-52**).
-Not a fault signal: a non-zero value is retention working as designed, and it
-falls to zero on its own as the log compacts. Worth a dashboard line rather than
-an alert, because a value that stays high while `purged` advances is the one
-shape that would suggest the tombstone table is not being cleared.
+number of unreferenced blobs this node is holding back under the tombstone
+rules — because its own log has not been purged past the index at which they
+stopped being referenced (**D-52** rule A), or because some member of the fleet
+has not yet *applied* past it (**D-55** rule C)). Not a fault signal: a non-zero
+value is retention working as designed, and it falls to zero on its own as the
+log compacts and the fleet catches up. Worth a dashboard line rather than an
+alert, because a value that stays high while `purged` advances *and* every
+member is caught up is the one shape that would suggest the tombstone table is
+not being cleared.
+
+Rule C is read, not gossiped: each GC sweep (every 60 s) asks every member —
+voters and learners — for its applied index over the cluster port, and **fails
+closed** when any of them cannot be read. The sweep then logs, at `warn`,
+`blob gc: fleet applied floor unknown` naming the member ids it could not reach,
+and retains every tombstoned blob on this node until they answer or leave the
+membership. That line repeating once a minute is the expected shape of a fleet
+with a down member, not a GC fault: it clears on its own when the member returns
+(and applies the deletes it missed) or is evicted (D-21/D-26). What it costs in
+the meantime is disk that grows with delete churn for as long as the member is
+down — every dataset or spec deleted or overwritten during the outage stays on
+every holder, and the tombstone table stops being pruned for the same window —
+and it is **not** capped by the dataset quota, which bounds live data only. So
+treat the line as a clock, not as noise: once it has repeated for longer than
+you would tolerate that member being absent, evict it. A member that will never
+return has to be evicted anyway; this is one more reason not to leave it in the
+membership.
 
 Two things this changes for the `blob_fetch_stall` runbook above. A stall now
 means the blob is held by nobody *and* referenced by no live state anywhere —

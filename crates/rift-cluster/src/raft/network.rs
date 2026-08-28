@@ -1429,6 +1429,152 @@ pub(crate) async fn joint_members(raft: &Raft<TypeConfig>) -> Result<JointMember
     .map_err(|e| RpcError::Handler(format!("reading membership for blob sideload probe: {e}")))
 }
 
+/// The fleet's applied-index floor, as [`fleet_applied_floor`] could establish it (D-55, #504).
+///
+/// `Known` **only when every member answered** — it is the minimum over the whole committed ∪
+/// effective membership, or nothing. A minimum over "whoever replied" would be the exact wrong
+/// number: the member that did not reply is the parked, restarting replica rule C exists to
+/// protect — so "a floor over some members" is not a state this type can express. `Unknown`
+/// names the members that could not be read, sorted by id, so the warning the GC sweep emits
+/// carries who to look at rather than a bare "unknown".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FleetAppliedFloor {
+    Known(u64),
+    Unknown(Vec<NodeId>),
+}
+
+/// Pull every member's applied index and fold it to the fleet minimum (D-55, #504) — blob GC's
+/// rule C input: a tombstoned blob is reaped only once every member has applied past the entry
+/// that unreferenced it, because a member whose log is ahead of its applied index replays that
+/// entry from its own log and is never offered the snapshot rule A's argument assumes.
+///
+/// **Pulled, not leader-published.** openraft carries no applied index on the wire — a
+/// follower's `AppendEntriesResponse` reports `matching`, which keeps advancing on a parked
+/// replica while `last_applied` does not — so the leader's replication view can never see this
+/// case. The channel is the one the write barrier (`RaftNode::await_applied`, #9) already uses:
+/// [`CLUSTER_APPLIED_PATH`] on the signed cluster port, in this crate. What was missing was the
+/// fold, not a channel or a layer (D-52 said otherwise, twice; #505 and #504 corrected it).
+///
+/// **Who is asked:** the committed ∪ effective membership, voters *and* learners — a learner
+/// applies the log too, so it can park too (the widening D-53 made for the capability probe).
+/// This node answers from its own metrics; each peer is asked concurrently, any of its resolved
+/// addresses answering being the peer answering (#79), each under `budget` so one hung member
+/// costs one budget, not one per address per retry. `Err` only when the membership itself cannot
+/// be read; a member that does not resolve, does not answer inside `budget`, sends an undecodable
+/// reply or reports `applied: None` is not an error — it is named in `unknown` and the floor is
+/// withheld, which is the fail-closed reading the sweep needs (one unreachable member pins every
+/// tombstoned blob until it answers or is evicted, D-21/D-26).
+pub(crate) async fn fleet_applied_floor(
+    raft: &Raft<TypeConfig>,
+    client: &RpcClient,
+    resolver: &Arc<dyn PeerResolver>,
+    budget: Duration,
+) -> Result<FleetAppliedFloor, RpcError> {
+    // One `with_raft_state` read, for `joint_members`' reason: two reads can straddle a
+    // membership change and describe a fleet that never existed.
+    let members: std::collections::BTreeMap<NodeId, String> = raft
+        .with_raft_state(|state| {
+            let committed = state.membership_state.committed();
+            let effective = state.membership_state.effective();
+            committed
+                .nodes()
+                .chain(effective.nodes())
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect()
+        })
+        .await
+        .map_err(|e| RpcError::Handler(format!("reading membership for the applied floor: {e}")))?;
+
+    // Every member starts as unknown and is overwritten by its answer, so a probe that never
+    // reports — a panic in its task — leaves the member unknown rather than absent from the fold.
+    let mut applied: std::collections::BTreeMap<NodeId, Option<u64>> =
+        members.keys().map(|member| (*member, None)).collect();
+    // This node's own id and applied index come from the same metrics read. Taking the id from a
+    // caller instead would let a miscall fill a *peer's* slot with this node's applied index —
+    // a floor too high, which is the one direction this rule must never err in.
+    let (id, own_applied) = {
+        let receiver = raft.metrics();
+        let metrics = receiver.borrow();
+        (metrics.id, metrics.last_applied.map(|l| l.index))
+    };
+    let mut probes = tokio::task::JoinSet::new();
+    for (member, addr) in members {
+        if member == id {
+            applied.insert(member, own_applied);
+            continue;
+        }
+        let client = client.clone();
+        let resolver = Arc::clone(resolver);
+        probes.spawn(async move {
+            let probe = async {
+                let addrs = match resolve_authority(&resolver, &addr).await {
+                    Ok(addrs) => addrs,
+                    Err(e) => {
+                        tracing::debug!(
+                            node_id = member, %addr, error = %e,
+                            "applied floor: member address did not resolve"
+                        );
+                        return None;
+                    }
+                };
+                for peer in addrs {
+                    // Both arms fold to "unknown" by design (fail closed); they are logged so a
+                    // member the sweep keeps naming can be told apart: never answered, or
+                    // answered with something this build cannot read.
+                    let reply = match client
+                        .call(peer, "POST", CLUSTER_APPLIED_PATH, Vec::new())
+                        .await
+                    {
+                        Ok(reply) => reply,
+                        Err(e) => {
+                            tracing::debug!(
+                                node_id = member, %peer, error = %e,
+                                "applied floor: member did not answer"
+                            );
+                            continue;
+                        }
+                    };
+                    match serde_json::from_slice::<AppliedReply>(&reply) {
+                        Ok(reply) => return reply.applied,
+                        Err(e) => {
+                            tracing::debug!(
+                                node_id = member, %peer, error = %e,
+                                "applied floor: member's reply did not decode"
+                            );
+                        }
+                    }
+                }
+                None
+            };
+            let applied = tokio::time::timeout(budget, probe).await.unwrap_or(None);
+            (member, applied)
+        });
+    }
+    while let Some(joined) = probes.join_next().await {
+        match joined {
+            Ok((member, index)) => {
+                applied.insert(member, index);
+            }
+            // A panic in a probe task is a defect of ours; its member stays unknown above.
+            Err(e) => tracing::error!(error = %e, "applied floor probe panicked"),
+        }
+    }
+
+    let unknown: Vec<NodeId> = applied
+        .iter()
+        .filter_map(|(member, index)| index.is_none().then_some(*member))
+        .collect();
+    if !unknown.is_empty() {
+        return Ok(FleetAppliedFloor::Unknown(unknown));
+    }
+    // Every member answered `Some`, so the fold is over the whole fleet. An empty membership —
+    // a node that has not been initialised into any cluster yet — has no floor to speak of.
+    Ok(applied.values().flatten().min().copied().map_or(
+        FleetAppliedFloor::Unknown(Vec::new()),
+        FleetAppliedFloor::Known,
+    ))
+}
+
 /// Leader-side: demote `node_id` from voter to learner if it currently is one
 /// — the first half of a graceful departure (issue #6), the second being
 /// [`remove_member`]. A no-op if `node_id` is not currently a voter, so a

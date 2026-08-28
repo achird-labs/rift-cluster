@@ -537,7 +537,7 @@ mod tests {
         .expect("stat answers");
 
         let outcome = store
-            .gc(&HashSet::new(), &HashMap::new(), 0, now_secs(), 3600)
+            .gc(&HashSet::new(), &HashMap::new(), 0, 0, now_secs(), 3600)
             .expect("gc");
         assert_eq!(
             outcome.removed, 0,
@@ -570,7 +570,7 @@ mod tests {
         );
 
         let outcome = store
-            .gc(&HashSet::new(), &HashMap::new(), 0, now_secs(), 3600)
+            .gc(&HashSet::new(), &HashMap::new(), 0, 0, now_secs(), 3600)
             .expect("gc");
         assert_eq!(
             outcome.removed, 0,

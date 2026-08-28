@@ -4520,22 +4520,14 @@ impl RedbStateMachine {
         Ok(digests)
     }
 
-    /// Every digest this node's applied state currently tombstones, and the log index at which
-    /// each one became unreferenced (#480) — what the per-node blob store's GC sweep must not
-    /// reap ahead of this node's own log purge point. The dual of [`Self::referenced_digests`]:
-    /// that answers "still live"; this answers "unreferenced as of which index", the fact that
-    /// tells the sweep whether a lagging replica might still need the bytes to apply an entry it
-    /// has not caught up to yet.
+    /// Drop every tombstone at or below `upto`, returning how many rows went. The caller passes
+    /// the **lower** of this node's purge point and the fleet applied floor (D-55): a row is
+    /// information-free only once *both* rules have passed it.
     ///
-    /// Read-only, no Raft round trip, the same shape as [`Self::referenced_digests`]: a row that
-    /// will not parse fails the whole scan rather than being silently dropped. Dropping it would
-    /// read as "never tombstoned" and let the sweep reap a blob a lagging replica may still need —
-    /// exactly the silent-swallow #480 exists to close. The caller (`RaftNode`'s GC tick) is
-    /// Drop every tombstone at or below `purged`, returning how many rows went.
-    ///
-    /// **Information-free, which is why a node may do it alone.** A log's purge point only ever
-    /// advances, so a row with `index <= purged` can never again satisfy the retention rule's
-    /// `index > purged` — it has already stopped protecting anything and never will again.
+    /// **Information-free, which is why a node may do it alone.** A log's purge point and a
+    /// fleet's applied floor only ever advance, so a row with `index <= upto` can never again
+    /// satisfy either retention rule's `index > bound` — it has already stopped protecting
+    /// anything and never will again.
     /// Without this the table is write-only: a row is added per unreference and removed only by a
     /// re-put of the same digest or a snapshot install, so a long-lived leader (which never
     /// installs one) accumulates a permanent row per delete forever, and the 60 s
@@ -4550,8 +4542,8 @@ impl RedbStateMachine {
     ///
     /// A redb failure opening, retaining over, or committing the table.
     #[allow(clippy::result_large_err)]
-    pub fn prune_blob_tombstones(&self, purged: u64) -> StorageResult<u64> {
-        if purged == 0 {
+    pub fn prune_blob_tombstones(&self, upto: u64) -> StorageResult<u64> {
+        if upto == 0 {
             return Ok(0);
         }
         let write_txn = self
@@ -4566,7 +4558,7 @@ impl RedbStateMachine {
                 .len()
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             tombstones
-                .retain(|_, index| index > purged)
+                .retain(|_, index| index > upto)
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
             let after = tombstones
                 .len()
@@ -4579,6 +4571,17 @@ impl RedbStateMachine {
         Ok(dropped)
     }
 
+    /// Every digest this node's applied state currently tombstones, and the log index at which
+    /// each one became unreferenced (#480) — what the per-node blob store's GC sweep must not
+    /// reap ahead of this node's own log purge point. The dual of [`Self::referenced_digests`]:
+    /// that answers "still live"; this answers "unreferenced as of which index", the fact that
+    /// tells the sweep whether a lagging replica might still need the bytes to apply an entry it
+    /// has not caught up to yet.
+    ///
+    /// Read-only, no Raft round trip, the same shape as [`Self::referenced_digests`]: a row that
+    /// will not parse fails the whole scan rather than being silently dropped. Dropping it would
+    /// read as "never tombstoned" and let the sweep reap a blob a lagging replica may still need —
+    /// exactly the silent-swallow #480 exists to close. The caller (`RaftNode`'s GC tick) is
     /// required to propagate this with `?` and skip that sweep, never to substitute an empty map.
     #[allow(clippy::result_large_err)]
     pub fn blob_tombstones(&self) -> StorageResult<HashMap<String, u64>> {
@@ -12491,6 +12494,116 @@ mod tests {
             Some(&20),
             "index 20 is still ahead of purged 10, so the row still protects"
         );
+    }
+
+    /// Pins D-55 (#504): the prune bound is `min(purged, fleet floor)`, never `purged` alone. A
+    /// row pruned because *this* log has passed it, while some member has not yet applied past
+    /// it, would turn a blob rule C is still holding into a never-referenced leftover on the next
+    /// sweep — reaped by the plain grace rule, with no tombstone left to say otherwise. The caller
+    /// computes the bound; this pins that a bound below the row keeps it, however far the purge
+    /// point itself has gone.
+    #[tokio::test]
+    async fn pruning_keeps_a_tombstone_above_the_fleet_floor_even_when_the_purge_point_has_passed_it()
+     {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let csv = "id,name\n1,ada\n";
+        let digest = crate::blobs::digest_of_bytes(csv.as_bytes());
+
+        apply_one(&mut sm, 1, dataset_put(1, "customers", csv)).await;
+        apply_one(&mut sm, 20, dataset_delete(2, "customers")).await;
+
+        // Purged 50 has passed the row at 20; a member still at 19 has not. The bound the sweep
+        // passes is min(50, 19) = 19.
+        let purged = 50_u64;
+        let fleet_min_applied = 19_u64;
+        let dropped = sm
+            .prune_blob_tombstones(purged.min(fleet_min_applied))
+            .expect("prune");
+
+        assert_eq!(dropped, 0, "the row still protects a member at 19");
+        assert_eq!(
+            sm.blob_tombstones()
+                .expect("tombstones")
+                .get(digest.as_str()),
+            Some(&20)
+        );
+
+        // Once the floor passes it too, the row is information-free and goes.
+        let fleet_min_applied = 20_u64;
+        assert_eq!(
+            sm.prune_blob_tombstones(purged.min(fleet_min_applied))
+                .expect("prune"),
+            1
+        );
+        assert!(sm.blob_tombstones().expect("tombstones").is_empty());
+    }
+
+    /// Pins D-55 (#504) at the sweep, where the bound is actually computed: `RaftNode::blob_gc_sweep`
+    /// prunes on `min(purged, fleet floor)`. The unit test above hands the pruner an
+    /// already-reduced bound; this one hands the *sweep* a purge point past the tombstone and a
+    /// floor below it, and checks the row survives — twice, because the sweep reads the tombstone
+    /// table before it prunes, so an over-prune shows only on the *next* sweep, when the row is
+    /// gone and the blob falls through to the plain grace rule and is reaped. A sweep that pruned
+    /// on `purged` alone passes the first sweep and fails the second.
+    #[tokio::test]
+    async fn the_sweep_prunes_on_the_lower_of_the_purge_point_and_the_fleet_floor() {
+        let (_td, mut sm) = fresh_sm(None).await;
+        let csv = "id,name\n1,ada\n";
+        let digest = crate::blobs::digest_of_bytes(csv.as_bytes());
+        let blobs_dir = TempDir::new().expect("tempdir");
+        let store = crate::blobs::BlobStore::open(blobs_dir.path().to_path_buf()).expect("store");
+        store
+            .store_whole(&digest, csv.as_bytes())
+            .expect("hold the bytes");
+
+        apply_one(&mut sm, 1, dataset_put(1, "customers", csv)).await;
+        apply_one(&mut sm, 20, dataset_delete(2, "customers")).await;
+
+        // Far past the blob's mtime grace, so only the tombstone rules can keep it.
+        let past_the_grace = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs()
+            + 10_000_000;
+        for sweep in 1..=2 {
+            let removed = crate::raft::node::RaftNode::blob_gc_sweep(
+                &store,
+                &sm,
+                Some(50),
+                Some(19),
+                past_the_grace,
+            )
+            .expect("sweep");
+            assert_eq!(
+                removed, 0,
+                "sweep {sweep}: a member at 19 still needs the blob"
+            );
+            assert!(
+                store.stat(&digest).expect("stat").have,
+                "sweep {sweep}: retained"
+            );
+            assert_eq!(
+                sm.blob_tombstones()
+                    .expect("tombstones")
+                    .get(digest.as_str()),
+                Some(&20),
+                "sweep {sweep}: the row must survive a purge point (50) past it while the floor (19) \
+                 is not — pruning on the purge point alone drops it here"
+            );
+        }
+
+        // Floor past the row: both rules are satisfied, the row is information-free, the blob goes.
+        let removed = crate::raft::node::RaftNode::blob_gc_sweep(
+            &store,
+            &sm,
+            Some(50),
+            Some(20),
+            past_the_grace,
+        )
+        .expect("sweep");
+        assert_eq!(removed, 1);
+        assert!(!store.stat(&digest).expect("stat").have);
+        assert!(sm.blob_tombstones().expect("tombstones").is_empty());
     }
 
     /// An unknown purge point prunes nothing — the same fail-closed reading `gc` gives it. A `0`
