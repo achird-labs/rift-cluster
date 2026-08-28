@@ -1132,9 +1132,8 @@ impl FlowNet {
                     let body =
                         serde_json::to_vec(&req).map_err(|e| RpcError::Handler(e.to_string()))?;
                     let reply = node
-                        .call_member(owner, "POST", WRITE_PATH, body)
-                        .await
-                        .map_err(RpcError::Transport)?;
+                        .call_member_typed(owner, "POST", WRITE_PATH, body)
+                        .await?;
                     serde_json::from_slice(&reply).map_err(|e| RpcError::Handler(e.to_string()))
                 }
             })
@@ -1185,9 +1184,8 @@ impl FlowNet {
                     let body =
                         serde_json::to_vec(&req).map_err(|e| RpcError::Handler(e.to_string()))?;
                     let reply = node
-                        .call_member(owner, "POST", GET_PATH, body)
-                        .await
-                        .map_err(RpcError::Transport)?;
+                        .call_member_typed(owner, "POST", GET_PATH, body)
+                        .await?;
                     let reply: GetReply = serde_json::from_slice(&reply)
                         .map_err(|e| RpcError::Handler(e.to_string()))?;
                     Ok(reply.entry)

@@ -459,6 +459,79 @@ fn prune_sideload_capable(capable: &mut BTreeSet<NodeId>, current_members: &BTre
     capable.retain(|id| current_members.contains(id));
 }
 
+/// Why an address sweep failed.
+///
+/// Two cases, kept apart in the type because they are answered differently and
+/// because the "nothing was dialled" one has no peer and no peer error to carry:
+/// folding them into one struct leaves a field that neither renderer reads,
+/// which is an invitation to start reading it.
+#[derive(Debug)]
+enum SweepFailure {
+    /// The authority resolved to no addresses, so nothing was contacted.
+    NoAddresses,
+    /// `peer` was contacted and produced `error`.
+    Attempted { peer: SocketAddr, error: RpcError },
+}
+
+impl SweepFailure {
+    /// The operator-facing rendering.
+    ///
+    /// D-61: "unreachable" is claimed only when nothing answered. A peer that
+    /// replied — even to refuse — was reachable, and calling that unreachability
+    /// points triage at the network instead of at the reason the peer gave,
+    /// which is precisely the runbook signal a refusal exists to provide (#471).
+    fn describe(&self, authority: &str) -> String {
+        match self {
+            Self::NoAddresses => format!("{authority} unreachable (no addresses to try)"),
+            Self::Attempted { peer, error } if error.is_liveness_failure() => {
+                format!("{authority} unreachable ({peer}: {error})")
+            }
+            Self::Attempted { peer, error } => {
+                format!("{authority} answered but refused ({peer}: {error})")
+            }
+        }
+    }
+
+    /// The same failure with the peer's variant intact, so a caller relaying a
+    /// refusal keeps the peer's error rather than restating it as transport
+    /// (D-61).
+    fn into_typed(self, authority: &str) -> RpcError {
+        match self {
+            Self::NoAddresses => RpcError::Transport(format!("{authority}: no addresses to try")),
+            Self::Attempted { error, .. } => error,
+        }
+    }
+}
+
+/// Try `addrs` in order until one answers, per #79's any-address contract.
+///
+/// A peer that *answers* ends the sweep even when the answer is a refusal: only
+/// a liveness failure — unreachable, timed out, shed — is worth trying the next
+/// address for. Without that, a `NotLeader` redirect recovered from the first
+/// address would be overwritten by a later address's transport error and the
+/// hint lost (#391). The premise is that an answer is more informative than a
+/// further address's silence — *not* that the addresses are one node: a
+/// dual-stack advertise authority is, but a multi-A headless service (what
+/// `--cluster-seeds` may name) is not, and there this rule stops the sweep at a
+/// pod that answered. D-61 keeps that trade deliberately.
+async fn sweep_addresses<T, F, Fut>(addrs: &[SocketAddr], mut call: F) -> Result<T, SweepFailure>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<T, RpcError>>,
+{
+    let mut last = SweepFailure::NoAddresses;
+    for &peer in addrs {
+        match call(peer).await {
+            Ok(reply) => return Ok(reply),
+            Err(error) if error.is_liveness_failure() => {
+                last = SweepFailure::Attempted { peer, error };
+            }
+            Err(error) => return Err(SweepFailure::Attempted { peer, error }),
+        }
+    }
+    Err(last)
+}
+
 /// Put `payload` to one peer, trying each address its authority resolved to.
 ///
 /// Mirrors `call_any_typed`'s sweep rule: only a *liveness* failure is worth
@@ -1783,8 +1856,9 @@ impl RaftNode {
     ///
     /// # Errors
     ///
-    /// The member is unknown, its authority does not resolve, or every address
-    /// refused. The text is operator-facing, not client-facing.
+    /// The member is unknown, its authority does not resolve, every address
+    /// failed liveness, or one of them answered a refusal — the text says which
+    /// of the last two happened (D-61). Operator-facing, not client-facing.
     pub async fn call_member(
         &self,
         id: NodeId,
@@ -1796,6 +1870,37 @@ impl RaftNode {
             .member_authority(id)
             .ok_or_else(|| format!("node {id} is not in the applied membership"))?;
         self.call_any(&authority, method, path, body).await
+    }
+
+    /// [`call_member`](Self::call_member) with the member's own error preserved.
+    ///
+    /// For the forwarding paths that relay an *owner's* refusal: the owner's
+    /// error travels as itself rather than as this hop's `Transport`, because
+    /// classifying a considered refusal as a transport fault is wrong where it is
+    /// made — the message then blames the network for a peer that answered
+    /// (D-61, #471). Callers today flatten the variant to a string within a frame
+    /// or two, so what changes downstream is the text, not a status.
+    ///
+    /// # Errors
+    ///
+    /// The member is unknown to the applied membership — reported as
+    /// [`RpcError::Unavailable`] because the caller's ring snapshot is stale and
+    /// re-resolving may find the owner, which is not a transport fault — its
+    /// authority does not resolve, or the peer refused.
+    pub async fn call_member_typed(
+        &self,
+        id: NodeId,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, RpcError> {
+        let authority = self
+            .member_authority(id)
+            .ok_or_else(|| RpcError::Unavailable {
+                detail: format!("node {id} is not in the applied membership"),
+                op_id: None,
+            })?;
+        self.call_any_typed(&authority, method, path, body).await
     }
 
     /// The current leader's advertise authority, if metrics know one right now.
@@ -1824,16 +1929,10 @@ impl RaftNode {
 
     /// [`call_any`](Self::call_any) with the typed error preserved.
     ///
-    /// Same address-sweep contract as `call_any` with one deliberate difference:
-    /// a peer that *answers* ends the sweep even when the answer is a refusal.
-    /// Only a liveness failure — unreachable, timed out, shed — is worth trying
-    /// the next address for. Without that, a `NotLeader` redirect recovered from
-    /// the first address would be overwritten by a later address's transport
-    /// error and the hint lost (#391).
-    ///
-    /// Kept separate from `call_any` rather than made its implementation: the
-    /// four other callers have relied on the try-every-address-on-any-error
-    /// sweep since #79, and this fix has no business changing them.
+    /// Same sweep as `call_any` — they share [`sweep_addresses`] — differing only
+    /// in how the failure is rendered: this one hands the caller the peer's own
+    /// [`RpcError`], so a forwarded refusal keeps the peer's status instead of
+    /// being restated as a transport failure (#471).
     async fn call_any_typed(
         &self,
         authority: &str,
@@ -1845,15 +1944,11 @@ impl RaftNode {
             .resolve(authority)
             .await
             .map_err(|e| RpcError::Transport(format!("resolve {authority}: {e}")))?;
-        let mut last = RpcError::Transport(format!("{authority}: no addresses to try"));
-        for peer in &addrs {
-            match self.client.call(*peer, method, path, body.clone()).await {
-                Ok(reply) => return Ok(reply),
-                Err(e) if e.is_liveness_failure() => last = e,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last)
+        sweep_addresses(&addrs, |peer| {
+            self.client.call(peer, method, path, body.clone())
+        })
+        .await
+        .map_err(|failure| failure.into_typed(authority))
     }
 
     /// Resolve `authority` and call it, trying every address the name yields
@@ -1863,6 +1958,9 @@ impl RaftNode {
     /// multi-A headless service — is only unreachable when *all* of them are.
     /// Committing to the first is what made a peer permanently undialable while
     /// a live address sat second in the same answer.
+    ///
+    /// The error text is operator-facing and says which of the two happened: a
+    /// peer nobody could reach, or a peer that answered and refused (#471).
     async fn call_any(
         &self,
         authority: &str,
@@ -1874,14 +1972,11 @@ impl RaftNode {
             .resolve(authority)
             .await
             .map_err(|e| format!("resolve {authority}: {e}"))?;
-        let mut last = String::from("no addresses to try");
-        for peer in &addrs {
-            match self.client.call(*peer, method, path, body.clone()).await {
-                Ok(reply) => return Ok(reply),
-                Err(e) => last = format!("{peer}: {e}"),
-            }
-        }
-        Err(format!("{authority} unreachable ({last})"))
+        sweep_addresses(&addrs, |peer| {
+            self.client.call(peer, method, path, body.clone())
+        })
+        .await
+        .map_err(|failure| failure.describe(authority))
     }
 
     /// Submit a control op through Raft and return the state machine's
@@ -5405,5 +5500,253 @@ mod tests {
     fn a_follower_that_can_see_a_leader_is_not_isolated() {
         assert!(!isolated_from(ME, Some(OTHER), None));
         assert!(!isolated_from(ME, Some(OTHER), Some(u64::MAX)));
+    }
+    // ---- address sweep: reachability vs. refusal (#471) --------------------
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}")
+            .parse()
+            .expect("a literal address")
+    }
+
+    fn refusal() -> RpcError {
+        RpcError::Unavailable {
+            detail: "flow store: owner is isolated from the cluster".to_owned(),
+            op_id: None,
+        }
+    }
+
+    /// Pins D-61: the defect in #471, at the one place the word is chosen. A peer that answered — even to
+    /// refuse — was reachable, so "unreachable" misdirects triage to the network when the
+    /// condition is the peer's own quorum state. Every non-liveness variant is checked, not just
+    /// the `Unavailable` the issue was found through.
+    #[test]
+    fn an_answered_refusal_is_never_described_as_unreachable() {
+        let answered = [
+            refusal(),
+            RpcError::NotLeader { leader: None },
+            RpcError::Handler("boom".to_owned()),
+            RpcError::UnknownRoute {
+                method: "POST".to_owned(),
+                path: "/_cluster/flow/get".to_owned(),
+            },
+            RpcError::BadRequest("nope".to_owned()),
+            RpcError::NotFound {
+                what: "blob".to_owned(),
+            },
+        ];
+        for error in answered {
+            let rendered = SweepFailure::Attempted {
+                peer: addr(9101),
+                error,
+            }
+            .describe("node-a:7000");
+            assert!(
+                !rendered.contains("unreachable"),
+                "a peer that answered must not be called unreachable: {rendered}"
+            );
+            assert!(
+                rendered.contains("answered but refused"),
+                "the wording must say the peer answered: {rendered}"
+            );
+            assert!(
+                rendered.contains("127.0.0.1:9101") && rendered.contains("node-a:7000"),
+                "the address and the authority must both survive: {rendered}"
+            );
+        }
+    }
+
+    /// The other half of the same rule, and the guard against over-correcting: a genuine
+    /// liveness failure still reads exactly as it did before #471, byte for byte.
+    #[test]
+    fn a_liveness_failure_still_reads_as_unreachable() {
+        for error in [
+            RpcError::Timeout,
+            RpcError::Transport("connection refused".to_owned()),
+            RpcError::Shed,
+        ] {
+            let rendered = SweepFailure::Attempted {
+                peer: addr(9102),
+                error,
+            }
+            .describe("node-b:7000");
+            assert!(
+                rendered.starts_with("node-b:7000 unreachable (127.0.0.1:9102: "),
+                "the pre-#471 wording is unchanged for a liveness failure: {rendered}"
+            );
+        }
+    }
+
+    /// An authority that resolves to nothing was never contacted, so it is unreachable — and
+    /// both renderings keep the text they had before #471.
+    #[test]
+    fn an_authority_with_no_addresses_is_unreachable() {
+        let failure = || SweepFailure::NoAddresses;
+        assert_eq!(
+            failure().describe("node-c:7000"),
+            "node-c:7000 unreachable (no addresses to try)"
+        );
+        match failure().into_typed("node-c:7000") {
+            RpcError::Transport(detail) => {
+                assert_eq!(detail, "node-c:7000: no addresses to try");
+            }
+            other => panic!("expected a transport failure, got {other:?}"),
+        }
+    }
+
+    /// The sweep rule `call_any_typed` has followed since #391, now shared with `call_any`:
+    /// only a liveness failure is worth trying the next address for. Without this the refusal
+    /// answered by the first address is overwritten by the second address's timeout, and the
+    /// caller is told the peer was unreachable.
+    #[tokio::test]
+    async fn a_peer_that_answers_ends_the_sweep() {
+        let (first, second) = (addr(9201), addr(9202));
+        let tried = std::cell::RefCell::new(Vec::new());
+
+        let failure = sweep_addresses(&[first, second], |peer| {
+            tried.borrow_mut().push(peer);
+            async move {
+                if peer == first {
+                    Err::<Vec<u8>, RpcError>(refusal())
+                } else {
+                    Err(RpcError::Timeout)
+                }
+            }
+        })
+        .await
+        .expect_err("every address failed");
+
+        assert_eq!(
+            *tried.borrow(),
+            vec![first],
+            "an answered error must end the sweep before the next address is dialled"
+        );
+        match failure {
+            SweepFailure::Attempted { peer, error } => {
+                assert_eq!(peer, first);
+                assert!(
+                    matches!(error, RpcError::Unavailable { .. }),
+                    "the answered variant must survive: {error:?}"
+                );
+            }
+            SweepFailure::NoAddresses => panic!("two addresses were supplied"),
+        }
+    }
+
+    /// The #79 contract the sweep exists for: a name is only unreachable when every address it
+    /// yields is, and the reported address is the last one actually tried.
+    #[tokio::test]
+    async fn every_address_failing_liveness_reports_the_last() {
+        let (first, second) = (addr(9301), addr(9302));
+        let tried = std::cell::RefCell::new(Vec::new());
+
+        let failure = sweep_addresses(&[first, second], |peer| {
+            tried.borrow_mut().push(peer);
+            async move { Err::<Vec<u8>, RpcError>(RpcError::Transport(format!("{peer} is down"))) }
+        })
+        .await
+        .expect_err("every address failed");
+
+        assert_eq!(*tried.borrow(), vec![first, second]);
+        assert!(
+            matches!(failure, SweepFailure::Attempted { peer, .. } if peer == second),
+            "the reported address is the last one actually tried: {failure:?}"
+        );
+        assert!(
+            failure.describe("node-d:7000").contains("unreachable"),
+            "all-liveness is the one case that is genuinely unreachable"
+        );
+    }
+
+    /// A later address answering is still a success — the sweep must not stop at the first
+    /// liveness failure.
+    #[tokio::test]
+    async fn a_later_address_that_answers_wins() {
+        let (dead, live) = (addr(9401), addr(9402));
+        let reply = sweep_addresses(&[dead, live], |peer| async move {
+            if peer == dead {
+                Err(RpcError::Transport("down".to_owned()))
+            } else {
+                Ok(b"pong".to_vec())
+            }
+        })
+        .await
+        .expect("the live address answers");
+        assert_eq!(reply, b"pong".to_vec());
+    }
+
+    /// The empty sweep, exercised through `sweep_addresses` itself rather than by hand-building
+    /// the failure: an authority that resolved to nothing was never dialled, so what it reports
+    /// must be the `peer: None` case — the one `describe`/`into_typed` render with the pre-#471
+    /// text.
+    #[tokio::test]
+    async fn a_sweep_with_no_addresses_never_calls_and_reports_no_peer() {
+        let called = std::cell::RefCell::new(0_u32);
+        let failure = sweep_addresses(&[], |peer| {
+            *called.borrow_mut() += 1;
+            async move { Err::<Vec<u8>, RpcError>(RpcError::Transport(format!("{peer}"))) }
+        })
+        .await
+        .expect_err("there is nothing to answer");
+
+        assert_eq!(*called.borrow(), 0, "no address means no call");
+        assert!(
+            matches!(failure, SweepFailure::NoAddresses),
+            "nothing was dialled, so there is no peer to name: {failure:?}"
+        );
+        assert_eq!(
+            failure.describe("node-e:7000"),
+            "node-e:7000 unreachable (no addresses to try)"
+        );
+    }
+
+    /// A single address that refuses is still a refusal — the wording must not depend on there
+    /// being a second address the sweep declined to try.
+    #[tokio::test]
+    async fn a_lone_address_that_refuses_is_not_unreachable() {
+        let only = addr(9501);
+        let failure = sweep_addresses(&[only], |_| async { Err::<Vec<u8>, RpcError>(refusal()) })
+            .await
+            .expect_err("the only address refused");
+        assert!(
+            matches!(failure, SweepFailure::Attempted { peer, .. } if peer == only),
+            "the lone address is the one reported: {failure:?}"
+        );
+        assert!(
+            !failure.describe("node-f:7000").contains("unreachable"),
+            "one answering address is still an answer"
+        );
+    }
+
+    /// `call_member_typed`'s own failure mode, which no forwarding caller reaches on purpose: a
+    /// ring snapshot naming a node the applied membership does not have. It is `Unavailable`
+    /// (re-resolve and retry), never `Transport` — nothing was dialled, so nothing about the
+    /// network is being claimed (D-61).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn calling_a_member_outside_the_applied_membership_is_unavailable_not_transport() {
+        let dir = TempDir::new().expect("tempdir");
+        let node = RaftNode::start(config_in(&dir, 1)).await.expect("start");
+        node.cluster_init().await.expect("cluster init");
+
+        let err = node
+            .call_member_typed(99, "POST", "/_cluster/flow/get", Vec::new())
+            .await
+            .expect_err("node 99 was never admitted");
+
+        match err {
+            RpcError::Unavailable { detail, op_id } => {
+                assert!(
+                    detail.contains("99") && detail.contains("applied membership"),
+                    "the detail must name the node and why it could not be called: {detail}"
+                );
+                assert_eq!(
+                    op_id, None,
+                    "nothing was submitted, so there is no op to poll"
+                );
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+
+        node.shutdown().await.ok();
     }
 }

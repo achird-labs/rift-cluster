@@ -1722,3 +1722,61 @@ image on the path to the shipped binary, where the pinned crates.io install has 
 dependency graph already trusts and costs a minute only on a cold build. Dropping
 `ignore-error=true` so a broken cache is loud — it would redden a required check on a GitHub
 outage; the tell is documented at the call site instead (no import line, cargo back at ~400 s).
+||||||| Stash base
+### D-61 — A peer that answered is never reported as unreachable; a relayed refusal keeps the peer's error
+
+- **Status:** active
+- **Decided:** 2026-08-28
+- **Refines:** D-17, D-28, D-40
+- **Implemented by:** #471
+- **Code:** crates/rift-cluster/src/raft/node.rs, crates/rift-cluster/src/stores/flow.rs, crates/rift-cluster/src/stores/proxy.rs
+
+Two rules, one subject: what a caller is told when the peer it needed said no.
+
+**1. Wording.** `call_any` sweeps the addresses an authority resolves to and, on failure, describes
+the outcome. It may say *unreachable* only when every attempt was a liveness failure
+(`RpcError::is_liveness_failure` — `Timeout | Transport | Shed`). A peer that answered — even to
+refuse — was reachable, and its own reason is the message. This is not cosmetic: it is the
+difference between on-call checking the network and on-call checking quorum state, and the refusal
+exists precisely to be that signal.
+
+**2. Sweep.** A peer that answers ends the sweep; only a liveness failure is worth trying the next
+address for. The justification is that an answer is more informative than a further address's
+silence — **not** that the addresses are the same node. Under D-28 every resolved address is
+dialled in resolver order, and while a dual-stack advertise authority is one node, a multi-A
+headless service (what `--cluster-seeds` may point at, reaching `sweep_addresses` through
+`join_via`) is not: there, a non-liveness answer from the first pod stops the sweep before a
+healthy second pod is tried. That is the behaviour `call_any_typed` has had since #391 — a
+`NotLeader` hint recovered from one address must not be overwritten by a later address's transport
+error — and this decision keeps it and extends it to `call_any` rather than revisiting it. A seed
+that answers is a seed that can redirect; a seed that is still booting and answers `Handler` is the
+case where the rule costs something, and it is accepted.
+
+**3. Relay.** A forwarding hop that carries an *owner's* refusal uses `call_member_typed` and
+propagates the owner's `RpcError` rather than restating it as this hop's `Transport`. Classifying a
+peer's considered refusal as a transport fault is wrong at the point it is made, independently of
+who reads it later.
+
+**What this does and does not change, measured rather than assumed.** The observable effect is the
+**message text** and the early stop. It is *not* an HTTP status change: at all six rewired sites the
+typed error is flattened within one or two frames — the flow store wraps it as
+`anyhow!("flow store: {e}")`, proxy claim/complete as `ProxyStoreError::Unavailable(String)`,
+release logs it, lookup discards it with `.ok()?` — so no `RpcError::status()` is ever consulted on
+these paths. A forwarded isolated-owner read answers **500** on the data plane before and after
+(`backend_error_response` finds no `BackendUnavailable` to downcast), or **200** with an empty token
+under `{{ state.k }}` with `RIFT_DEBUG` unset. An earlier draft of this entry claimed 502 → 503;
+that was false in both halves and is corrected here. Giving isolation its own 503 means carrying
+`BackendUnavailable` out of the clustered store — a data-plane contract change, and a separate
+decision.
+
+**Scope.** Only the flow store's `GET_PATH` forward relays a refusal the peer expressed *as* an
+`RpcError`. `WRITE_PATH` and proxy's `CLAIM`/`COMPLETE`/`LOOKUP`/`RELEASE` refuse **in band** —
+`WriteReply::Error { reason }`, `ClaimReply::Error { reason }` inside a `200` — which no
+transport-level change affects; they move to `call_member_typed` for the refusals they *can* carry
+(a shedding bridge, a `NotLeader`, a handler fault), not for isolation. Whether an in-band refusal
+should instead be a typed error is a separate question this decision does not settle.
+`sequencer.rs`'s forward keeps the `Transport` re-wrap deliberately: its result is `.ok()?`-ed into
+the local-cycle fallback, so no text or class it produces is ever read.
+
+Rejected: fixing only the flow store's call sites and leaving `call_any`'s wording. The wording is
+wrong for all sixteen `call_member` callers, and every one of them is operator-facing.

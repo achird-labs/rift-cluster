@@ -826,9 +826,8 @@ impl ClusterProxyStore {
                         let body = serde_json::to_vec(&req)
                             .map_err(|e| RpcError::Handler(e.to_string()))?;
                         let raw = node
-                            .call_member(owner, "POST", CLAIM_PATH, body)
-                            .await
-                            .map_err(RpcError::Transport)?;
+                            .call_member_typed(owner, "POST", CLAIM_PATH, body)
+                            .await?;
                         serde_json::from_slice(&raw)
                             .map_err(|e| RpcError::Handler(e.to_string()))?
                     };
@@ -907,9 +906,8 @@ impl ClusterProxyStore {
                         let body = serde_json::to_vec(&req)
                             .map_err(|e| RpcError::Handler(e.to_string()))?;
                         let raw = node
-                            .call_member(owner, "POST", COMPLETE_PATH, body)
-                            .await
-                            .map_err(RpcError::Transport)?;
+                            .call_member_typed(owner, "POST", COMPLETE_PATH, body)
+                            .await?;
                         serde_json::from_slice(&raw)
                             .map_err(|e| RpcError::Handler(e.to_string()))?
                     };
@@ -1074,9 +1072,8 @@ impl ProxyRecordingStore for ClusterProxyStore {
             } else {
                 let body =
                     serde_json::to_vec(&req).map_err(|e| RpcError::Handler(e.to_string()))?;
-                node.call_member(owner, "POST", RELEASE_PATH, body)
-                    .await
-                    .map_err(RpcError::Transport)?;
+                node.call_member_typed(owner, "POST", RELEASE_PATH, body)
+                    .await?;
                 Ok(())
             }
         });
@@ -1183,9 +1180,8 @@ impl ProxyRecordingStore for ClusterProxyStore {
                     let body =
                         serde_json::to_vec(&req).map_err(|e| RpcError::Handler(e.to_string()))?;
                     let raw = node
-                        .call_member(owner, "POST", LOOKUP_PATH, body)
-                        .await
-                        .map_err(RpcError::Transport)?;
+                        .call_member_typed(owner, "POST", LOOKUP_PATH, body)
+                        .await?;
                     serde_json::from_slice::<LookupReply>(&raw)
                         .map_err(|e| RpcError::Handler(e.to_string()))
                 }
