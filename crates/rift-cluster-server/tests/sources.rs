@@ -160,6 +160,7 @@ async fn start_with(admin_credential_configured: bool) -> Fixture {
         engine: None,
         audit_retention_secs: rift_cluster::DEFAULT_AUDIT_RETENTION_SECS,
         snapshot_log_entries: None,
+        advertise_as_digest_only_incapable: false,
     };
     let node = Arc::new(RaftNode::start(config).await.expect("node starts"));
     slot.set(&node).expect("the slot is bound exactly once");

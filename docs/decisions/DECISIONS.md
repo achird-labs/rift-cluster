@@ -773,6 +773,8 @@ actively requested) is not a redundancy but the sole recovery path for a replica
 parked, and why "wait for compaction" was never a real remedy.
 
 ### D-49 — Payload fields stay optional on the wire; the bytes leave the op at submit, after the quorum
+> **Amended by D-53** (2026-08-27): a quorum ack is no longer sufficient to strip — every member
+> must also be known to apply a digest-only op.
 - **Status:** active
 - **Decided:** 2026-08-25 · #439
 - **Implemented by:** #439
@@ -1005,3 +1007,74 @@ freed.
 **Observability:** `rift_cluster_blob_gc_retained` (gauge) — committed blobs this node actually held
 back under rule A, counted by `gc` itself rather than re-derived, so the gauge cannot drift from the
 rule it reports on.
+
+### D-53 — The bytes leave the op only when every member is known to apply a digest-only one
+- **Status:** active
+- **Decided:** 2026-08-27 · #481 (#432 follow-up)
+- **Refines:** D-19, D-23, D-49
+- **Implemented by:** #481
+- **Code:** crates/rift-cluster/src/raft/node.rs, crates/rift-cluster-server/src/admin_front.rs
+
+`fan_out_then_submit` strips a `DatasetPut`/`SpecPut`'s payload only when every member of the
+committed ∪ effective configuration is **known** to apply digest-only ops. Otherwise it submits the
+op unchanged — the pre-D-49 shape every build can decode — counts
+`rift_cluster_blob_sideload_deferred_total{reason}`, and warns naming the members responsible. A
+mixed fleet degrades to bytes-on-the-log for the duration of a roll, and wedges nobody.
+
+**What the prose rule it replaces got wrong.** `10-operations.md` told operators to upgrade the
+fleet before the first sideloaded write, and described the failure as an old node that "fails closed
+at apply". It does not. Log entries are decoded in `RedbLogStore::try_get_log_entries` with
+`serde_json::from_slice(..).map_err(|e| StorageIOError::read_logs(&e))?`, and a `StorageError` out of
+the **log store** is fatal to openraft's core: the node's Raft runtime stops. It is not a refused
+apply, and if the un-upgraded members are a majority, one routine spec or dataset write costs the
+fleet quorum mid-roll. That is the reason this is a mechanism rather than a sentence in a runbook.
+
+**The capability is learned, not configured.** `BlobStat` gains `applies_digest_only`, set `true` by
+this build's stat handler and `#[serde(default)]` so an old build's response — which omits the field
+— decodes as `false`. The fan-out already stat-probes before sending, so the signal costs nothing.
+`FanOutOutcome` carries the evidence (`sideload_safe`, plus which members were *incapable* and which
+were merely *unobserved*), not a bare verdict, so the warning can name who.
+
+**The probes run concurrently with the byte fan-out**, in a second `JoinSet` spawned before either
+is awaited. Serially they cost the *sum* over learners, and since an unreachable member is never
+remembered, that bill is paid on every write — enough to push a write past its caller's timeout on a
+fleet with a blackholed learner. Concurrently the cost is the *max*, and in a healthy fleet it is
+free: a stat round trip finishes long before a peer being sent megabytes. Learners are re-probed
+every round rather than skipped once remembered, because skipping is exactly what would let a stale
+`true` outlive the build it described.
+
+**The probe set is every member; the byte quorum is still joint voters.** A learner applies the log
+too, so it is asked the capability question — but bytes still go only to joint voters, and D-19 is
+untouched. An **empty** membership is never safe to strip: `sideload_safe` is false on it rather
+than vacuously true, which is what an `all()` over an empty set would have given.
+
+**Observed capability is remembered** for as long as a member is in the membership, and pruned when
+it leaves — but **a fresh `false` evicts a remembered `true`**. Without that eviction the set is
+grow-only, and the memory becomes the very hazard it was meant to close: a node id is chosen by the
+operator, so replacing a machine and rejoining under the *same* id from an older image is an
+ordinary move, and the prune cannot catch it (the prune only runs inside a fan-out, and there may be
+no write at all during the absence). The stale `true` would then authorise a strip, and the rejoined
+member's Raft core would stop at log read — #481's own failure, reached through #481's mechanism.
+An explicit `false` observed now is strictly better evidence than a `true` observed earlier, so
+honouring it is never less safe; it also makes "a rolling downgrade in place is out of contract" a
+statement of intent rather than a gap the code leans on.
+
+**The cost, stated accurately.** Bytes ride the log while any member is not known capable. That is
+*not* — as this issue's triage had it — "one write's worth, then it is remembered": a member this
+leader has **never** observed, because it was down when the leader's first fan-out ran, is never
+added to the set, so every write carries its bytes for as long as it stays away. Worse, since
+membership changes only via join or leave (D-21), a member that is down *permanently* keeps the
+fleet on bytes-on-the-log indefinitely — silently undoing the epic this sits in. The counter and the
+member-naming warning are therefore part of this decision, not observability garnish: they are what
+makes that state visible, and the operator closes it by removing the dead member. A leader failover
+empties the set, so the first write after one re-probes; that degrades, it never wedges.
+
+*Rejected:* capability in membership metadata — needs a custom openraft `Node` type and a join-time
+stamp that an in-place restart onto an older binary silently invalidates. *Rejected:* gating on
+*acked* members only — the member that will replay the entry is exactly the one that was down.
+*Rejected:* a replicated "digest-only enabled" ratchet — a one-way door, and a persisted
+state-machine field for a transient upgrade window, whose own op has the same decode problem unless
+smuggled onto an existing variant.
+
+**Replays are covered by construction:** `compose::drain_parked_intents` runs a parked write through
+this same function, so it cannot bypass the gate.

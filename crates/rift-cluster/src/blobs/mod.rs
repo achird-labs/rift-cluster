@@ -133,6 +133,23 @@ pub struct BlobStat {
     /// Bytes currently staged toward this digest, or 0 when nothing is
     /// staged (including when the blob is already committed).
     pub staged: u64,
+    /// Whether **this build** applies a digest-only `ControlOp` (#481, D-49) — not a property
+    /// of `digest` at all, unlike the three fields above. `blobs::routes`' `?stat` handler is
+    /// the only place that sets this to anything but the default; every other constructor of a
+    /// `BlobStat` (this store's own [`BlobStore::stat`], every test fixture) leaves it `false`,
+    /// because none of them speak for a build's capability.
+    ///
+    /// `#[serde(default)]` **is** the compatibility mechanism, not an incidental annotation: a
+    /// pre-#481 peer's `?stat` response has no such key at all, and a decoder that required it
+    /// would turn a routine rolling upgrade into a hard fan-out failure against every
+    /// not-yet-upgraded member. Defaulting to `false` on absence is also the only safe
+    /// direction — an unknown build must read as "cannot be trusted to apply a digest-only
+    /// entry", never the reverse (`RaftNode::sideload_safe` depends on this: a member that
+    /// never answers the question must never count toward "everyone confirmed capable").
+    #[serde(default)]
+    /// D-53: whether the *build* answering can apply a digest-only op. `#[serde(default)]`
+    /// is the compatibility mechanism — an older build omits the field, which decodes `false`.
+    pub applies_digest_only: bool,
 }
 
 /// Node-local record of this store's GC sweeps, persisted at
@@ -443,7 +460,14 @@ impl BlobStore {
             Err(e) => return Err(e.into()),
         };
         let staged = self.staged_len(digest)?;
-        Ok(BlobStat { have, size, staged })
+        // Never speaks to build capability — see `BlobStat::applies_digest_only`'s doc for why
+        // this always leaves it `false`; only `blobs::routes`' `?stat` handler answers that.
+        Ok(BlobStat {
+            have,
+            size,
+            staged,
+            applies_digest_only: false,
+        })
     }
 
     /// Write one chunk of `digest`'s bytes at `offset`, out of `total` bytes
@@ -1007,6 +1031,28 @@ mod tests {
             );
         }
         assert!(BlobDigest::parse(EMPTY_DIGEST).is_ok());
+    }
+
+    // ---- sideload capability (#481) --------------------------------------
+
+    /// The compatibility mechanism itself, not just the field: a pre-#481 peer's `?stat`
+    /// response has no `applies_digest_only` key at all, and this is what a build that has
+    /// never heard of the field must still decode as — `false`, the direction that cannot strip
+    /// bytes a peer might not be able to apply. If `#[serde(default)]` were ever dropped, this
+    /// literal JSON would fail to decode at all rather than merely defaulting wrong.
+    #[test]
+    fn an_old_builds_stat_decodes_as_not_digest_only() {
+        let stat: BlobStat =
+            serde_json::from_str(r#"{"have":true,"size":5,"staged":0}"#).expect("decode stat");
+        assert_eq!(
+            stat,
+            BlobStat {
+                have: true,
+                size: 5,
+                staged: 0,
+                applies_digest_only: false,
+            }
+        );
     }
 
     // ---- write path ------------------------------------------------------

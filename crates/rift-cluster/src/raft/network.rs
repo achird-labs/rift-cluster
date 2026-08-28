@@ -1364,6 +1364,14 @@ fn majority_of(config: &BTreeSet<NodeId>, acks: &BTreeSet<NodeId>) -> bool {
     held * 2 > config.len()
 }
 
+/// The two membership views one blob fan-out needs, read together (#481, D-53): whom to send
+/// bytes to (`voters`, D-19's quorum, unchanged) and whom to ask about digest-only support
+/// (`all`, which adds the learners — they apply the log too).
+pub(crate) struct JointMembership {
+    pub(crate) voters: QuorumTargets,
+    pub(crate) all: BTreeSet<NodeId>,
+}
+
 /// Read both voter sets in **one** `with_raft_state` closure (#438, D-19).
 ///
 /// One read, not two: separate reads can observe different membership epochs,
@@ -1380,6 +1388,45 @@ pub(crate) async fn joint_voters(raft: &Raft<TypeConfig>) -> Result<QuorumTarget
     })
     .await
     .map_err(|e| RpcError::Handler(format!("reading membership for blob fan-out: {e}")))
+}
+
+/// Every node id in the committed configuration ∪ the effective one — voters **and**
+/// learners (#481). A sibling to [`joint_voters`] rather than a change to it: that function
+/// answers a narrower question on purpose (voters only, for D-19's byte quorum), and this
+/// answers a different one — "who applies this log" — which a learner is part of too. openraft
+/// replicates to and applies on a learner exactly as it does a voter; a learner just does not
+/// count toward an election or toward the byte quorum a blob fan-out sends to.
+///
+/// `RaftNode::fan_out_blob` uses this to decide who to *probe* for sideload capability (every
+/// member here), which is deliberately a larger set than who it *sends bytes to* (only
+/// [`QuorumTargets::members`]) — D-19's byte quorum is unchanged by this.
+///
+/// The voter sets and the member union come from **one** `with_raft_state` closure, for
+/// [`joint_voters`]' reason and one more: read separately, the byte-quorum set and the
+/// capability-probe set could come from different membership epochs, and the gate would then be
+/// deciding about a configuration that never existed.
+///
+/// # Errors
+///
+/// [`RpcError::Handler`] if the RaftCore loop cannot be reached to answer.
+pub(crate) async fn joint_members(raft: &Raft<TypeConfig>) -> Result<JointMembership, RpcError> {
+    raft.with_raft_state(|state| {
+        let committed = state.membership_state.committed();
+        let effective = state.membership_state.effective();
+        JointMembership {
+            voters: QuorumTargets {
+                committed: committed.voter_ids().collect(),
+                effective: effective.voter_ids().collect(),
+            },
+            all: committed
+                .nodes()
+                .map(|(id, _)| *id)
+                .chain(effective.nodes().map(|(id, _)| *id))
+                .collect(),
+        }
+    })
+    .await
+    .map_err(|e| RpcError::Handler(format!("reading membership for blob sideload probe: {e}")))
 }
 
 /// Leader-side: demote `node_id` from voter to learner if it currently is one

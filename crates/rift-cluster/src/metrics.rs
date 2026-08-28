@@ -120,6 +120,21 @@ lazy_static! {
     )
     .expect("rift_cluster_blob_gc_retained registers once");
 
+    /// `rift_cluster_blob_sideload_deferred_total{reason}` — writes that kept their full bytes
+    /// on the log because `fan_out_blob` could not confirm every member's sideload capability
+    /// (#481). `member_incapable` = a member is confirmed to run a build that cannot apply a
+    /// digest-only `ControlOp` (an explicit `false` `?stat` answer, or no blob route at all);
+    /// `member_unobserved` = a member has simply never answered the question (typically a
+    /// fresh join, or a transient probe failure). Persistently non-zero on a fleet that is
+    /// *not* mid-rolling-upgrade means a member is stuck on an old build.
+    static ref BLOB_SIDELOAD_DEFERRED: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_blob_sideload_deferred_total",
+        "Writes whose bytes stayed on the log because the fan-out could not confirm every \
+         member's sideload capability, by reason",
+        &["reason"]
+    )
+    .expect("rift_cluster_blob_sideload_deferred_total registers once");
+
     // -- config-sync (issue #9) ---------------------------------------------
 
     /// `rift_cluster_write_forwards_total` — writes this node accepted and
@@ -661,6 +676,13 @@ pub(crate) fn blob_fetch_recovered() {
 /// Resample the tombstoned-but-not-yet-purged count from the blob GC sweep that just ran (#480).
 pub(crate) fn blob_gc_retained(kept: u64) {
     BLOB_GC_RETAINED.set(i64::try_from(kept).unwrap_or(i64::MAX));
+}
+
+/// `reason` ∈ `member_incapable` / `member_unobserved` — closed at the call site
+/// (`admin_front::fan_out_then_submit`, which is why this is `pub` rather than `pub(crate)`:
+/// that call site lives in the `rift-cluster-server` crate, not this one).
+pub fn blob_sideload_deferred(reason: &str) {
+    BLOB_SIDELOAD_DEFERRED.with_label_values(&[reason]).inc();
 }
 
 /// Resample the pending-intents depth from the ledger itself. The inc/dec pair

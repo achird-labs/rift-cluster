@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::{BLOB_CHUNK_MAX_BYTES, BLOB_PATH_PREFIX, BlobDigest, BlobError, BlobStore};
+use super::{BLOB_CHUNK_MAX_BYTES, BLOB_PATH_PREFIX, BlobDigest, BlobError, BlobStat, BlobStore};
 use crate::rpc::{HandlerFuture, Router, RpcError};
 
 /// Applied state, asked for a blob's bytes when this node's transport store
@@ -53,11 +53,21 @@ pub(crate) trait BlobFallback: Send + Sync + 'static {
 ///
 /// `fallback` backs the chunk-read half of `GET` only — see [`handle_get`] for
 /// why `?stat` deliberately does not consult it.
+///
+/// `applies_digest_only` is this build's own answer to whether it can apply a digest-only
+/// `ControlOp` (#481, D-49) — stamped onto every `?stat` response so a peer's fan-out can learn
+/// it. `RaftNode::start` passes `true` for every shipped configuration; `false` only under the
+/// [`crate::raft::NodeConfig::advertise_as_digest_only_incapable`] test knob, which makes this
+/// node's build pretend to be a pre-#481 one. Not in conflict with D-51 (`?stat` staying a pure
+/// transport-store probe, never consulting `fallback`): that decision is about what a `have`/
+/// `size`/`staged` answer describes (this store's own bytes), while this field describes the
+/// *build* answering, which needs no store lookup at all.
 #[must_use]
 pub(crate) fn blob_routes(
     router: Router,
     store: Arc<BlobStore>,
     fallback: Arc<dyn BlobFallback>,
+    applies_digest_only: bool,
 ) -> Router {
     let put_store = Arc::clone(&store);
     let get_store = store;
@@ -77,7 +87,9 @@ pub(crate) fn blob_routes(
             Arc::new(move |suffix: String, body: Vec<u8>| -> HandlerFuture {
                 let store = Arc::clone(&get_store);
                 let fallback = Arc::clone(&fallback);
-                Box::pin(async move { handle_get(store, fallback, suffix, body).await })
+                Box::pin(async move {
+                    handle_get(store, fallback, applies_digest_only, suffix, body).await
+                })
             }),
         )
 }
@@ -104,6 +116,7 @@ async fn handle_put(
 async fn handle_get(
     store: Arc<BlobStore>,
     fallback: Arc<dyn BlobFallback>,
+    applies_digest_only: bool,
     suffix: String,
     _body: Vec<u8>,
 ) -> Result<Vec<u8>, RpcError> {
@@ -121,6 +134,12 @@ async fn handle_get(
             .await
             .map_err(|e| RpcError::Handler(format!("blob stat task: {e}")))?
             .map_err(|e| map_blob_error(e, digest_str))?;
+        // The store never speaks to build capability (see `BlobStat::applies_digest_only`'s
+        // doc); this is the one place that stamps this build's own answer onto the response.
+        let stat = BlobStat {
+            applies_digest_only,
+            ..stat
+        };
         return encode(&stat);
     }
 
@@ -304,6 +323,7 @@ mod tests {
         handle_get(
             store,
             fallback,
+            true,
             format!("{DIGEST}?offset={offset}&len={len}"),
             Vec::new(),
         )
@@ -341,6 +361,7 @@ mod tests {
         let chunk = handle_get(
             store,
             holding(&five_mib),
+            true,
             format!("{FIVE_MIB_A_DIGEST}?offset=0&len={}", five_mib.len()),
             Vec::new(),
         )
@@ -416,6 +437,7 @@ mod tests {
         let body = handle_get(
             store,
             holding(b"hello"),
+            true,
             format!("{DIGEST}?stat=1"),
             Vec::new(),
         )
@@ -427,9 +449,37 @@ mod tests {
             BlobStat {
                 have: false,
                 size: 0,
-                staged: 0
+                staged: 0,
+                // D-53: this build applies digest-only ops; an older one omits the field entirely.
+                applies_digest_only: true,
             }
         );
+    }
+
+    /// #481: `?stat` is where a peer learns whether *this build* can apply a digest-only
+    /// `ControlOp` — `RaftNode::fan_out_blob` reads exactly this bit to decide whether a member
+    /// counts toward `sideload_safe`. Through the real `handle_get`, both directions, so a future
+    /// change that stops threading the parameter through fails this rather than only a
+    /// lower-level unit test of the struct literal.
+    #[tokio::test]
+    async fn a_stat_response_advertises_that_this_build_applies_digest_only() {
+        for applies_digest_only in [true, false] {
+            let (store, _dir) = empty_store();
+            let body = handle_get(
+                store,
+                holding_nothing(),
+                applies_digest_only,
+                format!("{DIGEST}?stat=1"),
+                Vec::new(),
+            )
+            .await
+            .expect("stat answers");
+            let stat: BlobStat = serde_json::from_slice(&body).expect("decode stat");
+            assert_eq!(
+                stat.applies_digest_only, applies_digest_only,
+                "the route must advertise exactly what it was asked to, got {stat:?}"
+            );
+        }
     }
 
     /// A transport store that already holds `bytes` under `DIGEST` — `empty_store` deliberately
@@ -479,6 +529,7 @@ mod tests {
         handle_get(
             Arc::clone(&store),
             holding_nothing(),
+            true,
             format!("{DIGEST}?stat=1"),
             Vec::new(),
         )
@@ -506,6 +557,7 @@ mod tests {
         let bytes = handle_get(
             Arc::clone(&store),
             holding_nothing(),
+            true,
             format!("{DIGEST}?offset=0&len=64"),
             Vec::new(),
         )

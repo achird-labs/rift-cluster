@@ -218,16 +218,43 @@ election and no ownership guess per step. Sequence cursors still reset on
 ownership moves (D-8) — schedule upgrades between test runs, stated in the
 docs rather than discovered in one.
 
-**Sideloaded blobs (#439, D-49): upgrade the whole fleet before the first
-dataset or spec write on the new build.** A new node replays every entry an
-old build wrote — the payload fields stayed on the wire, optional — but the
-reverse does not hold: an old build cannot deserialize a digest-only
-`DatasetPut`/`SpecPut` and fails closed at apply. Reads and every other
-write are unaffected during the roll; it is only a sideloaded write landing
-on a mixed fleet that an old member cannot follow. A member whose build
-cannot serve blobs is reported as *skewed* in the fan-out refusal and in
-`blob_fetch_stall`, distinct from a partition, so a half-finished roll reads
-as what it is.
+**Sideloaded blobs (#439, D-49; gated since #481, D-53): nothing to do.** A
+roll no longer has an ordering requirement. The write path strips a
+`DatasetPut`/`SpecPut`'s bytes only once every member of the committed ∪
+effective configuration is known to apply a digest-only op — a capability the
+fan-out learns for free from the `?stat` probe it already makes. Until then
+the op is committed **with its bytes**, the shape every build can decode, so a
+mixed fleet is slower for the duration of the roll and never wedged.
+
+*This paragraph used to say the opposite* — "upgrade the whole fleet before the
+first dataset or spec write", on the grounds that an old build "fails closed at
+apply". That description was wrong, and wrong in the dangerous direction. Log
+entries are decoded in the **log store**, not at apply
+(`RedbLogStore::try_get_log_entries`), and a decode failure there is a
+`StorageError` that is fatal to openraft's core: the node's Raft runtime stops.
+One routine write during a roll therefore took down every not-yet-upgraded
+member, and if those were a majority, the fleet lost quorum. Recorded here
+because a fleet still running a build older than #481 has that behaviour, and
+the runbook that told operators it was a soft failure was the reason it looked
+safe.
+
+**Watch `rift_cluster_blob_sideload_deferred_total`.** Non-zero during a roll is
+the mechanism working. Non-zero *after* one is the state worth acting on: some
+member is not known capable, so every write is carrying its bytes on the log —
+the load the #432 epic exists to remove. The warning that accompanies it names
+the members. The usual cause is a member that is down and has never been probed
+by the current leader; since membership changes only through a node joining or
+leaving (D-21), a permanently dead member holds the fleet in this state until it
+is removed. A leader failover also clears the learned set, so a single deferred
+write immediately after one is expected and self-correcting.
+
+A member whose build cannot serve blobs *at all* (pre-#437) is separately
+reported as *skewed* in the fan-out refusal and in `blob_fetch_stall`, distinct
+from a partition, so a half-finished roll still reads as what it is.
+
+**Downgrades across this boundary are out of contract.** An observed capability
+is remembered for as long as the member stays in the membership, so restarting a
+member in place onto an older binary is not something the gate can catch.
 
 ## Sizing rules of thumb
 

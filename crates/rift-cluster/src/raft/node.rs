@@ -22,7 +22,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -73,7 +73,7 @@ const STORAGE_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 /// shutdown wait.
 ///
 /// A *running* node holds a second clone: the blob route's `Arc<dyn BlobFallback>`
-/// (#486, D-51). That this constant is still `1` at rest is therefore an ordering
+/// (#486, D-51). That this constant does not count it is therefore an ordering
 /// guarantee, not an accident — [`RaftNode::shutdown`] aborts `server_task` and
 /// waits for it to finish *before* calling `await_storage_release`, which is what
 /// drops the router and with it that clone. Do not reorder those two steps.
@@ -199,6 +199,17 @@ pub struct NodeConfig {
     /// path stays unexercised. That is exactly the trap this knob exists to remove: three chaos
     /// scenarios independently discovered it and each wrote the same correction into the README.
     pub snapshot_log_entries: Option<u64>,
+    /// Make this node's blob `?stat` route advertise `applies_digest_only: false`, regardless of
+    /// what this build can actually apply (#481).
+    ///
+    /// **A testability knob, not an operator tuning parameter**, in the same style as
+    /// [`Self::snapshot_log_entries`]: `false` — the default, and the only value any shipped
+    /// configuration produces — lets the route answer honestly. `true` makes this node's build
+    /// pretend to be a pre-#481 one that cannot apply a digest-only `ControlOp`
+    /// (`DatasetPut`/`SpecPut` with `csv`/`document: Option<String>` unset), which is the only
+    /// way an in-process test can exercise `RaftNode::fan_out_blob`'s capability gate (D-53)
+    /// without actually standing up two binary versions side by side.
+    pub advertise_as_digest_only_incapable: bool,
 }
 
 // Hand-written so the shared secret never lands in a log line — matching the
@@ -379,6 +390,67 @@ pub struct FanOutOutcome {
     /// Whether the two configurations differed, i.e. a membership change was in
     /// flight and the second majority did real work.
     pub joint: bool,
+    /// Whether every member of the committed ∪ effective configuration — voters *and*
+    /// learners, since a learner applies the log too (#481) — has been confirmed able to apply
+    /// a digest-only `ControlOp`, with nobody [`Self::skewed`]. This, not [`Self::quorum`], is
+    /// what `fan_out_then_submit` strips the op's bytes on: quorum durability of the *blob*
+    /// says nothing about whether a member outside the byte quorum can *decode* a reference to
+    /// it. See [`sideload_safe`] for the decision rule.
+    pub sideload_safe: bool,
+    /// Members [`Self::sideload_safe`] found not confirmed capable, and *why* not, for
+    /// diagnosis and the deferred-write metric (#481): `sideload_incapable` were confirmed —
+    /// this round or a past one — unable to apply a digest-only entry (an explicit `false`
+    /// answer, or [`Self::skewed`]); `sideload_unobserved` have simply never answered the
+    /// question (unreachable this round, or never probed). Both are empty when
+    /// `sideload_safe` is true.
+    pub sideload_incapable: BTreeSet<NodeId>,
+    pub sideload_unobserved: BTreeSet<NodeId>,
+}
+
+/// The pure decision [`RaftNode::fan_out_blob`] strips an op's bytes on (#481): true iff
+/// `members` is non-empty, every one of them is in `capable`, and `skewed` is empty.
+///
+/// An **empty** `members` answers `false`, deliberately — the same reasoning
+/// `network::majority_of` applies to an empty configuration. The question "can everyone apply
+/// this" cannot be answered about zero members, and treating an unanswerable question as "yes"
+/// is the one direction that cannot be undone: it strips bytes a real (just not-yet-observed)
+/// membership might not be able to reconstruct.
+fn sideload_safe(
+    members: &BTreeSet<NodeId>,
+    capable: &BTreeSet<NodeId>,
+    skewed: &BTreeSet<NodeId>,
+) -> bool {
+    !members.is_empty() && members.is_subset(capable) && skewed.is_empty()
+}
+
+/// Drop every `capable` id that is not in `current_members` (#481) — so a member that has left
+/// the fleet cannot keep occupying a slot in the remembered observation set forever. Harmless to
+/// `sideload_safe` either way (extra ids in `capable` beyond `members` never make it stricter or
+/// laxer), but unbounded growth across a fleet's lifetime of joins and departures is its own
+/// slow leak, and this is the one place that closes it.
+/// Fold one fan-out's observations into the remembered capability set (D-53).
+///
+/// **A fresh `false` beats a remembered `true`.** The set is otherwise grow-only, and a remembered
+/// `true` outliving the build it described is a strip that wedges someone: a node id is chosen by
+/// the operator, so replacing a machine and rejoining as the *same* id — with an older image — is
+/// an ordinary move, and the prune below cannot catch it, because it only ever runs inside a
+/// fan-out and there may be no write at all during the absence. An explicit `false` observed now is
+/// strictly better evidence than a `true` observed earlier; honouring it is never less safe. It
+/// also makes D-53's "a rolling downgrade in place is out of contract" a statement about intent
+/// rather than a gap the code depends on.
+fn remember_capability(
+    capable: &mut BTreeSet<NodeId>,
+    observed_capable: &BTreeSet<NodeId>,
+    observed_incapable: &BTreeSet<NodeId>,
+    current_members: &BTreeSet<NodeId>,
+) {
+    capable.extend(observed_capable);
+    capable.retain(|id| !observed_incapable.contains(id));
+    prune_sideload_capable(capable, current_members);
+}
+
+fn prune_sideload_capable(capable: &mut BTreeSet<NodeId>, current_members: &BTreeSet<NodeId>) {
+    capable.retain(|id| current_members.contains(id));
 }
 
 /// Put `payload` to one peer, trying each address its authority resolved to.
@@ -397,6 +469,26 @@ async fn send_blob_to_peer(
     for addr in addrs {
         match transfer.put(*addr, digest, payload).await {
             Ok(outcome) => return Ok(outcome),
+            Err(e @ (RpcError::Timeout | RpcError::Transport(_) | RpcError::Shed)) => last = e,
+            Err(answered) => return Err(answered),
+        }
+    }
+    Err(last)
+}
+
+/// Probe one peer's sideload capability without sending it any bytes (#481) — the learner half
+/// of [`RaftNode::fan_out_blob`]'s capability sweep, for a member the byte quorum does not
+/// include. Mirrors [`send_blob_to_peer`]'s same-peer address sweep rule exactly: only a
+/// liveness failure is worth trying the next address for.
+async fn stat_only_peer(
+    transfer: &crate::blobs::client::BlobTransfer,
+    addrs: &[SocketAddr],
+    digest: &crate::blobs::BlobDigest,
+) -> Result<bool, RpcError> {
+    let mut last = RpcError::Transport("no address answered".to_owned());
+    for addr in addrs {
+        match transfer.stat_only(*addr, digest).await {
+            Ok(capable) => return Ok(capable),
             Err(e @ (RpcError::Timeout | RpcError::Transport(_) | RpcError::Shed)) => last = e,
             Err(answered) => return Err(answered),
         }
@@ -454,6 +546,19 @@ pub struct RaftNode {
     // `unpark_intent`); whoever drains it is a composition concern, but the
     // "there is something to drain" fact is this node's.
     replay_wake: Arc<tokio::sync::Notify>,
+    // Members `fan_out_blob` has *ever* observed applying a digest-only `ControlOp` (#481) —
+    // remembered, not just this call's answer, because a build does not regress in place: once a
+    // member proves it can decode a digest-only entry, a transient probe failure on a later
+    // fan-out must not un-mark it. Pruned against the current committed ∪ effective membership
+    // on every fan-out (`prune_sideload_capable`) so a departed member's id does not linger
+    // forever.
+    sideload_capable: Mutex<BTreeSet<NodeId>>,
+    // This node's own answer to the same question `sideload_capable` tracks about peers — the
+    // same bit its own blob `?stat` route advertises (#481). Read locally rather than over the
+    // network: `fan_out_blob` never asks itself. Test-controlled by
+    // `NodeConfig::advertise_as_digest_only_incapable`; every shipped configuration leaves it
+    // `true`.
+    digest_only_capable: bool,
 }
 
 impl RaftNode {
@@ -891,12 +996,17 @@ impl RaftNode {
             Arc::clone(&membership_gate),
             Arc::clone(&auto_voter_ceiling),
         );
+        // Read once, up front: `?stat` advertises exactly this bit on every response, and
+        // `fan_out_blob` below reads it back as this node's own answer rather than asking
+        // itself over the network — see `RaftNode::digest_only_capable`'s doc.
+        let digest_only_capable = !config.advertise_as_digest_only_incapable;
         // `sm_reader` is the fallback: applied state serves a referenced blob whose bytes
         // never reached this node's transport store (#486, D-51).
         let router = crate::blobs::routes::blob_routes(
             router,
             Arc::clone(&blob_store),
             Arc::new(sm_reader.clone()),
+            digest_only_capable,
         );
 
         let server = RpcServer::bind(config.bind, RpcServerConfig::new(verifier, router))
@@ -964,6 +1074,8 @@ impl RaftNode {
             membership_gate,
             auto_voter_ceiling,
             replay_wake: Arc::new(tokio::sync::Notify::new()),
+            sideload_capable: Mutex::new(BTreeSet::new()),
+            digest_only_capable,
         })
     }
 
@@ -1054,14 +1166,24 @@ impl RaftNode {
             .map_err(|e| NodeError::Runtime(format!("blob store task: {e}")))?
             .map_err(|e| NodeError::Runtime(format!("storing blob locally: {e}")))?;
 
-        let targets = network::joint_voters(&self.raft)
+        // Both views in one read (#481): D-19's byte quorum stays voters-only, but a learner
+        // applies the log the same as a voter, so its sideload capability matters even though it
+        // is never sent bytes below. Read separately, the two could come from different
+        // membership epochs and the gate would be deciding about a configuration that never was.
+        let membership = network::joint_members(&self.raft)
             .await
             .map_err(|e| NodeError::Runtime(e.to_string()))?;
+        let targets = membership.voters;
+        let all_members = membership.all;
+        let voter_members = targets.members();
 
         // Resolve before spawning: `resolve` borrows `self`, and the transfer
-        // tasks must own everything they touch.
+        // tasks must own everything they touch. Split here into who gets bytes
+        // (`peers`, unchanged from before #481) and who is only probed for
+        // capability (`probe_only`, the learners `all_members` adds).
         let mut peers: Vec<(NodeId, Vec<SocketAddr>)> = Vec::new();
-        for id in targets.members() {
+        let mut probe_only: Vec<(NodeId, Vec<SocketAddr>)> = Vec::new();
+        for id in all_members.iter().copied() {
             if id == self.id {
                 continue;
             }
@@ -1069,7 +1191,13 @@ impl RaftNode {
                 continue;
             };
             match self.resolve(&authority).await {
-                Ok(addrs) if !addrs.is_empty() => peers.push((id, addrs)),
+                Ok(addrs) if !addrs.is_empty() => {
+                    if voter_members.contains(&id) {
+                        peers.push((id, addrs));
+                    } else {
+                        probe_only.push((id, addrs));
+                    }
+                }
                 Ok(_) => {
                     tracing::warn!(node_id = id, %authority, "blob fan-out: authority resolved to no address")
                 }
@@ -1095,9 +1223,32 @@ impl RaftNode {
             });
         }
 
+        // Spawned here, before either set is awaited, so the capability probes overlap the byte
+        // transfers instead of following them. Serially this cost `sum` over the learners — and
+        // an unreachable learner is never remembered, so that bill was paid on *every* write and
+        // could push a write past its caller's timeout. Concurrently it is `max`, and in a healthy
+        // fleet it is free: a stat round trip finishes long before a peer that is being sent
+        // megabytes. Learners are probed every round rather than skipped once remembered, because
+        // skipping is what would let a stale `true` outlive the build it described — see
+        // `remember_capability`.
+        let mut probes = tokio::task::JoinSet::new();
+        for (id, addrs) in probe_only {
+            let transfer = crate::blobs::client::BlobTransfer::new(Arc::clone(&client));
+            let digest = digest.clone();
+            probes.spawn(async move { (id, stat_only_peer(&transfer, &addrs, &digest).await) });
+        }
+
         let mut acks: BTreeSet<NodeId> = BTreeSet::from([self.id]);
         let mut skewed: BTreeSet<NodeId> = BTreeSet::new();
         let mut bytes_sent = 0_u64;
+        // This fan-out's own observations, kept apart from the remembered `sideload_capable`
+        // until the end: a peer confirmed capable this round is remembered forever, but a peer
+        // that merely didn't answer *this* round must not overwrite an earlier `true`.
+        let mut observed_capable: BTreeSet<NodeId> = BTreeSet::new();
+        let mut observed_incapable: BTreeSet<NodeId> = BTreeSet::new();
+        if self.digest_only_capable {
+            observed_capable.insert(self.id);
+        }
         while let Some(joined) = tasks.join_next().await {
             let (id, result) = match joined {
                 Ok(pair) => pair,
@@ -1110,6 +1261,11 @@ impl RaftNode {
                 Ok(outcome) => {
                     bytes_sent += outcome.bytes_sent;
                     acks.insert(id);
+                    if outcome.applies_digest_only {
+                        observed_capable.insert(id);
+                    } else {
+                        observed_incapable.insert(id);
+                    }
                 }
                 // A build without the blob route cannot answer the question
                 // being asked. It is neither "has it" nor "lacks it", and
@@ -1126,6 +1282,69 @@ impl RaftNode {
             }
         }
 
+        // Learners never receive bytes (D-19 is unchanged), but they apply the log the same as a
+        // voter, so their sideload capability still has to be probed — a stat-only round trip that
+        // costs no bytes.
+        while let Some(joined) = probes.join_next().await {
+            let (id, result) = match joined {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(error = %e, "blob capability probe task panicked");
+                    continue;
+                }
+            };
+            match result {
+                Ok(true) => {
+                    observed_capable.insert(id);
+                }
+                Ok(false) => {
+                    observed_incapable.insert(id);
+                }
+                // A build with no blob route at all (pre-#437) cannot decode a digest-only entry
+                // either, so it is *incapable*, not merely unobserved — the same reading the byte
+                // path already gives it via `skewed`. Classifying it as unobserved would send an
+                // operator to the runbook line for a transient probe failure, which says a leader
+                // failover is self-correcting; for a permanently old learner that is the wrong
+                // advice, and nothing would ever correct it.
+                Err(e @ (RpcError::UnknownRoute { .. } | RpcError::VersionSkew { .. })) => {
+                    tracing::warn!(node_id = id, error = %e, "blob fan-out: peer's build cannot serve blobs");
+                    observed_incapable.insert(id);
+                }
+                Err(e) => {
+                    tracing::warn!(node_id = id, error = %e, "blob fan-out: could not probe sideload capability");
+                }
+            }
+        }
+
+        let capable_snapshot = {
+            let mut capable = self
+                .sideload_capable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            remember_capability(
+                &mut capable,
+                &observed_capable,
+                &observed_incapable,
+                &all_members,
+            );
+            capable.clone()
+        };
+        let sideload_safe = sideload_safe(&all_members, &capable_snapshot, &skewed);
+        let not_capable: BTreeSet<NodeId> =
+            all_members.difference(&capable_snapshot).copied().collect();
+        // Skewed peers are also known-incapable, just via a different signal (no blob route at
+        // all rather than an explicit `false`): a build that old cannot decode a digest-only
+        // entry either.
+        let sideload_incapable: BTreeSet<NodeId> = not_capable
+            .iter()
+            .copied()
+            .filter(|id| observed_incapable.contains(id) || skewed.contains(id))
+            .collect();
+        let sideload_unobserved: BTreeSet<NodeId> = not_capable
+            .difference(&sideload_incapable)
+            .copied()
+            .collect();
+
         Ok((
             FanOutOutcome {
                 quorum: targets.satisfied_by(&acks),
@@ -1133,6 +1352,9 @@ impl RaftNode {
                 acks,
                 skewed,
                 bytes_sent,
+                sideload_safe,
+                sideload_incapable,
+                sideload_unobserved,
             },
             pin,
         ))
@@ -2593,10 +2815,10 @@ impl RaftNode {
         raft_stopped.and(storage_released)
     }
 
-    /// Wait until the only remaining handle on the storage database is this node's
-    /// own `sm_reader`, i.e. openraft has dropped its log-store and state-machine
-    /// clones. Bounded by [`STORAGE_RELEASE_TIMEOUT`] so a stuck teardown surfaces
-    /// as an error instead of hanging shutdown.
+    /// Wait until the only remaining handles on the storage database are this node's
+    /// own `sm_reader`, i.e. openraft has dropped its log-store and
+    /// state-machine clones. Bounded by [`STORAGE_RELEASE_TIMEOUT`] so a stuck teardown
+    /// surfaces as an error instead of hanging shutdown.
     async fn await_storage_release(&self) -> Result<(), NodeError> {
         let deadline = tokio::time::Instant::now() + STORAGE_RELEASE_TIMEOUT;
         while self.sm_reader.db_refs() > NODE_HELD_DB_REFS {
@@ -2747,6 +2969,94 @@ mod tests {
 
     const SECRET: &str = "cluster-test-secret";
 
+    // ---- sideload capability (#481) --------------------------------------
+
+    /// The pure decision rule `fan_out_then_submit` strips bytes on, exercised on literal sets
+    /// so this stays independent of any live fan-out. Every branch the doc comment claims:
+    /// every member capable and nobody skewed is safe; missing even one member's capability is
+    /// not; a skewed member (however few) is never safe even with full capability coverage;
+    /// and an empty membership is `false`, not vacuously `true`.
+    #[test]
+    fn sideload_safe_needs_every_member_observed_capable() {
+        let members = BTreeSet::from([1, 2, 3]);
+        let empty: BTreeSet<NodeId> = BTreeSet::new();
+
+        assert!(
+            sideload_safe(&members, &BTreeSet::from([1, 2, 3]), &empty),
+            "every member capable, nobody skewed: safe"
+        );
+        assert!(
+            !sideload_safe(&members, &BTreeSet::from([1, 2]), &empty),
+            "member 3's capability was never confirmed: not safe"
+        );
+        assert!(
+            !sideload_safe(&members, &BTreeSet::from([1, 2, 3]), &BTreeSet::from([2])),
+            "member 2 is skewed even though everyone answered capable: not safe"
+        );
+        assert!(
+            !sideload_safe(&BTreeSet::new(), &BTreeSet::from([1, 2, 3]), &empty),
+            "an empty membership cannot be evaluated, so it must not read as safe"
+        );
+    }
+
+    /// Pins D-53's eviction rule: an explicit `false` observed **now** must beat a `true`
+    /// remembered earlier. Without it the set is grow-only, and a machine replaced but rejoining
+    /// under the same operator-chosen node id — from an older image — inherits the previous
+    /// build's capability and gets handed a stripped entry its log store cannot decode, stopping
+    /// its Raft core. That is precisely the wedge #481 exists to prevent, reached through the
+    /// mechanism meant to prevent it.
+    #[test]
+    fn an_observed_incapable_evicts_a_remembered_capable() {
+        let members = BTreeSet::from([1, 2, 3]);
+        let mut capable = BTreeSet::from([1, 2, 3]);
+
+        // Node 3 was replaced in place and now answers `false`.
+        remember_capability(
+            &mut capable,
+            &BTreeSet::from([1, 2]),
+            &BTreeSet::from([3]),
+            &members,
+        );
+
+        assert_eq!(capable, BTreeSet::from([1, 2]));
+        assert!(
+            !sideload_safe(&members, &capable, &BTreeSet::new()),
+            "a member that just said it cannot apply digest-only ops must block the strip"
+        );
+    }
+
+    /// The reverse must still hold, or the eviction would have turned the gate into a permanent
+    /// off switch: a member that answers `true` is remembered.
+    #[test]
+    fn an_observed_capable_is_remembered_across_fan_outs() {
+        let members = BTreeSet::from([1, 2]);
+        let mut capable = BTreeSet::new();
+
+        remember_capability(&mut capable, &members, &BTreeSet::new(), &members);
+        // A later fan-out observes nobody (say every peer was briefly unreachable).
+        remember_capability(&mut capable, &BTreeSet::new(), &BTreeSet::new(), &members);
+
+        assert_eq!(
+            capable, members,
+            "a positive observation survives a silent round"
+        );
+        assert!(sideload_safe(&members, &capable, &BTreeSet::new()));
+    }
+
+    /// Pins the other half of #481: a member observed capable is remembered, but only for as
+    /// long as it is still part of the membership. Once it departs, `prune_sideload_capable`
+    /// drops it — a departed member's id must not occupy the persisted set forever.
+    #[test]
+    fn a_member_that_left_is_forgotten() {
+        let mut capable = BTreeSet::from([1, 2, 3]);
+        prune_sideload_capable(&mut capable, &BTreeSet::from([1, 2]));
+        assert_eq!(
+            capable,
+            BTreeSet::from([1, 2]),
+            "member 3 left the membership and must be forgotten, not just ignored"
+        );
+    }
+
     fn config_in(dir: &TempDir, id: NodeId) -> NodeConfig {
         NodeConfig {
             node_id: id,
@@ -2758,6 +3068,7 @@ mod tests {
             engine: None,
             audit_retention_secs: crate::raft::store::DEFAULT_AUDIT_RETENTION_SECS,
             snapshot_log_entries: None,
+            advertise_as_digest_only_incapable: false,
         }
     }
 
@@ -3019,9 +3330,10 @@ mod tests {
 
     /// The storage-release contract shutdown promises: when it returns, openraft
     /// has dropped every database handle it held, leaving only the node's own
-    /// `sm_reader`. On the old shutdown, which returned before the core wound
-    /// down, this count could still be above one until the core caught up — the
-    /// window the #41 restart raced. Here it is the guaranteed postcondition.
+    /// `sm_reader`. On the old shutdown, which returned before the core
+    /// wound down, this count could still be above [`NODE_HELD_DB_REFS`] until the core
+    /// caught up — the window the #41 restart raced. Here it is the guaranteed
+    /// postcondition.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_waits_for_storage_release() {
         let dir = TempDir::new().expect("tempdir");
@@ -4277,8 +4589,9 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         // > 1: the pin itself is the one handle that legitimately remains —
-        // deliberately not NODE_HELD_DB_REFS, whose 1 is the dropped node's own
-        // sm_reader.
+        // deliberately not NODE_HELD_DB_REFS, which counts what a *live* node holds of its
+        // own (`sm_reader`); once `node` is fully dropped here, it
+        // survives it, leaving only the pin.
         while pin.db_refs() > 1 {
             assert!(
                 tokio::time::Instant::now() < deadline,
