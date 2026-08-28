@@ -131,7 +131,7 @@ stateDiagram-v2
     Learner --> CatchingUp : snapshot + log replay
     CatchingUp --> Voter : auto-promote when caught up<br/>(while voters < 9)
     CatchingUp --> Learner : voters full — stays learner<br/>(serves data plane, no vote)
-    Voter --> Leaving : SIGTERM — demote to learner,<br/>flow-state handoff, remove
+    Voter --> Leaving : SIGTERM — flow-state handoff,<br/>removed as a voter (D-59)
     Learner --> Leaving : SIGTERM
     Leaving --> [*]
     Voter --> Dead : crash — peers elect ≤ ~1s

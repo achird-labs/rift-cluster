@@ -859,7 +859,7 @@ gate can re-open it.
 On SIGTERM the node, in this order:
 
 1. **fails readiness**, so the balancer sheds it before any socket closes;
-2. **leaves the Raft membership** — demote-then-remove, performed by the leader
+2. **leaves the Raft membership** — one voter removal, performed by the leader
    (the departing node asks it over the cluster port). Until that commits the
    fleet still counts this node toward quorum, so leaving before the drain is
    what keeps a rolling restart from shrinking the effective quorum. The leader
@@ -883,8 +883,19 @@ and exits anyway — the cluster then handles it as a dead node, which is strict
 better than a shutdown that hangs.
 
 If the departing node is itself the **leader**, leadership moves as part of the
-departure: openraft keeps a node leading while it is merely demoted to learner,
-and hands off once the second write drops it from membership entirely.
+departure: openraft keeps a removed leader replicating until the entry that
+removes it is *committed*, so the leaver drives its own departure to completion
+and then steps down. Note the asymmetry this creates — the joint entry commits
+under the joint quorum, in which the leaving leader still counts, but the uniform
+entry commits under the **survivors'** quorum, so a departing leader needs every
+remaining voter to acknowledge it.
+
+A voter's departure is a **single** membership change (`RemoveVoters`, not
+retaining the node as a learner), which openraft commits as a joint entry then a
+uniform one. It is deliberately not demote-then-remove: that shape left the
+departing node a caught-up learner still in membership between its two halves,
+and the leader's promotion sweep would vote it straight back into the quorum
+(D-59).
 
 > **Set the orchestrator's grace period to at least twice
 > `--cluster-leave-timeout`** (`terminationGracePeriodSeconds` on Kubernetes).

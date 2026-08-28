@@ -146,8 +146,8 @@ const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60);
 const BLOB_GC_FLOOR_BUDGET: Duration = Duration::from_secs(2);
 
 /// How long [`RaftNode::leave`] waits between polls while chasing a leader
-/// hint that is moving (a demote just committed but the new leader has not
-/// settled, or metrics have not caught up yet). Small relative to typical
+/// hint that is moving (a membership entry just committed but the new leader
+/// has not settled, or metrics have not caught up yet). Small relative to typical
 /// caller deadlines, so a bounded `leave` still gets several tries.
 const LEAVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -1564,11 +1564,10 @@ impl RaftNode {
     /// Best-effort, deadline-bounded departure from the cluster (issue #6).
     ///
     /// If this node is currently the leader, it evicts itself in one local
-    /// call: openraft's own model allows a leader to be a non-voter (see
-    /// `RaftState::is_leading` in the vendored openraft source — leadership
-    /// only requires *membership*, and a leader stays "leading" through the
-    /// demote-to-learner half of the departure, only actually handing off once
-    /// the *second* write drops it from membership entirely). If that local
+    /// call: a voter's departure is a single membership change, which openraft
+    /// commits under the joint quorum — in which the leaving leader still
+    /// counts — so it keeps leading until the uniform entry takes effect and
+    /// then steps down (D-59). If that local
     /// attempt fails partway (leadership moved mid-flight) — or this node was
     /// never leader to begin with — completion falls back to asking whichever
     /// node the current leader hint names, chasing it while leadership settles.
@@ -1615,10 +1614,11 @@ impl RaftNode {
         }
 
         // Why the leader retries *inside* the loop rather than once before it:
-        // if the demote commits but the removal does not, this node is a learner
-        // that is still leading, and then `current_leader` reports `None` on
-        // every node including this one — so the RPC path has nothing to chase
-        // and could never finish what the local path started.
+        // a departure commits as a joint entry then a uniform one (D-59), and if
+        // leadership moves between them this node is still a voter in a joint
+        // configuration, with `current_leader` reporting `None` on every node
+        // including this one — so the RPC path has nothing to chase and could
+        // never finish what the local path started.
         loop {
             if !self.in_membership() {
                 return Ok(LeaveOutcome::Departed);
@@ -4606,7 +4606,7 @@ mod tests {
             survivors,
             "the first eviction must land"
         );
-        let membership_after_first = n1.raft.metrics().borrow().membership_config.clone();
+        let (index_after_first, _, _) = committed_membership(&n1.raft).await;
 
         // Bounded: a second eviction that tried to submit another membership
         // change would block on the commit barrier rather than return.
@@ -4619,14 +4619,9 @@ mod tests {
         .expect("a repeated eviction is not an error");
         assert_eq!(second, EvictOutcome::Removed, "still gone is still removed");
 
+        let (index_after_second, _, _) = committed_membership(&n1.raft).await;
         assert_eq!(
-            n1.raft
-                .metrics()
-                .borrow()
-                .membership_config
-                .log_id()
-                .map(|l| l.index),
-            membership_after_first.log_id().map(|l| l.index),
+            index_after_second, index_after_first,
             "the second eviction must not append another membership entry"
         );
 
@@ -4635,15 +4630,205 @@ mod tests {
         }
     }
 
-    /// Issue #71: a half-finished departure is completed by whoever leads next.
+    /// Reads the *committed* membership inside the RaftCore loop — the log index,
+    /// the voter set and the full member set in one pass.
     ///
-    /// `evict` is demote-then-remove, two committed entries. If leadership moves
-    /// between them the departing node is a learner that is still a member, and
-    /// `leave_inner` retries against the new leader. That retry only works
-    /// because both halves no-op when already done — this is the test for that
-    /// property, and nothing else exercises a leadership change mid-departure.
+    /// Committed rather than `metrics()`/`status()` on purpose: the metrics watch
+    /// lags the state it mirrors and reports *effective* membership, so an
+    /// assertion built on it is honest diagnostics, not a guarantee — the soft
+    /// spot a reviewer flagged on #495.
+    /// Ordered `(index, members, voters)` to match
+    /// `network::committed_members_and_voters`' `(members, voters)`. Both sets
+    /// are `BTreeSet<NodeId>`, so a transposition between the two would compile
+    /// silently.
+    async fn committed_membership(
+        raft: &Raft<TypeConfig>,
+    ) -> (Option<u64>, BTreeSet<NodeId>, BTreeSet<NodeId>) {
+        raft.with_raft_state(|state| {
+            let committed = state.membership_state.committed();
+            (
+                committed.log_id().as_ref().map(|l| l.index),
+                committed
+                    .nodes()
+                    .map(|(id, _)| *id)
+                    .collect::<BTreeSet<_>>(),
+                committed.voter_ids().collect::<BTreeSet<_>>(),
+            )
+        })
+        .await
+        .expect("read committed membership")
+    }
+
+    /// Pins D-59: a voter departs by one `RemoveVoters(retain = false)`, so no
+    /// committed membership ever presents it as a learner — which is the
+    /// promotion sweep's whole criterion (#496).
+    ///
+    /// Demote-then-remove left the departing node a caught-up learner that was
+    /// still a member between its two halves, which is exactly what
+    /// `promote_ready_learners` promotes; #495 observed the sweep voting such a
+    /// node back in (`voters=[1, 2, 3]`) after a widened takeover window. The fix
+    /// is structural rather than a new interlock, so the test is too: it samples
+    /// committed membership throughout a real departure and asserts the learner
+    /// state never exists at all.
+    ///
+    /// Two assertions do the discriminating, and both distinguish the shapes
+    /// rather than merely describing the new one:
+    ///
+    /// - **no learner sample.** Under demote-then-remove the committed uniform
+    ///   config after the demote holds the leaver in `nodes()` and out of
+    ///   `voter_ids()` — a learner — across a whole further membership round
+    ///   trip, so a sampler catches it.
+    /// - **exactly two membership entries.** One `RemoveVoters` commits a joint
+    ///   then a uniform entry; demote-then-remove committed three (joint, uniform,
+    ///   then `RemoveNodes`). Deterministic, and it fails on any re-promotion,
+    ///   which costs two more.
+    ///
+    /// The sweep runs here at full speed against the **default** ceiling — no
+    /// `set_auto_voter_ceiling` pin — so it is willing to promote throughout.
+    /// That pin is what #495 had to add to this area, and removing the need for
+    /// it is the point of the change.
+    ///
+    /// It does **not** exercise the sweep's scan/gate window: the leaver is a
+    /// voter for this test's whole duration, so the sweep short-circuits on
+    /// `voters.contains(&id)` and never reaches the membership re-check. That
+    /// window needs a *learner* candidate and is pinned separately by
+    /// `the_sweep_skips_a_candidate_removed_between_its_scan_and_its_gate`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn evict_completes_from_a_new_leader_after_partial_departure() {
+    async fn a_departing_voter_is_never_a_learner_in_committed_membership() {
+        use crate::raft::network::{self, EvictOutcome, MAX_AUTO_VOTERS};
+
+        let (d1, d2, d3) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+        let n3 = RaftNode::start(config_in(&d3, 3)).await.expect("start n3");
+        n2.join_via(n1.advertise()).await.expect("n2 join");
+        n3.join_via(n1.advertise()).await.expect("n3 join");
+        let all = BTreeSet::from([1, 2, 3]);
+        assert_eq!(wait_voters(&n1, &all).await, all, "three voters to start");
+
+        let (index_before, _, _) = committed_membership(&n1.raft).await;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let learner_samples = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sweep_errors = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        // Samples committed membership without taking the gate, so it observes
+        // states the departure passes through rather than only its endpoints.
+        let sampler = {
+            let raft = n1.raft.clone();
+            let (stop, samples) = (Arc::clone(&stop), Arc::clone(&learner_samples));
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let (index, voters, members) = committed_membership(&raft).await;
+                    if members.contains(&3) && !voters.contains(&3) {
+                        samples.lock().expect("sampler lock").push(format!(
+                            "committed index={index:?} voters={voters:?} members={members:?}"
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+
+        // The sweep, run far faster than its 1 s production cadence so it lands
+        // inside the departure instead of around it.
+        let sweep = {
+            let raft = n1.raft.clone();
+            let gate = Arc::clone(&n1.membership_gate);
+            let (stop, errors) = (Arc::clone(&stop), Arc::clone(&sweep_errors));
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Err(e) =
+                        network::promote_ready_learners(&raft, &gate, MAX_AUTO_VOTERS).await
+                    {
+                        // A leadership move would make this legitimate; nothing in
+                        // this test moves leadership, so it is not filtered away.
+                        errors.lock().expect("sweep lock").push(e.to_string());
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+
+        assert_eq!(
+            network::evict(&n1.raft, &n1.membership_gate, 3)
+                .await
+                .expect("evict the departing voter"),
+            EvictOutcome::Removed
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        sampler.await.expect("sampler task");
+        sweep.await.expect("sweep task");
+
+        let samples = learner_samples.lock().expect("sampler lock").clone();
+        assert!(
+            samples.is_empty(),
+            "the departing node was a learner in committed membership — the promotion sweep's \
+             exact criterion (#496). Samples: {samples:?}"
+        );
+
+        let errors = sweep_errors.lock().expect("sweep lock").clone();
+        assert!(
+            errors.is_empty(),
+            "a departure must not make the concurrent sweep fail: {errors:?}"
+        );
+
+        let (index_after, members_after, voters_after) = committed_membership(&n1.raft).await;
+        assert!(
+            !members_after.contains(&3),
+            "the departed node must be out of committed membership: members={members_after:?}"
+        );
+        assert_eq!(
+            voters_after,
+            BTreeSet::from([1, 2]),
+            "the survivors keep the quorum"
+        );
+        assert_eq!(
+            index_after.zip(index_before).map(|(a, b)| a - b),
+            Some(2),
+            "a voter's departure is one `RemoveVoters`: a joint entry then a uniform one, and \
+             nothing else. Three means demote-then-remove is back; more means the sweep wrote \
+             entries nobody asked for. This is a *log*-index delta, exact only because nothing \
+             else writes in this fixture. before={index_before:?} after={index_after:?}"
+        );
+
+        for node in [&n1, &n2, &n3] {
+            node.shutdown().await.ok();
+        }
+    }
+
+    /// Issue #71: a departure is completed — or found already complete — by
+    /// whoever leads next, and the retry costs nothing.
+    ///
+    /// `leave_inner` retries the whole sequence against whichever node leads now,
+    /// so `evict` running against an already-departed node on a *different*
+    /// leader is the normal case, not an edge one. It must return promptly and
+    /// append nothing.
+    ///
+    /// This test used to construct a genuinely half-finished departure by calling
+    /// `demote_voter` on its own and asserting the demote half no-op'd. Under
+    /// D-59 that state does not exist: a voter departs by one
+    /// `RemoveVoters(retain = false)`, whose two entries openraft commits inside a
+    /// single `change_membership` call, so a departure is observable only as
+    /// not-started or done. The residual half-finished state — joint committed,
+    /// uniform not — needs the leader to die *between* those two internal steps,
+    /// which no public API can stage; what makes it safe is argued from
+    /// openraft's coherence rule and pinned by
+    /// `a_departing_voter_is_never_a_learner_in_committed_membership`, since in
+    /// that state the leaver is still a voter and so still invisible to the sweep.
+    ///
+    /// The auto-voter ceiling is deliberately **not** pinned here. #495 had to pin
+    /// it in this test because the sweep re-promoted the departing node during the
+    /// takeover window (#496); if that pin is ever needed again, the structural
+    /// fix has regressed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evict_completes_from_a_new_leader() {
         use crate::raft::network::{self, EvictOutcome};
 
         let (d1, d2, d3) = (
@@ -4660,38 +4845,17 @@ mod tests {
         let all = BTreeSet::from([1, 2, 3]);
         assert_eq!(wait_voters(&n1, &all).await, all, "three voters to start");
 
-        // Hold the auto-voter ceiling at the survivor count for the rest of the
-        // test. `promote_ready_learners` re-promotes every caught-up learner in
-        // the committed membership on a cadence and has no notion of a member
-        // that is *leaving* (#496), so without this the departing n3 is voted
-        // straight back in during the takeover window below — which on a loaded
-        // runner is seconds, and several sweep ticks. Pinned on all three
-        // because the sweep runs on whichever node leads. This is #55's
-        // testability surface used for its stated purpose: bound the sweep so a
-        // membership property can be tested on a three-node cluster.
-        const SURVIVORS: usize = 2;
-        for node in [&n1, &n2, &n3] {
-            node.set_auto_voter_ceiling(SURVIVORS);
-        }
-
-        // Half of the departure only: n3 is demoted but still a member.
-        network::demote_voter(&n1.raft, 3)
-            .await
-            .expect("demote the departing node");
+        assert_eq!(
+            network::evict(&n1.raft, &n1.membership_gate, 3)
+                .await
+                .expect("the departure lands on the original leader"),
+            EvictOutcome::Removed
+        );
         let survivors = BTreeSet::from([1, 2]);
         assert_eq!(
             wait_voters(&n1, &survivors).await,
             survivors,
-            "the demote must land"
-        );
-        assert!(
-            n1.raft
-                .metrics()
-                .borrow()
-                .membership_config
-                .nodes()
-                .any(|(id, _)| *id == 3),
-            "n3 must still be a member — this is the half-finished state"
+            "the departure must land before leadership moves"
         );
 
         // Move leadership without losing quorum. Killing n1 would leave one of
@@ -4721,52 +4885,33 @@ mod tests {
         };
         assert!(took_over, "n2 must take over before the retry");
 
-        // Pin the no-op guard directly, before the eviction below. Every other
-        // assertion in this test passes without it: an unguarded `demote_voter`
-        // against an already-demoted node submits a legal membership entry that
-        // commits fine, the removal still lands, and the final state is
-        // identical. The only visible difference is the entry that should never
-        // have been written — so that is what gets asserted.
-        let membership_index = |node: &RaftNode| {
-            node.raft
-                .metrics()
-                .borrow()
-                .membership_config
-                .log_id()
-                .map(|l| l.index)
-        };
-        // The demote below is only *redundant* while n3 is still a learner —
-        // and with the ceiling pinned above, that holds. Asserted rather than
-        // assumed: it is the premise the assertion after it rests on, and when
-        // the sweep broke that premise on CI the failure surfaced as the no-op
-        // guard appearing to fail, which sent #495's diagnosis to the wrong
-        // place entirely.
-        let voters_before: BTreeSet<NodeId> = n2.status().voters.into_iter().collect();
-        assert!(
-            !voters_before.contains(&3),
-            "n3 must still be the learner the demote above made it, or the demote below is not \
-             redundant and this test measures nothing: voters={voters_before:?} \
-             (a departing member being re-promoted by the sweep is #496)"
-        );
-
-        let before_redundant_demote = membership_index(&n2);
-        network::demote_voter(&n2.raft, 3)
-            .await
-            .expect("demoting an already-demoted node is not an error");
+        // The property `leave_inner`'s retry rests on, asserted on the entry it
+        // must not write. An unguarded `evict` submits a legal membership change
+        // that commits fine and leaves an identical final state — the only
+        // visible difference is the entry, so that is what gets asserted.
+        let (index_before, _, _) = committed_membership(&n2.raft).await;
+        let retried = tokio::time::timeout(
+            Duration::from_secs(1),
+            network::evict(&n2.raft, &n2.membership_gate, 3),
+        )
+        .await
+        .expect("a retried departure must return promptly, not submit and wait")
+        .expect("a retried departure is not an error");
         assert_eq!(
-            membership_index(&n2),
-            before_redundant_demote,
-            "a redundant demote must append no membership entry — without that guard, every \
-             retried departure writes to the log. voters before={voters_before:?} after={:?}",
-            n2.status().voters
-        );
-
-        assert_eq!(
-            network::evict(&n2.raft, &n2.membership_gate, 3)
-                .await
-                .expect("the new leader finishes the departure"),
+            retried,
             EvictOutcome::Removed,
-            "the demote half must no-op so the removal half can complete"
+            "already gone is still removed"
+        );
+
+        let (index_after, members_after, _) = committed_membership(&n2.raft).await;
+        assert_eq!(
+            index_after, index_before,
+            "the retry from a new leader must append no membership entry — without that guard \
+             every retried departure a flaky network produces writes to the log"
+        );
+        assert!(
+            !members_after.contains(&3),
+            "the departed node must stay out of membership: members={members_after:?}"
         );
 
         for node in [&n1, &n2] {
@@ -4792,6 +4937,82 @@ mod tests {
         for node in [&n1, &n2, &n3] {
             node.shutdown().await.ok();
         }
+    }
+
+    /// Pins the sweep's under-gate re-check at its call site (#496), which the
+    /// predicate's own unit test cannot reach.
+    ///
+    /// `promote_ready_learners` scans members, then takes the gate per candidate.
+    /// A departure can commit in that interval, and judged on the voter set alone
+    /// the vanished node still looks promotable — it is not a voter, and the set
+    /// is under the ceiling — so the sweep submits `AddVoterIds` for a node that
+    /// is no longer a learner. openraft answers `LearnerNotFound`, and `?` turns
+    /// that into a skipped tick for every candidate behind it: one departure
+    /// quietly stalling unrelated promotions.
+    ///
+    /// The interval is held open rather than raced for. The test takes the gate
+    /// itself, lets the sweep block on it *after* its scan, removes the candidate
+    /// through a direct membership change, and only then releases — so the sweep
+    /// is guaranteed to re-read a membership its scan did not see. Without the
+    /// membership half of `still_promotable` this returns `LearnerNotFound`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sweep_skips_a_candidate_removed_between_its_scan_and_its_gate() {
+        use crate::raft::network::{self, MAX_AUTO_VOTERS};
+        use openraft::ChangeMembers;
+
+        let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let n1 = RaftNode::start(config_in(&d1, 1)).await.expect("start n1");
+        n1.cluster_init().await.expect("init n1");
+        let n2 = RaftNode::start(config_in(&d2, 2)).await.expect("start n2");
+
+        // The node's own promotion loop is pinned out of the way so the only
+        // sweep in play is the one this test drives, on the gate it owns.
+        n1.set_auto_voter_ceiling(1);
+        let gate: network::MembershipGate = Arc::new(tokio::sync::Mutex::new(()));
+        network::admit(&n1.raft, &gate, 2, n2.advertise().to_string(), 1)
+            .await
+            .expect("admit as learner");
+        assert_eq!(n1.status().voters, vec![1], "n2 must be a learner");
+
+        // A replicated write proves n2 is caught up, so the sweep gets past
+        // `is_catching_up` and actually reaches the gate.
+        n1.put_imposter(imposter(8080, "sweep-race"))
+            .await
+            .expect("leader write");
+        assert!(
+            wait_config(&n2, 8080, "sweep-race").await,
+            "the learner must be caught up before the sweep will consider it"
+        );
+
+        let held = gate.lock().await;
+
+        // Passes the full ceiling, so the sweep *wants* to promote n2 and is
+        // stopped only by the membership re-check under the gate.
+        let sweep = {
+            let (raft, gate) = (n1.raft.clone(), Arc::clone(&gate));
+            tokio::spawn(async move {
+                network::promote_ready_learners(&raft, &gate, MAX_AUTO_VOTERS).await
+            })
+        };
+        // Long enough for the scan to complete and the task to park on the gate.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The departure, submitted directly rather than through `evict` — `evict`
+        // would take the gate this test is holding.
+        n1.raft
+            .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([2])), false)
+            .await
+            .expect("remove the candidate while the sweep is parked on the gate");
+
+        drop(held);
+
+        sweep.await.expect("sweep task").expect(
+            "a candidate removed between the scan and the gate must be skipped, not fail \
+                     the tick for every candidate behind it",
+        );
+
+        n1.shutdown().await.ok();
+        n2.shutdown().await.ok();
     }
 
     /// Issue #69: the voter floor guards voters, not members.
