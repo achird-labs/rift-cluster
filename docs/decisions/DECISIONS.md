@@ -970,15 +970,20 @@ mtime, so it was never a retention window for a blob that was live and then dele
 entry, such a blob was reaped on the next 60 s tick on every member — the window in #480 was 60
 seconds, not an hour.
 
-*Rejected:* a leader-published fleet-minimum applied index — it watches the wrong index (a parked
+*Rejected:* a leader-published fleet-minimum applied index — it watches the wrong index: a parked
 node's *matched* index keeps advancing while its applied index does not, so the leader's replication
-view could never see the case), and disseminating the *applied* index instead is a layering change
-this entry did not want to make. **Correction (#504):** this rejection originally also claimed such
-a channel "does not exist". That was wrong — `RaftNode::status()` already reports `last_applied` per
-node, and `rift-cluster-server`'s `fleet_health` already fans out to every member and folds each
-one's `/_cluster/health` into a rolled-up row. What is actually in the way is that blob GC lives in
-`rift-cluster` and that fan-out lives in `rift-cluster-server`, so the dependency would invert the
-two. A build, not an impossibility; tracked in **#504**. *Also rejected:*
+view could never see the case. That half stands.
+
+**Correction (#504), twice over.** This rejection originally also claimed no channel existed for
+disseminating the *applied* index. It then said the obstacle was layering — that blob GC lives in
+`rift-cluster` while the fleet fan-out lives in `rift-cluster-server`. **Both are wrong.**
+`raft::network::CLUSTER_APPLIED_PATH` (`/internal/v1/applied`) reports how far a node's state
+machine has applied, and `RaftNode` already fans it out across members for the write barrier
+(`node.rs`, issue #9) — inside `rift-cluster`, on the signed cluster port, in the same type that
+owns `spawn_blob_gc_loop`. A fleet-minimum applied index is that existing call aggregated with
+`min`, not a new mechanism. What it actually costs is a fan-out per sweep (or a cached view), a
+fail-closed rule when a member does not answer, and the learner-vs-voter question D-53 also had to
+settle. Tracked in **#504**; the rule here is unchanged pending that ruling. *Also rejected:*
 leader-only GC (followers grow without bound); accepting the gap (the window is 60 s, not an hour);
 and retaining the redb row instead of the transport blob (the fetch path reads the transport store,
 and D-51's fallback serves *referenced* rows only — a blob in this state is by definition not one).
