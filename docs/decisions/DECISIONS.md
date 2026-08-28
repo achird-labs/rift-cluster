@@ -1479,12 +1479,23 @@ The image build itself measured **478 s / 460 s**, against the 627 s the regress
 intercept. The intercept was not only the build: it also held the 36 per-scenario `compose up
 --build` context re-transfers, which this change removes as well.
 
-**The GHA layer cache is worth ~4 %** — 478 s cold, 460 s warm on the next run. Predicted, and now
-measured: `COPY . .` sits before `cargo build` in `deploy/Dockerfile`, so any source edit
-invalidates the dependency layer and the cache can only return the apt and pnpm-install layers. It
-is kept because it costs nothing and pays on a docs-shaped rebuild, not because it solves this.
+> **Corrected by D-60** (#519): the sentence below claimed the GHA layer cache was worth ~4 %. It
+> was worth nothing — the cache never ran at all, and the two numbers it rested on were runner
+> variance. Left in place, struck through, because a wrong measurement is worth seeing next to how
+> it was made.
+
+~~**The GHA layer cache is worth ~4 %** — 478 s cold, 460 s warm on the next run. Predicted, and now
+measured.~~ **Wrong, on both counts.** A third run put the build back at 478 s with a `cargo build`
+layer of 404.4 s against the first run's 404.3 s — identical, because it was cold every time. Two
+samples had been read as cold-then-warm when they were two draws from the same distribution: the
+same "one sample per side is not a rate" error this register has recorded elsewhere, made in the
+write-up of the change that recorded it. What is true is the mechanism, which was never in doubt:
+`COPY . .` sits before `cargo build` in `deploy/Dockerfile`, so any source edit invalidates the
+dependency layer. D-60 fixes both the cache and that ordering.
+
 `ignore-error=true` on the export: the cache is an optimisation and this is a required check, so a
-cache backend that is down must cost minutes, never a red merge gate.
+cache backend that is down must cost minutes, never a red merge gate. It also, as D-60 found, hid
+the fact that the cache was doing nothing.
 
 **`cluster-smoke` keeps its name and stops doing the testing.** It is a required status check
 (#104), so the name is load-bearing in `.github/rulesets/master.json`; it is now a gate job that
@@ -1630,3 +1641,84 @@ gone at the source, so that pin comes out. `evict_completes_from_a_new_leader_af
 could no longer construct its half-finished state — that state does not exist — and is rewritten as
 `evict_completes_from_a_new_leader`, which pins what #71 actually guarantees: a retried departure
 from a new leader completes and appends nothing.
+
+### D-60 — The image's dependency build is a cached layer; `type=gha` needs an action, not a shell step
+- **Status:** active
+- **Decided:** 2026-08-28
+- **Refines:** D-58
+- **Implemented by:** #519
+- **Code:** deploy/Dockerfile, .github/workflows/ci.yml
+
+Two defects, one symptom. `cluster-smoke-prepare` builds the node image in ~460 s, of which
+`cargo build --locked --release -p rift-cluster-server --features console` is **404 s** — measured
+from buildx's own step timings, not inferred. D-58 deferred this; here it is, and the deferral was
+resting on a claim that turned out to be false.
+
+**The cache was never running.** D-58 passed `--cache-from type=gha` / `--cache-to type=gha` to
+`docker buildx build` from a `run:` step. Across three runs: zero `importing cache manifest` lines,
+zero `exporting cache` lines, and a cargo layer of 404.3 s / 404.4 s — cold every time. The reason
+is not the flags but where they were used: `type=gha` authenticates with `ACTIONS_RUNTIME_TOKEN`
+and `ACTIONS_CACHE_URL`, which GitHub injects into **JS actions** and not into `run:` steps, so the
+backend could not authenticate and silently did nothing. `ignore-error=true`, added so a cache
+outage could not redden a required check, is what kept it quiet. `release.yml` had it right all
+along by using `docker/build-push-action@v6`; this is the same fix one lane over.
+
+**Nothing to cache, either.** `COPY . .` sat immediately before `cargo build`, so even a working
+cache could only ever return the apt and pnpm layers: editing a chaos scenario rebuilt all 371
+crates. `cargo-chef` splits that in two — a `planner` stage that reduces the tree to a recipe of
+manifests and lockfile, and a dependency layer keyed on that recipe rather than on the source.
+
+**What the split is worth, from the same measurements.** Of the 404 s: 144 s to reach the first
+path crate (third-party dependencies), then 260 s across the nine path crates, of which the last
+174 s is `rift-cluster` and `rift-cluster-server`. Only those two, plus `rift-cluster-base` and
+`rift-cluster-spec`, change on an ordinary PR. Everything before them belongs in the cached layer.
+
+**`vendor/rift` is copied before `cook`, and that is not incidental.** Verified rather than assumed,
+because it decides whether the split is worth 144 s or 230 s: `cargo chef prepare` writes a skeleton
+of the **workspace members only** — the recipe carries the five `crates/`+`tests/` manifests and
+nothing from `vendor/rift`, which is a separate workspace consumed as path dependencies. So `cook`
+cannot resolve without the real directory present; and with it present, `cook` compiles all five
+vendored crates as the dependencies they are (run locally against the real recipe: `rift-types`,
+`rift-http-proxy`, `rift-lint`, `rift-mock-core`, `rift-store-redis`, alongside dummy `v0.0.1`
+stand-ins for this repo's own four). Its own `COPY` layer, so a submodule pin bump invalidates the
+dependency build — correct, they are dependencies — and nothing else does.
+
+**`builder-static` is left alone.** Only `release.yml` builds it, on a tag, so the split would buy
+no PR latency and a mistake in it would surface for the first time during a release. The stage worth
+restructuring is the one every cluster-touching PR exercises.
+
+**Measured, cold then warm, on the two runs that landed this:**
+
+| | before | cold (this change) | warm |
+|---|--:|--:|--:|
+| `cargo build` layer | 404.3 s | 439 s¹ | **184.7 s** |
+| "Build the node image" step | 478 s | 581 s | **314 s** |
+| `cluster-smoke-prepare` job | ~462–507 s | 615 s | **357 s** |
+| `cluster-smoke` wall clock | 17–18.5 min | — | **~14 min** |
+
+¹ cold is the sum of `cargo install cargo-chef` (58.9 s) + `cook` (240.7 s) + `cargo build`
+(139.5 s); all three are cached on a warm run except the last. A cold build is genuinely slower,
+which is the trade: it happens once per dependency change, and the warm path is what every PR pays.
+
+`importing cache manifest` and `preparing build cache for export` appear in the log for the first
+time, and `cargo install cargo-chef`, `cargo chef prepare` and `cargo chef cook` all report `CACHED`
+on the warm run. That is the whole claim, and it is now checkable rather than asserted.
+
+**Still on the table, and measured rather than guessed: ~100 s.** The warm `cargo build` recompiles
+the five vendored crates — the log shows `rift-types`, `rift-http-proxy`, `rift-lint`,
+`rift-mock-core` and `rift-store-redis` starting at 0.4 s, i.e. *after* the third-party graph came
+back from cache but before this repo's own four. `cook` built them, so cargo should have found them
+fresh; what dirties them is the blanket `COPY . .` after `cook`, which rewrites `vendor/rift` with
+new mtimes and so busts cargo's fingerprint. Copying only what the build actually needs after that
+point (`Cargo.toml`, `Cargo.lock`, `crates/`, `tests/`) would leave the submodule untouched. Not
+done here: it trades a blanket copy that cannot omit anything for an explicit list that can, and it
+belongs behind its own run rather than bundled into the change that made it visible.
+
+*Rejected:* `crazy-max/ghaction-github-runtime` to export the tokens into the existing `run:` step —
+it works, but it adds a publisher to the supply chain to keep a shell loop that the action replaces
+outright, and `release.yml` already establishes the action as this repo's way. A `lukemathwalker/
+cargo-chef` base image instead of `cargo install cargo-chef --locked --version` — a third-party
+image on the path to the shipped binary, where the pinned crates.io install has the provenance the
+dependency graph already trusts and costs a minute only on a cold build. Dropping
+`ignore-error=true` so a broken cache is loud — it would redden a required check on a GitHub
+outage; the tell is documented at the call site instead (no import line, cargo back at ~400 s).
