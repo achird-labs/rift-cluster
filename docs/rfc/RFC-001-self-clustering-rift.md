@@ -1170,6 +1170,13 @@ Unclaimed ──try_claim──► Pending(holder, deadline) ──complete─�
 
 ### 7.6 Partition & failure decision table
 
+> **Amended by D-66** (2026-08-29, #529): the proxyOnce row's `503` applies to the **claim
+> only**. `complete`/`release` keep upstream's release-and-serve — they fail *after* the upstream
+> call has already succeeded, so a `503` there would provoke the retry that is itself the
+> duplicate. The `local` alternative ("local Pending, duplicates possible") was never built and is
+> withdrawn. A refused claim is never forwarded and is counted
+> `rift_cluster_proxy_claims_total{outcome="refused"}`.
+
 > **Aligned with ADR-001 and #9 (v3.1).** The rows below were written for the v2 gossip
 > design, in which nothing had a quorum. Since ADR-001 the **control plane is a Raft group**
 > and therefore *does* have one; only the **data plane** (flow state, sequences, journal —

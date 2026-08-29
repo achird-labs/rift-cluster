@@ -45,6 +45,12 @@ hot-path write, because the floor is reserved a block at a time: one fsync per
 
 ## The degradation table
 
+> **Amended by D-66** (2026-08-29, #529): the *proxyOnce claim* row's `503` is now what the code
+> answers. It previously forwarded to the real upstream without a claim — the outcome the row
+> exists to prevent — because the store's refusal was flattened into upstream's degrade-shaped
+> error. A refused claim is never forwarded and is counted
+> `rift_cluster_proxy_claims_total{outcome="refused"}`.
+
 Behavior per operation class when the relevant authority is unreachable.
 Defaults shown; `local` overrides exist per feature and stamp
 `Rift-Cluster-Degraded: <feature>` on every response they taint:
@@ -116,7 +122,7 @@ what an existing family counts would silently redefine a shipped runbook signal.
 | Script flow-KV read (`strong`, default) | flow owner | `503` | Scripts drive responses off this |
 | Script flow-KV read (`local`, opt-in) | — | local replica, flagged when owner down | Imposter chose speed |
 | Sequence advance | cursor owner (opt-in, D-47) | **falls back to the node-local cursor, annotated and counted** (`rift_cluster_sequence_fallbacks_total`) | Blocking all cyclic responses during a blip is worse than a possible duplicate index — the one place availability wins (D-10). Never a `503`; the counter, not the returned index, is what distinguishes a degraded answer from a healthy one |
-| proxyOnce claim | signature owner | `503` | Duplicate upstream side-effects are worse than a failed mock call |
+| proxyOnce claim | signature owner | `503`, **never forwarded**; counted `rift_cluster_proxy_claims_total{outcome="refused"}` (D-66) | Duplicate upstream side-effects are worse than a failed mock call — and with the owner unreachable the duplicate is bounded by the *outage*, not by "1 + ownership changes" |
 | Journal append / count | — (always local) | unaffected | Mergeable by design |
 | Journal / count read | all peers | merge of reachable shards + `Rift-Cluster-Partial: true` | Partial-and-says-so beats blocked |
 | Journal read **from a crash-restarted writer** | all peers | merge, still `Rift-Cluster-Partial: true` while peers cache entries of its own lost shard (#349) | The entries are gone for good, not late — a knowingly short answer must say so |

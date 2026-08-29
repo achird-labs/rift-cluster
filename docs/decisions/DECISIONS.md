@@ -2026,3 +2026,66 @@ described the code at the time and is overtaken here. The message text D-61 chos
 Rejected: the isolation-only wrap (the two `ISOLATED_REFUSAL` sites). It would leave an
 *unreachable* owner at 500 while the same three documents promise 503, and RFC-001's row is
 literally "owner-unreachable".
+
+### D-66 — A proxyOnce claim the cluster cannot serialize refuses the request (503); it never forwards
+
+- **Status:** active
+- **Decided:** 2026-08-29
+- **Amends:** RFC-001 §7.6, docs/architecture/07-verification-plane.md, docs/architecture/09-durability-failure.md, docs/architecture/12-testing.md
+- **Refines:** D-17, D-40, D-65
+- **Implemented by:** #529 (EE), rift#990 (the U-17 seam)
+- **Code:** crates/rift-cluster/src/stores/proxy.rs, vendor/rift/crates/rift-mock-core/src/recording/proxy_store.rs
+
+Chapter 9's degradation table and RFC-001 §7.6 both promise `503` for a proxyOnce claim whose
+signature owner is unreachable, for the stated reason that *"duplicate upstream side-effects are
+worse than a failed mock call"*. The code did the opposite, and four layers had to line up for it
+to happen. Upstream's `ProxyStoreError` had a single variant, `Unavailable`, documented as *"lets
+the caller degrade gracefully"*, and the engine honoured it exactly: any `Err` from `try_claim`
+became `claim_token = None` and the request was forwarded upstream without a claim. The clustered
+store collapsed **every** failure into that one word — including `owner_claim`'s D-17 isolation
+refusal, which is written to fail closed and was undone two hops later. The handler had no door
+for the status anyway: its only `Err` arm answered `502` through `upstream_error_response`, and
+`ProxyStoreError` carried no `BackendUnavailable` for `backend_error_response` to downcast. And
+chaos C10 had institutionalised the result, calling the forward *"degrade-don't-wedge"* and
+bounding origin calls at `1 + refires` — a bound defined by the length of the outage.
+
+**The rule.** In `proxyOnce` mode this store **is** the exactly-once arbiter, so any failure to
+obtain a claim answer is `ProxyStoreError::Refused(BackendUnavailable { feature: "proxyOnce" })`;
+the engine fails the request through `backend_error_response` — `503` — and does **not** call the
+upstream. That covers the D-17 isolation refusal, a liveness failure reaching the owner
+(`Timeout`/`Transport`/`Shed`), an unsettled ring after the redirect attempts, the not-ready
+states (no bridge, no applied membership, node shut down, no owner), an unresolved port identity,
+and any in-band `ClaimReply::Error`. Every refusal counts
+`rift_cluster_proxy_claims_total{outcome="refused"}`.
+
+**Why the whole claim path, and not D-65's 503/500 split.** At a claim there is no request payload
+that can be at fault — the input is `(port, signature)`. The two paths that are not cluster state
+(a reply that fails to decode, i.e. version skew mid-upgrade; the owner's own `proxy_recorded`
+read failing) are transient from the client's seat, and no test or runbook distinguishes them.
+Splitting them would cost a second seam variant to serve a distinction nobody can act on.
+
+**What keeps its behaviour, deliberately.** `ClaimOutcome::InFlight` still forwards without
+recording: a claim *was* serialized there, so that duplicate is bounded by the one racing window
+and is by design (Ch. 12's C11 row). `complete`/`release` keep upstream's release-and-serve — they
+fail *after* the upstream call succeeded, and a `503` there would provoke the retry that is itself
+the duplicate; this refines RFC-001 §7.6, whose row reads "claim/complete/release". `proxyAlways`
+and `proxyTransparent` gate nothing and refuse nothing — making them fail closed would take an
+imposter offline for a partition that costs it nothing. `local` mode (§7.6's *"local Pending,
+duplicates possible"*) was never built and is withdrawn: no requirement exists, and D-10's
+availability-wins exception is sequences alone (D-47).
+
+**The seam is upstream's, not ours (U-17, rift#990).** `ProxyStoreError` gains `Refused` and
+becomes `#[non_exhaustive]`; `Unavailable` keeps its meaning, its degrade, and its test. The
+engine's `Err` arm splits, and both proxy-leg response arms — the stub proxy and `defaultForward`
+— share one helper that answers `BackendUnavailable` with `503` and everything else with the
+`502` it always had. A refusal is not logged as an upstream failure: none was called, and saying
+so would send an operator to the wrong system. This had to be upstream because both the
+degrade decision and the status choice are engine-side; a downstream store cannot reach either.
+
+*Rejected:* keeping the degrade and correcting the docs to say *"forwards without recording"*.
+The distinction that settles it is `InFlight` vs `Unavailable` — the first forwards while the
+owner **is** serializing, so the duplicate is bounded by one racing window; the second forwards
+while **nobody** is, so it is bounded by the outage. Only the first is a trade worth documenting.
+*Rejected:* a `fails_closed()` capability flag on the trait instead of an error variant — it
+describes the store rather than the failure, and the same store must not refuse for `proxyAlways`;
+the 503 door needs a typed cause regardless, which the variant already carries.

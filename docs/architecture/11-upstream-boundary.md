@@ -39,6 +39,7 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 | U-14 | — | `extensions::template_fn` — template-function registration | template read parity for datasets (RFC-005 §3.8, §6.2) | **queued** (#291) |
 | U-15 | — | `extensions::state_ops` — declarative state operations | `_rift.stateOps` (RFC-005 §3.7, §6.1); landed by #418 | merged |
 | U-16 | rift#910/#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once (`StubPublication`, `publishes_stubs()`) | clustered `proxyOnce` (#226, Chapter 7) | merged |
+| U-17 | rift#990 | `ProxyStoreError::Refused(BackendUnavailable)` (+ `#[non_exhaustive]`) and the proxy-leg 503 door — a store that *arbitrates* exactly-once can refuse a claim instead of being degraded around | clustered `proxyOnce` fails closed at the client (#529, D-66) | merged |
 
 The pattern in U-8 deserves a sentence: cluster backends *annotate* the
 request task-locally ("degraded: kv-adopt", "revision: 421"), and a

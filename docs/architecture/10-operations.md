@@ -126,6 +126,12 @@ first group, and `scripts/check-observability-families.sh` enforces that.
 `rift_cluster_source_scheduler_corrupt_rows`.
 
 *Registered by #470, alert threshold still to be chosen:*
+`rift_cluster_proxy_claims_total{outcome="refused"}` is the proxyOnce reading of the
+same condition: a claim the cluster could not serialize, answered `503` and **not**
+forwarded to the upstream (D-66). Unlike the gauge it is a counter of *refused
+requests*, so it measures the blast radius of a partition on proxy traffic rather
+than its duration.
+
 `rift_cluster_isolated` (gauge, `1` while this node cannot see the quorum and is
 refusing owner-side operations — proxyOnce claims under D-40, flow-KV owner
 writes and strong reads under D-17). This is the *condition*, not a symptom, and

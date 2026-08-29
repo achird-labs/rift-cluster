@@ -31,8 +31,8 @@ use rift_cluster::{
     RecordedStubPlacement, TenantId,
 };
 use rift_cluster_base::seams::{
-    ClaimOutcome, ClaimToken, ImposterConfig, ProxyRecordingStore, ProxyStoreError,
-    RecordedResponse, RequestSignature, Stub,
+    BackendUnavailable, ClaimOutcome, ClaimToken, ImposterConfig, ProxyRecordingStore,
+    ProxyStoreError, RecordedResponse, RequestSignature, Stub,
 };
 use tempfile::TempDir;
 
@@ -629,6 +629,8 @@ async fn publication_failure_releases_claim_and_is_retryable() {
 // ---------------------------------------------------------------------------
 // Pins D-40: Pending is owner-local and dies with its owner; the signature is re-claimable at
 // the new owner once membership settles.
+// Pins D-66: while it settles, the new owner *refuses* — the re-claim loop below accepts only
+// `Refused`, so a regression to the old degrade fails here rather than looking like patience.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn owner_death_while_pending_allows_reclaim_after_membership_settles() {
     let _lock = TEST_LOCK.lock().await;
@@ -667,11 +669,13 @@ async fn owner_death_while_pending_allows_reclaim_after_membership_settles() {
         match try_claim_raw(&store_a, TEST_PORT, &s).await {
             Ok(ClaimOutcome::Claimed(token)) => break token,
             Ok(ClaimOutcome::AlreadyRecorded) => panic!("nothing was recorded yet"),
-            Ok(ClaimOutcome::InFlight) | Err(_) => {
-                // The new owner may briefly refuse while isolated/settling.
+            Ok(ClaimOutcome::InFlight) | Err(ProxyStoreError::Refused(_)) => {
+                // The new owner may briefly refuse while isolated/settling — but only with the
+                // refusing error (D-66). Any other `Err` shape falls through to the panic below.
                 assert!(Instant::now() < deadline, "signature never re-claimable");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            Err(other) => panic!("a settling owner must refuse, not degrade: {other:?}"),
         }
     };
     complete_recorded(&store_a, TEST_PORT, &s, token, "after-handoff")
@@ -975,6 +979,8 @@ async fn proxy_always_merges_responses_fleet_wide() {
 // ---------------------------------------------------------------------------
 // Before bind, the store fails loud — no silent local fallback.
 // ---------------------------------------------------------------------------
+/// Pins D-66: an unbound store refuses, so a node that has not joined yet answers 503 rather
+/// than proxying to the real upstream un-arbitrated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unbound_store_fails_loud() {
     let net = ProxyNet::new();
@@ -983,8 +989,168 @@ async fn unbound_store_fails_loud() {
     let outcome = tokio::task::spawn_blocking(move || store.try_claim(TEST_PORT, &s))
         .await
         .expect("join");
+    // Pins D-66: not merely "an error" — the *refusing* error. A bare `is_err()` would pass on
+    // the old `Unavailable`, which the engine answers by forwarding to the upstream without a
+    // claim; that is exactly the behaviour this issue exists to remove.
     assert!(
-        outcome.is_err(),
-        "an unbound store must answer Unavailable, not pretend: {outcome:?}"
+        matches!(outcome, Err(ProxyStoreError::Refused(_))),
+        "an unbound store must refuse the claim, not degrade: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-66 — the cluster cannot serialize the claim, so the request is refused
+// (503 at the data plane), never forwarded.
+// ---------------------------------------------------------------------------
+
+/// Extract the refusal, asserting its shape. The `feature` is what the data plane puts in the
+/// 503 body's `feature` field, so it is part of the contract, not a log string.
+fn expect_refusal(
+    outcome: Result<ClaimOutcome, ProxyStoreError>,
+    what: &str,
+) -> BackendUnavailable {
+    match outcome {
+        Err(ProxyStoreError::Refused(b)) => {
+            assert_eq!(
+                b.feature, "proxyOnce",
+                "{what}: the 503 must name the feature that refused"
+            );
+            b
+        }
+        other => {
+            panic!("{what}: must refuse the claim (D-66), not degrade into a forward: {other:?}")
+        }
+    }
+}
+
+/// Pins D-66 on the D-17 isolation refusal. `owner_claim` has always failed closed while
+/// partitioned — it returns `ClaimReply::Error { "owner is isolated" }` — but that refusal was
+/// flattened to `ProxyStoreError::Unavailable` at the store face, which upstream's engine answers
+/// by **forwarding to the real upstream without a claim**. With nothing serializing claims, every
+/// request for the duration of the partition would reach the upstream: the unbounded duplicate
+/// Ch. 9's row exists to prevent. It must now carry `BackendUnavailable`, which the data plane
+/// answers 503.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_isolated_owner_refuses_the_claim() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(3, Duration::from_secs(30)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+
+    // A signature this node owns, so the claim is answered locally by `owner_claim` — the
+    // isolation gate under test — rather than forwarded.
+    let owner_ix = 0;
+    let s = sig_owned_by(&members, TEST_PORT, owner_ix);
+
+    // Partition it. Both peers go, so the owner loses quorum *and* has no leader left to hear:
+    // a follower that can still see a leader never isolates.
+    for (ix, member) in members.iter().enumerate() {
+        if ix != owner_ix {
+            member.node.shutdown().await.expect("shutdown peer");
+        }
+    }
+    let deadline = Instant::now() + CONVERGE;
+    while !members[owner_ix].node.is_isolated() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        members[owner_ix].node.is_isolated(),
+        "an owner that lost its quorum must report isolated"
+    );
+
+    let before = counter("rift_cluster_proxy_claims_total", ("outcome", "refused"));
+    let refusal = expect_refusal(
+        try_claim_raw(&store_on(&members[owner_ix]), TEST_PORT, &s).await,
+        "an isolated owner",
+    );
+    assert!(
+        refusal.detail.contains("isolated"),
+        "the refusal must name isolation rather than some other failure — a bare `Refused` \
+         would pass on a timeout or a decode error alike: {}",
+        refusal.detail
+    );
+    assert_eq!(
+        counter("rift_cluster_proxy_claims_total", ("outcome", "refused")) - before,
+        1,
+        "every refusal is counted exactly once — the operator's reading of this condition"
+    );
+}
+
+/// Pins D-66 on the row RFC-001 §7.6 names outright — *owner-unreachable* — and on Ch. 9's
+/// "fast-fail". The owner dies without leaving, so the ring still names it and a survivor
+/// forwards into a corpse; that liveness failure must refuse rather than degrade, and must do so
+/// inside the claim deadline rather than hanging the data plane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_through_a_survivor_of_a_dead_owner_is_refused_fast() {
+    let _lock = TEST_LOCK.lock().await;
+    let mut members = proxy_cluster_of(3, Duration::from_secs(30)).await;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+
+    // Owned by member 2, claimed from member 0: an RPC claim, not a local one.
+    let s = sig_owned_by(&members, TEST_PORT, 2);
+    let owner = members.remove(2);
+    owner.node.shutdown().await.ok();
+
+    // Two of three remain, so the survivors keep quorum and are *not* isolated: the only thing
+    // wrong is that the owner is unreachable. That is the row under test.
+    assert!(
+        !members[0].node.is_isolated(),
+        "the survivor must not be isolated — otherwise this test proves the isolation row again"
+    );
+
+    let started = Instant::now();
+    let refusal = expect_refusal(
+        try_claim_raw(&store_on(&members[0]), TEST_PORT, &s).await,
+        "a survivor of a dead owner",
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "Ch. 9 promises a *fast-fail* 503; this took {elapsed:?}"
+    );
+    assert!(
+        !refusal.detail.is_empty(),
+        "the refusal must carry the reason into the 503 body — the runbook signal D-61 chose"
+    );
+}
+
+/// Pins D-66's scope: only `proxyOnce` arbitrates, so only `proxyOnce` refuses. `proxyAlways`
+/// and `proxyTransparent` never gate — their claim is a formality — and making them fail closed
+/// would take a whole imposter offline for a partition that costs them nothing. An
+/// implementation that refused in `try_claim` before consulting the mode passes every other test
+/// in this file and fails this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_always_never_refuses_on_an_isolated_owner() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = proxy_cluster_of(3, Duration::from_secs(30)).await;
+    let always_port = TEST_PORT + 1;
+    install_imposter(&members, TEST_PORT, "proxyOnce").await;
+    install_imposter(&members, always_port, "proxyAlways").await;
+
+    let owner_ix = 0;
+    let once_sig = sig_owned_by(&members, TEST_PORT, owner_ix);
+    for (ix, member) in members.iter().enumerate() {
+        if ix != owner_ix {
+            member.node.shutdown().await.expect("shutdown peer");
+        }
+    }
+    let deadline = Instant::now() + CONVERGE;
+    while !members[owner_ix].node.is_isolated() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(members[owner_ix].node.is_isolated(), "owner must isolate");
+
+    let store = store_on(&members[owner_ix]);
+    // The control: on the same node, in the same partition, proxyOnce refuses.
+    expect_refusal(
+        try_claim_raw(&store, TEST_PORT, &once_sig).await,
+        "proxyOnce on the isolated owner",
+    );
+    // The claim under test: proxyAlways grants regardless.
+    assert!(
+        matches!(
+            try_claim_raw(&store, always_port, &sig("/always-partitioned")).await,
+            Ok(ClaimOutcome::Claimed(_))
+        ),
+        "proxyAlways gates nothing, so a partition must not stop it recording"
     );
 }

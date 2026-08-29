@@ -28,8 +28,8 @@ code = ["crates/rift-cluster/src/raft/**"]
 
 ["docs/rfc/RFC-001-self-clustering-rift.md"]
 status = "amended"
-verified_sha = ""
-verified_on = ""
+verified_sha = "e0df0c376"
+verified_on = "2026-08-29"
 code = ["crates/rift-cluster/src/**"]
 note = "v3.2. §7.1/§7.2/§7.4 superseded by D-15 (gossip → Raft); Appendix C is now a pointer to the register."
 
@@ -91,14 +91,14 @@ code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/store
 
 ["docs/architecture/06-flow-state.md"]
 status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "e0df0c376"
+verified_on = "2026-08-29"
 code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/flow_config.rs", "crates/rift-cluster/src/stores/shard.rs", "crates/rift-cluster/src/raft/ring.rs"]
 
 ["docs/architecture/07-verification-plane.md"]
 status = "current"
-verified_sha = "9e0433dd0"
-verified_on = "2026-08-25"
+verified_sha = "e0df0c376"
+verified_on = "2026-08-29"
 code = ["crates/rift-cluster/src/stores/journal.rs", "crates/rift-cluster/src/stores/journal_net.rs", "crates/rift-cluster/src/stores/journal_seq.rs", "crates/rift-cluster/src/stores/proxy.rs"]
 
 ["docs/architecture/08-tenancy-security.md"]
@@ -109,8 +109,8 @@ code = ["crates/rift-cluster-server/src/authz.rs", "crates/rift-cluster-server/s
 
 ["docs/architecture/09-durability-failure.md"]
 status = "current"
-verified_sha = "1a7b52b78"
-verified_on = "2026-08-26"
+verified_sha = "e0df0c376"
+verified_on = "2026-08-29"
 code = ["crates/rift-cluster/src/raft/store.rs", "crates/rift-cluster/src/stores/flow.rs"]
 
 ["docs/architecture/10-operations.md"]
@@ -121,14 +121,14 @@ code = ["crates/rift-cluster-server/src/cli.rs", "crates/rift-cluster-server/src
 
 ["docs/architecture/11-upstream-boundary.md"]
 status = "current"
-verified_sha = "9811cf076"
-verified_on = "2026-08-25"
+verified_sha = "e0df0c376"
+verified_on = "2026-08-29"
 code = ["crates/rift-cluster-base/**", "Cargo.toml"]
 
 ["docs/architecture/12-testing.md"]
 status = "current"
-verified_sha = "3c167428a"
-verified_on = "2026-08-25"
+verified_sha = "e0df0c376"
+verified_on = "2026-08-29"
 code = ["tests/cluster-chaos/**", "crates/rift-cluster/tests/**"]
 
 ["docs/architecture/13-front-door-and-sources.md"]
