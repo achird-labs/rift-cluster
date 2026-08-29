@@ -47,6 +47,35 @@ use crate::rpc::{Router, RpcError};
 /// cycled response from a fleet-ordered one (D-10's flagged degradation).
 const ANNOTATION: &str = "cluster.sequence";
 
+/// What answered one cursor decision. Mirrors `rift_cluster_flow_reads_total`'s
+/// `path` label, and is the closed set behind
+/// `rift_cluster_sequence_decisions_total{path}` — so the metric's label values
+/// cannot drift from the paths [`ClusteredSequencer::route`] actually has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionPath {
+    /// This node owns the cursor; served from its own memory, no hop.
+    Owner,
+    /// One RPC to the owner — the whole cost of `owner` mode on a non-owner.
+    Forward,
+    /// The imposter never opted in, so the node cycles its own cursor (D-10's
+    /// default). Not a degradation.
+    Local,
+    /// `owner` mode, but the fleet could not answer: cycled locally and
+    /// annotated (D-10). Also counted by `rift_cluster_sequence_fallbacks_total`.
+    Fallback,
+}
+
+impl DecisionPath {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Forward => "forward",
+            Self::Local => "local",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
 /// Wire path for an advancing cursor read.
 const NEXT_PATH: &str = "/_cluster/seq/next";
 /// Wire path for a non-advancing cursor read.
@@ -295,27 +324,45 @@ impl ClusteredSequencer {
         advance: bool,
     ) -> usize {
         let cursor_key = Self::key_of(&key);
-        if self.registry.mode(key.port) != SequencingMode::Owner {
-            return self.locally(&cursor_key, response_count, repeats, advance);
-        }
-        match self.owner_index(&cursor_key, response_count, repeats, advance) {
-            Some(index) => index,
-            None => {
-                crate::metrics::sequence_fallback();
-                rift_cluster_base::seams::annotate(ANNOTATION, "local-fallback".to_owned());
-                self.locally(&cursor_key, response_count, repeats, advance)
+        let (index, path) = if self.registry.mode(key.port) != SequencingMode::Owner {
+            (
+                self.locally(&cursor_key, response_count, repeats, advance),
+                DecisionPath::Local,
+            )
+        } else {
+            match self.owner_index(&cursor_key, response_count, repeats, advance) {
+                Some(answer) => answer,
+                None => {
+                    crate::metrics::sequence_fallback();
+                    rift_cluster_base::seams::annotate(ANNOTATION, "local-fallback".to_owned());
+                    (
+                        self.locally(&cursor_key, response_count, repeats, advance),
+                        DecisionPath::Fallback,
+                    )
+                }
             }
-        }
+        };
+        // Counted here rather than in the branches so every decision is counted
+        // exactly once, whichever way it was answered — that is the property
+        // D-63's pin reads back.
+        crate::metrics::sequence_decision(Self::op_of(advance), path.as_str());
+        index
     }
 
-    /// The owner's answer, or `None` when the fleet could not give one.
+    /// The `op` label: which of the seam's two reads this decision was.
+    fn op_of(advance: bool) -> &'static str {
+        if advance { "next" } else { "peek" }
+    }
+
+    /// The owner's answer and how it was reached, or `None` when the fleet
+    /// could not give one.
     fn owner_index(
         &self,
         cursor_key: &CursorKey,
         response_count: usize,
         repeats: &[u32],
         advance: bool,
-    ) -> Option<usize> {
+    ) -> Option<(usize, DecisionPath)> {
         let bridge = self.bridge.get()?;
         let (node, ring) = self.view()?;
         let ring_key = wire_key(cursor_key);
@@ -327,7 +374,10 @@ impl ClusteredSequencer {
             if node.is_isolated() {
                 return None;
             }
-            return Some(self.locally(cursor_key, response_count, repeats, advance));
+            return Some((
+                self.locally(cursor_key, response_count, repeats, advance),
+                DecisionPath::Owner,
+            ));
         }
 
         let req = SeqReq {
@@ -353,7 +403,9 @@ impl ClusteredSequencer {
             .ok()?;
 
         match reply {
-            SeqReply::Index { index } if index < response_count => Some(index),
+            SeqReply::Index { index } if index < response_count => {
+                Some((index, DecisionPath::Forward))
+            }
             // Anything else is the fleet declining to answer: fenced, misrouted,
             // an isolated owner, or an index the seam's contract forbids. All of
             // them mean "cycle locally and say so" rather than fail the request.

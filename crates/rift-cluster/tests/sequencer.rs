@@ -192,6 +192,38 @@ fn counter(name: &str) -> u64 {
         .sum()
 }
 
+/// One label set of `rift_cluster_sequence_decisions_total`. Unlike [`counter`]
+/// this does *not* sum across label sets — the whole point of the pin below is
+/// which path answered, so collapsing them would make it unfalsifiable.
+fn decisions(op: &str, path: &str) -> u64 {
+    prometheus::gather()
+        .into_iter()
+        .filter(|family| family.get_name() == "rift_cluster_sequence_decisions_total")
+        .flat_map(|family| family.get_metric().to_owned())
+        .filter(|metric| {
+            let labelled = |name: &str| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|l| l.get_name() == name)
+                    .map(|l| l.get_value().to_owned())
+            };
+            labelled("op").as_deref() == Some(op) && labelled("path").as_deref() == Some(path)
+        })
+        .map(|metric| metric.get_counter().get_value() as u64)
+        .sum()
+}
+
+/// Every `op="peek"` label set, summed — the assertion "the serving path never
+/// peeks" has to hold for paths that do not exist yet, so it cannot rely on
+/// enumerating the ones that do.
+fn peeks() -> u64 {
+    ["owner", "forward", "local", "fallback"]
+        .iter()
+        .map(|path| decisions("peek", path))
+        .sum()
+}
+
 /// The feature itself: three nodes advancing the same stub in turn see one
 /// cursor, not three. Before #466 each node cycled its own copy, so a
 /// round-robin LB served `A, A, A` for `responses: [A, B, C]`.
@@ -331,6 +363,141 @@ async fn a_cursor_is_not_replicated_so_a_fresh_owner_starts_at_zero() {
 /// member to `local` for the duration of the read is the recipe
 /// `a_cursor_is_not_replicated_so_a_fresh_owner_starts_at_zero` already uses to ask a member
 /// about its own copy.
+/// Pins D-63: one `next` per decision, no `peek`s, and the hop is paid by
+/// exactly the non-owners.
+///
+/// RFC-001 §11.3 used to budget "one `next` plus up to a few `peek`s per
+/// request", assuming a response body could interpolate the cursor without
+/// advancing it. No such path exists — upstream reaches `peek` from
+/// `get_response_preview` alone, which backs the debug preview — so the real
+/// cost is one `next` per decision and nothing else. That is a *cheaper* claim
+/// than the RFC's, which is exactly why it needs pinning: an amplification
+/// introduced later would still be inside the documented budget and would slip
+/// through unnoticed.
+///
+/// The `forward` share is what makes this discriminating. Ownership is HRW over
+/// a fixed membership, so one of the three members owns the key and a
+/// round-robin spray puts a third of the decisions on it; assert `2/3` exactly
+/// rather than a bound, because a bound also passes on a sequencer that
+/// forwards everything, or nothing.
+#[tokio::test]
+async fn owner_mode_costs_exactly_one_next_per_decision_and_never_peeks() {
+    let _lock = TEST_LOCK.lock().await;
+    let (members, _dirs) = cluster_of(3, "owner").await;
+
+    const DECISIONS: usize = 9;
+    let before = (
+        decisions("next", "owner"),
+        decisions("next", "forward"),
+        decisions("next", "local"),
+        decisions("next", "fallback"),
+        peeks(),
+    );
+
+    for round in 0..DECISIONS {
+        next_on(
+            &members[round % members.len()].seq,
+            "stub-cost",
+            3,
+            &[1, 1, 1],
+        )
+        .await;
+    }
+
+    let owner = decisions("next", "owner") - before.0;
+    let forward = decisions("next", "forward") - before.1;
+    let local = decisions("next", "local") - before.2;
+    let fallback = decisions("next", "fallback") - before.3;
+
+    assert_eq!(
+        owner + forward + local + fallback,
+        DECISIONS as u64,
+        "each decision must be counted exactly once: there is no amplification \
+         to measure, and no decision may go uncounted"
+    );
+    assert_eq!(
+        peeks() - before.4,
+        0,
+        "the serving path must never peek: upstream reaches `peek` only from \
+         `get_response_preview`, so movement here means a second, undocumented \
+         caller now pays an owner hop per reference"
+    );
+    assert_eq!(
+        (local, fallback),
+        (0, 0),
+        "a healthy fleet in `owner` mode answers every decision from the ring; \
+         a local or fallback decision here means the indices were not \
+         fleet-ordered"
+    );
+    assert_eq!(
+        (owner, forward),
+        (DECISIONS as u64 / 3, DECISIONS as u64 * 2 / 3),
+        "exactly one of three members owns the key, so a round-robin spray pays \
+         the owner hop on two decisions in three — one RPC each, never more"
+    );
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
+/// The measured owner-hop cost RFC-001 §11.3 owes, printed rather than asserted.
+///
+/// Ignored by default: 2 000 real decisions over localhost TCP is far too slow
+/// for the gate, and a latency *assertion* on CI's shared 2-vCPU runners would
+/// be a flake generator rather than a guardrail. The repo's precedent for a
+/// measured claim is an ignored test or a chaos scenario that prints (C10, C29);
+/// there is no `benches/` in the workspace, and criterion would not change the
+/// number.
+///
+/// Run with
+/// `cargo test -p rift-cluster --test sequencer -- --ignored --nocapture`
+/// and copy the figure into the RFC-001 §11.3 callout.
+#[tokio::test]
+#[ignore = "prints a measured figure; 2 000 real decisions is too slow for the gate"]
+async fn owner_hop_latency_figure() {
+    let _lock = TEST_LOCK.lock().await;
+    let (members, _dirs) = cluster_of(3, "owner").await;
+
+    // Which member owns the key is HRW over a private wire key the test cannot
+    // recompute (`sequencer.rs`'s `wire_key`), so find it by observation: the
+    // one whose decision does not move the `forward` counter is the owner.
+    let mut found = None;
+    for (i, member) in members.iter().enumerate() {
+        let before = decisions("next", "forward");
+        next_on(&member.seq, "stub-latency", 3, &[1, 1, 1]).await;
+        if decisions("next", "forward") == before {
+            found = Some(i);
+            break;
+        }
+    }
+    let owner_idx = found.expect("one of three members owns the key");
+    let non_owner_idx = (owner_idx + 1) % members.len();
+
+    const SAMPLES: usize = 1_000;
+    for (label, idx) in [
+        ("owner (no hop)", owner_idx),
+        ("non-owner (one RPC)", non_owner_idx),
+    ] {
+        let mut micros = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let start = Instant::now();
+            next_on(&members[idx].seq, "stub-latency", 3, &[1, 1, 1]).await;
+            micros.push(start.elapsed().as_micros() as u64);
+        }
+        micros.sort_unstable();
+        println!(
+            "sequence next, {label}: p50 {} us, p99 {} us over {SAMPLES} decisions",
+            micros[SAMPLES / 2],
+            micros[SAMPLES * 99 / 100],
+        );
+    }
+
+    for member in &members {
+        member.node.shutdown().await.expect("shutdown");
+    }
+}
+
 async fn local_cursors(members: &[Member], stub: &'static str) -> Vec<usize> {
     let mut cursors = Vec::new();
     for m in members {

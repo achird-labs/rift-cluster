@@ -1826,3 +1826,68 @@ Restoring mtimes after the copy — there is no declarative way to do it, and a 
 a second thing to keep correct. Copying `docs/api` alone rather than `docs/` — narrower, but it
 makes the next `include_str!` into `docs/` a build break for no gain; after `.dockerignore` strips
 `**/*.md`, the whole directory is three files.
+||||||| parent of 0614896 (test(sequencing): pin the real RPC cost — one `next` per decision, no peeks (D-63))
+### D-63 — Sequencing costs one `next` per decision and never peeks; there is no amplification, and no cache
+
+- **Status:** active
+- **Decided:** 2026-08-28
+- **Amends:** RFC-001 §11.3
+- **Refines:** D-47
+- **Implemented by:** #476
+- **Code:** crates/rift-cluster/src/stores/sequencer.rs, crates/rift-cluster/src/metrics.rs
+
+RFC-001 §11.3 budgeted **"one `next` plus up to a few `peek`s per request"** and reasoned from
+there to a mitigation: an optional ≈ 50 ms peek cache on the owner, to bound cursor-store work
+under a peek-heavy template. D-47 carried the claim forward and deferred the measurement to #476.
+
+**The premise is false. There is no template path that peeks.** Verified against source at
+`3c0ca47` / vendor `9fb5a1a`, in both directions:
+
+- `ResponseSequencer::peek` reaches the seam from exactly one engine site — `peek_stub_response`
+  (`vendor/rift/crates/rift-mock-core/src/imposter/core/responses.rs:22`), whose only caller is
+  `get_response_preview` (:102), whose only caller is the **debug preview** response
+  (`imposter/handler.rs:2046`). It is not on any serving path.
+- The serving path is `next_stub_response` → `via_sequencer(.., advance: true)`
+  (`responses.rs:11`, :33), reached from `handler.rs:1025`: **one `next` per matched stub with
+  responses, and nothing else.**
+- No template variable exposes the cursor index, so the body that §11.3 imagined — one that
+  interpolates the sequence several times — cannot be written today.
+
+So the honest cost is **one `next` RPC per decision on a non-owner, zero on the owner, zero
+`peek`s**. That is *cheaper* than the documented budget, which is exactly why it is worth pinning
+rather than quietly correcting: an amplification introduced later would still sit inside the
+RFC's stated envelope and would pass unnoticed.
+
+**The peek cache is withdrawn.** It was a mitigation for a cost that does not exist, and it is not
+free — a cursor read served from a 50 ms cache is a *stale* read of the one structure the whole
+owner-routing design exists to keep authoritative. If a peeking serving path is ever introduced, it
+is a new decision with its own numbers, not a licence already granted here.
+
+**Unchanged:** the RPC fan-out is still inherent, and a caller-side cache is still refused — that
+half of §11.3 was reasoning about `next`, and it survives intact. A non-owner cache would
+reintroduce precisely the stale read owner routing prevents (D-47, D-9).
+
+**Observability.** `rift_cluster_sequence_decisions_total{op,path}` counts every decision exactly
+once, `op` ∈ `next` / `peek` and `path` ∈ `owner` / `forward` / `local` / `fallback` — mirroring
+`rift_cluster_flow_reads_total{path}` (#120) so the two stateful ops read the same way. The label
+values are a closed Rust enum (`DecisionPath`) rather than free text, so they cannot drift from the
+paths `route` actually has. `rift_cluster_sequence_fallbacks_total` is unchanged and still the
+degradation signal; `path="fallback"` is the same event seen through the new metric.
+
+**Measured** (the figure §11.3 owed), from `owner_hop_latency_figure`, 1 000 decisions each over
+loopback TCP on a 3-member in-process fleet, Apple M4 / 10 cores, debug build:
+
+| | p50 | p99 |
+|---|--:|--:|
+| owner, no hop | 16–23 µs | 46–59 µs |
+| non-owner, one RPC | 181 µs | 374 µs |
+
+The owner hop costs ~160 µs on loopback, comfortably inside §11.3's "one LAN RPC
+(sub-millisecond typical) per op". This is a *floor*, not a production figure: a real LAN adds its
+own round trip, and a debug build is not a release one. It is recorded to give the RFC's cost model
+a number rather than a citation, and the figure is reproduced by running the ignored test, not
+asserted — a latency assertion on CI's shared 2-vCPU runners would be a flake generator.
+
+Rejected: writing the bench §11.3 asked for. `n = 1, 4, 16 sequence references per response` cannot
+be constructed, because a response cannot reference the sequence at all. Building the surface in
+order to measure it would be inventing the cost the RFC feared.
