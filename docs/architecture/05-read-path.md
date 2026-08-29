@@ -123,9 +123,16 @@ table in Chapter 9):
   owner-side reads rather than answering from a copy a healed majority may
   already disagree with (D-17, the isolated-owner rule, Chapter 6). It applies
   to the local owner branch and to a forwarded owner-read alike, and the refusal
-  is `RpcError::Unavailable` — so it reaches the caller as the same `503` an
-  unreachable owner produces, for a different reason. `local` reads never enter
-  that branch and stay available (D-10).
+  is `RpcError::Unavailable` — which the store carries out as
+  `BackendUnavailable`, so it reaches the caller as the same `503` an
+  unreachable owner produces, for a different reason (D-65). `local` reads never
+  enter that branch and stay available (D-10).
+
+> **Amended by D-65** (2026-08-28, #522): the sentence above was true of the cluster port
+> only until #522 — on the data plane the store flattened the typed error and both cases
+> answered 500. It now holds on the scenario paths (match gate, transition, debug preview);
+> the template and script doors erase the type upstream and still answer as they did
+> (Chapter 9, the paragraph under the degradation table).
 
 ## Admin reads
 

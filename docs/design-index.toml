@@ -85,8 +85,8 @@ code = ["crates/rift-cluster/src/control.rs", "crates/rift-cluster/src/raft/node
 
 ["docs/architecture/05-read-path.md"]
 status = "current"
-verified_sha = "3c167428a"
-verified_on = "2026-08-25"
+verified_sha = "98bcbfc09"
+verified_on = "2026-08-28"
 code = ["crates/rift-cluster/src/stores/flow.rs", "crates/rift-cluster/src/stores/shard.rs"]
 
 ["docs/architecture/06-flow-state.md"]
