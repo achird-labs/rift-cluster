@@ -67,23 +67,33 @@ the *condition* rather than its symptoms: a read-heavy workload can trip the
 isolated-owner rule continuously and move none of the counters above.
 
 The **message** is the same refusal wherever the read entered the cluster. A
-`strong` read forwarded to an isolated owner fails with `flow store: unavailable:
-flow store: owner is isolated from the cluster` through any node (D-61): the
-forwarding hop relays the owner's own error instead of restating it as its own
-transport failure. Before #471 the same read reported `flow store: transport
+`strong` read forwarded to an isolated owner fails with `backend unavailable:
+flowState: unavailable: flow store: owner is isolated from the cluster` through
+any node (D-61, wrapped per D-65 — `owner is isolated from the cluster` is the
+stable substring to grep for): the forwarding hop relays the owner's own error
+instead of restating it as its own transport failure. Before #471 the same read reported `flow store: transport
 failure: <authority> unreachable (<addr>: …)`, which pointed on-call at the
 network for a peer that was up and had answered — the reason survived only as a
 substring of a sentence that contradicted it.
 
-The **status** does not change, and it is worth knowing which one you get. The
-store hands the engine a bare `anyhow::Error`, so the data plane's
-`backend_error_response` finds no `BackendUnavailable` to downcast to and answers
-**500** — or, for a `{{ state.k }}` token with `RIFT_DEBUG` unset, **200** with the
-token rendered empty. Isolation is therefore not distinguishable by status on the
-data plane, before or after this change; the message and the `rift_cluster_isolated`
-gauge are the signals. Giving the refusal its own 503 would mean carrying
-`BackendUnavailable` out of the clustered store, which is a data-plane contract
-change and is not this one.
+> **Amended by D-65** (2026-08-28, #522): the status paragraph below replaces one that
+> recorded a 500 — the store then handed the engine a bare `anyhow::Error`, and the table
+> above promised a 503 it did not deliver.
+
+The **status** is the one this table promises. The store attaches
+`BackendUnavailable { feature: "flowState" }` to every failure caused by the
+cluster's state — the isolation refusal, an unreachable or shedding owner, a
+fenced or misrouted write, a node that is not ready (not bound, no applied
+membership, shut down), on this node or on the owner it forwarded to — and the data
+plane's `backend_error_response` answers **503** (`type: "backend unavailable"`) with the
+reason in `detail` (D-65). That is what the scenario match gate, the scenario
+transition and the debug preview answer. Two doors erase the type before it
+gets there and are unchanged: a `{{ state.k }}` token renders **empty** in a
+**200** (or a 500 `x-rift-template-error` under `RIFT_DEBUG`), and a script's
+`ctx.state.get` raises a 500 `script error` — the same as a Redis outage on those
+paths. So the status distinguishes isolation from a fault on the FSM paths, and
+on the template and script paths the message and the `rift_cluster_isolated`
+gauge remain the signals.
 
 The condition is `rift_cluster_isolated` — a gauge, `1` while this node cannot
 see the quorum, `0` otherwise (#470) — and the `isolated` field of

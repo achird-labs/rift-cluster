@@ -74,6 +74,7 @@ use crate::raft::{NodeId, RaftNode, Ring};
 use crate::rpc::{HandlerFuture, Router, RpcError};
 use crate::stores::flow_config::{ContextScope, FlowConfig, ReadConsistency};
 use crate::stores::shard::{Durability, FlowShard, Versioned};
+use rift_cluster_base::seams::BackendUnavailable;
 
 /// Bound on one flow op end to end: the bridge park, the owner RPC inside it,
 /// and the owner's own shard write. Matches the RPC layer's default request
@@ -103,6 +104,60 @@ const SPACES_PATH: &str = "/_cluster/flow/spaces";
 /// entries and the acceptance gate match on it, and a literal that drifted in
 /// one of them would turn that gate into a test of nothing.
 const ISOLATED_REFUSAL: &str = "flow store: owner is isolated from the cluster";
+
+/// The not-ready refusals (D-65): the cluster cannot take the op *yet* — or
+/// any more — and nothing about the request is wrong. Constants for the same
+/// reason [`ISOLATED_REFUSAL`] is one: an owner answers them in band, and the
+/// store face recognises them by text (see [`is_not_ready`]).
+const NOT_READY_STARTING: &str = "flow store: cluster is still starting";
+const NOT_READY_SHUT_DOWN: &str = "flow store: cluster node has shut down";
+const NOT_READY_NO_MEMBERSHIP: &str = "flow store: no applied membership yet";
+const NOT_READY_NO_OWNER: &str = "flow store: ring has no members";
+
+/// Whether an in-band refusal is one of the not-ready states.
+fn is_not_ready(reason: &str) -> bool {
+    matches!(
+        reason,
+        NOT_READY_STARTING | NOT_READY_SHUT_DOWN | NOT_READY_NO_MEMBERSHIP | NOT_READY_NO_OWNER
+    )
+}
+
+/// The store-face error for a failure caused by the cluster's *state* (D-65):
+/// the D-17 isolation refusal, an owner that could not be reached, a shed
+/// bridge, a node that is not ready. It carries [`BackendUnavailable`], the
+/// one type upstream's `backend_error_response` keys a 503 on (#318) — the
+/// same type `rift-store-redis` attaches to every Redis outage. A fault in the
+/// request or in this node stays a plain error and answers 500, because a
+/// retry cannot help it.
+fn unavailable(detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(BackendUnavailable {
+        feature: "flowState",
+        detail: detail.into(),
+    })
+}
+
+/// A not-ready refusal made where the error is still an [`RpcError`] — inside
+/// a bridge closure or a cluster-port handler. `Unavailable`, not `Handler`:
+/// on the cluster port that is a 503 rather than a 500, a forwarding hop
+/// relays it as the owner's own unavailability (D-61), and [`store_error`]
+/// types it at the face.
+fn rpc_not_ready(reason: String) -> RpcError {
+    RpcError::Unavailable {
+        detail: reason,
+        op_id: None,
+    }
+}
+
+/// The store-face error for a clustered op that failed on the wire or at the
+/// owner. Cluster state — see [`unavailable`] — is unavailability; the peer's
+/// own text is kept as the detail so the D-61 runbook signal survives the wrap.
+fn store_error(e: RpcError) -> anyhow::Error {
+    if matches!(e, RpcError::Unavailable { .. }) || e.is_liveness_failure() {
+        unavailable(e.to_string())
+    } else {
+        anyhow::anyhow!("flow store: {e}")
+    }
+}
 
 /// How often a replica pulls the flows it holds from their owners (#16's
 /// anti-entropy interval). A missed push heals within one tick. Deliberately
@@ -485,12 +540,12 @@ impl FlowNet {
         let node = self
             .node
             .get()
-            .ok_or("flow store: cluster is still starting")?
+            .ok_or(NOT_READY_STARTING)?
             .upgrade()
-            .ok_or("flow store: cluster node has shut down")?;
+            .ok_or(NOT_READY_SHUT_DOWN)?;
         let ring = node.ring();
         if ring.is_empty() {
-            return Err("flow store: no applied membership yet".to_owned());
+            return Err(NOT_READY_NO_MEMBERSHIP.to_owned());
         }
         Ok((node, ring))
     }
@@ -521,7 +576,7 @@ impl FlowNet {
             }
             None => {
                 return WriteReply::Error {
-                    reason: "flow store: ring has no members".to_owned(),
+                    reason: NOT_READY_NO_OWNER.to_owned(),
                 };
             }
         }
@@ -1111,9 +1166,9 @@ impl FlowNet {
         let bridge = self
             .bridge
             .get()
-            .ok_or_else(|| anyhow::anyhow!("flow store: cluster is still starting"))?;
+            .ok_or_else(|| unavailable(NOT_READY_STARTING))?;
         let net = Arc::clone(self);
-        let (_, ring) = self.view().map_err(|e| anyhow::anyhow!(e))?;
+        let (_, ring) = self.view().map_err(unavailable)?;
         let req = req_for(ring.m_idx());
 
         // `ScriptPool`, whichever surface called: the engine offloads blocking
@@ -1121,11 +1176,11 @@ impl FlowNet {
         // here is a blocking-pool or script thread, never a tokio worker.
         bridge
             .call(CallerClass::ScriptPool, FLOW_OP_DEADLINE, async move {
-                let (node, ring) = net.view().map_err(RpcError::Handler)?;
+                let (node, ring) = net.view().map_err(rpc_not_ready)?;
                 let key = OwnedKey::new(KeyClass::FlowKv, &req.flow_id);
-                let owner = ring.owner(key).ok_or_else(|| {
-                    RpcError::Handler("flow store: ring has no members".to_owned())
-                })?;
+                let owner = ring
+                    .owner(key)
+                    .ok_or_else(|| rpc_not_ready(NOT_READY_NO_OWNER.to_owned()))?;
                 if owner == node.id() {
                     Ok(net.owner_write(req).await)
                 } else {
@@ -1137,7 +1192,7 @@ impl FlowNet {
                     serde_json::from_slice(&reply).map_err(|e| RpcError::Handler(e.to_string()))
                 }
             })
-            .map_err(|e| anyhow::anyhow!("flow store: {e}"))
+            .map_err(store_error)
     }
 
     /// A strong read from a blocking thread: owner-answered, wherever the owner
@@ -1150,7 +1205,7 @@ impl FlowNet {
         let bridge = self
             .bridge
             .get()
-            .ok_or_else(|| anyhow::anyhow!("flow store: cluster is still starting"))?;
+            .ok_or_else(|| unavailable(NOT_READY_STARTING))?;
         let net = Arc::clone(self);
         let req = GetReq {
             flow_id: flow_id.to_owned(),
@@ -1159,11 +1214,11 @@ impl FlowNet {
 
         bridge
             .call(CallerClass::ScriptPool, FLOW_OP_DEADLINE, async move {
-                let (node, ring) = net.view().map_err(RpcError::Handler)?;
+                let (node, ring) = net.view().map_err(rpc_not_ready)?;
                 let owned = OwnedKey::new(KeyClass::FlowKv, &req.flow_id);
-                let owner = ring.owner(owned).ok_or_else(|| {
-                    RpcError::Handler("flow store: ring has no members".to_owned())
-                })?;
+                let owner = ring
+                    .owner(owned)
+                    .ok_or_else(|| rpc_not_ready(NOT_READY_NO_OWNER.to_owned()))?;
                 if owner == node.id() {
                     // D-17: an owner-answered `strong` read is an owner-side
                     // serve, so an isolated node refuses it rather than answer
@@ -1191,7 +1246,7 @@ impl FlowNet {
                     Ok(reply.entry)
                 }
             })
-            .map_err(|e| anyhow::anyhow!("flow store: {e}"))
+            .map_err(store_error)
     }
 
     /// This node's OWNED share of `numberOfFlowEntries` (#372): the live entry
@@ -1653,7 +1708,7 @@ pub fn flow_routes(net: Arc<FlowNet>) -> Router {
                     // the state the gate exists for, and answer `None` for a key
                     // this node may simply not have loaded yet, which reads to the
                     // caller as "absent" rather than as a failure.
-                    let (node, ring) = net.view().map_err(RpcError::Handler)?;
+                    let (node, ring) = net.view().map_err(rpc_not_ready)?;
                     // D-17: the ownership check is deliberately absent here (the
                     // caller routed to us), but isolation is a property of *this*
                     // node rather than of the route — a forwarded owner-read
@@ -1904,16 +1959,29 @@ impl ClusteredFlowStore {
     /// Collapse a reply into "applied or a real error". Fencing is an error at
     /// this face: the script asked for a write and it did not happen; quietly
     /// succeeding would be the silent-drop failure mode.
+    ///
+    /// D-65: the refusals that say "not now, retry" — a fence, a misroute, the
+    /// D-17 isolation refusal and the not-ready states, all of which an owner
+    /// answers in band — are unavailability and carry [`BackendUnavailable`].
+    /// They are recognised by their text rather than by `WriteReply` variants
+    /// of their own: the constants are the discriminators the acceptance gate
+    /// already matches on, and a new variant would decode as a handler error
+    /// on the old side of a mixed-version fleet. Any other in-band error — the
+    /// owner's shard refusing, an increment overflowing — is a fault a retry
+    /// cannot heal, and stays plain.
     fn applied(reply: WriteReply) -> anyhow::Result<WriteReply> {
         match reply {
-            WriteReply::Fenced { owner_m_idx } => Err(anyhow::anyhow!(
+            WriteReply::Fenced { owner_m_idx } => Err(unavailable(format!(
                 "flow write fenced: membership changed under the op (owner at m_idx {owner_m_idx}); retry"
-            )),
-            WriteReply::NotOwner { owner } => Err(anyhow::anyhow!(
+            ))),
+            WriteReply::NotOwner { owner } => Err(unavailable(format!(
                 "flow write misrouted: node {owner} owns this flow; retry"
-            )),
+            ))),
+            WriteReply::Error { reason } if reason == ISOLATED_REFUSAL || is_not_ready(&reason) => {
+                Err(unavailable(reason))
+            }
             WriteReply::Error { reason } => Err(anyhow::anyhow!("flow store: {reason}")),
-            applied => Ok(applied),
+            applied @ (WriteReply::Applied { .. } | WriteReply::CasConflict { .. }) => Ok(applied),
         }
     }
 }
@@ -2379,5 +2447,152 @@ mod tests {
 
         assert!(rows.is_empty());
         assert!(!partial);
+    }
+
+    /// Pins D-65: a failure caused by the cluster's state — isolation, an unreachable owner, a
+    /// shed bridge — carries `BackendUnavailable`, the one thing the data plane's
+    /// `backend_error_response` keys a 503 on; a fault in the request or in this node stays a
+    /// plain error, which answers 500 — both statuses taken from `backend_error_response`, the
+    /// production mapping. Every variant has a row, and the match has no wildcard, so a variant
+    /// added to `RpcError` must at least be named here before this compiles.
+    #[test]
+    fn store_error_types_cluster_state_failures_and_nothing_else() {
+        use crate::rpc::{AuthError, PROTO_VERSION};
+        use rift_cluster_base::seams::{BackendUnavailable, backend_error_response};
+
+        let every_variant_has_a_row = |e: &RpcError| match e {
+            RpcError::Unauthorized(_)
+            | RpcError::VersionSkew { .. }
+            | RpcError::UnknownRoute { .. }
+            | RpcError::BodyTooLarge { .. }
+            | RpcError::Timeout
+            | RpcError::Transport(_)
+            | RpcError::Shed
+            | RpcError::BadRequest(_)
+            | RpcError::Unavailable { .. }
+            | RpcError::NotLeader { .. }
+            | RpcError::Handler(_)
+            | RpcError::NotFound { .. } => {}
+        };
+        let rows = [
+            (
+                RpcError::Unavailable {
+                    detail: ISOLATED_REFUSAL.to_owned(),
+                    op_id: None,
+                },
+                true,
+            ),
+            (RpcError::Timeout, true),
+            (RpcError::Transport("connection refused".to_owned()), true),
+            (RpcError::Shed, true),
+            (RpcError::Unauthorized(AuthError::BadMac), false),
+            (
+                RpcError::VersionSkew {
+                    peer: None,
+                    ours: PROTO_VERSION,
+                },
+                false,
+            ),
+            (
+                RpcError::UnknownRoute {
+                    method: "POST".to_owned(),
+                    path: GET_PATH.to_owned(),
+                },
+                false,
+            ),
+            (RpcError::BodyTooLarge { limit: 1 }, false),
+            (RpcError::BadRequest("malformed".to_owned()), false),
+            (RpcError::NotLeader { leader: None }, false),
+            (RpcError::Handler("boom".to_owned()), false),
+            (
+                RpcError::NotFound {
+                    what: "blob".to_owned(),
+                },
+                false,
+            ),
+        ];
+        every_variant_has_a_row(&RpcError::Timeout);
+        for (error, unavailable) in rows {
+            let reason = error.to_string();
+            let err = store_error(error);
+            let typed = err.downcast_ref::<BackendUnavailable>();
+            assert_eq!(
+                typed.is_some(),
+                unavailable,
+                "{reason}: classified as {err:#}"
+            );
+            if let Some(typed) = typed {
+                assert_eq!(typed.feature, "flowState", "{reason}");
+            }
+            assert_eq!(
+                backend_error_response(&err).status().as_u16(),
+                if unavailable { 503 } else { 500 },
+                "{reason}: the data-plane status"
+            );
+            assert!(
+                err.to_string().contains(&reason),
+                "the peer's own reason must survive the wrap: {err:#} lost {reason:?}"
+            );
+        }
+    }
+
+    /// Pins D-65 on the write side. The replies that say "the op did not happen; retry" — a
+    /// fenced write, a misrouted one, the D-17 isolation refusal and the not-ready states, all
+    /// of which travel in band as `WriteReply::Error` — carry `BackendUnavailable`. Any other
+    /// in-band error is the owner's own fault and stays plain: a 503 there would invite a retry
+    /// that cannot help.
+    #[test]
+    fn applied_types_the_retryable_refusals_and_nothing_else() {
+        use rift_cluster_base::seams::BackendUnavailable;
+
+        let unavailable = |reply: WriteReply| {
+            let err = ClusteredFlowStore::applied(reply).expect_err("a refusal is an error");
+            let typed = err.downcast_ref::<BackendUnavailable>().is_some();
+            (typed, err.to_string())
+        };
+
+        let (typed, text) = unavailable(WriteReply::Fenced { owner_m_idx: 7 });
+        assert!(typed, "fenced: {text}");
+        assert!(
+            text.contains("m_idx 7"),
+            "the fence still names the owner's token: {text}"
+        );
+
+        let (typed, text) = unavailable(WriteReply::NotOwner { owner: 2 });
+        assert!(typed, "misrouted: {text}");
+        assert!(
+            text.contains("node 2 owns"),
+            "the misroute still names the owner: {text}"
+        );
+
+        let (typed, text) = unavailable(WriteReply::Error {
+            reason: ISOLATED_REFUSAL.to_owned(),
+        });
+        assert!(typed, "isolated: {text}");
+        assert!(text.contains("owner is isolated"), "{text}");
+
+        for not_ready in [
+            NOT_READY_STARTING,
+            NOT_READY_SHUT_DOWN,
+            NOT_READY_NO_MEMBERSHIP,
+            NOT_READY_NO_OWNER,
+        ] {
+            let (typed, text) = unavailable(WriteReply::Error {
+                reason: not_ready.to_owned(),
+            });
+            assert!(typed, "an owner that is not ready is unavailable: {text}");
+            assert!(text.contains(not_ready), "{text}");
+        }
+
+        for fault in [
+            "shard write failed: disk full",
+            "increment_by overflow: 1 + 2",
+        ] {
+            let (typed, text) = unavailable(WriteReply::Error {
+                reason: fault.to_owned(),
+            });
+            assert!(!typed, "a fault is not unavailability: {text}");
+            assert_eq!(text, format!("flow store: {fault}"));
+        }
     }
 }

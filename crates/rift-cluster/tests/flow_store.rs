@@ -19,7 +19,10 @@ use rift_cluster::stores::{
     ClusteredFlowStoreProvider, FlowNet, FlowShard, ShardConfig, flow_routes,
 };
 use rift_cluster::{Authority, KeyClass, NodeConfig, NodeId, OwnedKey, RaftNode};
-use rift_cluster_base::seams::{CasOutcome, FlowStore, FlowStoreProvider, ImposterConfig};
+use rift_cluster_base::seams::{
+    BackendUnavailable, CasOutcome, FlowStore, FlowStoreProvider, ImposterConfig,
+    backend_error_response,
+};
 use tempfile::TempDir;
 
 const SECRET: &str = "flow-store-test-secret";
@@ -199,6 +202,22 @@ fn stored_on(port: u16, flow_id: &str) -> String {
 /// engine does.
 async fn blocking<T: Send + 'static>(op: impl FnOnce() -> T + Send + 'static) -> T {
     tokio::task::spawn_blocking(op).await.expect("blocking op")
+}
+
+/// Pins D-65 at the store face: a failure caused by the cluster's state carries
+/// `BackendUnavailable` for the `flowState` feature, and the data plane answers it
+/// with 503. The status is taken from `backend_error_response` itself — the
+/// production mapping — so this asserts what a client sees, not a reading of it.
+fn assert_backend_unavailable(err: &anyhow::Error, what: &str) {
+    let typed = err
+        .downcast_ref::<BackendUnavailable>()
+        .unwrap_or_else(|| panic!("{what} must carry BackendUnavailable (D-65): {err:#}"));
+    assert_eq!(typed.feature, "flowState", "{what}: {err:#}");
+    assert_eq!(
+        backend_error_response(err).status().as_u16(),
+        503,
+        "{what} must answer 503 on the data plane, not a generic 500: {err:#}"
+    );
 }
 
 /// A gauge's value summed across this process's registry — both nodes' shards
@@ -1489,13 +1508,25 @@ async fn an_unbound_store_fails_loud_never_silently_local() {
         .provide(&imposter(serde_json::json!({})))
         .expect("provider always provides");
 
-    let err = blocking(move || store.set("flow-early", "k", serde_json::json!(1)))
+    let writer = Arc::clone(&store);
+    let err = blocking(move || writer.set("flow-early", "k", serde_json::json!(1)))
         .await
         .expect_err("a write before bind must refuse");
     assert!(
         err.to_string().contains("starting"),
         "the refusal must say the cluster is starting, got: {err}"
     );
+    assert_backend_unavailable(&err, "a write before bind");
+
+    // The read side has its own pre-flight, and D-65 types it the same way.
+    let err = blocking(move || store.get("flow-early", "k"))
+        .await
+        .expect_err("a strong read before bind must refuse, never answer `None`");
+    assert!(
+        err.to_string().contains("starting"),
+        "the refusal must say the cluster is starting, got: {err}"
+    );
+    assert_backend_unavailable(&err, "a strong read before bind");
 }
 
 /// Issue #372: `FlowNet::fleet_entry_counts`'s partial flag, with an
@@ -2048,6 +2079,19 @@ async fn an_isolated_owner_refuses_writes_and_strong_reads_but_not_local_ones() 
         err.to_string().contains("owner is isolated"),
         "the strong read must name isolation: {err}"
     );
+    assert_backend_unavailable(&err, "an owner-side strong read on an isolated owner");
+
+    // The same refusal on the write side travels in band (`WriteReply::Error`),
+    // and the store face must type it the same way (D-65).
+    let writer = store_on(&members[owner_ix], serde_json::json!({}));
+    let err = blocking(move || writer.set(flow, "k", serde_json::json!("divergent-face")))
+        .await
+        .expect_err("a write on an isolated owner must fail loudly at the store face");
+    assert!(
+        err.to_string().contains("owner is isolated"),
+        "the refused write must name isolation: {err}"
+    );
+    assert_backend_unavailable(&err, "a write on an isolated owner");
 
     let local = store_on(
         &members[owner_ix],
@@ -2168,9 +2212,12 @@ async fn a_forwarded_refusal_from_an_isolated_owner_is_unavailable_not_unreachab
         "a peer-answered refusal is not this hop's transport failure (502): {text}"
     );
     assert!(
-        text.contains("unavailable:"),
-        "the refusal must keep the owner's `Unavailable` class (503): {text}"
+        text.contains("flowState: unavailable:"),
+        "the refusal must keep the owner's `Unavailable` class inside the wrap — matched at the \
+         detail position, since the wrapper's own `backend unavailable:` would match any typed \
+         error: {text}"
     );
+    assert_backend_unavailable(&err, "a strong read forwarded to an isolated owner");
 
     for ix in [owner_ix, forwarder_ix] {
         members[ix]
@@ -2273,6 +2320,49 @@ async fn a_misroute_is_still_a_misroute_when_the_receiving_node_is_isolated() {
         reply.get("Fenced").is_some(),
         "a stale membership token must still be reported as `Fenced` on an isolated node: {reply}"
     );
+
+    survivor.node.shutdown().await.expect("shutdown survivor");
+}
+
+/// Pins D-65 on the row RFC-001 §7.6 names outright — *owner-unreachable*. A `strong` read
+/// through a survivor whose owner is dead fails with a liveness error at the store face, and
+/// that error must carry `BackendUnavailable` for the same 503 the isolation refusal answers:
+/// the client cannot tell the two apart by status, and should not have to. Node death without
+/// a membership change, as in `an_unreachable_peer_marks_the_flow_entry_usage_partial`: the
+/// ring still names the dead owner, so the survivor forwards to it and fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strong_read_through_a_survivor_of_a_dead_owner_is_backend_unavailable() {
+    let _lock = TEST_LOCK.lock().await;
+    let members = flow_cluster().await;
+
+    let flow = "flow-dead-owner";
+    let owner_id = members[0]
+        .node
+        .ring()
+        .owner(OwnedKey::new(KeyClass::FlowKv, &stored(flow)))
+        .expect("two members");
+    let (owner, survivor) = if members[0].node.id() == owner_id {
+        (&members[0], &members[1])
+    } else {
+        (&members[1], &members[0])
+    };
+
+    let store = store_on(owner, serde_json::json!({}));
+    blocking(move || store.set(flow, "k", serde_json::json!("v")))
+        .await
+        .expect("write through the owner");
+
+    owner.node.shutdown().await.expect("shutdown the owner");
+
+    let store = store_on(survivor, serde_json::json!({}));
+    let err = blocking(move || store.get(flow, "k"))
+        .await
+        .expect_err("a strong read whose owner is dead must fail, never answer from the replica");
+    assert!(
+        !err.to_string().contains("owner is isolated"),
+        "a dead owner is unreachable, not isolated — the reason must say which: {err:#}"
+    );
+    assert_backend_unavailable(&err, "a strong read whose owner is unreachable");
 
     survivor.node.shutdown().await.expect("shutdown survivor");
 }

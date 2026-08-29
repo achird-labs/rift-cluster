@@ -1957,3 +1957,72 @@ entries, of which buildkit was ~2.8 GB spread across PR refs. Seeding from `mast
 that — one shared copy rather than one per open PR — but eviction is LRU and repo-wide, so a
 `cluster-smoke` that suddenly rebuilds from cold is worth reading as "the cache was evicted" before
 it is read as "the Dockerfile changed".
+
+### D-65 — A clustered flow-store failure caused by the cluster's state is `BackendUnavailable`; the data plane answers it 503
+
+- **Status:** active
+- **Decided:** 2026-08-28
+- **Amends:** docs/architecture/09-durability-failure.md, docs/architecture/05-read-path.md
+- **Refines:** D-17, D-61
+- **Implemented by:** #522
+- **Code:** crates/rift-cluster/src/stores/flow.rs
+
+The design has promised this status three times over — RFC-001 §7.6's table (*"reject: 503
+cluster/owner-unreachable"*), Chapter 9's degradation table, and Chapter 5, which stated outright
+that the isolation refusal "reaches the caller as the same `503` an unreachable owner produces".
+The code delivered none of it. Upstream's contract (#318) is that a backend attaches
+`BackendUnavailable { feature, detail }` as the *source* of its `anyhow::Error` for an outage, and
+`backend_error_response` downcasts to it — 503 — or answers 500; `rift-store-redis` does exactly
+that for every Redis failure. The clustered store never constructed it: every `RpcError` → `anyhow`
+boundary in `stores/flow.rs` was a Display-flatten, so isolation, an unreachable owner, a shed
+bridge and a not-yet-started cluster were all generic 500s on the data plane. D-61 measured that
+and deferred the decision; this is the decision.
+
+**The rule.** A clustered flow-store failure caused by the **cluster's state**, not by the request,
+carries `BackendUnavailable { feature: "flowState" }`. Cluster state means:
+
+- the D-17 isolation refusal — the typed `RpcError::Unavailable` on the read path *and* the in-band
+  `WriteReply::Error { reason: ISOLATED_REFUSAL }` on the write path;
+- a liveness failure reaching the owner: `RpcError::is_liveness_failure()` — `Timeout`,
+  `Transport`, `Shed`;
+- any other `RpcError::Unavailable`;
+- a fenced or misrouted write (`WriteReply::Fenced` / `NotOwner`): the op did not happen and a
+  retry against a rebuilt ring succeeds;
+- the not-ready states — no bridge yet, no applied membership yet, no owner in the ring, node
+  shut down — wherever they are met: at this node's pre-flight, inside the bridge closure, or on
+  the owner side of a forwarded op.
+
+Everything else stays a plain error and answers 500: `Handler`, `BadRequest`, `Unauthorized`,
+`VersionSkew`, `UnknownRoute`, `BodyTooLarge`, `NotFound`, `NotLeader`, any other in-band
+`WriteReply::Error` reason (the owner's own storage failing), and a reply that fails to decode. The
+line is the Redis store's: corruption and faults are not unavailability, and a 503 there would
+invite a retry that cannot help.
+
+**What changes on the data plane, measured.** The status moves 500 → 503 exactly where the store's
+error reaches `backend_error_response` with its chain intact: the scenario match gate
+(`find_matching_stub` → `scenario_state`), the scenario transition (`apply_scenario_transition`)
+and the debug match preview. It does **not** change for `{{ state.k }}` (200 with an empty token,
+or a 500 `x-rift-template-error` under `RIFT_DEBUG`) or for `_rift.script`'s `ctx.state.get`
+(a 500 `script error`): those doors erase the type upstream — `template_fn::render` substitutes `""`
+for every failed token, `flow_result` stringifies with `{e:#}` — before any downcast can happen,
+and a Redis outage behaves identically there today. #522's premise that the wrap would turn the
+default template path into a hard failure was false; making those doors outage-aware is an
+upstream question, not this one. `local` reads (D-10) never reach any of this.
+
+**Wire format is unchanged, deliberately.** The in-band isolation refusal and the in-band
+not-ready refusals are recognised at the store face by matching their constants
+(`ISOLATED_REFUSAL`, `NOT_READY_*`) — the same discriminators the acceptance gate already matches
+on — rather than by new `WriteReply` variants, which a mixed-version fleet mid-upgrade would decode
+on the old side as handler errors. One cluster-port status does move with this: a node that is
+not ready now answers a forwarded flow op (and its own bridge closure) with `RpcError::Unavailable`
+(503) instead of `Handler` (500), so a forwarding hop relays it as unavailability under D-61's
+relay rule rather than as the owner's fault. The admin listings (`COUNTS_PATH`, `SPACES_PATH`)
+keep `Handler`: their callers already fold any error into `partial: true`.
+
+**On D-61.** Its wording, sweep and relay rules stand; its "not an HTTP status change" paragraph
+described the code at the time and is overtaken here. The message text D-61 chose survives inside
+`BackendUnavailable`'s `detail`, so the runbook signal and the status now agree.
+
+Rejected: the isolation-only wrap (the two `ISOLATED_REFUSAL` sites). It would leave an
+*unreachable* owner at 500 while the same three documents promise 503, and RFC-001's row is
+literally "owner-unreachable".
