@@ -27,7 +27,7 @@ use cluster_chaos::{
     SEQUENCING_HOST_PORTS, SEQUENCING_IMPOSTER_PORT, SOURCES_CLUSTER_HOST_PORTS,
     SOURCES_ORIGIN_BASE_URL, TENANCY_A_HOST_PORTS, TENANCY_A_IMPOSTER_PORT, TENANCY_B_HOST_PORTS,
     TENANCY_B_IMPOSTER_PORT, TENANCY_FLEET_KEY, add_toxic, admin_as, admin_with_key, append_stub,
-    backend_failing_health_check, clear_toxics, cluster_config, cluster_imposters,
+    backend_failing_health_check, chaos_artifact, clear_toxics, cluster_config, cluster_imposters,
     committed_config, config_revision, create_tenant, declare_source, exec_probe, get_data_plane,
     get_data_plane_with, get_json, imposter_ports, metric, mint_principal, origin_publish,
     origin_republish, origin_request_count, probe, provenance_of, published_host_ports,
@@ -5512,7 +5512,7 @@ async fn c12_clears_are_exact_under_clock_skew() {
          observed {}s — a synchronized fleet would pass every probe vacuously",
         fast - slow
     );
-    println!(
+    chaos_artifact!(
         "c12 artifact: observed clock spread between extremes = {}s",
         fast - slow
     );
@@ -5872,7 +5872,7 @@ async fn c11_concurrent_recording_loses_nothing() {
              cannot refuse it"
         );
     }
-    println!(
+    chaos_artifact!(
         "c11 artifact: raced proxyOnce requests refused (503, not forwarded) = {refused} of {}",
         SIGS * NODES.len()
     );
@@ -5956,7 +5956,7 @@ async fn c11_concurrent_recording_loses_nothing() {
                 == before.get(&path).copied().unwrap_or(0) + NODES.len()
         });
         if once_frozen && always_grew {
-            println!(
+            chaos_artifact!(
                 "c11 artifact: per-signature origin calls during the racing window: {:?}",
                 (0..SIGS)
                     .map(|sig| before.get(&format!("/once/p/{sig}")).copied().unwrap_or(0))
@@ -6199,7 +6199,7 @@ async fn c10_proxy_once_survives_owner_and_leader_kills() {
         let max_refires = refires.values().copied().max().unwrap_or(0);
         let total_refusals: usize = refusals.values().copied().sum();
         let max_chargeable = chargeable.values().copied().max().unwrap_or(0);
-        println!(
+        chaos_artifact!(
             "c10 artifact ({phase}): max upstream calls for one signature = {max_calls} \
              (max chargeable fires = {max_chargeable}; max refires = {max_refires}; \
              refused-and-not-forwarded = {total_refusals}; \
@@ -6620,7 +6620,9 @@ async fn c29_partial_reads_answer_within_budget_and_count_themselves() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
-    println!("c29 artifact: partitioned merged read answered in {measured:?} (peer budget 2s)");
+    chaos_artifact!(
+        "c29 artifact: partitioned merged read answered in {measured:?} (peer budget 2s)"
+    );
 
     // Metrics honesty: the stamped reads counted themselves.
     let partial_after = metric(

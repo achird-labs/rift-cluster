@@ -2104,3 +2104,49 @@ while **nobody** is, so it is bounded by the outage. Only the first is a trade w
 *Rejected:* a `fails_closed()` capability flag on the trait instead of an error variant — it
 describes the store rather than the failure, and the same store must not refuse for `proxyAlways`;
 the 503 door needs a typed cause regardless, which the variant already carries.
+
+### D-67 — A measured chaos figure is recorded as a run artifact, not merely printed
+
+- **Status:** active
+- **Decided:** 2026-08-29
+- **Refines:** D-41, D-58
+- **Amends:** docs/architecture/12-testing.md
+- **Implemented by:** #534
+- **Code:** tests/cluster-chaos/src/lib.rs, tests/cluster-chaos/tests/scenarios.rs, .github/workflows/ci.yml
+
+Chapter 12's verification philosophy rests on the suite *measuring* a documented window rather
+than asserting a guessed constant, and four scenario rows say so outright — C10's duplicate-upstream
+ceiling "printed as the run's artifact (D-66)", C11's racing-window call counts, C12's observed
+clock spread, C29's partitioned read answered "(measured, printed)".
+
+None of those figures existed anywhere a human could read them on a **passing** run. libtest
+captures a passing test's stdout and `cluster-smoke` passed no `--nocapture`, so an artifact
+surfaced only when its scenario **failed** — which is when it is least useful, the run having
+aborted before settling the measurement. The promise had been true in intent and false in fact
+since the first row was written.
+
+**The rule.** A scenario that measures a figure records it with `chaos_artifact!`, which prints the
+line **and** appends `<scenario>\t<text>` to `$CHAOS_ARTIFACT_LOG`. `cluster-smoke` sets that
+variable, runs the tier with `--nocapture`, renders the file as a per-shard step summary and
+uploads it as `chaos-artifacts-<shard>`. A bare `println!` for a measured figure is a defect.
+
+**Why both halves.** The print is what Ch. 12 promises and what puts the number beside its scenario
+in the log. The file is what makes the number comparable *across* runs, and that is the property
+the measurement was introduced for: a bound that drifts **inside** its own ceiling — duplicate
+upstream calls creeping 2 → 4 while still under C10's assertion — is invisible to the assertion by
+construction, and the printed artifact is the early warning. A trend cannot be read out of a
+thirty-minute log.
+
+Best effort on the file, as with `CHAOS_TIMING_LOG` (D-58), which this mirrors deliberately rather
+than inventing a second shape: an artifact log that cannot be written costs a datum, never the run.
+Unset — every local run — `chaos_artifact!` is a `println!` and nothing else.
+
+*Rejected:* `--nocapture` alone, which is what #534 proposed. It makes the figures visible and
+leaves them un-greppable across runs, which the issue itself names as the weakness; the collector
+that fixes that already existed one function away.
+*Rejected:* a distinct `chaos-artifact:` line prefix for grepping the log, also floated in #534.
+The lines already begin `cNN artifact:`, so the prefix would read `chaos-artifact: c10 artifact:`
+and would still be answering with a log what the uploaded TSV answers directly.
+*Rejected:* asserting the printed figures instead of recording them. That is the guessed-constant
+the philosophy rejects — C10's assertion is the contract's own bound, and the artifact is the
+separate question of what the run actually measured underneath it.

@@ -488,25 +488,105 @@ impl Drop for Cluster {
 /// a scenario, and this is called from `Drop` during unwind.
 fn record(phase: &str, since: Instant) -> Instant {
     let now = Instant::now();
-    if let Some(path) = std::env::var_os("CHAOS_TIMING_LOG") {
-        let scenario = std::thread::current()
-            .name()
-            .unwrap_or("unknown")
-            .to_owned();
+    if let Some(path) = std::env::var_os(TIMING_LOG_ENV) {
         let line = format!(
-            "{scenario}\t{phase}\t{}\n",
+            "{}\t{phase}\t{}\n",
+            scenario_name(),
             now.duration_since(since).as_millis()
         );
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            use std::io::Write as _;
-            let _ = f.write_all(line.as_bytes());
-        }
+        let _ = append_line(std::path::Path::new(&path), &line);
     }
     now
+}
+
+/// The environment variable `cluster-smoke` sets to collect per-phase timings.
+const TIMING_LOG_ENV: &str = "CHAOS_TIMING_LOG";
+
+/// The environment variable `cluster-smoke` sets to collect scenario artifacts.
+const ARTIFACT_LOG_ENV: &str = "CHAOS_ARTIFACT_LOG";
+
+/// The name of the scenario currently running, as libtest names its thread.
+///
+/// `--test-threads=1` does not change this: libtest still runs each test on its
+/// own named thread, so this is the test's name in both lanes.
+fn scenario_name() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+/// Best-effort append of one already-formatted line to a TSV.
+///
+/// Shared by the two collectors above and below so "append a line" has one
+/// definition, and so the row formats are testable against a real file without
+/// touching the process-global environment they are reached through in a run.
+fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(line.as_bytes())
+}
+
+/// One artifact row as it lands in `$CHAOS_ARTIFACT_LOG`.
+///
+/// Tabs and newlines are collapsed to spaces because the file is a TSV read one
+/// row per artifact. The artifact lines are assembled from multi-line format
+/// strings held together by `\` continuations, so a real newline is one dropped
+/// backslash away — and it would not fail anything, it would quietly split one
+/// measurement across two rows and mislabel the second with the first's
+/// scenario. Sanitizing here is cheaper than a parser that tolerates it.
+fn artifact_row(scenario: &str, text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\t' || c == '\n' { ' ' } else { c })
+        .collect();
+    format!("{scenario}\t{flat}\n")
+}
+
+/// Record a scenario's measured figure — Ch. 12's "printed as the run's
+/// artifact" contract, made true on a **passing** run.
+///
+/// Implements D-67: a scenario that measures a figure records it here, and a
+/// bare `println!` for a measured figure is a defect.
+///
+/// Prints it, and — when `$CHAOS_ARTIFACT_LOG` is set — appends it to that file
+/// as `<scenario>\t<text>`.
+///
+/// Both halves are needed and neither subsumes the other. `println!` alone is
+/// what this was before: libtest captures a passing test's stdout, so the figure
+/// reached a human only when the scenario **failed**, which is exactly when it is
+/// least useful because the run aborted before settling the measurement.
+/// `cluster-smoke` passes `--nocapture` so the line lands in the log beside its
+/// scenario; the file is what makes the same number greppable *across* runs, so a
+/// bound drifting inside its own ceiling — duplicate upstream calls creeping 2 → 4
+/// while still under C10's assertion — is visible before it crosses. A
+/// thirty-minute log is not a place a trend can be read.
+///
+/// Best effort on the file, like [`record`]: an artifact log that cannot be
+/// written must never fail a scenario. Losing the row costs a datum; failing the
+/// scenario costs the run.
+pub fn record_artifact(text: &str) {
+    println!("{text}");
+    if let Some(path) = std::env::var_os(ARTIFACT_LOG_ENV) {
+        let _ = append_line(
+            std::path::Path::new(&path),
+            &artifact_row(&scenario_name(), text),
+        );
+    }
+}
+
+/// Print and record a scenario's measured figure. See [`record_artifact`].
+///
+/// Takes `println!`'s arguments so a call site reads as the `println!` it
+/// replaces, and so nothing is tempted back to a bare print that no file sees.
+#[macro_export]
+macro_rules! chaos_artifact {
+    ($($arg:tt)*) => {
+        $crate::record_artifact(&format!($($arg)*))
+    };
 }
 
 impl Cluster {
@@ -515,11 +595,7 @@ impl Cluster {
     /// which scenario produced it.
     fn dump_logs(&self, dir: &str) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir).context("create log dir")?;
-        let scenario = std::thread::current()
-            .name()
-            .unwrap_or("unknown")
-            .to_owned();
-        let path = std::path::Path::new(dir).join(format!("{scenario}.log"));
+        let path = std::path::Path::new(dir).join(format!("{}.log", scenario_name()));
 
         let mut out = String::new();
         for args in [
@@ -2023,5 +2099,186 @@ mod tests {
         let args = up_args();
         assert_eq!(args.contains(&"--build"), !prebuilt());
         assert!(args.starts_with(&["up", "-d"]));
+    }
+
+    /// The workflow step that runs this tier, as text.
+    fn chaos_step() -> String {
+        let ci = std::fs::read_to_string(format!(
+            "{}/../../.github/workflows/ci.yml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read .github/workflows/ci.yml");
+        let (_, after) = ci
+            .split_once("- name: Container chaos scenarios")
+            .expect("ci.yml must still have the `Container chaos scenarios` step");
+        // Up to the next step at the same indentation.
+        after
+            .split_once("\n      - ")
+            .map_or(after, |(step, _)| step)
+            .to_owned()
+    }
+
+    /// The `cargo test` command that actually **runs** this tier, with its `\`
+    /// line continuations joined into one line.
+    ///
+    /// Two things here are not pedantry; mutation testing caught both.
+    ///
+    /// The step invokes `cargo test -p cluster-chaos` **twice** — once with
+    /// `--list` to derive the shard's scenario names, once to run them — so
+    /// taking the first match asserts against the listing pass, which carries
+    /// none of the flags that matter and would have reported the run's flags
+    /// missing whatever they were.
+    ///
+    /// And the assertions run against the command, not the step text: the step
+    /// *explains* `--nocapture` in a comment, so a `step.contains("--nocapture")`
+    /// stays satisfied by the prose describing the flag long after the flag
+    /// itself is gone.
+    fn chaos_test_invocation() -> String {
+        let step = chaos_step();
+        let mut runs: Vec<String> = Vec::new();
+        for tail in step.split("cargo test -p cluster-chaos").skip(1) {
+            let mut cmd = String::from("cargo test -p cluster-chaos");
+            for line in tail.lines() {
+                let trimmed = line.trim_end();
+                cmd.push(' ');
+                cmd.push_str(trimmed.trim_end_matches('\\').trim());
+                if !trimmed.ends_with('\\') {
+                    break;
+                }
+            }
+            // The listing pass derives the shard; it runs no scenario.
+            if !cmd.contains("--list") {
+                runs.push(cmd);
+            }
+        }
+        assert_eq!(
+            runs.len(),
+            1,
+            "expected exactly one non-`--list` chaos invocation to assert against, \
+             found {}: {runs:#?}",
+            runs.len()
+        );
+        let cmd = runs.remove(0);
+        // The run is the invocation piped through the empty-run guard. Anchoring
+        // on that rather than on position says which command this is supposed to
+        // be, so a future step that adds a third `cargo test` fails here instead
+        // of silently moving the assertions onto it.
+        assert!(
+            cmd.contains("assert-scenarios-ran.sh"),
+            "the selected invocation is not the guarded scenario run: {cmd}"
+        );
+        cmd
+    }
+
+    /// Pins D-67's other half: the collector is only durable if the workflow
+    /// actually switches it on.
+    ///
+    /// A collector the workflow does not switch on is a collector that does not
+    /// exist, and it fails **silently** — the harness reads an unset variable,
+    /// writes nothing, and the job stays green with an empty artifact.
+    ///
+    /// That is the shape of #534, in the other direction: the artifact prints
+    /// were there and correct, and nothing in CI made them reachable, so the
+    /// gap survived until someone went looking for a number they assumed had
+    /// been recorded all along. Nothing else pins these two names together —
+    /// one is a Rust string constant, the other a YAML key — so a rename on
+    /// either side would restore exactly that silence.
+    #[test]
+    fn cluster_smoke_sets_the_log_variables_this_harness_reads() {
+        let step = chaos_step();
+        for var in [TIMING_LOG_ENV, ARTIFACT_LOG_ENV] {
+            assert!(
+                step.contains(&format!("{var}:")),
+                "`cluster-smoke` does not set ${var}, which this harness reads to \
+                 decide whether to collect. Unset, the collector is a no-op and the \
+                 job is green with nothing recorded."
+            );
+        }
+    }
+
+    /// Pins D-67: a measured chaos figure is recorded as a run artifact, not
+    /// merely printed — and the printing half only happens with `--nocapture`.
+    ///
+    /// libtest captures a passing test's stdout. Without the flag the artifact
+    /// lines reach a human only on a **failing** scenario — which is when they
+    /// are least useful, the run having aborted before settling the measurement.
+    /// That was #534.
+    ///
+    /// Pinned here rather than trusted to review because dropping the flag
+    /// breaks nothing loudly: the scenarios still pass, the file is still
+    /// written, and only the in-log copy Ch.12 promises quietly disappears.
+    #[test]
+    fn cluster_smoke_runs_the_chaos_tier_with_nocapture() {
+        let cmd = chaos_test_invocation();
+        assert!(
+            cmd.contains("--nocapture"),
+            "the chaos invocation dropped `--nocapture`, so libtest captures the \
+             scenario artifacts again and a passing run prints none of them: {cmd}"
+        );
+        // `--nocapture` is a libtest argument, not a cargo one: before the `--`
+        // it is an unrecognised cargo flag and the step dies. Both halves have
+        // to be true for the flag to have any effect at all.
+        let (cargo_args, libtest_args) = cmd
+            .split_once(" -- ")
+            .expect("the invocation must pass libtest arguments after a `--`");
+        assert!(
+            libtest_args.contains("--nocapture") && !cargo_args.contains("--nocapture"),
+            "`--nocapture` must sit after the `--`, where libtest reads it: {cmd}"
+        );
+    }
+
+    /// The file is a TSV read one row per artifact, and the artifact lines are
+    /// assembled from multi-line format strings held together by `\` line
+    /// continuations. A dropped backslash puts a real newline in the text, which
+    /// would not fail anything — it would split one measurement across two rows
+    /// and label the second with the first's scenario.
+    #[test]
+    fn an_artifact_row_is_one_line_whatever_the_text_contains() {
+        let row = artifact_row("c10_scenario", "max = 3\tof 4\nrefused = 1");
+        assert_eq!(row, "c10_scenario\tmax = 3 of 4 refused = 1\n");
+        assert_eq!(row.matches('\n').count(), 1, "exactly one row");
+        assert_eq!(
+            row.matches('\t').count(),
+            1,
+            "exactly one separator, so column 2 is the whole measurement"
+        );
+    }
+
+    /// Every artifact in a shard lands in one file, so the collector has to
+    /// append. Truncating instead would leave only the last scenario's figure
+    /// and still produce a plausible-looking summary of one row.
+    #[test]
+    fn artifacts_accumulate_rather_than_replace() {
+        let path = std::env::temp_dir().join(format!(
+            "chaos-artifact-test-{}-{:?}.tsv",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        append_line(&path, &artifact_row("c10", "max = 3")).expect("create and write");
+        append_line(&path, &artifact_row("c29", "answered in 1.2s")).expect("append");
+
+        let body = std::fs::read_to_string(&path).expect("read back");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            body, "c10\tmax = 3\nc29\tanswered in 1.2s\n",
+            "both rows, in order, one per line"
+        );
+    }
+
+    /// Best effort, like the timing collector: this is reached from scenarios
+    /// mid-assertion, and a log that cannot be written must cost a datum, never
+    /// the run. `record_artifact` discards the error — this pins that there IS
+    /// an error to discard rather than a panic.
+    #[test]
+    fn an_unwritable_artifact_log_is_an_error_not_a_panic() {
+        let dir = std::env::temp_dir().join(format!("chaos-artifact-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create a directory");
+        // A directory is not an appendable file.
+        let err = append_line(&dir, "c10\tmax = 3\n");
+        let _ = std::fs::remove_dir(&dir);
+        assert!(err.is_err(), "opening a directory for append must fail");
     }
 }

@@ -140,6 +140,38 @@ LB-independence; C4+C5 together are R1 under adversity.
   designed but not registered — Chapter 10 — so this gate is not yet
   enforced; C13, the scenario that would drive it, is unbuilt.)
 
+## Where a measured figure ends up
+
+> **Amended by D-67** (2026-08-29, #534): the rows above have said "printed as the run's artifact"
+> since the first of them was written, and on a **passing** run none of those figures was printed
+> anywhere a human could read. libtest captures a passing test's stdout and `cluster-smoke` passed
+> no `--nocapture`, so an artifact surfaced only when its scenario *failed* — the one case where the
+> number is worthless, the run having aborted before settling it. This section is new, and states
+> where a measured figure actually lands now.
+
+Several rows above say a bound is *measured and printed* rather than asserted
+against a guessed constant — C10's duplicate-upstream ceiling, C11's racing-window
+call counts, C12's observed clock spread, C29's partitioned read latency. Those
+scenarios call `chaos_artifact!`, which does two things:
+
+- **Prints the line.** `cluster-smoke` runs the tier with `--nocapture`, so it
+  lands in the job log beside the scenario that produced it. Until #534 the flag
+  was missing and libtest captured a *passing* test's stdout — so the figure
+  reached a human only when the scenario **failed**, which is when it is least
+  useful, the run having aborted before settling the measurement.
+- **Appends it to `$CHAOS_ARTIFACT_LOG`.** Rendered as a step summary table per
+  shard and uploaded as `chaos-artifacts-<shard>`, alongside the `CHAOS_TIMING_LOG`
+  it mirrors.
+
+The second is not a convenience. A bound that drifts *inside* its own ceiling —
+duplicate upstream calls creeping from 2 to 4 while still under C10's assertion —
+is invisible to the assertion by construction, and that early warning is the whole
+reason these figures are printed rather than merely checked. Reading a trend needs
+the numbers side by side across runs, which a thirty-minute log is not.
+
+Unset, the collector is a clock read and a `println!` and nothing else, so a local
+run is unchanged: `cargo test -p cluster-chaos -- --ignored --nocapture --exact <name>`.
+
 ## Verification philosophy, in one paragraph
 
 Every guarantee in this guide names the test that would catch its violation,
