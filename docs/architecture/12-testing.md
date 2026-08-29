@@ -62,7 +62,11 @@ kill). These phase-2+ names are RFC-001 §10's *planned* names and no test
 exists under them: the claims landed in the container tier as C15 (flow
 state), C28–C30 (journal — the scenarios' own doc comments name which
 `test_journal_*` claim each is "in anger") and C10–C11 (proxyOnce) below.
-The sequencing names have no counterpart yet.
+The sequencing claims landed as **C33** (#476), which is the
+container-tier counterpart to the whole of `rift-cluster`'s `tests/sequencer.rs`
+gate; `test_sequence_redis_strict` itself stays unwritten, and now permanently
+so — D-15 killed the Redis-backed design it names, and D-47 shipped
+owner-routing in its place.
 
 ## The chaos suite
 
@@ -74,8 +78,10 @@ cell), **⛔ quarantined** (`#[ignore = "quarantined: #n -- why"]`, harvested by
 `scripts/chaos-quarantine.sh` into the tier's `--skip` list; nothing is
 quarantined today), **📋 planned** (the issue or RFC section that owns it).
 C2, C3 and C9 are RFC-001 §12 numbers never carried into this chapter (C3's
-claim is C11's; C9's fork class stopped being a scenario that can fail under
-D-15) and stay unallocated.
+claim is C11's; **C2's — "kill sequence-owner mid-traffic" — is C33's**, minus
+the "(gossip mode)" its wording assumed, which died with D-15 and was replaced
+by ring ownership in D-47; C9's fork class stopped being a scenario that can
+fail under D-15) and stay unallocated.
 
 | ID | Attack | Invariant it must fail to break |
 |---|---|---|
@@ -108,6 +114,7 @@ D-15) and stay unallocated.
 | C30 ✅ | Kill and restart a node mid-cursor-walk; overflow a shard past its cap (#228: `c30_vector_cursor_walk_survives_membership_change`) | The `?since=` walk stays gapless and duplicate-free across the kill and the return; `x-rift-truncated` appears **iff** a presented position predates a shard watermark (baseline reads never truncate) |
 | C31 📋 planned (#283) | Deploy a spec and flip its validation policy; full-cluster `kill -9` + restart (RFC-004 §9, S7) | Both converge on every node and are identical after recovery; a retried, unchanged `PUT /specs/:id` during recovery grows the log by zero |
 | C32 📋 planned (#283) | Mode `hard`, round-robin across all nodes while a follower restarts (RFC-004 §9, S7) | An off-contract request is rejected with the same status and shape through **any** node; an on-contract one is served through any node; violation rows land on the serving node and the merged `validationFailures` read reflects them, `Rift-Cluster-Partial`-honest if a node is down |
+| C33 ✅ | Owner-mode sequencing sprayed round-robin across all three nodes; SIGKILL the cursor's owner (found by killing — a non-owner's death must change nothing), then restart it (#476: `c33_owner_mode_sequencing_cycles_fleet_wide_and_degrades_on_owner_kill`) | Strict `A, B, C` cycling with **zero fallbacks** on a healthy fleet; with the owner dead every response is still a 2xx and carries `rift-cluster-sequence: local-fallback`, and the **fallback counter** — not the returned index — is what moves; after the owner returns the fallbacks stop and strict cycling resumes from wherever the new cursor started (D-8 permits the reset) |
 
 C14 and C15 are the direct tests of R4 and R3; C8 is the direct test of R2's
 LB-independence; C4+C5 together are R1 under adversity.

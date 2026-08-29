@@ -24,18 +24,18 @@ use tokio::task::JoinSet;
 use cluster_chaos::{
     CONVERGE_TIMEOUT, Cluster, FLOW_STATE_HOST_PORTS, FLOW_STATE_IMPOSTER_PORT,
     FRONT_DOOR_HOST_PORTS, FRONT_PORT, NODES, PULL_ON_MISS_HOST_PORTS, PULL_ON_MISS_IMPOSTER_PORT,
-    SOURCES_CLUSTER_HOST_PORTS, SOURCES_ORIGIN_BASE_URL, TENANCY_A_HOST_PORTS,
-    TENANCY_A_IMPOSTER_PORT, TENANCY_B_HOST_PORTS, TENANCY_B_IMPOSTER_PORT, TENANCY_FLEET_KEY,
-    add_toxic, admin_as, admin_with_key, append_stub, backend_failing_health_check, clear_toxics,
-    cluster_config, cluster_imposters, committed_config, config_revision, create_tenant,
-    declare_source, exec_probe, get_data_plane, get_data_plane_with, get_json, imposter_ports,
-    metric, mint_principal, origin_publish, origin_republish, origin_request_count, probe,
-    provenance_of, published_host_ports, pull_source, put_imposter, put_imposter_config,
-    put_imposter_with_key, put_routes, put_stubs, read_source, source_document, toxic_count,
-    wait_admin_reachable, wait_admin_reachable_with_key, wait_backend_ejected, wait_converged,
-    wait_converged_on, wait_converged_with_key, wait_origin_ready, wait_ports_free_in,
-    wait_revisions_agree, wait_revisions_agree_on, wait_single_leader, wait_sources_reachable,
-    wait_voters,
+    SEQUENCING_HOST_PORTS, SEQUENCING_IMPOSTER_PORT, SOURCES_CLUSTER_HOST_PORTS,
+    SOURCES_ORIGIN_BASE_URL, TENANCY_A_HOST_PORTS, TENANCY_A_IMPOSTER_PORT, TENANCY_B_HOST_PORTS,
+    TENANCY_B_IMPOSTER_PORT, TENANCY_FLEET_KEY, add_toxic, admin_as, admin_with_key, append_stub,
+    backend_failing_health_check, clear_toxics, cluster_config, cluster_imposters,
+    committed_config, config_revision, create_tenant, declare_source, exec_probe, get_data_plane,
+    get_data_plane_with, get_json, imposter_ports, metric, mint_principal, origin_publish,
+    origin_republish, origin_request_count, probe, provenance_of, published_host_ports,
+    pull_source, put_imposter, put_imposter_config, put_imposter_with_key, put_routes, put_stubs,
+    read_source, source_document, toxic_count, wait_admin_reachable, wait_admin_reachable_with_key,
+    wait_backend_ejected, wait_converged, wait_converged_on, wait_converged_with_key,
+    wait_origin_ready, wait_ports_free_in, wait_revisions_agree, wait_revisions_agree_on,
+    wait_single_leader, wait_sources_reachable, wait_voters,
 };
 
 /// The imposter port a scenario configures. Inside the container network
@@ -6646,5 +6646,274 @@ fn the_observability_runtime_lane_actually_enables_its_assertions() {
         job.contains("--job observability"),
         "the lane must use its own watched set; defaulting to cluster-smoke's \
          would run it on every cluster source change"
+    );
+}
+
+/// The sequencing imposter C33 drives: three responses, cycled fleet-wide.
+///
+/// `_rift.sequencing.mode: "owner"` is the whole opt-in (D-47). Without it the
+/// default is per-process cursors (D-10), and every node would answer `A` — the
+/// behaviour this scenario exists to prove is gone.
+fn sequencing_imposter(port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "port": port,
+        "protocol": "http",
+        "_rift": { "sequencing": { "mode": "owner" } },
+        "stubs": [{
+            "predicates": [{ "equals": { "path": "/cycle" } }],
+            "responses": [
+                { "is": { "statusCode": 200, "body": "A" } },
+                { "is": { "statusCode": 200, "body": "B" } },
+                { "is": { "statusCode": 200, "body": "C" } },
+            ],
+        }],
+    })
+}
+
+/// One request to the sequencing imposter through the node at `node_idx`,
+/// returning `(status, body, fleet-ordered?)`.
+///
+/// The third element is the `rift-cluster-sequence` header's absence: the
+/// decorator sets it to `local-fallback` exactly when the decision degraded
+/// (`ClusteredSequencer::route`), so no header means the ring answered.
+async fn c33_cycle(node_idx: usize) -> anyhow::Result<(u16, String, bool)> {
+    let (status, headers, body) = get_data_plane(SEQUENCING_HOST_PORTS[node_idx], "/cycle").await?;
+    let fleet_ordered = !headers.contains_key("rift-cluster-sequence");
+    Ok((status, body, fleet_ordered))
+}
+
+/// The fleet's total `rift_cluster_sequence_fallbacks_total`, over the nodes
+/// named in `live`.
+///
+/// Summed rather than read per node because the counter lives on whichever node
+/// *served* the degraded request, and the spray deliberately does not control
+/// which that is.
+///
+/// `unwrap_or(0.0)`, like C29's partial-reads baseline, and for the same
+/// reason rather than as a shrug: a `lazy_static` Prometheus counter registers
+/// on first use, so on a fleet that has never fallen back the family is
+/// **absent from `/metrics`** and `metric` reports "not present" — which is the
+/// number 0, not a failure. It cannot mask a dead node either, because every
+/// index passed here has just served a 200 in [`c33_spray`], or is about to.
+async fn c33_fallbacks(live: &[usize]) -> f64 {
+    let mut total = 0.0;
+    for &i in live {
+        total += metric(NODES[i].metrics, "rift_cluster_sequence_fallbacks_total")
+            .await
+            .unwrap_or(0.0);
+    }
+    total
+}
+
+/// Spray `rounds * 3` serial requests round-robin across `live`, returning the
+/// bodies in order.
+///
+/// **Serial, one request at a time.** Concurrent clients cannot assert strict
+/// order: the cursor advances per decision, so two in-flight requests may be
+/// answered in either order and `A, C, B` would be a correct fleet-wide cycle
+/// reported as a failure. A load balancer's *spraying* is what this reproduces,
+/// not its concurrency — and the spray is the part the claim is about.
+async fn c33_spray(live: &[usize], rounds: usize) -> anyhow::Result<Vec<String>> {
+    let mut bodies = Vec::with_capacity(rounds * live.len());
+    for round in 0..rounds * live.len() {
+        let node_idx = live[round % live.len()];
+        let (status, body, _) = c33_cycle(node_idx).await?;
+        anyhow::ensure!(
+            status == 200,
+            "sequencing answered {status} via {} — D-47 makes every cluster \
+             failure on this path a degraded 200, never an error",
+            NODES[node_idx].name
+        );
+        bodies.push(body);
+    }
+    Ok(bodies)
+}
+
+/// C33 — owner-mode sequencing under an LB-shaped spray, the owner's death, and
+/// its return.
+///
+/// The in-process gate (`crates/rift-cluster/tests/sequencer.rs`) already covers
+/// fleet-wide cycling, the untouched `local` default, fallback-on-owner-loss,
+/// non-replication, reset fan-out and the RPC count. What only the container
+/// tier can answer is whether that survives real traffic sprayed across a real
+/// three-node fleet by something that has never heard of cursor ownership.
+///
+/// **The fallback counter is the assertion, not the index.** By design every
+/// cluster failure here degrades to a local cursor (D-10: sequencing is the one
+/// stateful op where availability wins), so a broken fleet still returns
+/// plausible-looking indices — three nodes each cycling their own copy answer
+/// `A, A, A`, and after the kill a healthy-looking `A, B, C` proves nothing
+/// about ownership. `rift_cluster_sequence_fallbacks_total` and the
+/// `rift-cluster-sequence` header are what distinguish a fleet-ordered answer
+/// from a locally cycled one, and they are checked at every phase.
+///
+/// **Finding the owner by killing.** Ownership is HRW over committed membership
+/// under `KeyClass::Sequence`, keyed by a private wire key built from the
+/// engine's `stub_key` — the chaos crate cannot recompute it, and adding surface
+/// to expose it would be inventing an API for a test. So the owner is found the
+/// way an operator would find it: SIGKILL does not change membership (a killed
+/// node does not leave), so killing a *non-owner* leaves the cursor's owner
+/// intact and nothing degrades. The node whose death makes the survivors'
+/// fallback counter move is the owner. At most two kills are needed to identify
+/// it among three, and the kills that turn out to hit a bystander are not waste:
+/// they are the "killing a non-owner changes nothing" claim, asserted.
+#[tokio::test]
+#[ignore = "needs a container runtime"]
+async fn c33_owner_mode_sequencing_cycles_fleet_wide_and_degrades_on_owner_kill() {
+    let cluster = Cluster::up_with_overlays(&["sequencing.overlay.yml"])
+        .await
+        .expect("fleet comes up");
+    let port = SEQUENCING_IMPOSTER_PORT;
+    let all: Vec<usize> = (0..NODES.len()).collect();
+
+    let (status, body) = put_imposter_config(NODES[0].admin, &sequencing_imposter(port))
+        .await
+        .expect("admin write");
+    assert_eq!(
+        status, 201,
+        "the owner-mode sequencing imposter was refused: {body}"
+    );
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the imposter binds on every node before any request is sprayed");
+
+    // ---- Phase 1: a healthy fleet cycles once, however the LB spreads it. ----
+    let before = c33_fallbacks(&all).await;
+    let bodies = c33_spray(&all, 3).await.expect("healthy spray");
+    let want: Vec<String> = "ABCABCABC".chars().map(|c| c.to_string()).collect();
+    assert_eq!(
+        bodies, want,
+        "three nodes sharing one owned cursor must produce ONE cycle. `A, A, A` \
+         means each node cycled its own copy — the pre-#466 behaviour, and what \
+         a load balancer in front of an un-clustered fleet still does"
+    );
+    let healthy = c33_fallbacks(&all).await - before;
+    assert_eq!(
+        healthy, 0.0,
+        "a healthy fleet must answer every decision from the ring; {healthy} \
+         fallback(s) means the cycle above was assembled locally and the \
+         indices happened to line up"
+    );
+
+    // ---- Phase 2: find the owner by killing, asserting the bystanders. ----
+    // Kill candidates in turn. A non-owner's death must change nothing; the
+    // owner's death must move the counter. The loop stops at the first mover.
+    let mut owner: Option<usize> = None;
+    for (candidate, node) in NODES.iter().enumerate() {
+        let live: Vec<usize> = all.iter().copied().filter(|&i| i != candidate).collect();
+        let before = c33_fallbacks(&live).await;
+        cluster.kill(node.name).expect("SIGKILL the node");
+
+        let sprayed = 3 * live.len();
+        let bodies = c33_spray(&live, 3).await.expect("spray past the dead node");
+        for (i, body) in bodies.iter().enumerate() {
+            assert!(
+                matches!(body.as_str(), "A" | "B" | "C"),
+                "request {i} answered {body:?} with {} dead — D-47 keeps this \
+                 path answering, degraded if it must, never with an error body",
+                node.name
+            );
+        }
+        let moved = c33_fallbacks(&live).await - before;
+
+        // The owner is dead ⇒ **every** decision degrades, because SIGKILL left
+        // membership (and so the ring) untouched and the key is still homed on a
+        // node that cannot answer. Classifying on `moved == sprayed` rather than
+        // `moved > 0` is what keeps this robust: a single stray fallback from
+        // some unrelated blip would otherwise be read as "found the owner" and
+        // send the rest of the scenario after the wrong node.
+        #[allow(clippy::cast_precision_loss)]
+        let all_degraded = moved == sprayed as f64;
+        if all_degraded {
+            // The owner. Every response must still be a 2xx (asserted in the
+            // spray) and the degradation must be *stated*, not merely counted:
+            // the header is what a client sees.
+            let (status, _, fleet_ordered) = c33_cycle(live[0]).await.expect("probe after kill");
+            assert_eq!(
+                status, 200,
+                "an unreachable cursor owner must degrade, never fail the request"
+            );
+            assert!(
+                !fleet_ordered,
+                "with the owner dead the response must carry \
+                 `rift-cluster-sequence: local-fallback`. A degraded answer that \
+                 does not say so is the failure mode D-10's flagged-degradation \
+                 rule exists to prevent — the counter moved, so the client was \
+                 served a local cursor and was not told"
+            );
+            owner = Some(candidate);
+            break;
+        }
+
+        // A bystander: nothing degraded, so the cursor's owner is still alive
+        // and still answering. Restore the fleet and try the next candidate.
+        assert_eq!(
+            moved, 0.0,
+            "killing {} — which is not the cursor's owner — moved the fallback \
+             counter by {moved} over {sprayed} decisions. A non-owner's death \
+             must be invisible to sequencing: SIGKILL is not a leave, so \
+             committed membership and the ring are unchanged and the owner is \
+             still answering. A small non-zero here would mean a decision \
+             degraded for some reason other than the owner being gone — worth \
+             an issue, not a wider tolerance",
+            node.name
+        );
+        cluster.start(node.name).expect("restart the bystander");
+        cluster
+            .wait_all_ready(Duration::from_secs(120))
+            .await
+            .expect("the bystander comes back");
+        cluster
+            .wait_cluster_formed(Duration::from_secs(120))
+            .await
+            .expect("the fleet re-forms after the bystander returns");
+        wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+            .await
+            .expect("the imposter is rebound on the returned bystander");
+    }
+    let owner = owner.expect(
+        "one of the three nodes owns the cursor, so one of the kills above must \
+         have moved the fallback counter",
+    );
+
+    // ---- Phase 3: the owner returns and the fleet re-orders. ----
+    cluster.start(NODES[owner].name).expect("restart the owner");
+    cluster
+        .wait_all_ready(Duration::from_secs(120))
+        .await
+        .expect("the owner comes back");
+    cluster
+        .wait_cluster_formed(Duration::from_secs(120))
+        .await
+        .expect("the fleet re-forms with the owner back");
+    wait_converged(u64::from(port), CONVERGE_TIMEOUT)
+        .await
+        .expect("the imposter is rebound on the returned owner");
+
+    let before = c33_fallbacks(&all).await;
+    let bodies = c33_spray(&all, 3).await.expect("spray after recovery");
+    let after = c33_fallbacks(&all).await - before;
+    assert_eq!(
+        after, 0.0,
+        "with every node back the ring must answer every decision again; \
+         {after} fallback(s) means the returned owner never re-took the key"
+    );
+
+    // Cycling, not continuity. D-8 makes a cursor reset the documented price of
+    // not replicating every advance, so the sequence after the owner's return
+    // may start anywhere in `A, B, C` — asserting it resumed where it left off
+    // would be asserting the opposite of the design.
+    let start = "ABC"
+        .find(bodies[0].as_str())
+        .unwrap_or_else(|| panic!("first response after recovery was {:?}", bodies[0]));
+    let want: Vec<String> = (0..bodies.len())
+        .map(|i| "ABC".as_bytes()[(start + i) % 3] as char)
+        .map(|c| c.to_string())
+        .collect();
+    assert_eq!(
+        bodies, want,
+        "after the owner's return the fleet must cycle strictly again from \
+         wherever the new cursor started (D-8 permits the reset, not a stall or \
+         a repeat)"
     );
 }
