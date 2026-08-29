@@ -9,6 +9,7 @@ rest is discipline, described in [`docs/process/design-code-sync.md`](../process
 ## How to read an entry
 
 ```
+
 ### D-16 — `redb` for all cluster durability
 - **Status:** amended            active | amended | superseded | pending
 - **Decided:** 2026-07-21 · ADR-001 · #14
@@ -1700,6 +1701,13 @@ restructuring is the one every cluster-touching PR exercises.
 (139.5 s); all three are cached on a warm run except the last. A cold build is genuinely slower,
 which is the trade: it happens once per dependency change, and the warm path is what every PR pays.
 
+> **Corrected by D-64** (#524): "the warm path is what every PR pays" is the error in the footnote
+> above. A GitHub cache is scoped to the ref that wrote it, and every job here runs only on
+> `pull_request` — so nothing wrote a cache `master` could share, and **every PR's first run was
+> cold**, at 19.4 min against the 16.5 min this change inherited. The warm figure was real, but it
+> was the second-run case presented as the general one. D-64 seeds from `master` and makes it
+> general.
+
 `importing cache manifest` and `preparing build cache for export` appear in the log for the first
 time, and `cargo install cargo-chef`, `cargo chef prepare` and `cargo chef cook` all report `CACHED`
 on the warm run. That is the whole claim, and it is now checkable rather than asserted.
@@ -1722,7 +1730,7 @@ image on the path to the shipped binary, where the pinned crates.io install has 
 dependency graph already trusts and costs a minute only on a cold build. Dropping
 `ignore-error=true` so a broken cache is loud — it would redden a required check on a GitHub
 outage; the tell is documented at the call site instead (no import line, cargo back at ~400 s).
-||||||| Stash base
+
 ### D-61 — A peer that answered is never reported as unreachable; a relayed refusal keeps the peer's error
 
 - **Status:** active
@@ -1826,7 +1834,7 @@ Restoring mtimes after the copy — there is no declarative way to do it, and a 
 a second thing to keep correct. Copying `docs/api` alone rather than `docs/` — narrower, but it
 makes the next `include_str!` into `docs/` a build break for no gain; after `.dockerignore` strips
 `**/*.md`, the whole directory is three files.
-||||||| parent of 0614896 (test(sequencing): pin the real RPC cost — one `next` per decision, no peeks (D-63))
+
 ### D-63 — Sequencing costs one `next` per decision and never peeks; there is no amplification, and no cache
 
 - **Status:** active
@@ -1891,3 +1899,61 @@ asserted — a latency assertion on CI's shared 2-vCPU runners would be a flake 
 Rejected: writing the bench §11.3 asked for. `n = 1, 4, 16 sequence references per response` cannot
 be constructed, because a response cannot reference the sequence at all. Building the surface in
 order to measure it would be inventing the cost the RFC feared.
+
+### D-64 — Only `master` writes the image build cache; PRs read it
+- **Status:** active
+- **Decided:** 2026-08-28
+- **Refines:** D-60
+- **Implemented by:** #524
+- **Code:** .github/workflows/ci.yml
+
+D-60 fixed a cache that had never run, and measured it warm. It never asked *which refs can read
+it*, and the answer undid most of the win.
+
+**A GitHub Actions cache is scoped to the ref that wrote it.** A pull request reads its own
+`refs/pull/<n>/merge` entries and the default branch's, and nothing else. Every job that builds this
+image runs `if: github.event_name == 'pull_request'`, so nothing ever wrote a cache under
+`refs/heads/master`. Measured, from the cache API rather than inferred: **93 buildkit entries across
+two PR refs, zero under `master`.** Each PR could only warm itself.
+
+**So D-60 was a regression for any PR that runs once.** The chef install (~60 s) and `cook` (~246 s)
+are added work that only pays back off a readable cache. Measured across four runs:
+
+| | wall clock |
+|---|--:|
+| D-58, before cargo-chef | 16.5 min |
+| D-60/D-62, first run of a new PR | **19.4 min** |
+| D-60/D-62, second run of the same PR | 14.0 min |
+| D-60/D-62, run whose Docker context is unchanged | 8.9 min |
+
+The 14 min figure was real, and it was the second-run case reported as the general one.
+
+**`cluster-smoke-cache-seed` writes the cache, on push, and nothing else does.** No `load`, no
+`push`, no scenarios — `outputs: type=cacheonly`, whose only product is cache under
+`refs/heads/master` that every branch can read. Its build must match `cluster-smoke-prepare`'s
+exactly (same target, flags and scope) or it warms a cache the PRs then miss, which is D-60's
+failure from the other side.
+
+**Not path-filtered, deliberately.** It reads the same cache it writes, so a push that changed
+nothing the image depends on finds every layer present and finishes in about a minute. It does real
+work exactly when the dependency graph moved — which is exactly when PRs would otherwise each pay
+for it. A filter would add a second thing to keep correct in exchange for that minute.
+
+**`continue-on-error: true`.** This job feeds an optimisation; a failure in it must slow the next PR
+down and never turn `master` red, because a red `master` is how people learn to ignore a signal.
+
+**The faketime flavor is not seeded.** It is `FROM runtime` plus one apt layer, so every expensive
+layer it needs is already in what this produces.
+
+*Rejected:* seeding on a schedule instead of on push — it would warm a cache for a `master` that had
+already moved, which is the stalest possible thing to hand a PR. Making `cluster-smoke` itself run on
+push — that runs 36 scenarios per merge to populate a cache, and the tier's whole cost is the
+scenarios. Sharing one scope across flavors *and* the static builder (`release.yml` scopes per
+flavor for a reason its own comment gives: `runtime` and `runtime-static` diverge at `builder`, so a
+shared scope has each evict the other).
+
+**Watch the ceiling.** Repo cache usage stood at 9.54 GB of GitHub's 10 GB when this landed, 165
+entries, of which buildkit was ~2.8 GB spread across PR refs. Seeding from `master` should reduce
+that — one shared copy rather than one per open PR — but eviction is LRU and repo-wide, so a
+`cluster-smoke` that suddenly rebuilds from cold is worth reading as "the cache was evicted" before
+it is read as "the Dockerfile changed".

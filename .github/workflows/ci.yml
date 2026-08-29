@@ -159,6 +159,64 @@ jobs:
   # check's name. Measured before the split: 35–37 min, of which ~10 min was a cold
   # image build inside the first scenario's `compose up --build` and ~20 min was 36
   # scenarios run serially on one runner.
+
+  # Writes the image build cache that every PR reads (D-64). Nothing else does.
+  #
+  # GitHub scopes an Actions cache to the ref that wrote it: a PR can read its own
+  # `refs/pull/<n>/merge` entries and the default branch's, and nothing else. Every
+  # job above runs only on `pull_request`, so before this job the cache existed
+  # solely under PR refs — measured, from the cache API: 93 buildkit entries across
+  # two PR refs, **zero** under `refs/heads/master`. A PR could therefore only ever
+  # warm itself, and its FIRST run was always cold.
+  #
+  # That made D-60 a regression for any PR that runs once: the chef install (~60 s)
+  # and `cook` (~246 s) are added work that only pays back off a readable cache, so
+  # a cold `cluster-smoke` went from 16.5 min to 19.4 min while a warm one went to
+  # 14. This job is what makes the warm figure the ordinary one.
+  #
+  # It builds nothing anyone consumes — no `load`, no `push`, no scenarios. Its only
+  # output is the cache, under `refs/heads/master`, where every branch can read it.
+  #
+  # Deliberately NOT path-filtered, because it does not need to be: it reads the
+  # same cache it writes, so a push that changed nothing the image depends on finds
+  # every layer already there and finishes in about a minute. It does real work
+  # exactly when the dependency graph moved, which is exactly when PRs would
+  # otherwise pay for it one at a time.
+  #
+  # `continue-on-error`: this job feeds an optimisation. A failure here must slow
+  # the next PR down, never turn `master` red — and a red `master` is what would
+  # make people start ignoring it.
+  cluster-smoke-cache-seed:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Same target, same flags, same scope as `cluster-smoke-prepare`'s build.
+      # They have to match exactly or this warms a cache the PRs then miss — which
+      # is the failure D-60 already had once, from the other direction.
+      #
+      # `outputs: type=cacheonly` rather than `load: true`: the image itself is of
+      # no use here and exporting it to the docker store would only cost time.
+      #
+      # The faketime flavor is not built. It is `FROM runtime` plus one apt layer,
+      # so every expensive layer it needs is in what this produces.
+      - name: Seed the node image build cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: runtime
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=cluster-smoke
+          cache-to: type=gha,mode=max,scope=cluster-smoke,ignore-error=true
+
   cluster-smoke-prepare:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
@@ -371,11 +429,11 @@ jobs:
       - name: Reserve the tier's published ports from the ephemeral range
         run: |
           set -euo pipefail
-          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,36700,39090,42525,45251-45253,45261-45263,46525,48474,49901
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901
           # Assert the read-back, do not merely print it: `sysctl <key>` exits 0
           # whatever the value is, so echoing it would prove nothing about a
           # partially applied or silently truncated write.
-          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,36700,39090,42525,45251-45253,45261-45263,46525,48474,49901"
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901"
 
       - uses: actions/download-artifact@v4
         with:
@@ -1103,8 +1161,8 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         run: |
           set -euo pipefail
-          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,36700,39090,42525,45251-45253,45261-45263,46525,48474,49901
-          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,36700,39090,42525,45251-45253,45261-45263,46525,48474,49901"
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901"
 
       # `verify.sh` self-locates (`cd "$(dirname "$0")"`), so it runs from the
       # repo root. `RIFT_OBSERVABILITY=1` is what turns on the overlay half —
