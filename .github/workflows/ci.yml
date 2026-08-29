@@ -429,11 +429,11 @@ jobs:
       - name: Reserve the tier's published ports from the ephemeral range
         run: |
           set -euo pipefail
-          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,36700,39090,42525,45251-45253,45261-45263,46525,48474,49901
           # Assert the read-back, do not merely print it: `sysctl <key>` exits 0
           # whatever the value is, so echoing it would prove nothing about a
           # partially applied or silently truncated write.
-          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901"
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,36700,39090,42525,45251-45253,45261-45263,46525,48474,49901"
 
       - uses: actions/download-artifact@v4
         with:
@@ -1161,8 +1161,8 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         run: |
           set -euo pipefail
-          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901
-          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,39090,42525,45251-45253,45261-45263,46525,48474,49901"
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=34790,36300,36400,36500-36501,36700,39090,42525,45251-45253,45261-45263,46525,48474,49901
+          test "$(sysctl -n net.ipv4.ip_local_reserved_ports)" = "34790,36300,36400,36500-36501,36700,39090,42525,45251-45253,45261-45263,46525,48474,49901"
 
       # `verify.sh` self-locates (`cd "$(dirname "$0")"`), so it runs from the
       # repo root. `RIFT_OBSERVABILITY=1` is what turns on the overlay half —
