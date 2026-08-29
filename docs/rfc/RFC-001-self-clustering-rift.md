@@ -1444,6 +1444,7 @@ registered in `crates/rift-cluster/src/metrics.rs`:
 | `rift_cluster_config_revision{port}` | Applied config revision per port. **This is the convergence signal** — two nodes disagreeing here have not converged |
 | `rift_cluster_bind_failures{port}` | Ports that failed to bind |
 | `rift_cluster_flow_reads_total{path}` | Flow-state reads by answering path (#120): `owner` (this node owns the key), `forward` (one RPC to the owner — the whole cost of `strong` on a non-owner), `local` (a replica read the imposter opted into) |
+| `rift_cluster_sequence_decisions_total{op,path}` | Cursor decisions by operation and answering path (#476, D-63). `op` ∈ `next` / `peek`; `path` carries the same four values as the flow-store metric above plus `fallback` (the fleet could not answer, so the node cycled its own cursor and said so). Every decision is counted exactly once. `op="peek"` moving at all means something other than the debug response preview has reached the sequencer — the amplification §11.3 assumed, arriving for real |
 | `rift_cluster_cas_conflicts_total{reason}` | Owner-side flow-write refusals (#120): `cas` lost to the current value, `fence` carried a stale `m_idx` (§7.6), `misroute` reached a non-owner, `isolated` the owner could not see a quorum (D-17) |
 | `rift_cluster_flow_fsync_seconds` | Durable flow-state commit latency (#119) — `sync` writes wait on its tail |
 | `rift_cluster_flow_wal_lag_ops` | `async` writes acknowledged but not yet fsynced — the loss window, measured (#119) |
@@ -1522,25 +1523,39 @@ therefore strictly more informative than the 0/1 gauge it replaces.
 > peek-amplification cost is still owed a measurement (#476); what changed is that an owner which
 > cannot answer degrades to the local cursor and annotates, rather than failing the request.
 
+> **Amended by D-63** (2026-08-28, #476): the peek amplification below **does not exist**, and the
+> owner-side peek cache it justified is withdrawn. `peek` reaches the sequencer from the debug
+> response preview alone; the serving path issues one `next` per decision and never peeks, and no
+> template variable exposes the cursor index. Measured owner hop: **p50 181 µs / p99 374 µs**
+> against **p50 16–23 µs** on the owner (1 000 decisions each, loopback, Apple M4, debug build) —
+> inside the one-LAN-RPC budget. Pinned by
+> `owner_mode_costs_exactly_one_next_per_decision_and_never_peeks` and readable in production from
+> `rift_cluster_sequence_decisions_total{op,path}`. The refusal of a *caller-side* cache stands
+> unchanged.
+
 - Stateless hot path: **zero cluster code** — `Local` trait impls are the moved current
   code; Phase-0 exit criterion pins bench regressions ≤ 2 %.
 - Stateful ops: budget **one LAN RPC (sub-millisecond typical) per op** — scenario-gated
   requests cost one `kv/get(for_match)` (+ one CAS when transitioning, same round trip);
   sequence advances one `seq/next`; proxyOnce one claim + one complete. `owner == self`
   (~1/N) short-circuits to memory. There is no zero-hop assumption (§6.2).
-- **Sequencer honesty:** "one RPC per op" holds for `next`, but a response body that
-  interpolates the cursor without advancing it costs a `peek`, so the real budget is
-  **one `next` plus up to a few `peek`s per request** — a stub template referencing the
-  sequence several times pays per reference. State plainly what is and is not mitigable:
-  the **RPC fan-out is inherent**, because the only cache that could remove a round trip
-  would live on the *calling* node, and a non-owner cache reintroduces exactly the stale
-  read the owner-authoritative design exists to prevent. An optional short-lived (≈ 50 ms)
-  peek cache **on the owner** bounds owner-side cursor-store work under a peek-heavy
-  template — it does not reduce the number of RPCs. Templates that reference a sequence
-  many times per response are therefore a known cost, to be measured rather than designed
-  away — and no existing chaos scenario measures it (C13 loads the *stateless* path against
-  a black-holing owner, which is a different question), so Phase 4 owes a peek-amplification
-  benchmark rather than a citation.
+- **Sequencer honesty (D-63):** "one RPC per op" holds for `next`, and there is nothing else
+  — **one `next` per decision on a non-owner, zero on the owner, zero `peek`s**. An earlier
+  draft of this section assumed a response body could interpolate the cursor without
+  advancing it, and budgeted "one `next` plus up to a few `peek`s per request" for a stub
+  template referencing the sequence several times. No such path exists: `peek` is reached
+  only from the debug response preview, and no template variable exposes the index. The
+  ≈ 50 ms owner-side peek cache that assumption justified is therefore **withdrawn** —
+  it would trade a stale read for a cost that is not being paid. What survives unchanged is
+  the other half: the **RPC fan-out is inherent**, because the only cache that could remove a
+  round trip would live on the *calling* node, and a non-owner cache reintroduces exactly
+  the stale read the owner-authoritative design exists to prevent. The measurement this
+  section used to owe is now taken (`owner_hop_latency_figure`, 1 000 decisions each,
+  loopback, Apple M4, debug): **p50 181 µs / p99 374 µs** through the hop against
+  **p50 16–23 µs** on the owner — a floor rather than a production number, and inside the
+  one-LAN-RPC budget above. The count, not the latency, is what is pinned in CI, by
+  `owner_mode_costs_exactly_one_next_per_decision_and_never_peeks` reading
+  `rift_cluster_sequence_decisions_total{op,path}`.
 - Bridge capacity: semaphore `max(2, workers/2)`; fast-fail on Suspect/Dead owners keeps
   the parked-thread window to roughly one detection interval after a crash.
 - Sizing rules of thumb (per node): journal ≤ ports × shard-cap × avg-entry;

@@ -204,6 +204,20 @@ stub that was deleted or replaced, and it will keep doing so until it is asked
 again or the membership changes. A non-zero value with no member down is worth
 looking at; the warning names which member to look at.
 
+*Registered by #476, no alert yet:* `rift_cluster_sequence_decisions_total{op,path}`
+(counter, every cursor decision by operation and answering path — **D-63**).
+`op` is `next` or `peek`; `path` is `owner` (this node owns the cursor, no hop),
+`forward` (one RPC to the owner), `local` (the imposter never opted in — D-10's
+default, not a degradation) or `fallback` (the fleet could not answer, the same
+event `rift_cluster_sequence_fallbacks_total` counts). Two things to read from it.
+`forward / (owner + forward)` is the share of decisions paying an owner hop, the
+sequencing counterpart of the same ratio on `rift_cluster_flow_reads_total`. And
+**`op="peek"` should never move**: the serving path issues one `next` per decision
+and peeks only from the debug response preview, so a rising `peek` means a code
+path now pays an owner round trip per cursor reference — the amplification
+RFC-001 §11.3 once assumed, arriving for real. Neither is a paging signal; both
+are what to look at when sequencing is suspected of costing more than one RPC.
+
 *Registered, but not alerted on:* `rift_cluster_flow_wal_lag_ops` (async
 durability backlog). It is a legitimate paging signal, but it appears in
 neither the alert pack nor the shipped dashboards yet: nobody has chosen a

@@ -451,6 +451,26 @@ lazy_static! {
     )
     .expect("rift_cluster_sequence_fallbacks_total registers once");
 
+    /// `rift_cluster_sequence_decisions_total{op,path}` — every cursor decision,
+    /// by operation and by what answered it. Mirrors
+    /// `rift_cluster_flow_reads_total{path}` deliberately: `owner` = this node
+    /// owns the cursor and served from memory; `forward` = one RPC to the owner
+    /// (the whole cost of `owner` mode on a non-owner); `local` = the imposter
+    /// never opted in, so this is the D-10 default path; `fallback` = the fleet
+    /// could not answer and the node cycled its own cursor, which is also
+    /// counted by `rift_cluster_sequence_fallbacks_total` above.
+    ///
+    /// `op` is `next` or `peek`. The split is what makes the RPC budget
+    /// falsifiable rather than asserted (D-63): the serving path issues exactly
+    /// one `next` per decision and never peeks, so `op="peek"` moving at all
+    /// means something other than the debug preview reached the sequencer.
+    static ref SEQUENCE_DECISIONS: IntCounterVec = register_int_counter_vec!(
+        "rift_cluster_sequence_decisions_total",
+        "Cursor decisions by operation and answering path",
+        &["op", "path"]
+    )
+    .expect("rift_cluster_sequence_decisions_total registers once");
+
     /// `rift_cluster_sequence_resets_incomplete_total` — cursor resets that did not reach every
     /// member (D-57). One per sweep, not per member; the `warn!` beside it names who. Unlike the
     /// fallback counter above this *is* a fault signal: a member that missed a reset keeps
@@ -796,6 +816,17 @@ pub(crate) fn flow_conflict(reason: &str) {
 /// non-zero means owners are unreachable, not that sequencing is off.
 pub(crate) fn sequence_fallback() {
     SEQUENCE_FALLBACKS.inc();
+}
+
+/// One cursor decision, by operation (`next` / `peek`) and answering path
+/// (`owner` / `forward` / `local` / `fallback`) — both closed at the call site
+/// by [`crate::stores::sequencer`]'s own enums, so neither label is free text.
+///
+/// Pins the RPC budget RFC-001 §11.3 used to only assert (D-63): summed over
+/// `path`, `op="next"` equals the number of decisions, and `op="peek"` never
+/// moves on the serving path.
+pub(crate) fn sequence_decision(op: &str, path: &str) {
+    SEQUENCE_DECISIONS.with_label_values(&[op, path]).inc();
 }
 
 pub(crate) fn sequence_reset_incomplete() {
