@@ -472,6 +472,7 @@ jobs:
           # stack rather than discovering it as a failed pull.
           RIFT_CHAOS_PREBUILT_IMAGE: "1"
           CHAOS_TIMING_LOG: ${{ runner.temp }}/chaos-timing.tsv
+          CHAOS_ARTIFACT_LOG: ${{ runner.temp }}/chaos-artifacts.tsv
         run: |
           set -euo pipefail
           # An array, not a string, for the reason `chaos-quarantine.sh`'s header
@@ -504,8 +505,17 @@ jobs:
           # from, so a scenario that was selected and then did not run — renamed,
           # newly ignored, filtered away by an `--exact` that stopped matching —
           # fails the shard instead of quietly shrinking it.
+          # `--nocapture` so the measured figures Ch.12 calls "printed as the
+          # run's artifact" are actually printed on a **passing** run (#534).
+          # libtest captures a passing test's stdout, so before this they reached
+          # a human only when the scenario failed — which is when the number is
+          # least useful, the run having aborted before settling it. It costs
+          # nothing here: the harness owns the only five prints in the crate, it
+          # installs no tracing subscriber, and `compose_with` captures docker's
+          # own output into an `Output` rather than letting it reach this stdout.
+          # `--test-threads=1` is already set, so nothing interleaves.
           cargo test -p cluster-chaos -- \
-              --ignored --test-threads=1 --exact "${scenarios[@]}" \
+              --ignored --test-threads=1 --nocapture --exact "${scenarios[@]}" \
             | scripts/assert-scenarios-ran.sh --assert "${#scenarios[@]}"
 
       # Where the per-scenario cost of this tier becomes readable. libtest
@@ -545,6 +555,39 @@ jobs:
         with:
           name: chaos-timing-${{ matrix.index }}
           path: ${{ runner.temp }}/chaos-timing.tsv
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Where the figures Ch.12 promises become readable, and comparable. The
+      # `--nocapture` above puts each artifact in the log beside its scenario;
+      # this puts the shard's whole set in the summary, and the upload below
+      # makes them greppable ACROSS runs. That last part is the one the log
+      # cannot do: a measured bound drifting inside its own ceiling — C10's
+      # duplicate upstream calls creeping 2 -> 4 while still under the assertion —
+      # is a trend, and a thirty-minute log is not somewhere a trend can be read.
+      - name: Scenario artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          f="${RUNNER_TEMP}/chaos-artifacts.tsv"
+          [ -s "$f" ] || exit 0
+          {
+            echo "### cluster-smoke shard ${{ matrix.index }} — scenario artifacts"
+            echo
+            echo "| scenario | measured |"
+            echo "|---|---|"
+            # `|` is the cell separator, so an artifact containing one would
+            # split its own row. The harness flattens tabs and newlines on the
+            # way in; pipes only matter to this renderer, so they are escaped
+            # here rather than mangled in the recorded value.
+            awk -F'\t' '{ v = $2; gsub(/\|/, "\\|", v); printf "| `%s` | %s |\n", $1, v }' "$f"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-artifacts-${{ matrix.index }}
+          path: ${{ runner.temp }}/chaos-artifacts.tsv
           if-no-files-found: ignore
           retention-days: 7
 

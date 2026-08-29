@@ -788,6 +788,46 @@ On failure the harness writes `docker compose ps` and `logs` to `$CHAOS_LOG_DIR`
 tore its own evidence down is a failure nobody can act on. Set `CHAOS_LOG_DIR`
 locally to get the same dump; unset, teardown behaves exactly as before.
 
+### Scenario artifacts (`CHAOS_ARTIFACT_LOG`)
+
+Some scenarios *measure* a bound rather than asserting a guessed constant, and
+Ch. 12 promises the measurement is printed as the run's artifact: C10's duplicate
+upstream calls, C11's racing-window call counts and refusal tally, C12's observed
+clock spread, C29's partitioned read latency. They call `chaos_artifact!`, which
+prints the line **and** — when `CHAOS_ARTIFACT_LOG` is set — appends
+`<scenario>\t<text>` to that file.
+
+Both halves earn their place, and #534 is why:
+
+- Until then the tier ran without `--nocapture`, so libtest captured a **passing**
+  test's stdout and the figure reached a human only when the scenario *failed* —
+  which is when it is least useful, the run having aborted before settling the
+  measurement. `cluster-smoke` now passes the flag. It costs nothing: the harness
+  owns the only five prints in the crate, installs no tracing subscriber, and
+  `compose_with` captures docker's output into an `Output` rather than letting it
+  reach the job's stdout.
+- The file is what makes the same number greppable **across** runs. A bound that
+  drifts inside its own ceiling — duplicate upstream calls creeping 2 → 4 while
+  still under C10's assertion — is invisible to the assertion by construction, and
+  a thirty-minute log is not somewhere a trend can be read. `cluster-smoke` renders
+  it as a per-shard step-summary table and uploads it as `chaos-artifacts-<shard>`,
+  exactly as it already does for `CHAOS_TIMING_LOG`.
+
+Best effort, like the timing collector: an artifact log that cannot be written
+costs a datum, never the run. Unset — every local run — `chaos_artifact!` is a
+`println!` and nothing else, so add `--nocapture` yourself to see them:
+
+```sh
+cargo test -p cluster-chaos -- --ignored --nocapture --exact c10_proxy_once_survives_owner_and_leader_kills
+```
+
+Two unit tests hold the wiring together, because both halves fail *silently*:
+`cluster_smoke_sets_the_log_variables_this_harness_reads` pins the YAML keys
+against the Rust constants (a rename on either side turns the collector into a
+green no-op), and `cluster_smoke_runs_the_chaos_tier_with_nocapture` pins the
+flag (dropping it breaks nothing loudly — the scenarios still pass and the file
+is still written, only the in-log copy disappears).
+
 ### `cluster-smoke` is a required check
 
 Since #104, `master` carries a ruleset (`.github/rulesets/master.json`) that
