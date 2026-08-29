@@ -279,6 +279,37 @@ async fn wait_served(port: u16, path: &str) -> Option<(u16, String)> {
     }
 }
 
+/// Re-issue a write while the fleet answers that it cannot take one yet.
+///
+/// A node that has just been joined by a follower is briefly unable to accept a
+/// write: the membership change is in flight, so the node this test holds is
+/// momentarily not the leader, or is parked replaying. The admin API says so
+/// honestly — `503 unavailable`, body `no quorum / leader unreachable (parked
+/// for replay): local write refused: not the leader` — and a real client
+/// retries, which is what `--cluster` clients are documented to do. Asserting
+/// on the first answer instead made
+/// `deploy_serves_the_compiled_imposter_on_every_node_after_the_2xx` fail three
+/// times in one day of CI, once on a plain `master` push with no PR involved.
+///
+/// **Only 503 is retried, and only until the deadline.** A 503 that persists is
+/// returned like any other answer, so the assertion that follows fails with the
+/// real status and body rather than with a timeout message that says nothing —
+/// and no other status is waited out, so a wrong answer stays a wrong answer.
+async fn when_writable<F, Fut>(mut send: F) -> Seen
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Seen>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = send().await;
+        if seen.status != 503 || std::time::Instant::now() > deadline {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn an_editor_imports_a_spec_and_an_unchanged_re_put_writes_nothing() {
     let fixture = start().await;
@@ -614,20 +645,23 @@ async fn deploy_serves_the_compiled_imposter_on_every_node_after_the_2xx() {
     assert!(pet["name"].is_string(), "schema-shaped body: {pet}");
 
     // A second deploy replaces (200, not 201) and stays bound.
-    let seen = on_leader
-        .post_json(
-            "/specs/petstore/deploy",
-            &json!({ "port": port }),
-            EDITOR_KEY,
-            "acme",
-        )
-        .await;
+    //
+    // Through `when_writable`, like every write below it: the follower joined a
+    // few lines up, so the membership change may still be in flight and the
+    // leader may refuse a write for a moment. What is being asserted is that a
+    // redeploy replaces rather than creates — not how quickly a two-node fleet
+    // settles after a join, which is D-25's business and is covered elsewhere.
+    // Bound outside the closure: `post_json` borrows the body, and a `json!`
+    // temporary built inside would not outlive the future the closure returns.
+    let redeploy = json!({ "port": port });
+    let seen = when_writable(|| {
+        on_leader.post_json("/specs/petstore/deploy", &redeploy, EDITOR_KEY, "acme")
+    })
+    .await;
     assert_eq!(seen.status, 200, "redeploy replaces: {seen}");
 
     // Delete refuses while bound; `?force` unbinds first and the imposter stays.
-    let seen = on_leader
-        .delete("/specs/petstore", EDITOR_KEY, "acme")
-        .await;
+    let seen = when_writable(|| on_leader.delete("/specs/petstore", EDITOR_KEY, "acme")).await;
     assert_eq!(
         seen.status, 409,
         "bound specs are not deleted by accident: {seen}"
@@ -638,9 +672,8 @@ async fn deploy_serves_the_compiled_imposter_on_every_node_after_the_2xx() {
         "names the port: {seen}"
     );
     assert!(seen.body.contains("force"), "says how: {seen}");
-    let seen = on_leader
-        .delete("/specs/petstore?force", EDITOR_KEY, "acme")
-        .await;
+    let seen =
+        when_writable(|| on_leader.delete("/specs/petstore?force", EDITOR_KEY, "acme")).await;
     assert_eq!(seen.status, 200, "{seen}");
     assert_eq!(seen.json()["unboundPorts"], json!([port]));
     for (label, api) in [("leader", &on_leader), ("follower", &on_follower)] {
