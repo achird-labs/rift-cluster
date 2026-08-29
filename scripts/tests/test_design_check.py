@@ -408,5 +408,59 @@ class Diff(unittest.TestCase):
         self.assertIn("D-2: 2 citation(s)", out)
 
 
+class ConflictMarkers(unittest.TestCase):
+    """A half-resolved rebase must not be able to land in a design doc.
+
+    Two did, hours apart, in the one file that defines every decision, and
+    `--strict` passed over both because every other check asks whether
+    citations resolve rather than whether the file is intact.
+    """
+
+    def test_a_marker_in_the_register_is_an_error(self):
+        f = Fixture()
+        f.write("docs/decisions/DECISIONS.md", REGISTER + "\n||||||| Stash base\n")
+        code, out = f.run("--strict")
+        self.assertEqual(code, 1, out)
+        self.assertIn("conflict-marker", out)
+        self.assertIn("docs/decisions/DECISIONS.md", out)
+
+    def test_every_marker_shape_is_caught_and_located(self):
+        for marker in ("<<<<<<< HEAD", ">>>>>>> theirs", "||||||| parent of abc123"):
+            with self.subTest(marker=marker):
+                f = Fixture()
+                f.write("docs/architecture/11-upstream-boundary.md", SEAMS + f"\n{marker}\n")
+                code, out = f.run("--strict")
+                self.assertEqual(code, 1, out)
+                self.assertIn("conflict-marker", out)
+                self.assertIn("docs/architecture/11-upstream-boundary.md", out)
+
+    def test_a_setext_underline_is_not_a_marker(self):
+        """`=======` underlines a Markdown heading, so it is not in the set.
+
+        A guard that fires on legitimate prose gets suppressed rather than
+        fixed, which is worse than not having it.
+        """
+        f = Fixture()
+        f.write("docs/architecture/11-upstream-boundary.md", SEAMS + "\nA heading\n=======\n\nBody.\n")
+        code, out = f.run("--strict")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("conflict-marker", out)
+
+    def test_a_marker_mid_line_is_not_a_marker(self):
+        """Only a marker at the start of a line is one; prose may quote them."""
+        f = Fixture()
+        f.write("docs/architecture/11-upstream-boundary.md", SEAMS + "\nGit writes `<<<<<<< HEAD` on conflict.\n")
+        code, out = f.run("--strict")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("conflict-marker", out)
+
+    def test_the_clean_fixture_stays_clean(self):
+        """The guard must not fire on the fixture every other test relies on."""
+        f = Fixture()
+        code, out = f.run("--strict")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("conflict-marker", out)
+
+
 if __name__ == "__main__":
     unittest.main()

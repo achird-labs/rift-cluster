@@ -429,6 +429,45 @@ def check_resolution(root: Path, cites: list[Citation], decisions: dict[str, Dec
     return findings
 
 
+CONFLICT_MARKERS = ("<<<<<<<", ">>>>>>>", "|||||||")
+
+
+def check_conflict_markers(root: Path) -> list[Finding]:
+    """No design document may contain an unresolved VCS conflict marker.
+
+    Cheap, and it earns its place: the register is the only place a decision is
+    defined, and a botched rebase can leave a marker in it that reads as prose.
+    Two landed on `master` within hours of each other -- `||||||| Stash base`
+    from #520 and `||||||| parent of ...` from #525 -- and `--strict` passed
+    over both, because every other check here asks whether *citations* resolve
+    and none asks whether the file is intact.
+
+    `=======` is deliberately NOT a marker for this check: it is also a valid
+    setext `<h1>` underline in Markdown, and a guard that fires on legitimate
+    prose gets suppressed rather than fixed. The other three have no meaning in
+    Markdown, so their presence is unambiguous.
+    """
+    findings: list[Finding] = []
+    for p in walk(root, DOC_ROOTS, {".md"}):
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for n, line in enumerate(text.splitlines(), start=1):
+            if line.startswith(CONFLICT_MARKERS):
+                findings.append(
+                    Finding(
+                        "error",
+                        "conflict-marker",
+                        f"unresolved conflict marker {line.split()[0]!r} — a merge or "
+                        f"rebase was committed half-resolved",
+                        rel(root, p),
+                        n,
+                    )
+                )
+    return findings
+
+
 def check_callouts(root: Path, decisions: dict[str, Decision]) -> list[Finding]:
     """Every `Amends: RFC-00N §x.y` needs an `Amended by D-n` callout inside that section."""
     findings: list[Finding] = []
@@ -789,6 +828,7 @@ def main(argv: list[str] | None = None) -> int:
             print("\n".join(lines))
         return 0
 
+    findings += check_conflict_markers(root)
     findings += check_resolution(root, cites, decisions)
     findings += check_callouts(root, decisions)
     cov_findings, cover = check_coverage(cites, decisions)
