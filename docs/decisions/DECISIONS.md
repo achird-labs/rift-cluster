@@ -9,6 +9,7 @@ rest is discipline, described in [`docs/process/design-code-sync.md`](../process
 ## How to read an entry
 
 ```
+
 ### D-16 — `redb` for all cluster durability
 - **Status:** amended            active | amended | superseded | pending
 - **Decided:** 2026-07-21 · ADR-001 · #14
@@ -1722,7 +1723,7 @@ image on the path to the shipped binary, where the pinned crates.io install has 
 dependency graph already trusts and costs a minute only on a cold build. Dropping
 `ignore-error=true` so a broken cache is loud — it would redden a required check on a GitHub
 outage; the tell is documented at the call site instead (no import line, cargo back at ~400 s).
-||||||| Stash base
+
 ### D-61 — A peer that answered is never reported as unreachable; a relayed refusal keeps the peer's error
 
 - **Status:** active
@@ -1826,7 +1827,7 @@ Restoring mtimes after the copy — there is no declarative way to do it, and a 
 a second thing to keep correct. Copying `docs/api` alone rather than `docs/` — narrower, but it
 makes the next `include_str!` into `docs/` a build break for no gain; after `.dockerignore` strips
 `**/*.md`, the whole directory is three files.
-||||||| parent of 0614896 (test(sequencing): pin the real RPC cost — one `next` per decision, no peeks (D-63))
+
 ### D-63 — Sequencing costs one `next` per decision and never peeks; there is no amplification, and no cache
 
 - **Status:** active
