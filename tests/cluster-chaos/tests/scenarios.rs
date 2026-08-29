@@ -5839,19 +5839,43 @@ async fn c11_concurrent_recording_loses_nothing() {
             });
         }
     }
+    let mut refused = 0usize;
     while let Some(joined) = tasks.join_next().await {
         let (once, always) = joined.expect("hammer task");
-        assert_eq!(
-            once,
-            Some(200),
-            "a raced proxyOnce request must still answer"
+        // D-66 changed what a raced proxyOnce request may answer, and this assertion is where
+        // that shows up. 200 is the ordinary answer. 503 is the *designed* one for the instant
+        // the cluster cannot serialize the claim — here a readiness race against a
+        // just-created imposter, or the data-plane bridge shedding under a burst of
+        // `SIGS × NODES` simultaneous claims. Before D-66 that same condition forwarded to the
+        // origin and answered 200; that forward is the unbounded duplicate this scenario's own
+        // Ch.9 row exists to forbid, so the 503 is the fix working, not a regression.
+        //
+        // What is still pinned, and is what would catch a real break: the status is one of
+        // exactly those two (never a 5xx of another shape, never a 4xx), and — far stronger —
+        // the settle loop below still requires every signature to end Recorded exactly once on
+        // every node. A cluster that refused everything would hang there and fail.
+        assert!(
+            matches!(once, Some(200) | Some(503)),
+            "a raced proxyOnce request answers 200, or 503 when its claim could not be \
+             serialized (D-66) — nothing else: {once:?}"
         );
+        if once == Some(503) {
+            refused += 1;
+        }
+        // proxyAlways is the control and stays strict: it gates nothing, so it has no claim to
+        // refuse and D-66 must not have touched it. A refusal leaking into this mode would mean
+        // the store started failing closed before consulting the proxy mode.
         assert_eq!(
             always,
             Some(200),
-            "a raced proxyAlways request must still answer"
+            "a raced proxyAlways request must still answer — it gates nothing, so D-66 \
+             cannot refuse it"
         );
     }
+    println!(
+        "c11 artifact: raced proxyOnce requests refused (503, not forwarded) = {refused} of {}",
+        SIGS * NODES.len()
+    );
 
     // Settle: every proxyOnce signature ends Recorded — one stub each, on
     // every node. The fixture's readiness probes went through the same

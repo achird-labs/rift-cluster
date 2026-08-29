@@ -2082,6 +2082,21 @@ engine's `Err` arm splits, and both proxy-leg response arms — the stub proxy a
 so would send an operator to the wrong system. This had to be upstream because both the
 degrade decision and the status choice are engine-side; a downstream store cannot reach either.
 
+**What this costs, measured (C11, 2026-08-29).** The refusal is not confined to partitions. A
+claim can fail to serialize on a *healthy* fleet for transient reasons — a readiness race against a
+just-created imposter whose config a node has not applied yet, or the data-plane bridge shedding
+under a burst — and those now answer `503` where they previously forwarded and answered `200`.
+Chaos C11 caught this on its first run after the change: 18 simultaneous first-hits across three
+nodes produced refusals, and its assertion that *"a raced proxyOnce request must still answer"*
+`200` was encoding the pre-D-66 contract. It now accepts `200` or `503` and counts the refusals,
+while `proxyAlways` stays strictly `200` as the control.
+
+This is the trade Chapter 9 chose, stated in the direction that costs something: **proxyOnce trades
+availability under transient claim-path failure for the absence of duplicate upstream calls.** A
+client that cannot tolerate that should use `proxyAlways`/`proxyTransparent`, which gate nothing,
+or retry — the signature stays claimable, and C11's settle loop is exactly that retry. The bound is
+that a refused request is retryable and costs the upstream nothing, not that it never happens.
+
 *Rejected:* keeping the degrade and correcting the docs to say *"forwards without recording"*.
 The distinction that settles it is `InFlight` vs `Unavailable` — the first forwards while the
 owner **is** serializing, so the duplicate is bounded by one racing window; the second forwards
