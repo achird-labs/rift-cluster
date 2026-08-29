@@ -204,7 +204,7 @@ fencing):
 |---|---|---|
 | Scenario FSM / flow KV | **Adopt** highest `(m_idx, v, origin)` from replicas/disk | ≤ 1 replication round staleness; adopt-found-nothing ⇒ FSM restarts, counted (`rift_cluster_flow_adoptions_total{outcome="empty"}`) — no response header, because the store is reached through `spawn_blocking`, which the annotation scope does not cross; bounded and visible, never silent |
 | Sequence cursors | **Reset** | Deliberate (D-8): replicating every advance puts a network write on the hottest stateful path for test-run-scoped data. A mid-test membership change may restart sequences; documented. *Not yet built:* no clustered sequencer exists — cursors are node-local (`LocalSequencer`) today, so there is nothing to hand off |
-| proxyOnce | `Recorded` adopts (replicated); `Pending` dies with the owner → re-claim | Duplicate-upstream bound: 1 + ownership changes in flight (Chapter 7) |
+| proxyOnce | `Recorded` adopts (replicated); `Pending` dies with the owner → re-claim | Duplicate-upstream bound: 1 + ownership changes in flight (Chapter 7). That is now the bound on *upstream calls* too, not just recordings: a claim the cluster cannot serialize is refused `503` rather than forwarded (D-66), so an outage no longer adds a call per request |
 | Journal / counters | No owner — nothing to hand off | CRDT merge-on-read (Chapter 7) |
 
 Graceful leave adds no separate flush: every accepted write was already pushed

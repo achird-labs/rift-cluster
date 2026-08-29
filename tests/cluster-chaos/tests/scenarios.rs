@@ -5839,19 +5839,43 @@ async fn c11_concurrent_recording_loses_nothing() {
             });
         }
     }
+    let mut refused = 0usize;
     while let Some(joined) = tasks.join_next().await {
         let (once, always) = joined.expect("hammer task");
-        assert_eq!(
-            once,
-            Some(200),
-            "a raced proxyOnce request must still answer"
+        // D-66 changed what a raced proxyOnce request may answer, and this assertion is where
+        // that shows up. 200 is the ordinary answer. 503 is the *designed* one for the instant
+        // the cluster cannot serialize the claim — here a readiness race against a
+        // just-created imposter, or the data-plane bridge shedding under a burst of
+        // `SIGS × NODES` simultaneous claims. Before D-66 that same condition forwarded to the
+        // origin and answered 200; that forward is the unbounded duplicate this scenario's own
+        // Ch.9 row exists to forbid, so the 503 is the fix working, not a regression.
+        //
+        // What is still pinned, and is what would catch a real break: the status is one of
+        // exactly those two (never a 5xx of another shape, never a 4xx), and — far stronger —
+        // the settle loop below still requires every signature to end Recorded exactly once on
+        // every node. A cluster that refused everything would hang there and fail.
+        assert!(
+            matches!(once, Some(200) | Some(503)),
+            "a raced proxyOnce request answers 200, or 503 when its claim could not be \
+             serialized (D-66) — nothing else: {once:?}"
         );
+        if once == Some(503) {
+            refused += 1;
+        }
+        // proxyAlways is the control and stays strict: it gates nothing, so it has no claim to
+        // refuse and D-66 must not have touched it. A refusal leaking into this mode would mean
+        // the store started failing closed before consulting the proxy mode.
         assert_eq!(
             always,
             Some(200),
-            "a raced proxyAlways request must still answer"
+            "a raced proxyAlways request must still answer — it gates nothing, so D-66 \
+             cannot refuse it"
         );
     }
+    println!(
+        "c11 artifact: raced proxyOnce requests refused (503, not forwarded) = {refused} of {}",
+        SIGS * NODES.len()
+    );
 
     // Settle: every proxyOnce signature ends Recorded — one stub each, on
     // every node. The fixture's readiness probes went through the same
@@ -5957,11 +5981,13 @@ async fn c11_concurrent_recording_loses_nothing() {
 /// - zero wedged signatures — every signature ends Recorded (a stub on every
 ///   node) and replaying (a final round adds nothing at the origin);
 /// - the duplicate-upstream bound is *measured* and printed, per Ch.12's
-///   philosophy, and asserted as one origin call per fire (initial + counted
-///   degraded-window refires): the contract bounds *recordings* at
-///   1 + ownership changes, while degraded forwards during the owner outage
-///   are by-design and tracked by the scenario itself — anything beyond its
-///   own fire count is genuine duplication.
+///   philosophy, and asserted as one origin call per **chargeable** fire —
+///   every fire except those the claim gate refused with a 503, which under
+///   D-66 are never forwarded and so provably cost the origin nothing. That
+///   makes the assertion the contract's own bound (recordings at 1 + ownership
+///   changes) rather than the pre-D-66 `1 + refires`, which scaled with the
+///   length of the outage. It now also catches the inverse regression: a
+///   refusal that forwarded anyway shows up as calls exceeding chargeable.
 /// - "recorded but stub-less" is asserted through its observable consequence:
 ///   any signature the fleet replays must show its recorded stub in every
 ///   node's applied config (no marker-inspection endpoint exists, and with
@@ -6008,7 +6034,10 @@ async fn c10_proxy_once_survives_owner_and_leader_kills() {
         let mut tasks = tokio::task::JoinSet::new();
         for (n, path) in sigs.iter().cloned().enumerate() {
             let node = firers[n % firers.len()];
-            tasks.spawn(async move { fire(node, &path).await });
+            tasks.spawn(async move {
+                let status = fire(node, &path).await;
+                (path, status)
+            });
         }
         tokio::time::sleep(Duration::from_millis(600)).await;
         cluster
@@ -6028,11 +6057,23 @@ async fn c10_proxy_once_survives_owner_and_leader_kills() {
             "{phase}: the kill landed before any claim was in flight — the mid-flight \
              premise is vacuous (origin had seen none of {sigs:?})"
         );
+        // A fire answered 503 was *refused* by the claim gate (D-66): the cluster could not
+        // serialize the claim, so the request was never forwarded and provably cost the origin
+        // nothing. That is what makes the bound below tighter than "one call per fire" — it is
+        // the only reason a fire can be discounted, and it is measured, not assumed.
+        let mut refusals: std::collections::BTreeMap<String, usize> =
+            sigs.iter().map(|sig| (sig.clone(), 0)).collect();
+        let mut chargeable: std::collections::BTreeMap<String, usize> =
+            sigs.iter().map(|sig| (sig.clone(), 0)).collect();
         while let Some(joined) = tasks.join_next().await {
-            // The response itself may be an error if its claim RPC raced the
-            // kill; the engine's contract is degrade-don't-wedge, asserted
-            // below by every signature ending Recorded.
-            let _ = joined.expect("hammer task");
+            let (path, status) = joined.expect("hammer task");
+            // `None` is a transport failure, not a refusal: it cannot be proven to have missed
+            // the origin, so it stays chargeable. Only an explicit 503 is discounted.
+            if status == Some(503) {
+                *refusals.entry(path).or_insert(0) += 1;
+            } else {
+                *chargeable.entry(path).or_insert(0) += 1;
+            }
         }
 
         cluster
@@ -6075,14 +6116,20 @@ async fn c10_proxy_once_survives_owner_and_leader_kills() {
             for (n, path) in sigs.iter().enumerate() {
                 // A signature recorded *somewhere* is committed and only
                 // replicating; refiring it would replay, not record. Only the
-                // genuinely unrecorded ones need another upstream round — and
-                // each refire is counted, because while a claim's owner is
-                // dead every retry legitimately forwards without recording
-                // (degrade-don't-wedge), so the origin-call bound below is a
-                // function of exactly this counter.
+                // genuinely unrecorded ones need another upstream round.
+                //
+                // Each refire is classified the same way the initial fires were: a 503 is a
+                // refused claim that never reached the origin (D-66), anything else is
+                // chargeable. Before D-66 a retry against a dead owner *forwarded* — which is
+                // why this bound used to have to be `1 + refires`, a bound the length of the
+                // outage rather than the length of the contract.
                 if recorded_on.get(path.as_str()) == Some(&0) {
                     *refires.entry(path.clone()).or_insert(0) += 1;
-                    let _ = fire(n % NODES.len(), path).await;
+                    if fire(n % NODES.len(), path).await == Some(503) {
+                        *refusals.entry(path.clone()).or_insert(0) += 1;
+                    } else {
+                        *chargeable.entry(path.clone()).or_insert(0) += 1;
+                    }
                 }
             }
             assert!(
@@ -6129,31 +6176,44 @@ async fn c10_proxy_once_survives_owner_and_leader_kills() {
             );
         }
 
-        // The measured duplicate bound — the Ch.12 artifact. The contract
-        // bounds *recordings* at 1 + ownership changes (Ch.6/Ch.7); upstream
-        // *calls* additionally include every degraded forward the outage
-        // window produced, and this scenario knows exactly how many of those
-        // it manufactured: its own refires. So the sound per-signature bound
-        // is `1 initial fire + refires` — one origin call per fire, at most —
-        // and anything above it is genuine duplication (a double recording or
-        // a replay that proxied), which is what the assertion exists to catch.
+        // The measured duplicate bound — the Ch.12 artifact.
+        //
+        // This bound used to be `1 initial fire + refires`: before D-66, a request whose claim
+        // could not be serialized was *forwarded* without recording, so every retry against a
+        // dead owner legitimately reached the origin and the only sound bound was the number of
+        // fires — a quantity set by how long the outage lasted, which is to say not a bound on
+        // anything the contract promises.
+        //
+        // Now a claim the cluster cannot serialize is refused (503) and never forwarded, so a
+        // refused fire provably costs the origin nothing and is discounted. What remains,
+        // `chargeable`, is the number of fires that could have reached the origin at all, and it
+        // collapses to the contract's own bound — 1 + ownership changes in flight (Ch.6/Ch.7) —
+        // whenever the outage refuses rather than forwards. Anything above it is genuine
+        // duplication: a double recording, a replay that proxied, or a refusal that forwarded
+        // after all, which is the regression this assertion now also catches.
         let max_calls = sigs
             .iter()
             .map(|path| after.get(path).copied().unwrap_or(0))
             .max()
             .unwrap_or(0);
         let max_refires = refires.values().copied().max().unwrap_or(0);
+        let total_refusals: usize = refusals.values().copied().sum();
+        let max_chargeable = chargeable.values().copied().max().unwrap_or(0);
         println!(
             "c10 artifact ({phase}): max upstream calls for one signature = {max_calls} \
-             (max degraded-window refires = {max_refires}; recordings bound: 1 + ownership changes)"
+             (max chargeable fires = {max_chargeable}; max refires = {max_refires}; \
+             refused-and-not-forwarded = {total_refusals}; \
+             recordings bound: 1 + ownership changes)"
         );
         for path in &sigs {
             let calls = after.get(path).copied().unwrap_or(0);
-            let fired = 1 + refires.get(path).copied().unwrap_or(0);
+            let fired = chargeable.get(path).copied().unwrap_or(0);
             assert!(
                 calls <= fired,
-                "{phase}: {path} reached the origin {calls} times from only {fired} fires — \
-                 a request that should have replayed proxied instead"
+                "{phase}: {path} reached the origin {calls} times from only {fired} chargeable \
+                 fires ({} refused, which must never forward) — either a request that should \
+                 have replayed proxied instead, or a refused claim forwarded anyway",
+                refusals.get(path).copied().unwrap_or(0)
             );
         }
     }

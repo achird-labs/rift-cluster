@@ -34,8 +34,8 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rift_cluster_base::seams::{
-    ClaimOutcome, ClaimToken, ProxyRecordingStore, ProxyStoreError, RecordedResponse,
-    RequestSignature, StubPlacement, StubPublication,
+    BackendUnavailable, ClaimOutcome, ClaimToken, ProxyRecordingStore, ProxyStoreError,
+    RecordedResponse, RequestSignature, StubPlacement, StubPublication,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -586,6 +586,32 @@ impl ProxyNet {
 /// rift, which is precisely the fidelity #226's acceptance forbids — a mode-less proxy
 /// stub round-trips as `"mode": ""`, and reading that as anything but transparent would
 /// silently turn a forward-everything proxy into a record-once one.
+/// Turn a claim-path failure into the refusing form (D-66) and count it.
+///
+/// Mirrors `stores/flow.rs::unavailable`, with one deliberate difference: the flow store splits
+/// cluster-state failures (503) from request faults (500), and this face does not. At a claim
+/// there is no request payload that can be at fault — the input is `(port, signature)` — and the
+/// two non-cluster-state paths that exist (a reply that fails to decode, i.e. version skew mid
+/// upgrade; the owner's own `proxy_recorded` read failing) are transient from the client's seat.
+/// Every one of them is "not now, retry", which is what `503` says.
+///
+/// The reason string upstream built survives as `detail`, so `owner is isolated from the
+/// cluster`, `not bound`, `ownership unsettled` and the bridge's `Timeout`/`Transport`/`Shed`
+/// text all reach the response body — the runbook signal D-61 chose, exactly as D-65 kept it.
+fn refused(e: ProxyStoreError) -> ProxyStoreError {
+    // Already refusing: count it once and pass it through unchanged. Nothing below this face
+    // constructs `Refused` today, so this arm is defensive — but a second wrap would both
+    // double-count and bury the original detail inside a Display of itself.
+    if matches!(e, ProxyStoreError::Refused(_)) {
+        return e;
+    }
+    metrics::proxy_claim("refused");
+    ProxyStoreError::Refused(BackendUnavailable {
+        feature: "proxyOnce",
+        detail: e.to_string(),
+    })
+}
+
 fn parse_proxy_mode(config_json: &str) -> PortMode {
     let config = match serde_json::from_str::<Value>(config_json) {
         Ok(config) => config,
@@ -1020,16 +1046,33 @@ impl ClusterProxyStore {
 }
 
 impl ProxyRecordingStore for ClusterProxyStore {
+    /// D-66: under `proxyOnce` this store **is** the exactly-once arbiter, so a failure to
+    /// obtain a claim answer refuses the request rather than degrading it. Upstream's
+    /// `ProxyStoreError::Unavailable` means "forward without recording" — correct for a store
+    /// that merely persists, wrong for one that arbitrates: with nothing serializing claims,
+    /// every request for the duration of the outage reaches the upstream, so the duplicate is
+    /// bounded by the outage rather than by one racing window. `Refused` carries
+    /// [`BackendUnavailable`], which the data plane answers `503` (U-17), delivering the status
+    /// RFC-001 §7.6 and Ch. 9 have promised all along.
+    ///
+    /// `InFlight` is untouched: a claim *was* serialized there, so that forward is the bounded,
+    /// by-design duplicate (Ch. 12's C11 row).
     fn try_claim(
         &self,
         port: u16,
         sig: &RequestSignature,
     ) -> Result<ClaimOutcome, ProxyStoreError> {
-        let identity = self.net.port_identity(port)?;
+        // Fail closed *before* the mode is known: an unresolved port identity cannot prove this
+        // port does not gate, and the only ways to reach it while serving traffic are a node
+        // mid-shutdown or a cache miss racing a delete — both "not now", never "go ahead".
+        let identity = self.net.port_identity(port).map_err(refused)?;
         match identity.mode {
-            PortMode::Once => self.blocking_claim(&identity.tenant, port, sig),
+            PortMode::Once => self
+                .blocking_claim(&identity.tenant, port, sig)
+                .map_err(refused),
             // proxyAlways / proxyTransparent never gate — the claim is a formality so the
-            // caller path is uniform, exactly as `LocalProxyStore` answers.
+            // caller path is uniform, exactly as `LocalProxyStore` answers. Nothing is being
+            // arbitrated, so there is nothing to refuse.
             PortMode::Always | PortMode::Transparent => Ok(ClaimOutcome::Claimed(ClaimToken::new(
                 self.net.mint_token(),
             ))),

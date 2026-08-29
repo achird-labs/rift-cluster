@@ -297,6 +297,11 @@ ever was.)
 
 ## proxyOnce: exactly-once recording via an owner claim
 
+> **Amended by D-66** (2026-08-29, #529): the duplicate-upstream bound below holds only while
+> something is serializing claims. When nothing is — an isolated, unreachable or not-ready owner —
+> the request is now **refused** (`503`) rather than forwarded; see the paragraph after the state
+> diagram.
+
 The one verification feature that is *not* mergeable: `proxyOnce` must call
 the real upstream **once** per request signature, record the response, and
 replay it forever after. "Once" under concurrent first-hits on three nodes
@@ -352,6 +357,23 @@ config stub, is the replay source for the stub-less case. The claim deadline
 is a fixed TTL rather than a per-imposter derivation because the recording
 seam (U-16) deliberately carries no timeout context; it only needs to sit
 comfortably above any upstream call the engine would wait for.
+
+**When the arbiter cannot answer, the request fails — it is not forwarded.** The bound above
+("1 + ownership changes in flight") holds only while *something* is serializing claims. If the
+owner is isolated, unreachable, or not yet ready, nothing is: every request for the duration of
+the outage would reach the real upstream, and the duplicate would be bounded by the outage rather
+than by the contract. So a claim the cluster cannot serialize is **refused** — `503`
+`backendUnavailable`, `feature: "proxyOnce"`, the reason in `detail` — and the upstream is never
+called (D-66, through the U-17 seam; Chapter 9's degradation table has promised this status since
+the design was written, and RFC-001 §7.6 with it). Refusals are counted
+`rift_cluster_proxy_claims_total{outcome="refused"}`.
+
+Two things this deliberately does **not** cover. `ClaimOutcome::InFlight` — a concurrent
+first-hit that lost the race — still proxies without recording: a claim *was* serialized there, so
+that duplicate is the bounded, by-design one (Chapter 12's C11 row). And `complete`/`release`
+failures still release the claim and serve the response, because by then the upstream call has
+already succeeded; answering `503` would provoke a retry, and the retry is the duplicate.
+`proxyAlways` and `proxyTransparent` gate nothing and so refuse nothing.
 
 ## What this plane deliberately does not promise
 

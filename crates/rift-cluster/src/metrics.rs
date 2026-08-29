@@ -400,8 +400,12 @@ lazy_static! {
     /// `rift_cluster_proxy_claims_total{outcome}` — proxyOnce claim answers as the data
     /// plane saw them (#226). `granted` = this request won the right to record;
     /// `inflight` = a concurrent winner exists (this request proxies without recording);
-    /// `already_recorded` = replay. `granted` exceeding recordings over time means claims
-    /// are being released — see the releases counter for why.
+    /// `already_recorded` = replay; `refused` = the cluster could not serialize the claim
+    /// (isolated, unreachable owner, not ready, unsettled ring) so the request was answered
+    /// `503` and **not** forwarded (D-66). `granted` exceeding recordings over time means
+    /// claims are being released — see the releases counter for why. A rising `refused` is
+    /// the proxyOnce reading of the same condition `rift_cluster_isolated` gauges: requests
+    /// are being correctly failed rather than silently duplicated at the upstream.
     static ref PROXY_CLAIMS: IntCounterVec = register_int_counter_vec!(
         "rift_cluster_proxy_claims_total",
         "proxyOnce claim outcomes, as answered to this node's data plane",
@@ -833,7 +837,8 @@ pub(crate) fn sequence_reset_incomplete() {
     SEQUENCE_RESETS_INCOMPLETE.inc();
 }
 
-/// `outcome` ∈ `granted` / `inflight` / `already_recorded` — closed at the call sites.
+/// `outcome` ∈ `granted` / `inflight` / `already_recorded` / `refused` — closed at the
+/// call sites.
 pub(crate) fn proxy_claim(outcome: &str) {
     PROXY_CLAIMS.with_label_values(&[outcome]).inc();
 }

@@ -70,6 +70,11 @@ owner-routing in its place.
 
 ## The chaos suite
 
+> **Amended by D-66** (2026-08-29, #529): C10's duplicate-upstream acceptance is now one origin
+> call per **chargeable** fire — every fire except those the claim gate refused with a `503`,
+> which are never forwarded. The former `1 + refires` bound scaled with the length of the outage
+> rather than with anything the contract promises.
+
 Each scenario targets a specific claim made earlier in this guide. The
 registry below is rebuilt from the harness — `tests/cluster-chaos/tests/scenarios.rs`
 is the source of truth, and every scenario it knows has a row. Status lives in
@@ -91,8 +96,8 @@ fail under D-15) and stay unallocated.
 | C6 ✅ | 30% connection resets + 100 ± 100 ms jitter on the cluster port via toxiproxy, 60 s (#73/#94: `c6_loss_and_jitter_do_not_flap_or_lose_writes`) | Leadership transitions bounded by **rate** (`C6_MAX_LEADER_TRANSITIONS`), not count — the jitter overlaps the election timeout by design; no false membership changes; zero lost acknowledged writes |
 | C7 ✅ | Node joins with stale/empty disk (#73: `c7_joining_node_serves_nothing_until_reconciled`) | Serves nothing until caught up; then byte-identical config |
 | C8 📋 planned (RFC-001 §12; no issue filed) | Round-robin scenario traffic, healthy fleet, no affinity | Zero stale-read matches — the owner-read guarantee under the worst LB |
-| C10 ✅ | Kill claim-owner AND config-leader at proxyOnce's two critical moments (#228: `c10_proxy_once_survives_owner_and_leader_kills`) | Duplicate upstream calls ≤ measured bound (printed as the run's artifact); **zero wedged signatures**; failed publication releases the claim; a replaying signature shows its stub on every node |
-| C11 ✅ | Concurrent proxy recording on 3 nodes (#228: `c11_concurrent_recording_loses_nothing`) | Exactly one recorded stub per proxyOnce signature fleet-wide; zero upstream calls once Recorded; proxyAlways never replays and merges every recording (an `InFlight` racer forwards-without-recording *by upstream design*, so the racing-window call count is measured, not pinned) |
+| C10 ✅ | Kill claim-owner AND config-leader at proxyOnce's two critical moments (#228: `c10_proxy_once_survives_owner_and_leader_kills`) | Duplicate upstream calls ≤ **1 + ownership changes in the phase** — the contract's own bound, not a bound derived from the outage; refusals during the outage are counted and printed as the run's artifact (D-66); **zero wedged signatures**; failed publication releases the claim; a replaying signature shows its stub on every node |
+| C11 ✅ | Concurrent proxy recording on 3 nodes (#228: `c11_concurrent_recording_loses_nothing`) | Exactly one recorded stub per proxyOnce signature fleet-wide; zero upstream calls once Recorded; proxyAlways never replays and merges every recording (an `InFlight` racer forwards-without-recording *by upstream design*, so the racing-window call count is measured, not pinned). A raced `proxyOnce` request answers `200` **or** `503` — the latter when the cluster could not serialize its claim in that instant (D-66), which under load is a normal outcome and not a failure; `proxyAlways` stays strictly `200` as the control |
 | C12 ✅ | ±5 s clock skew across nodes via `faketime.overlay.yml` (#228: `c12_clears_are_exact_under_clock_skew`) | Clears exact (generation-based, clock-free): a fast-clock clear erases fleet-wide, every post-clear append survives, racing skewed clears converge; the skew itself is proven real before any probe runs |
 | C13 📋 planned (RFC-001 §12; no issue filed) | Owner black-holes while 20% of load is stateful | **Stateless p99 < 5 ms throughout** — the bridge + fast-fail firewall |
 | C14 ✅ | Kill the Raft leader during a 100-write admin storm (#11: `c14_leader_kill_keeps_every_acknowledged_write`) | Every write acked-and-present or 503-with-op-id-then-present; zero duplicates; writes resume within `WRITES_RESUME_BOUND` (measured as write availability, not off the ~5 s leader gauge) |
