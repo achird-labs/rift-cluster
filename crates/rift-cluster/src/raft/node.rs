@@ -534,45 +534,33 @@ where
 
 /// Put `payload` to one peer, trying each address its authority resolved to.
 ///
-/// Mirrors `call_any_typed`'s sweep rule: only a *liveness* failure is worth
-/// trying the next address for. A peer that answers — even to refuse — has
-/// answered, and re-asking a second address would overwrite that answer with a
-/// later address's transport error.
+/// This is [`sweep_addresses`] with a put as the per-address call, so D-61 §2's rule — only a
+/// *liveness* failure is worth trying the next address for — is read from
+/// [`RpcError::is_liveness_failure`] rather than restated here (#521).
 async fn send_blob_to_peer(
     transfer: &crate::blobs::client::BlobTransfer,
+    authority: &str,
     addrs: &[SocketAddr],
     digest: &crate::blobs::BlobDigest,
     payload: &[u8],
 ) -> Result<crate::blobs::client::PutOutcome, RpcError> {
-    let mut last = RpcError::Transport("no address answered".to_owned());
-    for addr in addrs {
-        match transfer.put(*addr, digest, payload).await {
-            Ok(outcome) => return Ok(outcome),
-            Err(e @ (RpcError::Timeout | RpcError::Transport(_) | RpcError::Shed)) => last = e,
-            Err(answered) => return Err(answered),
-        }
-    }
-    Err(last)
+    sweep_addresses(addrs, |peer| transfer.put(peer, digest, payload))
+        .await
+        .map_err(|failure| failure.into_typed(authority))
 }
 
 /// Probe one peer's sideload capability without sending it any bytes (#481) — the learner half
 /// of [`RaftNode::fan_out_blob`]'s capability sweep, for a member the byte quorum does not
-/// include. Mirrors [`send_blob_to_peer`]'s same-peer address sweep rule exactly: only a
-/// liveness failure is worth trying the next address for.
+/// include. The same sweep as [`send_blob_to_peer`], with a stat in place of the put.
 async fn stat_only_peer(
     transfer: &crate::blobs::client::BlobTransfer,
+    authority: &str,
     addrs: &[SocketAddr],
     digest: &crate::blobs::BlobDigest,
 ) -> Result<bool, RpcError> {
-    let mut last = RpcError::Transport("no address answered".to_owned());
-    for addr in addrs {
-        match transfer.stat_only(*addr, digest).await {
-            Ok(capable) => return Ok(capable),
-            Err(e @ (RpcError::Timeout | RpcError::Transport(_) | RpcError::Shed)) => last = e,
-            Err(answered) => return Err(answered),
-        }
-    }
-    Err(last)
+    sweep_addresses(addrs, |peer| transfer.stat_only(peer, digest))
+        .await
+        .map_err(|failure| failure.into_typed(authority))
 }
 
 /// The control-plane Raft node.
@@ -1346,8 +1334,8 @@ impl RaftNode {
         // tasks must own everything they touch. Split here into who gets bytes
         // (`peers`, unchanged from before #481) and who is only probed for
         // capability (`probe_only`, the learners `all_members` adds).
-        let mut peers: Vec<(NodeId, Vec<SocketAddr>)> = Vec::new();
-        let mut probe_only: Vec<(NodeId, Vec<SocketAddr>)> = Vec::new();
+        let mut peers: Vec<(NodeId, String, Vec<SocketAddr>)> = Vec::new();
+        let mut probe_only: Vec<(NodeId, String, Vec<SocketAddr>)> = Vec::new();
         for id in all_members.iter().copied() {
             if id == self.id {
                 continue;
@@ -1358,9 +1346,9 @@ impl RaftNode {
             match self.resolve(&authority).await {
                 Ok(addrs) if !addrs.is_empty() => {
                     if voter_members.contains(&id) {
-                        peers.push((id, addrs));
+                        peers.push((id, authority, addrs));
                     } else {
-                        probe_only.push((id, addrs));
+                        probe_only.push((id, authority, addrs));
                     }
                 }
                 Ok(_) => {
@@ -1376,15 +1364,14 @@ impl RaftNode {
         // reuses the same connections and signer rather than standing up its own.
         let client = Arc::new(self.client.clone());
         let mut tasks = tokio::task::JoinSet::new();
-        for (id, addrs) in peers {
+        for (id, authority, addrs) in peers {
             let transfer = crate::blobs::client::BlobTransfer::new(Arc::clone(&client));
             let digest = digest.clone();
             let payload = Arc::clone(&payload);
             tasks.spawn(async move {
-                (
-                    id,
-                    send_blob_to_peer(&transfer, &addrs, &digest, &payload).await,
-                )
+                let outcome =
+                    send_blob_to_peer(&transfer, &authority, &addrs, &digest, &payload).await;
+                (id, authority, outcome)
             });
         }
 
@@ -1397,10 +1384,13 @@ impl RaftNode {
         // skipping is what would let a stale `true` outlive the build it described — see
         // `remember_capability`.
         let mut probes = tokio::task::JoinSet::new();
-        for (id, addrs) in probe_only {
+        for (id, authority, addrs) in probe_only {
             let transfer = crate::blobs::client::BlobTransfer::new(Arc::clone(&client));
             let digest = digest.clone();
-            probes.spawn(async move { (id, stat_only_peer(&transfer, &addrs, &digest).await) });
+            probes.spawn(async move {
+                let capable = stat_only_peer(&transfer, &authority, &addrs, &digest).await;
+                (id, authority, capable)
+            });
         }
 
         let mut acks: BTreeSet<NodeId> = BTreeSet::from([self.id]);
@@ -1415,8 +1405,8 @@ impl RaftNode {
             observed_capable.insert(self.id);
         }
         while let Some(joined) = tasks.join_next().await {
-            let (id, result) = match joined {
-                Ok(pair) => pair,
+            let (id, authority, result) = match joined {
+                Ok(triple) => triple,
                 Err(e) => {
                     tracing::warn!(error = %e, "blob fan-out task panicked");
                     continue;
@@ -1438,11 +1428,11 @@ impl RaftNode {
                 // report a durability it never had — so it counts as nothing
                 // and is surfaced separately.
                 Err(e @ (RpcError::UnknownRoute { .. } | RpcError::VersionSkew { .. })) => {
-                    tracing::warn!(node_id = id, error = %e, "blob fan-out: peer cannot serve blobs; not counted toward quorum");
+                    tracing::warn!(node_id = id, %authority, error = %e, "blob fan-out: peer cannot serve blobs; not counted toward quorum");
                     skewed.insert(id);
                 }
                 Err(e) => {
-                    tracing::warn!(node_id = id, error = %e, "blob fan-out: peer did not take the blob");
+                    tracing::warn!(node_id = id, %authority, error = %e, "blob fan-out: peer did not take the blob");
                 }
             }
         }
@@ -1451,8 +1441,8 @@ impl RaftNode {
         // voter, so their sideload capability still has to be probed — a stat-only round trip that
         // costs no bytes.
         while let Some(joined) = probes.join_next().await {
-            let (id, result) = match joined {
-                Ok(pair) => pair,
+            let (id, authority, result) = match joined {
+                Ok(triple) => triple,
                 Err(e) => {
                     tracing::warn!(error = %e, "blob capability probe task panicked");
                     continue;
@@ -1472,11 +1462,11 @@ impl RaftNode {
                 // failover is self-correcting; for a permanently old learner that is the wrong
                 // advice, and nothing would ever correct it.
                 Err(e @ (RpcError::UnknownRoute { .. } | RpcError::VersionSkew { .. })) => {
-                    tracing::warn!(node_id = id, error = %e, "blob fan-out: peer's build cannot serve blobs");
+                    tracing::warn!(node_id = id, %authority, error = %e, "blob fan-out: peer's build cannot serve blobs");
                     observed_incapable.insert(id);
                 }
                 Err(e) => {
-                    tracing::warn!(node_id = id, error = %e, "blob fan-out: could not probe sideload capability");
+                    tracing::warn!(node_id = id, %authority, error = %e, "blob fan-out: could not probe sideload capability");
                 }
             }
         }

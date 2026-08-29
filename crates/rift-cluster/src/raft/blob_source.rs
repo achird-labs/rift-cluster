@@ -96,7 +96,10 @@ fn classify(error: &RpcError) -> FetchStep {
     match error {
         RpcError::NotFound { .. } => FetchStep::NextPeer,
         RpcError::UnknownRoute { .. } | RpcError::VersionSkew { .. } => FetchStep::Skewed,
-        RpcError::Timeout | RpcError::Transport(_) | RpcError::Shed => FetchStep::NextAddress,
+        // Not a copy of the variant list: `is_liveness_failure` is its one definition
+        // (D-61 §2, #521). Matched after the three arms above, which are D-48's own answers and
+        // stay D-48's whatever that rule grows to include.
+        e if e.is_liveness_failure() => FetchStep::NextAddress,
         _ => FetchStep::Refused,
     }
 }
@@ -668,6 +671,101 @@ mod tests {
             }),
             FetchStep::Refused
         );
+    }
+
+    /// One representative value of every [`RpcError`] variant.
+    ///
+    /// The never-called wildcard-free `match` below is the point, in the shape `metrics.rs`
+    /// already uses for the reason buckets: a variant added to `RpcError` stops compiling
+    /// *there* until it is listed, which puts whoever adds it in this file — the check this
+    /// list feeds cannot quietly stop covering the enum. Keys come from `reason()` rather than
+    /// a second hand-written label list, since a copied list is the very thing #521 is about.
+    fn every_rpc_error_variant() -> Vec<RpcError> {
+        let all = vec![
+            RpcError::Unauthorized(crate::rpc::AuthError::BadMac),
+            RpcError::VersionSkew {
+                peer: None,
+                ours: PROTO_VERSION,
+            },
+            RpcError::UnknownRoute {
+                method: "GET".to_owned(),
+                path: "/internal/v1/blob/x".to_owned(),
+            },
+            RpcError::BodyTooLarge { limit: 32 },
+            RpcError::Timeout,
+            RpcError::Transport("connection refused".to_owned()),
+            RpcError::Shed,
+            RpcError::BadRequest("malformed".to_owned()),
+            RpcError::Unavailable {
+                detail: "no leader".to_owned(),
+                op_id: None,
+            },
+            RpcError::NotLeader { leader: None },
+            RpcError::Handler("blob hashes to something else".to_owned()),
+            RpcError::NotFound {
+                what: "blob".to_owned(),
+            },
+        ];
+
+        fn _every_variant_is_listed_above(e: &RpcError) {
+            match e {
+                RpcError::Unauthorized(_)
+                | RpcError::VersionSkew { .. }
+                | RpcError::UnknownRoute { .. }
+                | RpcError::BodyTooLarge { .. }
+                | RpcError::Timeout
+                | RpcError::Transport(_)
+                | RpcError::Shed
+                | RpcError::BadRequest(_)
+                | RpcError::Unavailable { .. }
+                | RpcError::NotLeader { .. }
+                | RpcError::Handler(_)
+                | RpcError::NotFound { .. } => {}
+            }
+        }
+
+        let covered: std::collections::BTreeSet<_> = all.iter().map(RpcError::reason).collect();
+        assert_eq!(
+            covered.len(),
+            all.len(),
+            "two values of the same variant: {covered:?}"
+        );
+        all
+    }
+
+    /// Pins D-61 §2 for the fetch classifier: `RpcError::is_liveness_failure` is the *only*
+    /// definition of "the peer was not reached", and `classify` must not restate it.
+    ///
+    /// Outside the three variants D-48 answers for itself (`NotFound` absent, `UnknownRoute`
+    /// and `VersionSkew` skewed), every variant routes to `NextAddress` exactly when
+    /// `is_liveness_failure` says so.
+    ///
+    /// What this discriminates, stated precisely because it is narrow: it fails when a *copy*
+    /// of the variant list is present here **and** the rule has moved on — which is the drift
+    /// #521 is about, a variant added to `is_liveness_failure` that a copy keeps classifying as
+    /// `Refused`, sending the round to the next *member* instead of the peer's next *address*.
+    /// It cannot fail while `classify` delegates, because then both sides move together — that
+    /// is the property the fix creates, not a weakness of the test. The forward guard is the
+    /// compile break in [`every_rpc_error_variant`].
+    #[test]
+    fn classify_follows_is_liveness_failure_for_every_variant() {
+        for e in every_rpc_error_variant() {
+            if matches!(
+                e,
+                RpcError::NotFound { .. }
+                    | RpcError::UnknownRoute { .. }
+                    | RpcError::VersionSkew { .. }
+            ) {
+                continue;
+            }
+            let step = classify(&e);
+            assert_eq!(
+                step == FetchStep::NextAddress,
+                e.is_liveness_failure(),
+                "{e:?}: classify says {step:?}, is_liveness_failure() says {}",
+                e.is_liveness_failure()
+            );
+        }
     }
 
     // ---- the local path ----
