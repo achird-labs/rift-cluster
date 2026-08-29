@@ -1,0 +1,47 @@
+# Overlay: publish C33's owner-mode sequencing imposter on every node.
+#
+#     docker compose -f deploy/compose/docker-compose.yml \
+#                    -f tests/cluster-chaos/compose/sequencing.overlay.yml up
+#
+# Why C33 needs it: the claim is that `_rift.sequencing.mode: "owner"` makes
+# `responses: [A, B, C]` cycle **once fleet-wide** behind a load balancer, and
+# that killing the cursor's owner degrades to a local cursor instead of failing
+# the request (D-47, D-10). Both are facts about the response *body* and its
+# `rift-cluster-sequence` header, and `exec_probe` — the path most scenarios use
+# to reach the data plane — runs the healthcheck subcommand inside a container
+# and answers success/failure only, dropping both. So the port has to be
+# reachable from the host, where a real client can read them.
+#
+# All three nodes, and that is the claim rather than a convenience: a
+# round-robin spray across the fleet is what a load balancer does, and it is the
+# only arrangement in which "one cursor, not three" can fail. Publishing one
+# node would exercise the owner-local short-circuit and nothing else.
+#
+# Its own port and its own overlay, not a reuse of flow-state's 6400: two
+# scenarios sharing a data port couple them, and the sibling overlays' headers
+# already warn against this quietly becoming "the chaos tier publishes the data
+# plane". One port, one scenario, enabled only where it is needed.
+#
+# No `MB_ALLOW_INJECTION` here, unlike flow-state's overlay: a cycling stub is
+# plain config with no script in it, so this scenario runs against the same
+# injection-refusing topology the shipped compose file describes.
+#
+# 16700/26700/36700 follow the base file's convention (1xxxx/2xxxx/3xxxx for
+# rift-1/2/3). **36700 is inside** Linux's ephemeral source-port range
+# (32768-60999) and so must be reserved by the `ip_local_reserved_ports` step in
+# both `ci.yml` and `nightly-chaos.yml`, alongside its 36300/36400/36500-36501
+# siblings — an outbound connection could otherwise be holding it when compose
+# tries to publish it (#117). The other two sit below the range and need
+# nothing. `ci_reserves_every_published_port_that_linux_could_hand_out` fails
+# the build if that reservation is ever dropped.
+
+services:
+  rift-1:
+    ports:
+      - "16700:6700"
+  rift-2:
+    ports:
+      - "26700:6700"
+  rift-3:
+    ports:
+      - "36700:6700"

@@ -570,6 +570,7 @@ pub fn published_host_ports() -> Vec<u16> {
     ports.extend(SOURCES_HOST_PORTS);
     ports.extend(TENANCY_A_HOST_PORTS);
     ports.extend(TENANCY_B_HOST_PORTS);
+    ports.extend(SEQUENCING_HOST_PORTS);
     ports
 }
 
@@ -1035,6 +1036,21 @@ pub const PULL_ON_MISS_HOST_PORTS: [u16; 3] = [16300, 26300, 36300];
 /// way a load balancer would.
 pub const FLOW_STATE_IMPOSTER_PORT: u16 = 6400;
 pub const FLOW_STATE_HOST_PORTS: [u16; 3] = [16400, 26400, 36400];
+
+/// C33's imposter data port, and the host ports `sequencing.overlay.yml`
+/// publishes it on — one per node, in [`NODES`] order, so the scenario can
+/// round-robin its data-plane requests across the fleet the way a load balancer
+/// would.
+///
+/// Sequencing needs the *body* and the `rift-cluster-sequence` header, neither
+/// of which [`exec_probe`] can return, and it needs all three nodes because
+/// "one cursor, not three" is only falsifiable when the requests are spread.
+///
+/// 36700 is inside Linux's ephemeral range (32768-60999) and is reserved in
+/// both workflows alongside 36300/36400/36500-36501; the other two sit below it
+/// — see the overlay's header and #117.
+pub const SEQUENCING_IMPOSTER_PORT: u16 = 6700;
+pub const SEQUENCING_HOST_PORTS: [u16; 3] = [16700, 26700, 36700];
 
 /// C27's two imposter data ports — one per tenant — and the host ports
 /// `tenancy.overlay.yml` publishes them on, indexed like [`NODES`].
