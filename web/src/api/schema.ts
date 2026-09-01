@@ -605,11 +605,15 @@ export interface paths {
         /**
          * Read the caller's tenant's front-door route table
          * @description Terminates: this front door's only read path — a state-machine read, not a mutation, so it never reaches the write classifier or the proxy. There is no upstream `/front-door/routes` to fall back on. The table and its `Rift-Cluster-Revision` are read in one state-machine transaction, so the revision always describes exactly the body returned with it.
+         *
+         *     The body is a config document a client `PUT`s back verbatim, and stays one: `installed` is a read-only decoration ignored on parse, so round-tripping this response through `putFrontDoorRoutes` stores an identical table.
          */
         get: operations["getFrontDoorRoutes"];
         /**
          * Replace the caller's tenant's front-door route table
          * @description Terminates: whole-table replace, deterministic and pre-validated before commit, so the parsed table itself is what gets stored (no post-commit re-read — there is no upstream `/front-door/routes` to read from). Because it replaces the table wholesale, an unconditional `PUT` silently discards any edit committed since the caller read — send `If-Match` with the revision `getFrontDoorRoutes` answered to make the replace conditional.
+         *
+         *     **Only the default tenant's routes are compiled into the shared front door.** A non-default tenant's table is validated, committed and read back intact — the tenant sees what it wrote, and the data survives whenever the front door grows a tenant dimension — but it is never compiled in, so none of its routes can take a dispatch. The `200` here means the table was stored, not that it will dispatch; the `installed` field in the response body is the one place the write says which.
          */
         put: operations["putFrontDoorRoutes"];
         post?: never;
@@ -1676,6 +1680,11 @@ export interface components {
         };
         RouteTable: {
             routes?: components["schemas"]["Route"][];
+        };
+        /** @description A route table as answered, which is the stored table plus whether this tenant's routes are compiled into the shared front door. Request bodies take a plain `RouteTable` — `installed` is derived server-side and any value sent for it is ignored, so a client cannot declare its own table installed. */
+        RouteTableView: components["schemas"]["RouteTable"] & {
+            /** @description Whether this tenant's routes are compiled into the shared front door. **Only the default tenant's are.** A non-default tenant's table is validated, stored, replicated and served back unchanged, but is never compiled in and can therefore never take a dispatch — `false` here is the difference between "these routes took no traffic" and "these routes cannot take any". Same fact, same source function, and the same word `getFrontDoorRouteHits` reports it under. */
+            installed: boolean;
         };
         RouteHits: {
             /** @description Whether this tenant's routes are compiled into the shared front door. False means they are stored but can never take a dispatch. */
@@ -4345,14 +4354,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The tenant's route table. */
+            /** @description The tenant's route table, and whether it is compiled into the shared front door — `false` for every non-default tenant, whose routes are stored and served back but never dispatch. */
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RouteTable"];
+                    "application/json": components["schemas"]["RouteTableView"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -4391,7 +4400,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The stored table. */
+            /** @description The stored table, and whether it is compiled into the shared front door. */
             200: {
                 headers: {
                     "Rift-Cluster-Revision": components["headers"]["RiftClusterRevision"];
@@ -4399,7 +4408,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RouteTable"];
+                    "application/json": components["schemas"]["RouteTableView"];
                 };
             };
             202: components["responses"]["AcceptedParked"];

@@ -1507,6 +1507,36 @@ async fn handle(state: Arc<FrontState>, req: Request<Incoming>) -> Response<Fron
     proxy(state, req, None).await
 }
 
+/// A route table as *answered*, which is the stored table plus whether this tenant's routes are
+/// compiled into the shared front door (issue #536, D-68).
+///
+/// A serialize-only decoration rather than a field on [`RouteTable`] itself: `installed` is a
+/// property of the **tenant**, not of the table, so putting it on the shared type would push it
+/// into the state machine's stored bytes and into the *request* body — where a client could assert
+/// itself installed. `serde(flatten)` over a struct that serializes as a map yields exactly
+/// `{"routes": [...], "installed": <bool>}`, which is also why this is a struct and not a
+/// `serde_json::Value` with a key inserted: there is no "the value was not an object" branch to
+/// either handle or quietly swallow.
+#[derive(Serialize)]
+struct RouteTableView<'a> {
+    #[serde(flatten)]
+    table: &'a RouteTable,
+    installed: bool,
+}
+
+/// The body both `/front-door/routes` endpoints answer with.
+///
+/// One helper for the write and the read so the two cannot drift from each other, and
+/// [`routes_installed_for`] so neither can drift from the compiler that enforces the rule
+/// (`RedbStateMachine::desired_routes`) — the same single-definition discipline
+/// `GET /front-door/route-hits` already follows.
+fn route_table_body(table: &RouteTable, tenant: &TenantId) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&RouteTableView {
+        table,
+        installed: routes_installed_for(tenant.as_str()),
+    })
+}
+
 /// `GET /front-door/routes`: `tenant`'s current route table, read straight from the state machine.
 /// This is the front door's *only* read path (issue #131) — upstream never shipped a `GET` to proxy
 /// to, so unlike every other read in this module, there is no loopback re-read to fall back on.
@@ -1532,7 +1562,7 @@ async fn read_routes(
         Ok(pair) => pair,
         Err(e) => return internal(&e.to_string()),
     };
-    let body = match serde_json::to_vec(&table) {
+    let body = match route_table_body(&table, tenant) {
         Ok(body) => body,
         Err(e) => return internal(&e.to_string()),
     };
@@ -7123,7 +7153,11 @@ async fn build_mutation(
             // table just parsed IS what gets stored — captured now rather
             // than re-read, the same shortcut `SetEnabled` takes for its
             // canned message.
-            let body = serde_json::to_vec(&table).map_err(|e| internal(&e.to_string()))?;
+            //
+            // Decorated with `installed` (issue #536): this is the one moment a caller could act
+            // on the fact that a non-default tenant's table, though stored and readable, is never
+            // compiled into the shared front door and can take no dispatch.
+            let body = route_table_body(&table, tenant).map_err(|e| internal(&e.to_string()))?;
             Ok(Mutation {
                 ops: vec![ControlOp::PutRoutes {
                     tenant: tenant.clone(),

@@ -2150,3 +2150,57 @@ and would still be answering with a log what the uploaded TSV answers directly.
 *Rejected:* asserting the printed figures instead of recording them. That is the guessed-constant
 the philosophy rejects — C10's assertion is the contract's own bound, and the artifact is the
 separate question of what the run actually measured underneath it.
+
+### D-68 — Both front-door route endpoints publish `installed`; the write says what it cannot do
+
+- **Status:** active
+- **Decided:** 2026-09-01
+- **Refines:** D-54
+- **Amends:** docs/architecture/13-front-door-and-sources.md
+- **Implemented by:** #536
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/control.rs
+
+`routes_installed_for` is the single definition of which tenants' routes are compiled into the
+shared front door, and only the default tenant's are. That rule is deliberate — the front door is
+one listener with no tenant discriminator, so a unioned table would let any tenant publish a
+catch-all that captures the whole fleet's traffic — and it is not what this entry changes.
+
+The rule had **two** call sites and neither was a write: the compiler that enforces it
+(`RedbStateMachine::desired_routes`) and `GET /front-door/route-hits`. So a non-default tenant's
+`PUT /front-door/routes` was validated, committed to the replicated log, read back byte-for-byte
+and answered `200` for a table that could never dispatch a single request, with the only signal in
+the system sitting behind a *different* endpoint the caller had no reason to suspect it needed.
+
+**The rule.** Both `PUT` and `GET /front-door/routes` answer `installed: <bool>` beside the table,
+derived from `routes_installed_for` at the render site through one shared helper — so the write,
+the read and the compiler cannot drift from each other, and the word means exactly what
+`route-hits` already means by it. `200` continues to mean *stored*; `installed` is what says
+*dispatching*.
+
+**Why a body field and not a `Warning` header.** `Warning` is deprecated (RFC 9111 obsoleted RFC
+7234's definition), so it is not a surface to put new contract on. Beyond that, headers are
+routinely dropped by clients, proxies and logs, while SDK consumers treat this admin API as JSON
+passthrough — a body field reaches every one of them with no SDK change, and gives the console one
+concept to render rather than two.
+
+**Why a response decoration and not a field on `RouteTable`.** `installed` is a property of the
+**tenant**, not of the table. On the shared type it would enter the state machine's stored bytes
+and the *request* body, where a client could assert itself installed. It is therefore a
+serialize-only view (`RouteTableView`, `serde(flatten)`) over the stored table, and a `PUT` body
+carrying `installed` is ignored on parse. `RouteTable` sets no `deny_unknown_fields`, so the read
+body stays what its contract calls it — a config document a client `PUT`s back verbatim.
+
+**Scope: the two whole-table endpoints, and deliberately not `DELETE /front-door/routes/{id}`.**
+That route answers a single `Route` — the row it removed — not a table, so there is no table body
+to decorate and no shape the field would fit. It also removes inert config rather than creating
+it, which is the direction this entry is not about: the trap is being told a write will dispatch
+when it cannot, and a delete promises nothing. The asymmetry is intended, not an oversight.
+
+*Rejected:* refusing a non-default-tenant write with a `400`. The routes are stored and read back
+per tenant **on purpose**, so a tenant sees what it wrote and the data survives whenever the front
+door does grow a tenant dimension. Refusing would discard a deliberate property to close a
+signalling gap.
+
+*Rejected:* leaving it to documentation alone. The contract now says it too, and that half was
+never in question — but the fact is derivable per-request and cheap, and a caller acting on a
+`200` is not reading the spec at that moment.

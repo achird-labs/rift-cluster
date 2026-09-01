@@ -803,3 +803,132 @@ async fn a_node_with_no_front_door_reports_zeros_rather_than_failing() {
 
     server.shutdown().await;
 }
+
+/// Pins D-68 on the other side of the rule: the default tenant's table *is* compiled into the
+/// front door, and both route endpoints report that in the body (issue #536). Without this the
+/// flag could be hardcoded `false` and the non-default test in `tenancy_api.rs` would still pass.
+///
+/// Also pins that the decoration changed nothing else: status stays `200` and the write still
+/// carries its `Rift-Cluster-Revision` token, which is what a caller feeds back as `If-Match`.
+#[tokio::test]
+async fn the_default_tenants_route_table_reports_installed() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+
+    // Installed is a property of the tenant, not of having written any routes.
+    let empty: serde_json::Value = reqwest::get(format!("http://{admin}/front-door/routes"))
+        .await
+        .expect("get routes")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        empty,
+        json!({ "routes": [], "installed": true }),
+        "an empty default table is still an installed one: {empty}"
+    );
+
+    let put = reqwest::Client::new()
+        .put(format!("http://{admin}/front-door/routes"))
+        .json(&one_route("svc", "/svc", port))
+        .send()
+        .await
+        .expect("put routes");
+    assert_eq!(
+        put.status().as_u16(),
+        200,
+        "status is unchanged by the flag"
+    );
+    assert!(
+        put.headers().get("rift-cluster-revision").is_some(),
+        "the revision token a caller feeds back as If-Match survives the decoration"
+    );
+    let written: serde_json::Value = put.json().await.expect("json");
+    assert_eq!(
+        written,
+        json!({
+            "routes": [{
+                "id": "svc",
+                "priority": 0,
+                "match": { "path_prefix": "/svc" },
+                "target": { "port": port, "strip_prefix": false },
+                "enabled": true,
+            }],
+            "installed": true,
+        }),
+        "{written}"
+    );
+
+    let read: serde_json::Value = reqwest::get(format!("http://{admin}/front-door/routes"))
+        .await
+        .expect("get routes")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(read, written, "read and write agree: {read}");
+
+    server.shutdown().await;
+}
+
+/// `GET /front-door/routes`' own contract calls its body "a config document a client `PUT`s back
+/// verbatim". Adding `installed` to that body must not break it: `RouteTable` sets no
+/// `deny_unknown_fields`, so the key is ignored on parse and the round-trip stores an identical
+/// table (issue #536).
+#[tokio::test]
+async fn a_route_table_body_put_back_verbatim_round_trips() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr();
+    let port = reserve_port();
+    let client = reqwest::Client::new();
+
+    client
+        .put(format!("http://{admin}/front-door/routes"))
+        .json(&one_route("svc", "/svc", port))
+        .send()
+        .await
+        .expect("put routes");
+
+    let first: serde_json::Value = reqwest::get(format!("http://{admin}/front-door/routes"))
+        .await
+        .expect("get routes")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(first["installed"], json!(true), "precondition: {first}");
+
+    // The whole body back, `installed` and all — exactly what a client that read then wrote would
+    // send.
+    let echoed = client
+        .put(format!("http://{admin}/front-door/routes"))
+        .json(&first)
+        .send()
+        .await
+        .expect("put the read body back");
+    assert_eq!(
+        echoed.status().as_u16(),
+        200,
+        "the body this endpoint answered is a body it accepts"
+    );
+
+    let second: serde_json::Value = reqwest::get(format!("http://{admin}/front-door/routes"))
+        .await
+        .expect("get routes")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        second, first,
+        "the round-trip is a fixed point — the extra key changed nothing that was stored: {second}"
+    );
+
+    server.shutdown().await;
+}
