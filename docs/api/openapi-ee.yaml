@@ -1819,6 +1819,11 @@ paths:
     get:
       operationId: listSpaceStubs
       summary: List stubs scoped to a space (upstream)
+      description: >
+        Proxied to the answering node's engine, which is correct because the
+        stubs themselves replicate (see `addSpaceStub`): every node renders the
+        same space from the same committed config, so any node's answer is the
+        fleet's answer.
       tags: [upstream-core]
       x-rift-origin: upstream
       responses:
@@ -1827,12 +1832,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  stubs:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/Stub'
+                $ref: '#/components/schemas/SpaceStubs'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1845,9 +1845,29 @@ paths:
                 $ref: '#/components/schemas/Error'
     post:
       operationId: addSpaceStub
-      summary: Add a stub scoped to a space (upstream)
+      summary: Add a stub scoped to a space
+      description: >
+        Terminates (issue #537): committed as an ordinary stub edit on the
+        imposter's replicated config, so the stub **replicates to every node and
+        survives a config reconcile**.
+
+
+        Before this it was proxied to the receiving node's engine and never
+        reached replicated state, so it existed on that node alone and the next
+        reconcile — triggered by any committed write, on any imposter — deleted
+        it as a stub the replicated layer had never heard of. Both behind a
+        `201`. A space stub is an ordinary imposter-config stub distinguished
+        only by `space`, so it needed no new replicated shape.
+
+
+        The path's `flowId` is the source of truth for the scope: a `space` in
+        the body is ignored, exactly as the upstream handler did it. The body is
+        the **bare stub**, not the `{"stub": …}` envelope that
+        `POST /imposters/{port}/stubs` takes — sending that envelope here is a
+        `400` naming the mistake, because every field it carries would otherwise
+        be discarded and leave a stub that matches everything in the space.
       tags: [upstream-core]
-      x-rift-origin: upstream
+      x-rift-origin: ee
       requestBody:
         required: true
         content:
@@ -1855,12 +1875,19 @@ paths:
             schema:
               $ref: '#/components/schemas/Stub'
       responses:
-        '200':
-          description: The stub added.
+        '201':
+          description: The space and its stubs, including the one just added.
+          headers:
+            Rift-Cluster-Op-Id:
+              $ref: '#/components/headers/RiftClusterOpId'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Stub'
+                $ref: '#/components/schemas/SpaceStubs'
+        '202':
+          $ref: '#/components/responses/AcceptedParked'
+        '400':
+          $ref: '#/components/responses/BadData'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1873,6 +1900,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/WriteTimeout'
 
   /admin/imposters/{port}/try:
     parameters:
@@ -5666,6 +5699,24 @@ components:
             server. Includes connect and the body read; excludes admin-side
             authorization.
       additionalProperties: false
+
+    SpaceStubs:
+      type: object
+      required: [space, stubs]
+      description: >
+        One correlated-isolation space and the stubs scoped to it. Both the read
+        and the write answer this shape.
+      properties:
+        space:
+          type: string
+          description: The `flowId` from the path, echoed.
+        stubs:
+          type: array
+          description: >
+            Only the stubs scoped to this space. An imposter's unscoped stubs
+            (no `space`) match every space and are not listed here.
+          items:
+            $ref: '#/components/schemas/Stub'
 
     RouteTable:
       type: object

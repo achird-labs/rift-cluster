@@ -12,6 +12,11 @@ engineering discipline and a build-system invariant — this chapter covers both
 
 ## The shape: seams upstream, brains cluster
 
+> **Amended by D-69** (2026-09-01, #537): the seam table below gains **U-18**. It is the first
+> seam added not to give the cluster a new capability but to stop it *losing* one: terminating a
+> route moves the request off an upstream handler, and any validation living in that handler has
+> to come across the boundary with it or be silently dropped.
+
 The open-source engine knows nothing about clusters. It exposes **generic
 extension seams** — traits with `Local` default implementations that preserve
 single-node behavior byte-for-byte — and the cluster crates supply
@@ -40,6 +45,7 @@ table is where a `U-n` is defined (`scripts/design-check.py` resolves citations 
 | U-15 | — | `extensions::state_ops` — declarative state operations | `_rift.stateOps` (RFC-005 §3.7, §6.1); landed by #418 | merged |
 | U-16 | rift#910/#911 | `ProxyRecordingStore` claim semantics revised for fleet-wide exactly-once (`StubPublication`, `publishes_stubs()`) | clustered `proxyOnce` (#226, Chapter 7) | merged |
 | U-17 | rift#990 | `ProxyStoreError::Refused(BackendUnavailable)` (+ `#[non_exhaustive]`) and the proxy-leg 503 door — a store that *arbitrates* exactly-once can refuse a claim instead of being degraded around | clustered `proxyOnce` fails closed at the client (#529, D-66) | merged |
+| U-18 | rift#1012 | `admin_api::not_a_stub_reason` — the space-stub shape guard's *decision* (#336), separated from its rendering | the clustered front terminates `POST .../spaces/{flowId}/stubs` as a replicated write and applies the same rule, rather than keeping a second copy of `STUB_FIELD_NAMES` that would go stale (#537, D-69) | merged |
 
 The pattern in U-8 deserves a sentence: cluster backends *annotate* the
 request task-locally ("degraded: kv-adopt", "revision: 421"), and a

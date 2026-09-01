@@ -3647,3 +3647,292 @@ async fn a_parked_blob_write_replays_through_the_fan_out() {
     follower.shutdown().await;
     leader.shutdown().await;
 }
+
+/// An imposter whose flows are keyed by a header, so `spaces/{flow}` means something.
+fn flow_keyed_imposter(port: u16) -> serde_json::Value {
+    json!({
+        "port": port,
+        "protocol": "http",
+        "_rift": { "flowState": { "flowIdSource": "header:X-Flow-Id" } },
+        "stubs": [{
+            "id": "global",
+            "responses": [{ "is": { "statusCode": 200, "body": "global" } }],
+        }],
+    })
+}
+
+fn space_stub(body: &str) -> serde_json::Value {
+    json!({
+        "predicates": [{ "equals": { "path": "/cart" } }],
+        "responses": [{ "is": { "statusCode": 200, "body": body } }],
+    })
+}
+
+/// The ids of the stubs an imposter holds, read from `node`'s own engine.
+async fn stub_ids_on(admin: &str, port: u16) -> Vec<String> {
+    let read: serde_json::Value = reqwest::get(format!("http://{admin}/imposters/{port}"))
+        .await
+        .expect("read the imposter")
+        .json()
+        .await
+        .expect("json");
+    read["stubs"]
+        .as_array()
+        .expect("stubs array")
+        .iter()
+        .map(|s| {
+            format!(
+                "{}:{}",
+                s["space"].as_str().unwrap_or("-"),
+                s["responses"][0]["is"]["body"].as_str().unwrap_or("?")
+            )
+        })
+        .collect()
+}
+
+/// Pins D-69 (first half): a space-scoped stub is a replicated control-plane object, so it
+/// exists on **every** node and survives the config reconcile that any unrelated imposter write
+/// triggers. Before this it was proxied to the receiving node's engine, existed nowhere else, and
+/// `apply_config`'s `reconcile_stubs` deleted it as a stale stub the replicated layer had never
+/// heard of — all behind a `201`.
+#[tokio::test]
+async fn a_space_stub_replicates_and_survives_an_unrelated_reconcile() {
+    let leader_state = TempDir::new().expect("tempdir");
+    let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
+        .await
+        .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+
+    let follower_state = TempDir::new().expect("tempdir");
+    let follower = compose::start(cluster_cli(&follower_state, &["--cluster-seeds", &seed]))
+        .await
+        .expect("follower joins");
+    wait_ready(&follower).await;
+
+    let lead_admin = leader.admin_addr().to_string();
+    let follow_admin = follower.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+
+    let created = client
+        .post(format!("http://{lead_admin}/imposters"))
+        .json(&flow_keyed_imposter(port))
+        .send()
+        .await
+        .expect("create the imposter");
+    assert_eq!(created.status().as_u16(), 201, "seeding the imposter");
+
+    let added = client
+        .post(format!(
+            "http://{lead_admin}/imposters/{port}/spaces/blue/stubs"
+        ))
+        .json(&space_stub("blue cart"))
+        .send()
+        .await
+        .expect("add the space stub");
+    assert_eq!(
+        added.status().as_u16(),
+        201,
+        "the space stub is accepted, as it always was"
+    );
+
+    // The write barrier means a 2xx already implies every ready node applied it, so this is a
+    // read-your-write on a node that never saw the request — the exact thing that failed before.
+    assert!(
+        stub_ids_on(&follow_admin, port)
+            .await
+            .contains(&"blue:blue cart".to_string()),
+        "the stub must exist on the node that did NOT take the write: {:?}",
+        stub_ids_on(&follow_admin, port).await
+    );
+
+    // Any committed op emits `EngineAction::Sync`, which re-renders every imposter from
+    // `sm_configs`. An unrelated port is enough — that is how the filed repro hit it.
+    let other = reserve_port();
+    let unrelated = client
+        .post(format!("http://{follow_admin}/imposters"))
+        .json(&minimal_imposter(other))
+        .send()
+        .await
+        .expect("create an unrelated imposter");
+    assert_eq!(unrelated.status().as_u16(), 201, "seeding the second port");
+
+    for (label, admin) in [("leader", &lead_admin), ("follower", &follow_admin)] {
+        let ids = stub_ids_on(admin, port).await;
+        assert!(
+            ids.contains(&"blue:blue cart".to_string()),
+            "{label}: an unrelated imposter write must not erase a space stub: {ids:?}"
+        );
+    }
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// Pins D-69 (the inverse half): once space stubs are in the replicated config, a
+/// space `DELETE` that only tears down the local engine would be undone by the next `Sync`, which
+/// would resurrect the stubs fleet-wide. The teardown therefore commits a space-scoped stub delete
+/// alongside its journal clear.
+///
+/// Also pins that the delete is *scoped*: another space's stubs and the imposter's global stubs
+/// are untouched, which is what makes a space-addressed delete correct rather than approximately
+/// right.
+#[tokio::test]
+async fn a_space_teardown_removes_only_that_spaces_stubs_fleet_wide_and_they_stay_gone() {
+    let leader_state = TempDir::new().expect("tempdir");
+    let leader = compose::start(cluster_cli(&leader_state, &["--cluster-allow-solo"]))
+        .await
+        .expect("leader starts");
+    wait_ready(&leader).await;
+    let seed = leader.cluster_addr().expect("cluster addr").to_string();
+
+    let follower_state = TempDir::new().expect("tempdir");
+    let follower = compose::start(cluster_cli(&follower_state, &["--cluster-seeds", &seed]))
+        .await
+        .expect("follower joins");
+    wait_ready(&follower).await;
+
+    let lead_admin = leader.admin_addr().to_string();
+    let follow_admin = follower.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+
+    client
+        .post(format!("http://{lead_admin}/imposters"))
+        .json(&flow_keyed_imposter(port))
+        .send()
+        .await
+        .expect("create the imposter");
+
+    for (flow, body) in [("blue", "blue cart"), ("green", "green cart")] {
+        let added = client
+            .post(format!(
+                "http://{lead_admin}/imposters/{port}/spaces/{flow}/stubs"
+            ))
+            .json(&space_stub(body))
+            .send()
+            .await
+            .expect("add the space stub");
+        assert_eq!(added.status().as_u16(), 201, "seeding {flow}");
+    }
+
+    let torn = client
+        .delete(format!("http://{lead_admin}/imposters/{port}/spaces/blue"))
+        .send()
+        .await
+        .expect("tear the space down");
+    assert!(
+        torn.status().is_success(),
+        "the teardown itself must succeed: {}",
+        torn.status()
+    );
+
+    // Force the reconcile that would resurrect them if the delete had stayed node-local.
+    let other = reserve_port();
+    client
+        .post(format!("http://{follow_admin}/imposters"))
+        .json(&minimal_imposter(other))
+        .send()
+        .await
+        .expect("create an unrelated imposter");
+
+    for (label, admin) in [("leader", &lead_admin), ("follower", &follow_admin)] {
+        let ids = stub_ids_on(admin, port).await;
+        assert!(
+            !ids.contains(&"blue:blue cart".to_string()),
+            "{label}: the torn-down space's stub must stay gone across a reconcile, not be \
+             resurrected by the next Sync: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"green:green cart".to_string()),
+            "{label}: another space's stubs are not this teardown's business: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"-:global".to_string()),
+            "{label}: the imposter's unscoped stubs are not this teardown's business: {ids:?}"
+        );
+    }
+
+    follower.shutdown().await;
+    leader.shutdown().await;
+}
+
+/// Tearing down a space that has flow state but no stubs is ordinary, not an error. A
+/// space-addressed delete addresses a *set*, and an empty set is a legitimate answer — unlike the
+/// by-id deletes, where a missing target means the caller asserted something untrue.
+#[tokio::test]
+async fn tearing_down_a_space_with_no_stubs_succeeds() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+
+    client
+        .post(format!("http://{admin}/imposters"))
+        .json(&flow_keyed_imposter(port))
+        .send()
+        .await
+        .expect("create the imposter");
+
+    let torn = client
+        .delete(format!("http://{admin}/imposters/{port}/spaces/empty-flow"))
+        .send()
+        .await
+        .expect("tear down a space that never had a stub");
+    assert!(
+        torn.status().is_success(),
+        "a space with no stubs is an ordinary teardown, not a 500: {}",
+        torn.status()
+    );
+
+    server.shutdown().await;
+}
+
+/// The path names the space, not the body. Upstream sets `stub.space` from the path parameter
+/// after parsing; terminating the route must keep that, or a caller could file a stub into a
+/// space the URL never mentioned.
+#[tokio::test]
+async fn a_space_stub_body_cannot_choose_its_own_space() {
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &["--cluster-allow-solo"]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let port = reserve_port();
+
+    client
+        .post(format!("http://{admin}/imposters"))
+        .json(&flow_keyed_imposter(port))
+        .send()
+        .await
+        .expect("create the imposter");
+
+    let mut claimed = space_stub("claimed");
+    claimed["space"] = json!("somewhere-else");
+    let added = client
+        .post(format!("http://{admin}/imposters/{port}/spaces/blue/stubs"))
+        .json(&claimed)
+        .send()
+        .await
+        .expect("add the space stub");
+    assert_eq!(added.status().as_u16(), 201);
+
+    let ids = stub_ids_on(&admin, port).await;
+    assert!(
+        ids.contains(&"blue:claimed".to_string()),
+        "the path is the source of truth for the space: {ids:?}"
+    );
+    assert!(
+        !ids.iter().any(|s| s.starts_with("somewhere-else:")),
+        "a body-supplied space must not win over the path: {ids:?}"
+    );
+
+    server.shutdown().await;
+}

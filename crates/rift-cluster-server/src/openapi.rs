@@ -323,6 +323,9 @@ mod parity {
             Terminated::SpaceTeardown(_, _) => {
                 RouteKey::new(&Method::DELETE, "/imposters/{port}/spaces/{flowId}")
             }
+            Terminated::AddSpaceStub(_, _) => {
+                RouteKey::new(&Method::POST, "/imposters/{port}/spaces/{flowId}/stubs")
+            }
             Terminated::SpacesList(_) => RouteKey::new(&Method::GET, "/imposters/{port}/spaces"),
             Terminated::TryImposter(_) => {
                 RouteKey::new(&Method::POST, "/admin/imposters/{port}/try")
@@ -439,6 +442,7 @@ mod parity {
             Terminated::ClearSavedRequests(4545),
             Terminated::ClearSavedProxyResponses(4545),
             Terminated::SpaceTeardown(4545, "flow-1".to_owned()),
+            Terminated::AddSpaceStub(4545, "flow-1".to_owned()),
             Terminated::SpacesList(4545),
             Terminated::TryImposter(4545),
             Terminated::PutRoutes,
@@ -562,7 +566,11 @@ mod parity {
             // `contract_route` both treat the whole route as terminated —
             // `Terminated::SpaceTeardown` in `ee_served_routes` covers it.
             ("GET", "/imposters/{port}/spaces/{flowId}/stubs"),
-            ("POST", "/imposters/{port}/spaces/{flowId}/stubs"),
+            // NOT the POST (issue #537): it terminates as `ControlOp::PatchStubs` so the stub
+            // replicates and survives a config reconcile, where proxied it reached one node's
+            // engine and the next reconcile deleted it. `Terminated::AddSpaceStub` in
+            // `ee_served_routes` covers it now. The GET above stays proxied and is correct that
+            // way precisely *because* the write replicates — every node renders the same space.
             ("DELETE", "/admin/imposters/{port}/flow-state/{flowId}"),
             ("GET", "/admin/imposters/{port}/flow-state/{flowId}/{key}"),
             ("PUT", "/admin/imposters/{port}/flow-state/{flowId}/{key}"),
