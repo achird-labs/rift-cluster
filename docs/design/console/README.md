@@ -80,17 +80,37 @@ length descending, then header-clause count, then id. That order is **independen
 an editor showing the order you typed would be showing something that decides nothing. Disabled routes
 are excluded from dispatch and shown with `—`.
 
+> **Amended by D-70** (2026-09-01, #539): the not-installed fact is read from the local route-table
+> response first and the route-hits fan-out only as a fallback. It was previously sourced from
+> `route-hits` alone, so the whole treatment below vanished whenever that fan-out was pending or
+> failed. Absence from *both* is still unknown.
+
 **A non-default tenant's table is never in any order at all.** `desired_routes` compiles only the
 default tenant's routes into the shared front door (`08-tenancy-security.md`), so for every other
 tenant the screen is showing stored state that cannot take a request. The server says so with
-`installed: false` on `GET /front-door/route-hits`, and the screen spends it four ways (#400): a
-`role="status"` banner naming the fact and its reason, `—` in every rank cell, `not installed` in
-place of the tie-break prose, and the rows listed in **stored** order rather than
-`effective_order()` — sorting by a chain that is never evaluated would be the same fabrication the
-rank column is being muted to avoid. Editing stays enabled — the table is real replicated state — and
-all of it keys on a positive `installed: false`, never on a hits read that merely failed. That last
+`installed: false` twice over (D-68): beside the table on `GET`/`PUT /front-door/routes`, and again
+on `GET /front-door/route-hits`. One server function is behind both, so they cannot disagree — the
+only thing that differs is which one answered.
+
+**The screen asks the table first (D-70, #539).** The hits endpoint is a cluster-wide fan-out and
+the table read is local, so keying the fact on the fan-out alone made the whole treatment below
+vanish whenever that query was slow, degraded or failed — which is precisely when someone is
+looking at this screen to find out why. The write carries the flag for the same reason: an operator
+saving a table under a non-default tenant learns from the answer to their own `PUT` that it will
+never dispatch, rather than waiting on a poll that may not come back.
+
+The screen then spends the fact four ways (#400): a `role="status"` banner naming it and its
+reason, `—` in every rank cell, `not installed` in place of the tie-break prose, and the rows listed
+in **stored** order rather than `effective_order()` — sorting by a chain that is never evaluated
+would be the same fabrication the rank column is being muted to avoid. The Hits cell says `not
+installed` too, and says it *ahead* of the unavailable dash: a failed fan-out leaves the count
+unknown, but the table read has already settled that the route can take no dispatch at all, which is
+the stronger and still-true answer. Editing stays enabled — the table is real replicated state — and
+all of it keys on a positive `installed: false`, never on a read that merely failed. That last
 point is the rule, not an implementation detail: rendering "cannot take a request" off the back of a
-read the console could not complete would be a confident claim sourced from an unknown.
+read the console could not complete would be a confident claim sourced from an unknown — and it
+stays the rule with two sources, where "neither said" is still unknown rather than a majority of
+silence.
 
 **A fleet with no listener at all gets the same treatment, one level down (#403).** `--front-door`
 is optional, so every node in a fleet can be running without one — and then every route reports an

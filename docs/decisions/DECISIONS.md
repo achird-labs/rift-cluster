@@ -2204,3 +2204,46 @@ signalling gap.
 *Rejected:* leaving it to documentation alone. The contract now says it too, and that half was
 never in question — but the fact is derivable per-request and cheap, and a caller acting on a
 `200` is not reading the spec at that moment.
+
+### D-70 — The console reads a structural claim from the cheapest source that carries it; absence from every source is still unknown
+
+- **Status:** active
+- **Decided:** 2026-09-01
+- **Refines:** D-68
+- **Amends:** docs/design/console/README.md
+- **Implemented by:** #539
+- **Code:** web/src/screens/Routes.tsx, web/src/app/queries.ts
+
+D-68 put `installed` on both `/front-door/routes` and `/front-door/route-hits`, derived from one
+server function so the two cannot disagree. The console went on reading it only from `route-hits`
+— which is a **cluster-wide fan-out**, while the route-table read beside it is a local read of
+replicated state. So the entire not-installed treatment (banner, muted ranks, "not installed" in
+the why column, stored-order rows) was gated on the slowest and most failure-prone of the two
+queries, and disappeared exactly when an operator was on that screen asking why nothing dispatches.
+
+**The rule.** Where one fact is published by more than one endpoint, the console derives it from
+the cheapest and most available of them, and falls back to the others. Preference is settled by
+*availability*, never by adjudicating truth: this rule is only ever applied to facts a single
+server-side definition guarantees cannot differ between their sources. A screen that had to decide
+which of two disagreeing endpoints to believe would have a contract problem, not a rendering
+problem.
+
+**Unknown does not weaken as sources are added.** The #369 bound-versus-unknown discipline holds
+across all of them at once: a confident structural claim ("these routes can never take a request")
+requires a source that *positively* reported it. Neither answering is still unknown — never a
+majority of silence, and never a default. Concretely `(table ?? hits) === false`, so a body that
+omitted the flag reads exactly as a read that never completed, which is what a pre-D-68 node during
+a rolling upgrade looks like from the console.
+
+**Corollary: a stronger fact outranks a missing weaker one.** The Hits cell reports "not installed"
+*before* it reports the unavailable dash. A failed fan-out leaves the count unknown, but the table
+read has already established that the route can take no dispatch at all — so the dash would hide a
+fact the console holds, in the one state this entry exists to fix.
+
+*Rejected:* requiring both sources to agree before rendering. It converts an availability question
+into a consensus one and reintroduces the original bug — the banner would again be hostage to the
+fan-out, now in every state rather than only the failing ones.
+
+*Rejected:* folding an absent flag to `false` so the banner is never missed. That trades a missing
+true statement for a confident false one, on the screen whose whole design premise is that a zero
+and an unknown are different claims.
