@@ -2204,3 +2204,65 @@ signalling gap.
 *Rejected:* leaving it to documentation alone. The contract now says it too, and that half was
 never in question — but the fact is derivable per-request and cheap, and a caller acting on a
 `200` is not reading the spec at that moment.
+
+### D-69 — A space-scoped stub is replicated config; a space teardown deletes it fleet-wide
+
+- **Status:** active
+- **Decided:** 2026-09-01
+- **Refines:** D-5
+- **Amends:** docs/api/openapi-ee.yaml (`addSpaceStub`), docs/architecture/11-upstream-boundary.md
+- **Implemented by:** #537 (EE), rift#1012 (the #336 shape seam)
+- **Code:** crates/rift-cluster-server/src/admin_front.rs, crates/rift-cluster/src/control.rs, crates/rift-cluster/src/raft/store.rs
+
+`POST /imposters/{port}/spaces/{flowId}/stubs` answered `201` for a stub that existed on exactly
+one node and was deleted by the next config reconcile. The classifier deliberately excluded the
+three-segment shape, so the write was reverse-proxied to the receiving node's engine and never
+became a `ControlOp` — absent from `sm_configs`, and therefore absent from the desired set that
+`apply_config`'s `reconcile_stubs` renders each node's imposters from. Any committed op emitting
+`EngineAction::Sync` — creating or deleting **any** imposter, anywhere in the fleet — re-rendered
+the port and removed the stub as stale. D-5's "a replicated write never resets an untouched
+imposter's runtime state" held; a space stub was not runtime state but *config the replicated layer
+had never learned about*, so the diff was correct to drop it.
+
+The asymmetry is what made it worth fixing rather than documenting: `GET /imposters/{port}/spaces`
+is explicitly fleet-wide, and flow-state KV replicates, so the surface read as clustered in every
+direction except the one that silently was not.
+
+**The rule.** The `POST` terminates as an ordinary `ControlOp::PatchStubs` carrying
+`StubEdit::Add`, with `space` set from the **path** (a `space` in the body is ignored, exactly as
+upstream's handler did it). No new replicated shape was needed: a space stub is already an
+imposter-config stub distinguished only by `Stub::space`. Reads on the shape stay proxied — correct
+once the data replicates, because every node renders the same space from the same committed config.
+
+**And the inverse, which replication creates.** `DELETE /imposters/{port}/spaces/{flow}` proxied
+its teardown to the local engine and committed only `JournalClearGen`. Once the stubs replicate,
+that would remove them from one engine and let the next `Sync` **resurrect them fleet-wide** — a
+worse failure than the one being fixed. The teardown therefore also commits
+`StubEdit::DeleteBySpace`. It is **set-addressed and idempotent**: a space stub need not carry an
+`id`, so `DeleteById` cannot express this at all, and zero matches is success — a space holding
+flow state but no stubs is ordinary, and erroring would turn an everyday teardown into a `500`.
+That is the deliberate difference from the by-id steps, which address one named thing the caller
+asserted exists.
+
+**Validation parity is inherited, not re-implemented.** `--allowInjection` gating
+(`op_uses_script_surface`) and `file:`/`ref:` script resolution (`resolve_op_scripts`) are already
+generic over `ControlOp::PatchStubs`, so terminating gains both with no new code. The one gate that
+did *not* survive is upstream's `reject_if_not_a_stub` (#336), which lived in the handler the
+request no longer reaches — and it cannot be dropped: `Stub` deserializes through `StubRaw` where
+every field is `#[serde(default)]` and unknown keys are discarded, so any JSON object parses, and
+an object of only unrecognised keys becomes the vacuous stub that matches everything in its space.
+
+*Rejected:* re-implementing that guard in EE. It would put a second copy of `STUB_FIELD_NAMES` in
+another crate, which goes stale the moment upstream adds a stub field and fails the wrong way — a
+legitimate stub answered `400`, silently. That is the same two-definitions-of-one-rule defect D-68
+had just removed from the front door. rift#1012 exposes the decision instead, as
+`not_a_stub_reason`, returning the reason rather than a `Response` so the rule stays upstream while
+the rendering stays with whoever answers.
+
+*Rejected:* refusing the write under `--cluster` with a `501`/`409`. Honest, and it cannot lose
+data, but it removes a working single-node feature from clustered fleets to fix a durability gap
+that turned out to be cheap to close properly.
+
+*Rejected:* folding the stub delete into the existing `JournalClearGen` op. One op, atomic, no new
+variant — but it silently changes what an already-committed `JournalClearGen` entry means, so a log
+replay would start deleting stubs it never deleted when it was written.

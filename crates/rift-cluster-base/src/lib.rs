@@ -214,6 +214,19 @@ pub mod seams {
     /// same check the core admin applies before storing.
     pub use rift_http_proxy::injection_gate::config_uses_script_surface;
 
+    /// The space-stub shape guard (upstream #336): why a body is not shaped like a stub, or
+    /// `None` if it is. `Stub` deserializes through `StubRaw`, where every field is
+    /// `#[serde(default)]` and unknown keys are discarded, so **any** JSON object deserializes —
+    /// an object of only unrecognised keys becomes the vacuous stub, which matches everything in
+    /// its space and serves a response nobody authored.
+    ///
+    /// The clustered admin front terminates `POST /imposters/:port/spaces/:flowId/stubs` as a
+    /// replicated write (issue #537), so the request never reaches the upstream handler that
+    /// used to apply this. Reading the rule through the seam rather than restating the field list
+    /// here is the point: a second copy goes stale the moment upstream adds a stub field, and it
+    /// fails the wrong way — a legitimate stub answered `400`.
+    pub use rift_http_proxy::admin_api::not_a_stub_reason;
+
     /// TCP-fault carrier classification (upstream #965): whether a response is
     /// the placeholder a fault stub produces — the one the engine's own serve
     /// loop throws away in favour of aborting the socket, so a client over TCP
@@ -404,6 +417,7 @@ mod tests {
         let _ = (validate_stub, validate_stubs);
         let _ = ErrorKind::Unavailable;
         let _ = (error_response_typed, config_uses_script_surface);
+        let _ = not_a_stub_reason;
         _named::<BackendUnavailable>();
         _named::<TlsDefaults>();
         _named::<ServerBuilder>();
