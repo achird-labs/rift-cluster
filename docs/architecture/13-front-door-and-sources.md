@@ -9,6 +9,12 @@ proxy, its glue scripts, its config drift — stops existing. Tracked as issues
 
 ## The front door: many imposters, one port, zero client cooperation
 
+> **Amended by D-68** (2026-09-01, #536): the "Tenancy-aware" bullet below said only that the
+> default tenant's routes are compiled into the listener. It is now also *published*: both
+> `PUT` and `GET /front-door/routes` answer `installed: <bool>` beside the table, so a tenant
+> writing a table that can never dispatch learns it on the write rather than from
+> `/front-door/route-hits`.
+
 Chapter 2's gateway mode asks the *client* to name the target imposter
 (the `/__rift/8080` path prefix — the header and subdomain forms were withdrawn
 by D-54 in favour of the route table below). Test
@@ -59,7 +65,13 @@ Design points that carry weight (full spec in #19):
   tenant's imposters; shared catch-alls are fleet-admin territory. Only the
   default tenant's routes are actually compiled into the listener — see
   Chapter 8, and `routes_installed_for`, which is the one definition of that
-  rule.
+  rule. **Both route endpoints publish that fact** (#536, D-68): `PUT` and
+  `GET /front-door/routes` answer `installed: <bool>` beside the table, from
+  that same function, so a tenant that writes a table which can never dispatch
+  learns it at the moment it writes rather than by reading
+  `/front-door/route-hits` it has no reason to suspect it needs. The flag is a
+  read-only decoration on the response — it is not part of the stored table,
+  and a `PUT` body claiming `installed: true` is ignored.
 - **Dispatches are counted** (#368): upstream calls a `RouteObserver` once per
   request a route *claims*, before its target answers, so a route that only
   ever 404s still counts — a route claiming traffic and failing is exactly

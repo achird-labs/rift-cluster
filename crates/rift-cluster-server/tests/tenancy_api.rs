@@ -2084,3 +2084,167 @@ async fn a_non_default_tenants_route_hits_report_not_installed_never_zero() {
 
     server.shutdown().await;
 }
+
+/// Pins D-68: a non-default tenant's route table is stored, readable, and **never compiled into
+/// the shared front door** — and the two front-door route endpoints now say so in the body they
+/// answer, rather than leaving `GET /front-door/route-hits` as the only place the fact appears
+/// (issue #536).
+///
+/// Lives here rather than in `front_door.rs` for the same reason
+/// `a_non_default_tenants_route_hits_report_not_installed_never_zero` does: under the
+/// no-principal bypass `X-Rift-Tenant` is ignored and every request targets `default`, so a
+/// bypass-only test would assert the default tenant's `installed: true` twice and could never
+/// fail.
+#[tokio::test]
+async fn a_non_default_tenants_route_table_reports_not_installed_on_write_and_read() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "tenancy-fleet-routes-installed";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+    let (_, acme_key) = mint_principal(&client, &admin, fleet_key, "acme", Role::Editor).await;
+
+    // An empty table still carries the flag. Absence would leave "this tenant wrote no routes"
+    // and "this tenant's routes can never dispatch" looking identical, which is the same
+    // took-none-vs-cannot-take error #368/#403 fixed one endpoint over.
+    let empty: Value = client
+        .get(format!("http://{admin}/front-door/routes"))
+        .header("authorization", &acme_key)
+        .header("x-rift-tenant", "acme")
+        .send()
+        .await
+        .expect("get routes as acme")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        empty,
+        json!({ "routes": [], "installed": false }),
+        "an empty tenanted table still reports that it could never dispatch: {empty}"
+    );
+
+    let put = client
+        .put(format!("http://{admin}/front-door/routes"))
+        .header("authorization", &acme_key)
+        .header("x-rift-tenant", "acme")
+        .json(&json!({
+            "routes": [{ "id": "svc", "match": { "path_prefix": "/svc" }, "target": { "port": 4545 } }],
+        }))
+        .send()
+        .await
+        .expect("put routes as acme");
+    assert_eq!(put.status().as_u16(), 200, "acme may write its own table");
+    let written: Value = put.json().await.expect("json");
+    assert_eq!(
+        written,
+        json!({
+            "routes": [{
+                "id": "svc",
+                "priority": 0,
+                "match": { "path_prefix": "/svc" },
+                "target": { "port": 4545, "strip_prefix": false },
+                "enabled": true,
+            }],
+            "installed": false,
+        }),
+        "the write that stores an inert table must say so at the one moment a caller could act \
+         on it (#536): {written}"
+    );
+
+    let read: Value = client
+        .get(format!("http://{admin}/front-door/routes"))
+        .header("authorization", &acme_key)
+        .header("x-rift-tenant", "acme")
+        .send()
+        .await
+        .expect("get routes as acme")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        read, written,
+        "the read answers exactly what the write echoed, flag included: {read}"
+    );
+
+    server.shutdown().await;
+}
+
+/// A client cannot declare its own table installed. `installed` is derived server-side from
+/// `routes_installed_for` at the render site, so a `PUT` body asserting `"installed": true` is
+/// ignored on parse (`RouteTable` has no `deny_unknown_fields`) and changes neither the answer
+/// nor what is stored.
+#[tokio::test]
+async fn a_client_cannot_declare_its_own_route_table_installed() {
+    let _guard = ARGON2_COUNTER_LOCK.lock().await;
+    let state = TempDir::new().expect("tempdir");
+    let server = compose::start(cluster_cli(&state, &[]))
+        .await
+        .expect("solo cluster starts");
+    wait_ready(&server).await;
+    let node = server.node().expect("clustered");
+    let admin = server.admin_addr().to_string();
+    let client = reqwest::Client::new();
+    let mut op_id = 1u128;
+
+    let fleet_key = "tenancy-fleet-routes-claimed";
+    seed_fleet_admin(node, &mut op_id, fleet_key).await;
+    create_tenant(&client, &admin, fleet_key, "acme").await;
+    let (_, acme_key) = mint_principal(&client, &admin, fleet_key, "acme", Role::Editor).await;
+
+    let claimed: Value = client
+        .put(format!("http://{admin}/front-door/routes"))
+        .header("authorization", &acme_key)
+        .header("x-rift-tenant", "acme")
+        .json(&json!({
+            "installed": true,
+            "routes": [{ "id": "svc", "match": { "path_prefix": "/svc" }, "target": { "port": 4545 } }],
+        }))
+        .send()
+        .await
+        .expect("put routes as acme")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        claimed["installed"],
+        json!(false),
+        "the server's answer wins over the client's claim: {claimed}"
+    );
+
+    let read: Value = client
+        .get(format!("http://{admin}/front-door/routes"))
+        .header("authorization", &acme_key)
+        .header("x-rift-tenant", "acme")
+        .send()
+        .await
+        .expect("get routes as acme")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        read,
+        json!({
+            "routes": [{
+                "id": "svc",
+                "priority": 0,
+                "match": { "path_prefix": "/svc" },
+                "target": { "port": 4545, "strip_prefix": false },
+                "enabled": true,
+            }],
+            "installed": false,
+        }),
+        "the stored table is the parsed one — the claimed key reached neither storage nor the \
+         answer: {read}"
+    );
+
+    server.shutdown().await;
+}
