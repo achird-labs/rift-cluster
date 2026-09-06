@@ -443,7 +443,7 @@ the cost this would save is one verify on an admin-plane request, and the
 machinery — an invalidation hook on four op variants, with a correctness bug
 that fails *open* — is not earned by that. Operators should expect roughly
 20–50 ms of argon2id per authenticated admin request. If that becomes a real
-constraint for a console or MCP client, the state-machine-invalidated cache
+constraint for a console or an API client, the state-machine-invalidated cache
 described in §11 is the shape to build, and it should land as its own slice with
 its own revocation test.
 
