@@ -20,14 +20,24 @@ import { useToast } from "../components/toast.tsx";
 /**
  * Is this tenant's table *known* to be uninstalled?
  *
- * The `undefined` case — the read is pending, failed, or came back without the flag — is
- * deliberately not `true`. Everything this predicate gates is a confident structural claim ("these
- * routes can never take a request"), and putting that behind a read the console could not complete
- * would be the same bound-versus-unknown error #369 exists to prevent, one level up. One
- * definition, used by every call site, so the rule cannot drift between them.
+ * D-70: two endpoints report this, and D-68 derives both from one server function — so they cannot
+ * disagree, and the only thing that differs between them is which one answered. The table read is
+ * local and the hits read is a cluster-wide fan-out, so the table's copy is asked first: deriving
+ * the banner from the fan-out alone made it vanish whenever that query was slow, degraded or
+ * failed, which is precisely when an operator is most likely to be looking for it (#539).
+ *
+ * The `undefined` case — neither body carried the flag — is deliberately not `true`. Everything
+ * this predicate gates is a confident structural claim ("these routes can never take a request"),
+ * and putting that behind a read the console could not complete would be the same
+ * bound-versus-unknown error #369 exists to prevent, one level up. Unknown does not weaken as
+ * sources are added: "neither said" is unknown, never a majority of silence. One definition, used
+ * by every call site, so the rule cannot drift between them.
  */
-function isNotInstalled(hits: RouteHits | undefined): boolean {
-  return hits?.installed === false;
+function isNotInstalled(
+  fromTable: boolean | undefined,
+  hits: RouteHits | undefined,
+): boolean {
+  return (fromTable ?? hits?.installed) === false;
 }
 
 /**
@@ -59,7 +69,7 @@ export function RouteTableScreen(): ReactNode {
    * table at all, and a fan-out polling behind that screen buys nothing.
    */
   const hits = useRouteHits({ enabled: table.isSuccess });
-  const notInstalled = isNotInstalled(hits.data);
+  const notInstalled = isNotInstalled(table.data?.installed, hits.data);
   const mayWrite = can("imposter.write");
 
   if (table.isError) {
@@ -85,10 +95,15 @@ export function RouteTableScreen(): ReactNode {
       {table.isSuccess ? (
         <div className="screen-split">
           <div className="screen-main">
-            <Editor loaded={table.data} mayWrite={mayWrite} hits={hits} />
+            <Editor
+              loaded={table.data.routes}
+              mayWrite={mayWrite}
+              hits={hits}
+              notInstalled={notInstalled}
+            />
             <FrontDoorNotes />
           </div>
-          <RouteTester routes={table.data} notInstalled={notInstalled} />
+          <RouteTester routes={table.data.routes} notInstalled={notInstalled} />
         </div>
       ) : null}
     </section>
@@ -99,13 +114,23 @@ function Editor({
   loaded,
   mayWrite,
   hits,
+  notInstalled,
 }: {
   loaded: Route[];
   mayWrite: boolean;
   hits: UseQueryResult<RouteHits>;
+  /** Resolved once by the screen and passed down, so no component re-derives the rule. */
+  notInstalled: boolean;
 }): ReactNode {
-  const notInstalled = isNotInstalled(hits.data);
-  const noFrontDoor = hasNoFrontDoorAnywhere(hits.data);
+  /*
+   * The `!notInstalled` is the same deliberate redundancy as the `!hits.partial` inside
+   * `hasNoFrontDoorAnywhere`, and it is new surface rather than belt-and-braces: since #539 the two
+   * inert-fact banners read `installed` from *different* endpoints, so a server that ever
+   * contradicted itself between them could put both on screen at once, each stating something the
+   * other denies. D-68 makes that unrepresentable; this keeps the exclusion a property of this
+   * component rather than of a remote invariant.
+   */
+  const noFrontDoor = hasNoFrontDoorAnywhere(hits.data) && !notInstalled;
   const [draft, setDraft] = useState<Route[]>(loaded);
   const [adding, setAdding] = useState(false);
   const [base, setBase] = useState<Route[]>(loaded);
@@ -315,8 +340,9 @@ function Editor({
       {/*
        * The sibling of the not-installed banner, one level down: these routes ARE compiled into
        * the shared table, but nothing in the fleet is listening on it. Same inert-fact family, and
-       * mutually exclusive with the banner above by construction — that one renders only on
-       * `installed: false`, and the server omits this field entirely there.
+       * mutually exclusive with the banner above — that one renders only on `installed: false`,
+       * and the server omits `front_door` entirely there. `noFrontDoor` is guarded against the
+       * two-source case at its declaration; see the note there.
        */}
       {noFrontDoor ? (
         <div className="banner info" data-testid="routes-no-front-door" role="status">
@@ -405,6 +431,7 @@ function Editor({
                 enabled={route.enabled}
                 hits={hits.data}
                 unavailable={hits.isError}
+                notInstalled={notInstalled}
               />
               <td className="muted" data-testid="route-why">
                 {routeWhy(route, notInstalled)}
@@ -800,7 +827,9 @@ function RouteTester({
  * report and never flagging a zero the fleet has already explained:
  *
  * - "not installed" — this tenant's routes are never compiled into the shared front door, so a
- *   zero would be a claim about traffic where the truth is about installation;
+ *   zero would be a claim about traffic where the truth is about installation. Tested first,
+ *   because it outranks the dash: it is knowable from the table read alone (#539), and it stays
+ *   true whether or not a count was ever obtained;
  * - a muted zero for a **disabled** route, which is excluded from dispatch;
  * - a muted zero when **no node in the fleet binds a listener** (#403) — nothing could have
  *   arrived, and flagging every row at once is a diagnosis rather than a warning;
@@ -811,20 +840,22 @@ function HitsCell({
   enabled,
   hits,
   unavailable,
+  notInstalled,
 }: {
   id: string;
   enabled: boolean;
   hits: RouteHits | undefined;
   unavailable: boolean;
+  notInstalled: boolean;
 }): ReactNode {
-  if (unavailable || hits === undefined) {
-    return (
-      <td className="numeric muted" data-testid="route-hits" title="Dispatch counts unavailable">
-        &#x2014;
-      </td>
-    );
-  }
-  if (isNotInstalled(hits)) {
+  /*
+   * D-70's corollary: ahead of the unavailable branch, not behind it. A failed or in-flight
+   * fan-out leaves the *count* unknown, but when the table body has already established that this
+   * tenant's routes are never compiled in, "not installed" is both stronger and still true — and a
+   * dash there would hide the very fact #539 exists to surface, in the state that made it worth
+   * surfacing.
+   */
+  if (notInstalled) {
     return (
       <td
         className="numeric muted"
@@ -832,6 +863,13 @@ function HitsCell({
         title="Stored, but never compiled into the shared front door — only the default tenant's routes are installed, so this route cannot take a dispatch at all."
       >
         not installed
+      </td>
+    );
+  }
+  if (unavailable || hits === undefined) {
+    return (
+      <td className="numeric muted" data-testid="route-hits" title="Dispatch counts unavailable">
+        &#x2014;
       </td>
     );
   }

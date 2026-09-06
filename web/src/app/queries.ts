@@ -69,7 +69,8 @@ export type TrySpec = components["schemas"]["TryRequest"];
 export type TryResult = components["schemas"]["TryResponse"];
 type FleetMembers = components["schemas"]["FleetMembers"];
 type FleetHealth = components["schemas"]["FleetHealth"];
-type RouteTable = components["schemas"]["RouteTable"];
+/** The table as *answered* — the stored rows plus the tenant's install fact (D-68). */
+type RouteTableView = components["schemas"]["RouteTableView"];
 type Tenant = components["schemas"]["Tenant"];
 type TenantWrite = components["schemas"]["TenantWrite"];
 type Principal = components["schemas"]["Principal"];
@@ -1357,12 +1358,40 @@ export function useClearFlowState(): UseMutationResult<
   });
 }
 
-export function useRouteTable(): UseQueryResult<Route[]> {
+/**
+ * The tenant's stored table, plus whether its routes are compiled into the shared front door.
+ *
+ * All three states of `installed` carry weight: `false` is a tenant whose table can never take a
+ * dispatch, `true` is the default tenant's, and `undefined` is a node that did not say — a
+ * pre-D-68 body, which is what a rolling upgrade looks like from here. Absent is deliberately not
+ * `false` (D-70): the screen renders that as a confident structural claim, and a fact the console
+ * could not read is not a fact that came back negative.
+ */
+export type RouteTableRead = { routes: Route[]; installed: boolean | undefined };
+
+/**
+ * The wire body as the screen reads it.
+ *
+ * A missing flag folds to `undefined` rather than failing the query — the opposite of
+ * {@link useRouteHits}, and deliberately so. That endpoint answers the flag and the counts and
+ * nothing else, so refusing a body without it costs one column a dash; refusing this one would
+ * blank the whole screen for the length of every rolling upgrade. `typeof` rather than a plain
+ * read because the generated type calls `installed` required, which a pre-D-68 node is not
+ * obliged to have known.
+ */
+function readRouteTable(body: RouteTableView | null | undefined): RouteTableRead {
+  return {
+    routes: normalizeTable(body),
+    installed: typeof body?.installed === "boolean" ? body.installed : undefined,
+  };
+}
+
+export function useRouteTable(): UseQueryResult<RouteTableRead> {
   const { tenant } = useSession();
   return useQuery({
     queryKey: key(["front-door-routes"], tenant),
-    queryFn: async () =>
-      normalizeTable(await apiGet<RouteTable>(API_PATHS.frontDoorRoutes, { tenant })),
+    queryFn: async (): Promise<RouteTableRead> =>
+      readRouteTable(await apiGet<RouteTableView>(API_PATHS.frontDoorRoutes, { tenant })),
     ...POLLED,
   });
 }
@@ -1464,7 +1493,7 @@ export class RouteTableConflict extends Error {
  * server-side precondition on this route (filed as a follow-up).
  */
 export function usePutRoutes(): UseMutationResult<
-  { stored: RouteTable | null; outcome: CommitOutcome },
+  { stored: RouteTableView | null; outcome: CommitOutcome },
   Error,
   { draft: Route[]; base: Route[] }
 > {
@@ -1473,14 +1502,19 @@ export function usePutRoutes(): UseMutationResult<
   const keyed = keyedAttempt();
   return useMutation({
     mutationFn: async ({ draft, base }) => {
+      /*
+       * Compared as rows, never as the whole body: `installed` is a property of the tenant rather
+       * than of the table — which is why the server keeps it off `RouteTable` entirely (D-68) —
+       * so letting it into this comparison would report a conflict against a table nobody edited.
+       */
       const current = normalizeTable(
-        await apiGet<RouteTable>(API_PATHS.frontDoorRoutes, { tenant }),
+        await apiGet<RouteTableView>(API_PATHS.frontDoorRoutes, { tenant }),
       );
       if (JSON.stringify(current) !== JSON.stringify(base)) {
         throw new RouteTableConflict(current);
       }
       const sent = await keyed((idempotencyKey) =>
-        apiSend<RouteTable>(
+        apiSend<RouteTableView>(
           "PUT",
           API_PATHS.frontDoorRoutes,
           { routes: draft },
@@ -1505,10 +1539,15 @@ export function usePutRoutes(): UseMutationResult<
      * older `loaded` and reverts the screen to it. It converges, but a save that briefly shows as
      * undone — and stays that way if the refetch fails — is exactly the kind of quiet lie this
      * console is being careful about elsewhere.
+     *
+     * The `installed` flag rides along, which is the write half of D-68: a `PUT` is the one moment
+     * an operator could act on the fact that a non-default tenant's table will never dispatch, so
+     * the answer to their own write is what tells them — not a poll of a fan-out that may not
+     * answer at all.
      */
     onSuccess: ({ stored }) => {
       if (stored === null) return;
-      client.setQueryData(key(["front-door-routes"], tenant), () => normalizeTable(stored));
+      client.setQueryData(key(["front-door-routes"], tenant), () => readRouteTable(stored));
     },
     onSettled: () => client.invalidateQueries({ queryKey: ["front-door-routes"] }),
   });
